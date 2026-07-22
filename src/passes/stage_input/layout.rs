@@ -1,0 +1,296 @@
+//! Stage-input and resource-block layout decoration.
+
+use super::*;
+
+pub(super) fn include_existing_private_globals(ctx: &mut Ctx) {
+    let vars: Vec<Word> = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter(|inst| {
+            inst.class.opcode == Op::Variable
+                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Private))
+        })
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    for var in vars {
+        ctx.interface_buffer_var(var);
+    }
+}
+
+impl Ctx {
+    /// SPIR-V 1.4 requires all global variables referenced by the entry to be on the interface list,
+    /// but 1.3 forbids non-Input/Output there. The llc backend emits version 1.4, so include buffers
+    /// and resources too. We gate on header version.
+    pub(in crate::passes) fn interface_buffer_var(&mut self, var: Word) {
+        let v = self.module.header.as_ref().map(|h| h.version).unwrap_or(0);
+        // version word: high byte major, next minor. 1.4 = 0x00010400.
+        if v >= 0x0001_0400 {
+            self.interface.push(var);
+        }
+    }
+
+    /// Lazily create a default sampler resource variable for `air.get_read_sampler()`. Metal's
+    /// `texture.read(coord)` is sampler-less, but AIR still threads a sampler pointer (from
+    /// `air.get_read_sampler`) into the read intrinsic, where our `lower_read` ignores it. To keep the
+    /// SSA value well-typed we materialize one real `OpTypeSampler` UniformConstant variable (binding
+    /// past every binding already assigned by the interface pass) and load from it. Memoized so a
+    /// shader with many reads shares a single sampler resource.
+    pub(in crate::passes) fn default_read_sampler(&mut self) -> Word {
+        if let Some(v) = self.default_sampler_var {
+            return v;
+        }
+        // Pick a binding one past the maximum currently decorated (the interface pass already ran).
+        let mut max_binding: i64 = -1;
+        for ann in &self.module.annotations {
+            if ann.class.opcode == Op::Decorate
+                && ann.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
+            {
+                if let Some(Operand::LiteralBit32(b)) = ann.operands.get(2) {
+                    max_binding = max_binding.max(*b as i64);
+                }
+            }
+        }
+        let binding = (max_binding + 1) as u32;
+        let sty = self.ty_sampler();
+        let pptr = self.ty_ptr(StorageClass::UniformConstant, sty);
+        let var = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pptr),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        decorate_binding(&mut self.module, var, binding);
+        self.interface_buffer_var(var);
+        self.default_sampler_var = Some(var);
+        var
+    }
+
+    /// Lazily create a default (null) 2D float texture resource for `air.get_null_texture_2d()`.
+    /// Metal's `[[function_constant]]`-gated optional attachments resolve (with our FCs folded off) to
+    /// a "null texture" the shader still threads through phis and may sample (yielding 0). We bind one
+    /// real `OpTypeImage` 2D-float UniformConstant variable (past every assigned binding) and load it;
+    /// sampling it is valid (reads as the unbound-descriptor default). Memoized across all uses so the
+    /// phi-merged values share one image id and type.
+    pub(in crate::passes) fn default_null_image_of(&mut self, dim: Dim, arrayed: bool) -> Word {
+        if let Some(&v) = self.default_null_image_vars.get(&(dim, arrayed)) {
+            return v;
+        }
+        let mut max_binding: i64 = -1;
+        for ann in &self.module.annotations {
+            if ann.class.opcode == Op::Decorate
+                && ann.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
+            {
+                if let Some(Operand::LiteralBit32(b)) = ann.operands.get(2) {
+                    max_binding = max_binding.max(*b as i64);
+                }
+            }
+        }
+        let binding = (max_binding + 1) as u32;
+        let img_ty = self.ty_image(dim, arrayed, ImageComp::Float);
+        let pptr = self.ty_ptr(StorageClass::UniformConstant, img_ty);
+        let var = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pptr),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        decorate_binding(&mut self.module, var, binding);
+        self.interface_buffer_var(var);
+        self.default_null_image_vars.insert((dim, arrayed), var);
+        var
+    }
+
+    /// A constant/undef of `ty` for unused params (OpUndef is always legal).
+    pub(super) fn const_zero(&mut self, ty: Word, _defs: &HashMap<Word, Instruction>) -> Word {
+        let id = self.module.fresh_id();
+        self.new_globals
+            .push(Instruction::new(Op::Undef, Some(ty), Some(id), vec![]));
+        id
+    }
+
+    /// An OpConstantNull of any type — the canonical zero value (handles aggregates, vectors, scalars).
+    fn const_null(&mut self, ty: Word) -> Word {
+        let id = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::ConstantNull,
+            Some(ty),
+            Some(id),
+            vec![],
+        ));
+        id
+    }
+
+    /// Materialize a Private zero-initialized variable of `pointee` for an unmodeled pointer param, and
+    /// list it on the entry interface (1.4+). Returns the variable id to splice for the param. The
+    /// caller (apply_bindings) re-storage-classes the derived access chains to Private.
+    pub(super) fn zero_private_var(&mut self, pointee: Word) -> Word {
+        // An absent raw buffer's pointee is a `{ RuntimeArray<uint> }` Block. A RuntimeArray is illegal
+        // in Private storage (and in an OpConstantNull), so swap it for a fixed-size array in a fresh,
+        // undecorated struct. Access chains off the var only reference the var id and yield element
+        // pointers, so the substitution is transparent to them; reads are dead anyway (the resource is
+        // function-constant-gated off), and any dynamic index is unbounded-but-valid SPIR-V.
+        let pointee = self.private_safe_type(pointee);
+        let init = self.const_null(pointee);
+        let pptr = self.ty_ptr(StorageClass::Private, pointee);
+        let var = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pptr),
+            Some(var),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(init),
+            ],
+        ));
+        self.interface_buffer_var(var);
+        var
+    }
+
+    /// Return a type safe to use as a Private variable + OpConstantNull: a `RuntimeArray<E>` becomes a
+    /// fixed-size `Array<E, N>`, and a struct with any RuntimeArray member becomes a fresh undecorated
+    /// struct with those members fixed. Other types pass through unchanged. (Vulkan forbids
+    /// RuntimeArray outside StorageBuffer/Workgroup, and OpConstantNull of a RuntimeArray-bearing type.)
+    fn private_safe_type(&mut self, ty: Word) -> Word {
+        const ABSENT_BUFFER_ARRAY_LEN: u32 = 1024;
+        let def = self
+            .module
+            .types_global_values
+            .iter()
+            .chain(self.new_globals.iter())
+            .find(|inst| inst.result_id == Some(ty))
+            .cloned();
+        let Some(def) = def else { return ty };
+        match def.class.opcode {
+            Op::TypeRuntimeArray => match def.operands.first() {
+                Some(Operand::IdRef(elem)) => self.ty_array(*elem, ABSENT_BUFFER_ARRAY_LEN),
+                _ => ty,
+            },
+            Op::TypeStruct => {
+                let members: Vec<Word> = def
+                    .operands
+                    .iter()
+                    .filter_map(|o| match o {
+                        Operand::IdRef(m) => Some(*m),
+                        _ => None,
+                    })
+                    .collect();
+                let fixed: Vec<Word> = members.iter().map(|m| self.private_safe_type(*m)).collect();
+                if fixed == members {
+                    return ty;
+                }
+                let st = self.module.fresh_id();
+                self.new_globals.push(crate::passes::type_inst(
+                    Op::TypeStruct,
+                    st,
+                    fixed.into_iter().map(Operand::IdRef).collect(),
+                ));
+                st
+            }
+            _ => ty,
+        }
+    }
+}
+
+/// Decorate a struct type as a Block + member Offset decorations computed from member sizes/aligns
+/// (MSL/std140 vec rules). Only handles scalar/vector/array-of-bytes members, which is what AIR
+/// fragment-arg structs use.
+pub(in crate::passes) fn decorate_block_struct(
+    ctx: &mut Ctx,
+    struct_ty: Word,
+    defs: &HashMap<Word, Instruction>,
+) {
+    ctx.module.annotations.push(Instruction::new(
+        Op::Decorate,
+        None,
+        None,
+        vec![
+            Operand::IdRef(struct_ty),
+            Operand::Decoration(Decoration::Block),
+        ],
+    ));
+    // Lay out the struct (and everything reachable inside it) exactly once.
+    decorate_layout_recursive(ctx, struct_ty, defs);
+}
+
+/// Recursively add ArrayStride decorations to array members and Offset decorations to nested structs
+/// reachable inside a Block-decorated struct (Vulkan requires every composite in the block to be
+/// explicitly laid out). Idempotent enough for our shaders: a given array/struct type is decorated
+/// once even if shared, but duplicate identical decorations are harmless to the validator.
+fn decorate_layout_recursive(ctx: &mut Ctx, ty: Word, defs: &HashMap<Word, Instruction>) {
+    if !ctx.laid_out.insert(ty) {
+        return; // already laid out (shared type) — decorating twice is invalid.
+    }
+    let Some(def) = defs.get(&ty).cloned() else {
+        return;
+    };
+    match def.class.opcode {
+        Op::TypeArray | Op::TypeRuntimeArray => {
+            let elem = match def.operands.first() {
+                Some(Operand::IdRef(e)) => *e,
+                _ => return,
+            };
+            let (es, ea) = layout_ty_size_align(ctx, elem, defs);
+            let stride = round_up(es, ea);
+            ctx.module.annotations.push(Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(ty),
+                    Operand::Decoration(Decoration::ArrayStride),
+                    Operand::LiteralBit32(stride),
+                ],
+            ));
+            decorate_layout_recursive(ctx, elem, defs);
+        }
+        Op::TypeStruct => {
+            let mut off = 0u32;
+            let explicit_offsets = ctx.air_struct_offsets.get(&ty).cloned();
+            for (mi, op) in def.operands.clone().iter().enumerate() {
+                let Operand::IdRef(mty) = op else { continue };
+                let (s, a) = layout_ty_size_align(ctx, *mty, defs);
+                off = explicit_offsets
+                    .as_ref()
+                    .and_then(|offsets| offsets.get(mi).copied())
+                    .unwrap_or_else(|| round_up(off, a));
+                ctx.module.annotations.push(Instruction::new(
+                    Op::MemberDecorate,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(ty),
+                        Operand::LiteralBit32(mi as u32),
+                        Operand::Decoration(Decoration::Offset),
+                        Operand::LiteralBit32(off),
+                    ],
+                ));
+                decorate_layout_recursive(ctx, *mty, defs);
+                off += s;
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(in crate::passes) fn layout_ty_size_align(
+    ctx: &Ctx,
+    ty: Word,
+    defs: &HashMap<Word, Instruction>,
+) -> (u32, u32) {
+    crate::layout::spirv_size_align(
+        ty,
+        defs,
+        crate::layout::SpirvLayout::AirOffsets(&ctx.air_struct_offsets),
+    )
+}
+
+pub(in crate::passes) use crate::layout::round_up_u32 as round_up;
+
+/// (size, align) in bytes for a SPIR-V type, MSL/std140 vector rules. Covers float/int scalars,
+/// vectors (align = 2x for vec2, 4x for vec3/4), arrays, and nested structs.
+pub(in crate::passes) fn ty_size_align(ty: Word, defs: &HashMap<Word, Instruction>) -> (u32, u32) {
+    crate::layout::spirv_size_align(ty, defs, crate::layout::SpirvLayout::Natural)
+}

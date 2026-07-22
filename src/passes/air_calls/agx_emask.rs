@@ -1,0 +1,985 @@
+//! Apple AGX3 emask intrinsic lowering.
+//!
+//! The AIR `llvm.agx3.*.with.emask.global.*` family is a stable LLVM/AGX ABI namespace, not a
+//! shader identifier. The observed `sdpa_tile_fwd_reduction` shape uses byte-addressed global
+//! pointers plus two 4-bit lane masks. Loads leave inactive lanes as zero; stores skip inactive lanes.
+//! Lower memory operations into explicit four-lane guarded control flow so inactive lanes are never
+//! speculatively dereferenced.
+
+use super::*;
+use std::collections::HashSet;
+
+const AGX_LOAD_EMASK_PREFIX: &str = "llvm.agx3.load.with.emask.global.";
+const AGX_STORE_EMASK_PREFIX: &str = "llvm.agx3.store.with.emask.global.";
+const AGX_EMASK_LANES: u32 = 4;
+
+pub(in crate::passes) fn lower_agx3_edgecheck(
+    ctx: &mut Ctx,
+    name: &str,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    if args.len() != 3 {
+        return Err(format!("{name} expects 3 operands"));
+    }
+    let mut out = Vec::new();
+    let base = ensure_u32(ctx, &mut out, args[0], "llvm.agx3.edgecheck lane base")?;
+    let low = ensure_u32(ctx, &mut out, args[1], "llvm.agx3.edgecheck low bound")?;
+    let high = ensure_u32(ctx, &mut out, args[2], "llvm.agx3.edgecheck high bound")?;
+    let uint_ty = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
+    let zero = ctx.const_uint(0);
+    let mut acc = zero;
+    for lane in 0..AGX_EMASK_LANES {
+        let lane_value = if lane == 0 {
+            base
+        } else {
+            let lane_const = ctx.const_uint(lane);
+            let id = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::IAdd,
+                Some(uint_ty),
+                Some(id),
+                vec![Operand::IdRef(base), Operand::IdRef(lane_const)],
+            ));
+            id
+        };
+        let ge_low = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::UGreaterThanEqual,
+            Some(bool_ty),
+            Some(ge_low),
+            vec![Operand::IdRef(lane_value), Operand::IdRef(low)],
+        ));
+        let lt_high = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::ULessThan,
+            Some(bool_ty),
+            Some(lt_high),
+            vec![Operand::IdRef(lane_value), Operand::IdRef(high)],
+        ));
+        let active = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::LogicalAnd,
+            Some(bool_ty),
+            Some(active),
+            vec![Operand::IdRef(ge_low), Operand::IdRef(lt_high)],
+        ));
+        let bit = ctx.const_uint(1u32 << lane);
+        let lane_bits = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::Select,
+            Some(uint_ty),
+            Some(lane_bits),
+            vec![
+                Operand::IdRef(active),
+                Operand::IdRef(bit),
+                Operand::IdRef(zero),
+            ],
+        ));
+        if lane == 0 {
+            acc = lane_bits;
+        } else {
+            let next = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::BitwiseOr,
+                Some(uint_ty),
+                Some(next),
+                vec![Operand::IdRef(acc), Operand::IdRef(lane_bits)],
+            ));
+            acc = next;
+        }
+    }
+    let result = coerce_u32_to_result(ctx, &mut out, acc, rty, res)?;
+    if result != res {
+        out.push(Instruction::new(
+            Op::CopyObject,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(result)],
+        ));
+    }
+    Ok(out)
+}
+
+pub(in crate::passes) fn lower_agx_emask_memory_calls(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    loop {
+        let names = air_names(&ctx.module);
+        let Some(site) = find_next_agx_emask_memory_call(ctx, entry_idx, &names) else {
+            return Ok(());
+        };
+        split_agx_emask_memory_call(ctx, entry_idx, site)?;
+    }
+}
+
+#[derive(Clone)]
+struct AgxMemorySite {
+    block: usize,
+    inst: usize,
+    name: String,
+    call: Instruction,
+}
+
+fn find_next_agx_emask_memory_call(
+    ctx: &Ctx,
+    entry_idx: usize,
+    names: &std::collections::HashMap<Word, String>,
+) -> Option<AgxMemorySite> {
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.class.opcode != Op::FunctionCall {
+                continue;
+            }
+            let Some(Operand::IdRef(callee)) = inst.operands.first() else {
+                continue;
+            };
+            let Some(name) = names.get(callee) else {
+                continue;
+            };
+            if name.starts_with(AGX_LOAD_EMASK_PREFIX) || name.starts_with(AGX_STORE_EMASK_PREFIX) {
+                return Some(AgxMemorySite {
+                    block: bi,
+                    inst: ii,
+                    name: name.clone(),
+                    call: inst.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+fn split_agx_emask_memory_call(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    site: AgxMemorySite,
+) -> Result<(), String> {
+    let args = idref_args(&site.call);
+    let is_load = site.name.starts_with(AGX_LOAD_EMASK_PREFIX);
+    let old_label = ctx.module.functions[entry_idx].blocks[site.block]
+        .label
+        .as_ref()
+        .and_then(|label| label.result_id)
+        .ok_or_else(|| format!("{} appears in a block without a label", site.name))?;
+    let old_insts = ctx.module.functions[entry_idx].blocks[site.block]
+        .instructions
+        .clone();
+    let mut prefix = old_insts[..site.inst].to_vec();
+    let mut suffix = old_insts[site.inst + 1..].to_vec();
+    if suffix.is_empty()
+        || !suffix
+            .last()
+            .is_some_and(|inst| is_block_terminator(inst.class.opcode))
+    {
+        return Err(format!(
+            "{} lowering requires the source block to retain its terminator",
+            site.name
+        ));
+    }
+    if prefix
+        .last()
+        .is_some_and(|inst| matches!(inst.class.opcode, Op::SelectionMerge | Op::LoopMerge))
+    {
+        return Err(format!(
+            "{} lowering cannot split between a structured merge and its terminator",
+            site.name
+        ));
+    }
+
+    let successors = terminator_successors(suffix.last().expect("suffix terminator"));
+    let cont_label = ctx.module.fresh_id();
+    let test_labels: Vec<Word> = (0..AGX_EMASK_LANES)
+        .map(|_| ctx.module.fresh_id())
+        .collect();
+    let body_labels: Vec<Word> = (0..AGX_EMASK_LANES)
+        .map(|_| ctx.module.fresh_id())
+        .collect();
+
+    let replacement = if is_load {
+        plan_load(
+            ctx,
+            entry_idx,
+            &site.name,
+            &args,
+            site.call.result_id,
+            site.call.result_type,
+        )?
+    } else {
+        plan_store(ctx, &site.name, &args)?
+    };
+
+    let mask0 = ensure_u32(ctx, &mut prefix, replacement.mask0, "AGX emask mask0")?;
+    let mask1 = ensure_u32(ctx, &mut prefix, replacement.mask1, "AGX emask mask1")?;
+    let stride = ensure_u32(ctx, &mut prefix, replacement.stride, "AGX emask stride")?;
+    if let Some((scratch, zero)) = replacement.load_scratch {
+        prefix.push(Instruction::new(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(scratch), Operand::IdRef(zero)],
+        ));
+    }
+    prefix.push(Instruction::new(
+        Op::Branch,
+        None,
+        None,
+        vec![Operand::IdRef(test_labels[0])],
+    ));
+
+    let mut blocks = Vec::with_capacity((AGX_EMASK_LANES as usize) * 2 + 1);
+    for lane in 0..AGX_EMASK_LANES {
+        let lane_idx = lane as usize;
+        let next = if lane + 1 == AGX_EMASK_LANES {
+            cont_label
+        } else {
+            test_labels[lane_idx + 1]
+        };
+        let mut test = Vec::new();
+        let active = append_mask_bit_test(ctx, &mut test, mask0, mask1, lane)?;
+        test.push(Instruction::new(
+            Op::SelectionMerge,
+            None,
+            None,
+            vec![
+                Operand::IdRef(next),
+                Operand::SelectionControl(spirv::SelectionControl::NONE),
+            ],
+        ));
+        test.push(Instruction::new(
+            Op::BranchConditional,
+            None,
+            None,
+            vec![
+                Operand::IdRef(active),
+                Operand::IdRef(body_labels[lane_idx]),
+                Operand::IdRef(next),
+            ],
+        ));
+        blocks.push(block(test_labels[lane_idx], test));
+
+        let mut body = Vec::new();
+        append_lane_memory_op(ctx, &mut body, &replacement, stride, lane)?;
+        body.push(Instruction::new(
+            Op::Branch,
+            None,
+            None,
+            vec![Operand::IdRef(next)],
+        ));
+        blocks.push(block(body_labels[lane_idx], body));
+    }
+
+    if let Some((scratch, _, result, rty)) = replacement.load_scratch_result {
+        suffix.insert(
+            0,
+            Instruction::new(
+                Op::Load,
+                Some(rty),
+                Some(result),
+                vec![Operand::IdRef(scratch)],
+            ),
+        );
+    }
+    blocks.push(block(cont_label, suffix));
+
+    ctx.module.functions[entry_idx].blocks[site.block].instructions = prefix;
+    ctx.module.functions[entry_idx]
+        .blocks
+        .splice(site.block + 1..site.block + 1, blocks);
+    rewrite_successor_phi_predecessors(
+        &mut ctx.module.functions[entry_idx],
+        &successors,
+        old_label,
+        cont_label,
+    );
+    Ok(())
+}
+
+struct MemoryReplacement {
+    base: Word,
+    value: Option<Word>,
+    elem_ty: Word,
+    ptr_pointee: Word,
+    mask0: Word,
+    mask1: Word,
+    stride: Word,
+    ptr_ty: Word,
+    load_scratch: Option<(Word, Word)>,
+    load_scratch_result: Option<(Word, Word, Word, Word)>,
+}
+
+fn plan_load(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    name: &str,
+    args: &[Word],
+    res: Option<Word>,
+    rty: Option<Word>,
+) -> Result<MemoryReplacement, String> {
+    if args.len() != 4 {
+        return Err(format!("{name} expects 4 operands"));
+    }
+    let res = res.ok_or_else(|| format!("{name} has no result id"))?;
+    let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
+    let (elem_ty, lanes) =
+        composite_shape(ctx, rty).ok_or_else(|| format!("{name} result is not a vector"))?;
+    if lanes != AGX_EMASK_LANES {
+        return Err(format!("{name} result is not a 4-lane vector"));
+    }
+    if !matches!(scalar_bit_width(ctx, elem_ty), 8 | 16 | 32) {
+        return Err(format!("{name} result element is not 8-, 16-, or 32-bit"));
+    }
+    let ptr_ty = value_result_type(ctx, args[0])
+        .ok_or_else(|| format!("{name} pointer operand has no type"))?;
+    let ptr_pointee = pointer_pointee_type(ctx, ptr_ty)
+        .ok_or_else(|| format!("{name} pointer operand is not a pointer"))?;
+    let scratch = insert_function_scratch(ctx, entry_idx, rty);
+    let zero = const_null_of(ctx, rty);
+    Ok(MemoryReplacement {
+        base: args[0],
+        value: None,
+        elem_ty,
+        ptr_pointee,
+        mask0: args[1],
+        mask1: args[2],
+        stride: args[3],
+        ptr_ty,
+        load_scratch: Some((scratch, zero)),
+        load_scratch_result: Some((scratch, zero, res, rty)),
+    })
+}
+
+fn plan_store(ctx: &mut Ctx, name: &str, args: &[Word]) -> Result<MemoryReplacement, String> {
+    if args.len() != 5 {
+        return Err(format!("{name} expects 5 operands"));
+    }
+    let value_ty =
+        value_result_type(ctx, args[1]).ok_or_else(|| format!("{name} value has no type"))?;
+    let (elem_ty, lanes) =
+        composite_shape(ctx, value_ty).ok_or_else(|| format!("{name} value is not a vector"))?;
+    if lanes != AGX_EMASK_LANES {
+        return Err(format!("{name} value is not a 4-lane vector"));
+    }
+    if !matches!(scalar_bit_width(ctx, elem_ty), 8 | 16 | 32) {
+        return Err(format!("{name} value element is not 8-, 16-, or 32-bit"));
+    }
+    let ptr_ty = value_result_type(ctx, args[0])
+        .ok_or_else(|| format!("{name} pointer operand has no type"))?;
+    let ptr_pointee = pointer_pointee_type(ctx, ptr_ty)
+        .ok_or_else(|| format!("{name} pointer operand is not a pointer"))?;
+    Ok(MemoryReplacement {
+        base: args[0],
+        value: Some(args[1]),
+        elem_ty,
+        ptr_pointee,
+        mask0: args[2],
+        mask1: args[3],
+        stride: args[4],
+        ptr_ty,
+        load_scratch: None,
+        load_scratch_result: None,
+    })
+}
+
+fn append_lane_memory_op(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    replacement: &MemoryReplacement,
+    stride: Word,
+    lane: u32,
+) -> Result<(), String> {
+    let ptr = append_lane_ptr(
+        ctx,
+        out,
+        replacement.ptr_ty,
+        replacement.ptr_pointee,
+        replacement.base,
+        stride,
+        lane,
+    )?;
+    if let Some(value) = replacement.value {
+        let lane_value = composite_extract(ctx, out, replacement.elem_ty, value, lane);
+        let lane_value = coerce_store_lane_value(
+            ctx,
+            out,
+            lane_value,
+            replacement.elem_ty,
+            replacement.ptr_pointee,
+        );
+        out.push(Instruction::new(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(ptr), Operand::IdRef(lane_value)],
+        ));
+    } else {
+        let (scratch, _) = replacement
+            .load_scratch
+            .ok_or("AGX emask load missing scratch")?;
+        let rty = replacement
+            .load_scratch_result
+            .map(|(_, _, _, rty)| rty)
+            .ok_or("AGX emask load missing result type")?;
+        let load_ty = lane_load_type(ctx, replacement.elem_ty, replacement.ptr_pointee);
+        let loaded_lane = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::Load,
+            Some(load_ty),
+            Some(loaded_lane),
+            vec![Operand::IdRef(ptr)],
+        ));
+        let lane_value =
+            coerce_loaded_lane_value(ctx, out, loaded_lane, load_ty, replacement.elem_ty);
+        let current = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::Load,
+            Some(rty),
+            Some(current),
+            vec![Operand::IdRef(scratch)],
+        ));
+        let inserted = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::CompositeInsert,
+            Some(rty),
+            Some(inserted),
+            vec![
+                Operand::IdRef(lane_value),
+                Operand::IdRef(current),
+                Operand::LiteralBit32(lane),
+            ],
+        ));
+        out.push(Instruction::new(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(scratch), Operand::IdRef(inserted)],
+        ));
+    }
+    Ok(())
+}
+
+fn lane_load_type(ctx: &Ctx, elem_ty: Word, ptr_pointee: Word) -> Word {
+    if elem_ty == ptr_pointee {
+        return elem_ty;
+    }
+    match (
+        direct_scalar_bit_width(ctx, elem_ty),
+        direct_scalar_bit_width(ctx, ptr_pointee),
+    ) {
+        (Some(a), Some(b)) if a == b => ptr_pointee,
+        _ => elem_ty,
+    }
+}
+
+fn coerce_loaded_lane_value(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    value: Word,
+    value_ty: Word,
+    elem_ty: Word,
+) -> Word {
+    if value_ty == elem_ty {
+        return value;
+    }
+    match (
+        direct_scalar_bit_width(ctx, value_ty),
+        direct_scalar_bit_width(ctx, elem_ty),
+    ) {
+        (Some(a), Some(b)) if a == b => {
+            let coerced = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::Bitcast,
+                Some(elem_ty),
+                Some(coerced),
+                vec![Operand::IdRef(value)],
+            ));
+            coerced
+        }
+        _ => value,
+    }
+}
+
+fn coerce_store_lane_value(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    value: Word,
+    value_ty: Word,
+    ptr_pointee: Word,
+) -> Word {
+    if value_ty == ptr_pointee {
+        return value;
+    }
+    match (
+        direct_scalar_bit_width(ctx, value_ty),
+        direct_scalar_bit_width(ctx, ptr_pointee),
+    ) {
+        (Some(a), Some(b)) if a == b => {
+            let coerced = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::Bitcast,
+                Some(ptr_pointee),
+                Some(coerced),
+                vec![Operand::IdRef(value)],
+            ));
+            coerced
+        }
+        _ => value,
+    }
+}
+
+fn append_lane_ptr(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    ptr_ty: Word,
+    ptr_pointee: Word,
+    base: Word,
+    byte_stride: Word,
+    lane: u32,
+) -> Result<Word, String> {
+    let offset = if lane == 0 {
+        ctx.const_uint(0)
+    } else {
+        let elem_bits = direct_scalar_bit_width(ctx, ptr_pointee)
+            .ok_or("AGX emask pointer pointee is not scalar-sized")?;
+        let elem_bytes = elem_bits
+            .checked_div(8)
+            .filter(|bytes| *bytes != 0 && elem_bits % 8 == 0)
+            .ok_or("AGX emask pointer pointee size is not byte-addressable")?;
+        let elem_stride = if elem_bytes == 1 {
+            byte_stride
+        } else {
+            let id = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::UDiv,
+                Some(ctx.ty_uint()),
+                Some(id),
+                vec![
+                    Operand::IdRef(byte_stride),
+                    Operand::IdRef(ctx.const_uint(elem_bytes)),
+                ],
+            ));
+            id
+        };
+        let lane_const = ctx.const_uint(lane);
+        let id = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::IMul,
+            Some(ctx.ty_uint()),
+            Some(id),
+            vec![Operand::IdRef(elem_stride), Operand::IdRef(lane_const)],
+        ));
+        id
+    };
+    let ptr = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::PtrAccessChain,
+        Some(ptr_ty),
+        Some(ptr),
+        vec![Operand::IdRef(base), Operand::IdRef(offset)],
+    ));
+    Ok(ptr)
+}
+
+fn append_mask_bit_test(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    mask0: Word,
+    mask1: Word,
+    lane: u32,
+) -> Result<Word, String> {
+    let uint_ty = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
+    let combined = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint_ty),
+        Some(combined),
+        vec![Operand::IdRef(mask0), Operand::IdRef(mask1)],
+    ));
+    let bit = ctx.const_uint(1u32 << lane);
+    let lane_bits = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint_ty),
+        Some(lane_bits),
+        vec![Operand::IdRef(combined), Operand::IdRef(bit)],
+    ));
+    let zero = ctx.const_uint(0);
+    let active = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::INotEqual,
+        Some(bool_ty),
+        Some(active),
+        vec![Operand::IdRef(lane_bits), Operand::IdRef(zero)],
+    ));
+    Ok(active)
+}
+
+fn ensure_u32(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    value: Word,
+    what: &str,
+) -> Result<Word, String> {
+    let Some(ty) = value_result_type(ctx, value) else {
+        return Err(format!("{what} has no type"));
+    };
+    let Some(def) = type_def_of(ctx, ty) else {
+        return Err(format!("{what} type is undefined"));
+    };
+    if def.class.opcode != Op::TypeInt {
+        return Err(format!("{what} is not an integer"));
+    }
+    if def.operands.first() == Some(&Operand::LiteralBit32(32)) {
+        return Ok(value);
+    }
+    let uint = ctx.ty_uint();
+    let converted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(converted),
+        vec![Operand::IdRef(value)],
+    ));
+    Ok(converted)
+}
+
+fn coerce_u32_to_result(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    value: Word,
+    rty: Word,
+    res: Word,
+) -> Result<Word, String> {
+    let Some(def) = type_def_of(ctx, rty) else {
+        return Err("llvm.agx3.edgecheck result type is undefined".to_string());
+    };
+    if def.class.opcode != Op::TypeInt {
+        return Err("llvm.agx3.edgecheck result type is not an integer".to_string());
+    }
+    if def.operands.first() == Some(&Operand::LiteralBit32(32)) {
+        out.push(Instruction::new(
+            Op::CopyObject,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(value)],
+        ));
+        return Ok(res);
+    }
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(value)],
+    ));
+    Ok(res)
+}
+
+fn direct_scalar_bit_width(ctx: &Ctx, ty: Word) -> Option<u32> {
+    let def = type_def_of(ctx, ty)?;
+    match def.class.opcode {
+        Op::TypeInt | Op::TypeFloat => match def.operands.first() {
+            Some(Operand::LiteralBit32(bits)) => Some(*bits),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn insert_function_scratch(ctx: &mut Ctx, entry_idx: usize, pointee: Word) -> Word {
+    let ptr_ty = ctx.ty_ptr(StorageClass::Function, pointee);
+    let var = ctx.module.fresh_id();
+    let entry = &mut ctx.module.functions[entry_idx].blocks[0];
+    let at = entry
+        .instructions
+        .iter()
+        .position(|inst| inst.class.opcode != Op::Variable)
+        .unwrap_or(entry.instructions.len());
+    entry.instructions.insert(
+        at,
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_ty),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::Function)],
+        ),
+    );
+    var
+}
+
+fn idref_args(inst: &Instruction) -> Vec<Word> {
+    inst.operands[1..]
+        .iter()
+        .filter_map(|operand| match operand {
+            Operand::IdRef(id) => Some(*id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn block(label: Word, instructions: Vec<Instruction>) -> Block {
+    Block {
+        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
+        instructions,
+    }
+}
+
+fn terminator_successors(inst: &Instruction) -> HashSet<Word> {
+    let mut out = HashSet::new();
+    match inst.class.opcode {
+        Op::Branch => {
+            if let Some(Operand::IdRef(label)) = inst.operands.first() {
+                out.insert(*label);
+            }
+        }
+        Op::BranchConditional => {
+            for operand in inst.operands.iter().skip(1).take(2) {
+                if let Operand::IdRef(label) = operand {
+                    out.insert(*label);
+                }
+            }
+        }
+        Op::Switch => {
+            for operand in inst.operands.iter().skip(1) {
+                if let Operand::IdRef(label) = operand {
+                    out.insert(*label);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn rewrite_successor_phi_predecessors(
+    function: &mut Function,
+    successors: &HashSet<Word>,
+    old_label: Word,
+    new_label: Word,
+) {
+    if successors.is_empty() {
+        return;
+    }
+    for block in &mut function.blocks {
+        let Some(label) = block.label.as_ref().and_then(|label| label.result_id) else {
+            continue;
+        };
+        if !successors.contains(&label) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            if inst.class.opcode != Op::Phi {
+                break;
+            }
+            for pair in inst.operands.chunks_mut(2) {
+                if pair.len() == 2 && pair[1] == Operand::IdRef(old_label) {
+                    pair[1] = Operand::IdRef(new_label);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::{Function, Module, ModuleHeader};
+
+    fn inst(op: Op, ty: Option<Word>, id: Option<Word>, ops: Vec<Operand>) -> Instruction {
+        Instruction::new(op, ty, id, ops)
+    }
+
+    #[test]
+    fn edgecheck_lowers_to_four_lane_mask() {
+        let mut ctx = Ctx::new(Module::new());
+        let rty = ctx.ty_int16();
+        let base = ctx.const_uint(8);
+        let low = ctx.const_uint(0);
+        let high = ctx.const_uint(10);
+        let res = ctx.module.fresh_id();
+
+        let insts = lower_agx3_edgecheck(
+            &mut ctx,
+            "llvm.agx3.edgecheck",
+            res,
+            rty,
+            &[base, low, high],
+        )
+        .expect("edgecheck lowers");
+
+        assert_eq!(insts.last().and_then(|inst| inst.result_id), Some(res));
+        assert_eq!(
+            insts.last().map(|inst| inst.class.opcode),
+            Some(Op::UConvert)
+        );
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::UGreaterThanEqual)
+                .count(),
+            4
+        );
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::ULessThan)
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn emask_store_split_retargets_successor_phi_predecessor() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(300));
+        module.types_global_values = vec![
+            inst(Op::TypeVoid, None, Some(1), vec![]),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(3),
+                vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(4),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(Op::TypeBool, None, Some(5), vec![]),
+            inst(
+                Op::TypeVector,
+                None,
+                Some(6),
+                vec![Operand::IdRef(4), Operand::LiteralBit32(4)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(7),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(2),
+                ],
+            ),
+            inst(
+                Op::TypeFunction,
+                None,
+                Some(8),
+                vec![Operand::IdRef(1), Operand::IdRef(7), Operand::IdRef(6)],
+            ),
+            inst(
+                Op::Constant,
+                Some(3),
+                Some(30),
+                vec![Operand::LiteralBit32(15)],
+            ),
+            inst(
+                Op::Constant,
+                Some(3),
+                Some(31),
+                vec![Operand::LiteralBit32(4)],
+            ),
+            inst(
+                Op::Constant,
+                Some(4),
+                Some(32),
+                vec![Operand::LiteralBit32(0)],
+            ),
+        ];
+        module.debug_names = vec![inst(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(200),
+                Operand::LiteralString("llvm.agx3.store.with.emask.global.v4i32".to_string()),
+            ],
+        )];
+        module.functions = vec![Function {
+            def: Some(inst(
+                Op::Function,
+                Some(1),
+                Some(100),
+                vec![
+                    Operand::FunctionControl(FunctionControl::NONE),
+                    Operand::IdRef(8),
+                ],
+            )),
+            parameters: vec![
+                inst(Op::FunctionParameter, Some(7), Some(20), vec![]),
+                inst(Op::FunctionParameter, Some(6), Some(21), vec![]),
+            ],
+            blocks: vec![
+                block(
+                    10,
+                    vec![
+                        inst(
+                            Op::FunctionCall,
+                            Some(1),
+                            Some(40),
+                            vec![
+                                Operand::IdRef(200),
+                                Operand::IdRef(20),
+                                Operand::IdRef(21),
+                                Operand::IdRef(30),
+                                Operand::IdRef(30),
+                                Operand::IdRef(31),
+                            ],
+                        ),
+                        inst(Op::Branch, None, None, vec![Operand::IdRef(11)]),
+                    ],
+                ),
+                block(
+                    11,
+                    vec![
+                        inst(
+                            Op::Phi,
+                            Some(4),
+                            Some(50),
+                            vec![Operand::IdRef(32), Operand::IdRef(10)],
+                        ),
+                        inst(Op::Return, None, None, vec![]),
+                    ],
+                ),
+            ],
+            end: Some(inst(Op::FunctionEnd, None, None, vec![])),
+        }];
+        let mut ctx = Ctx::new(module);
+
+        lower_agx_emask_memory_calls(&mut ctx, 0).expect("emask store splits");
+        let function = &ctx.module.functions[0];
+        assert!(function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .all(|inst| inst.class.opcode != Op::FunctionCall));
+        assert_eq!(
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter(|inst| inst.class.opcode == Op::SelectionMerge)
+                .count(),
+            4
+        );
+        let phi = function.blocks.iter().find_map(|block| {
+            block
+                .instructions
+                .iter()
+                .find(|inst| inst.class.opcode == Op::Phi)
+        });
+        let phi = phi.expect("successor phi remains");
+        assert_ne!(phi.operands.get(1), Some(&Operand::IdRef(10)));
+        assert!(matches!(phi.operands.get(1), Some(Operand::IdRef(_))));
+    }
+}

@@ -1,0 +1,67 @@
+[workspace]
+members = ["validation"]
+resolver = "2"
+
+[package]
+name = "metal2vulkan"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "LGPL-3.0-or-later"
+authors = ["Anees Iqbal <hello@aneesiqbal.ai>"]
+description = "Translate Metal AIR / LLVM IR to Vulkan SPIR-V with a native Rust emitter"
+readme = "README.md"
+repository = "https://github.com/steelbrain/metal2vulkan"
+homepage = "https://github.com/steelbrain/metal2vulkan"
+documentation = "https://docs.rs/metal2vulkan"
+keywords = ["metal", "air", "spir-v", "vulkan", "gpu"]
+categories = ["compilers", "graphics", "encoding"]
+# crates.io ships only this product crate (lib + bin + unit/integration tests under
+# src/ and tests/). Workspace member `validation/`, private harvest/corpus, scripts,
+# and docs stay out of the published tarball.
+exclude = [
+    "/.github/",
+    "/docs/",
+    "/scripts/",
+    "/validation/",
+    "/validation/**",
+    "/target/",
+    "Cargo.lock",
+    "tests/fixtures/",
+    "m2v-old",
+    "**/*.air",
+    "**/*.metallib",
+    "**/*.mtlb",
+    "**/*.spv",
+    "**/*.spvasm",
+]
+
+[[bin]]
+name = "metal2vulkan"
+path = "src/main.rs"
+required-features = []
+
+[lib]
+name = "metal2vulkan"
+path = "src/lib.rs"
+
+[dependencies]
+# Grammar-derived SPIR-V enums at the locked 1.4.341 revision.
+spirv = "0.4.0"
+# Bound every external-tool spawn (llvm-dis / spirv-val / …) so a stuck tool cannot hang us.
+wait-timeout = "0.2"
+# Optional: persistable ShaderReflection + CLI `--emit-meta` JSON.
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+# Derive Serialize/Deserialize on public reflection types and enable the CLI `--emit-meta` dump.
+serde = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+serde_json = "1"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

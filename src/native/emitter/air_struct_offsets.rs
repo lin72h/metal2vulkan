@@ -1,0 +1,340 @@
+//! Producer-owned AIR aggregate layout facts.
+//!
+//! AIR metadata names entry-parameter layouts while native emission owns the concrete SPIR-V type
+//! ids. Match those two structural descriptions once, before returning the emitted module, and carry
+//! the exact offsets in `EmitSidecar`. The interface pass consumes the typed map directly.
+
+use super::*;
+use crate::meta::{AirMember, AirScalar, AirType};
+
+impl Emitter {
+    pub(super) fn record_air_struct_offsets(
+        &mut self,
+        buffer_layouts: Option<&HashMap<u32, AirType>>,
+    ) {
+        let Some(buffer_layouts) = buffer_layouts else {
+            return;
+        };
+        let entry_id = self
+            .ir
+            .entry_name
+            .as_ref()
+            .and_then(|name| self.function_ids.get(name))
+            .copied();
+        let entry = entry_id
+            .and_then(|entry_id| {
+                self.module.functions.iter().find(|function| {
+                    function
+                        .def
+                        .as_ref()
+                        .and_then(|instruction| instruction.result_id)
+                        == Some(entry_id)
+                })
+            })
+            .or_else(|| {
+                self.module
+                    .functions
+                    .iter()
+                    .find(|function| !function.blocks.is_empty())
+            });
+        let Some(entry) = entry else {
+            return;
+        };
+        let param_types = entry
+            .parameters
+            .iter()
+            .map(|param| param.result_type)
+            .collect::<Vec<_>>();
+        let defs = self
+            .module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+            .collect::<HashMap<_, _>>();
+
+        for (index, param_type) in param_types.into_iter().enumerate() {
+            let Some(layout) = buffer_layouts.get(&(index as u32)) else {
+                continue;
+            };
+            let Some(struct_ty) = param_type.and_then(|ty| pointer_pointee(&defs, ty)) else {
+                continue;
+            };
+            remember_existing_air_struct_offsets(
+                &mut self.emit_sidecar.air_struct_offsets,
+                &defs,
+                struct_ty,
+                layout,
+            );
+        }
+    }
+}
+
+fn pointer_pointee(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<Word> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypePointer).then_some(())?;
+    match def.operands.get(1)? {
+        Operand::IdRef(pointee) => Some(*pointee),
+        _ => None,
+    }
+}
+
+fn remember_existing_air_struct_offsets(
+    offsets_by_type: &mut HashMap<Word, Vec<u32>>,
+    defs: &HashMap<Word, Instruction>,
+    struct_ty: Word,
+    layout: &AirType,
+) {
+    let AirType::Struct(members) = layout else {
+        return;
+    };
+    remember_existing_air_struct_offsets_inner(offsets_by_type, defs, struct_ty, members);
+}
+
+fn remember_existing_air_struct_offsets_inner(
+    offsets_by_type: &mut HashMap<Word, Vec<u32>>,
+    defs: &HashMap<Word, Instruction>,
+    struct_ty: Word,
+    members: &[AirMember],
+) {
+    let Some(def) = defs.get(&struct_ty) else {
+        return;
+    };
+    if def.class.opcode != Op::TypeStruct || def.operands.len() < members.len() {
+        return;
+    }
+    let Some(offsets) = map_existing_air_struct_offsets(defs, def, members) else {
+        return;
+    };
+    if offsets.windows(2).all(|window| window[1] > window[0]) {
+        offsets_by_type.insert(struct_ty, offsets);
+    }
+    remember_nested_existing_air_struct_offsets(offsets_by_type, defs, def, members);
+}
+
+fn remember_nested_existing_air_struct_offsets(
+    offsets_by_type: &mut HashMap<Word, Vec<u32>>,
+    defs: &HashMap<Word, Instruction>,
+    def: &Instruction,
+    members: &[AirMember],
+) {
+    let mut air_idx = 0usize;
+    for op in &def.operands {
+        let Operand::IdRef(member_ty) = op else {
+            return;
+        };
+        if let Some(member) = members.get(air_idx) {
+            if air_type_matches_existing(defs, *member_ty, &member.ty) {
+                remember_existing_air_type_offsets(offsets_by_type, defs, *member_ty, &member.ty);
+                air_idx += 1;
+                continue;
+            }
+        }
+        if is_backend_padding_array(defs, *member_ty) {
+            continue;
+        }
+        return;
+    }
+}
+
+fn remember_existing_air_type_offsets(
+    offsets_by_type: &mut HashMap<Word, Vec<u32>>,
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    air_ty: &AirType,
+) {
+    match air_ty {
+        AirType::Struct(members) => {
+            remember_existing_air_struct_offsets_inner(offsets_by_type, defs, ty, members);
+        }
+        AirType::Array { elem, .. } => {
+            if let Some((array_elem, _)) = array_type(defs, ty) {
+                remember_existing_air_type_offsets(offsets_by_type, defs, array_elem, elem);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn map_existing_air_struct_offsets(
+    defs: &HashMap<Word, Instruction>,
+    def: &Instruction,
+    members: &[AirMember],
+) -> Option<Vec<u32>> {
+    let mut offsets = Vec::with_capacity(def.operands.len());
+    let mut air_idx = 0usize;
+    let mut cursor = 0u32;
+
+    for op in &def.operands {
+        let Operand::IdRef(member_ty) = op else {
+            return None;
+        };
+        let (size, _align) =
+            crate::layout::spirv_size_align(*member_ty, defs, crate::layout::SpirvLayout::Natural);
+        if let Some(member) = members.get(air_idx) {
+            if air_type_matches_existing(defs, *member_ty, &member.ty) {
+                offsets.push(member.offset);
+                cursor = member.offset.saturating_add(size);
+                air_idx += 1;
+                continue;
+            }
+        }
+        if is_backend_padding_array(defs, *member_ty) {
+            let offset = cursor;
+            offsets.push(offset);
+            cursor = offset.saturating_add(size);
+            continue;
+        }
+        return None;
+    }
+
+    (air_idx == members.len()).then_some(offsets)
+}
+
+fn air_type_matches_existing(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    air_ty: &AirType,
+) -> bool {
+    match air_ty {
+        AirType::Scalar(scalar) => scalar_type_matches(defs, ty, *scalar),
+        AirType::Vec { scalar, lanes } => vector_type_matches(defs, ty, *scalar, *lanes),
+        AirType::PackedVec { scalar, lanes } => array_type_matches(defs, ty, *scalar, *lanes),
+        AirType::Array { elem, len } => {
+            let Some((array_elem, array_len)) = array_type(defs, ty) else {
+                return false;
+            };
+            array_len == *len && air_type_matches_existing(defs, array_elem, elem)
+        }
+        AirType::Matrix { scalar, cols, rows } => {
+            matrix_type_matches(defs, ty, *scalar, *cols, *rows)
+        }
+        AirType::Struct(members) => {
+            let Some(def) = defs.get(&ty) else {
+                return false;
+            };
+            def.class.opcode == Op::TypeStruct
+                && map_existing_air_struct_offsets(defs, def, members).is_some()
+        }
+    }
+}
+
+fn scalar_type_matches(defs: &HashMap<Word, Instruction>, ty: Word, scalar: AirScalar) -> bool {
+    match scalar {
+        AirScalar::Float => type_float_width(defs, ty).is_some(),
+        AirScalar::Half => type_float_width(defs, ty) == Some(16),
+        AirScalar::UInt | AirScalar::SInt => type_int_width(defs, ty) == Some(32),
+        AirScalar::ULong | AirScalar::SLong => type_int_width(defs, ty) == Some(64),
+        AirScalar::UShort | AirScalar::SShort => type_int_width(defs, ty) == Some(16),
+        AirScalar::UChar => type_int_width(defs, ty) == Some(8),
+        AirScalar::Bool => {
+            type_int_width(defs, ty) == Some(8)
+                || type_float_width(defs, ty) == Some(32)
+                || defs
+                    .get(&ty)
+                    .is_some_and(|def| def.class.opcode == Op::TypeBool)
+        }
+    }
+}
+
+fn vector_type_matches(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    scalar: AirScalar,
+    lanes: u32,
+) -> bool {
+    if scalar == AirScalar::UChar {
+        return array_type_matches(defs, ty, scalar, lanes);
+    }
+    let Some(def) = defs.get(&ty) else {
+        return false;
+    };
+    if def.class.opcode != Op::TypeVector {
+        return false;
+    }
+    let Some(Operand::IdRef(elem)) = def.operands.first() else {
+        return false;
+    };
+    let Some(Operand::LiteralBit32(n)) = def.operands.get(1) else {
+        return false;
+    };
+    *n == lanes && scalar_type_matches(defs, *elem, scalar)
+}
+
+fn array_type_matches(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    scalar: AirScalar,
+    len: u32,
+) -> bool {
+    let Some((elem, array_len)) = array_type(defs, ty) else {
+        return false;
+    };
+    array_len == len && scalar_type_matches(defs, elem, scalar)
+}
+
+fn matrix_type_matches(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    scalar: AirScalar,
+    cols: u32,
+    rows: u32,
+) -> bool {
+    let Some(def) = defs.get(&ty) else {
+        return false;
+    };
+    if def.class.opcode != Op::TypeStruct || def.operands.len() != 1 {
+        return false;
+    }
+    let Some(Operand::IdRef(array_ty)) = def.operands.first() else {
+        return false;
+    };
+    let Some((vec_ty, array_len)) = array_type(defs, *array_ty) else {
+        return false;
+    };
+    array_len == cols && vector_type_matches(defs, vec_ty, scalar, rows)
+}
+
+fn array_type(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<(Word, u32)> {
+    let def = defs.get(&ty)?;
+    if def.class.opcode != Op::TypeArray {
+        return None;
+    }
+    let elem = match def.operands.first()? {
+        Operand::IdRef(elem) => *elem,
+        _ => return None,
+    };
+    let len_const = match def.operands.get(1)? {
+        Operand::IdRef(len_const) => *len_const,
+        _ => return None,
+    };
+    let len = defs
+        .get(&len_const)
+        .and_then(|constant| match constant.operands.first() {
+            Some(Operand::LiteralBit32(len)) => Some(*len),
+            _ => None,
+        })?;
+    Some((elem, len))
+}
+
+fn type_int_width(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<u32> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypeInt).then(|| match def.operands.first() {
+        Some(Operand::LiteralBit32(width)) => *width,
+        _ => 32,
+    })
+}
+
+fn type_float_width(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<u32> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypeFloat).then(|| match def.operands.first() {
+        Some(Operand::LiteralBit32(width)) => *width,
+        _ => 32,
+    })
+}
+
+fn is_backend_padding_array(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
+    let Some((elem, _len)) = array_type(defs, ty) else {
+        return false;
+    };
+    type_int_width(defs, elem) == Some(8)
+}

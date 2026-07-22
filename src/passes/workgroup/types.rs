@@ -1,0 +1,348 @@
+//! Workgroup interface type construction and explicit-layout alias isolation.
+
+use super::*;
+use crate::passes::stage_input::array_type;
+
+pub(in crate::passes) fn split_workgroup_block_type_aliases(
+    ctx: &mut Ctx,
+    buffer_structs: &[(Word, Word)],
+    defs: &mut HashMap<Word, Instruction>,
+) {
+    let block_structs = buffer_structs
+        .iter()
+        .map(|(_, struct_ty)| *struct_ty)
+        .collect::<HashSet<_>>();
+    if block_structs.is_empty() {
+        return;
+    }
+
+    // Every aggregate reachable from a Block struct gets explicit Offset/ArrayStride layout when
+    // `decorate_block_struct` recurses. A Workgroup variable whose pointee graph shares any of those
+    // ids would inherit illegal explicit layout (VUID-StandaloneSpirv-None-10684). Clone the complete
+    // path from each Workgroup root down to every shared aggregate; cloning only a top-level struct is
+    // insufficient when the Workgroup root is an array or the shared type is a nested array.
+    let laid_out_types = layout_types_reachable_from(&block_structs, defs);
+
+    // Preserve the established byte-stable path for a top-level struct alias: clone only that struct
+    // and its Workgroup pointer, leaving its members unchanged. The recursive path below then sees the
+    // fresh root and does extra work only if a nested aggregate still conflicts.
+    let mut shallow = vec![];
+    for (idx, inst) in ctx.module.types_global_values.iter().enumerate() {
+        if inst.class.opcode != Op::Variable
+            || inst.operands.first() != Some(&Operand::StorageClass(StorageClass::Workgroup))
+        {
+            continue;
+        }
+        let Some(ptr_ty) = inst.result_type else {
+            continue;
+        };
+        let Some(pointee) = ptr_pointee(defs, ptr_ty) else {
+            continue;
+        };
+        let Some(def) = defs.get(&pointee) else {
+            continue;
+        };
+        if def.class.opcode == Op::TypeStruct && laid_out_types.contains(&pointee) {
+            shallow.push((idx, def.operands.clone()));
+        }
+    }
+    for (idx, operands) in shallow.into_iter().rev() {
+        let clone_ty = ctx.module.fresh_id();
+        let clone_inst = type_inst(Op::TypeStruct, clone_ty, operands);
+        let clone_ptr_ty = ctx.module.fresh_id();
+        let clone_ptr_inst = type_inst(
+            Op::TypePointer,
+            clone_ptr_ty,
+            vec![
+                Operand::StorageClass(StorageClass::Workgroup),
+                Operand::IdRef(clone_ty),
+            ],
+        );
+        ctx.module
+            .types_global_values
+            .insert(idx, clone_inst.clone());
+        ctx.module
+            .types_global_values
+            .insert(idx + 1, clone_ptr_inst.clone());
+        ctx.module.types_global_values[idx + 2].result_type = Some(clone_ptr_ty);
+        defs.insert(clone_ty, clone_inst);
+        defs.insert(clone_ptr_ty, clone_ptr_inst);
+    }
+    let workgroup_roots = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+        .filter(|inst| {
+            inst.class.opcode == Op::Variable
+                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Workgroup))
+        })
+        .filter_map(|inst| inst.result_type.and_then(|ptr| ptr_pointee(defs, ptr)))
+        .collect::<Vec<_>>();
+
+    let mut resolved = HashMap::new();
+    let mut cloned_types = vec![];
+    for root in workgroup_roots {
+        clone_workgroup_layout_conflicts(
+            ctx,
+            root,
+            &laid_out_types,
+            defs,
+            &mut resolved,
+            &mut cloned_types,
+        );
+    }
+    let cloned = resolved
+        .into_iter()
+        .filter(|(old, new)| old != new)
+        .collect::<HashMap<_, _>>();
+    if cloned.is_empty() {
+        return;
+    }
+
+    for inst in &cloned_types {
+        if let Some(id) = inst.result_id {
+            defs.insert(id, inst.clone());
+        }
+    }
+
+    // Cloned definitions must precede the first Workgroup pointer type that references them. All
+    // clone operands are existing types/constants or earlier post-order clones.
+    let insert_at = ctx
+        .module
+        .types_global_values
+        .iter()
+        .position(|inst| {
+            inst.class.opcode == Op::TypePointer
+                && matches!(
+                    inst.operands.first(),
+                    Some(Operand::StorageClass(
+                        StorageClass::Workgroup | StorageClass::Function
+                    ))
+                )
+                && matches!(
+                    inst.operands.get(1),
+                    Some(Operand::IdRef(pointee)) if cloned.contains_key(pointee)
+                )
+        })
+        .unwrap_or(ctx.module.types_global_values.len());
+    ctx.module
+        .types_global_values
+        .splice(insert_at..insert_at, cloned_types);
+
+    // Retarget Workgroup pointer types and Function pointers that exchange an aggregate with them
+    // (for example through OpCopyMemory). Both storage classes require the undecorated clone, while
+    // StorageBuffer keeps the original explicit-layout type. Refresh the structural interner keys
+    // because these existing type instructions changed shape in place.
+    let mut cache_updates = vec![];
+    repoint_unlaid_pointer_types(
+        &mut ctx.module.types_global_values,
+        &cloned,
+        defs,
+        &mut cache_updates,
+    );
+    repoint_unlaid_pointer_types(&mut ctx.new_globals, &cloned, defs, &mut cache_updates);
+    for (id, old_operands, new_operands) in cache_updates {
+        let old_key = (Op::TypePointer, None, old_operands);
+        if ctx.struct_cache.get(&old_key) == Some(&id) {
+            ctx.struct_cache.remove(&old_key);
+        }
+        ctx.struct_cache
+            .insert((Op::TypePointer, None, new_operands), id);
+    }
+}
+
+pub(in crate::passes) fn clone_workgroup_layout_conflicts(
+    ctx: &mut Ctx,
+    ty: Word,
+    laid_out_types: &HashSet<Word>,
+    defs: &HashMap<Word, Instruction>,
+    resolved: &mut HashMap<Word, Word>,
+    cloned_types: &mut Vec<Instruction>,
+) -> Word {
+    if let Some(&resolved_ty) = resolved.get(&ty) {
+        return resolved_ty;
+    }
+    let Some(def) = defs.get(&ty) else {
+        resolved.insert(ty, ty);
+        return ty;
+    };
+    let mut operands = def.operands.clone();
+    let mut child_changed = false;
+    match def.class.opcode {
+        Op::TypeStruct => {
+            for operand in &mut operands {
+                let Operand::IdRef(member) = operand else {
+                    continue;
+                };
+                let cloned = clone_workgroup_layout_conflicts(
+                    ctx,
+                    *member,
+                    laid_out_types,
+                    defs,
+                    resolved,
+                    cloned_types,
+                );
+                child_changed |= cloned != *member;
+                *member = cloned;
+            }
+        }
+        Op::TypeArray | Op::TypeRuntimeArray => {
+            if let Some(Operand::IdRef(elem)) = operands.first_mut() {
+                let cloned = clone_workgroup_layout_conflicts(
+                    ctx,
+                    *elem,
+                    laid_out_types,
+                    defs,
+                    resolved,
+                    cloned_types,
+                );
+                child_changed = cloned != *elem;
+                *elem = cloned;
+            }
+        }
+        _ => {
+            resolved.insert(ty, ty);
+            return ty;
+        }
+    }
+    if !child_changed && !laid_out_types.contains(&ty) {
+        resolved.insert(ty, ty);
+        return ty;
+    }
+
+    let cloned = ctx.module.fresh_id();
+    cloned_types.push(type_inst(def.class.opcode, cloned, operands));
+    if def.class.opcode == Op::TypeStruct {
+        if let Some(offsets) = ctx.air_struct_offsets.get(&ty).cloned() {
+            ctx.air_struct_offsets.insert(cloned, offsets);
+        }
+    }
+    resolved.insert(ty, cloned);
+    cloned
+}
+
+pub(in crate::passes) fn repoint_unlaid_pointer_types(
+    instructions: &mut [Instruction],
+    cloned: &HashMap<Word, Word>,
+    defs: &mut HashMap<Word, Instruction>,
+    cache_updates: &mut Vec<(Word, Vec<Operand>, Vec<Operand>)>,
+) {
+    for inst in instructions {
+        if inst.class.opcode != Op::TypePointer {
+            continue;
+        }
+        let Some(Operand::StorageClass(storage)) = inst.operands.first() else {
+            continue;
+        };
+        let storage = *storage;
+        if !matches!(storage, StorageClass::Workgroup | StorageClass::Function) {
+            continue;
+        }
+        let Some(Operand::IdRef(pointee)) = inst.operands.get(1) else {
+            continue;
+        };
+        let pointee = *pointee;
+        let Some(&new_pointee) = cloned.get(&pointee) else {
+            continue;
+        };
+        let Some(id) = inst.result_id else { continue };
+        let old_operands = inst.operands.clone();
+        inst.operands[1] = Operand::IdRef(new_pointee);
+        cache_updates.push((id, old_operands, inst.operands.clone()));
+        defs.insert(id, inst.clone());
+    }
+}
+
+/// Aggregate type ids that explicit-layout decoration reaches from `roots`. These are exactly the
+/// structs and arrays `decorate_layout_recursive` gives Offset/ArrayStride, so a Workgroup pointee
+/// graph sharing any of them needs an undecorated clone.
+pub(in crate::passes) fn layout_types_reachable_from(
+    roots: &HashSet<Word>,
+    defs: &HashMap<Word, Instruction>,
+) -> HashSet<Word> {
+    let mut seen: HashSet<Word> = HashSet::new();
+    let mut stack: Vec<Word> = roots.iter().copied().collect();
+    while let Some(ty) = stack.pop() {
+        let Some(def) = defs.get(&ty) else { continue };
+        match def.class.opcode {
+            Op::TypeStruct => {
+                if !seen.insert(ty) {
+                    continue;
+                }
+                for op in &def.operands {
+                    if let Operand::IdRef(member) = op {
+                        stack.push(*member);
+                    }
+                }
+            }
+            Op::TypeArray | Op::TypeRuntimeArray => {
+                if !seen.insert(ty) {
+                    continue;
+                }
+                if let Some(Operand::IdRef(elem)) = def.operands.first() {
+                    stack.push(*elem);
+                }
+            }
+            _ => {}
+        }
+    }
+    seen
+}
+
+pub(in crate::passes) fn build_workgroup_air_type(ctx: &mut Ctx, ty: &AirType) -> Word {
+    match ty {
+        AirType::Scalar(scalar) => ctx.ty_air_scalar(*scalar),
+        AirType::Vec { scalar, lanes } => ctx.ty_air_vec(*scalar, *lanes),
+        AirType::PackedVec { scalar, lanes } => {
+            let elem = ctx.ty_air_scalar(*scalar);
+            fresh_array_type(ctx, elem, *lanes)
+        }
+        AirType::Array { elem, len } => {
+            let elem_ty = build_workgroup_air_type(ctx, elem);
+            fresh_array_type(ctx, elem_ty, *len)
+        }
+        AirType::Matrix { scalar, cols, rows } => {
+            let col = ctx.ty_air_vec(*scalar, *rows);
+            let arr = fresh_array_type(ctx, col, *cols);
+            let st = ctx.module.fresh_id();
+            ctx.new_globals
+                .push(type_inst(Op::TypeStruct, st, vec![Operand::IdRef(arr)]));
+            st
+        }
+        AirType::Struct(members) => {
+            let fields = members
+                .iter()
+                .map(|member| Operand::IdRef(build_workgroup_air_type(ctx, &member.ty)))
+                .collect();
+            let st = ctx.module.fresh_id();
+            ctx.new_globals.push(type_inst(Op::TypeStruct, st, fields));
+            st
+        }
+    }
+}
+
+pub(in crate::passes) fn is_raw_workgroup_array(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+) -> bool {
+    let Some((elem, _len)) = array_type(defs, ty) else {
+        return false;
+    };
+    defs.get(&elem).is_some_and(|inst| {
+        inst.class.opcode == Op::TypeInt
+            && inst.operands.first() == Some(&Operand::LiteralBit32(32))
+            && inst.operands.get(1) == Some(&Operand::LiteralBit32(0))
+    })
+}
+
+pub(in crate::passes) fn fresh_array_type(ctx: &mut Ctx, elem: Word, len: u32) -> Word {
+    let len_c = ctx.const_uint(len);
+    let id = ctx.module.fresh_id();
+    ctx.new_globals.push(type_inst(
+        Op::TypeArray,
+        id,
+        vec![Operand::IdRef(elem), Operand::IdRef(len_c)],
+    ));
+    id
+}

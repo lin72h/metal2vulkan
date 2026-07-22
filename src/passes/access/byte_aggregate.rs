@@ -1,0 +1,739 @@
+//! Byte-neutral responsibility split of the former monolith; see the parent module.
+
+use super::*;
+
+/// One lowered byte-offset access into a `Private` scalar-array aggregate.
+pub(in crate::passes) struct PrivAggAccess {
+    pub(in crate::passes) remove: Vec<(usize, usize)>, // the OpPtrAccessChain (+ the OpBitcast, load form) to delete
+    pub(in crate::passes) anchor: (usize, usize), // the OpStore (store form) / OpLoad (load form) to replace
+    pub(in crate::passes) is_store: bool,
+    pub(in crate::passes) store_val: Word, // store form: the stored object
+    pub(in crate::passes) load_result: Word, // load form: the original OpLoad result id to preserve
+    pub(in crate::passes) load_result_ty: Word, // load form: the loaded value's type (vector<elem,M> or elem)
+    pub(in crate::passes) var: Word,            // the Private array variable
+    pub(in crate::passes) elem_ty: Word,        // the array element scalar type
+    pub(in crate::passes) ptr_elem_ty: Word, // `_ptr_Private_<elem>` (the base chain's result type)
+    pub(in crate::passes) start_elem: u32,   // first element index this access touches
+    pub(in crate::passes) lanes: u32,        // number of consecutive elements (= vector lane count)
+}
+
+/// Lower a byte-offset reinterpret into a thread-local (`Private`) scalar-array aggregate whose declared
+/// element type is too NARROW for an overlapping wider vector access. The AIR models a Metal thread-local
+/// union — e.g. `struct { half a; half2 b; }` laid out `a`@0, `b`@4 — as a `Private` `array<half, 2>` and
+/// addresses the wider member by BYTE offset:
+/// ```text
+///   %base = OpInBoundsAccessChain %_ptr_Private_half  %V    %uint_0   ; &half[0]
+///   %bp   = OpPtrAccessChain      %_ptr_Private_uchar  %base %uint_4   ; +4 bytes
+///   OpStore %bp %v2half                                                ; store form
+///   ; — or — load form:
+///   %vp = OpBitcast %_ptr_Private_v2half %bp   %v = OpLoad %v2half %vp
+/// ```
+/// All of this is INVALID under Logical addressing: `OpPtrAccessChain` on a `Private` pointer needs a
+/// capability the module never declares, the `uchar` result type mismatches the `half` element, and the
+/// pointer `OpBitcast` is illegal. (spirv-val: "OpPtrAccessChain result type uchar … does not match …
+/// half".)
+///
+/// The fix re-expresses the wider access as per-ELEMENT accesses at the equivalent element indices: byte
+/// offset 4 over a 2-byte `half` element is element index 2, and a `half2` is two consecutive `half`s, so
+/// the store becomes `Store &half[2] v.x; Store &half[3] v.y` and the load becomes
+/// `CompositeConstruct(Load &half[2], Load &half[3])`. The variable's array is enlarged to cover the
+/// highest element touched (`array<half,2>` → `array<half,4>`). Byte-EXACT by construction on a
+/// little-endian target: element `k` of a scalar array sits at byte `k·sizeof(elem)`, exactly the bytes
+/// the byte-offset chain addressed; the enlarged tail is internal thread-local scratch, never compared
+/// against any golden.
+///
+/// Floor-SAFE by construction: fires ONLY on a `Private` scalar-array variable reached by an
+/// `OpPtrAccessChain` whose pointee is STRICTLY NARROWER than the array element — a form a valid/banked
+/// module never contains (a Logical `Private` `OpPtrAccessChain` is itself invalid), so the floor is
+/// provably untouched. Decides purely from IR structure (storage class + type walk + use kinds), never a
+/// shader name.
+pub(in crate::passes) fn lower_private_byte_aggregate_reinterpret(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    let mut defs: HashMap<Word, Instruction> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if let Some(r) = inst.result_id {
+            defs.insert(r, inst.clone());
+        }
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*s, *p));
+            }
+        }
+    }
+
+    // Within-function def positions and use sites (cross-block).
+    let mut def_pos: HashMap<Word, (usize, usize)> = HashMap::new();
+    let mut users: HashMap<Word, Vec<(usize, usize)>> = HashMap::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(r) = inst.result_id {
+                def_pos.insert(r, (bi, ii));
+            }
+            for op in &inst.operands {
+                if let Operand::IdRef(id) = op {
+                    users.entry(*id).or_default().push((bi, ii));
+                }
+            }
+        }
+    }
+
+    let mut accesses: Vec<PrivAggAccess> = Vec::new();
+    let mut need_len: HashMap<Word, (u32, Word)> = HashMap::new(); // var -> (max element count, elem ty)
+
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.class.opcode != Op::PtrAccessChain {
+                continue;
+            }
+            let Some(rp) = inst.result_id else {
+                continue;
+            };
+            let Some(rpt) = inst.result_type else {
+                continue;
+            };
+            let Some(&(storage, pac_pointee)) = ptr_info.get(&rpt) else {
+                continue;
+            };
+            if storage != StorageClass::Private {
+                continue;
+            }
+            let Some(pw) = direct_scalar_width(ctx, pac_pointee) else {
+                continue;
+            };
+            // [base, stride] — a single byte-stride index, no further descent.
+            if inst.operands.len() != 2 {
+                continue;
+            }
+            let Some(Operand::IdRef(base)) = inst.operands.first() else {
+                continue;
+            };
+            let Some(Operand::IdRef(c_id)) = inst.operands.get(1) else {
+                continue;
+            };
+            let Some(c) = const_u32(ctx, *c_id) else {
+                continue;
+            };
+            // base = OpInBoundsAccessChain/OpAccessChain V [single const element index].
+            let Some(&(bbi, bii)) = def_pos.get(base) else {
+                continue;
+            };
+            let bdef = &ctx.module.functions[entry_idx].blocks[bbi].instructions[bii];
+            if !matches!(bdef.class.opcode, Op::InBoundsAccessChain | Op::AccessChain) {
+                continue;
+            }
+            let Some(bpt) = bdef.result_type else {
+                continue;
+            };
+            let Some(&(bstorage, elem_ty)) = ptr_info.get(&bpt) else {
+                continue;
+            };
+            if bstorage != StorageClass::Private {
+                continue;
+            }
+            let Some(elem_bits) = direct_scalar_width(ctx, elem_ty) else {
+                continue;
+            };
+            // The reinterpret signature: the byte pointee is STRICTLY narrower than the array element.
+            if pw == 0 || pw % 8 != 0 || elem_bits == 0 || pw >= elem_bits {
+                continue;
+            }
+            if bdef.operands.len() != 2 {
+                continue;
+            }
+            let Some(Operand::IdRef(var)) = bdef.operands.first() else {
+                continue;
+            };
+            let Some(Operand::IdRef(e0_id)) = bdef.operands.get(1) else {
+                continue;
+            };
+            let Some(e0) = const_u32(ctx, *e0_id) else {
+                continue;
+            };
+            // V must be an OpVariable of type `_ptr_Private_array<elem_ty, N>`.
+            let Some(vdef) = defs.get(var) else {
+                continue;
+            };
+            if vdef.class.opcode != Op::Variable {
+                continue;
+            }
+            let Some(vpt) = vdef.result_type else {
+                continue;
+            };
+            let Some(&(vstorage, varr)) = ptr_info.get(&vpt) else {
+                continue;
+            };
+            if vstorage != StorageClass::Private {
+                continue;
+            }
+            let Some(arr_def) = defs.get(&varr) else {
+                continue;
+            };
+            if arr_def.class.opcode != Op::TypeArray {
+                continue;
+            }
+            let (Some(Operand::IdRef(arr_elem)), Some(Operand::IdRef(_len_c))) =
+                (arr_def.operands.first(), arr_def.operands.get(1))
+            else {
+                continue;
+            };
+            if *arr_elem != elem_ty {
+                continue;
+            }
+            // The byte stride must align to whole elements.
+            let elem_bytes = elem_bits / 8;
+            let byteoff = c * (pw / 8);
+            if byteoff % elem_bytes != 0 {
+                continue;
+            }
+            let start_elem = e0 + byteoff / elem_bytes;
+            // The chain result must be used exactly once, by a store or a bitcast-then-load.
+            let Some(rp_users) = users.get(&rp) else {
+                continue;
+            };
+            if rp_users.len() != 1 {
+                continue;
+            }
+            let (ubi, uii) = rp_users[0];
+            let udef = &ctx.module.functions[entry_idx].blocks[ubi].instructions[uii];
+            if udef.class.opcode == Op::Store {
+                // OpStore %bp %val — %bp must be the POINTER operand, not the object.
+                let Some(Operand::IdRef(sptr)) = udef.operands.first() else {
+                    continue;
+                };
+                if *sptr != rp {
+                    continue;
+                }
+                let Some(Operand::IdRef(val)) = udef.operands.get(1) else {
+                    continue;
+                };
+                let Some(vty) = value_result_type(ctx, *val) else {
+                    continue;
+                };
+                let Some(lanes) = vector_lanes_of(ctx, vty, elem_ty) else {
+                    continue;
+                };
+                let entry = need_len.entry(*var).or_insert((0, elem_ty));
+                entry.0 = entry.0.max(start_elem + lanes);
+                accesses.push(PrivAggAccess {
+                    remove: vec![(bi, ii)],
+                    anchor: (ubi, uii),
+                    is_store: true,
+                    store_val: *val,
+                    load_result: 0,
+                    load_result_ty: 0,
+                    var: *var,
+                    elem_ty,
+                    ptr_elem_ty: bpt,
+                    start_elem,
+                    lanes,
+                });
+            } else if udef.class.opcode == Op::Bitcast {
+                // %vp = OpBitcast %_ptr_Private_vec %bp ; %vp used once by OpLoad.
+                let Some(vp) = udef.result_id else {
+                    continue;
+                };
+                let Some(vpt2) = udef.result_type else {
+                    continue;
+                };
+                let Some(&(vp_storage, vec_pointee)) = ptr_info.get(&vpt2) else {
+                    continue;
+                };
+                if vp_storage != StorageClass::Private {
+                    continue;
+                }
+                let Some(lanes) = vector_lanes_of(ctx, vec_pointee, elem_ty) else {
+                    continue;
+                };
+                let Some(vp_users) = users.get(&vp) else {
+                    continue;
+                };
+                if vp_users.len() != 1 {
+                    continue;
+                }
+                let (lbi, lii) = vp_users[0];
+                let ldef = &ctx.module.functions[entry_idx].blocks[lbi].instructions[lii];
+                if ldef.class.opcode != Op::Load {
+                    continue;
+                }
+                let Some(Operand::IdRef(lptr)) = ldef.operands.first() else {
+                    continue;
+                };
+                if *lptr != vp {
+                    continue;
+                }
+                let (Some(lres), Some(lty)) = (ldef.result_id, ldef.result_type) else {
+                    continue;
+                };
+                if lty != vec_pointee {
+                    continue;
+                }
+                let entry = need_len.entry(*var).or_insert((0, elem_ty));
+                entry.0 = entry.0.max(start_elem + lanes);
+                accesses.push(PrivAggAccess {
+                    remove: vec![(bi, ii), (ubi, uii)],
+                    anchor: (lbi, lii),
+                    is_store: false,
+                    store_val: 0,
+                    load_result: lres,
+                    load_result_ty: lty,
+                    var: *var,
+                    elem_ty,
+                    ptr_elem_ty: bpt,
+                    start_elem,
+                    lanes,
+                });
+            }
+        }
+    }
+
+    if accesses.is_empty() {
+        return Ok(());
+    }
+
+    // Enlarge each variable's array so the highest element touched is in bounds. The new array/pointer
+    // defs must DEFINE-BEFORE-USE the existing OpVariable, so (mirroring the Workgroup remodel) drain the
+    // freshly-synthesized defs and splice them immediately before the variable in its global vector.
+    for (&var, &(needed, elem_ty)) in &need_len {
+        let Some(vdef) = defs.get(&var) else {
+            continue;
+        };
+        let Some(vpt) = vdef.result_type else {
+            continue;
+        };
+        let Some(&(_, varr)) = ptr_info.get(&vpt) else {
+            continue;
+        };
+        let Some(arr_def) = defs.get(&varr) else {
+            continue;
+        };
+        let Some(Operand::IdRef(len_c)) = arr_def.operands.get(1) else {
+            continue;
+        };
+        let Some(n) = const_u32(ctx, *len_c) else {
+            continue;
+        };
+        if needed <= n {
+            continue;
+        }
+        let new_glob_start = ctx.new_globals.len();
+        // Capture the array's length constant id BEFORE building the array, so a freshly-synthesized one
+        // lands in `synthesized` (and thus splices before the variable). A REUSED existing constant may
+        // sit AFTER the variable in the type section; the new array type then forward-references it, so
+        // relocate that constant into the spliced block below.
+        let len_needed_c = ctx.const_uint(needed);
+        let arr_ty = ctx.ty_array(elem_ty, needed);
+        let new_var_ptr = ctx.ty_ptr(StorageClass::Private, arr_ty);
+        let mut synthesized: Vec<Instruction> = ctx.new_globals.drain(new_glob_start..).collect();
+        if let Some(p) = ctx
+            .module
+            .types_global_values
+            .iter()
+            .position(|i| i.class.opcode == Op::Variable && i.result_id == Some(var))
+        {
+            // The length constant must precede the spliced array. If it lives AT/AFTER the variable in
+            // this same vector, move its definition to the front of the block — always sound: in a valid
+            // module every use of a constant already follows its (later) current definition, so an earlier
+            // definition cannot precede any use.
+            if let Some(q) = ctx
+                .module
+                .types_global_values
+                .iter()
+                .position(|i| i.result_id == Some(len_needed_c))
+            {
+                if q >= p {
+                    let len_inst = ctx.module.types_global_values.remove(q);
+                    synthesized.insert(0, len_inst);
+                }
+            }
+            let p = ctx
+                .module
+                .types_global_values
+                .iter()
+                .position(|i| i.class.opcode == Op::Variable && i.result_id == Some(var))
+                .ok_or("private byte aggregate: variable not found in globals")?;
+            ctx.module.types_global_values[p].result_type = Some(new_var_ptr);
+            let tail = ctx.module.types_global_values.split_off(p);
+            ctx.module.types_global_values.extend(synthesized);
+            ctx.module.types_global_values.extend(tail);
+        } else if let Some(p) = ctx
+            .new_globals
+            .iter()
+            .position(|i| i.class.opcode == Op::Variable && i.result_id == Some(var))
+        {
+            if let Some(q) = ctx
+                .new_globals
+                .iter()
+                .position(|i| i.result_id == Some(len_needed_c))
+            {
+                if q >= p {
+                    let len_inst = ctx.new_globals.remove(q);
+                    synthesized.insert(0, len_inst);
+                }
+            }
+            let p = ctx
+                .new_globals
+                .iter()
+                .position(|i| i.class.opcode == Op::Variable && i.result_id == Some(var))
+                .ok_or("private byte aggregate: variable not found in globals")?;
+            ctx.new_globals[p].result_type = Some(new_var_ptr);
+            let tail = ctx.new_globals.split_off(p);
+            ctx.new_globals.extend(synthesized);
+            ctx.new_globals.extend(tail);
+        } else {
+            ctx.new_globals.extend(synthesized);
+        }
+    }
+
+    // Apply: rebuild each touched block, deleting the byte chains/bitcasts and splicing the per-element
+    // store/load sequence in place of the store/load anchor.
+    let mut remove: HashSet<(usize, usize)> = HashSet::new();
+    let mut store_anchor: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut load_anchor: HashMap<(usize, usize), usize> = HashMap::new();
+    for (ai, acc) in accesses.iter().enumerate() {
+        for &r in &acc.remove {
+            remove.insert(r);
+        }
+        if acc.is_store {
+            store_anchor.insert(acc.anchor, ai);
+        } else {
+            load_anchor.insert(acc.anchor, ai);
+        }
+    }
+
+    let nblocks = ctx.module.functions[entry_idx].blocks.len();
+    for bi in 0..nblocks {
+        let touched = (0..ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .len())
+            .any(|ii| {
+                remove.contains(&(bi, ii))
+                    || store_anchor.contains_key(&(bi, ii))
+                    || load_anchor.contains_key(&(bi, ii))
+            });
+        if !touched {
+            continue;
+        }
+        let insts = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
+        let mut out: Vec<Instruction> = Vec::with_capacity(insts.len());
+        for (ii, inst) in insts.into_iter().enumerate() {
+            if remove.contains(&(bi, ii)) {
+                continue;
+            }
+            if let Some(&ai) = store_anchor.get(&(bi, ii)) {
+                let acc = &accesses[ai];
+                for k in 0..acc.lanes {
+                    let idx_c = ctx.const_uint(acc.start_elem + k);
+                    let pk = ctx.module.fresh_id();
+                    out.push(Instruction::new(
+                        Op::InBoundsAccessChain,
+                        Some(acc.ptr_elem_ty),
+                        Some(pk),
+                        vec![Operand::IdRef(acc.var), Operand::IdRef(idx_c)],
+                    ));
+                    let ek = if acc.lanes == 1 {
+                        acc.store_val
+                    } else {
+                        let id = ctx.module.fresh_id();
+                        out.push(Instruction::new(
+                            Op::CompositeExtract,
+                            Some(acc.elem_ty),
+                            Some(id),
+                            vec![Operand::IdRef(acc.store_val), Operand::LiteralBit32(k)],
+                        ));
+                        id
+                    };
+                    out.push(Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(pk), Operand::IdRef(ek)],
+                    ));
+                }
+                continue;
+            }
+            if let Some(&ai) = load_anchor.get(&(bi, ii)) {
+                let acc = &accesses[ai];
+                let mut elems: Vec<Operand> = Vec::with_capacity(acc.lanes as usize);
+                for k in 0..acc.lanes {
+                    let idx_c = ctx.const_uint(acc.start_elem + k);
+                    let pk = ctx.module.fresh_id();
+                    out.push(Instruction::new(
+                        Op::InBoundsAccessChain,
+                        Some(acc.ptr_elem_ty),
+                        Some(pk),
+                        vec![Operand::IdRef(acc.var), Operand::IdRef(idx_c)],
+                    ));
+                    let lk = ctx.module.fresh_id();
+                    out.push(Instruction::new(
+                        Op::Load,
+                        Some(acc.elem_ty),
+                        Some(lk),
+                        vec![Operand::IdRef(pk)],
+                    ));
+                    elems.push(Operand::IdRef(lk));
+                }
+                if acc.lanes == 1 {
+                    out.push(Instruction::new(
+                        Op::CopyObject,
+                        Some(acc.load_result_ty),
+                        Some(acc.load_result),
+                        vec![elems[0].clone()],
+                    ));
+                } else {
+                    out.push(Instruction::new(
+                        Op::CompositeConstruct,
+                        Some(acc.load_result_ty),
+                        Some(acc.load_result),
+                        elems,
+                    ));
+                }
+                continue;
+            }
+            out.push(inst);
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = out;
+    }
+    Ok(())
+}
+
+/// Retype a write-only `Private` placeholder variable that is the TARGET of an `OpCopyMemory` whose
+/// SOURCE pointee type differs, so the two pointees match. The native emitter sometimes demotes a
+/// module-scope aggregate (e.g. a `static` row-major instance matrix `struct { float3[4] }`) to a
+/// `Private` `uchar` placeholder when it cannot resolve the real type, then emits
+/// `OpCopyMemory %placeholder %assembled_struct` to fill it — invalid, because the `uchar` target pointee
+/// does not match the `struct` source pointee (spirv-val: "Target … type does not match Source … type").
+///
+/// The fix retypes the placeholder's pointer to `_ptr_Private_<source-pointee>` (and drops its scalar
+/// initializer), so the copy is a well-typed struct→struct copy. Byte-EXACT for every host-visible output:
+/// the variable is `Private` (per-invocation, NOT host-visible under Vulkan) and WRITE-ONLY (its only
+/// function-body operand use is this one `OpCopyMemory` target slot — it is never loaded, never the source
+/// of a copy, never address-taken otherwise), so neither its type nor its contents can affect any
+/// StorageBuffer/Image the golden compares. Floor-SAFE by construction: an `OpCopyMemory` with mismatched
+/// pointee types is itself invalid, so a valid/banked module never matches. Decides purely from IR
+/// structure (storage class + type compare + a single write-only use), never a shader name.
+pub(in crate::passes) fn retype_demoted_copymemory_placeholder(ctx: &mut Ctx, entry_idx: usize) {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    let mut defs: HashMap<Word, Instruction> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if let Some(r) = inst.result_id {
+            defs.insert(r, inst.clone());
+        }
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*s, *p));
+            }
+        }
+    }
+
+    // Count every operand reference inside function bodies, so "write-only" is provable.
+    let mut use_count: HashMap<Word, usize> = HashMap::new();
+    for block in &ctx.module.functions[entry_idx].blocks {
+        for inst in &block.instructions {
+            for op in &inst.operands {
+                if let Operand::IdRef(id) = op {
+                    *use_count.entry(*id).or_default() += 1;
+                }
+            }
+        }
+    }
+
+    // (placeholder var, new source-matching pointee type).
+    let mut plans: Vec<(Word, Word)> = Vec::new();
+    for block in &ctx.module.functions[entry_idx].blocks {
+        for inst in &block.instructions {
+            if inst.class.opcode != Op::CopyMemory {
+                continue;
+            }
+            let (Some(Operand::IdRef(target)), Some(Operand::IdRef(source))) =
+                (inst.operands.first(), inst.operands.get(1))
+            else {
+                continue;
+            };
+            let (Some(tpt), Some(spt)) = (
+                value_result_type(ctx, *target),
+                value_result_type(ctx, *source),
+            ) else {
+                continue;
+            };
+            let (Some(&(t_storage, t_pointee)), Some(&(_, s_pointee))) =
+                (ptr_info.get(&tpt), ptr_info.get(&spt))
+            else {
+                continue;
+            };
+            if t_pointee == s_pointee {
+                continue; // a matched copy — a valid module always lands here; never touched.
+            }
+            if t_storage != StorageClass::Private {
+                continue;
+            }
+            // The target must be a module-scope OpVariable that is WRITE-ONLY: its single function-body
+            // operand use is this OpCopyMemory's target slot (never loaded / copied-from / address-taken).
+            let Some(tdef) = defs.get(target) else {
+                continue;
+            };
+            if tdef.class.opcode != Op::Variable {
+                continue;
+            }
+            if use_count.get(target).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            plans.push((*target, s_pointee));
+        }
+    }
+    if plans.is_empty() {
+        return;
+    }
+
+    for (var, new_pointee) in plans {
+        let new_glob_start = ctx.new_globals.len();
+        let new_ptr = ctx.ty_ptr(StorageClass::Private, new_pointee);
+        let synthesized: Vec<Instruction> = ctx.new_globals.drain(new_glob_start..).collect();
+        // Splice any freshly-synthesized pointer type immediately before the variable so it
+        // define-before-uses it (the pointee is a struct/array defined far earlier). Then retype the
+        // variable and drop its now-mistyped scalar initializer.
+        if let Some(p) = ctx
+            .module
+            .types_global_values
+            .iter()
+            .position(|i| i.class.opcode == Op::Variable && i.result_id == Some(var))
+        {
+            ctx.module.types_global_values[p].result_type = Some(new_ptr);
+            ctx.module.types_global_values[p].operands =
+                vec![Operand::StorageClass(StorageClass::Private)];
+            let tail = ctx.module.types_global_values.split_off(p);
+            ctx.module.types_global_values.extend(synthesized);
+            ctx.module.types_global_values.extend(tail);
+        } else if let Some(p) = ctx
+            .new_globals
+            .iter()
+            .position(|i| i.class.opcode == Op::Variable && i.result_id == Some(var))
+        {
+            ctx.new_globals[p].result_type = Some(new_ptr);
+            ctx.new_globals[p].operands = vec![Operand::StorageClass(StorageClass::Private)];
+            let tail = ctx.new_globals.split_off(p);
+            ctx.new_globals.extend(synthesized);
+            ctx.new_globals.extend(tail);
+        } else {
+            ctx.new_globals.extend(synthesized);
+        }
+    }
+}
+
+/// Rewrite an INVALID `OpInBoundsAccessChain`/`OpAccessChain` `base [stride, descent…]` whose FIRST
+/// index is an LLVM-GEP pointer STRIDE over the base pointee (`getelementptr T, ptr %p, i64 N, …` — N
+/// strides whole `T`s) into an `OpPtrAccessChain`, for StorageBuffer/Workgroup/PSB bases where that op
+/// is legal (`getelementptr inbounds` lowers to the InBounds opcode, plain `getelementptr` to the
+/// non-inbounds one; both over-index identically and the fix is byte-identical for each).
+/// Under Logical addressing `OpInBoundsAccessChain` mis-reads N as an into-pointee index and
+/// over-runs the element (spirv-val "reached non-composite"); `OpPtrAccessChain` strides by exactly
+/// N whole pointee elements, then descends — byte-IDENTICAL to the GEP. The base pointer type gets
+/// its required `ArrayStride` from [`decorate_ptr_access_chain_base_strides`] (run next), computed by
+/// the SAME `layout_ty_size_align` the buffer interface uses — so the stride is the real byte layout,
+/// not a guess.
+///
+/// Byte-safe by construction: only chains that are CURRENTLY INVALID (the InBounds type-walk over the
+/// base pointee fails) AND whose PtrAccessChain reading (idx0 strides the pointee, idx1.. descend) is
+/// VALID and reaches the SAME result pointee are touched — so a banked/valid module is provably
+/// unchanged (the pass can only convert invalid→valid). Decides purely from IR structure (storage
+/// class + type walk), never a shader name.
+pub(in crate::passes) fn rewrite_strided_descent_access_chains(ctx: &mut Ctx, entry_idx: usize) {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*s, *p));
+            }
+        }
+    }
+
+    let mut rewrites: Vec<(usize, usize)> = Vec::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            // Both GEP-derived member-access opcodes: `getelementptr inbounds` lowers to
+            // OpInBoundsAccessChain, plain `getelementptr` to OpAccessChain. A leading-stride GEP
+            // over-indexes identically under either, and the OpPtrAccessChain fix is byte-identical
+            // for both (OpPtrAccessChain has no inbounds variant).
+            if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain) {
+                continue;
+            }
+            let Some(result_type) = inst.result_type else {
+                continue;
+            };
+            let Some((storage, result_pointee)) = ptr_info.get(&result_type).copied() else {
+                continue;
+            };
+            if !ptr_access_chain_allowed_storage(storage) {
+                continue;
+            }
+            // [base, idx0, idx1, …]; a stride+descent needs ≥2 indices.
+            if inst.operands.len() < 3 {
+                continue;
+            }
+            let Some(Operand::IdRef(base)) = inst.operands.first() else {
+                continue;
+            };
+            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+                continue;
+            };
+            let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
+                continue;
+            };
+            let indices = &inst.operands[1..];
+            // Currently INVALID (InBounds over-indexes) AND the stride+descent reading is valid and
+            // reaches the same result pointee.
+            if walk_into_type(ctx, base_pointee, indices).is_some() {
+                continue;
+            }
+            if walk_into_type(ctx, base_pointee, &indices[1..]) != Some(result_pointee) {
+                continue;
+            }
+            rewrites.push((bi, ii));
+        }
+    }
+
+    for (bi, ii) in rewrites {
+        let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
+        *inst = Instruction::new(
+            Op::PtrAccessChain,
+            inst.result_type,
+            inst.result_id,
+            inst.operands.clone(),
+        );
+    }
+}
+
+/// Bit width of a type id that is DIRECTLY an `OpTypeInt`/`OpTypeFloat` scalar (not a vector/array).
+/// `None` for anything else — used as a same-width-scalar-reinterpret guard where vectors must NOT be
+/// transparently unwrapped.
+pub(in crate::passes) fn direct_scalar_width(ctx: &Ctx, ty: Word) -> Option<u32> {
+    type_def_of(ctx, ty).and_then(|d| match d.class.opcode {
+        Op::TypeInt | Op::TypeFloat => match d.operands.first() {
+            Some(Operand::LiteralBit32(b)) => Some(*b),
+            _ => None,
+        },
+        _ => None,
+    })
+}

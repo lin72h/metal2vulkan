@@ -1,0 +1,1069 @@
+use super::cfg::{
+    block_index_by_label, id_ref_operand, infer_branch_merges, infer_loop_merges,
+    infer_switch_merges, lower_unstructured_switches, LoopMergeInfo,
+};
+use super::ir::{
+    LlDeclaration, LlFunction, LlGep, LlGlobal, LlModule, LlType, LlTypeCapability, LlValue,
+    TypedValue,
+};
+use super::parse::{
+    fcmp_predicate, float_compare_result_type, icmp_predicate, int_compare_result_type,
+    is_ignored_call_line, matching_paren, parse_type, parse_typed_value, parse_value,
+    split_top_level, split_top_level_whitespace, strip_call_prefix, switch_literal_operand, LlCall,
+    LlLoad,
+};
+use crate::spirv_module::Operand;
+use crate::spirv_module::{Block, Function, Instruction, Module, ModuleHeader};
+use crate::types::TypeInterner;
+use spirv::{
+    AddressingModel, Capability, FunctionControl, GlslStd450Op, LoopControl, MemoryModel,
+    MemorySemantics, Op, Scope, SelectionControl, SourceLanguage, StorageClass, Word,
+};
+use std::collections::{HashMap, HashSet};
+
+mod air_struct_offsets;
+mod body;
+mod control;
+mod functions;
+mod helpers;
+mod memory;
+mod ops;
+mod pointer_network;
+mod pointers;
+mod types;
+
+#[cfg(test)]
+mod layout_tests;
+
+use helpers::*;
+
+pub(super) struct Emitter {
+    module: Module,
+    ir: LlModule,
+    emit_sidecar: crate::emit_sidecar::EmitSidecar,
+    /// SPIR-V type/constant dedup caches (see `crate::types`). The builder methods that emit the
+    /// instructions live on `Emitter`; the module owns result-id allocation.
+    interner: TypeInterner,
+    glsl_ext: Option<Word>,
+    values: HashMap<String, (Word, LlType)>,
+    global_values: HashMap<String, (Word, LlType)>,
+    /// Module globals (kebab here: `@name`) that are the pointer operand of an integer atomic
+    /// (`air.atomic.*.i32`) but are declared with a 32-bit-bitcastable *non*-integer scalar pointee
+    /// (e.g. a `float` threadgroup scratch slot used for the atomic-min/max bit-pattern idiom).
+    /// Under Logical addressing an integer atomic needs an `i32`-typed pointer to that exact memory,
+    /// which — for a global — only exists if the variable itself is declared `i32`; the old path
+    /// reinterpreted the float pointer with an illegal logical-pointer `OpBitcast`. So `emit_global`
+    /// declares these as `i32` instead, and the existing scalar value-reinterpret load/store paths
+    /// (32-bit `OpBitcast` on the *value*) carry the float accesses. Computed structurally from the
+    /// `air.atomic.*.i32` ABI symbol family before globals emit; excludes any global also accessed by
+    /// a float atomic (`air.atomic.*.f32`), which would then need the opposite reinterpret.
+    int_atomic_reinterpret_globals: HashSet<String>,
+    /// Constant globals accessed through a GEP source type that differs from the declared type
+    /// (a byte-table reinterpret view); when all-i8-leaf, declared as a flat `[N x i8]` so every
+    /// view lowers through the byte-array raw paths. Populated before globals emit.
+    byte_view_reinterpret_globals: HashSet<String>,
+    gep_provenance: HashMap<String, GepProvenance>,
+    selected_pointers: HashMap<String, SelectedPointer>,
+    selected_load_pointers: HashMap<String, SelectedLoadPointer>,
+    vector_word_roots: HashMap<Word, VectorWordRoot>,
+    vector_word_pointers: HashMap<String, VectorWordPointer>,
+    local_pointer_fields: HashMap<LocalPointerField, TypedValue>,
+    raw_memcpy_shadows: HashMap<String, Vec<(u64, Word)>>,
+    imageblock_data_scratch: Option<(Word, LlType)>,
+    dynamic_pointer_tables: HashMap<String, DynamicPointerTable>,
+    forward_geps: HashMap<String, LlGep>,
+    pointer_storage: HashMap<String, StorageClass>,
+    pointer_pointees: HashMap<String, LlType>,
+    local_alloca_pointees: HashMap<String, LlType>,
+    pointer_nullness: HashMap<String, Word>,
+    /// The two little-endian 32-bit words of a serialized 64-bit pointer loaded through a raw
+    /// buffer view. Logical SPIR-V pointers cannot represent or compare this wire payload, so raw
+    /// pointer equality and stores operate on these integer words instead.
+    pointer_payload_words: HashMap<String, (Word, Word)>,
+    /// Pointer SSA values used by a non-null equality comparison in the current function. Built from
+    /// the typed def/use graph before emission so a raw load can retain its serialized payload even
+    /// when dynamic offset alignment is known only from the load's explicit `align` contract.
+    pointer_payload_values: HashSet<String>,
+    pointer_phi_values: HashSet<String>,
+    pointer_phi_incoming_values: HashSet<String>,
+    function_param_pointees: HashMap<(String, usize), LlType>,
+    function_param_nonnull: HashSet<(String, usize)>,
+    direct_param_values: HashSet<String>,
+    direct_param_indices: HashMap<String, u32>,
+    param_values: HashSet<String>,
+    inline_parameter_substitutions: Vec<(Word, Word)>,
+    raw_buffer_params: HashSet<String>,
+    /// Current function's entry params declared `air.buffer` in kernel metadata (data pointers,
+    /// never textures/samplers). Rebuilt per emit_function from `ir.metadata_data_buffer_params`.
+    data_buffer_params: HashSet<String>,
+    raw_offsets: HashMap<String, RawBufferOffset>,
+    int_alignments: HashMap<String, u64>,
+    unmodeled_pointers: HashSet<String>,
+    /// SSA value names bound by `air.get_null_texture_*`. A strict subset of `unmodeled_pointers`
+    /// (many other placeholders land there too), so `air.is_null_texture` keys on THIS set — a
+    /// value synthesized as a null texture answers TRUE, everything else stays on the default path.
+    null_texture_values: HashSet<String>,
+    function_ids: HashMap<String, Word>,
+    block_labels: HashMap<String, Word>,
+    branch_merges: HashMap<(String, String), String>,
+    branch_merges_by_header: HashMap<String, String>,
+    loop_merges: HashMap<String, LoopMergeInfo>,
+    switch_merges: HashMap<String, String>,
+    current_block: Option<String>,
+    /// R3 graph-driven emission: the current function's instruction operands resolved by the typed SSA
+    /// IR (`tir`), keyed by result `%name`. Emission for the opcode shapes tir lowers (binary ops) reads
+    /// its operands from here instead of re-lexing the instruction text; absent/`Unresolved` entries
+    /// fall back to the string path. Rebuilt per function in `emit_function` (empty if
+    /// `build_from_blocks` fails, so emission degrades to the string path — floor-safe).
+    tir_operands: HashMap<String, Vec<crate::native::tir::TirOperand>>,
+    /// R3 graph-driven emission: the typed SSA IR's resolved RESULT TYPE for each `%name`, keyed by
+    /// result name (the dual of `tir_operands`, which carries operand types). Emitters that today
+    /// re-lex a result/destination type from the instruction text (e.g. the `<conv> .. to <dstty>`
+    /// destination type) read it from here instead, retiring that text parse. Byte-neutral: tir
+    /// computes the same `parse_type(dst)` the text path does, so `resolve_type` of either is identical.
+    /// Absent entries fall back to the string parse. Rebuilt per function in `emit_function`.
+    tir_result_types: HashMap<String, crate::native::ir::LlType>,
+    /// R3 graph-driven emission: the typed SSA IR's comparison PREDICATE token for each `icmp`/`fcmp`
+    /// result (`eq`/`slt`/`oeq`/...), keyed by result name. The compare emitters read the predicate
+    /// from here instead of re-lexing it from the instruction text, retiring that structural-literal
+    /// parse. Byte-neutral: `icmp_predicate`/`fcmp_predicate` over this stored token yields the same
+    /// `Op` the text path derives. Absent entries fall back to the string parse. Rebuilt per function in
+    /// `emit_function`.
+    tir_predicates: HashMap<String, String>,
+    /// R3 graph-driven emission: the typed SSA IR's explicit memory ALIGNMENT (`align N`) for each
+    /// `load` result, keyed by result name. The `load` emitter reads the alignment from here instead of
+    /// re-lexing the trailing `, align N` field, retiring that structural-literal parse. Byte-neutral:
+    /// tir computes it via the same `parse_memory_alignment` the text path uses. Absent entries fall
+    /// back to the parsed `LlLoad.align`. In the graph walk `store` (result-LESS) sources its alignment
+    /// straight from `inst.mem_align` at the dispatch site instead.
+    tir_aligns: HashMap<String, Option<u64>>,
+    /// R3 graph-driven emission: the typed SSA IR's `getelementptr` SOURCE element type for each gep
+    /// result, keyed by result name. The `getelementptr` emitter builds its `LlGep` from this (plus the
+    /// base/index operands in `tir_operands`) instead of re-parsing the line with `parse_gep`, retiring
+    /// that emit-time re-lex on the R4-critical pointer path. Byte-identical: tir computes the source_ty
+    /// via the same `parse_gep`. Absent entries fall back to the string parse. Rebuilt per function in
+    /// `emit_function`.
+    tir_gep_source_types: HashMap<String, crate::native::ir::LlType>,
+    /// M1 (pointer-typing rewrite): the USE-based pointee carried on every pointer SSA value, keyed by
+    /// result `%name`. Sourced once per function from the structurized typed-IR graph
+    /// (`tir::build_from_blocks(..).use_pointees`, the SAME graph `tir_operands` is built from), it gives
+    /// emission the pointee a pointer is actually *dereferenced* as — a `load`/`store` type, a GEP source
+    /// element type, an atomic element type — propagated across `select`/`phi`/`freeze` pointer merges to
+    /// a fixpoint (see [`crate::native::tir::TirFunction::use_pointees`]). This is the data carrier the
+    /// whole-module pointer-typing rewrite needs to retire the ~42 name-keyed pointee/storage side-tables
+    /// and the illegal pointer-`OpBitcast` reinterpret fallback: storage is already a pure function of
+    /// address space (`pointer_storage_for`/`llvm_pointer_storage`), so this pointee half is what was
+    /// missing at every pointer def. M2 (S20) first consumer: `pointer_pointee_for_value`
+    /// (`pointers.rs`) reads it as a FALLBACK for a local pointer the def-time side-tables left without
+    /// a pointee — the emitter-recorded pointee stays authoritative (checked first), so the carrier only
+    /// ADDS answers where the emitter had `None`, never overrides. Floor-safe (G4 3 / G5 62). Later M2
+    /// slices widen consumption to the divergence set behind the BC byte-drift gate / the frontier
+    /// battery. Rebuilt per function in `emit_function`.
+    tir_use_pointees: HashMap<String, crate::native::ir::LlType>,
+    /// The pointers `tir_use_pointees` resolved that ALSO carry a byte (`i8`) view — a byte-cursor
+    /// `getelementptr i8` / `i8` load-store / byte atomic (see
+    /// [`crate::native::tir::TirFunction::byte_view_pointers`]). The M2 byte→real pointee upgrade in
+    /// `pointer_pointee_for_value` must skip these: their carrier is wider than `i8`, but the emitter
+    /// still emits their byte cursor as a `uchar`-result `OpPtrAccessChain`, so upgrading the pointee
+    /// strands it (globally-invalid SPIR-V). Only the pure-widening subset (absent from this set) is
+    /// safe to flip. Rebuilt per function in `emit_function`.
+    tir_byte_view_pointers: std::collections::HashSet<String>,
+    /// M-A2 def-site network-pointee recording: the uniform pointee to record at every def
+    /// site of a pointer network (connected component over phi/select edges) whose tir-carrier
+    /// granularity is consistent across the component. Consulted by `pointer_meta_for_value` for a
+    /// network member so `pointer_merge_meta` reconciles on the carrier type instead of the byte-view
+    /// `Int(8)` the raw recording flattens the byte-addressed arm to. Rebuilt per function in
+    /// `emit_function`; empty (no effect) unless the flag is set.
+    network_pointees: HashMap<String, crate::native::ir::LlType>,
+    /// When true, `emit_function` attempts the R2 cross-arm restructure (full-closure tail duplication
+    /// + return unification) for a function `structured_plan` rejects, taking the transformed blocks if
+    ///   they then admit a structured plan. This produces a CANDIDATE that the caller (the
+    ///   `inline_sroa_raw_cfg_restructure` retry tier) keeps ONLY if the whole module then passes
+    ///   spirv-val — the adopt-if-VALIDATES discipline. The DEFAULT emit path leaves this false so a
+    ///   reject emits its inferred merges unrepaired and the unsafe in-emit adopt-if-ADMITS can never
+    ///   hijack an admitting case. Set via [`with_cfg_restructure`].
+    cfg_restructure: bool,
+    /// When true, `emit_function` attempts the reject-only construct-tree own-arm candidate for a
+    /// function `structured_plan` rejects. The default emitter leaves this false; the retry cascade sets
+    /// it only after the primary module fails CFG validation and adopts only a validating module.
+    construct_tree: bool,
+    /// When true, `emit_function` SKIPS the structured-plan attempt entirely — even for a function
+    /// `structured_plan` WOULD admit — emitting the blocks with their inferred merges but no
+    /// structuring. The result is an UNSTRUCTURED (spirv-val-illegal) but complete module whose only
+    /// consumer is the W2 relooper, which strips the stale merges and rebuilds a structured CFG from
+    /// scratch. (The DEFAULT path already emits a *reject* unstructured since the W4 repair-roster
+    /// deletion; this flag forces the same for an admitting function, so a guaranteed-unstructured
+    /// complete module always exists to reloop.) Set via [`with_relooper_feed`]; never on the
+    /// production path (the caller adopts only the relooper's validating output).
+    relooper_feed: bool,
+    /// M1 storage-carrier measurement: when set, `emit_function` snapshots its final per-value
+    /// `pointer_storage` map (the emitter's stateful storage derivation) into `storage_snapshots`,
+    /// keyed by function name, so the validation harness can compare it against the from-tir
+    /// derivation (`tir::derive_pointer_storage`). Off in production emission; set via
+    /// [`emit_collecting_storage`].
+    capture_storage: bool,
+    storage_snapshots: Vec<(String, HashMap<String, StorageClass>)>,
+    /// M2 pointee-carrier measurement (the pointer-typing rewrite, the pointee half). When set,
+    /// `emit_function` snapshots its final per-value `pointer_pointees` map (the emitter's stateful
+    /// ground-truth pointee derivation, populated across GEP/load/phi/select/bitcast/buffer sites)
+    /// into `pointee_snapshots`, keyed by function name, so the validation harness can compare it
+    /// against the from-tir `use_pointees` carrier (`tir::TirFunction::use_pointees`) — the reconciliation
+    /// set an M2 consumer must settle before flipping a pointer def from the side-tables to the carrier.
+    /// Off in production emission; set via [`emit_collecting_pointees`].
+    capture_pointees: bool,
+    pointee_snapshots: Vec<(String, HashMap<String, LlType>)>,
+    /// When true, a device pointer (`addrspace(1)`) LOADED from a buffer word is modeled as its real
+    /// 64-bit address (an `OpConvertUToPtr` PhysicalStorageBuffer64 pointer) instead of being dropped to
+    /// a Private null placeholder — so the kernel can STORE it (a verbatim 8-byte copy) and DEREFERENCE
+    /// it (address + struct/array offset). This is the honest lowering of the "BDA" frontier class
+    /// (Apple BVH builders that load/store/deref a device pointer): byte-correct by construction (the
+    /// stored bytes are the exact loaded address; the deref is `address + offset` with no tag-bit
+    /// manipulation), valid SPIR-V under `buffer_device_address`. Off by default (the default Logical
+    /// emit is byte-identical); set via [`with_bda_device_pointers`] for the adopt-if-validates BDA
+    /// retry tier. See [`RawBufferOffset::device_addr_base`].
+    bda_device_pointers: bool,
+    /// Set true the first time a device-address (`device_addr_base`) leaf load/store is emitted, so
+    /// [`emit`] flips the module to the `PhysicalStorageBuffer64` addressing model (+ `Int64` /
+    /// `PhysicalStorageBufferAddresses` caps + the `SPV_KHR_physical_storage_buffer` extension). Only
+    /// ever set in BDA mode.
+    used_device_address: bool,
+}
+
+#[derive(Clone, Debug)]
+struct GepProvenance {
+    root: Word,
+    addrspace: u32,
+    source_ty: LlType,
+    indices: Vec<TypedValue>,
+    root_is_indexed_container: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedPointer {
+    cond: Word,
+    true_value: LlValue,
+    false_value: LlValue,
+    ty: LlType,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedLoadPointer {
+    cond: Word,
+    true_ptr: Option<Word>,
+    false_ptr: Option<Word>,
+    pointee: LlType,
+    true_raw: Option<RawBufferOffset>,
+    false_raw: Option<RawBufferOffset>,
+    /// The arms are already-typed pointers whose modeled pointee is unknown (e.g. a select between
+    /// pointers into distinct buffers, which cannot be a legal Logical-SPIR-V `OpSelect`). The load
+    /// drives the value type: load each arm with the load's result type and select the values.
+    load_typed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct DynamicPointerTable {
+    index: TypedValue,
+    entries: Vec<(u32, TypedValue)>,
+}
+
+#[derive(Clone, Debug)]
+struct VectorWordRoot {
+    storage: StorageClass,
+    vector_ty: LlType,
+    lanes: u32,
+    lanes_per_word: u32,
+    words_per_vector: u32,
+    base_is_vector_pointer: bool,
+}
+
+#[derive(Clone, Debug)]
+struct VectorWordPointer {
+    base: Word,
+    storage: StorageClass,
+    vector_ty: LlType,
+    lanes: u32,
+    lanes_per_word: u32,
+    words_per_vector: u32,
+    base_is_vector_pointer: bool,
+    word_index: Word,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LocalPointerField {
+    root: Word,
+    indices: Vec<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PointerMeta {
+    storage: StorageClass,
+    pointee: Option<LlType>,
+}
+
+#[derive(Clone, Debug)]
+struct RawBufferOffset {
+    const_off: i64,
+    dyn_terms: Vec<(TypedValue, i64)>,
+    root: String,
+    addrspace: u32,
+    unmodelable: bool,
+    /// When `Some(addr)`, this offset is NOT rooted at a descriptor-bound buffer but at a runtime
+    /// 64-bit device ADDRESS value `addr` (a pointer the kernel loaded from device memory). The
+    /// offset is then `addr + const_off + Σ(dyn_terms)` in bytes, and a leaf load/store through it is
+    /// lowered with `OpConvertUToPtr` to a `PhysicalStorageBuffer` pointer (BDA mode only — see
+    /// [`Emitter::bda_device_pointers`]). GEP folds offsets into `const_off`/`dyn_terms` exactly as for
+    /// a descriptor-rooted offset, so the existing [`Emitter::apply_raw_gep`] machinery is reused. `None`
+    /// for every descriptor-bound buffer offset (the default).
+    device_addr_base: Option<Word>,
+}
+
+impl RawBufferOffset {
+    fn root(root: String, addrspace: u32) -> Self {
+        Self {
+            const_off: 0,
+            dyn_terms: vec![],
+            root,
+            addrspace,
+            unmodelable: false,
+            device_addr_base: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RawSubwordLane {
+    Static(u32),
+    Dynamic(Word),
+}
+
+impl Emitter {
+    pub(super) fn require_capability(&mut self, capability: Capability) {
+        if self.module.capabilities.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [Operand::Capability(existing)] if *existing == capability
+            )
+        }) {
+            return;
+        }
+        self.module.capabilities.push(Instruction::new(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(capability)],
+        ));
+    }
+
+    pub(super) fn require_extension(&mut self, extension: &str) {
+        if self.module.extensions.iter().any(|inst| {
+            matches!(
+                inst.operands.as_slice(),
+                [Operand::LiteralString(existing)] if existing == extension
+            )
+        }) {
+            return;
+        }
+        self.module.extensions.push(Instruction::new(
+            Op::Extension,
+            None,
+            None,
+            vec![Operand::LiteralString(extension.to_string())],
+        ));
+    }
+
+    pub(super) fn new(mut ir: LlModule) -> Self {
+        ir.inline_simple_static_initializers();
+        ir.inline_ordinary_leaf_helpers();
+        let mut module = Module::new();
+        module.capabilities.push(Instruction::new(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(Capability::Shader)],
+        ));
+        module.memory_model = Some(Instruction::new(
+            Op::MemoryModel,
+            None,
+            None,
+            vec![
+                Operand::AddressingModel(AddressingModel::Logical),
+                Operand::MemoryModel(MemoryModel::GLSL450),
+            ],
+        ));
+        module.debug_string_source.push(Instruction::new(
+            Op::Source,
+            None,
+            None,
+            vec![
+                Operand::SourceLanguage(SourceLanguage::Unknown),
+                Operand::LiteralBit32(0),
+            ],
+        ));
+        Self {
+            module,
+            ir,
+            emit_sidecar: crate::emit_sidecar::EmitSidecar::default(),
+            interner: TypeInterner::new(),
+            glsl_ext: None,
+            values: HashMap::new(),
+            global_values: HashMap::new(),
+            int_atomic_reinterpret_globals: HashSet::new(),
+            byte_view_reinterpret_globals: HashSet::new(),
+            gep_provenance: HashMap::new(),
+            selected_pointers: HashMap::new(),
+            selected_load_pointers: HashMap::new(),
+            vector_word_roots: HashMap::new(),
+            vector_word_pointers: HashMap::new(),
+            local_pointer_fields: HashMap::new(),
+            raw_memcpy_shadows: HashMap::new(),
+            imageblock_data_scratch: None,
+            dynamic_pointer_tables: HashMap::new(),
+            forward_geps: HashMap::new(),
+            pointer_storage: HashMap::new(),
+            pointer_pointees: HashMap::new(),
+            local_alloca_pointees: HashMap::new(),
+            pointer_nullness: HashMap::new(),
+            pointer_payload_words: HashMap::new(),
+            pointer_payload_values: HashSet::new(),
+            pointer_phi_values: HashSet::new(),
+            pointer_phi_incoming_values: HashSet::new(),
+            function_param_pointees: HashMap::new(),
+            function_param_nonnull: HashSet::new(),
+            direct_param_values: HashSet::new(),
+            direct_param_indices: HashMap::new(),
+            param_values: HashSet::new(),
+            inline_parameter_substitutions: Vec::new(),
+            raw_buffer_params: HashSet::new(),
+            data_buffer_params: HashSet::new(),
+            raw_offsets: HashMap::new(),
+            int_alignments: HashMap::new(),
+            unmodeled_pointers: HashSet::new(),
+            null_texture_values: HashSet::new(),
+            function_ids: HashMap::new(),
+            block_labels: HashMap::new(),
+            branch_merges: HashMap::new(),
+            branch_merges_by_header: HashMap::new(),
+            loop_merges: HashMap::new(),
+            switch_merges: HashMap::new(),
+            current_block: None,
+            tir_operands: HashMap::new(),
+            tir_result_types: HashMap::new(),
+            tir_predicates: HashMap::new(),
+            tir_aligns: HashMap::new(),
+            tir_gep_source_types: HashMap::new(),
+            tir_use_pointees: HashMap::new(),
+            network_pointees: HashMap::new(),
+            tir_byte_view_pointers: std::collections::HashSet::new(),
+            cfg_restructure: false,
+            construct_tree: false,
+            relooper_feed: false,
+            capture_storage: false,
+            storage_snapshots: Vec::new(),
+            capture_pointees: false,
+            pointee_snapshots: Vec::new(),
+            bda_device_pointers: false,
+            used_device_address: false,
+        }
+    }
+
+    /// Enable BDA device-pointer modeling (see [`Self::bda_device_pointers`]). The caller marks device
+    /// buffers raw and adopts the result only if it independently passes spirv-val, so the default
+    /// Logical emission is never altered.
+    pub(super) fn with_bda_device_pointers(mut self) -> Self {
+        self.bda_device_pointers = true;
+        self
+    }
+
+    /// Enable the R2 cross-arm restructure retry for this emitter (see [`Self::cfg_restructure`]). Used
+    /// by the `inline_sroa_raw_cfg_restructure` emit variant the translate pipeline drives as an
+    /// adopt-if-validates fallback; the default emitter leaves it off.
+    pub(super) fn with_cfg_restructure(mut self) -> Self {
+        self.cfg_restructure = true;
+        self
+    }
+
+    /// Enable the construct-tree own-arm retry for this emitter. Used only by an adopt-if-validates
+    /// retry tier; the default emitter leaves it off.
+    pub(super) fn with_construct_tree(mut self) -> Self {
+        self.construct_tree = true;
+        self
+    }
+
+    /// Enable the "emit unstructured for the relooper" path (see [`Self::relooper_feed`]). The caller
+    /// (`raw_reemit_relooper_feed`, the last raw fallback of `raw_then_relooper`) feeds the result
+    /// straight to the W2 relooper and adopts only its validating output, so the unstructured
+    /// intermediate is never shipped.
+    pub(super) fn with_relooper_feed(mut self) -> Self {
+        self.relooper_feed = true;
+        self
+    }
+
+    pub(super) fn glsl_ext_inst_import(&mut self) -> Word {
+        if let Some(id) = self.glsl_ext {
+            return id;
+        }
+        for inst in &self.module.ext_inst_imports {
+            if let Some(Operand::LiteralString(s)) = inst.operands.first() {
+                if s == "GLSL.std.450" {
+                    let id = inst.result_id.expect("GLSL import result id");
+                    self.glsl_ext = Some(id);
+                    return id;
+                }
+            }
+        }
+        let id = self.fresh();
+        self.module.ext_inst_imports.push(Instruction::new(
+            Op::ExtInstImport,
+            None,
+            Some(id),
+            vec![Operand::LiteralString("GLSL.std.450".into())],
+        ));
+        self.glsl_ext = Some(id);
+        id
+    }
+
+    fn infer_function_param_pointees(&mut self, functions: &[LlFunction]) -> Result<(), String> {
+        let functions_by_name: HashMap<String, &LlFunction> = functions
+            .iter()
+            .map(|function| (function.name.clone(), function))
+            .collect();
+        let mut inferred = HashMap::new();
+        let mut ambiguous = HashSet::new();
+        for function in functions {
+            let local_pointees = self.local_call_arg_pointees(function)?;
+            for inst in function.carrier_insts() {
+                let Some(call_result) = &inst.emit_scan_call else {
+                    continue;
+                };
+                let call = call_result.as_ref().map_err(|e| e.clone())?;
+                let Some(callee) = functions_by_name.get(&call.callee) else {
+                    continue;
+                };
+                for (index, arg) in call.args.iter().enumerate() {
+                    if index >= callee.params.len() {
+                        break;
+                    }
+                    if !matches!(self.resolve_type(&callee.params[index].1)?, LlType::Ptr(_)) {
+                        continue;
+                    }
+                    let Some(pointee) = self.call_arg_pointee(&arg.value, &local_pointees) else {
+                        continue;
+                    };
+                    let callee_param = &callee.params[index].0;
+                    let callee_param_ty = &callee.params[index].1;
+                    if !self.callee_param_accepts_call_pointee(
+                        &callee.name,
+                        callee_param,
+                        callee_param_ty,
+                        &pointee,
+                    ) {
+                        continue;
+                    }
+                    let key = (callee.name.clone(), index);
+                    if ambiguous.contains(&key) {
+                        continue;
+                    }
+                    if let Some(existing) = inferred.get(&key) {
+                        if !types_compatible(existing, &pointee) {
+                            inferred.remove(&key);
+                            ambiguous.insert(key);
+                        }
+                    } else {
+                        inferred.insert(key, pointee);
+                    }
+                }
+            }
+        }
+        self.function_param_pointees = inferred;
+        Ok(())
+    }
+
+    pub(super) fn infer_function_param_nonnull(
+        &self,
+        functions: &[LlFunction],
+    ) -> Result<HashSet<(String, usize)>, String> {
+        let functions_by_name: HashMap<String, &LlFunction> = functions
+            .iter()
+            .map(|function| (function.name.clone(), function))
+            .collect();
+        let mut all_nonnull = HashSet::new();
+        let mut seen = HashSet::new();
+        let mut rejected = HashSet::new();
+        for function in functions {
+            let local_nonnull = self.local_call_arg_nonnull_values(function)?;
+            for inst in function.carrier_insts() {
+                let Some(call_result) = &inst.emit_scan_call else {
+                    continue;
+                };
+                let call = call_result.as_ref().map_err(|e| e.clone())?;
+                let Some(callee) = functions_by_name.get(&call.callee) else {
+                    continue;
+                };
+                for (index, arg) in call.args.iter().enumerate() {
+                    if index >= callee.params.len() {
+                        break;
+                    }
+                    if !matches!(self.resolve_type(&callee.params[index].1)?, LlType::Ptr(_)) {
+                        continue;
+                    }
+                    let key = (callee.name.clone(), index);
+                    if rejected.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key.clone());
+                    if self.call_arg_known_nonnull(&arg.value, &local_nonnull) {
+                        all_nonnull.insert(key);
+                    } else {
+                        all_nonnull.remove(&key);
+                        rejected.insert(key);
+                    }
+                }
+            }
+        }
+        all_nonnull.retain(|key| seen.contains(key) && !rejected.contains(key));
+        Ok(all_nonnull)
+    }
+
+    fn local_call_arg_nonnull_values(
+        &self,
+        function: &LlFunction,
+    ) -> Result<HashSet<String>, String> {
+        let mut nonnull = HashSet::new();
+        for inst in function.carrier_insts() {
+            if inst.opcode == "alloca" {
+                if let Some(name) = &inst.result {
+                    nonnull.insert(name.clone());
+                }
+            }
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for inst in function.carrier_insts() {
+                let Some(name) = &inst.result else {
+                    continue;
+                };
+                if nonnull.contains(name) {
+                    continue;
+                }
+                // `bitcast` carries the parsed src + dst TEXT (`convert_dst_type` stays emit-time); re-parse
+                // the dst text to keep the reader's `parse_type(dst_text)? -> resolve_type?` propagation.
+                if let Some((src, dst_text)) = &inst.bitcast {
+                    if matches!(self.resolve_type(&parse_type(dst_text)?)?, LlType::Ptr(_))
+                        && self.call_arg_known_nonnull(&src.value, &nonnull)
+                    {
+                        nonnull.insert(name.clone());
+                        changed = true;
+                    }
+                    continue;
+                }
+                if let Some(gep) = &inst.gep {
+                    if self.call_arg_known_nonnull(&gep.base.value, &nonnull) {
+                        nonnull.insert(name.clone());
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(nonnull)
+    }
+
+    fn call_arg_known_nonnull(&self, value: &LlValue, local_nonnull: &HashSet<String>) -> bool {
+        match value {
+            LlValue::Local(name) => local_nonnull.contains(name),
+            LlValue::Global(_) => true,
+            LlValue::Gep(gep) => self.call_arg_known_nonnull(&gep.base.value, local_nonnull),
+            _ => false,
+        }
+    }
+
+    fn local_call_arg_pointees(
+        &self,
+        function: &LlFunction,
+    ) -> Result<HashMap<String, LlType>, String> {
+        let mut pointees = HashMap::new();
+        for (param, ty) in &function.params {
+            if !matches!(ty, LlType::Ptr(_)) {
+                continue;
+            }
+            if let Some(pointee) = self
+                .ir
+                .ptr_pointees
+                .get(&(function.name.clone(), param.clone()))
+                .cloned()
+            {
+                pointees.insert(param.clone(), pointee);
+            }
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for inst in function.carrier_insts() {
+                let Some(name) = &inst.result else {
+                    continue;
+                };
+                if pointees.contains_key(name) {
+                    continue;
+                }
+                if let Some((src, dst_text)) = &inst.bitcast {
+                    let dst_ty = self.resolve_type(&parse_type(dst_text)?)?;
+                    if matches!(dst_ty, LlType::Ptr(_)) {
+                        if let LlValue::Local(src_name) = &src.value {
+                            if let Some(pointee) = pointees.get(src_name).cloned() {
+                                pointees.insert(name.clone(), pointee);
+                                changed = true;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(gep) = &inst.gep {
+                    let LlValue::Local(base_name) = &gep.base.value else {
+                        continue;
+                    };
+                    if pointees.contains_key(base_name) {
+                        let pointee =
+                            gep_pointee(&self.resolve_type(&gep.source_ty)?, &gep.indices)?;
+                        pointees.insert(name.clone(), pointee);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(pointees)
+    }
+
+    fn call_arg_pointee(
+        &self,
+        value: &LlValue,
+        local_pointees: &HashMap<String, LlType>,
+    ) -> Option<LlType> {
+        match value {
+            LlValue::Local(name) => local_pointees.get(name).cloned(),
+            LlValue::Global(name) => self.pointer_pointees.get(name).cloned(),
+            _ => None,
+        }
+    }
+
+    fn callee_param_accepts_call_pointee(
+        &self,
+        callee_name: &str,
+        callee_param: &str,
+        callee_param_ty: &LlType,
+        call_pointee: &LlType,
+    ) -> bool {
+        if matches!(callee_param_ty, LlType::Ptr(3)) {
+            return true;
+        }
+        self.ir
+            .ptr_pointees
+            .get(&(callee_name.to_string(), callee_param.to_string()))
+            .is_none_or(|local_pointee| types_compatible(local_pointee, call_pointee))
+    }
+
+    /// Drop body-less `OpFunction`s (emitted from `declare`s) that no `OpFunctionCall` references.
+    /// An inlined intrinsic (e.g. `air.rhadd.u.i16`) leaves its declaration behind as an empty
+    /// function shell, which is invalid SPIR-V; removing the *unreferenced* ones is strictly a
+    /// correctness improvement (genuinely-called declarations are kept untouched).
+    fn remove_dead_empty_functions(&mut self) {
+        let mut called: HashSet<Word> = HashSet::new();
+        for f in &self.module.functions {
+            for b in &f.blocks {
+                for inst in &b.instructions {
+                    if inst.class.opcode == Op::FunctionCall {
+                        if let Some(Operand::IdRef(callee)) = inst.operands.first() {
+                            called.insert(*callee);
+                        }
+                    }
+                }
+            }
+        }
+        let mut removed: HashSet<Word> = HashSet::new();
+        self.module.functions.retain(|f| {
+            if !f.blocks.is_empty() {
+                return true;
+            }
+            match f.def.as_ref().and_then(|d| d.result_id) {
+                Some(id) if !called.contains(&id) => {
+                    removed.insert(id);
+                    false
+                }
+                _ => true,
+            }
+        });
+        if !removed.is_empty() {
+            self.module.debug_names.retain(|inst| {
+                !(inst.class.opcode == Op::Name
+                    && matches!(inst.operands.first(), Some(Operand::IdRef(id)) if removed.contains(id)))
+            });
+        }
+    }
+
+    pub(super) fn emit_with_sidecar(
+        mut self,
+        buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+    ) -> Result<(Module, crate::emit_sidecar::EmitSidecar), String> {
+        self.emit_inner()?;
+        self.record_air_struct_offsets(buffer_layouts);
+        if self.used_device_address {
+            self.switch_to_physical_storage_buffer64();
+        }
+        Ok((self.module, self.emit_sidecar))
+    }
+
+    /// Flip the module to the `PhysicalStorageBuffer64` addressing model and declare the capabilities +
+    /// extension a BDA (`OpConvertUToPtr` → `PhysicalStorageBuffer` pointer) module requires. Called from
+    /// [`emit_with_sidecar`](Self::emit_with_sidecar) only when at least one device-address leaf was
+    /// emitted (BDA mode). Mirrors the equivalent block in the `native::psb` byte-rewrite pass.
+    fn switch_to_physical_storage_buffer64(&mut self) {
+        if let Some(mm) = self.module.memory_model.as_mut() {
+            if let Some(op) = mm.operands.get_mut(0) {
+                *op = Operand::AddressingModel(AddressingModel::PhysicalStorageBuffer64);
+            }
+        }
+        self.require_capability(Capability::PhysicalStorageBufferAddresses);
+        self.require_capability(Capability::Int64);
+        self.require_extension("SPV_KHR_physical_storage_buffer");
+    }
+
+    /// Run the full emission for its side effect of populating `storage_snapshots` (one per function's
+    /// final `pointer_storage`), and return them — the M1 storage-carrier measurement entry. Discards
+    /// the module. Mirrors [`emit`] exactly except for the capture flag, so the snapshots reflect the
+    /// production storage derivation.
+    pub(super) fn emit_collecting_storage(
+        mut self,
+    ) -> Result<Vec<(String, HashMap<String, StorageClass>)>, String> {
+        self.capture_storage = true;
+        self.emit_inner()?;
+        Ok(self.storage_snapshots)
+    }
+
+    /// Run the full emission for its side effect of populating `pointee_snapshots` (one per function's
+    /// final `pointer_pointees`) and return them — the M2 pointee-carrier measurement entry. Discards
+    /// the module. Mirrors [`emit`] exactly except for the capture flag, so the snapshots reflect the
+    /// production pointee derivation.
+    pub(super) fn emit_collecting_pointees(
+        mut self,
+    ) -> Result<Vec<(String, HashMap<String, LlType>)>, String> {
+        self.capture_pointees = true;
+        self.emit_inner()?;
+        Ok(self.pointee_snapshots)
+    }
+
+    /// Run the full emission for its side effect of populating `function_param_pointees` (the
+    /// call-site-inferred `(function, param-index) -> pointee` map — the S18 advisory sidecar's
+    /// pointer-pointee facts) and return it. Discards the module. Mirrors [`emit`] exactly except
+    /// that it hands back the sidecar instead of the bytes, so it reflects the production inference.
+    pub(super) fn emit_collecting_param_pointees(
+        mut self,
+    ) -> Result<HashMap<(String, usize), LlType>, String> {
+        self.emit_inner()?;
+        Ok(self.function_param_pointees)
+    }
+
+    fn emit_inner(&mut self) -> Result<(), String> {
+        let globals = self.ir.globals.clone();
+        let functions = self.ir.functions.clone();
+        let declarations = self.ir.declarations.clone();
+        self.int_atomic_reinterpret_globals =
+            Self::scan_int_atomic_reinterpret_globals(&globals, &functions);
+        self.byte_view_reinterpret_globals = self.scan_byte_view_reinterpret_globals()?;
+        for global in &globals {
+            self.emit_global(global)?;
+        }
+        for f in &functions {
+            let id = self.fresh();
+            self.function_ids.insert(f.name.clone(), id);
+        }
+        for decl in &declarations {
+            let id = self.fresh();
+            self.function_ids.insert(decl.name.clone(), id);
+        }
+        for decl in &declarations {
+            self.emit_declaration(decl)?;
+        }
+        self.infer_function_param_pointees(&functions)?;
+        self.function_param_nonnull = self.infer_function_param_nonnull(&functions)?;
+        for f in &functions {
+            self.emit_function_with_raw_retry(f)?;
+        }
+        // The old residual inliner removed migrated helper bodies and dead types after emission,
+        // but left capabilities requested while materializing those types. Replay only declarations
+        // still missing after surviving functions emit: `require_capability` preserves the exact
+        // order of every capability the live module already requested.
+        let mut retained_type_capabilities = self
+            .ir
+            .preinlined_helper_type_capabilities
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        retained_type_capabilities.sort_unstable();
+        for capability in retained_type_capabilities {
+            self.require_capability(match capability {
+                LlTypeCapability::Float16 => Capability::Float16,
+                LlTypeCapability::Int8 => Capability::Int8,
+                LlTypeCapability::Int16 => Capability::Int16,
+                LlTypeCapability::Int64 => Capability::Int64,
+            });
+        }
+        self.rewrite_scalar_pointer_arithmetic_access_chains();
+        self.remove_dead_empty_functions();
+        self.inject_static_initializer_calls(&functions)?;
+        let mut header = ModuleHeader::new(self.module.id_bound());
+        // Match the SPIR-V version LLVM's Vulkan backend emitted for this pipeline.
+        header.set_version(1, 4);
+        self.module.header = Some(header);
+        let module = std::mem::take(&mut self.module);
+        let emit_sidecar = std::mem::take(&mut self.emit_sidecar);
+        (self.module, self.emit_sidecar) = crate::passes::inline_all_emitted_helpers(
+            module,
+            emit_sidecar,
+            self.ir.entry_name.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    /// Emit a function, and if it fails specifically because the logical pointer model cannot
+    /// represent a buffer access, mark the function's buffer params raw and retry. Two trigger classes,
+    /// both raised ONLY when a buffer access genuinely cannot be lowered logically:
+    /// - **pointer-merge** (`pointer merge pointee mismatch`): a `select`/`phi` merges pointers with
+    ///   incompatible pointees (the aggregate-vs-element reinterpret) — the dominant pointer-merge
+    ///   frontier class.
+    /// - **integer atomic on a float-typed buffer** (`atomic i32 pointer targets ...`): the
+    ///   atomic-float-min/max idiom (`air.atomic.global.{min,max}.s.i32` on a `<3 x float>*` bounding
+    ///   box, reinterpreting the float bits as a signed int) — `atomic_i32_pointer_id` cannot form an
+    ///   `i32*` from a float/vector pointee under Logical addressing, but the raw path (`raw_offsets` →
+    ///   `emit_raw_word_pointer_for_access`) lowers it as a uint-word atomic on the `RuntimeArray<uint>`
+    ///   backing.
+    ///
+    /// This is a *precise* raw trigger: it fires ONLY on a genuine lowering failure, so a function that
+    /// already translates (and therefore can be banked) never reaches it and is never marked raw — the
+    /// over-marking that regressed earlier whole-buffer attempts is impossible by construction. A failed
+    /// first attempt pushes only well-formed, unused type/constant globals (the function's blocks are
+    /// not appended to the module until it fully succeeds), so the retry is safe without snapshotting
+    /// module state; `emit_function` rebuilds `raw_buffer_params` from `self.ir.raw_buffer_params` on
+    /// each call, so the retry observes the new marking.
+    fn emit_function_with_raw_retry(&mut self, f: &LlFunction) -> Result<(), String> {
+        match self.emit_function(f) {
+            Err(e)
+                if e.contains("pointer merge pointee mismatch")
+                    || e.contains("atomic i32 pointer targets") =>
+            {
+                if self.mark_function_buffers_raw(f) {
+                    self.emit_function(f)
+                } else {
+                    Err(e)
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Mark every device/constant buffer pointer param of `f` raw in `self.ir.raw_buffer_params`.
+    /// Returns whether any param was newly marked (so a retry that would change nothing is skipped).
+    fn mark_function_buffers_raw(&mut self, f: &LlFunction) -> bool {
+        let mut newly_marked = false;
+        for (name, ty) in &f.params {
+            if matches!(ty, LlType::Ptr(1 | 2)) {
+                let key = (f.name.clone(), name.clone());
+                if self.ir.raw_buffer_params.insert(key) {
+                    newly_marked = true;
+                }
+            }
+        }
+        newly_marked
+    }
+
+    fn rewrite_scalar_pointer_arithmetic_access_chains(&mut self) {
+        let mut pointer_storage = HashMap::new();
+        for inst in &self.module.types_global_values {
+            if inst.class.opcode == Op::TypePointer {
+                if let (Some(result), Some(Operand::StorageClass(storage))) =
+                    (inst.result_id, inst.operands.first())
+                {
+                    pointer_storage.insert(result, *storage);
+                }
+            }
+        }
+
+        let mut id_types = HashMap::new();
+        for inst in &self.module.types_global_values {
+            if let (Some(result), Some(result_type)) = (inst.result_id, inst.result_type) {
+                id_types.insert(result, result_type);
+            }
+        }
+        for function in &self.module.functions {
+            for inst in &function.parameters {
+                if let (Some(result), Some(result_type)) = (inst.result_id, inst.result_type) {
+                    id_types.insert(result, result_type);
+                }
+            }
+            for block in &function.blocks {
+                if let Some(label) = &block.label {
+                    if let (Some(result), Some(result_type)) = (label.result_id, label.result_type)
+                    {
+                        id_types.insert(result, result_type);
+                    }
+                }
+                for inst in &block.instructions {
+                    if let (Some(result), Some(result_type)) = (inst.result_id, inst.result_type) {
+                        id_types.insert(result, result_type);
+                    }
+                }
+            }
+        }
+
+        for function in &mut self.module.functions {
+            for block in &mut function.blocks {
+                for inst in &mut block.instructions {
+                    if inst.class.opcode != Op::InBoundsAccessChain {
+                        continue;
+                    }
+                    let Some(result_type) = inst.result_type else {
+                        continue;
+                    };
+                    if !pointer_storage
+                        .get(&result_type)
+                        .is_some_and(|storage| ptr_access_chain_allowed_storage(*storage))
+                    {
+                        continue;
+                    }
+                    let Some(Operand::IdRef(base)) = inst.operands.first() else {
+                        continue;
+                    };
+                    if id_types.get(base) != Some(&result_type) {
+                        continue;
+                    }
+                    *inst = Self::inst(
+                        Op::PtrAccessChain,
+                        inst.result_type,
+                        inst.result_id,
+                        inst.operands.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    pub(super) fn fresh(&mut self) -> Word {
+        self.module.fresh_id()
+    }
+
+    pub(super) fn inst(
+        op: Op,
+        result_type: Option<Word>,
+        result_id: Option<Word>,
+        operands: Vec<Operand>,
+    ) -> Instruction {
+        Instruction::new(op, result_type, result_id, operands)
+    }
+}
+
+fn ptr_access_chain_allowed_storage(storage: StorageClass) -> bool {
+    matches!(
+        storage,
+        StorageClass::Workgroup | StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer
+    )
+}

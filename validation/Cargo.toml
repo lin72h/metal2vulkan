@@ -1,0 +1,41 @@
+[package]
+name = "metal2vulkan-validation"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+license = "LGPL-3.0-or-later"
+authors = ["Anees Iqbal <hello@aneesiqbal.ai>"]
+description = "Optional Metal oracle and Vulkan executor helpers for metal2vulkan"
+# Never publish this workspace member to crates.io (oracle/executor + private corpus).
+publish = false
+readme = "README.md"
+# Belt-and-suspenders if someone packages this crate locally: keep private harvest out.
+exclude = [
+    "corpus/local/",
+    "corpus/local/**",
+    "tests/corpus_*.rs",
+    "tests/fixtures/",
+    "target/",
+    "**/*.air",
+    "**/*.metallib",
+    "**/*.mtlb",
+    "**/*.spv",
+    "**/*.spvasm",
+]
+
+[dependencies]
+metal2vulkan = { path = ".." }
+base64 = "0.22"
+rspirv = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-metal = "0.3"
+# Same vulkano executor as Linux, targeting the Apple GPU through MoltenVK.
+vulkano = { version = "0.35", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+vulkano = { version = "0.35", default-features = false }

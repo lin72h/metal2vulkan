@@ -1,0 +1,44 @@
+# Cargo
+**/target/
+**/Cargo.lock
+
+# Local tool caches / script outputs
+.cache/
+mtlb_blobs/
+m2v-old
+
+# Local fixtures / private captures (not shipped)
+tests/fixtures/
+validation/tests/fixtures/
+*.air
+*.metallib
+*.mtlb
+*.spv
+*.spvasm
+
+# Optional private metallib corpus (mined data + generated nextest stubs).
+# Committed under validation/corpus/: README.md + drift-ledger.jsonl (hashes only).
+# Everything under local/ is user-supplied and must never be committed.
+validation/corpus/local/
+validation/tests/corpus_*.rs
+
+# OS / editor
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+*~
+*.swp
+*.swo
+.idea/
+.vscode/
+*.code-workspace
+
+# Tool backups
+**/*.rs.bk
+*.orig
+*.rej
+
+# Python
+__pycache__/
+*.py[cod]

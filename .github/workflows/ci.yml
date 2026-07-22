@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail the job on any rustc warning (unused imports, dead_code, etc.).
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Pin major OS images (not *-latest). Labels from actions/runner-images:
+        #   ubuntu-26.04  — Ubuntu 26.04 LTS
+        #   macos-26      — macOS 26 (arm64 GitHub-hosted runner)
+        os: [ubuntu-26.04, macos-26]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install LLVM + SPIR-V tools (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # llvm: llvm-dis; spirv-tools: spirv-val, spirv-as, spirv-diff (needed by spirv_delta)
+          # mesa-vulkan-drivers + libvulkan1: lavapipe software ICD so the Linux validation
+          # executor can create a VkInstance on GPU-less GitHub runners. Without an ICD,
+          # Instance::new fails with VK_ERROR_INCOMPATIBLE_DRIVER (not an apt-tool-age issue).
+          sudo apt-get install -y llvm clang spirv-tools mesa-vulkan-drivers libvulkan1
+          command -v llvm-dis
+          command -v spirv-val
+          command -v spirv-as
+          command -v spirv-diff
+          # Fail setup early if the loader has nothing to bind — otherwise the atomic-float
+          # executor (and any other runner_linux test) panics mid-suite.
+          shopt -s nullglob
+          icds=(/usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json)
+          echo "Vulkan ICDs: ${icds[*]:-none}"
+          test "${#icds[@]}" -gt 0
+
+      - name: Install LLVM + SPIR-V tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          brew install llvm spirv-tools
+          # llvm is keg-only: not linked into /opt/homebrew/bin. GITHUB_PATH only
+          # affects *later* steps, so export PATH here before command -v probes.
+          export PATH="/opt/homebrew/opt/llvm/bin:/usr/local/opt/llvm/bin:${PATH}"
+          echo "/opt/homebrew/opt/llvm/bin" >> "$GITHUB_PATH"
+          echo "/usr/local/opt/llvm/bin" >> "$GITHUB_PATH"
+          echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+          command -v llvm-dis
+          command -v spirv-val
+          command -v spirv-as
+          command -v spirv-diff
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # clippy --all-targets typechecks the workspace; no separate cargo build step.
+      - name: Clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test metal2vulkan
+        run: cargo test -p metal2vulkan -- --test-threads=1
+
+      - name: Test validation suite
+        run: cargo test -p metal2vulkan-validation -- --test-threads=1
