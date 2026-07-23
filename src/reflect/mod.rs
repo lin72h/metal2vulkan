@@ -26,7 +26,9 @@ use crate::meta::{
 /// `texture_shape` (dimension/arrayed/multisampled/component/writable/storage_format) and
 /// `embedded_source`; stage-level `vertex_builtins`, `imageblock_layouts`, `function_constants`, and
 /// the source `datalayout`; plus fragment/vertex buffer `address_space`/`declared_size` population.
-pub const REFLECTION_VERSION: u32 = 2;
+///
+/// v3 reports AIR-embedded constexpr samplers as `StaticSampler` bindings with their decoded state.
+pub const REFLECTION_VERSION: u32 = 3;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
@@ -84,6 +86,9 @@ pub enum ResourceKind {
     StorageImage,
     /// A `[[sampler(n)]]`. Bound at `SAMPLER_BINDING_BASE + n`.
     Sampler,
+    /// An AIR-embedded constexpr sampler. It has no Metal argument index and is populated from
+    /// [`ResourceBinding::static_sampler`] at the reflected descriptor location.
+    StaticSampler,
     /// A `[[color(n)]]` framebuffer-fetch input (Vulkan input attachment). Bound at
     /// `COLOR_INPUT_BINDING_BASE + n`.
     ColorInput,
@@ -120,6 +125,222 @@ pub enum ResourceAccess {
     Sampled,
     /// A storage image (`OpTypeImage Sampled=2`), read/written directly.
     Storage,
+}
+
+/// Minification or magnification filtering encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerFilter {
+    Nearest,
+    Linear,
+    Bicubic,
+}
+
+/// Mipmap filtering encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerMipFilter {
+    None,
+    Nearest,
+    Linear,
+}
+
+/// Texture-coordinate addressing encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerAddressMode {
+    ClampToZero,
+    ClampToEdge,
+    Repeat,
+    MirroredRepeat,
+    ClampToBorder,
+}
+
+/// Coordinate convention encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerCoordinates {
+    Normalized,
+    Pixel,
+}
+
+/// Comparison mode encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerCompareFunction {
+    None,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+    Equal,
+    NotEqual,
+    Always,
+    Never,
+}
+
+/// Border color encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerBorderColor {
+    TransparentBlack,
+    OpaqueBlack,
+    OpaqueWhite,
+}
+
+/// Reduction mode encoded in an AIR constexpr sampler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SamplerReduction {
+    WeightedAverage,
+    Minimum,
+    Maximum,
+}
+
+/// Fully decoded AIR constexpr sampler state.
+///
+/// The raw words remain available for forward-compatible diagnostics. Consumers should use the
+/// typed fields and reject unsupported modes rather than reinterpret the AIR ABI themselves.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct StaticSamplerState {
+    pub min_filter: SamplerFilter,
+    pub mag_filter: SamplerFilter,
+    pub mip_filter: SamplerMipFilter,
+    pub address_mode_s: SamplerAddressMode,
+    pub address_mode_t: SamplerAddressMode,
+    pub address_mode_r: SamplerAddressMode,
+    pub coordinates: SamplerCoordinates,
+    pub compare_function: SamplerCompareFunction,
+    pub max_anisotropy: u32,
+    pub lod_min_clamp: f32,
+    pub lod_max_clamp: f32,
+    pub border_color: SamplerBorderColor,
+    pub reduction: SamplerReduction,
+    pub lod_bias: f32,
+    pub raw_words: [u64; 2],
+}
+
+impl StaticSamplerState {
+    pub(crate) fn from_air_words(words: [u64; 2]) -> Result<Self, String> {
+        let word = words[0];
+        let border_color = match (word >> 56) & 0x3 {
+            0 => SamplerBorderColor::TransparentBlack,
+            1 => SamplerBorderColor::OpaqueBlack,
+            2 => SamplerBorderColor::OpaqueWhite,
+            value => return Err(format!("unsupported AIR sampler border-color code {value}")),
+        };
+        let address = |shift: u32| match (word >> shift) & 0x7_u64 {
+            0 if border_color != SamplerBorderColor::TransparentBlack => {
+                Ok(SamplerAddressMode::ClampToBorder)
+            }
+            0 => Ok(SamplerAddressMode::ClampToZero),
+            1 => Ok(SamplerAddressMode::ClampToEdge),
+            2 => Ok(SamplerAddressMode::Repeat),
+            3 => Ok(SamplerAddressMode::MirroredRepeat),
+            value => Err(format!("unsupported AIR sampler address code {value}")),
+        };
+        let filter = |shift: u32| match (word >> shift) & 0x3_u64 {
+            0 => Ok(SamplerFilter::Nearest),
+            1 => Ok(SamplerFilter::Linear),
+            2 => Ok(SamplerFilter::Bicubic),
+            value => Err(format!("unsupported AIR sampler filter code {value}")),
+        };
+        let mip_filter = match (word >> 13) & 0x3 {
+            0 => SamplerMipFilter::None,
+            1 => SamplerMipFilter::Nearest,
+            2 => SamplerMipFilter::Linear,
+            value => return Err(format!("unsupported AIR sampler mip-filter code {value}")),
+        };
+        let coordinates = match (word >> 15) & 0x1 {
+            0 => SamplerCoordinates::Normalized,
+            _ => SamplerCoordinates::Pixel,
+        };
+        let compare_function = match (word >> 16) & 0xf {
+            0 => SamplerCompareFunction::None,
+            1 => SamplerCompareFunction::Less,
+            2 => SamplerCompareFunction::LessEqual,
+            3 => SamplerCompareFunction::Greater,
+            4 => SamplerCompareFunction::GreaterEqual,
+            5 => SamplerCompareFunction::Equal,
+            6 => SamplerCompareFunction::NotEqual,
+            7 => SamplerCompareFunction::Always,
+            8 => SamplerCompareFunction::Never,
+            value => {
+                return Err(format!(
+                    "unsupported AIR sampler compare-function code {value}"
+                ))
+            }
+        };
+        let reduction = match (word >> 58) & 0x3 {
+            0 => SamplerReduction::WeightedAverage,
+            1 => SamplerReduction::Minimum,
+            2 => SamplerReduction::Maximum,
+            value => return Err(format!("unsupported AIR sampler reduction code {value}")),
+        };
+        let min_half = (((word >> 32) & 0xff) as u16) << 8;
+        let max_half = ((word >> 40) & 0xffff) as u16;
+        let bias_half = (words[1] & 0xffff) as u16;
+        Ok(Self {
+            min_filter: filter(11)?,
+            mag_filter: filter(9)?,
+            mip_filter,
+            address_mode_s: address(0)?,
+            address_mode_t: address(3)?,
+            address_mode_r: address(6)?,
+            coordinates,
+            compare_function,
+            max_anisotropy: (((word >> 20) & 0xf) as u32) + 1,
+            lod_min_clamp: half_to_f32(min_half),
+            lod_max_clamp: half_to_f32(max_half),
+            border_color,
+            reduction,
+            lod_bias: half_to_f32(bias_half),
+            raw_words: words,
+        })
+    }
+
+    pub(crate) fn uses_pixel_nearest(self) -> bool {
+        self.uses_pixel_coordinates() && !self.uses_linear_filter()
+    }
+
+    pub(crate) fn uses_linear_filter(self) -> bool {
+        self.min_filter == SamplerFilter::Linear && self.mag_filter == SamplerFilter::Linear
+    }
+
+    pub(crate) fn uses_pixel_coordinates(self) -> bool {
+        self.coordinates == SamplerCoordinates::Pixel
+    }
+
+    pub(crate) fn spatial_clamps_to_zero(self, dimension: usize) -> bool {
+        matches!(
+            [
+                self.address_mode_s,
+                self.address_mode_t,
+                self.address_mode_r
+            ]
+            .get(dimension),
+            Some(SamplerAddressMode::ClampToZero)
+        )
+    }
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = u32::from(bits & 0x03ff);
+    let value = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let leading = 31 - fraction.leading_zeros();
+            let normalized_fraction = (fraction << (10 - leading)) & 0x03ff;
+            let exponent = 127 - 14 - (10 - leading);
+            sign | (exponent << 23) | (normalized_fraction << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (fraction << 13),
+        _ => sign | (u32::from(exponent) + 112) << 23 | (fraction << 13),
+    };
+    f32::from_bits(value)
 }
 
 /// The argument-buffer source of a translator-synthesized embedded texture: which
@@ -165,6 +386,8 @@ pub struct ResourceBinding {
     pub embedded_source: Option<EmbeddedArgBuffer>,
     /// Per-binding access, once Workstream M2 computes it; `None` otherwise.
     pub access: Option<ResourceAccess>,
+    /// Decoded AIR state for [`ResourceKind::StaticSampler`]; `None` for every other kind.
+    pub static_sampler: Option<StaticSamplerState>,
 }
 
 impl ResourceBinding {
@@ -300,6 +523,7 @@ impl ShaderReflection {
                     texture_shape: None,
                     embedded_source: None,
                     access: None,
+                    static_sampler: None,
                 },
                 FragRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
                 FragRole::Sampler(n) => sampler_binding(*n, Some(idx)),
@@ -315,6 +539,7 @@ impl ShaderReflection {
                     texture_shape: None,
                     embedded_source: None,
                     access: None,
+                    static_sampler: None,
                 },
                 FragRole::Position | FragRole::Varying(_) | FragRole::Other => continue,
             };
@@ -385,6 +610,7 @@ impl ShaderReflection {
                     texture_shape: None,
                     embedded_source: None,
                     access: None,
+                    static_sampler: None,
                 },
                 VertRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
                 VertRole::Sampler(n) => sampler_binding(*n, Some(idx)),
@@ -469,6 +695,7 @@ impl ShaderReflection {
                         texture_shape: None,
                         embedded_source: None,
                         access: buffer_access_from_address_space(address_space),
+                        static_sampler: None,
                     }
                 }
                 KernRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
@@ -485,6 +712,7 @@ impl ShaderReflection {
                     texture_shape: None,
                     embedded_source: None,
                     access: None,
+                    static_sampler: None,
                 },
                 _ => continue,
             };
@@ -517,6 +745,7 @@ impl ShaderReflection {
                     field_offset: embedded.field_offset,
                 }),
                 access: Some(ResourceAccess::Sampled),
+                static_sampler: None,
             });
         }
         ShaderReflection {
@@ -554,6 +783,143 @@ impl ShaderReflection {
             .iter()
             .find(|b| b.kind == kind && b.metal_index == metal_index)
     }
+
+    pub(crate) fn add_static_samplers(&mut self, ll: &str) -> Result<(), String> {
+        let constants = parse_static_sampler_constants(ll)?;
+        if constants.is_empty() {
+            return Ok(());
+        }
+        let mut occupied = self
+            .bindings
+            .iter()
+            .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
+            .collect::<std::collections::BTreeSet<_>>();
+        for words in constants {
+            let binding = (SAMPLER_BINDING_BASE..COLOR_INPUT_BINDING_BASE)
+                .find(|binding| !occupied.contains(binding))
+                .ok_or_else(|| {
+                    format!(
+                        "AIR constexpr sampler count exceeds descriptor band \
+                         [{SAMPLER_BINDING_BASE},{COLOR_INPUT_BINDING_BASE})"
+                    )
+                })?;
+            occupied.insert(binding);
+            self.bindings.push(ResourceBinding {
+                kind: ResourceKind::StaticSampler,
+                metal_index: binding - SAMPLER_BINDING_BASE,
+                descriptor: Some(DescriptorLocation {
+                    set: RESOURCE_DESCRIPTOR_SET,
+                    binding,
+                }),
+                param_index: None,
+                address_space: None,
+                declared_size: None,
+                type_layout: None,
+                type_name: None,
+                texture_shape: None,
+                embedded_source: None,
+                access: None,
+                static_sampler: Some(StaticSamplerState::from_air_words(words)?),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn parse_static_sampler_constants(ll: &str) -> Result<Vec<[u64; 2]>, String> {
+    let mut globals = std::collections::HashMap::<String, [u64; 2]>::new();
+    let mut nodes = std::collections::HashMap::<u32, String>::new();
+    let mut root = None;
+
+    for raw in ll.lines() {
+        let line = raw.trim();
+        if line.starts_with('@') && line.contains(" constant ") {
+            let Some((name, _)) = line.split_once(" = ") else {
+                continue;
+            };
+            let mut values = line.split("i64 ").skip(1).filter_map(|tail| {
+                tail.split(|ch: char| ch == ',' || ch == ']' || ch.is_whitespace())
+                    .find(|token| !token.is_empty())
+                    .and_then(|token| token.parse::<i64>().ok())
+                    .map(|value| value as u64)
+            });
+            if let Some(first) = values.next() {
+                globals.insert(name.to_string(), [first, values.next().unwrap_or(0)]);
+            }
+            continue;
+        }
+        if let Some(body) = line.strip_prefix("!air.sampler_states = !{") {
+            root = Some(metadata_refs(body));
+            continue;
+        }
+        let Some(rest) = line.strip_prefix('!') else {
+            continue;
+        };
+        let Some((id, body)) = rest.split_once(" = !{") else {
+            continue;
+        };
+        if let Ok(id) = id.parse::<u32>() {
+            nodes.insert(id, body.trim_end_matches('}').to_string());
+        }
+    }
+
+    let Some(root) = root else {
+        return Ok(Vec::new());
+    };
+    let mut constants = Vec::with_capacity(root.len());
+    for node_id in root {
+        let body = nodes
+            .get(&node_id)
+            .ok_or_else(|| format!("AIR sampler-state metadata node !{node_id} is missing"))?;
+        if !body.contains("!\"air.sampler_state\"") {
+            return Err(format!(
+                "AIR sampler-state root references non-sampler node !{node_id}"
+            ));
+        }
+        let name = global_name(body)
+            .ok_or_else(|| format!("AIR sampler-state node !{node_id} has no global"))?;
+        let words = globals
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("AIR sampler-state global {name} has no i64 initializer"))?;
+        constants.push((name.to_string(), words));
+    }
+    constants.sort_by_key(|(name, _)| static_sampler_name_order(name));
+    Ok(constants.into_iter().map(|(_, words)| words).collect())
+}
+
+fn metadata_refs(body: &str) -> Vec<u32> {
+    body.split('!')
+        .skip(1)
+        .filter_map(|tail| {
+            let digits = tail
+                .chars()
+                .take_while(|character| character.is_ascii_digit())
+                .collect::<String>();
+            (!digits.is_empty())
+                .then(|| digits.parse::<u32>().ok())
+                .flatten()
+        })
+        .collect()
+}
+
+fn global_name(body: &str) -> Option<&str> {
+    let start = body.find('@')?;
+    let rest = &body[start..];
+    let end = rest
+        .find(|character: char| {
+            character.is_whitespace() || matches!(character, ',' | ')' | ']' | '}')
+        })
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+fn static_sampler_name_order(name: &str) -> u64 {
+    name.trim_start_matches('@')
+        .strip_prefix("__air_sampler_state")
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn texture_binding(
@@ -576,6 +942,7 @@ fn texture_binding(
         texture_shape,
         embedded_source: None,
         access: Some(access),
+        static_sampler: None,
     }
 }
 
@@ -622,6 +989,7 @@ fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {
         texture_shape: None,
         embedded_source: None,
         access: None,
+        static_sampler: None,
     }
 }
 

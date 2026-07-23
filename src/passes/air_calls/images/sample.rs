@@ -292,7 +292,7 @@ pub(in crate::passes) fn clamp_pixel_coord_component_finite(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::passes) fn lower_pixel_linear_sample(
     ctx: &mut Ctx,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     img: Word,
     dim: Dim,
     arrayed: bool,

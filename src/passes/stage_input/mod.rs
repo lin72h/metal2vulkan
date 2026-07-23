@@ -977,7 +977,7 @@ pub(super) fn build_stage_input(
     // Convert the module-scope static sampler `__air_sampler_state` (an AIR-embedded default sampler,
     // an OpVariable UniformConstant with a constant array initializer) into a real sampler resource
     // and rewrite its `OpBitcast ... %__air_sampler_state` uses into a load of that sampler.
-    handle_static_sampler(ctx, &mut binding_ctr);
+    handle_static_sampler(ctx)?;
     include_existing_private_globals(ctx);
 
     // Register textures embedded in an argument buffer (via `air.indirect_argument` → `air.texture`,

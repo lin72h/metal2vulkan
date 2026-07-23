@@ -156,7 +156,7 @@ pub(in crate::passes) struct PixelFetchCoord {
 
 pub(in crate::passes) fn build_pixel_fetch_coord(
     ctx: &mut Ctx,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     img: Word,
     dim: Dim,
     arrayed: bool,
@@ -203,7 +203,7 @@ pub(in crate::passes) fn build_pixel_fetch_coord(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::passes) fn build_pixel_fetch_coord_from_parts(
     ctx: &mut Ctx,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     img: Word,
     dim: Dim,
     arrayed: bool,
@@ -302,7 +302,7 @@ pub(in crate::passes) fn build_pixel_fetch_coord_from_parts(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::passes) fn build_normalized_nearest_fetch_coord(
     ctx: &mut Ctx,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     img: Word,
     dim: Dim,
     arrayed: bool,
@@ -418,7 +418,7 @@ pub(in crate::passes) fn build_normalized_nearest_fetch_coord(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::passes) fn pixel_linear_tap_coord(
     ctx: &mut Ctx,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     dim: Dim,
     arrayed: bool,
     base: &[Word],
@@ -461,7 +461,7 @@ pub(in crate::passes) fn pixel_linear_tap_coord(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::passes) fn build_pixel_fetch_coord_from_signed_components(
     ctx: &mut Ctx,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     dim: Dim,
     arrayed: bool,
     signed_components: &[Word],

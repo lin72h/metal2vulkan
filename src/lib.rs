@@ -292,6 +292,10 @@ pub fn translate_sanitized_native_reflected(
     // Function constants are a cross-stage IR fact (not in the per-stage meta): scan the sanitized
     // IR once so a consumer can discover the module's spec-ids without walking SPIR-V.
     reflection.function_constants = meta::parse_function_constants(san_ll);
+    // AIR constexpr samplers are module globals rather than entry parameters, so stage metadata
+    // does not carry them. Reflect their decoded state and the same first-free sampler-band
+    // allocation used by the interface pass before returning the consumer contract.
+    reflection.add_static_samplers(san_ll)?;
     let spv = translate_sanitized_with_meta(
         san_ll,
         stage,

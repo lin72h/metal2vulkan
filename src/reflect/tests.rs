@@ -87,6 +87,97 @@ fn fragment_reflection_matches_abi_convention() {
 }
 
 #[test]
+fn reflected_static_samplers_stay_in_sampler_band_and_carry_state() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+@__air_sampler_state.118 = internal addrspace(2) constant i64 -9188470239253755319, align 8
+@__air_sampler_state.119 = internal addrspace(2) constant i64 -9188470239253757806, align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex, ptr addrspace(2) %runtime_sampler, <4 x float> %color0) {
+entry:
+  %sample0 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.118, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value0 = extractvalue { <4 x float>, i8 } %sample0, 0
+  %sample1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.119, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value1 = extractvalue { <4 x float>, i8 } %sample1, 0
+  %value = fadd <4 x float> %value0, %value1
+  ret <4 x float> %value
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!9, !8}
+!air.compile_options = !{!10}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7, !11}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!7 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.118}
+!9 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.119}
+!10 = !{!"air.compile.framebuffer_fetch_enable"}
+!11 = !{i32 4, !"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_static_sampler_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Fragment,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+    let asm = crate::disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("Binding 64"), "{asm}");
+    assert!(asm.contains("Binding 65"), "{asm}");
+    assert!(asm.contains("Binding 66"), "{asm}");
+    assert!(asm.contains("Binding 96"), "{asm}");
+    assert!(!asm.contains("Binding 97"), "{asm}");
+    assert!(!asm.contains("Binding 98"), "{asm}");
+
+    let static_samplers = reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+        .collect::<Vec<_>>();
+    assert_eq!(static_samplers.len(), 2);
+    assert_eq!(
+        static_samplers
+            .iter()
+            .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
+            .collect::<Vec<_>>(),
+        vec![65, 66]
+    );
+    let linear = static_samplers[0]
+        .static_sampler
+        .expect("linear static state");
+    assert_eq!(linear.min_filter, SamplerFilter::Linear);
+    assert_eq!(linear.mag_filter, SamplerFilter::Linear);
+    assert_eq!(linear.address_mode_s, SamplerAddressMode::ClampToEdge);
+    assert_eq!(linear.address_mode_t, SamplerAddressMode::ClampToEdge);
+    assert_eq!(linear.address_mode_r, SamplerAddressMode::ClampToEdge);
+    assert_eq!(linear.compare_function, SamplerCompareFunction::Never);
+    assert_eq!(linear.lod_min_clamp, 0.0);
+    assert_eq!(linear.lod_max_clamp, 65504.0);
+
+    let repeat = static_samplers[1]
+        .static_sampler
+        .expect("repeat static state");
+    assert_eq!(repeat.min_filter, SamplerFilter::Nearest);
+    assert_eq!(repeat.mag_filter, SamplerFilter::Nearest);
+    assert_eq!(repeat.address_mode_s, SamplerAddressMode::Repeat);
+    assert_eq!(repeat.address_mode_t, SamplerAddressMode::Repeat);
+    assert_eq!(repeat.address_mode_r, SamplerAddressMode::Repeat);
+}
+
+#[test]
 fn fragment_and_vertex_buffer_address_space_exported_when_known() {
     // R1.6: when the AIR carries a buffer arg's address space, reflection reports it (device=1,
     // constant=2) for the fragment and vertex stages the way it already did for kernels — no guess
@@ -524,7 +615,7 @@ fn reflection_serde_round_trips() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn reflection_serde_covers_every_v2_field() {
+fn reflection_serde_covers_every_v3_field() {
     // R6: the persisted-cache contract. Build a reflection with EVERY field populated to a
     // non-default value — including the translate-path-only fields a stage builder never fills
     // (function_constants, datalayout, imageblock_layouts) and the storage-format / embedded-source
@@ -553,6 +644,7 @@ fn reflection_serde_covers_every_v2_field() {
                 texture_shape: None,
                 embedded_source: None,
                 access: Some(ResourceAccess::ReadOnly),
+                static_sampler: None,
             },
             ResourceBinding {
                 kind: ResourceKind::Texture,
@@ -569,6 +661,27 @@ fn reflection_serde_covers_every_v2_field() {
                     field_offset: 8,
                 }),
                 access: Some(ResourceAccess::Storage),
+                static_sampler: None,
+            },
+            ResourceBinding {
+                kind: ResourceKind::StaticSampler,
+                metal_index: 1,
+                descriptor: ResourceBinding::descriptor_at(SAMPLER_BINDING_BASE, 1),
+                param_index: None,
+                address_space: None,
+                declared_size: None,
+                type_layout: None,
+                type_name: None,
+                texture_shape: None,
+                embedded_source: None,
+                access: None,
+                static_sampler: Some(
+                    StaticSamplerState::from_air_words([
+                        0x807b_ff00_0008_0a49,
+                        0x0000_0000_0000_3c00,
+                    ])
+                    .expect("static sampler"),
+                ),
             },
         ],
         vertex_attributes: vec![VertexAttribute {
@@ -609,7 +722,7 @@ fn reflection_serde_covers_every_v2_field() {
     let json = serde_json::to_string(&r).expect("serialize reflection");
     let back: ShaderReflection = serde_json::from_str(&json).expect("deserialize reflection");
     assert_eq!(r, back);
-    assert_eq!(back.reflection_version, 2);
+    assert_eq!(back.reflection_version, REFLECTION_VERSION);
 }
 
 #[test]

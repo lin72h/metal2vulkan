@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::passes::stage_input::{decorate_builtin, decorate_location};
+use crate::reflect::{COLOR_INPUT_BINDING_BASE, SAMPLER_BINDING_BASE};
 
 fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
     match frag {
@@ -320,32 +321,35 @@ pub(in crate::passes) fn rewrite_return(
 }
 
 /// Find the module-scope `__air_sampler_state` global (if any), replace it with a real sampler
-/// resource variable (binding `*binding_ctr`, no initializer), drop the old global, and rewrite
+/// resource variable in the first free sampler-band slot, drop the old global, and rewrite
 /// uses in the entry body into an `OpLoad %sampler %var`.
-pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx, binding_ctr: &mut u32) {
+pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), String> {
     // A shader can embed SEVERAL static samplers (`__air_sampler_state`, `__air_sampler_state.31`,
     // ...) — one per distinct sampler-state the source used. Collect every such global by name prefix.
-    let mut samp_globals: Vec<Word> = vec![];
+    let mut samp_globals: Vec<(Word, String)> = vec![];
     for inst in &ctx.module.debug_names {
         if inst.class.opcode == Op::Name {
             if let (Some(Operand::IdRef(id)), Some(Operand::LiteralString(s))) =
                 (inst.operands.first(), inst.operands.get(1))
             {
                 if s.trim_start_matches('@').starts_with("__air_sampler_state") {
-                    samp_globals.push(*id);
+                    samp_globals.push((*id, s.trim_start_matches('@').to_string()));
                 }
             }
         }
     }
     if samp_globals.is_empty() {
-        return;
+        return Ok(());
     }
+    samp_globals.sort_by_key(|(_, name)| static_sampler_name_order(name));
 
     let sty = ctx.ty_sampler();
     let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
 
-    for old_var in samp_globals {
-        let sampler_state = static_sampler_word(ctx, old_var).map(AirStaticSamplerState::from_word);
+    for (old_var, _) in samp_globals {
+        let sampler_state = static_sampler_words(ctx, old_var)
+            .map(StaticSamplerState::from_air_words)
+            .transpose()?;
         // One sampler resource per static sampler.
         let new_var = ctx.module.fresh_id();
         ctx.new_globals.push(Instruction::new(
@@ -354,8 +358,13 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx, binding_ctr: &mut 
             Some(new_var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        decorate_binding(&mut ctx.module, new_var, *binding_ctr);
-        *binding_ctr += 1;
+        let binding = allocate_static_sampler_binding(&ctx.module).ok_or_else(|| {
+            format!(
+                "AIR constexpr sampler count exceeds descriptor band \
+                 [{SAMPLER_BINDING_BASE},{COLOR_INPUT_BINDING_BASE})"
+            )
+        })?;
+        decorate_binding(&mut ctx.module, new_var, binding);
         ctx.interface_buffer_var(new_var);
 
         // Drop the old global variable + its OpName/decorations (a dangling reference to its id would
@@ -444,9 +453,17 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx, binding_ctr: &mut 
         }
         debug_assert!(load_ids.next().is_none());
     }
+    Ok(())
 }
 
-fn static_sampler_word(ctx: &Ctx, var: Word) -> Option<u64> {
+fn static_sampler_name_order(name: &str) -> u64 {
+    name.strip_prefix("__air_sampler_state")
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+fn static_sampler_words(ctx: &Ctx, var: Word) -> Option<[u64; 2]> {
     let initializer = ctx
         .module
         .types_global_values
@@ -457,10 +474,10 @@ fn static_sampler_word(ctx: &Ctx, var: Word) -> Option<u64> {
             Operand::IdRef(id) => Some(*id),
             _ => None,
         })?;
-    static_sampler_word_from_const(ctx, initializer)
+    static_sampler_words_from_const(ctx, initializer)
 }
 
-fn static_sampler_word_from_const(ctx: &Ctx, value: Word) -> Option<u64> {
+fn static_sampler_words_from_const(ctx: &Ctx, value: Word) -> Option<[u64; 2]> {
     let inst = ctx
         .module
         .types_global_values
@@ -468,14 +485,19 @@ fn static_sampler_word_from_const(ctx: &Ctx, value: Word) -> Option<u64> {
         .find(|inst| inst.result_id == Some(value))?;
     match inst.class.opcode {
         Op::Constant => match inst.operands.first()? {
-            Operand::LiteralBit64(value) => Some(*value),
-            Operand::LiteralBit32(value) => Some(*value as u64),
+            Operand::LiteralBit64(value) => Some([*value, 0]),
+            Operand::LiteralBit32(value) => Some([*value as u64, 0]),
             _ => None,
         },
-        Op::ConstantComposite => inst.operands.first().and_then(|operand| match operand {
-            Operand::IdRef(id) => static_sampler_word_from_const(ctx, *id),
-            _ => None,
-        }),
+        Op::ConstantComposite => {
+            let mut words = inst.operands.iter().filter_map(|operand| match operand {
+                Operand::IdRef(id) => {
+                    static_sampler_words_from_const(ctx, *id).map(|words| words[0])
+                }
+                _ => None,
+            });
+            Some([words.next()?, words.next().unwrap_or(0)])
+        }
         _ => None,
     }
 }

@@ -268,7 +268,7 @@ pub(in crate::passes) fn lower_pixel_gather_2d(
     rty: Word,
     img: Word,
     arrayed: bool,
-    sampler_state: AirStaticSamplerState,
+    sampler_state: StaticSamplerState,
     coord: Word,
     layer: Option<Word>,
     offset: Word,

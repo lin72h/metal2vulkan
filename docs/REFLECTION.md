@@ -55,7 +55,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature.
-Bump-aware field: `reflection_version` (`REFLECTION_VERSION`, currently `2`). Invalidate any
+Bump-aware field: `reflection_version` (`REFLECTION_VERSION`, currently `3`). Invalidate any
 on-disk cache when that constant changes.
 
 ## Descriptor ABI (binding map)
@@ -69,6 +69,7 @@ Bindings are a fixed base plus the Metal resource index `n`:
 | `[[buffer(n)]]` (threadgroup) | `ThreadgroupBuffer` | **no descriptor** (`descriptor: None`) |
 | `[[texture(n)]]` | `Texture` / `StorageImage` / `TextureArray` | `TEXTURE_BINDING_BASE + n` → **`32 + n`** |
 | `[[sampler(n)]]` | `Sampler` | `SAMPLER_BINDING_BASE + n` → **`64 + n`** |
+| AIR `constexpr sampler` | `StaticSampler` | first free binding in **`64..96`** |
 | `[[color(n)]]` (framebuffer fetch) | `ColorInput` | `COLOR_INPUT_BINDING_BASE + n` → **`96 + n`** |
 | Acceleration-structure shadow buffer | `AccelerationStructureShadow` | Metal buffer index `n` (set 0) |
 | Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | `32 + synthetic_index` |
@@ -126,6 +127,7 @@ Top-level fields:
 | `texture_shape` | Dim / arrayed / MS / component / writable / storage format (decoded) |
 | `embedded_source` | For arg-buffer textures: owning buffer index + field byte offset |
 | `access` | When known: `ReadOnly` / `ReadWrite` / `Sampled` / `Storage` |
+| `static_sampler` | Decoded immutable state for `StaticSampler`; `None` for other kinds |
 
 **Gaps consumers should expect:**
 
@@ -135,6 +137,9 @@ Top-level fields:
   `function_constants` empty; populate via the reflected translate paths (they scan sanitized IR).
 - **Datalayout:** only filled when translating from unsanitized `.air`/`.ll` via
   `translate_reflected*` (sanitization strips the line; the reflected path captures it first).
+- **Static samplers:** only reflected by translated entry points because they require the sanitized
+  module's `!air.sampler_states` metadata. The state includes typed filter, address, coordinate,
+  compare, anisotropy, LOD, border, and reduction fields plus the original two AIR words.
 
 ## Typical consumer flow
 

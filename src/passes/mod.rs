@@ -20,6 +20,7 @@
 use crate::meta::{
     AirScalar, AirType, FragMeta, FragRole, KernMeta, KernRole, VertMeta, VertOutRole, VertRole,
 };
+use crate::reflect::StaticSamplerState;
 use crate::spirv_module::{is_block_terminator, Block, Function, Instruction, Module, Operand};
 use spirv::{
     BuiltIn, Decoration, Dim, FunctionControl, ImageFormat, MemorySemantics, Op, Scope,
@@ -69,37 +70,6 @@ pub enum ImageComp {
     Float,
     Uint,
     Sint,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct AirStaticSamplerState {
-    word: u64,
-}
-
-impl AirStaticSamplerState {
-    fn from_word(word: u64) -> Self {
-        Self { word }
-    }
-
-    fn uses_pixel_nearest(self) -> bool {
-        self.uses_pixel_coordinates() && !self.uses_linear_filter()
-    }
-
-    fn uses_linear_filter(self) -> bool {
-        self.word & 0x0a00 == 0x0a00
-    }
-
-    fn uses_pixel_coordinates(self) -> bool {
-        self.word & 0x8000 != 0
-    }
-
-    fn address_code(self, dimension: usize) -> u64 {
-        (self.word >> (dimension * 3)) & 0x7
-    }
-
-    fn spatial_clamps_to_zero(self, dimension: usize) -> bool {
-        self.address_code(dimension) == 0
-    }
 }
 
 /// Typed cache key for the singleton types the finalize pass synthesizes (cleanup-plan S4). Each has
@@ -200,7 +170,7 @@ struct Ctx {
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
     /// Loaded sampler value ids that came from AIR-embedded `__air_sampler_state` globals.
-    sampler_states: HashMap<Word, AirStaticSamplerState>,
+    sampler_states: HashMap<Word, StaticSamplerState>,
     /// lazily-created default (null) float image variables for `air.get_null_texture_*()`, keyed by
     /// (Dim, arrayed) so a 2D and a 3D null texture get distinct bindings/types.
     default_null_image_vars: HashMap<(Dim, bool), Word>,
