@@ -80,3 +80,6 @@ Optional private system-metallib harvest and hash-only drift pins are documented
 
 Licensed under the [GNU Lesser General Public License v3.0 or later](LICENSE)
 (`LGPL-3.0-or-later`).
+
+Metal is a trademark of Apple Inc. metal2vulkan is an independent project and is not affiliated
+with, sponsored by, or endorsed by Apple Inc.
