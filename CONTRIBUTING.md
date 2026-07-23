@@ -78,10 +78,11 @@ cargo build --release --features serde
 2. **Stable ABI symbols are allowed.** Dispatching on documented `air.*` / `llvm.*` intrinsics is
    fine; prefer structural tests when possible.
 3. **No third-party captured shaders in tree.** Reduce regressions to synthetic `.ll` tests.
-   Optional **private** harvest stays under gitignored `validation/corpus/local/` and
-   `validation/tests/corpus_*.rs` — see [`validation/corpus/README.md`](validation/corpus/README.md).
-   Public pins are **hashes / metadata only**: `drift-ledger.jsonl`, `tolerances.jsonl`,
-   `broken.jsonl` (no shader bodies).
+   Optional **private** harvest writes gitignored shard JSONL under
+   `validation/corpus/local/shards/` — see
+   [`validation/corpus/README.md`](validation/corpus/README.md). Translate ledgers store hashes;
+   execution ledgers may also store deterministic input/output digests and output payloads for
+   reproducibility, but never AIR source bodies.
 4. **Honest FALLBACK.** Unsupported inputs must return `Err` / CLI `FALLBACK`, never emit
    wrong-but-valid SPIR-V.
 
@@ -100,10 +101,16 @@ cargo test -p metal2vulkan -- --test-threads=1
 cp target/release/metal2vulkan ./m2v-old
 # … edit …
 scripts/metal2vulkan-ab/metal2vulkan-ab.sh --old ./m2v-old
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh check
+# optional: translate ledger + execution goldens (see validation/README.md, plan.md)
+# cargo run -p metal2vulkan-validation --release --bin corpus-mint
+# cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
+# cargo run -p metal2vulkan-validation --release --bin corpus-why -- <air_sha256>
+# cargo run -p metal2vulkan-validation --release --bin corpus-run-metal   # macOS
+# cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan  # Linux
+# cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk
 
-# optional private real-AIR bank (macOS; gitignored)
-scripts/metal2vulkan-harvest/metal2vulkan-harvest.py
+# optional private real-AIR bank (macOS; shard JSONL is gitignored)
+cargo run -p metal2vulkan-validation --release --bin corpus-harvest
 ```
 
 See also [AGENTS.md](AGENTS.md) for the full agent operating guide.

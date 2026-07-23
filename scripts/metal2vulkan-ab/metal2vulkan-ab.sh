@@ -134,12 +134,50 @@ scan_tree() {
 }
 
 # Sample set (all optional except explicit -- paths):
-#   1) tests/fixtures/**                 — private local fixtures
-#   2) validation/fixtures/public/**     — committed synthetic samples
-#   3) validation/corpus/local/air/**    — gitignored mined AIR
+#   1) tests/fixtures/**                         — private local fixtures
+#   2) validation/fixtures/public/**             — committed synthetic samples
+#   3) validation/corpus/local/shards/*.jsonl    — gitignored mined AIR rows
 scan_tree "$CRATE_DIR/tests/fixtures" "fixture"
 scan_tree "$CRATE_DIR/validation/fixtures/public" "public"
-scan_tree "$CRATE_DIR/validation/corpus/local/air" "local-air"
+
+scan_shards() {
+  local shard_root="$1" tag="$2"
+  if [ ! -d "$shard_root" ]; then
+    echo "# $tag: skipped (not present)"
+    return
+  fi
+  echo "# $tag:"
+  local extracted="$WORK/$tag"
+  mkdir -p "$extracted"
+  python3 - "$shard_root" "$extracted" <<'PY' | while IFS=$'\t' read -r name src; do
+import json
+import sys
+from pathlib import Path
+
+shard_root = Path(sys.argv[1])
+out_root = Path(sys.argv[2])
+for shard in sorted(shard_root.glob("shard_*.jsonl")):
+    shard_name = shard.name
+    with shard.open("r", encoding="utf-8", errors="replace") as f:
+        for line_no, line in enumerate(f, 1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            row = json.loads(line)
+            air = row.get("air_ll") or ""
+            sha = (row.get("air_sha256") or "").lower()
+            if not air or not sha:
+                continue
+            path = out_root / f"{sha}.ll"
+            path.write_text(air, encoding="utf-8")
+            label = row.get("label") or f"{shard_name}:{line_no}"
+            print(f"{label}\t{path}")
+PY
+    [ -n "$src" ] || continue
+    compare_case "$tag:$name" "$src"
+  done
+}
+
+scan_shards "$CRATE_DIR/validation/corpus/local/shards" "local-shards"
 
 if [ "${#EXTRA_SRCS[@]}" -gt 0 ]; then
   echo "# extra inputs:"

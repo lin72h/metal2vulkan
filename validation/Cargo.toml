@@ -13,7 +13,6 @@ readme = "README.md"
 exclude = [
     "corpus/local/",
     "corpus/local/**",
-    "tests/corpus_*.rs",
     "tests/fixtures/",
     "target/",
     "**/*.air",
@@ -29,6 +28,8 @@ base64 = "0.22"
 rspirv = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

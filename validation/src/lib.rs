@@ -1,14 +1,14 @@
-pub mod corpus_sidecars;
-pub mod local_corpus;
-pub mod predicate;
+pub mod air;
+pub mod corpus_run;
+pub mod corpus_shards;
+pub mod corpus_source;
+pub mod corpus_triage;
+pub mod hash;
+pub mod jsonl;
+pub mod loop_budget;
 pub mod spirv_delta;
 mod texture;
-
-pub use corpus_sidecars::{
-    air_sha256_hex, broken_for_air_sha256, load_broken, load_tolerances, tolerance_for_air_sha256,
-    BrokenCategory, BrokenEntry, BrokenIndex, ToleranceEntry, ToleranceSpec, TolerancesIndex,
-};
-pub use local_corpus::run_corpus_case;
+pub mod translate_ledger;
 
 #[cfg(target_os = "macos")]
 pub mod oracle_macos;
@@ -52,7 +52,16 @@ pub enum DataFormat {
     Rgba8Uint,
     Rgba8Sint,
     Rgba16Uint,
+    R32Uint,
+    Rg32Uint,
+    Rgba32Uint,
+    R32Sint,
+    Rg32Sint,
+    Rgba32Sint,
+    R16Float,
+    Rg16Float,
     Rgba16Float,
+    Rg32Float,
     Rgba32Float,
     R32Float,
     Depth32Float,
@@ -65,7 +74,10 @@ impl DataFormat {
             self,
             DataFormat::F32
                 | DataFormat::Rgba8Unorm
+                | DataFormat::R16Float
+                | DataFormat::Rg16Float
                 | DataFormat::Rgba16Float
+                | DataFormat::Rg32Float
                 | DataFormat::Rgba32Float
                 | DataFormat::R32Float
                 | DataFormat::Depth32Float
@@ -75,73 +87,18 @@ impl DataFormat {
     pub const fn bytes_per_pixel(self) -> Option<usize> {
         match self {
             DataFormat::Rgba8Unorm | DataFormat::Rgba8Uint | DataFormat::Rgba8Sint => Some(4),
+            DataFormat::R32Uint | DataFormat::R32Sint => Some(4),
+            DataFormat::Rg32Uint | DataFormat::Rg32Sint => Some(8),
+            DataFormat::Rgba32Uint | DataFormat::Rgba32Sint => Some(16),
+            DataFormat::R16Float => Some(2),
+            DataFormat::Rg16Float => Some(4),
             DataFormat::Rgba16Uint | DataFormat::Rgba16Float => Some(8),
+            DataFormat::Rg32Float => Some(8),
             DataFormat::Rgba32Float => Some(16),
             DataFormat::R32Float => Some(4),
             DataFormat::Depth32Float => Some(4),
             DataFormat::Depth24Stencil8 => Some(4),
             DataFormat::RawBytes | DataFormat::U32 | DataFormat::I32 | DataFormat::F32 => None,
-        }
-    }
-
-    pub const fn rust_name(self) -> &'static str {
-        match self {
-            DataFormat::RawBytes => "RawBytes",
-            DataFormat::U32 => "U32",
-            DataFormat::I32 => "I32",
-            DataFormat::F32 => "F32",
-            DataFormat::Rgba8Unorm => "Rgba8Unorm",
-            DataFormat::Rgba8Uint => "Rgba8Uint",
-            DataFormat::Rgba8Sint => "Rgba8Sint",
-            DataFormat::Rgba16Uint => "Rgba16Uint",
-            DataFormat::Rgba16Float => "Rgba16Float",
-            DataFormat::Rgba32Float => "Rgba32Float",
-            DataFormat::R32Float => "R32Float",
-            DataFormat::Depth32Float => "Depth32Float",
-            DataFormat::Depth24Stencil8 => "Depth24Stencil8",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Tolerance {
-    Exact,
-    Abs {
-        max_abs: f32,
-        reason: &'static str,
-    },
-    Ulp {
-        max_ulp: u32,
-        reason: &'static str,
-    },
-    RawF16Ulp {
-        max_ulp: u32,
-        reason: &'static str,
-    },
-    RawU8Ulp {
-        max_ulp: u32,
-        reason: &'static str,
-    },
-    AbsAndUlp {
-        max_abs: f32,
-        max_ulp: u32,
-        reason: &'static str,
-    },
-}
-
-impl Tolerance {
-    pub const fn is_exact(self) -> bool {
-        matches!(self, Tolerance::Exact)
-    }
-
-    pub const fn reason(self) -> Option<&'static str> {
-        match self {
-            Tolerance::Exact => None,
-            Tolerance::Abs { reason, .. }
-            | Tolerance::Ulp { reason, .. }
-            | Tolerance::RawF16Ulp { reason, .. }
-            | Tolerance::RawU8Ulp { reason, .. }
-            | Tolerance::AbsAndUlp { reason, .. } => Some(reason),
         }
     }
 }
@@ -385,170 +342,6 @@ impl Inputs {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Expected {
-    pub format: DataFormat,
-    pub tolerance: Tolerance,
-    pub bytes: &'static [u8],
-}
-
-impl Expected {
-    pub const fn empty() -> Self {
-        Self {
-            format: DataFormat::RawBytes,
-            tolerance: Tolerance::Exact,
-            bytes: &[],
-        }
-    }
-
-    pub const fn exact(format: DataFormat, bytes: &'static [u8]) -> Self {
-        Self {
-            format,
-            tolerance: Tolerance::Exact,
-            bytes,
-        }
-    }
-
-    pub const fn with_tolerance(
-        format: DataFormat,
-        tolerance: Tolerance,
-        bytes: &'static [u8],
-    ) -> Self {
-        Self {
-            format,
-            tolerance,
-            bytes,
-        }
-    }
-
-    pub const fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    pub const fn bytes(&self) -> &'static [u8] {
-        self.bytes
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Case {
-    pub id: &'static str,
-    pub stage: Stage,
-    pub metal_src: &'static str,
-    pub air_ll: &'static str,
-    pub inputs: Inputs,
-    pub expected: Expected,
-}
-
-pub fn run_case(c: Case) {
-    #[cfg(target_os = "macos")]
-    {
-        oracle_macos::assert_toolchain_pinned();
-
-        let ll_now = oracle_macos::compile_to_sanitized_ll(c.metal_src, c.stage);
-        if c.air_ll == "TODO" || normalize_ll(c.air_ll) != normalize_ll(&ll_now) {
-            print_seed_block("air_ll", &as_rust_raw_string(&ll_now));
-            panic!(
-                "[{}] air_ll unseeded or drifted -- paste the block above into the test",
-                c.id
-            );
-        }
-
-        let golden_now = oracle_macos::execute(c.metal_src, c.stage, &c.inputs);
-        if c.expected.is_empty() || c.expected.bytes() != golden_now {
-            print_seed_block(
-                "expected",
-                &as_rust_hex(&golden_now, c.inputs.output_format()),
-            );
-            panic!(
-                "[{}] expected golden unseeded or changed -- paste the block above",
-                c.id
-            );
-        }
-
-        // Local byte-verification (opt-in via METAL2VULKAN_MOLTENVK=1): translate through metal2vulkan and run the
-        // SPIR-V on the Apple GPU via MoltenVK, then byte-compare against the Apple Metal golden just
-        // captured. This is the SAME gold-standard gate the Linux/RTX box runs, brought local — spirv-val
-        // identity is only a proxy, a module can be valid-but-wrong, so this is what proves a lowering
-        // byte-correct rather than merely well-formed. Opt-in because it needs the MoltenVK ICD env
-        // (VK_ICD_FILENAMES + the Vulkan loader) and not every host has it.
-        if std::env::var("METAL2VULKAN_MOLTENVK").is_ok_and(|v| v != "0") && c.air_ll != "TODO" {
-            let tmp = scratch_dir_for(c.id);
-            let spv = metal2vulkan::translate_sanitized_native(c.air_ll, c.stage.into(), &tmp)
-                .unwrap_or_else(|e| panic!("[{}] metal2vulkan FALLBACK: {e}", c.id));
-            metal2vulkan::tools::spirv_val_bytes(&spv, &tmp)
-                .unwrap_or_else(|e| panic!("[{}] INVALID-SPIRV: {e}", c.id));
-            let candidate = runner_linux::execute(c.stage, c.air_ll, &spv, &c.inputs, &tmp);
-            predicate::assert_conforms(c.id, &candidate, &c.expected);
-            cleanup(&tmp);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        assert!(
-            c.air_ll != "TODO",
-            "[{}] air_ll not seeded; run on macOS first",
-            c.id
-        );
-        let tmp = scratch_dir_for(c.id);
-        let spv = metal2vulkan::translate_sanitized_native(c.air_ll, c.stage.into(), &tmp)
-            .unwrap_or_else(|e| panic!("[{}] metal2vulkan FALLBACK: {e}", c.id));
-        assert_spirv_valid(c.id, &spv, &tmp);
-        let candidate = runner_linux::execute(c.stage, c.air_ll, &spv, &c.inputs, &tmp);
-        predicate::assert_conforms(c.id, &candidate, &c.expected);
-        cleanup(&tmp);
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn assert_spirv_valid(id: &str, spv: &[u8], tmp: &std::path::Path) {
-    metal2vulkan::tools::spirv_val_bytes(spv, tmp)
-        .unwrap_or_else(|e| panic!("[{id}] INVALID-SPIRV: {e}"));
-}
-
-pub fn normalize_ll(ll: &str) -> String {
-    ll.lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with(';'))
-        .flat_map(|line| line.split_whitespace())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub fn as_rust_raw_string(s: &str) -> String {
-    for hashes in 0..8 {
-        let fence = "#".repeat(hashes);
-        let close = format!("\"{fence}");
-        if !s.contains(&close) {
-            return format!("r{fence}\"{s}\"{fence}");
-        }
-    }
-    panic!("raw string contains every supported delimiter");
-}
-
-pub fn as_rust_hex(bytes: &[u8], format: DataFormat) -> String {
-    let mut out = String::new();
-    out.push_str("Expected::exact(DataFormat::");
-    out.push_str(format.rust_name());
-    out.push_str(", &[\n");
-    for chunk in bytes.chunks(16) {
-        out.push_str("    ");
-        for byte in chunk {
-            out.push_str(&format!("0x{byte:02x}, "));
-        }
-        out.push('\n');
-    }
-    out.push_str("])");
-    out
-}
-
-pub fn print_seed_block(field: &str, literal: &str) {
-    eprintln!("// === SEED {field} BEGIN ===");
-    eprintln!("{literal}");
-    eprintln!("// === SEED {field} END ===");
-}
-
 pub fn seeded_buffer_bytes(input: &BufferInput) -> Vec<u8> {
     seeded_linear_bytes(input.len, input.index, input.seed)
 }
@@ -577,8 +370,12 @@ pub fn seeded_render_target_bytes(format: DataFormat, extent: Extent3d) -> Vec<u
 /// NaN/Inf sanitization applies — integer/unorm formats are finite by construction).
 fn float_element_size(format: DataFormat) -> Option<usize> {
     match format {
-        DataFormat::Rgba16Float => Some(2),
-        DataFormat::Rgba32Float | DataFormat::Depth32Float | DataFormat::F32 => Some(4),
+        DataFormat::R16Float | DataFormat::Rg16Float | DataFormat::Rgba16Float => Some(2),
+        DataFormat::Rg32Float
+        | DataFormat::Rgba32Float
+        | DataFormat::R32Float
+        | DataFormat::Depth32Float
+        | DataFormat::F32 => Some(4),
         // Rgba8Unorm is normalized on read (byte/255) — already finite.
         _ => None,
     }
@@ -712,21 +509,9 @@ pub(crate) fn scratch_dir_for(id: &str) -> PathBuf {
     dir
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn cleanup(path: &PathBuf) {
-    let _ = fs::remove_dir_all(path);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_llvm_ir_ignores_comments_and_whitespace() {
-        let a = "  ; ModuleID\n define   void @main() {\n ret void\n}\n";
-        let b = "define void @main() { ret void }";
-        assert_eq!(normalize_ll(a), normalize_ll(b));
-    }
 
     #[test]
     fn deterministic_buffer_seed_is_nonzero_and_stable() {
@@ -869,17 +654,5 @@ mod tests {
             seeded_buffer_bytes(&input),
             vec![1, 0, 0, 0, 1, 0, 0, 0, 1, 0]
         );
-    }
-
-    #[test]
-    fn seed_blocks_are_copy_paste_ready() {
-        let ll = "define void @main() {\n  ret void\n}\n";
-        assert_eq!(
-            as_rust_raw_string(ll),
-            "r\"define void @main() {\n  ret void\n}\n\""
-        );
-        let expected = as_rust_hex(&[0, 1, 0xfe, 0xff], DataFormat::RawBytes);
-        assert!(expected.contains("Expected::exact(DataFormat::RawBytes"));
-        assert!(expected.contains("0xfe"));
     }
 }

@@ -45,15 +45,16 @@ Because `--new` defaults to `--old`, an explicit A/B run is usually: pass the pr
 
 1. Every `*.air` / `*.ll` under `tests/fixtures/**` when that directory exists (gitignored).
 2. Every `*.air` / `*.ll` under `validation/fixtures/public/**` (committed synthetic samples).
-3. Every `*.air` / `*.ll` under `validation/corpus/local/air/**` (gitignored private harvest).
+3. Every `air_ll` row under `validation/corpus/local/shards/shard_*.jsonl` (gitignored private harvest).
 4. Any paths listed after `--`.
 
-Paired harvest outputs (`stem.air` + `stem.ll`) use only the **`.ll`** so each module is
-compared once.
+Shard rows materialize temporary `.ll` files under the script work directory and are removed when
+the run exits.
 
 This public tree does not ship third-party captured shaders. For cross-version hash pins (without
-keeping two binaries around), see [`scripts/metal2vulkan-drift/`](../metal2vulkan-drift/) and
-[`validation/corpus/README.md`](../../validation/corpus/README.md).
+keeping two binaries around), bank with `corpus-mint` / `corpus-remint` (and optional
+`corpus-run-*` execution ledgers) — see [`validation/corpus/README.md`](../../validation/corpus/README.md)
+and [`plan.md`](../../plan.md).
 
 ## Output
 

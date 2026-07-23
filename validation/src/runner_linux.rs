@@ -1,6 +1,8 @@
 #[cfg(test)]
 use crate::texture::texture_kind_from_type_name;
-use crate::texture::{texture_kind, texture_seed_bytes, TextureKind};
+use crate::texture::{
+    texture_kind, texture_output_extent, texture_seed_bytes, texture_seed_extent, TextureKind,
+};
 use crate::{
     seeded_buffer_bytes, seeded_render_target_bytes, BlendMode, DataFormat, Extent3d, Inputs,
     Output, Stage, TextureRole,
@@ -483,11 +485,111 @@ fn execute_vertex(sanitized_ll: &str, vertex_spv: &[u8], inputs: &Inputs) -> Vec
     read[..output_len].to_vec()
 }
 
+/// Load the Vulkan loader dylib/so, including Homebrew Apple Silicon paths that stock vulkano
+/// does not probe.
+///
+/// Vulkano's default macOS search ends at bare names + `/usr/local/lib/libvulkan.dylib` (Intel
+/// Homebrew / LunarG SDK layout). On arm64 Homebrew the loader lives at
+/// `/opt/homebrew/lib/libvulkan.dylib`, which is outside dyld's fallback list for bare names —
+/// every `VulkanLibrary::new()` call then fails and the corpus runner banks
+/// `vulkan execute panicked`.
+///
+/// Override order:
+/// 1. `METAL2VULKAN_LIBVULKAN` absolute path (validation tooling only)
+/// 2. `$VULKAN_SDK/lib/libvulkan.{dylib,1.dylib}` and `$VULKAN_SDK/macOS/lib/...`
+/// 3. Vulkano default (`VulkanLibrary::new`)
+/// 4. Known absolute locations (Homebrew prefixes, `/usr/local/lib`)
+pub fn load_vulkan_library() -> Result<Arc<VulkanLibrary>, String> {
+    if let Ok(explicit) = std::env::var("METAL2VULKAN_LIBVULKAN") {
+        let path = explicit.trim();
+        if !path.is_empty() {
+            return load_vulkan_library_from(path)
+                .map_err(|e| format!("METAL2VULKAN_LIBVULKAN={path}: {e}"));
+        }
+    }
+
+    if let Ok(sdk) = std::env::var("VULKAN_SDK") {
+        let sdk = sdk.trim();
+        if !sdk.is_empty() {
+            for rel in [
+                "lib/libvulkan.dylib",
+                "lib/libvulkan.1.dylib",
+                "macOS/lib/libvulkan.dylib",
+                "macOS/lib/libvulkan.1.dylib",
+                "lib/libvulkan.so.1",
+                "lib/libvulkan.so",
+            ] {
+                let candidate = format!("{sdk}/{rel}");
+                if Path::new(&candidate).is_file() {
+                    if let Ok(lib) = load_vulkan_library_from(&candidate) {
+                        return Ok(lib);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Ok(lib) = VulkanLibrary::new() {
+        return Ok(lib);
+    }
+
+    // Fall through to absolute path probes after the stock search fails.
+    let mut last = "VulkanLibrary::new failed".to_string();
+    for path in vulkan_library_fallback_paths() {
+        match load_vulkan_library_from(&path) {
+            Ok(lib) => return Ok(lib),
+            Err(e) => last = format!("{path}: {e}"),
+        }
+    }
+    Err(format!(
+        "load Vulkan library failed ({last}). \
+         Install vulkan-loader (and MoltenVK on macOS), or set METAL2VULKAN_LIBVULKAN to \
+         the absolute path of libvulkan.dylib / libvulkan.so.1"
+    ))
+}
+
+fn load_vulkan_library_from(path: &str) -> Result<Arc<VulkanLibrary>, String> {
+    use vulkano::library::DynamicLibraryLoader;
+    let loader = unsafe { DynamicLibraryLoader::new(path) }.map_err(|e| e.to_string())?;
+    VulkanLibrary::with_loader(loader).map_err(|e| e.to_string())
+}
+
+fn vulkan_library_fallback_paths() -> Vec<String> {
+    let mut paths = Vec::new();
+
+    // Homebrew: prefer the active prefix, then the two common install roots.
+    if let Ok(prefix) = std::env::var("HOMEBREW_PREFIX") {
+        let p = prefix.trim();
+        if !p.is_empty() {
+            paths.push(format!("{p}/lib/libvulkan.dylib"));
+            paths.push(format!("{p}/lib/libvulkan.1.dylib"));
+            paths.push(format!("{p}/lib/libvulkan.so.1"));
+        }
+    }
+    for root in ["/opt/homebrew", "/usr/local"] {
+        paths.push(format!("{root}/lib/libvulkan.dylib"));
+        paths.push(format!("{root}/lib/libvulkan.1.dylib"));
+    }
+
+    // Dedup while preserving order (HOMEBREW_PREFIX may equal one of the roots).
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
+    paths
+}
+
 fn device_and_queue(
     required_queue_flags: QueueFlags,
     need_dynamic_rendering: bool,
 ) -> (Arc<Device>, Arc<Queue>) {
-    let library = VulkanLibrary::new().expect("load Vulkan library");
+    device_and_queue_result(required_queue_flags, need_dynamic_rendering)
+        .unwrap_or_else(|error| panic!("{error}"))
+}
+
+pub fn device_and_queue_result(
+    required_queue_flags: QueueFlags,
+    need_dynamic_rendering: bool,
+) -> Result<(Arc<Device>, Arc<Queue>), String> {
+    let library = load_vulkan_library()?;
     // MoltenVK (macOS) is a NON-CONFORMANT portability driver: the Vulkan loader hides it unless the
     // instance opts in with the ENUMERATE_PORTABILITY flag + the khr_portability_enumeration extension.
     // On Linux (a conformant ICD) neither is needed — set them only when the loader actually exposes the
@@ -516,14 +618,14 @@ fn device_and_queue(
             ..Default::default()
         },
     )
-    .unwrap_or_else(|error| {
-        panic!(
-            "create Vulkan instance: {error}\n\
+    .map_err(|error| {
+        format!(
+            "create Vulkan instance: {error}: \
              VK_ERROR_INCOMPATIBLE_DRIVER almost always means no conformant ICD is installed \
              (or portability devices are hidden). On Linux install mesa-vulkan-drivers \
              (lavapipe) + libvulkan1; on macOS load MoltenVK with ENUMERATE_PORTABILITY."
         )
-    });
+    })?;
     let enabled_features = DeviceFeatures {
         dynamic_rendering: need_dynamic_rendering,
         shader_demote_to_helper_invocation: true,
@@ -555,7 +657,7 @@ fn device_and_queue(
     let device_filter = std::env::var("METAL2VULKAN_VK_DEVICE").ok();
     let (physical_device, queue_family_index) = instance
         .enumerate_physical_devices()
-        .expect("enumerate Vulkan physical devices")
+        .map_err(|error| format!("enumerate Vulkan physical devices: {error}"))?
         .filter(|device| device.supported_extensions().contains(&required_extensions))
         .filter(|device| device.supported_features().contains(&enabled_features))
         .filter(|device| match &device_filter {
@@ -581,7 +683,12 @@ fn device_and_queue(
             PhysicalDeviceType::Other => 4,
             _ => 5,
         })
-        .expect("no Vulkan device with a compute queue");
+        .ok_or_else(|| {
+            format!(
+                "no Vulkan device with required features and queue flags {:?}",
+                required_queue_flags
+            )
+        })?;
 
     if std::env::var("METAL2VULKAN_PSB_DEBUG").is_ok() {
         eprintln!(
@@ -614,11 +721,11 @@ fn device_and_queue(
             ..Default::default()
         },
     )
-    .expect("create Vulkan logical device");
-    (
-        device,
-        queues.next().expect("logical device returned no queue"),
-    )
+    .map_err(|error| format!("create Vulkan logical device: {error}"))?;
+    let queue = queues
+        .next()
+        .ok_or_else(|| "logical device returned no queue".to_string())?;
+    Ok((device, queue))
 }
 
 /// The image-view type each set-0 texture binding's SPIR-V image type requires, keyed by the
@@ -1136,7 +1243,7 @@ fn texture_shape(extent: Extent3d, kind: TextureKind) -> TextureShape {
             extent: [extent.width, 1, 1],
             array_layers: 1,
             view_type: Some(ImageViewType::Dim1d),
-            seed_extent: Extent3d::new(extent.width, 1, 1),
+            seed_extent: texture_seed_extent(extent, kind),
         },
         TextureKind::Dim2dArray => TextureShape {
             flags: ImageCreateFlags::empty(),
@@ -1144,7 +1251,7 @@ fn texture_shape(extent: Extent3d, kind: TextureKind) -> TextureShape {
             extent: [extent.width, extent.height, 1],
             array_layers: extent.depth.max(1),
             view_type: Some(ImageViewType::Dim2dArray),
-            seed_extent: extent,
+            seed_extent: texture_seed_extent(extent, kind),
         },
         TextureKind::Dim3d => TextureShape {
             flags: ImageCreateFlags::empty(),
@@ -1152,7 +1259,7 @@ fn texture_shape(extent: Extent3d, kind: TextureKind) -> TextureShape {
             extent: [extent.width, extent.height, extent.depth.max(1)],
             array_layers: 1,
             view_type: Some(ImageViewType::Dim3d),
-            seed_extent: extent,
+            seed_extent: texture_seed_extent(extent, kind),
         },
         TextureKind::Cube => TextureShape {
             flags: ImageCreateFlags::CUBE_COMPATIBLE,
@@ -1160,7 +1267,7 @@ fn texture_shape(extent: Extent3d, kind: TextureKind) -> TextureShape {
             extent: [extent.width, extent.height, 1],
             array_layers: 6,
             view_type: Some(ImageViewType::Cube),
-            seed_extent: Extent3d::new(extent.width, extent.height, 6),
+            seed_extent: texture_seed_extent(extent, kind),
         },
         TextureKind::Plain => TextureShape {
             flags: ImageCreateFlags::empty(),
@@ -1168,22 +1275,8 @@ fn texture_shape(extent: Extent3d, kind: TextureKind) -> TextureShape {
             extent: [extent.width, extent.height, extent.depth],
             array_layers: 1,
             view_type: None,
-            seed_extent: extent,
+            seed_extent: texture_seed_extent(extent, kind),
         },
-    }
-}
-
-/// The extent an output texture's readback actually covers, derived from the texture's declared
-/// kind rather than the caller's (2D-shaped) contract extent. A 1D texture holds one row of
-/// `width` texels regardless of the contract's `h`; a cube readback covers the single face the
-/// harness copies (`array_layers = 0..1`). Reading a larger region than the texture stores would
-/// silently return zero padding — never real texel data — so the contract length must follow the
-/// texture's real shape. Mirrors the macOS oracle's readback extent so goldens stay comparable.
-fn texture_output_extent(extent: Extent3d, kind: TextureKind) -> Extent3d {
-    match kind {
-        TextureKind::Dim1d => Extent3d::new(extent.width, 1, 1),
-        TextureKind::Cube => Extent3d::new(extent.width, extent.height, 1),
-        TextureKind::Plain | TextureKind::Dim2dArray | TextureKind::Dim3d => extent,
     }
 }
 
@@ -1205,7 +1298,16 @@ fn vulkan_format(format: DataFormat) -> Format {
         DataFormat::Rgba8Uint => Format::R8G8B8A8_UINT,
         DataFormat::Rgba8Sint => Format::R8G8B8A8_SINT,
         DataFormat::Rgba16Uint => Format::R16G16B16A16_UINT,
+        DataFormat::R32Uint => Format::R32_UINT,
+        DataFormat::Rg32Uint => Format::R32G32_UINT,
+        DataFormat::Rgba32Uint => Format::R32G32B32A32_UINT,
+        DataFormat::R32Sint => Format::R32_SINT,
+        DataFormat::Rg32Sint => Format::R32G32_SINT,
+        DataFormat::Rgba32Sint => Format::R32G32B32A32_SINT,
+        DataFormat::R16Float => Format::R16_SFLOAT,
+        DataFormat::Rg16Float => Format::R16G16_SFLOAT,
         DataFormat::Rgba16Float => Format::R16G16B16A16_SFLOAT,
+        DataFormat::Rg32Float => Format::R32G32_SFLOAT,
         DataFormat::Rgba32Float => Format::R32G32B32A32_SFLOAT,
         DataFormat::R32Float => Format::R32_SFLOAT,
         _ => panic!("unsupported Vulkan texture format {format:?}"),

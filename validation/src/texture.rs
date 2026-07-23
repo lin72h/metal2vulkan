@@ -26,6 +26,36 @@ pub(crate) fn texture_seed_bytes(
     seeded_texture_bytes_for_extent(input, extent)
 }
 
+pub(crate) fn texture_seed_extent(extent: Extent3d, kind: TextureKind) -> Extent3d {
+    match kind {
+        TextureKind::Dim1d => Extent3d::new(extent.width, 1, 1),
+        TextureKind::Cube => Extent3d::new(extent.width, extent.height, 6),
+        TextureKind::Plain | TextureKind::Dim2dArray | TextureKind::Dim3d => extent,
+    }
+}
+
+pub(crate) fn texture_output_extent(extent: Extent3d, kind: TextureKind) -> Extent3d {
+    match kind {
+        TextureKind::Dim1d => Extent3d::new(extent.width, 1, 1),
+        TextureKind::Cube => Extent3d::new(extent.width, extent.height, 1),
+        TextureKind::Plain | TextureKind::Dim2dArray | TextureKind::Dim3d => extent,
+    }
+}
+
+pub(crate) fn texture_layer_count(extent: Extent3d, kind: TextureKind) -> usize {
+    match kind {
+        TextureKind::Dim2dArray => extent.depth.max(1) as usize,
+        TextureKind::Cube => 6,
+        TextureKind::Dim1d | TextureKind::Dim3d | TextureKind::Plain => 1,
+    }
+}
+
+pub(crate) fn fragment_writes_depth(sanitized_ll: &str) -> bool {
+    sanitized_ll
+        .lines()
+        .any(|line| line.contains(r#""air.depth""#))
+}
+
 pub(crate) fn texture_kind(sanitized_ll: Option<&str>, texture_location: u32) -> TextureKind {
     let Some(sanitized_ll) = sanitized_ll else {
         return TextureKind::Plain;
@@ -156,5 +186,37 @@ mod tests {
             texture_seed_bytes(&input, TextureKind::Plain, extent),
             seeded_texture_bytes_for_extent(&input, extent)
         );
+    }
+
+    #[test]
+    fn shared_shape_policy_handles_1d_cube_and_arrays() {
+        let extent = Extent3d::new(8, 8, 3);
+        assert_eq!(
+            texture_seed_extent(extent, TextureKind::Dim1d),
+            Extent3d::new(8, 1, 1)
+        );
+        assert_eq!(
+            texture_output_extent(extent, TextureKind::Dim1d),
+            Extent3d::new(8, 1, 1)
+        );
+        assert_eq!(
+            texture_seed_extent(extent, TextureKind::Cube),
+            Extent3d::new(8, 8, 6)
+        );
+        assert_eq!(
+            texture_output_extent(extent, TextureKind::Cube),
+            Extent3d::new(8, 8, 1)
+        );
+        assert_eq!(texture_layer_count(extent, TextureKind::Dim2dArray), 3);
+        assert_eq!(texture_layer_count(extent, TextureKind::Cube), 6);
+        assert_eq!(texture_layer_count(extent, TextureKind::Dim3d), 1);
+    }
+
+    #[test]
+    fn depth_output_metadata_is_detected() {
+        assert!(fragment_writes_depth(r#"!1 = !{!"air.depth", i32 0}"#));
+        assert!(!fragment_writes_depth(
+            r#"!1 = !{!"air.render_target", i32 0}"#
+        ));
     }
 }

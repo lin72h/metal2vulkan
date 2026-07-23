@@ -1,4 +1,0 @@
-# metal2vulkan broken / not-applicable cases — one JSON object per line, no shader bodies.
-# schema: {"air_sha256":"<hex>","reason":"...","label"?,"category"?: "not_applicable|harness_gap|translator_gap|oracle_hazard|other"}
-# key is SHA-256 of AIR source bytes. Blank / # lines ignored.
-# Parent monorepo analogue: not_applicable.jsonl (+ harness gaps banked here by category).

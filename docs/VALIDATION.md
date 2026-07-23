@@ -16,7 +16,7 @@ Related:
 | [`REFLECTION.md`](REFLECTION.md) | Consumer binding metadata |
 | [`../CONTRIBUTING.md`](../CONTRIBUTING.md) | Day-to-day build loop |
 | [`../validation/`](../validation/) | Optional oracle / executor crate |
-| [`../validation/corpus/`](../validation/corpus/) | Drift ledger + private corpus layout |
+| [`../validation/corpus/`](../validation/corpus/) | Translate/execution ledgers + private corpus layout |
 
 ---
 
@@ -62,7 +62,7 @@ should climb at least to **B**, and preferably **C**/**D** if you have a local h
 You want all of these to be true for the scope you claimed:
 
 1. **Synthetic suite still green** — `cargo test -p metal2vulkan -- --test-threads=1`.
-2. **No accidental SPIR-V churn** on banked cases — drift check clean, or A/B clean, *or* an
+2. **No accidental SPIR-V churn** on banked cases — A/B clean, ledger remint clean, *or* an
    intentional re-mint with a clear commit message.
 3. **No silent FALLBACK explosion** — cases that used to emit still emit (or are honestly marked
    broken / fallback in the ledger).
@@ -94,27 +94,24 @@ cargo test -p metal2vulkan -- --test-threads=1
 This is the “I refuse to trust only toy shaders” path. Output is **gitignored** — never commit it.
 
 ```sh
-# Scan prioritized system metallibs → validation/corpus/local/{air,shards,ledger}/
+# Scan prioritized system metallibs → validation/corpus/local/shards/
 # No default --limit: processes the full prioritized list (long first run).
-scripts/metal2vulkan-harvest/metal2vulkan-harvest.py
-
-# Optional: generate cargo tests that seek into the JSONL shards
-cargo run -p metal2vulkan-validation --bin metallib_gen_tests
+cargo run -p metal2vulkan-validation --release --bin corpus-harvest
 
 # Optional: bank private hashes into the committed ledger as kind=private
 # (fingerprints only — still no shader bodies in git)
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh mint --local
+cargo run -p metal2vulkan-validation --release --bin corpus-mint
 ```
 
 What harvest keeps:
 
-- Real **Kernel / Vertex / Fragment** entries with `!air.*` stage metadata → translate smokes
-- Drops metallib-embedded **helpers** without stage meta (stdlib / libcall noise)
+- Real **Kernel / Vertex / Fragment** entries with `!air.*` stage metadata → JSONL shard rows
+- Drops metallib-embedded **helpers** without stage meta (stdlib / libcall / MPS stitching)
+  so they never land in ledgers or A/B samples
 - Skips AIR larger than the configured size cap
-- Content-addresses under `local/air/` so re-runs are additive for files
+- Stores sanitized `air_ll`, optional `blob_b64`, source metallib path/hash, and shard name in JSONL
 
-Details: [`scripts/metal2vulkan-harvest/`](../scripts/metal2vulkan-harvest/),
-[`validation/corpus/README.md`](../validation/corpus/README.md).
+Details: [`validation/corpus/README.md`](../validation/corpus/README.md).
 
 ---
 
@@ -139,9 +136,7 @@ cp target/release/metal2vulkan ./m2v-old    # gitignored name pattern; fine loca
 Optional: ensure the public + local ledgers are current *before* the change:
 
 ```sh
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh mint --public
-# if you maintain private pins:
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh mint --local
+cargo run -p metal2vulkan-validation --release --bin corpus-mint
 ```
 
 ### 2. Make the change
@@ -168,59 +163,183 @@ A/B walks (when present):
 
 - `tests/fixtures/**` (private, gitignored)
 - `validation/fixtures/public/**` (committed synthetic)
-- `validation/corpus/local/air/**` (private harvest)
+- `validation/corpus/local/shards/*.jsonl` (private harvest; temp `.ll` materialized only while A/B runs)
 
-Paired harvest files use **only `.ll`** when both `stem.ll` and `stem.air` exist, so you do not
-pay double translate cost.
+Shard rows use the embedded sanitized `air_ll`; no retained `local/air` mirror is required.
 
 Exit 0 means no `DIFFERS` / asymmetric produce-vs-fail on that sample. `BOTH-FAIL` is not a
 regression (both sides FALLBACK).
 
-### 5. Hash ledger check (no need to keep two binaries forever)
+### 5. Hash ledger mint / remint (no need to keep two binaries forever)
+
+Bank AIR/SPIR-V content hashes in `validation/corpus/metal2vulkan-ledger.jsonl` (no shader bodies).
+Use byte A/B (`metal2vulkan-ab`) when you need a before/after binary compare on a live sample.
+
+After an intentional emit change (or to bank **new** hashes only):
 
 ```sh
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh check
+# additive: only air_sha256 not already in the ledger (public + local)
+cargo run -p metal2vulkan-validation --release --bin corpus-mint
+# review the ledger diff; commit only hash rows you mean to bank
 ```
 
-- **`kind: synthetic`** rows with missing sources → fail (public fixtures must stay present).
-- **`kind: private`** rows with missing AIR → skip (other developers without your harvest are fine).
-- Present sources whose SPIR-V hash moved → **DRIFT** (either fix the refactor or re-mint).
-
-After an intentional emit change:
+To re-bank existing ledger pins after a translator fix (or a full intentional re-emit):
 
 ```sh
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh mint --public
-# and if you use private pins:
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh mint --local
-# review the ledger diff; commit only hash rows you mean to publish
+# remint every banked hash still present in public fixtures or local shards
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --dry-run
+cargo run -p metal2vulkan-validation --release --bin corpus-remint
+
+# only status != ok (fallback / timeout / …)
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
 ```
 
-### 6. Private corpus translate smokes (if harvested)
+Rows without a matching public fixture or shard row are left alone. Prefer `--dry-run` first.
+
+### 6. Execution ledgers (when translate-green is not enough)
+
+Execution builds on the translate ledger and up to three backend ledgers:
+
+```text
+metal2vulkan-ledger.jsonl          # translate pins: AIR hash -> SPIR-V hash/status
+metal2vulkan-ledger-metal.jsonl    # Metal oracle: plan + golden output_b64
+metal2vulkan-ledger-moltenvk.jsonl # MoltenVK candidate vs Metal golden
+metal2vulkan-ledger-vulkan.jsonl   # Linux Vulkan candidate vs Metal golden, when produced
+```
+
+Metal is the source of truth. Candidate runners reuse the Metal row's plan and compare their bytes
+against the Metal row's `output_b64` / `output_sha256`. A candidate cannot establish its own plan
+or golden.
 
 ```sh
-cargo run -p metal2vulkan-validation --bin metallib_gen_tests   # if stubs missing/stale
-cargo test -p metal2vulkan-validation --test corpus_00 -- --test-threads=1
-# more shards as needed: corpus_01 … corpus_15
+# macOS: establish or refresh the oracle row
+cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- \
+  --air-sha256 <hash> --force --jobs 1
+
+# macOS: rerun one MoltenVK candidate row
+cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+  --air-sha256 <hash> --force --jobs 1
+
+# Linux: rerun one native Vulkan candidate row
+cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan -- \
+  --air-sha256 <hash> --force --jobs 1
 ```
 
-Each case is a **translate smoke** (and optional `spirv-val`), not a Metal-vs-Vulkan byte oracle.
-That is still enormously useful: “did I break half of QuartzCore?” shows up as a wall of red
-without needing an ICD.
-
-Reclassify without re-carving:
+For a batch over existing bad execution rows, prefer a targeted filter from `corpus-triage`:
 
 ```sh
-scripts/metal2vulkan-harvest/metal2vulkan-harvest.py --shards-only
+cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+  --status fallback --bucket "create compute pipeline" --jobs 1
+
+# Full non-success sweep; useful late, but broad.
+cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+  --failed-only --dry-run
 ```
 
-### 7. Optional execution (when translate-green is not enough)
+Runners skip hashes already present in that backend ledger unless `--force` or an existing-row
+filter is set (`--failed-only`, `--status`, `--bucket`, `--contains`). `--dry-run` lists what would
+run. The parent writes a per-run delta under the OS temp dir and then rewrites the backend ledger
+once with `air_sha256` dedupe; the last row for a hash wins.
 
-On macOS, validation’s Metal oracle and MoltenVK-backed runner can compare execution results for
-hand-built or corpus-shaped cases. On Linux, use a native Vulkan ICD. This path is the richest and
-the most environment-specific — treat it as **layer E**, not the daily default.
+Candidate statuses:
 
-See [`validation/README.md`](../validation/README.md) and the `oracle_macos` / `runner_linux`
-modules.
+| Status | Meaning | Agent action |
+|---|---|---|
+| `ok` | exact byte match | leave it alone |
+| `tolerance` | float-like output is within recorded tolerance | accepted; leave it alone unless the policy is wrong |
+| `failure` | candidate ran and produced bytes, but they do not match / exceed tolerance | inspect output class; reduce to a synthetic test when possible |
+| `fallback` | translate, bind, pipeline creation, dispatch, readback, or harness panic before comparable bytes | inspect `error`; usually a harness or executor gap |
+| `missing` | no usable Metal golden for this hash | rerun/fix `corpus-run-metal` first |
+| `quarantine` | Metal loop guard refused to dispatch | do not force GPU execution; improve loop-budget proof or accept quarantine |
+| `timeout` | worker process exceeded `METAL2VULKAN_CORPUS_TIMEOUT_SECS` | rerun single-case with `--jobs 1`; treat persistent timeouts as harness/tool hangs |
+
+Use `corpus-triage` to see the current queue:
+
+```sh
+# summarize all ledgers and list the first non-success rows
+cargo run -p metal2vulkan-validation --release --bin corpus-triage
+
+# group/list MoltenVK failures and print reproduction commands
+cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
+  --backend moltenvk --status fallback --contains pipeline --commands
+```
+
+On macOS, validation's Metal oracle and MoltenVK-backed runner are machine-specific. On Linux, use
+a native Vulkan ICD. Treat execution as **layer E**, not the daily default.
+
+### 7. Agent loop over ledger failures
+
+An agent should not start by rerunning the whole corpus. The useful loop is:
+
+1. **Pick a bucket, not a random row.**
+
+   ```sh
+   cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
+     --backend moltenvk --limit 0
+   ```
+
+   Work the largest actionable bucket first: pipeline creation panics, missing Metal rows, output
+   mismatches, timeouts, etc. Quarantines are a loop-budget project, not a candidate rerun project.
+
+2. **Pull one reproducible hash with commands.**
+
+   ```sh
+   cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
+     --backend moltenvk --status fallback --contains "create vertex validation pipeline" --commands
+   ```
+
+3. **Diagnose translate separately from execution.**
+
+   ```sh
+   cargo run -p metal2vulkan-validation --release --bin corpus-why -- <hash>
+   cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+     --air-sha256 <hash> --force --jobs 1
+   ```
+
+   If the Metal row is missing, stale, or not `status=ok`, fix/rerun Metal before touching the
+   candidate path.
+
+4. **Classify the bug before editing.**
+
+   | Observation | Likely owner |
+   |---|---|
+   | `corpus-why` FALLBACKs | product translator / stage detect |
+   | Metal `fallback` with oracle error | Metal harness / oracle limitation |
+   | Candidate `fallback` with `vulkan execute panicked` | Vulkan/MoltenVK executor harness |
+   | Candidate `failure` with output bytes | product semantics, plan mismatch, or tolerance policy |
+   | Candidate `missing` | Metal ledger is absent or stale |
+   | Persistent `timeout` | harness/tool hang; rerun single-case before broad changes |
+
+5. **Make the smallest structural fix and add a synthetic test when it is a translator class.**
+   Execution-ledger rows are evidence; CI protection still comes from owned fixtures/tests.
+
+6. **Rerun the same hash, then the bucket.**
+
+   ```sh
+   cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+     --air-sha256 <hash> --force --jobs 1
+   cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+     --status fallback --bucket "create vertex validation pipeline" --jobs 1
+   ```
+
+   `--failed-only` is the whole existing non-success queue; use it as a dry-run or late sweep, not
+   as the first bucket loop.
+
+7. **Commit only intentional ledger movement.**
+   A single forced rerun rewrites the row for that `air_sha256` during delta merge. Review the JSONL
+   diff: `fallback -> ok`, `failure -> ok`, or `failure -> tolerance` are meaningful; a changed
+   `output_b64` without an explanation is not.
+
+For risky reruns, work against copied ledgers:
+
+```sh
+mkdir -p /tmp/m2v-ledgers
+cp validation/corpus/metal2vulkan-ledger.jsonl /tmp/m2v-ledgers/
+cp validation/corpus/metal2vulkan-ledger-metal.jsonl /tmp/m2v-ledgers/
+
+cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
+  --ledger-dir /tmp/m2v-ledgers --air-sha256 <hash> --force --jobs 1
+```
 
 ---
 
@@ -230,14 +349,14 @@ modules.
 
 1. Synthetic tests (**A**).
 2. Save `m2v-old`, implement, A/B (**B**).
-3. `drift check` on public + any local pins (**C**).
-4. If you harvest: corpus smokes (**D**).
+3. `corpus-remint --dry-run` / `corpus-remint` on public + any local pins (**C**).
+4. If you harvest: `corpus-mint` for new rows and `corpus-triage` for execution queues (**D/E**).
 5. Re-mint only if you *meant* SPIR-V to move, and say so in the commit.
 
 ### “I fixed one FALLBACK class”
 
 1. Add a **synthetic** regression that would have failed before (so CI owns the class).
-2. Confirm the real metallib case (if you have it under `local/air`) translates.
+2. Confirm the real metallib case (if you have it in a local shard) translates.
 3. Optionally bank its hashes so the fix cannot silently reverse.
 
 ### “I only touched docs / scripts / validation helpers”
@@ -247,16 +366,14 @@ Stay on **A** for the product crate; run validation package tests if you edited 
 ### “I need a new public sample everyone can run”
 
 1. Author a **small owned** `.ll` under `validation/fixtures/public/` (no third-party capture).
-2. `mint --public` and commit the fixture + ledger row.
+2. Run `corpus-mint` and commit the fixture + the new `kind=synthetic` translate-ledger row.
 3. Never paste system-metallib AIR into the public tree.
 
 ### “Harvest is huge / slow”
 
-- First full harvest is the expensive one; `air/` is content-addressed, re-runs skip existing
-  blobs.
+- Full harvest is expensive because it re-carves and rewrites shard JSONL.
 - Use `--limit` / `--offset` only when batching deliberately.
-- Prefer `--shards-only` when only classification changed.
-- Drift/A/B prefer `.ll` over paired `.air` — one translate per stem.
+- A/B and corpus ledger tools materialize temporary `.ll` files from shard `air_ll` rows.
 
 ---
 
@@ -268,23 +385,22 @@ Stay on **A** for the product crate; run validation package tests if you edited 
 | `src/`, `tests/` (product) | yes | yes | Published package |
 | `validation/` workspace member | yes | **no** | `publish = false` + root `exclude` |
 | `validation/fixtures/public/*.ll` | yes | **no** | Repo-only owned samples |
-| `validation/corpus/drift-ledger.jsonl` | yes | **no** | Hashes only, not in product crate |
-| `validation/corpus/tolerances.jsonl` | yes | **no** | Repo-only |
-| `validation/corpus/broken.jsonl` | yes | **no** | Repo-only |
-| `validation/corpus/local/**` | **no** | **no** | Metallibs, AIR, shards |
-| `validation/tests/corpus_*.rs` | **no** | **no** | Generated local stubs |
+| `validation/corpus/metal2vulkan-ledger.jsonl` | yes | **no** | Translate hashes only |
+| `validation/corpus/metal2vulkan-ledger-*.jsonl` | optional | **no** | Execution plans + deterministic input/output digests + `output_b64`; hash-identified, no AIR bodies |
+| `validation/corpus/local/**` | **no** | **no** | Private shard JSONL (`air_ll` + optional AIR blob) |
 | `scripts/`, `docs/` | yes | **no** | Root package `exclude` |
 | `m2v-old`, `*.spv` dumps | **no** | **no** | Local experiment debris |
 
-**Rule of thumb:** if it contains Apple or app shader bodies, it stays private. If it is only a
-SHA-256 and a reason string, it may be public **in the git repo**, but still is **not** shipped
-inside the `metal2vulkan` crates.io tarball (validation is a separate, non-published package).
+**Rule of thumb:** if it contains Apple or app shader bodies, it stays private. Hash-identified
+translate and execution ledgers may be public **in the git repo** for reproducibility, but still are
+**not** shipped inside the `metal2vulkan` crates.io tarball (validation is a separate, non-published
+package).
 
 Verify before a release:
 
 ```sh
 cargo package --list
-# must not list validation/, corpus/, *.air, harvest scripts, etc.
+# must not list validation/, docs/, scripts/, private corpus rows, *.air, *.spv, etc.
 cargo publish --dry-run
 ```
 
@@ -295,12 +411,17 @@ cargo publish --dry-run
 | Tool | Path | One-liner |
 |---|---|---|
 | Unit tests | `cargo test -p metal2vulkan` | Synthetic regressions |
-| Harvest | `scripts/metal2vulkan-harvest/` | System metallib → `local/` |
-| Gen corpus tests | `metallib_gen_tests` | JSONL → gitignored `corpus_NN.rs` |
-| Drift ledger | `scripts/metal2vulkan-drift/` | AIR/SPIR-V hash mint + check |
+| Harvest | `corpus-harvest` | System metallib → shard JSONL |
+| `corpus-mint` | validation bin | Append new translate `air_sha256` pins |
+| `corpus-remint` | validation bin | Re-translate existing pins (`--failed-only`) |
+| `corpus-why` | validation bin | One `air_sha256` → translate error string |
+| `corpus-run-metal` | validation bin | Metal oracle → plan + golden `output_b64` + digests |
+| `corpus-run-vulkan` | validation bin | Linux Vulkan vs metal golden |
+| `corpus-run-moltenvk` | validation bin | MoltenVK vs metal golden |
+| `corpus-triage` | validation bin | Summarize ledgers and print failure rerun commands |
 | Byte A/B | `scripts/metal2vulkan-ab/` | Two binaries, one sample |
 | AIR carve | `scripts/mtlb-extract/` | Low-level MTLB → `.air` |
-| SPIR-V delta class | `validation` `spirv_delta` | Classify id/order vs semantic delta |
+| SPIR-V delta class | `spirv_delta` validation bin | Classify id/order vs semantic delta |
 | Pipeline probe | `spirv_pipeline_probe` | Module + pipeline create |
 | Oracle / runner | `validation` lib | Execution experiments |
 
@@ -313,8 +434,6 @@ cargo publish --dry-run
 | Unit red | You broke a structural case | Fix or update the synthetic test honestly |
 | A/B `DIFFERS` | SPIR-V bytes moved | Revert, or re-mint if intentional |
 | A/B `NEW-ONLY` / `OLD-ONLY` | One side FALLBACKs | Investigate emit path / stage detect |
-| Drift `DRIFT` | Ledger out of date vs HEAD | Same as A/B |
-| Drift `MISSING` synthetic | Public fixture deleted | Restore fixture or drop ledger row |
 | Corpus mass FAIL | Broad emit regression | Bisect; do not name-key harvest cases |
 | Corpus sparse FAIL | Narrow class | Reduce to synthetic `.ll`, land unit test |
 | spirv-val fail after translate | Invalid module | Prefer honest FALLBACK over wrong SPIR-V |
@@ -345,13 +464,17 @@ cargo build --release --bin metal2vulkan && cp target/release/metal2vulkan ./m2v
 # After
 cargo build --release --bin metal2vulkan
 scripts/metal2vulkan-ab/metal2vulkan-ab.sh --old ./m2v-old
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh check
 
 # Once per machine (macOS): fat private sample
-scripts/metal2vulkan-harvest/metal2vulkan-harvest.py
-cargo run -p metal2vulkan-validation --bin metallib_gen_tests
-scripts/metal2vulkan-drift/metal2vulkan-drift.sh mint --local
+cargo run -p metal2vulkan-validation --release --bin corpus-harvest
+cargo run -p metal2vulkan-validation --release --bin corpus-mint
+# optional execution goldens (see plan.md / validation/README.md)
+# cargo run -p metal2vulkan-validation --release --bin corpus-run-metal
+# cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan
 ```
+
+Corpus ledger CLIs (full flag list and pipeline): [`validation/README.md`](../validation/README.md),
+[`validation/corpus/README.md`](../validation/corpus/README.md), [`plan.md`](../plan.md).
 
 When the ladder is green at the height you chose, ship the refactor. When it is not, the failure
 is a gift: it named a class before a user did.

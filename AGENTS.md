@@ -90,14 +90,16 @@ fixes over one-off workarounds.
 ### What not to commit
 
 - Apple-owned binaries, guest disk images, mined metallib/AIR corpora, or private golden sets
-- Contents of `validation/corpus/local/`, generated `validation/tests/corpus_*.rs`, raw `*.metallib`
-  / `*.air` / `*.spv` dumps (all gitignored — see `validation/corpus/README.md`)
+- Contents of `validation/corpus/local/`, raw `*.metallib` / `*.air` / `*.spv` dumps
+  (all gitignored — see `validation/corpus/README.md`)
 - `target/`, `Cargo.lock` (gitignored for this library-first tree), `.cache/`
 - Name-keyed special cases “just to pass one case”
 
 **Allowed (committed):** synthetic fixtures under `validation/fixtures/public/`;
-`validation/corpus/drift-ledger.jsonl` (AIR + SPIR-V hashes); `tolerances.jsonl` and
-`broken.jsonl` (AIR fingerprints + tolerance / skip metadata — **no** shader bodies).
+`validation/corpus/metal2vulkan-ledger.jsonl` (AIR + SPIR-V translate hashes only — **no**
+shader bodies). Execution ledgers (`metal2vulkan-ledger-{metal,vulkan,moltenvk}.jsonl`) may be
+committed for reproducibility: they store hash-identified plans, deterministic input/output
+digests, and `output_b64` payloads, but never AIR source bodies.
 
 ## Layout & ownership
 

@@ -16,11 +16,13 @@ validation/tests/fixtures/
 *.spv
 *.spvasm
 
-# Optional private metallib corpus (mined data + generated nextest stubs).
-# Committed under validation/corpus/: README.md + drift-ledger.jsonl (hashes only).
+# Optional private metallib corpus (mined data).
+# Committed under validation/corpus/: README.md + metal2vulkan-ledger.jsonl (translate hashes).
+# Execution goldens (metal/vulkan/moltenvk JSONL) may be committed for reproducibility:
+# hash-identified plans, deterministic digests, and output_b64 payloads; no AIR bodies.
 # Everything under local/ is user-supplied and must never be committed.
 validation/corpus/local/
-validation/tests/corpus_*.rs
+*.jsonl.tmp
 
 # OS / editor
 .DS_Store

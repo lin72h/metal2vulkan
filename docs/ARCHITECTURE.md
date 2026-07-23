@@ -161,8 +161,9 @@ refactoring, what to commit, recipes by change type) lives in **[`VALIDATION.md`
 | Unit + integration | `cargo test -- --test-threads=1` | translator regressions |
 | SPIR-V delta class | validation `classify_spirv_delta` | id/order vs semantic drift |
 | Byte A/B | `scripts/metal2vulkan-ab/` | drift on a local sample |
-| Hash ledger | `scripts/metal2vulkan-drift/` | AIR/SPIR-V sha256 pins (no bodies) |
-| Private corpus (optional) | `validation/corpus/local/` + `corpus_*.rs` | local translate smokes |
+| Translate ledger | `corpus-mint` / `corpus-remint` / `corpus-why` | AIR/SPIR-V sha256 pins |
+| Execution ledgers | `corpus-run-metal` / `-vulkan` / `-moltenvk` | plan + `output_b64` + digests (JSONL) |
+| Private corpus (optional) | `validation/corpus/local/` | local shard source for ledgers / A/B |
 | Metal oracle (optional) | `validation` on macOS | host Metal execution |
 | Vulkan executor (optional) | `validation` runner | candidate vs oracle bytes |
 

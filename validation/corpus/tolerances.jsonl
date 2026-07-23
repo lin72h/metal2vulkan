@@ -1,3 +1,0 @@
-# metal2vulkan corpus tolerances — one JSON object per line, no shader bodies.
-# schema: {"air_sha256":"<hex>","label"?,"tolerance":{"kind":"Exact|Abs|Ulp|RawF16Ulp|RawU8Ulp|AbsAndUlp",...}}
-# key is SHA-256 of AIR source bytes (.ll text or .air blob). Blank / # lines ignored.
