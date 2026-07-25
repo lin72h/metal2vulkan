@@ -19,20 +19,21 @@ struct AccessChainDef {
 /// Lower the simple StorageBuffer shape:
 ///
 /// ```text
-/// %base = OpAccessChain    %_ptr_StorageBuffer_T %root ... %zero
+/// %base = OpAccessChain    %_ptr_StorageBuffer_T %root ... %base_index
 /// %ptr  = OpPtrAccessChain %_ptr_StorageBuffer_U %base %dynamic ...
 /// ```
 ///
 /// to:
 ///
 /// ```text
-/// %ptr = OpAccessChain %_ptr_StorageBuffer_U %root ... %dynamic ...
+/// %sum = OpIAdd %idx_ty %base_index %dynamic  ; omitted when base_index is zero
+/// %ptr = OpAccessChain %_ptr_StorageBuffer_U %root ... %sum ...
 /// ```
 ///
-/// but only when `%zero` indexes an array/runtime-array element, and the recomputed access-chain
-/// pointee matches the original result type. This preserves byte address semantics while avoiding
-/// `VariablePointersStorageBuffer` for address math that is expressible as a normal logical access
-/// chain.
+/// but only when `%base_index` indexes an array/runtime-array element, the dynamic offset has the same
+/// integer type when addition is needed, and the recomputed access-chain pointee matches the original
+/// result type. This preserves byte address semantics while avoiding `VariablePointersStorageBuffer`
+/// for address math that is expressible as a normal logical access chain.
 pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Module) -> usize {
     let defs = collect_defs(module);
     let zero_constants = zero_integer_constants(&defs);
@@ -41,7 +42,13 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
         return 0;
     }
 
-    let mut rewrites: HashMap<Word, Vec<Operand>> = HashMap::new();
+    struct Rewrite {
+        operands: Vec<Operand>,
+        add: Option<(Word, Word, Word, Word)>, // result, type, lhs, rhs
+    }
+
+    let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(0);
+    let mut rewrites: HashMap<Word, Rewrite> = HashMap::new();
     for inst in module
         .functions
         .iter()
@@ -75,12 +82,6 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
         if base_chain.indices.is_empty() {
             continue;
         }
-        let Some(last_base_index) = base_chain.indices.last() else {
-            continue;
-        };
-        if !zero_constants.contains(last_base_index) {
-            continue;
-        }
         let Some(parent) = base_chain.parent_before_last else {
             continue;
         };
@@ -96,7 +97,25 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
 
         let mut new_indices = Vec::with_capacity(base_chain.indices.len() + ptr_indices.len() - 1);
         new_indices.extend_from_slice(&base_chain.indices[..base_chain.indices.len() - 1]);
-        new_indices.extend_from_slice(&ptr_indices);
+        let Some(last_base_index) = base_chain.indices.last() else {
+            continue;
+        };
+        let add = if zero_constants.contains(last_base_index) {
+            new_indices.push(ptr_indices[0]);
+            None
+        } else {
+            let Some(index_ty) = integer_value_type(&defs, *last_base_index) else {
+                continue;
+            };
+            if integer_value_type(&defs, ptr_indices[0]) != Some(index_ty) {
+                continue;
+            }
+            let sum = next_id;
+            next_id += 1;
+            new_indices.push(sum);
+            Some((sum, index_ty, *last_base_index, ptr_indices[0]))
+        };
+        new_indices.extend_from_slice(&ptr_indices[1..]);
         if walk_access_chain_pointee(&defs, root_pointee, &new_indices) != Some(result_pointee) {
             continue;
         }
@@ -104,7 +123,7 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
         let mut operands = Vec::with_capacity(1 + new_indices.len());
         operands.push(Operand::IdRef(base_chain.root));
         operands.extend(new_indices.into_iter().map(Operand::IdRef));
-        rewrites.insert(result_id, operands);
+        rewrites.insert(result_id, Rewrite { operands, add });
     }
 
     if rewrites.is_empty() {
@@ -112,21 +131,44 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
     }
 
     let mut changed = 0;
-    for inst in module
+    for block in module
         .functions
         .iter_mut()
         .flat_map(|function| &mut function.blocks)
-        .flat_map(|block| &mut block.instructions)
     {
-        let Some(result_id) = inst.result_id else {
-            continue;
-        };
-        let Some(operands) = rewrites.remove(&result_id) else {
-            continue;
-        };
-        inst.class.opcode = Op::AccessChain;
-        inst.operands = operands;
-        changed += 1;
+        let mut pos = 0;
+        while pos < block.instructions.len() {
+            let Some(result_id) = block.instructions[pos].result_id else {
+                pos += 1;
+                continue;
+            };
+            let Some(rewrite) = rewrites.remove(&result_id) else {
+                pos += 1;
+                continue;
+            };
+            if let Some((sum, ty, lhs, rhs)) = rewrite.add {
+                block.instructions.insert(
+                    pos,
+                    Instruction::new(
+                        Op::IAdd,
+                        Some(ty),
+                        Some(sum),
+                        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+                    ),
+                );
+                pos += 1;
+            }
+            block.instructions[pos].class.opcode = Op::AccessChain;
+            block.instructions[pos].operands = rewrite.operands;
+            changed += 1;
+            pos += 1;
+        }
+    }
+
+    if changed != 0 {
+        if let Some(header) = module.header.as_mut() {
+            header.bound = next_id;
+        }
     }
     changed
 }
@@ -262,6 +304,11 @@ fn is_zero_integer_constant(defs: &HashMap<Word, Instruction>, inst: &Instructio
             | (Op::Constant, [Operand::LiteralBit32(0)])
             | (Op::Constant, [Operand::LiteralBit64(0)])
     )
+}
+
+fn integer_value_type(defs: &HashMap<Word, Instruction>, id: Word) -> Option<Word> {
+    let ty = defs.get(&id)?.result_type?;
+    (defs.get(&ty)?.class.opcode == Op::TypeInt).then_some(ty)
 }
 
 fn constant_u32(defs: &HashMap<Word, Instruction>, id: Word) -> Option<u32> {

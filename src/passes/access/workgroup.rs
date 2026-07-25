@@ -238,6 +238,213 @@ pub(in crate::passes) fn remodel_workgroup_flatword_aggregate(ctx: &mut Ctx, ent
     }
 }
 
+/// Retype Workgroup `[N x struct { T }]` variables to `[N x T]` when every use immediately selects
+/// field 0. AIR uses this shape for `threadgroup atomic<T> bins[N]`; the single-field struct is
+/// layout-neutral for Workgroup memory, and flattening it avoids fragile atomic access chains that
+/// select through a redundant aggregate layer.
+pub(in crate::passes) fn remodel_workgroup_single_field_struct_array(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    let mut defs: HashMap<Word, Instruction> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if let Some(result) = inst.result_id {
+            defs.insert(result, inst.clone());
+        }
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*sc, *pointee));
+            }
+        }
+    }
+
+    let mut cands = Vec::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode != Op::Variable {
+            continue;
+        }
+        let (Some(var), Some(ptr_ty)) = (inst.result_id, inst.result_type) else {
+            continue;
+        };
+        let Some(&(StorageClass::Workgroup, arr_ty)) = ptr_info.get(&ptr_ty) else {
+            continue;
+        };
+        let Some(arr_def) = defs.get(&arr_ty) else {
+            continue;
+        };
+        if arr_def.class.opcode != Op::TypeArray {
+            continue;
+        }
+        let (Some(Operand::IdRef(struct_ty)), Some(Operand::IdRef(len_c))) =
+            (arr_def.operands.first(), arr_def.operands.get(1))
+        else {
+            continue;
+        };
+        let Some(struct_def) = defs.get(struct_ty) else {
+            continue;
+        };
+        if struct_def.class.opcode != Op::TypeStruct || struct_def.operands.len() != 1 {
+            continue;
+        }
+        let Some(Operand::IdRef(field_ty)) = struct_def.operands.first() else {
+            continue;
+        };
+        if direct_scalar_width(ctx, *field_ty).is_none() || const_u32(ctx, *len_c).is_none() {
+            continue;
+        }
+        cands.push((var, *len_c, *field_ty));
+    }
+
+    for (var, len_c, field_ty) in cands {
+        let Some(chains) = validate_single_field_struct_array_uses(
+            ctx,
+            &ctx.module.functions[entry_idx],
+            var,
+            field_ty,
+            &ptr_info,
+        ) else {
+            continue;
+        };
+
+        let arr_ty = ctx.module.fresh_id();
+        let new_var_ptr = ctx.module.fresh_id();
+        let synthesized = vec![
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(arr_ty),
+                vec![Operand::IdRef(field_ty), Operand::IdRef(len_c)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(new_var_ptr),
+                vec![
+                    Operand::StorageClass(StorageClass::Workgroup),
+                    Operand::IdRef(arr_ty),
+                ],
+            ),
+        ];
+        let chain_ptr = ctx.ty_ptr(StorageClass::Workgroup, field_ty);
+        let is_var = |i: &Instruction| i.class.opcode == Op::Variable && i.result_id == Some(var);
+        if let Some(p) = ctx.module.types_global_values.iter().position(is_var) {
+            ctx.module.types_global_values[p].result_type = Some(new_var_ptr);
+            let tail = ctx.module.types_global_values.split_off(p);
+            ctx.module.types_global_values.extend(synthesized);
+            ctx.module.types_global_values.extend(tail);
+        } else if let Some(p) = ctx.new_globals.iter().position(is_var) {
+            ctx.new_globals[p].result_type = Some(new_var_ptr);
+            let tail = ctx.new_globals.split_off(p);
+            ctx.new_globals.extend(synthesized);
+            ctx.new_globals.extend(tail);
+        } else {
+            continue;
+        }
+
+        for &(bi, ii) in &chains {
+            let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
+            inst.result_type = Some(chain_ptr);
+            inst.operands.truncate(2);
+        }
+    }
+}
+
+fn validate_single_field_struct_array_uses(
+    ctx: &Ctx,
+    func: &Function,
+    var: Word,
+    field_ty: Word,
+    ptr_info: &HashMap<Word, (StorageClass, Word)>,
+) -> Option<Vec<(usize, usize)>> {
+    let mut chains = Vec::new();
+    let mut chain_ids = HashSet::new();
+    for (bi, block) in func.blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            let mentions_var = inst
+                .operands
+                .iter()
+                .any(|o| matches!(o, Operand::IdRef(id) if *id == var));
+            if !mentions_var {
+                continue;
+            }
+            if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                || inst.operands.len() != 3
+                || operand_id(inst, 0) != Some(var)
+                || operand_id(inst, 2).and_then(|id| const_u32(ctx, id)) != Some(0)
+                || inst.result_type.and_then(|ty| ptr_info.get(&ty).copied())
+                    != Some((StorageClass::Workgroup, field_ty))
+            {
+                return None;
+            }
+            chains.push((bi, ii));
+            chain_ids.insert(inst.result_id?);
+        }
+    }
+    if chains.is_empty() {
+        return None;
+    }
+
+    for block in &func.blocks {
+        for inst in &block.instructions {
+            if inst
+                .result_id
+                .is_some_and(|result| chain_ids.contains(&result))
+                && matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+            {
+                continue;
+            }
+            match inst.class.opcode {
+                Op::Load => {
+                    if operand_id(inst, 0).is_some_and(|ptr| chain_ids.contains(&ptr))
+                        && inst.result_type != Some(field_ty)
+                    {
+                        return None;
+                    }
+                }
+                Op::Store => {
+                    if operand_id(inst, 0).is_some_and(|ptr| chain_ids.contains(&ptr))
+                        && operand_id(inst, 1).and_then(|value| value_result_type(ctx, value))
+                            != Some(field_ty)
+                    {
+                        return None;
+                    }
+                }
+                op if is_atomic_pointer_op(op) => {
+                    if !operand_id(inst, 0).is_some_and(|ptr| chain_ids.contains(&ptr))
+                        && inst
+                            .operands
+                            .iter()
+                            .any(|o| matches!(o, Operand::IdRef(id) if chain_ids.contains(id)))
+                    {
+                        return None;
+                    }
+                }
+                _ => {
+                    if inst
+                        .operands
+                        .iter()
+                        .any(|o| matches!(o, Operand::IdRef(id) if chain_ids.contains(id)))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(chains)
+}
+
 /// Whether `op` is an atomic instruction whose FIRST operand is the pointer it operates on (the whole
 /// `OpAtomic*` family relevant to the float-as-uint idiom — min/max/exchange and the integer RMWs).
 pub(in crate::passes) fn is_atomic_pointer_op(op: Op) -> bool {

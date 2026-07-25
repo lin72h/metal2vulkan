@@ -92,9 +92,13 @@ them.
 ```sh
 cargo run -p metal2vulkan-validation --release --bin corpus-remint
 cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only --status fallback --limit 50
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --status timeout --skip 50 --limit 50 --case-timeout-secs 60
 ```
 
-Flags: `--jobs N`, `--quiet`, `--ledger PATH`, `--dry-run`, `--failed-only`.
+Flags: `--jobs N`, `--quiet`, `--ledger PATH`, `--dry-run`, `--failed-only`, `--status STATUS`,
+`--contains TEXT`, `--skip N`, `--limit N`, `--case-timeout-secs N` (`0` keeps the legacy
+in-process path).
 
 ### `corpus-why` — diagnose one translate failure
 
@@ -149,6 +153,8 @@ cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan
 Without a metal golden for a hash → candidate status `missing`.
 `status=tolerance` is an accepted candidate success; it records the policy and observed margins on
 the candidate row.
+`status=smoke` is also an accepted candidate success; it means the candidate executed and captured
+bytes, but the Metal row was `compare=none` and is not a semantic golden.
 
 ### `corpus-run-moltenvk` — MoltenVK candidate (macOS)
 
@@ -221,9 +227,10 @@ select existing backend rows.
 ### Execution ledgers (metal / vulkan / moltenvk)
 
 See [`plan.md`](../../plan.md): metal row owns harness **plan** + golden `output_b64`; candidate rows
-record `status` (`ok` / `tolerance` / `failure` / `missing` / `fallback` / `quarantine`) and may
-embed `tolerance` / `observed` on the same line. A metal row may also be `quarantine` (unbounded /
-uninstrumentable loop — not dispatched); candidates record `status=quarantine` for that hash.
+record `status` (`ok` / `tolerance` / `smoke` / `failure` / `missing` / `fallback` /
+`quarantine`) and may embed `tolerance` / `observed` on the same line. A metal row may also be
+`quarantine` (unbounded / uninstrumentable loop — not dispatched); candidates record
+`status=quarantine` for that hash.
 
 ## Byte A/B
 

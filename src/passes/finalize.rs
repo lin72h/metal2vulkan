@@ -36,6 +36,8 @@ pub(in crate::passes) fn finalize(
     let globals = std::mem::take(&mut ctx.new_globals);
     ctx.module.types_global_values.extend(globals);
     rewrite_resource_query_selects(ctx)?;
+    let globals = std::mem::take(&mut ctx.new_globals);
+    ctx.module.types_global_values.extend(globals);
 
     let entry_id = ctx.module.functions[entry_idx]
         .def

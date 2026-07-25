@@ -131,6 +131,7 @@ pub(in crate::passes) fn rewrite_resource_query_selects(ctx: &mut Ctx) -> Result
         return Ok(());
     }
 
+    let mut rewritten_value_types: HashMap<Word, Word> = HashMap::new();
     for function_idx in 0..ctx.module.functions.len() {
         for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
             let old = std::mem::take(
@@ -168,18 +169,36 @@ pub(in crate::passes) fn rewrite_resource_query_selects(ctx: &mut Ctx) -> Result
                         *f_op = Operand::IdRef(sel.false_value);
                     }
                 }
+                let true_result_type = duplicated_resource_use_result_type(
+                    ctx,
+                    &rewritten_value_types,
+                    &inst,
+                    result_type,
+                    used_id,
+                    sel.true_value,
+                );
+                let false_result_type = duplicated_resource_use_result_type(
+                    ctx,
+                    &rewritten_value_types,
+                    &inst,
+                    result_type,
+                    used_id,
+                    sel.false_value,
+                );
                 new_insts.push(Instruction::new(
                     inst.class.opcode,
-                    Some(result_type),
+                    Some(true_result_type),
                     Some(true_use),
                     true_ops,
                 ));
                 new_insts.push(Instruction::new(
                     inst.class.opcode,
-                    Some(result_type),
+                    Some(false_result_type),
                     Some(false_use),
                     false_ops,
                 ));
+                rewritten_value_types.insert(true_use, true_result_type);
+                rewritten_value_types.insert(false_use, false_result_type);
                 if let Some(cascade) = candidates.get_mut(&result) {
                     cascade.true_value = true_use;
                     cascade.false_value = false_use;
@@ -199,7 +218,82 @@ pub(in crate::passes) fn rewrite_resource_query_selects(ctx: &mut Ctx) -> Result
             ctx.module.functions[function_idx].blocks[block_idx].instructions = new_insts;
         }
     }
+    repair_sampled_image_result_types(ctx);
     Ok(())
+}
+
+fn duplicated_resource_use_result_type(
+    ctx: &mut Ctx,
+    local_value_types: &HashMap<Word, Word>,
+    inst: &Instruction,
+    fallback: Word,
+    used_id: Word,
+    replacement: Word,
+) -> Word {
+    if inst.class.opcode != Op::SampledImage
+        || inst.operands.first() != Some(&Operand::IdRef(used_id))
+    {
+        return fallback;
+    }
+    image_type_for_sampled_operand(ctx, local_value_types, replacement)
+        .map(|image_ty| ctx.ty_sampled_image(image_ty))
+        .unwrap_or(fallback)
+}
+
+fn image_type_for_sampled_operand(
+    ctx: &Ctx,
+    local_value_types: &HashMap<Word, Word>,
+    image: Word,
+) -> Option<Word> {
+    let ty = local_value_types
+        .get(&image)
+        .copied()
+        .or_else(|| value_result_type(ctx, image))?;
+    let def = type_def_of(ctx, ty)?;
+    if def.class.opcode == Op::TypeImage {
+        return Some(ty);
+    }
+    if def.class.opcode != Op::TypePointer {
+        return None;
+    }
+    let pointee = match def.operands.get(1)? {
+        Operand::IdRef(pointee) => *pointee,
+        _ => return None,
+    };
+    type_def_of(ctx, pointee)
+        .filter(|pointee_def| pointee_def.class.opcode == Op::TypeImage)
+        .map(|_| pointee)
+}
+
+fn repair_sampled_image_result_types(ctx: &mut Ctx) {
+    let mut updates = Vec::new();
+    let empty = HashMap::new();
+    for function_idx in 0..ctx.module.functions.len() {
+        for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
+            for inst_idx in 0..ctx.module.functions[function_idx].blocks[block_idx]
+                .instructions
+                .len()
+            {
+                let inst =
+                    &ctx.module.functions[function_idx].blocks[block_idx].instructions[inst_idx];
+                if inst.class.opcode != Op::SampledImage {
+                    continue;
+                }
+                let Some(Operand::IdRef(image)) = inst.operands.first() else {
+                    continue;
+                };
+                let Some(image_ty) = image_type_for_sampled_operand(ctx, &empty, *image) else {
+                    continue;
+                };
+                updates.push((function_idx, block_idx, inst_idx, image_ty));
+            }
+        }
+    }
+    for (function_idx, block_idx, inst_idx, image_ty) in updates {
+        let sampled_ty = ctx.ty_sampled_image(image_ty);
+        ctx.module.functions[function_idx].blocks[block_idx].instructions[inst_idx].result_type =
+            Some(sampled_ty);
+    }
 }
 
 fn is_duplicable_resource_use(inst: &Instruction, id: Word) -> bool {

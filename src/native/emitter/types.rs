@@ -354,6 +354,47 @@ impl Emitter {
                         ));
                     }
                     (self.result_id(name, &have_ty)?, have_ty)
+                } else if self.pointer_phi_values.contains(name) {
+                    let Some(have_ty) = self.tir_result_types.get(name).cloned() else {
+                        return Err(format!("native emitter: unknown SSA value {name}"));
+                    };
+                    let want = self.resolve_type(ty)?;
+                    let have = self.resolve_type(&have_ty)?;
+                    if !types_compatible(&have, &want) {
+                        return Err(format!(
+                            "native emitter: SSA value {name} has type {have:?}, used as {want:?}"
+                        ));
+                    }
+                    if let LlType::Ptr(addrspace) = have {
+                        self.reserve_pointer_phi_provenance(name)?;
+                        let merge_meta = self
+                            .tir_phi_incomings
+                            .get(name)
+                            .cloned()
+                            .map(|incoming| {
+                                self.pointer_merge_meta(
+                                    &incoming.iter().map(|(value, _)| value).collect::<Vec<_>>(),
+                                    &have_ty,
+                                )
+                            })
+                            .transpose()?
+                            .flatten();
+                        self.pointer_storage
+                            .entry(name.clone())
+                            .or_insert(match &merge_meta {
+                                Some(meta) => meta.storage,
+                                None => llvm_pointer_storage(addrspace)?,
+                            });
+                        if !self.pointer_pointees.contains_key(name) {
+                            if let Some(pointee) = merge_meta
+                                .and_then(|meta| meta.pointee)
+                                .or_else(|| self.tir_use_pointees.get(name).cloned())
+                            {
+                                self.pointer_pointees.insert(name.clone(), pointee);
+                            }
+                        }
+                    }
+                    (self.result_id(name, &have_ty)?, have_ty)
                 } else {
                     return Err(format!("native emitter: unknown SSA value {name}"));
                 };

@@ -3,6 +3,18 @@
 use super::*;
 
 impl Emitter {
+    fn raw_index_const_u32(raw: &RawBufferOffset, off: i64, unit: &str) -> Result<u32, String> {
+        if (0..=u32::MAX as i64).contains(&off) {
+            return Ok(off as u32);
+        }
+        if off < 0 && !raw.dyn_terms.is_empty() && off >= i32::MIN as i64 {
+            return Ok(off as u32);
+        }
+        Err(format!(
+            "native emitter: raw buffer {unit} offset {off} is out of range"
+        ))
+    }
+
     pub(in crate::native::emitter) fn emit_raw_pointer_payload(
         &mut self,
         raw: &RawBufferOffset,
@@ -351,12 +363,7 @@ impl Emitter {
             return Err("native emitter: raw buffer offset is not modelable".into());
         }
         let off = raw.const_off + extra_byte as i64;
-        if off < 0 || off > u32::MAX as i64 {
-            return Err(format!(
-                "native emitter: raw buffer byte offset {off} is out of range"
-            ));
-        }
-        let mut acc = self.const_uint(off as u32)?;
+        let mut acc = self.const_uint(Self::raw_index_const_u32(raw, off, "byte")?)?;
         let uint_ty = self.type_id(&LlType::Int(32))?;
         for (index, stride) in &raw.dyn_terms {
             if *stride < 0 {
@@ -402,12 +409,7 @@ impl Emitter {
     ) -> Result<Word, String> {
         let off = raw.const_off + extra_byte as i64;
         let const_word = off.div_euclid(4);
-        if const_word < 0 || const_word > u32::MAX as i64 {
-            return Err(format!(
-                "native emitter: raw buffer word offset {const_word} is out of range"
-            ));
-        }
-        let mut acc = self.const_uint(const_word as u32)?;
+        let mut acc = self.const_uint(Self::raw_index_const_u32(raw, const_word, "word")?)?;
         let uint_ty = self.type_id(&LlType::Int(32))?;
         for (index, stride) in &raw.dyn_terms {
             if *stride < 0 {

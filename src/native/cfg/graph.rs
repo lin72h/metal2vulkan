@@ -193,9 +193,9 @@ pub(super) fn compute_idom(
                 if !idom.contains_key(pred) {
                     continue;
                 }
-                new_idom = Some(match new_idom {
+                new_idom = Some(match new_idom.as_deref() {
                     None => pred.clone(),
-                    Some(cur) => intersect(pred, &cur, &idom, rpo_num),
+                    Some(cur) => intersect(pred, cur, &idom, rpo_num),
                 });
             }
             if let Some(new_idom) = new_idom {
@@ -216,22 +216,34 @@ fn intersect(
     idom: &HashMap<String, String>,
     rpo_num: &HashMap<&str, usize>,
 ) -> String {
-    let mut a = a.to_string();
-    let mut b = b.to_string();
+    let mut a = a;
+    let mut b = b;
     let num = |s: &str| rpo_num.get(s).copied().unwrap_or(usize::MAX);
     while a != b {
-        while num(&a) > num(&b) {
-            a = idom.get(&a).cloned().unwrap_or_else(|| a.clone());
+        while num(a) > num(b) {
+            let Some(next) = idom.get(a).map(String::as_str) else {
+                break;
+            };
+            if next == a {
+                break;
+            }
+            a = next;
         }
-        while num(&b) > num(&a) {
-            b = idom.get(&b).cloned().unwrap_or_else(|| b.clone());
+        while num(b) > num(a) {
+            let Some(next) = idom.get(b).map(String::as_str) else {
+                break;
+            };
+            if next == b {
+                break;
+            }
+            b = next;
         }
         // Guard against a stuck pair (shouldn't happen for reducible idom).
-        if a != b && num(&a) == num(&b) {
+        if a != b && num(a) == num(b) {
             break;
         }
     }
-    a
+    a.to_string()
 }
 
 /// Blocks reachable from `start` (inclusive) over the given forward-edge adjacency.

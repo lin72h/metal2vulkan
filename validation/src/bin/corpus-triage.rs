@@ -272,7 +272,8 @@ fn print_commands(row: &TriageRow) {
         }
     } else {
         eprintln!(
-            "    remint-failures: cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only --jobs 1"
+            "    remint: cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --status {} --contains {} --limit 1 --jobs 1",
+            row.status, row.air_sha256
         );
     }
 }

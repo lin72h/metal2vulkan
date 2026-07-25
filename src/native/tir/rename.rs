@@ -195,6 +195,7 @@ fn rename_inst(inst: &mut TirInst, map: &Map) {
     for s in [
         &mut inst.diag_line,
         &mut inst.void_call_line,
+        &mut inst.value_call_error,
         &mut inst.icmp_rest,
     ]
     .into_iter()

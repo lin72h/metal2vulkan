@@ -262,7 +262,43 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
             && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::ViewportIndex))
     });
     if has_viewport_index {
-        want.push(Capability::MultiViewport);
+        want.push(Capability::ShaderViewportIndex);
+        if let Some(header) = ctx.module.header.as_mut() {
+            let version = header.version();
+            if version < (1, 5) {
+                header.set_version(1, 5);
+            }
+        }
+    }
+    let has_layer = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::Layer))
+    });
+    if has_layer {
+        want.push(Capability::ShaderLayer);
+        if let Some(header) = ctx.module.header.as_mut() {
+            let version = header.version();
+            if version < (1, 5) {
+                header.set_version(1, 5);
+            }
+        }
+    }
+    let has_clip_distance = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::ClipDistance))
+    });
+    if has_clip_distance {
+        want.push(Capability::ClipDistance);
+    }
+    let has_primitive_id = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::PrimitiveId))
+    });
+    if has_primitive_id {
+        want.push(Capability::Geometry);
     }
     let has_stencil_export = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate
@@ -282,7 +318,10 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
         .any(|i| {
             matches!(
                 i.class.opcode,
-                Op::ImageQuerySize | Op::ImageQuerySizeLod | Op::ImageQueryLevels
+                Op::ImageQuerySize
+                    | Op::ImageQuerySizeLod
+                    | Op::ImageQueryLod
+                    | Op::ImageQueryLevels
             )
         });
     if has_query {

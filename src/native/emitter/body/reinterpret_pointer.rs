@@ -292,12 +292,14 @@ impl Emitter {
             let LlType::Ptr(addrspace) = result_ty else {
                 return Ok(false);
             };
+            let index_id = self.value_id_in(&index.value, &index.ty, instructions)?;
             self.emit_unmodeled_byte_pointer_copy(result_name, result, *addrspace, instructions)?;
             self.emit_sidecar.local_pointer_dynamic_field_loads.push(
                 crate::emit_sidecar::LocalPointerDynamicFieldLoad {
                     id: result,
                     root,
                     prefix,
+                    index: index_id,
                     suffix,
                 },
             );

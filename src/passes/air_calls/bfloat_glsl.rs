@@ -102,19 +102,115 @@ pub(in crate::passes) fn f32_to_bfloat(
         vec![Operand::IdRef(value)],
     ));
     let shift = ctx.const_uint(16);
+    let high = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(uint),
+        Some(high),
+        vec![Operand::IdRef(bits), Operand::IdRef(shift)],
+    ));
+    let one = ctx.const_uint(1);
+    let lsb = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(lsb),
+        vec![Operand::IdRef(high), Operand::IdRef(one)],
+    ));
+    let bias_base = ctx.const_uint(0x7fff);
+    let bias = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(bias),
+        vec![Operand::IdRef(bias_base), Operand::IdRef(lsb)],
+    ));
+    let rounded = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(rounded),
+        vec![Operand::IdRef(bits), Operand::IdRef(bias)],
+    ));
     let shifted = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::ShiftRightLogical,
         Some(uint),
         Some(shifted),
-        vec![Operand::IdRef(bits), Operand::IdRef(shift)],
+        vec![Operand::IdRef(rounded), Operand::IdRef(shift)],
     ));
+    let shifted = select_canonical_bfloat_nan_bits(ctx, out, bits, shifted);
     out.push(Instruction::new(
         Op::UConvert,
         Some(result_type),
         Some(result),
         vec![Operand::IdRef(shifted)],
     ));
+}
+
+fn select_canonical_bfloat_nan_bits(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    bits: Word,
+    narrowed: Word,
+) -> Word {
+    let uint = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
+    let exp_mask = ctx.const_uint(0x7f80_0000);
+    let mant_mask = ctx.const_uint(0x007f_ffff);
+    let zero = ctx.const_uint(0);
+
+    let exp_bits = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(exp_bits),
+        vec![Operand::IdRef(bits), Operand::IdRef(exp_mask)],
+    ));
+    let exp_all_ones = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IEqual,
+        Some(bool_ty),
+        Some(exp_all_ones),
+        vec![Operand::IdRef(exp_bits), Operand::IdRef(exp_mask)],
+    ));
+
+    let mant_bits = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(mant_bits),
+        vec![Operand::IdRef(bits), Operand::IdRef(mant_mask)],
+    ));
+    let mant_nonzero = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::INotEqual,
+        Some(bool_ty),
+        Some(mant_nonzero),
+        vec![Operand::IdRef(mant_bits), Operand::IdRef(zero)],
+    ));
+
+    let is_nan = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::LogicalAnd,
+        Some(bool_ty),
+        Some(is_nan),
+        vec![Operand::IdRef(exp_all_ones), Operand::IdRef(mant_nonzero)],
+    ));
+
+    let canonical_nan = ctx.const_uint(0x7fc0);
+    let selected = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Select,
+        Some(uint),
+        Some(selected),
+        vec![
+            Operand::IdRef(is_nan),
+            Operand::IdRef(canonical_nan),
+            Operand::IdRef(narrowed),
+        ],
+    ));
+    selected
 }
 
 /// GLSL.std.450 opcode for the simple unary/binary/ternary math intrinsics.

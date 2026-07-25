@@ -291,6 +291,148 @@ declare bfloat @air.convert.f.bf16.f.f32(float)
 }
 
 #[test]
+fn native_air_float_to_narrow_int_convert_clamps_before_convert() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(ptr addrspace(1) %out_u8, ptr addrspace(1) %out_i16, ptr addrspace(1) %out_vu8, ptr addrspace(1) %in_f, ptr addrspace(1) %in_vf) {
+entry:
+  %x = load float, ptr addrspace(1) %in_f, align 4
+  %v = load <2 x float>, ptr addrspace(1) %in_vf, align 8
+  %u8 = tail call i8 @air.convert.u.i8.f.f32(float %x)
+  %i16 = tail call i16 @air.convert.s.i16.f.f32(float %x)
+  %vu8 = tail call <2 x i8> @air.convert.u.v2i8.f.v2f32(<2 x float> %v)
+  store i8 %u8, ptr addrspace(1) %out_u8, align 1
+  store i16 %i16, ptr addrspace(1) %out_i16, align 2
+  store <2 x i8> %vu8, ptr addrspace(1) %out_vu8, align 2
+  ret void
+}
+
+declare i8 @air.convert.u.i8.f.f32(float)
+declare i16 @air.convert.s.i16.f.f32(float)
+declare <2 x i8> @air.convert.u.v2i8.f.v2f32(<2 x float>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar*", !"air.arg_name", !"out_u8"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"short*", !"air.arg_name", !"out_i16"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"uchar2*", !"air.arg_name", !"out_vu8"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"in_f"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"float2*", !"air.arg_name", !"in_vf"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_float_to_narrow_int_convert_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches(" FClamp ").count(), 3, "{asm}");
+    assert!(asm.contains("OpConvertFToU"), "{asm}");
+    assert!(asm.contains("OpConvertFToS"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_air_fast_pow_selects_one_for_zero_to_zero() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(ptr addrspace(1) %out, ptr addrspace(1) %base_in, ptr addrspace(1) %exp_in) {
+entry:
+  %base = load float, ptr addrspace(1) %base_in, align 4
+  %exp = load float, ptr addrspace(1) %exp_in, align 4
+  %pow = tail call fast float @air.fast_pow.f32(float %base, float %exp)
+  store float %pow, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare float @air.fast_pow.f32(float, float)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"base_in"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"exp_in"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fast_pow_zero_zero_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains(" Pow "), "{asm}");
+    assert!(asm.contains("OpFOrdEqual"), "{asm}");
+    assert!(asm.contains("OpLogicalAnd"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_air_half_pow_selects_one_for_zero_to_zero() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(ptr addrspace(1) %out, ptr addrspace(1) %base_in, ptr addrspace(1) %exp_in) {
+entry:
+  %base = load <3 x half>, ptr addrspace(1) %base_in, align 8
+  %exp = load <3 x half>, ptr addrspace(1) %exp_in, align 8
+  %pow = tail call fast <3 x half> @air.pow.v3f16(<3 x half> %base, <3 x half> %exp)
+  store <3 x half> %pow, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+declare <3 x half> @air.pow.v3f16(<3 x half>, <3 x half>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half3*", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half3*", !"air.arg_name", !"base_in"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half3*", !"air.arg_name", !"exp_in"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_half_pow_zero_zero_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains(" Pow "), "{asm}");
+    assert!(asm.contains("OpFOrdEqual"), "{asm}");
+    assert!(asm.contains("OpLogicalAnd"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_bfloat_vector_arithmetic_rounds_through_float() {
     // bf16 has no SPIR-V float type — a `<N x bfloat>` value is modeled as its `Vector(Int(16), N)` bit
     // pattern. A vector bf16 arithmetic op (`fadd <4 x bfloat>`) must widen each lane to f32, do the op
@@ -573,10 +715,33 @@ entry:
     assert!(asm.contains("OpTypeInt 16 0"), "{asm}");
     assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
     assert!(asm.contains("OpShiftRightLogical"), "{asm}");
+    assert!(asm.contains("OpIAdd"), "{asm}");
+    assert!(asm.contains("32767"), "{asm}");
     assert!(asm.contains("OpBitcast"), "{asm}");
     assert!(asm.contains("OpUConvert"), "{asm}");
     assert!(!asm.contains("OpTypeFloat 16"), "{asm}");
     assert!(!asm.contains("OpFConvert"), "{asm}");
+}
+
+#[test]
+fn native_float_to_bfloat_canonicalizes_nan_bits() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(float %x, <4 x float> %v) {
+entry:
+  %b = fptrunc float %x to bfloat
+  %vb = fptrunc <4 x float> %v to <4 x bfloat>
+  ret void
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(asm.contains("2139095040"), "{asm}"); // f32 exponent mask
+    assert!(asm.contains("8388607"), "{asm}"); // f32 mantissa mask
+    assert!(asm.contains("32704"), "{asm}"); // canonical bf16 qNaN bits
+    assert!(asm.contains("OpIEqual"), "{asm}");
+    assert!(asm.contains("OpINotEqual"), "{asm}");
+    assert!(asm.contains("OpLogicalAnd"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
 }
 
 #[test]
@@ -652,6 +817,8 @@ declare bfloat @llvm.fmuladd.bf16(bfloat, bfloat, bfloat)
     );
     assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
     assert!(asm.contains("OpShiftRightLogical"), "{asm}");
+    assert!(asm.contains("OpIAdd"), "{asm}");
+    assert!(asm.contains("32767"), "{asm}");
     assert!(asm.contains("OpBitcast"), "{asm}");
     assert!(asm.contains("OpUConvert"), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
@@ -1311,6 +1478,56 @@ declare <3 x float> @air.fast_log2.v3f32(<3 x float>)
     assert!(asm.contains(" Log2 "), "{asm}");
     assert!(!asm.contains(" Exp "), "{asm}");
     assert!(!asm.contains(" Log "), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_air_mix_preserves_exact_vector_endpoints() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(float %t) {
+entry:
+  %x0 = insertelement <4 x float> poison, float 0x47EFFFFFE0000000, i32 0
+  %x1 = insertelement <4 x float> %x0, float 0xC7D0000000000000, i32 1
+  %x2 = insertelement <4 x float> %x1, float 0x47D0000000000000, i32 2
+  %x = insertelement <4 x float> %x2, float 0xC7EFFFFFE0000000, i32 3
+  %y0 = insertelement <4 x float> poison, float 1.250000e-01, i32 0
+  %y1 = insertelement <4 x float> %y0, float 2.500000e-01, i32 1
+  %y2 = insertelement <4 x float> %y1, float 5.000000e-01, i32 2
+  %y = insertelement <4 x float> %y2, float 7.500000e-01, i32 3
+  %t0 = insertelement <4 x float> poison, float %t, i32 0
+  %tv = shufflevector <4 x float> %t0, <4 x float> poison, <4 x i32> zeroinitializer
+  %mixed = tail call fast <4 x float> @air.mix.v4f32(<4 x float> %x, <4 x float> %y, <4 x float> %tv)
+  %lane = extractelement <4 x float> %mixed, i32 0
+  %sink = fcmp oge float %lane, 0.000000e+00
+  ret void
+}
+
+declare <4 x float> @air.mix.v4f32(<4 x float>, <4 x float>, <4 x float>)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_air_mix_endpoint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains(" FMix "), "{asm}");
+    assert!(asm.matches("OpFOrdEqual").count() >= 2, "{asm}");
+    assert!(asm.matches("OpSelect").count() >= 2, "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")

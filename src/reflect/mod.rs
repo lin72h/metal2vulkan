@@ -80,7 +80,8 @@ pub enum ResourceKind {
     ThreadgroupBuffer,
     /// A `[[texture(n)]]` sampled image. Bound at `TEXTURE_BINDING_BASE + n`.
     Texture,
-    /// A runtime-indexed `array_ref<texture>` descriptor array. Bound at `TEXTURE_BINDING_BASE + n`.
+    /// A runtime-indexed texture descriptor array. Bound at `TEXTURE_BINDING_BASE + n`.
+    /// See `ResourceBinding::access` to distinguish sampled from storage arrays.
     TextureArray,
     /// A write-only storage image (`texture` with `access::write`). Bound at `TEXTURE_BINDING_BASE + n`.
     StorageImage,
@@ -541,7 +542,14 @@ impl ShaderReflection {
                     access: None,
                     static_sampler: None,
                 },
-                FragRole::Position | FragRole::Varying(_) | FragRole::Other => continue,
+                FragRole::Position
+                | FragRole::PointCoord
+                | FragRole::PrimitiveId
+                | FragRole::ViewportArrayIndex
+                | FragRole::Varying(_)
+                | FragRole::Other => {
+                    continue;
+                }
             };
             bindings.push(binding);
         }
@@ -947,17 +955,24 @@ fn texture_binding(
 }
 
 /// Classify a texture argument from its decoded [`TextureShape`], matching the interface pass's
-/// `texture_arg_storage` (M2). A `write`/`read_write` texture lowers to a storage image; an
-/// `array_ref<texture...>` is a runtime-indexed sampled descriptor array; everything else is a
-/// sampled image. This is the DECLARED access — the authoritative Metal qualifier — so it is
-/// translate-time exact for a top-level texture argument. No decoded shape (no type name carried)
-/// falls back to a plain sampled 2D texture.
+/// `texture_arg_storage` (M2). A `write`/`read_write` texture lowers to a storage image; texture
+/// handle arrays are runtime-indexed descriptor arrays whose access follows the inner texture
+/// qualifier; everything else is a sampled image. This is the DECLARED access — the authoritative
+/// Metal qualifier — so it is translate-time exact for a top-level texture argument. No decoded
+/// shape (no type name carried) falls back to a plain sampled 2D texture.
 fn classify_texture(shape: Option<&TextureShape>) -> (ResourceKind, ResourceAccess) {
     let Some(shape) = shape else {
         return (ResourceKind::Texture, ResourceAccess::Sampled);
     };
     if shape.array_ref {
-        (ResourceKind::TextureArray, ResourceAccess::Sampled)
+        (
+            ResourceKind::TextureArray,
+            if shape.writable {
+                ResourceAccess::Storage
+            } else {
+                ResourceAccess::Sampled
+            },
+        )
     } else if shape.writable {
         (ResourceKind::StorageImage, ResourceAccess::Storage)
     } else {

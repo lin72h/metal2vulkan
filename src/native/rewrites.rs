@@ -333,6 +333,8 @@ pub(crate) fn rewrite_variable_pointer_phis_module(module: &mut Module) -> Resul
         return Err("native emitter: no variable pointer phi to rewrite".to_string());
     }
     add_native_module_capabilities(module);
+    crate::passes::lower_scalar_i64_arithmetic_module(module);
+    add_native_module_capabilities(module);
     Ok(())
 }
 

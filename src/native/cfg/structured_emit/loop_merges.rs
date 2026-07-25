@@ -123,6 +123,7 @@ pub(in crate::native) fn forest_loop_merges(
     let mut out_blocks = blocks.to_vec();
     let mut merges = HashMap::new();
     let mut split_counter = 0usize;
+    let mut collision_cache: Option<(LoopForest, HashMap<String, String>)> = None;
 
     for plan in &plans {
         // A pure infinite loop with its header as the sole latch has no distinct continue target and
@@ -136,6 +137,7 @@ pub(in crate::native) fn forest_loop_merges(
             if let Some((merge, continue_target)) =
                 synth_noexit_self_latch(&mut out_blocks, &plan.header, &mut split_counter)
             {
+                collision_cache = None;
                 merges.insert(
                     plan.header.clone(),
                     LoopMergeInfo {
@@ -153,23 +155,6 @@ pub(in crate::native) fn forest_loop_merges(
             continue;
         };
 
-        if crate::env_vars::flm_why() {
-            let collides = merge_collides_with_outer_selection(
-                &out_blocks,
-                &plan.header,
-                &merge_block,
-                converge_inloop,
-            );
-            eprintln!(
-                "[flm-why] header={} restructure={:?} merge={} collides={} has_phi={}",
-                plan.header,
-                plan.restructure,
-                merge_block,
-                collides,
-                block_has_phi(&out_blocks, &merge_block),
-            );
-        }
-
         if plan.restructure.is_empty() {
             // Loop-merge ⇄ selection-merge collision: if the loop's merge block is ALSO the
             // post-dominator (natural selection merge) of a conditional OUTSIDE this loop, a single
@@ -178,17 +163,35 @@ pub(in crate::native) fn forest_loop_merges(
             // its in-loop exit edges to `merge_block` through a fresh pass-through (with phi surgery
             // when `merge_block` carries a phi), leaving the original block as the enclosing
             // selection's merge. This is the dominant `cond-phi-shared/loop-role` frontier shape.
-            let merge_block = if merge_collides_with_outer_selection(
-                &out_blocks,
+            if collision_cache.is_none() {
+                let det_forest = analyze(&out_blocks);
+                let det_selection_merges = selection_merges(&out_blocks, &det_forest);
+                collision_cache = Some((det_forest, det_selection_merges));
+            }
+            let (det_forest, det_selection_merges) = collision_cache.as_ref().unwrap();
+            let collides = merge_collides_with_outer_selection_from(
+                det_forest,
+                det_selection_merges,
                 &plan.header,
                 &merge_block,
                 converge_inloop,
-            ) {
-                let det_forest = analyze(&out_blocks);
+            );
+            if crate::env_vars::flm_why() {
+                eprintln!(
+                    "[flm-why] header={} restructure={:?} merge={} collides={} has_phi={}",
+                    plan.header,
+                    plan.restructure,
+                    merge_block,
+                    collides,
+                    block_has_phi(&out_blocks, &merge_block),
+                );
+            }
+            let mut mutated = false;
+            let merge_block = if collides {
                 let split = if block_has_phi(&out_blocks, &merge_block) {
                     split_phi_overlap(
                         &mut out_blocks,
-                        &det_forest,
+                        det_forest,
                         &plan.header,
                         &merge_block,
                         &mut split_counter,
@@ -196,12 +199,13 @@ pub(in crate::native) fn forest_loop_merges(
                 } else {
                     split_no_phi_overlap(
                         &mut out_blocks,
-                        &det_forest,
+                        det_forest,
                         &plan.header,
                         &merge_block,
                         &mut split_counter,
                     )
                 };
+                mutated |= split.is_some();
                 split.unwrap_or(merge_block)
             } else {
                 merge_block
@@ -209,14 +213,18 @@ pub(in crate::native) fn forest_loop_merges(
             // do-while normalization: when the latch (continue) block itself ends in a conditional
             // that exits to the loop merge (the exit test is at the loop bottom), split off a separate
             // unconditional continue block so the latch becomes an ordinary {continue, merge} break.
-            let continue_target = synth_dowhile_continue(
+            let rotated_continue = synth_dowhile_continue(
                 &mut out_blocks,
                 &plan.header,
                 &continue_target,
                 &merge_block,
                 &mut split_counter,
-            )
-            .unwrap_or(continue_target);
+            );
+            mutated |= rotated_continue.is_some();
+            let continue_target = rotated_continue.unwrap_or(continue_target);
+            if mutated {
+                collision_cache = None;
+            }
             merges.insert(
                 plan.header.clone(),
                 LoopMergeInfo {
@@ -241,6 +249,7 @@ pub(in crate::native) fn forest_loop_merges(
                 &exits,
                 &mut split_counter,
             ) {
+                collision_cache = None;
                 // A dispatch exit arm reached ALSO from outside the loop (a shared exit) is not
                 // `M`-dominated; clone its dominated forward region so both arms reconverge at an
                 // `M`-dominated merge (M2 residual fix). Only in the reject-triggered clone attempt
@@ -289,6 +298,7 @@ pub(in crate::native) fn forest_loop_merges(
                 &latches,
                 &mut split_counter,
             ) {
+                collision_cache = None;
                 // The unified loop may now be a do-while (its single latch conditionally exits to the
                 // merge); rotate that latch into a separate unconditional continue block too.
                 let continue_target = synth_dowhile_continue(
@@ -336,6 +346,7 @@ pub(in crate::native) fn forest_loop_merges(
             )
         };
         if let Some(new_merge) = split {
+            collision_cache = None;
             // The split redirected this loop's in-body predecessors of the shared merge (including its
             // latch) to `new_merge`; if the latch is now a do-while bottom test (conditionally branches
             // back to the header or out to `new_merge`), rotate it into a clean unconditional continue
@@ -690,6 +701,7 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
         origins: Vec<String>,
     }
     let mut ct_owned_preds: HashMap<(String, String), Vec<CtOwnedPred>> = HashMap::new();
+    let mut stopped_for_growth = false;
     for b in headers.iter().copied() {
         if let Some(merge) = forced_terminal_merges.get(&b.name).cloned() {
             header_merges.insert(b.name.clone(), merge.clone());
@@ -867,7 +879,9 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
             };
             match synth {
                 Some(s) => {
-                    if !construct_tree_owned {
+                    if selection_synth_growth_exceeds_ladder_cap(blocks.len(), out.len()) {
+                        stopped_for_growth = true;
+                    } else if !construct_tree_owned {
                         cur_forest = analyze(&out);
                     }
                     if construct_tree_owned && !propagated_origins.is_empty() {
@@ -912,9 +926,12 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
                 branch.insert((true_target, false_target), merge);
             }
         }
+        if stopped_for_growth {
+            break;
+        }
     }
 
-    if construct_tree_owned {
+    if construct_tree_owned && !stopped_for_growth {
         repair_construct_tree_nondominated_selection_merges(
             &mut out,
             loop_merges,

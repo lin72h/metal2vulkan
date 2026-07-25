@@ -29,11 +29,7 @@ pub(in crate::passes) fn lower_gather(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
-    let (dim, arrayed) = ctx
-        .image_dims
-        .get(&img)
-        .copied()
-        .unwrap_or((Dim::Dim2D, false));
+    let (dim, arrayed, _) = image_shape_or_recorded(ctx, img);
     let (layer, offset, component) = if arrayed {
         if args.len() < 7 {
             return Err("air.gather_texture array form missing layer/offset/component".into());
@@ -78,11 +74,7 @@ pub(in crate::passes) fn lower_gather_depth(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
-    let (dim, arrayed) = ctx
-        .image_dims
-        .get(&img)
-        .copied()
-        .unwrap_or((Dim::Dim2D, false));
+    let (dim, arrayed, _) = image_shape_or_recorded(ctx, img);
     let coord = args[3];
     let (layer, normalized_index, offset_index) = if arrayed {
         if args.len() < 8 {
@@ -143,14 +135,13 @@ pub(in crate::passes) fn lower_gather_2d(
     if dim != Dim::Dim2D {
         return Err("air.gather_texture currently supports 2D textures only".into());
     }
-    let comp = ctx
-        .image_comp
-        .get(&img)
-        .copied()
-        .unwrap_or(crate::passes::ImageComp::Float);
+    let mut out = vec![];
+    let img = load_image_if_pointer(ctx, img, &mut out);
+    let (_, _, fallback_comp) = image_shape_or_recorded(ctx, img);
+    let (img_ty, _dim, arrayed, _) =
+        sampled_operand_image_info(ctx, img, dim, arrayed, fallback_comp);
     let gather_v4 = image_fetch_v4(ctx, img, v4);
 
-    let mut out = vec![];
     if let Some(sampler_state) = ctx
         .sampler_states
         .get(&samp)
@@ -173,7 +164,6 @@ pub(in crate::passes) fn lower_gather_2d(
         );
     }
 
-    let img_ty = ctx.ty_image(dim, arrayed, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
     let samp = valid_sampler_value(ctx, samp, &mut out)?;
     let si = ctx.module.fresh_id();

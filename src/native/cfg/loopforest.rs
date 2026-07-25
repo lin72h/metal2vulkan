@@ -12,6 +12,7 @@
 //! Dominators use the Cooper-Harvey-Kennedy iterative algorithm over reverse-postorder; natural
 //! loops are the standard back-edge (`u -> v` where `v` dominates `u`) closure.
 
+use super::blocks::block_successors;
 use super::graph::{compute_idom, reverse_postorder, Cfg, Dominators};
 use super::BodyBlock;
 use std::collections::{HashMap, HashSet};
@@ -563,23 +564,17 @@ fn selection_merges_from_pidom(
     forest: &LoopForest,
     pidom: &HashMap<String, String>,
 ) -> HashMap<String, String> {
-    let cfg = match Cfg::from_blocks(blocks) {
-        Some(cfg) => cfg,
-        None => return HashMap::new(),
-    };
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
+    let block_names: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
     let mut merges = HashMap::new();
     for b in blocks {
         if loop_headers.contains(b.name.as_str()) {
             continue;
         }
         // A conditional/switch header has >= 2 distinct real successors.
-        let distinct: HashSet<&str> = cfg
-            .successors
-            .get(&b.name)
+        let distinct: HashSet<String> = block_successors(b)
             .into_iter()
-            .flatten()
-            .map(String::as_str)
+            .filter(|successor| block_names.contains(successor.as_str()))
             .collect();
         if distinct.len() < 2 {
             continue;

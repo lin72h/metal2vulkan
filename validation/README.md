@@ -67,17 +67,20 @@ input/output digests, and full run `output_b64` payloads (no AIR/source bodies).
 cargo run -p metal2vulkan-validation --release --bin corpus-mint -- --dry-run
 cargo run -p metal2vulkan-validation --release --bin corpus-mint
 
-# Remint existing rows (all with source in public fixtures/shards, or failures only)
+# Remint existing rows (all, failures only, or a bounded failure slice)
 cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --dry-run
 cargo run -p metal2vulkan-validation --release --bin corpus-remint
 cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only --status fallback --limit 50
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --status timeout --skip 50 --limit 50 --case-timeout-secs 60
 
 # Diagnose one hash (surfaces the translator error mint banks as status=fallback)
 cargo run -p metal2vulkan-validation --release --bin corpus-why -- <air_sha256>
 ```
 
 `corpus-mint`: `--jobs N`, `--quiet`, `--ledger PATH`, `--dry-run`.
-`corpus-remint`: same flags plus `--failed-only`.
+`corpus-remint`: same flags plus `--failed-only`, `--status STATUS`, `--contains TEXT`, `--skip N`,
+`--limit N`, `--case-timeout-secs N` (`0` keeps the legacy in-process path).
 
 #### Execution goldens (Metal → Vulkan / MoltenVK)
 

@@ -5395,6 +5395,103 @@ fn normalize_int_arith_operand_widths_leaves_matched_and_shift_operands_alone() 
     );
 }
 
+#[test]
+fn lower_scalar_i64_arithmetic_to_u32_halves_preserves_result_id() {
+    let uint = 1;
+    let ulong = 2;
+    let lhs = 10;
+    let rhs = 11;
+    let product = 20;
+    let difference = 21;
+    let sum = 22;
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(100));
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(ulong),
+            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+        ),
+    ];
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(ulong),
+            Some(40),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(41),
+            ],
+        )),
+        parameters: vec![
+            Instruction::new(Op::FunctionParameter, Some(ulong), Some(lhs), vec![]),
+            Instruction::new(Op::FunctionParameter, Some(ulong), Some(rhs), vec![]),
+        ],
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
+            instructions: vec![
+                Instruction::new(
+                    Op::IMul,
+                    Some(ulong),
+                    Some(product),
+                    vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+                ),
+                Instruction::new(
+                    Op::ISub,
+                    Some(ulong),
+                    Some(difference),
+                    vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+                ),
+                Instruction::new(
+                    Op::IAdd,
+                    Some(ulong),
+                    Some(sum),
+                    vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+                ),
+            ],
+        }],
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    run_idempotent(&mut ctx, lower_scalar_i64_arithmetic_to_u32_halves);
+
+    let body = &ctx.module.functions[0].blocks[0].instructions;
+    assert!(
+        !body
+            .iter()
+            .any(|i| matches!(i.class.opcode, Op::IAdd | Op::ISub | Op::IMul)
+                && i.result_type == Some(ulong)),
+        "native 64-bit scalar arithmetic should be decomposed"
+    );
+    assert!(
+        !body.iter().any(|i| i.class.opcode == Op::UMulExtended),
+        "extended multiply is deliberately avoided"
+    );
+    assert!(
+        body.iter()
+            .filter(|i| i.class.opcode == Op::IMul && i.result_type == Some(uint))
+            .count()
+            >= 6,
+        "16-bit pieces and 32-bit cross-products rebuild the low 64 bits"
+    );
+    for result in [product, difference, sum] {
+        let final_inst = body
+            .iter()
+            .find(|i| i.result_id == Some(result))
+            .expect("original result id is preserved");
+        assert_eq!(final_inst.class.opcode, Op::BitwiseOr);
+        assert_eq!(final_inst.result_type, Some(ulong));
+    }
+}
+
 // A wider-scalar `OpStore` through a NARROWER element pointer (a `uint` object written through a
 // `device uchar*` `OpPtrAccessChain` — the pointee-mismatch spirv-val rejects) is lowered to
 // `obj_bits / pointee_bits` little-endian per-element stores through sibling element pointers.

@@ -21,9 +21,10 @@ use objc2_metal::{
     MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState,
     MTLCreateSystemDefaultDevice, MTLDepthStencilDescriptor, MTLDepthStencilState, MTLDevice,
     MTLFunction, MTLFunctionConstantValues, MTLFunctionDescriptor, MTLLibrary, MTLLinkedFunctions,
-    MTLLoadAction, MTLOrigin, MTLPipelineOption, MTLPixelFormat, MTLPrimitiveType, MTLRegion,
-    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLResourceOptions, MTLResourceUsage, MTLSamplerDescriptor, MTLSamplerState, MTLSize,
+    MTLLoadAction, MTLOrigin, MTLPipelineOption, MTLPixelFormat, MTLPrimitiveTopologyClass,
+    MTLPrimitiveType, MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor,
+    MTLRenderPipelineColorAttachmentDescriptor, MTLRenderPipelineDescriptor, MTLResourceOptions,
+    MTLResourceUsage, MTLSamplerDescriptor, MTLSamplerState, MTLSize,
     MTLStageInputOutputDescriptor, MTLStepFunction, MTLStorageMode, MTLStoreAction, MTLTexture,
     MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLVertexDescriptor, MTLVertexFormat,
     MTLVertexStepFunction,
@@ -98,6 +99,8 @@ pub fn execute_metallib_blob(
         let mut effective_name = function_name.to_string();
         // One case per `--oneshot` worker; reset the per-thread compare mode before we classify.
         set_oracle_compare(OracleCompare::Full);
+        set_oracle_function_constants(OracleFunctionConstants::None);
+        let mut load_source_metallib = false;
 
         // Structural infinite-loop guard. A committed Metal command buffer CANNOT be cancelled —
         // an unbounded compute loop pins the GPU until the machine is rebooted (killing the CPU
@@ -155,6 +158,11 @@ pub fn execute_metallib_blob(
                         Ok(entry) => effective_name = entry,
                         Err(e) => panic!("threadgroup zero-init relink failed: {e}"),
                     }
+                } else if source_metallib.is_some() {
+                    // For an unmodified loop-free module, the original metallib is the most
+                    // faithful oracle input and avoids temporary AIR round-trip gaps for Apple
+                    // ABI helpers that are externally defined by the source library.
+                    load_source_metallib = true;
                 } else if let Err(e) = command_stdout(
                     "xcrun",
                     &[
@@ -192,10 +200,8 @@ pub fn execute_metallib_blob(
 
         let device =
             MTLCreateSystemDefaultDevice().expect("MTLCreateSystemDefaultDevice returned nil");
-        let library_path = if effective_name == function_name
-            && sanitized_ll.contains("air.visible_function_references")
-        {
-            source_metallib.unwrap_or(&metallib_path)
+        let library_path = if load_source_metallib {
+            source_metallib.expect("source metallib flag set without source path")
         } else {
             &metallib_path
         };
@@ -309,6 +315,29 @@ pub fn last_oracle_compare_mode() -> OracleCompare {
 
 fn set_oracle_compare(mode: OracleCompare) {
     LAST_ORACLE_COMPARE.with(|c| c.set(mode));
+}
+
+/// Function-constant specialization mode used by the most recent [`execute_metallib_blob`] call.
+/// `None` means the module declared no AIR FC initializer globals. `Zero` is the translator's
+/// disabled-default model. `Values` records explicit non-zero-compatible oracle cases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OracleFunctionConstants {
+    None,
+    Zero,
+    Values(Vec<(usize, u64)>),
+}
+
+thread_local! {
+    static LAST_ORACLE_FUNCTION_CONSTANTS: std::cell::RefCell<OracleFunctionConstants> =
+        const { std::cell::RefCell::new(OracleFunctionConstants::None) };
+}
+
+pub fn last_oracle_function_constants() -> OracleFunctionConstants {
+    LAST_ORACLE_FUNCTION_CONSTANTS.with(|c| c.borrow().clone())
+}
+
+fn set_oracle_function_constants(mode: OracleFunctionConstants) {
+    LAST_ORACLE_FUNCTION_CONSTANTS.with(|c| *c.borrow_mut() = mode);
 }
 
 /// Apple's textual module dump for an AIR object: `metal-objdump --disassemble-all` with the
@@ -558,18 +587,10 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-// Create a Metal function with an **empty** `MTLFunctionConstantValues`. This matches how `metal2vulkan`
-// handles `[[function_constant]]`s: every function constant is treated as undefined and folded to
-// its disabled default (booleans → false, scalar loads → 0). Supplying no constant values makes
-// `is_function_constant_defined` return false and lets Metal use each constant's declared default,
-// so the oracle pipeline and the translated SPIR-V select the same code path. Functions with no
-// function constants are unaffected. A pipeline that genuinely requires an unset constant fails
-// here (the collector gates those out via `kernel_harness_gap_reason`).
 thread_local! {
-    /// Per-case request (set by `the optional oracle path` from the override's `zero_fc` flag) to specialize
-    /// the oracle with explicit-zero function constants. A thread-local (not a parameter threaded
-    /// through the whole execute path) keeps the signature churn contained; oracle tests run one
-    /// case per thread so there is no cross-case bleed.
+    /// Legacy per-case zero-FC request. The oracle now zero-specializes every declared FC by
+    /// default to match the translator's disabled-default model; this setter is retained for old
+    /// override plumbing.
     static ZERO_FC_CASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Per-case explicit function-constant values (set from the override's `fc_values`): FC index ->
     /// value. When non-empty the oracle is specialized with these values (any declared FC not listed
@@ -580,8 +601,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Set the per-case zero-FC specialization request for the current thread. `the optional oracle path` calls
-/// this before invoking the oracle so the specialization matches the case's override.
+/// Set the per-case zero-FC specialization request for the current thread.
 pub fn set_zero_fc(on: bool) {
     ZERO_FC_CASE.with(|c| c.set(on));
 }
@@ -594,10 +614,6 @@ pub fn set_fc_values(values: Vec<(usize, u64)>) {
 
 fn fc_values_requested() -> Vec<(usize, u64)> {
     FC_VALUES_CASE.with(|c| c.borrow().clone())
-}
-
-fn zero_fc_requested() -> bool {
-    ZERO_FC_CASE.with(|c| c.get()) || std::env::var("METAL2VULKAN_ZERO_FC").is_ok_and(|v| v != "0")
 }
 
 fn new_specialized_function(
@@ -622,13 +638,16 @@ fn new_specialized_function(
         if let Some(function) =
             new_fc_specialized_function(library, entry, sanitized_ll, &explicit_fc)
         {
+            set_oracle_function_constants(OracleFunctionConstants::Values(explicit_fc));
             return function;
         }
     }
-    if zero_fc_requested() {
-        if let Some(function) = new_fc_specialized_function(library, entry, sanitized_ll, &[]) {
-            return function;
-        }
+    // Default validation mode: specialize every declared FC to explicit zero so Metal and the
+    // translator both execute the disabled-default path. Older banked rows without this mode are
+    // treated as needing rebank by candidate runners.
+    if let Some(function) = new_fc_specialized_function(library, entry, sanitized_ll, &[]) {
+        set_oracle_function_constants(OracleFunctionConstants::Zero);
+        return function;
     }
     let constants = MTLFunctionConstantValues::new();
     match library.newFunctionWithName_constantValues_error(&function_name, &constants) {
@@ -638,6 +657,7 @@ fn new_specialized_function(
                 if let Some(function) =
                     new_fc_specialized_function(library, entry, sanitized_ll, &values)
                 {
+                    set_oracle_function_constants(OracleFunctionConstants::Values(values));
                     return function;
                 }
             }
@@ -648,9 +668,12 @@ fn new_specialized_function(
             // to its disabled zero default) and avoids the front-end crash, so retry with zeros
             // before giving up. Only reached when the empty-set specialization already failed, so
             // no currently-passing case changes behavior.
-            new_fc_specialized_function(library, entry, sanitized_ll, &[]).unwrap_or_else(|| {
-                panic!("Metal function {entry:?} could not be specialized: {empty_err}")
-            })
+            let function = new_fc_specialized_function(library, entry, sanitized_ll, &[])
+                .unwrap_or_else(|| {
+                    panic!("Metal function {entry:?} could not be specialized: {empty_err}")
+                });
+            set_oracle_function_constants(OracleFunctionConstants::Zero);
+            function
         }
     }
 }
@@ -682,7 +705,8 @@ fn new_fc_specialized_function(
         };
         // Little-endian value bytes; `setConstantValue_type_atIndex` reads `data_type`-many bytes
         // from the front, so the low N bytes are correct for any scalar-int width. Unlisted FCs → 0.
-        let bytes = value_for.get(index).copied().unwrap_or(0).to_le_bytes();
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&value_for.get(index).copied().unwrap_or(0).to_le_bytes());
         unsafe {
             specialized.setConstantValue_type_atIndex(
                 std::ptr::NonNull::new(bytes.as_ptr() as *mut _).unwrap(),
@@ -886,6 +910,11 @@ fn execute_compute_library(
             dynamic_resource_location_fc_values(sanitized_ll).unwrap_or_else(fc_values_requested);
         let zero_fn = new_fc_specialized_function(library, entry, sanitized_ll, &retry_values)
             .unwrap_or_else(|| panic!("newComputePipelineStateWithFunction({entry}): {pso_err}"));
+        if retry_values.is_empty() {
+            set_oracle_function_constants(OracleFunctionConstants::Zero);
+        } else {
+            set_oracle_function_constants(OracleFunctionConstants::Values(retry_values));
+        }
         new_compute_pipeline_state(
             device,
             library,
@@ -1012,7 +1041,10 @@ fn execute_compute_library(
                 texture,
                 format,
                 texture_output_extent(extent, kind),
-                kind == TextureKind::Dim2dArray,
+                matches!(
+                    kind,
+                    TextureKind::Dim1dArray | TextureKind::Dim2dArray | TextureKind::CubeArray
+                ),
             )
         }
         Output::RenderTarget { .. } => {
@@ -1030,13 +1062,11 @@ fn new_compute_pipeline_state(
     stage_inputs: &[VertexInput],
     stage_input_buffer_index: u32,
 ) -> Result<MetalComputePipeline, Retained<objc2_foundation::NSError>> {
-    let linked_names = sanitized_ll
-        .map(visible_function_reference_names)
-        .unwrap_or_default();
-    if linked_names.is_empty() && stage_inputs.is_empty() {
+    let linked_functions = visible_linked_functions(library, entry, sanitized_ll);
+    if linked_functions.is_none() && stage_inputs.is_empty() {
         return device.newComputePipelineStateWithFunction_error(function);
     }
-    if !linked_names.is_empty() && stage_inputs.is_empty() {
+    if linked_functions.is_some() && stage_inputs.is_empty() {
         if let Ok(pipeline) = device.newComputePipelineStateWithFunction_error(function) {
             return Ok(pipeline);
         }
@@ -1050,18 +1080,9 @@ fn new_compute_pipeline_state(
         descriptor.setStageInputDescriptor(Some(&stage_descriptor));
     }
 
-    if !linked_names.is_empty() {
-        descriptor.setMaxCallStackDepth((linked_names.len() + 1).max(2));
-
-        let linked_functions = MTLLinkedFunctions::new();
-        let functions: Vec<_> = linked_names
-            .iter()
-            .filter(|name| name.as_str() != entry)
-            .filter_map(|name| new_linked_function(library, name))
-            .collect();
-        let functions = NSArray::from_retained_slice(&functions);
-        linked_functions.setFunctions(Some(&functions));
-        descriptor.setLinkedFunctions(Some(&linked_functions));
+    if let Some(linked) = &linked_functions {
+        descriptor.setMaxCallStackDepth((linked.reference_count + 1).max(2));
+        descriptor.setLinkedFunctions(Some(&linked.functions));
     }
 
     device.newComputePipelineStateWithDescriptor_options_reflection_error(
@@ -1069,6 +1090,38 @@ fn new_compute_pipeline_state(
         MTLPipelineOption::None,
         None,
     )
+}
+
+struct VisibleLinkedFunctions {
+    functions: Retained<MTLLinkedFunctions>,
+    reference_count: usize,
+}
+
+fn visible_linked_functions(
+    library: &ProtocolObject<dyn MTLLibrary>,
+    entry: &str,
+    sanitized_ll: Option<&str>,
+) -> Option<VisibleLinkedFunctions> {
+    let linked_names = sanitized_ll
+        .map(visible_function_reference_names)
+        .unwrap_or_default();
+    if linked_names.is_empty() {
+        return None;
+    }
+
+    let linked_functions = MTLLinkedFunctions::new();
+    let functions: Vec<_> = linked_names
+        .iter()
+        .filter(|name| name.as_str() != entry)
+        .filter_map(|name| new_linked_function(library, name))
+        .collect();
+    let functions = NSArray::from_retained_slice(&functions);
+    linked_functions.setFunctions(Some(&functions));
+
+    Some(VisibleLinkedFunctions {
+        functions: linked_functions,
+        reference_count: linked_names.len(),
+    })
 }
 
 fn new_linked_function(
@@ -1217,6 +1270,9 @@ fn execute_render_fragment_library(
     );
     let depth_output = is_depth_format(format);
     let writes_depth = depth_output || sanitized_ll.is_some_and(fragment_writes_depth);
+    let color_attachment_formats = sanitized_ll
+        .map(fragment_render_target_attachments)
+        .unwrap_or_default();
 
     let validation_vertex_src = validation_vertex_src_for_fragment(sanitized_ll);
     let validation_vertex_library = compile_library(device, &validation_vertex_src);
@@ -1229,27 +1285,27 @@ fn execute_render_fragment_library(
     let pipeline_descriptor = MTLRenderPipelineDescriptor::new();
     pipeline_descriptor.setVertexFunction(Some(&vertex_function));
     pipeline_descriptor.setFragmentFunction(Some(&fragment_function));
+    let fragment_linked_functions = visible_linked_functions(library, fragment_entry, sanitized_ll);
+    if let Some(linked) = &fragment_linked_functions {
+        pipeline_descriptor.setMaxFragmentCallStackDepth((linked.reference_count + 1).max(2));
+        pipeline_descriptor.setFragmentLinkedFunctions(Some(&linked.functions));
+    }
+    // The validation vertex shader renders one fullscreen triangle. Metal requires an explicit
+    // topology class when the compiled vertex stage writes render_target_array_index.
+    unsafe {
+        pipeline_descriptor.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+    }
     if depth_output {
         pipeline_descriptor.setDepthAttachmentPixelFormat(metal_pixel_format(format));
-    } else {
-        let color_attachments = pipeline_descriptor.colorAttachments();
-        let color_attachment = unsafe { color_attachments.objectAtIndexedSubscript(0) };
-        color_attachment.setPixelFormat(metal_pixel_format(format));
-        match inputs.render.blend {
-            BlendMode::Replace => {
-                color_attachment.setBlendingEnabled(false);
-            }
-            BlendMode::SourceOver => {
-                color_attachment.setBlendingEnabled(true);
-                color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
-                color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-                color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
-                color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
-                color_attachment
-                    .setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
-                color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
-            }
-        }
+    }
+    if !depth_output || !color_attachment_formats.is_empty() {
+        configure_fragment_color_attachments(
+            &pipeline_descriptor,
+            format,
+            depth_output,
+            &color_attachment_formats,
+            inputs.render.blend,
+        );
     }
     if writes_depth && !depth_output {
         pipeline_descriptor.setDepthAttachmentPixelFormat(MTLPixelFormat::Depth32Float);
@@ -1268,6 +1324,8 @@ fn execute_render_fragment_library(
         TextureKind::Plain,
         &mut target_bytes,
     );
+    let extra_color_targets =
+        make_extra_color_targets(device, extent, depth_output, &color_attachment_formats);
     let depth_target = if writes_depth && !depth_output {
         let depth_target = make_render_target(device, DataFormat::Depth32Float, extent);
         let mut depth_bytes = seeded_render_target_bytes(DataFormat::Depth32Float, extent);
@@ -1301,6 +1359,7 @@ fn execute_render_fragment_library(
             pass_depth_attachment.setStoreAction(MTLStoreAction::Store);
         }
     }
+    attach_extra_color_targets(&pass_descriptor, &extra_color_targets);
 
     let queue = device
         .newCommandQueue()
@@ -1354,11 +1413,152 @@ fn execute_render_fragment_library(
     read_texture(&target, format, extent, false)
 }
 
+fn configure_fragment_color_attachments(
+    pipeline_descriptor: &MTLRenderPipelineDescriptor,
+    output_format: DataFormat,
+    depth_output: bool,
+    color_attachment_formats: &[(u32, DataFormat)],
+    blend: BlendMode,
+) {
+    let color_attachments = pipeline_descriptor.colorAttachments();
+    if color_attachment_formats.is_empty() && !depth_output {
+        let color_attachment = unsafe { color_attachments.objectAtIndexedSubscript(0) };
+        color_attachment.setPixelFormat(metal_pixel_format(output_format));
+        configure_output_blend(&color_attachment, blend);
+        return;
+    }
+
+    for (index, format) in color_attachment_formats {
+        let color_attachment =
+            unsafe { color_attachments.objectAtIndexedSubscript(*index as usize) };
+        let attachment_format = if *index == 0 && !depth_output {
+            output_format
+        } else {
+            *format
+        };
+        color_attachment.setPixelFormat(metal_pixel_format(attachment_format));
+        if *index == 0 && !depth_output {
+            configure_output_blend(&color_attachment, blend);
+        }
+    }
+
+    if !depth_output
+        && !color_attachment_formats
+            .iter()
+            .any(|(index, _)| *index == 0)
+    {
+        let color_attachment = unsafe { color_attachments.objectAtIndexedSubscript(0) };
+        color_attachment.setPixelFormat(metal_pixel_format(output_format));
+        configure_output_blend(&color_attachment, blend);
+    }
+}
+
+fn configure_output_blend(
+    color_attachment: &MTLRenderPipelineColorAttachmentDescriptor,
+    blend: BlendMode,
+) {
+    match blend {
+        BlendMode::Replace => {
+            color_attachment.setBlendingEnabled(false);
+        }
+        BlendMode::SourceOver => {
+            color_attachment.setBlendingEnabled(true);
+            color_attachment.setSourceRGBBlendFactor(MTLBlendFactor::SourceAlpha);
+            color_attachment.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            color_attachment.setRgbBlendOperation(MTLBlendOperation::Add);
+            color_attachment.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+            color_attachment.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+            color_attachment.setAlphaBlendOperation(MTLBlendOperation::Add);
+        }
+    }
+}
+
+fn make_extra_color_targets(
+    device: &ProtocolObject<dyn MTLDevice>,
+    extent: Extent3d,
+    depth_output: bool,
+    color_attachment_formats: &[(u32, DataFormat)],
+) -> Vec<(u32, MetalTexture)> {
+    let mut targets = Vec::new();
+    for (index, format) in color_attachment_formats {
+        if *index == 0 && !depth_output {
+            continue;
+        }
+        let target = make_render_target(device, *format, extent);
+        let mut bytes = seeded_render_target_bytes(*format, extent);
+        write_texture_bytes(&target, *format, extent, TextureKind::Plain, &mut bytes);
+        targets.push((*index, target));
+    }
+    targets
+}
+
+fn attach_extra_color_targets(
+    pass_descriptor: &MTLRenderPassDescriptor,
+    extra_color_targets: &[(u32, MetalTexture)],
+) {
+    let pass_color_attachments = pass_descriptor.colorAttachments();
+    for (index, target) in extra_color_targets {
+        let attachment =
+            unsafe { pass_color_attachments.objectAtIndexedSubscript(*index as usize) };
+        attachment.setTexture(Some(&**target));
+        attachment.setLoadAction(MTLLoadAction::Load);
+        attachment.setStoreAction(MTLStoreAction::Store);
+    }
+}
+
+fn fragment_render_target_attachments(sanitized_ll: &str) -> Vec<(u32, DataFormat)> {
+    let mut attachments = Vec::new();
+    for line in sanitized_ll
+        .lines()
+        .filter(|line| line.contains(r#""air.render_target""#))
+    {
+        let Some(index) = metadata_i32_after(line, "air.render_target") else {
+            continue;
+        };
+        let Some(type_name) = metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(format) = fragment_render_target_format_from_air_type(&type_name) else {
+            continue;
+        };
+        if !attachments.iter().any(|(seen, _)| *seen == index) {
+            attachments.push((index, format));
+        }
+    }
+    attachments.sort_by_key(|(index, _)| *index);
+    attachments
+}
+
+fn fragment_render_target_format_from_air_type(type_name: &str) -> Option<DataFormat> {
+    Some(match type_name {
+        "half" => DataFormat::R16Float,
+        "half2" => DataFormat::Rg16Float,
+        "half4" => DataFormat::Rgba16Float,
+        "float" => DataFormat::R32Float,
+        "float2" => DataFormat::Rg32Float,
+        "float4" => DataFormat::Rgba32Float,
+        "ushort" => DataFormat::R16Uint,
+        "ushort2" => DataFormat::Rg16Uint,
+        "ushort4" => DataFormat::Rgba16Uint,
+        "short" => DataFormat::R16Sint,
+        "short2" => DataFormat::Rg16Sint,
+        "short4" => DataFormat::Rgba16Sint,
+        "uint" => DataFormat::R32Uint,
+        "uint2" => DataFormat::Rg32Uint,
+        "uint4" => DataFormat::Rgba32Uint,
+        "int" => DataFormat::R32Sint,
+        "int2" => DataFormat::Rg32Sint,
+        "int4" => DataFormat::Rgba32Sint,
+        _ => return None,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct FragmentInput {
     user_name: String,
     user_attribute: Option<String>,
     type_name: String,
+    flat: bool,
 }
 
 fn validation_vertex_src_for_fragment(sanitized_ll: Option<&str>) -> String {
@@ -1437,12 +1637,22 @@ fn validation_vertex_field_name(input: &FragmentInput, fallback_index: usize) ->
 }
 
 fn validation_vertex_user_attribute(input: &FragmentInput) -> String {
-    input
+    let mut attributes = Vec::new();
+    if let Some(name) = input
         .user_attribute
         .as_deref()
         .filter(|name| is_msl_identifier(name))
-        .map(|name| format!(" [[user({name})]]"))
-        .unwrap_or_default()
+    {
+        attributes.push(format!("user({name})"));
+    }
+    if input.flat {
+        attributes.push("flat".to_string());
+    }
+    if attributes.is_empty() {
+        String::new()
+    } else {
+        format!(" [[{}]]", attributes.join(", "))
+    }
 }
 
 fn validation_vertex_position_field_name(field_names: &[String]) -> String {
@@ -1469,10 +1679,12 @@ fn fragment_inputs(sanitized_ll: &str) -> Vec<FragmentInput> {
                 metadata_string_after(line, "air.fragment_input").and_then(user_attribute_name);
             let user_name = metadata_string_after(line, "air.arg_name")?;
             let type_name = metadata_string_after(line, "air.arg_type_name")?;
+            let flat = line.contains(r#""air.flat""#);
             Some(FragmentInput {
                 user_name,
                 user_attribute,
                 type_name,
+                flat,
             })
         })
         .collect()
@@ -1503,6 +1715,26 @@ fn validation_vertex_value(type_name: &str) -> Option<&'static str> {
         "uint2" => "uint2(1, 2)",
         "uint3" => "uint3(1, 2, 3)",
         "uint4" => "uint4(1, 2, 3, 4)",
+        "short" => "short(1)",
+        "short2" => "short2(1, 2)",
+        "short3" => "short3(1, 2, 3)",
+        "short4" => "short4(1, 2, 3, 4)",
+        "ushort" => "ushort(1)",
+        "ushort2" => "ushort2(1, 2)",
+        "ushort3" => "ushort3(1, 2, 3)",
+        "ushort4" => "ushort4(1, 2, 3, 4)",
+        "char" => "char(1)",
+        "char2" => "char2(1, 2)",
+        "char3" => "char3(1, 2, 3)",
+        "char4" => "char4(1, 2, 3, 4)",
+        "uchar" => "uchar(1)",
+        "uchar2" => "uchar2(1, 2)",
+        "uchar3" => "uchar3(1, 2, 3)",
+        "uchar4" => "uchar4(1, 2, 3, 4)",
+        "bool" => "true",
+        "bool2" => "bool2(true, false)",
+        "bool3" => "bool3(true, false, true)",
+        "bool4" => "bool4(true, false, true, false)",
         _ => return None,
     })
 }
@@ -1550,7 +1782,22 @@ fn execute_vertex_library(
     let vertex_input_buffer_index = free_attribute_buffer_index(inputs);
     let pipeline_descriptor = MTLRenderPipelineDescriptor::new();
     pipeline_descriptor.setVertexFunction(Some(&function));
-    pipeline_descriptor.setFragmentFunction(Some(&fragment_function));
+    let vertex_linked_functions = visible_linked_functions(library, entry, sanitized_ll);
+    if let Some(linked) = &vertex_linked_functions {
+        pipeline_descriptor.setMaxVertexCallStackDepth((linked.reference_count + 1).max(2));
+        pipeline_descriptor.setVertexLinkedFunctions(Some(&linked.functions));
+    }
+    let vertex_returns_void = sanitized_ll.is_some_and(|ll| entry_function_returns_void(ll, entry));
+    if vertex_returns_void {
+        pipeline_descriptor.setRasterizationEnabled(false);
+    } else {
+        pipeline_descriptor.setFragmentFunction(Some(&fragment_function));
+    }
+    // Standalone vertex validation also draws a triangle below; declare the topology for layered
+    // vertex outputs such as render_target_array_index.
+    unsafe {
+        pipeline_descriptor.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+    }
     let vertex_descriptor = if vertex_inputs.is_empty() {
         None
     } else {
@@ -1651,6 +1898,32 @@ fn execute_vertex_library(
     }
 }
 
+fn entry_function_returns_void(sanitized_ll: &str, entry: &str) -> bool {
+    for line in sanitized_ll.lines() {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("define ") else {
+            continue;
+        };
+        let Some(marker_pos) = function_name_marker_pos(rest, entry) else {
+            continue;
+        };
+        return rest[..marker_pos]
+            .split_whitespace()
+            .next_back()
+            .is_some_and(|ret_ty| ret_ty == "void");
+    }
+    false
+}
+
+fn function_name_marker_pos(rest: &str, entry: &str) -> Option<usize> {
+    let plain_marker = format!("@{entry}(");
+    if let Some(pos) = rest.find(&plain_marker) {
+        return Some(pos);
+    }
+    let quoted_marker = format!("@\"{}\"(", entry.replace('\\', "\\\\").replace('"', "\\\""));
+    rest.find(&quoted_marker)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VertexInput {
     location: u32,
@@ -1658,18 +1931,79 @@ struct VertexInput {
 }
 
 fn vertex_inputs(sanitized_ll: &str) -> Vec<VertexInput> {
-    sanitized_ll
+    let metadata_defs: Vec<_> = sanitized_ll
         .lines()
-        .filter(|line| line.contains(r#""air.vertex_input""#))
-        .filter_map(|line| {
-            let location = metadata_i32_after(line, "air.location_index")?;
-            let type_name = metadata_string_after(line, "air.arg_type_name")?;
-            Some(VertexInput {
-                location,
-                type_name,
-            })
-        })
-        .collect()
+        .filter_map(|line| Some((metadata_definition_id(line)?, line)))
+        .collect();
+    let mut inputs = Vec::new();
+
+    for line in sanitized_ll.lines() {
+        if line.contains(r#""air.vertex_input""#) {
+            push_vertex_input_metadata(&mut inputs, line);
+        }
+        if line.contains(r#""air.patch_control_point_input""#) {
+            for ref_id in metadata_refs(line) {
+                if let Some((_, field_line)) =
+                    metadata_defs.iter().find(|(def_id, _)| *def_id == ref_id)
+                {
+                    push_vertex_input_metadata(&mut inputs, field_line);
+                }
+            }
+        }
+    }
+
+    inputs
+}
+
+fn push_vertex_input_metadata(inputs: &mut Vec<VertexInput>, line: &str) {
+    let Some(location) = metadata_i32_after(line, "air.location_index") else {
+        return;
+    };
+    let Some(type_name) = metadata_string_after(line, "air.arg_type_name") else {
+        return;
+    };
+    inputs.push(VertexInput {
+        location,
+        type_name,
+    });
+}
+
+fn metadata_definition_id(line: &str) -> Option<u32> {
+    let rest = line.trim_start().strip_prefix('!')?;
+    let digits_len = rest
+        .bytes()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if digits_len == 0 || !rest[digits_len..].starts_with(" = !{") {
+        return None;
+    }
+    rest[..digits_len].parse().ok()
+}
+
+fn metadata_refs(line: &str) -> Vec<u32> {
+    let Some(body) = line.split_once("!{").map(|(_, body)| body) else {
+        return Vec::new();
+    };
+    let bytes = body.as_bytes();
+    let mut refs = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'!' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i > start {
+            if let Ok(value) = body[start..i].parse() {
+                refs.push(value);
+            }
+        }
+    }
+    refs
 }
 
 fn compute_stage_inputs(sanitized_ll: &str) -> Vec<VertexInput> {
@@ -2125,7 +2459,13 @@ fn write_texture_bytes(
     let width = extent.width as usize;
     let height = extent.height as usize;
     let depth = extent.depth as usize;
-    if matches!(kind, TextureKind::Dim2dArray | TextureKind::Cube) {
+    if matches!(
+        kind,
+        TextureKind::Dim1dArray
+            | TextureKind::Dim2dArray
+            | TextureKind::Cube
+            | TextureKind::CubeArray
+    ) {
         let layer_stride = width * height * stride;
         for layer in 0..texture_layer_count(extent, kind) {
             let ptr = NonNull::new(unsafe { bytes.as_mut_ptr().add(layer * layer_stride) }.cast())
@@ -2290,12 +2630,15 @@ fn texture_descriptor(
     unsafe {
         descriptor.setWidth(extent.width as usize);
         descriptor.setHeight(extent.height as usize);
-        if kind == TextureKind::Dim2dArray {
+        if matches!(kind, TextureKind::Dim1dArray | TextureKind::Dim2dArray) {
             descriptor.setDepth(1);
             descriptor.setArrayLength(extent.depth.max(1) as usize);
         } else if kind == TextureKind::Cube {
             descriptor.setDepth(1);
             descriptor.setArrayLength(1);
+        } else if kind == TextureKind::CubeArray {
+            descriptor.setDepth(1);
+            descriptor.setArrayLength((extent.depth.max(6) / 6) as usize);
         } else {
             descriptor.setDepth(extent.depth as usize);
         }
@@ -2308,9 +2651,11 @@ fn texture_descriptor(
 fn metal_texture_type(extent: Extent3d, kind: TextureKind) -> MTLTextureType {
     match kind {
         TextureKind::Dim1d => MTLTextureType::Type1D,
+        TextureKind::Dim1dArray => MTLTextureType::Type1DArray,
         TextureKind::Dim3d => MTLTextureType::Type3D,
         TextureKind::Dim2dArray => MTLTextureType::Type2DArray,
         TextureKind::Cube => MTLTextureType::TypeCube,
+        TextureKind::CubeArray => MTLTextureType::TypeCubeArray,
         TextureKind::Plain if extent.depth > 1 => MTLTextureType::Type3D,
         TextureKind::Plain => MTLTextureType::Type2D,
     }
@@ -2332,10 +2677,15 @@ fn metal_pixel_format(format: DataFormat) -> MTLPixelFormat {
         DataFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
         DataFormat::Rgba8Uint => MTLPixelFormat::RGBA8Uint,
         DataFormat::Rgba8Sint => MTLPixelFormat::RGBA8Sint,
+        DataFormat::R16Uint => MTLPixelFormat::R16Uint,
+        DataFormat::Rg16Uint => MTLPixelFormat::RG16Uint,
         DataFormat::Rgba16Uint => MTLPixelFormat::RGBA16Uint,
         DataFormat::R32Uint => MTLPixelFormat::R32Uint,
         DataFormat::Rg32Uint => MTLPixelFormat::RG32Uint,
         DataFormat::Rgba32Uint => MTLPixelFormat::RGBA32Uint,
+        DataFormat::R16Sint => MTLPixelFormat::R16Sint,
+        DataFormat::Rg16Sint => MTLPixelFormat::RG16Sint,
+        DataFormat::Rgba16Sint => MTLPixelFormat::RGBA16Sint,
         DataFormat::R32Sint => MTLPixelFormat::R32Sint,
         DataFormat::Rg32Sint => MTLPixelFormat::RG32Sint,
         DataFormat::Rgba32Sint => MTLPixelFormat::RGBA32Sint,
@@ -2404,6 +2754,21 @@ mod tests {
     }
 
     #[test]
+    fn fragment_render_target_attachments_use_air_metadata() {
+        let ll = r#"
+!16 = !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"half4", !"air.arg_name", !"maskOut"}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float2", !"air.arg_name", !"colorOut"}
+!18 = !{i32 5, !"air.render_target", i32 1, !"air.arg_type_name", !"half4", !"air.arg_name", !"maskIn"}
+!19 = !{!"air.render_target", i32 2, i32 0, !"air.arg_type_name", !"half3", !"air.arg_name", !"unsupportedArity"}
+"#;
+
+        assert_eq!(
+            fragment_render_target_attachments(ll),
+            vec![(0, DataFormat::Rg32Float), (1, DataFormat::Rgba16Float),]
+        );
+    }
+
+    #[test]
     fn dynamic_resource_location_fcs_use_minimal_positive_values() {
         let ll = r#"
 !air.function_constants = !{!47, !48}
@@ -2433,16 +2798,19 @@ mod tests {
                     user_name: "texcoord0".to_string(),
                     user_attribute: None,
                     type_name: "float2".to_string(),
+                    flat: false,
                 },
                 FragmentInput {
                     user_name: "color".to_string(),
                     user_attribute: None,
                     type_name: "float4".to_string(),
+                    flat: false,
                 },
                 FragmentInput {
                     user_name: "outlinecolor".to_string(),
                     user_attribute: None,
                     type_name: "half4".to_string(),
+                    flat: false,
                 },
             ]
         );
@@ -2467,11 +2835,23 @@ mod tests {
                 user_name: "texCoord".to_string(),
                 user_attribute: Some("texturecoord".to_string()),
                 type_name: "float2".to_string(),
+                flat: false,
             }]
         );
         let src = validation_vertex_src_for_fragment(Some(ll));
         assert!(src.contains("float2 texCoord [[user(texturecoord)]];"));
         assert!(src.contains("out.texCoord = coord;"));
+    }
+
+    #[test]
+    fn validation_vertex_combines_user_attribute_and_flat_interpolation() {
+        let ll = r#"
+!20 = !{i32 1, !"air.fragment_input", !"user(instance)", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"instanceId"}
+"#;
+
+        let src = validation_vertex_src_for_fragment(Some(ll));
+        assert!(src.contains("uint instanceId [[user(instance), flat]];"));
+        assert!(src.contains("out.instanceId = uint(1);"));
     }
 
     #[test]
@@ -2486,6 +2866,34 @@ mod tests {
         assert!(src
             .contains("out.metal2vulkan_validation_position = float4(positions[vid], 0.0, 1.0);"));
         assert!(src.contains("out.position = float3(coord, 0.5f);"));
+    }
+
+    #[test]
+    fn validation_vertex_emits_flat_integer_and_bool_inputs() {
+        let ll = r#"
+!20 = !{i32 1, !"air.fragment_input", !"generated(8instancet)", !"air.flat", !"air.arg_type_name", !"ushort", !"air.arg_name", !"instance"}
+!21 = !{i32 2, !"air.fragment_input", !"generated(6culledb)", !"air.flat", !"air.arg_type_name", !"bool", !"air.arg_name", !"culled"}
+"#;
+
+        let src = validation_vertex_src_for_fragment(Some(ll));
+        assert!(src.contains("ushort instance [[flat]];"));
+        assert!(src.contains("bool culled [[flat]];"));
+        assert!(src.contains("out.instance = ushort(1);"));
+        assert!(src.contains("out.culled = true;"));
+    }
+
+    #[test]
+    fn validation_vertex_emits_small_integer_vectors() {
+        let ll = r#"
+!20 = !{i32 1, !"air.fragment_input", !"generated(7packedDv4_t)", !"air.flat", !"air.arg_type_name", !"ushort4", !"air.arg_name", !"packed"}
+!21 = !{i32 2, !"air.fragment_input", !"generated(7maskDv2_b)", !"air.flat", !"air.arg_type_name", !"bool2", !"air.arg_name", !"mask"}
+"#;
+
+        let src = validation_vertex_src_for_fragment(Some(ll));
+        assert!(src.contains("ushort4 packed [[flat]];"));
+        assert!(src.contains("bool2 mask [[flat]];"));
+        assert!(src.contains("out.packed = ushort4(1, 2, 3, 4);"));
+        assert!(src.contains("out.mask = bool2(true, false);"));
     }
 
     #[test]
@@ -2514,6 +2922,34 @@ mod tests {
             append_vertex_attribute_value(&mut bytes, &input.type_name, 0);
         }
         assert_eq!(bytes.len(), 20);
+    }
+
+    #[test]
+    fn vertex_inputs_resolve_patch_control_point_fields() {
+        let ll = r#"
+!50 = !{i32 0, !"air.patch_control_point_input", !51, !52, !53, !55}
+!51 = !{!"air.patch_control_point_function", ptr @_Z12scn_vertex_t.MTL_CONTROL_POINT_FN}
+!52 = !{!"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float3", !"air.arg_name", !"position"}
+!53 = !{!"air.function_constant", !54, !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"float3", !"air.arg_name", !"normal"}
+!55 = !{!"air.function_constant", !54, !"air.location_index", i32 6, i32 1, !"air.arg_type_name", !"float2", !"air.arg_name", !"texcoord0"}
+"#;
+        assert_eq!(
+            vertex_inputs(ll),
+            vec![
+                VertexInput {
+                    location: 0,
+                    type_name: "float3".to_string(),
+                },
+                VertexInput {
+                    location: 1,
+                    type_name: "float3".to_string(),
+                },
+                VertexInput {
+                    location: 6,
+                    type_name: "float2".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2555,6 +2991,54 @@ mod tests {
             visible_function_reference_names(ll),
             vec!["first".to_string(), "second".to_string()]
         );
+    }
+
+    #[test]
+    fn visible_function_reference_names_include_fragment_visible_refs() {
+        let ll = r#"
+define <4 x half> @frag(<2 x float> %coord) {
+entry:
+  %v = tail call <4 x half> @custom_fn.MTL_VISIBLE_FN_REF(<2 x float> %coord)
+  ret <4 x half> %v
+}
+
+declare <4 x half> @custom_fn.MTL_VISIBLE_FN_REF(<2 x float>) local_unnamed_addr section "air.externally_defined"
+
+!air.fragment = !{!0}
+!air.visible_function_references = !{!4}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{!"air.visible_function_reference", ptr @custom_fn.MTL_VISIBLE_FN_REF, !"custom_fn"}
+"#;
+
+        assert_eq!(
+            visible_function_reference_names(ll),
+            vec!["custom_fn".to_string()]
+        );
+    }
+
+    #[test]
+    fn entry_function_returns_void_detects_plain_and_quoted_entries() {
+        let ll = r#"
+define internal fastcc void @"persona::ksDepthDilate"(ptr addrspace(2) %0) {
+  ret void
+}
+
+define <{ <4 x float> }> @layered(<4 x float> %position) {
+  ret <{ <4 x float> }> zeroinitializer
+}
+
+define void @progressTrackVertex(ptr addrspace(1) %out) {
+  ret void
+}
+"#;
+
+        assert!(entry_function_returns_void(ll, "persona::ksDepthDilate"));
+        assert!(entry_function_returns_void(ll, "progressTrackVertex"));
+        assert!(!entry_function_returns_void(ll, "layered"));
+        assert!(!entry_function_returns_void(ll, "missing"));
     }
 
     /// End-to-end on the real Apple toolchain, but WITHOUT dispatching to the GPU: compile a kernel

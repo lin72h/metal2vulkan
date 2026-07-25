@@ -37,13 +37,9 @@ pub(super) fn parse_function(
     let at = head
         .find('@')
         .ok_or_else(|| format!("native emitter: define without function name: {head}"))?;
-    let open = head[at..]
-        .find('(')
-        .map(|p| p + at)
-        .ok_or_else(|| format!("native emitter: define without params: {head}"))?;
+    let (name, open) = parse_global_symbol_with_params(head, at, "define")?;
     let close = matching_paren(head, open)
         .ok_or_else(|| format!("native emitter: unmatched params in define: {head}"))?;
-    let name = head[at + 1..open].to_string();
     let ret = parse_return_type(&head["define".len()..at])?;
     let params = parse_params(&head[open + 1..close])?;
     let mut body = Vec::new();
@@ -101,16 +97,71 @@ pub(super) fn parse_declaration(line: &str) -> Result<LlDeclaration, String> {
     let at = head
         .find('@')
         .ok_or_else(|| format!("native emitter: declare without function name: {head}"))?;
-    let open = head[at..]
-        .find('(')
-        .map(|p| p + at)
-        .ok_or_else(|| format!("native emitter: declare without params: {head}"))?;
+    let (name, open) = parse_global_symbol_with_params(head, at, "declare")?;
     let close = matching_paren(head, open)
         .ok_or_else(|| format!("native emitter: unmatched params in declare: {head}"))?;
-    let name = head[at + 1..open].to_string();
     let ret = parse_return_type(&head["declare".len()..at])?;
     let params = parse_decl_params(&head[open + 1..close])?;
     Ok(LlDeclaration { name, ret, params })
+}
+
+fn parse_global_symbol_with_params(
+    s: &str,
+    at: usize,
+    context: &str,
+) -> Result<(String, usize), String> {
+    let after_at = at + 1;
+    if s[after_at..].starts_with('"') {
+        let (name, end) = parse_quoted_global_symbol(s, after_at)?;
+        let open = s[end..]
+            .find('(')
+            .map(|p| p + end)
+            .ok_or_else(|| format!("native emitter: {context} without params: {s}"))?;
+        return Ok((name, open));
+    }
+    let open = s[at..]
+        .find('(')
+        .map(|p| p + at)
+        .ok_or_else(|| format!("native emitter: {context} without params: {s}"))?;
+    Ok((s[after_at..open].to_string(), open))
+}
+
+fn parse_quoted_global_symbol(s: &str, quote: usize) -> Result<(String, usize), String> {
+    let mut out = String::new();
+    let mut pos = quote + 1;
+    while pos < s.len() {
+        let ch = s[pos..]
+            .chars()
+            .next()
+            .ok_or_else(|| format!("native emitter: malformed quoted symbol: {s}"))?;
+        pos += ch.len_utf8();
+        match ch {
+            '"' => return Ok((out, pos)),
+            '\\' => {
+                let hi = s[pos..].chars().next();
+                let lo = hi.and_then(|hi| {
+                    let next = pos + hi.len_utf8();
+                    s[next..].chars().next()
+                });
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() {
+                        pos += hi.len_utf8() + lo.len_utf8();
+                        let byte =
+                            ((hi.to_digit(16).unwrap() << 4) | lo.to_digit(16).unwrap()) as u8;
+                        out.push(byte as char);
+                        continue;
+                    }
+                }
+                let escaped = s[pos..].chars().next().ok_or_else(|| {
+                    format!("native emitter: unterminated quoted symbol escape: {s}")
+                })?;
+                pos += escaped.len_utf8();
+                out.push(escaped);
+            }
+            _ => out.push(ch),
+        }
+    }
+    Err(format!("native emitter: unterminated quoted symbol: {s}"))
 }
 
 pub(super) fn parse_global(line: &str) -> Result<LlGlobal, String> {
@@ -523,14 +574,10 @@ pub(super) fn parse_call(s: &str) -> Result<LlCall, String> {
         Some(at) => at,
         None => return Err(indirect_call_diagnostic(s)),
     };
-    let open = s[at..]
-        .find('(')
-        .map(|p| p + at)
-        .ok_or_else(|| format!("native emitter: call without argument list: {s}"))?;
+    let (callee, open) = parse_global_symbol_with_params(s, at, "call")?;
     let close = matching_paren(s, open)
         .ok_or_else(|| format!("native emitter: unmatched call parens: {s}"))?;
     let ret = parse_return_type(&s[..at])?;
-    let callee = s[at + 1..open].to_string();
     let args_text = &s[open + 1..close];
     let (args, arg_aligns) = if args_text.trim().is_empty() {
         (Vec::new(), Vec::new())
@@ -1047,6 +1094,23 @@ mod parse_tests {
         assert_eq!(parse_type("ptr addrspace(1)").unwrap(), LlType::Ptr(1));
         assert!(parse_type("ptr addrspace(2").is_err()); // missing ')'
         assert!(parse_type("ptr addrspace(x)").is_err()); // non-numeric
+    }
+
+    #[test]
+    fn parse_quoted_function_and_call_names() {
+        let lines = [
+            r#"define void @"re::df::pack"(ptr addrspace(1) %out) {"#,
+            "  ret void",
+            "}",
+        ];
+        let (function, _, _) = parse_function(&lines, 0).expect("parse function");
+        assert_eq!(function.name, "re::df::pack");
+        let declaration = parse_declaration(r#"declare void @"helper::quoted"(ptr addrspace(1))"#)
+            .expect("parse declaration");
+        assert_eq!(declaration.name, "helper::quoted");
+        let call =
+            parse_call(r#"void @"helper::quoted"(ptr addrspace(1) %out)"#).expect("parse call");
+        assert_eq!(call.callee, "helper::quoted");
     }
 
     #[test]

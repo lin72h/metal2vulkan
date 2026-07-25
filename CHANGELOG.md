@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+
+- Public `specialize_function_constants_zero` helper for baking discovered Metal function
+  constants to their zero/default values, including branch pruning and removal of now-dead entry
+  interface globals.
+- Reflection schema v3: AIR `constexpr sampler` globals are reported as `StaticSampler` bindings
+  with decoded filter, address, coordinate, compare, LOD, border-color, reduction, and raw-word
+  state. Texture arrays also report sampled vs storage access through `ResourceBinding::access`.
+- Additional stage-interface coverage for fragment builtins such as `[[point_coord]]` and
+  `[[primitive_id]]`, flat fragment varyings, framebuffer-fetch color inputs, vertex builtins, and
+  fragment outputs with nonzero render-target locations.
+- Native lowering support for fixed and runtime-indexed texture arrays, storage-image array access,
+  more texture gather/sample/read/write shapes, half/integer render-target formats, scalar 64-bit
+  integer arithmetic emulation, and AIR denorm flush-to-zero emulation for floating-point paths.
+- Workgroup-memory lowering for deterministic zero initialization, small Workgroup atomic-loop
+  unrolling, and additional atomic reinterpretation patterns used by shared-memory reductions.
+- Rust validation/corpus tooling: `corpus-harvest`, `corpus-mint`, `corpus-remint`, `corpus-why`,
+  `corpus-run-metal`, `corpus-run-vulkan`, `corpus-run-moltenvk`, and `corpus-triage`, backed by
+  translate and execution JSONL ledgers.
+
+### Changed
+
+- Translation now derives AIR metadata once per entry and shares it across emission, reflection,
+  lowering passes, and retry tiers, including the function-constant-buffer-promoted kernel metadata
+  used by retry paths.
+- The retry cascade and structured-CFG repair path were bounded and hardened: planner clone/search
+  growth is capped, fallback classification is more specific, graph-walk retry inputs are cached,
+  and timeout-prone retry rows are handled with per-case limits in validation tooling.
+- Floating-point behavior is closer to AIR for the covered cases, including denorm flush-to-zero,
+  f32-to-f16 clamping, bf16 narrowing/NaN handling, fast `sin`/`cos` large-argument behavior,
+  `pow` zero edges, and exact `mix` endpoints.
+- Buffer, pointer, and access-chain lowering handles more structural cases, including dynamic
+  struct/word indices, local pointer tables, pointer-select loads, aggregate memcpy forms, raw
+  subword loads/stores, unaligned metadata byte fields, and direct call pointer results.
+- Validation now uses local shard JSONL as the private corpus source of truth and committed
+  `metal2vulkan-ledger*.jsonl` files for hash-identified translate/execution evidence. The ledger
+  files are tracked with Git LFS.
+- Developer documentation now describes the ledger-based validation ladder and the updated
+  reflection v3 descriptor contract.
+
+### Fixed
+
+- Visible Metal function references now fail fast with an explicit fallback instead of being treated
+  as ordinary functions.
+- Multiple `OpReturnValue` sites are rewritten consistently to stage outputs, and undefined
+  fragment output stores are skipped rather than materialized.
+- Kernel local-size options are validated as nonzero and are propagated into AIR local-size queries,
+  imageblock lowering, and validation execution plans.
+- SPIR-V generation avoids several invalid Logical-addressing forms by normalizing pointer phis,
+  pointer selects, reinterpret loads/stores, access-chain index widths, and cross-binding pointer
+  merges before final validation.
+
+### Removed
+
+- Removed the old `scripts/metal2vulkan-drift/` and `scripts/metal2vulkan-harvest/` workflows in
+  favor of the validation crate's Rust corpus/ledger binaries.
+- Removed the generated local corpus test workflow and obsolete corpus files
+  (`drift-ledger.jsonl`, `broken.jsonl`, `tolerances.jsonl`, and `validation/TOOLCHAIN.lock`).
+
 ## v0.1.0
 
 ### Added

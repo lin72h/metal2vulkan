@@ -50,7 +50,7 @@ pub(in crate::passes) fn lower_float_math(
     // `cospi/sinpi/tanpi(x) = {cos,sin,tan}(pi*x)` and `exp10(x) = exp2(x*log2(10))` have no direct
     // GLSL.std.450 op; build them as a constant pre-multiply followed by the base transcendental.
     // Scalar f16/f32 only (the observed signatures); a vector form FALLBACKs honestly.
-    if name.starts_with("air.cospi.") && args.len() == 1 {
+    if (name.starts_with("air.cospi.") || name.starts_with("air.fast_cospi.")) && args.len() == 1 {
         return lower_premul_glsl_unary(
             ctx,
             res,
@@ -60,7 +60,7 @@ pub(in crate::passes) fn lower_float_math(
             GLSLstd450::Cos,
         );
     }
-    if name.starts_with("air.sinpi.") && args.len() == 1 {
+    if (name.starts_with("air.sinpi.") || name.starts_with("air.fast_sinpi.")) && args.len() == 1 {
         return lower_premul_glsl_unary(
             ctx,
             res,
@@ -70,7 +70,7 @@ pub(in crate::passes) fn lower_float_math(
             GLSLstd450::Sin,
         );
     }
-    if name.starts_with("air.tanpi.") && args.len() == 1 {
+    if (name.starts_with("air.tanpi.") || name.starts_with("air.fast_tanpi.")) && args.len() == 1 {
         return lower_premul_glsl_unary(
             ctx,
             res,
@@ -330,6 +330,12 @@ pub(in crate::passes) fn lower_float_math(
     if name.starts_with("air.fast_tanh.") && args.len() == 1 {
         return lower_fast_tanh(ctx, res, rty, args[0]);
     }
+    if name.starts_with("air.fast_cos.") && args.len() == 1 && is_f32_scalar_or_vector(ctx, rty) {
+        return Ok(lower_fast_trig(ctx, res, rty, args[0], GLSLstd450::Cos));
+    }
+    if name.starts_with("air.fast_sin.") && args.len() == 1 && is_f32_scalar_or_vector(ctx, rty) {
+        return Ok(lower_fast_trig(ctx, res, rty, args[0], GLSLstd450::Sin));
+    }
     // GLSL.std.450 ext-inst math.
     if let Some(glsl_op) = glsl_extinst(name) {
         if args.len() == 1 && matches!(glsl_op, GLSLstd450::Round | GLSLstd450::RoundEven) {
@@ -349,6 +355,11 @@ pub(in crate::passes) fn lower_float_math(
             if name.starts_with("air.fast_pow.") && is_f32_scalar_or_vector(ctx, rty) {
                 return Ok(f32_abs_pow(ctx, res, rty, args[0], args[1]));
             }
+        }
+        if args.len() == 3 && matches!(glsl_op, GLSLstd450::FMix) {
+            return Ok(lower_endpoint_preserving_mix(
+                ctx, res, rty, args[0], args[1], args[2],
+            ));
         }
         let ext = ctx.glsl();
         let mut ops = vec![
@@ -388,6 +399,169 @@ pub(in crate::passes) fn lower_float_math(
     }
 
     Err(format!("unhandled air.* intrinsic: {name}"))
+}
+
+fn lower_endpoint_preserving_mix(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    x: Word,
+    y: Word,
+    t: Word,
+) -> Vec<Instruction> {
+    let ext = ctx.glsl();
+    let lanes = vector_len(ctx, rty);
+    let bool_ty = if lanes == 1 {
+        ctx.ty_bool()
+    } else {
+        ctx.ty_vec_bool(lanes)
+    };
+    let (zero, one) = scalar_zero_one(ctx, rty);
+    let (zero, one) = clamp_edges(ctx, rty, zero, one);
+    let raw = ctx.module.fresh_id();
+    let is_zero = ctx.module.fresh_id();
+    let is_one = ctx.module.fresh_id();
+    let zero_selected = ctx.module.fresh_id();
+    vec![
+        Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(raw),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::FMix as u32),
+                Operand::IdRef(x),
+                Operand::IdRef(y),
+                Operand::IdRef(t),
+            ],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(is_zero),
+            vec![Operand::IdRef(t), Operand::IdRef(zero)],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(zero_selected),
+            vec![
+                Operand::IdRef(is_zero),
+                Operand::IdRef(x),
+                Operand::IdRef(raw),
+            ],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(is_one),
+            vec![Operand::IdRef(t), Operand::IdRef(one)],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(is_one),
+                Operand::IdRef(y),
+                Operand::IdRef(zero_selected),
+            ],
+        ),
+    ]
+}
+
+fn lower_fast_trig(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    x: Word,
+    op: GLSLstd450,
+) -> Vec<Instruction> {
+    let ext = ctx.glsl();
+    let lanes = vector_len(ctx, rty);
+    let bool_ty = if lanes == 1 {
+        ctx.ty_bool()
+    } else {
+        ctx.ty_vec_bool(lanes)
+    };
+    let zero = ctx.const_float(0.0);
+    let threshold = ctx.const_float(1_073_741_824.0);
+    let two_pi = ctx.const_float(std::f32::consts::TAU);
+    let (zero, threshold) = clamp_edges(ctx, rty, zero, threshold);
+    let (_, two_pi) = clamp_edges(ctx, rty, zero, two_pi);
+    let abs = ctx.module.fresh_id();
+    let quotient = ctx.module.fresh_id();
+    let periods = ctx.module.fresh_id();
+    let scaled_periods = ctx.module.fresh_id();
+    let reduced = ctx.module.fresh_id();
+    let raw = ctx.module.fresh_id();
+    let too_large = ctx.module.fresh_id();
+    vec![
+        Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(abs),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::FAbs as u32),
+                Operand::IdRef(x),
+            ],
+        ),
+        Instruction::new(
+            Op::FDiv,
+            Some(rty),
+            Some(quotient),
+            vec![Operand::IdRef(x), Operand::IdRef(two_pi)],
+        ),
+        Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(periods),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::Trunc as u32),
+                Operand::IdRef(quotient),
+            ],
+        ),
+        Instruction::new(
+            Op::FMul,
+            Some(rty),
+            Some(scaled_periods),
+            vec![Operand::IdRef(periods), Operand::IdRef(two_pi)],
+        ),
+        Instruction::new(
+            Op::FSub,
+            Some(rty),
+            Some(reduced),
+            vec![Operand::IdRef(x), Operand::IdRef(scaled_periods)],
+        ),
+        Instruction::new(
+            Op::FOrdGreaterThanEqual,
+            Some(bool_ty),
+            Some(too_large),
+            vec![Operand::IdRef(abs), Operand::IdRef(threshold)],
+        ),
+        Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(raw),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(op as u32),
+                Operand::IdRef(reduced),
+            ],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(too_large),
+                Operand::IdRef(zero),
+                Operand::IdRef(raw),
+            ],
+        ),
+    ]
 }
 
 pub(in crate::passes) fn lower_signed_integer_minmax(
@@ -884,19 +1058,15 @@ struct ImageblockRegionGate {
     empty: Word,
 }
 
-/// Gate an `air.write_imageblock_slice_to_texture_*` store on its destination region being fully
-/// contained in the target texture, and report whether the region has a zero spatial extent. The AIR
-/// call writes a whole block region `[origin, origin + size)` — `size` is the explicit `<2 x i16>`
-/// size operand (args[4]) when the has-size flag (args[2]) is set, otherwise the imageblock
-/// dimensions, which for a compute kernel are the threadgroup x/y dimensions. The Apple GPU discards
-/// the *entire* write when that region extends past the texture bounds (verified against the metallib
-/// conformance goldens: every regression case whose block region exceeds the output texture leaves it
-/// untouched). Emulate that by OR-ing the write coordinate with all-ones when the region does not fit,
-/// so the single `OpImageWrite` this lowering emits lands out of bounds and is dropped by the same
-/// OOB-store rule the per-thread writes already rely on. A zero-area region is not folded into this
-/// coordinate gate: the measured `overlayMasks/3a39f1a4` Apple oracle writes a transparent-zero texel
-/// at the destination origin for explicit zero extent, so the caller uses `empty` to select a zero
-/// texel while preserving the in-bounds coordinate.
+/// Gate an `air.write_imageblock_slice_to_texture_*` store on its destination region when the call
+/// uses the implicit imageblock extent, and report whether the region has a zero spatial extent. The
+/// implicit extent is the imageblock dimensions, which for a compute kernel are the threadgroup x/y
+/// dimensions. The Apple GPU discards the whole implicit-region write when that region extends past
+/// the texture bounds, so OR the write coordinate with all-ones in that case and let Vulkan's OOB
+/// store rule drop the single `OpImageWrite` this lowering emits. Constant explicit-size calls are
+/// different: observed AIR goldens keep the destination coordinate even when the explicit size is
+/// larger than the target, but write a transparent-zero texel for zero-area or non-fitting explicit
+/// regions.
 fn gate_imageblock_region_in_bounds(
     ctx: &mut Ctx,
     args: &[Word],
@@ -1063,8 +1233,30 @@ fn gate_imageblock_region_in_bounds(
     }
     let fits = fits.ok_or("gate_imageblock_region_in_bounds: at least one spatial axis")?;
     let empty = empty.ok_or("gate_imageblock_region_in_bounds: at least one spatial axis")?;
+    let skip_fit_gate = matches!(has_size_flag, Some(Op::ConstantTrue)) && explicit_usable;
+    if skip_fit_gate {
+        let not_fits = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::LogicalNot,
+            Some(bool_ty),
+            Some(not_fits),
+            vec![Operand::IdRef(fits)],
+        ));
+        let zero_texel = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::LogicalOr,
+            Some(bool_ty),
+            Some(zero_texel),
+            vec![Operand::IdRef(empty), Operand::IdRef(not_fits)],
+        ));
+        return Ok(ImageblockRegionGate {
+            coord: coord32,
+            empty: zero_texel,
+        });
+    }
+
     // mask = fits ? 0 : 0xffffffff; OR-ing it into the coordinate forces the store out of bounds
-    // (and thus discarded) exactly when the block region does not fit.
+    // (and thus discarded) exactly when the implicit/runtime-selected block region does not fit.
     let all_ones = ctx.const_uint(u32::MAX);
     let mask = ctx.module.fresh_id();
     out.push(Instruction::new(

@@ -71,6 +71,130 @@ pub(in crate::passes) fn fragment_input_needs_flat(
     }
 }
 
+pub(in crate::passes) fn fragment_varying_interface_type(
+    ctx: &mut Ctx,
+    frag: Option<&FragMeta>,
+    loc: u32,
+    ty: Word,
+    defs: &HashMap<Word, Instruction>,
+) -> Word {
+    let Some(name) = frag.and_then(|meta| meta.varying_type(loc)) else {
+        return ty;
+    };
+    let Some((bits, signed, lanes)) = air_integer_type_shape(name) else {
+        return ty;
+    };
+    integer_interface_type_like(ctx, ty, bits, signed, lanes, defs).unwrap_or(ty)
+}
+
+fn air_integer_type_shape(name: &str) -> Option<(u32, bool, u32)> {
+    let raw = name.trim();
+    let raw = raw.strip_prefix("packed_").unwrap_or(raw);
+    for (prefix, bits, signed) in [
+        ("ushort", 16, false),
+        ("short", 16, true),
+        ("uint", 32, false),
+        ("int", 32, true),
+    ] {
+        if let Some(rest) = raw.strip_prefix(prefix) {
+            let lanes = if rest.is_empty() {
+                1
+            } else {
+                rest.parse::<u32>().ok()?
+            };
+            if (1..=4).contains(&lanes) {
+                return Some((bits, signed, lanes));
+            }
+        }
+    }
+    None
+}
+
+fn integer_interface_type_like(
+    ctx: &mut Ctx,
+    ty: Word,
+    bits: u32,
+    signed: bool,
+    lanes: u32,
+    defs: &HashMap<Word, Instruction>,
+) -> Option<Word> {
+    if lanes == 1 {
+        let (actual_bits, _) = type_int_shape(defs, ty)?;
+        return (actual_bits == bits).then(|| integer_scalar_type(ctx, bits, signed));
+    }
+    let def = defs.get(&ty)?;
+    if def.class.opcode != Op::TypeVector {
+        return None;
+    }
+    let elem = match def.operands.first()? {
+        Operand::IdRef(elem) => *elem,
+        _ => return None,
+    };
+    if def.operands.get(1) != Some(&Operand::LiteralBit32(lanes)) {
+        return None;
+    }
+    let (actual_bits, _) = type_int_shape(defs, elem)?;
+    if actual_bits != bits {
+        return None;
+    }
+    let elem_ty = integer_scalar_type(ctx, bits, signed);
+    Some(ctx.get_or_create(
+        Op::TypeVector,
+        None,
+        vec![Operand::IdRef(elem_ty), Operand::LiteralBit32(lanes)],
+    ))
+}
+
+fn integer_scalar_type(ctx: &mut Ctx, bits: u32, signed: bool) -> Word {
+    ctx.get_or_create(
+        Op::TypeInt,
+        None,
+        vec![
+            Operand::LiteralBit32(bits),
+            Operand::LiteralBit32(u32::from(signed)),
+        ],
+    )
+}
+
+fn type_int_shape(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<(u32, bool)> {
+    let def = defs.get(&ty)?;
+    if def.class.opcode != Op::TypeInt {
+        return None;
+    }
+    let bits = match def.operands.first()? {
+        Operand::LiteralBit32(bits) => *bits,
+        _ => return None,
+    };
+    let signed = match def.operands.get(1)? {
+        Operand::LiteralBit32(signed) => *signed != 0,
+        _ => return None,
+    };
+    Some((bits, signed))
+}
+
+/// Vulkan user `Input` / `Output` variables cannot use `OpTypeBool` unless they are builtins.
+/// Aggregate bool varyings therefore have no honest user-location interface encoding here. Scalar
+/// fragment bool varyings can be represented by a flat uint interface slot and converted back at
+/// function entry.
+pub(in crate::passes) fn type_contains_bool(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
+    let Some(def) = defs.get(&ty) else {
+        return false;
+    };
+    match def.class.opcode {
+        Op::TypeBool => true,
+        Op::TypeVector | Op::TypeMatrix | Op::TypeArray => match def.operands.first() {
+            Some(Operand::IdRef(elem)) => type_contains_bool(defs, *elem),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+pub(in crate::passes) fn is_scalar_bool(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
+    defs.get(&ty)
+        .is_some_and(|def| def.class.opcode == Op::TypeBool)
+}
+
 pub(in crate::passes) fn type_float_width(
     defs: &HashMap<Word, Instruction>,
     ty: Word,
@@ -212,15 +336,28 @@ pub(in crate::passes) fn input_attachment_read_types(
 ) -> Result<(Word, Word), String> {
     let (component_ty, lanes) = scalar_or_vector_component(defs, param_ty)
         .ok_or_else(|| format!("color input param type {param_ty} is not scalar/vector"))?;
+    if lanes.is_some_and(|lane_count| lane_count > 4) {
+        return Err(format!(
+            "color input param type {param_ty} has more than 4 components"
+        ));
+    }
     if is_float_width(defs, component_ty, 16) {
         let sampled_ty = ctx.ty_float();
-        let read_ty = lanes
-            .map(|lane_count| ctx.ty_vecf(lane_count))
-            .unwrap_or(sampled_ty);
+        let read_ty = ctx.ty_vecf(4);
         Ok((sampled_ty, read_ty))
     } else {
-        Ok((component_ty, param_ty))
+        let sampled_ty = component_ty;
+        let read_ty = input_attachment_vector_type(ctx, component_ty, 4);
+        Ok((sampled_ty, read_ty))
     }
+}
+
+fn input_attachment_vector_type(ctx: &mut Ctx, component_ty: Word, lanes: u32) -> Word {
+    ctx.get_or_create(
+        Op::TypeVector,
+        None,
+        vec![Operand::IdRef(component_ty), Operand::LiteralBit32(lanes)],
+    )
 }
 
 pub(in crate::passes) fn scalar_or_vector_component(

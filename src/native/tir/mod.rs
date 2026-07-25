@@ -371,6 +371,11 @@ pub(super) struct TirInst {
     /// `tir_call_queue` the text path pops — the queue holds the same operands). `None` for every other
     /// opcode and for a result-bearing (value) call.
     pub(super) void_call_line: Option<String>,
+    /// For a result-bearing `call`/`tail call` whose direct-call parse failed, the exact parse diagnostic
+    /// computed at lower time. This is diagnostics-only: the emitter reads it to return the same unsupported
+    /// indirect-call error the text parser would have returned, instead of falling through to the generic
+    /// unmigrated-opcode bucket. `None` for non-calls and successfully parsed direct value calls.
+    pub(super) value_call_error: Option<String>,
     /// For a `bitcast`: the parsed source typed value + the destination-type TEXT (`resolve_bitcast` —
     /// the SAME `strip_comment` + rhs after `%r = ` with the opcode token dropped + `split_once(" to ")` +
     /// `parse_typed_value` the `bitcast` handler re-lexed). The bitcast emitter reads it off the graph instead of
@@ -448,6 +453,7 @@ impl TirInst {
             diag_line: None,
             shuffle_mask: None,
             void_call_line: None,
+            value_call_error: None,
             bitcast: None,
             icmp_rest: None,
             pointer_pointee: None,

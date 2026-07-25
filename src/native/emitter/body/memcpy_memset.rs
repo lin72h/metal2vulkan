@@ -797,13 +797,22 @@ impl Emitter {
         let Some(src_pointee) = self.pointer_pointee_for_value(&call.args[1].value)? else {
             return Ok(false);
         };
+        let dst_pointee = self.resolve_type(&dst_pointee)?;
+        let src_pointee = self.resolve_type(&src_pointee)?;
         let copy_pointee = function_storage_local_type(&src_pointee);
         let (copy_size, _) = self.raw_type_size_align(&copy_pointee)?;
         if len < copy_size {
             if !types_compatible(&dst_pointee, &src_pointee) {
-                return Ok(false);
+                return self.emit_prefix_source_struct_memcpy(
+                    &call.args[0],
+                    &call.args[1],
+                    &dst_pointee,
+                    &src_pointee,
+                    len,
+                    instructions,
+                );
             }
-            let LlType::Struct(fields) = &copy_pointee else {
+            let LlType::Struct(fields) = &function_storage_local_type(&src_pointee) else {
                 return Ok(false);
             };
             let LlType::Ptr(dst_addrspace) = self.resolve_type(&call.args[0].ty)? else {
@@ -1027,6 +1036,62 @@ impl Emitter {
             }
             _ => Ok(false),
         }
+    }
+
+    pub(in crate::native::emitter) fn emit_prefix_source_struct_memcpy(
+        &mut self,
+        dst_arg: &TypedValue,
+        src_arg: &TypedValue,
+        dst_pointee: &LlType,
+        src_pointee: &LlType,
+        len: u64,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let LlType::Struct(src_fields) = src_pointee else {
+            return Ok(false);
+        };
+        if src_fields.is_empty() {
+            return Ok(false);
+        }
+        let (src_offset, src_field) = self.raw_struct_member(src_fields, 0)?;
+        if src_offset != 0 {
+            return Ok(false);
+        }
+        let src_field = function_storage_local_type(&src_field);
+        let dst_pointee = function_storage_local_type(dst_pointee);
+        if !types_compatible(&dst_pointee, &src_field) {
+            return Ok(false);
+        }
+
+        let LlType::Ptr(dst_addrspace) = self.resolve_type(&dst_arg.ty)? else {
+            return Ok(false);
+        };
+        let LlType::Ptr(src_addrspace) = self.resolve_type(&src_arg.ty)? else {
+            return Ok(false);
+        };
+        let dst_storage = self.pointer_storage_for(&dst_arg.value, dst_addrspace)?;
+        let src_storage = self.pointer_storage_for(&src_arg.value, src_addrspace)?;
+        let dst = self.value_id(&dst_arg.value, &dst_arg.ty)?;
+        let src = self.value_id(&src_arg.value, &src_arg.ty)?;
+        let src_ptr_ty = self.ptr_type_id(src_storage, &src_field)?;
+        let src_field_ptr = self.fresh();
+        let zero = self.const_uint(0)?;
+        instructions.push(Self::inst(
+            Op::InBoundsAccessChain,
+            Some(src_ptr_ty),
+            Some(src_field_ptr),
+            vec![Operand::IdRef(src), Operand::IdRef(zero)],
+        ));
+        self.emit_aggregate_memcpy(
+            dst,
+            src_field_ptr,
+            dst_storage,
+            src_storage,
+            &dst_pointee,
+            &src_field,
+            len,
+            instructions,
+        )
     }
 
     pub(in crate::native::emitter) fn emit_prefix_struct_memcpy(

@@ -326,6 +326,41 @@ impl Emitter {
         Ok(())
     }
 
+    pub(in crate::native::emitter) fn reserve_pointer_phi_provenance(
+        &mut self,
+        name: &str,
+    ) -> Result<(), String> {
+        if self.gep_provenance.contains_key(name) {
+            return Ok(());
+        }
+        let Some(incoming) = self.tir_phi_incomings.get(name).cloned() else {
+            return Ok(());
+        };
+        let Some(template) = self.pointer_phi_template_provenance(name, &incoming)? else {
+            return Ok(());
+        };
+        if template.indices.len() != 1 {
+            return Ok(());
+        }
+        let index_ty = template.indices[0].ty.clone();
+        let index_name = pointer_index_name(name);
+        self.result_id(&index_name, &index_ty)?;
+        self.gep_provenance.insert(
+            name.to_string(),
+            GepProvenance {
+                root: template.root,
+                addrspace: template.addrspace,
+                source_ty: template.source_ty,
+                indices: vec![TypedValue {
+                    ty: index_ty,
+                    value: LlValue::Local(index_name),
+                }],
+                root_is_indexed_container: template.root_is_indexed_container,
+            },
+        );
+        Ok(())
+    }
+
     pub(in crate::native::emitter) fn record_pointer_meta(
         &mut self,
         name: String,

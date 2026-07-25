@@ -30,10 +30,21 @@ pub(in crate::passes) enum ParamBinding {
     /// A loadable interface var (Input varying / vertex attribute): replace param uses with an
     /// OpLoad of `var` (type = the param's value type) inserted at function start.
     LoadVar { var: Word, ty: Word },
+    /// A scalar fragment bool varying. Vulkan user IO cannot use OpTypeBool, so the interface slot is
+    /// a flat uint and the loaded value is compared against zero at function entry.
+    LoadVarBoolFromUint { var: Word, bool_ty: Word },
     /// A scalar builtin Input var (`VertexIndex`/`InstanceIndex`, a 32-bit uint) feeding a NARROWER
     /// integer param (`ushort [[instance_id]]`, an i16): load the uint then `OpUConvert` it down to the
     /// param's own width, so the body's 16-bit uses (`OpBitwiseAnd %ushort`) are width-consistent.
     LoadVarConverted {
+        var: Word,
+        load_ty: Word,
+        param_ty: Word,
+    },
+    /// A loadable interface var whose signedness was recovered from AIR metadata while the LLVM body
+    /// still uses the original signless integer type id. Load the interface type, then bitcast to the
+    /// body's parameter type.
+    LoadVarBitcast {
         var: Word,
         load_ty: Word,
         param_ty: Word,
@@ -86,9 +97,9 @@ pub(in crate::passes) enum ParamBinding {
         dim: (Dim, bool),
         comp: ImageComp,
     },
-    /// A runtime-indexed texture ARRAY (`array_ref<texture>`): a descriptor array of sampled images.
-    /// Declared as `OpTypeArray %image N` in UniformConstant. Unlike `Image`, the param is NOT replaced
-    /// by a loaded image at function top; it is spliced to the array VARIABLE, and
+    /// A runtime-indexed texture ARRAY (`array_ref<texture>`): a descriptor array of sampled or storage
+    /// images. Declared as `OpTypeArray %image N` in UniformConstant. Unlike `Image`, the param is NOT
+    /// replaced by a loaded image at function top; it is spliced to the array VARIABLE, and
     /// `materialize_texture_array_loads` turns each per-element handle load into
     /// `OpAccessChain %arrayvar %idx` + `OpLoad %image` at the use site. `elem_image_ty` is the element
     /// `OpTypeImage`; the pass records `(var -> (elem_image_ty, dim, comp))` in `ctx.image_array_vars`.
@@ -119,6 +130,14 @@ pub(in crate::passes) enum ParamBinding {
     Sampler { var: Word },
     /// A buffer block variable, with the lowering of the body's param uses (see `BufWrap`).
     Buffer { var: Word, wrap: BufWrap },
+    /// A compute `[[stage_in]]` value. Vulkan has no compute-stage attribute stream, so the
+    /// translator exposes each attribute as a read-only StorageBuffer array and indexes it by
+    /// `GlobalInvocationId.x`.
+    StageInput {
+        var: Word,
+        value_ty: Word,
+        index_var: Word,
+    },
     /// Threadgroup memory (`air.buffer` with `air.address_space = 3`): a fixed Workgroup array.
     WorkgroupMemory { var: Word },
     /// A non-resource value that can be spliced directly into parameter uses.
@@ -134,6 +153,14 @@ pub(in crate::passes) enum ParamBinding {
     /// a storage class NVIDIA compiles cleanly. Derived access chains are re-storage-classed to Private
     /// in `apply_bindings`.
     ZeroPointer { var: Word },
+}
+
+fn texture_type_is_handle_array(name: &str) -> bool {
+    let compact = name
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    compact.contains("array_ref<texture") || compact.contains("array<texture")
 }
 
 /// How a buffer param's body uses are lowered.
@@ -203,15 +230,21 @@ pub(super) fn build_stage_input(
                                                         // an FC-specialized shader threads the pixel position into several helpers), but Vulkan forbids two
                                                         // interface variables decorated with the same builtin. Create FragCoord once and share it.
     let mut fragcoord_var: Option<Word> = None;
+    let mut pointcoord_var: Option<Word> = None;
+    let mut primitive_id_var: Option<Word> = None;
     let mut local_invocation_index_var: Option<Word> = None;
     let mut num_workgroups_var: Option<Word> = None;
     let mut global_invocation_id_var: Option<Word> = None;
+    let stage_input_bindings = kernel_stage_input_bindings(kern);
 
     for (i, (pid, pty)) in params.iter().enumerate() {
         let idx = i as u32;
         let role_is = |s: &str| match stage {
             Stage::Fragment => match frag.and_then(|m| m.role_of(idx)) {
                 Some(FragRole::Position) => s == "position",
+                Some(FragRole::PointCoord) => s == "point_coord",
+                Some(FragRole::PrimitiveId) => s == "primitive_id",
+                Some(FragRole::ViewportArrayIndex) => s == "viewport_array_index",
                 Some(FragRole::Varying(_)) => s == "varying",
                 Some(FragRole::Texture(_)) => s == "texture",
                 Some(FragRole::Sampler(_)) => s == "sampler",
@@ -253,6 +286,7 @@ pub(super) fn build_stage_input(
                 Some(KernRole::ThreadsPerSimdgroup) => s == "threads_per_simdgroup",
                 Some(KernRole::SimdgroupsPerThreadgroup) => s == "simdgroups_per_threadgroup",
                 Some(KernRole::ThreadPositionInGrid) => s == "thread_position_in_grid",
+                Some(KernRole::StageInput(_)) => s == "stage_in",
                 _ => s == "other",
             },
         };
@@ -294,28 +328,71 @@ pub(super) fn build_stage_input(
             && (kern.and_then(|m| m.buffer_address_space(idx)) == Some(3)
                 || ptr_storage(&defs, *pty) == Some(StorageClass::Workgroup));
 
-        // A runtime-indexed texture array is declared `array_ref<texture...>` in the AIR arg type
-        // metadata. Such a param is a descriptor ARRAY, not a single image: the backend emits real
-        // per-element handle loads (`load ptr addrspace(1), gep %argbuf, %idx`) that a single-image
-        // binding turns into an illegal `OpLoad` of a pointer FROM the image value. Route these to the
-        // `ImageArray` binding + `materialize_texture_array_loads`. Floor-safe: every `array_ref`
-        // texture fails today (the emitter never aliases its handle loads to the param), so no currently
-        // passing case is on this path.
+        // Runtime-indexed texture arrays are declared as `array_ref<texture...>` or fixed
+        // `array<texture...>` in AIR metadata. Both are descriptor ARRAYs, not single images: the
+        // backend emits per-element handle loads (`load ptr addrspace(1), gep %argbuf, %idx`) that
+        // must become `OpAccessChain` into a UniformConstant image array.
         let texture_type_name = match stage {
             Stage::Fragment => frag.and_then(|m| m.texture_type_name(idx)),
             Stage::Vertex => vert.and_then(|m| m.texture_type_name(idx)),
             Stage::Kernel => kern.and_then(|m| m.texture_type_name(idx)),
         };
-        let is_array_texture = texture_type_name
-            .is_some_and(|n| n.contains("array_ref<") || n.contains("array_ref <"));
+        let is_array_texture = texture_type_name.is_some_and(texture_type_is_handle_array);
 
-        if role_is("texture") && !wtex_dims.contains_key(pid) && is_array_texture {
-            let (dim, arrayed, comp) = tex_dims
-                .get(pid)
+        if let (Stage::Kernel, Some(KernRole::StageInput(_))) =
+            (stage, kern.and_then(|m| m.role_of(idx)))
+        {
+            let rta = ctx.ty_runtime_array(*pty);
+            let block_ty = ctx.module.fresh_id();
+            ctx.new_globals.push(type_inst(
+                Op::TypeStruct,
+                block_ty,
+                vec![Operand::IdRef(rta)],
+            ));
+            let pptr = ctx.ty_ptr(StorageClass::StorageBuffer, block_ty);
+            let var = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::Variable,
+                Some(pptr),
+                Some(var),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ));
+            let binding = stage_input_bindings
+                .get(&idx)
                 .copied()
-                .or_else(|| texture_type_hints.get(pid).copied())
-                .unwrap_or((Dim::Dim2D, false, ImageComp::Float));
-            let elem_image_ty = ctx.ty_image(dim, arrayed, comp);
+                .ok_or_else(|| format!("kernel stage_in parameter {idx} missing binding"))?;
+            decorate_binding(&mut ctx.module, var, binding);
+            let index_var = bind_kernel_v3uint_builtin_once(
+                ctx,
+                &mut global_invocation_id_var,
+                BuiltIn::GlobalInvocationId,
+            );
+            bindings.push((
+                *pid,
+                ParamBinding::StageInput {
+                    var,
+                    value_ty: *pty,
+                    index_var,
+                },
+            ));
+            buffer_structs.push((var, block_ty));
+        } else if role_is("texture") && is_array_texture {
+            let (elem_image_ty, dim, arrayed, comp) =
+                if let Some((dim, arrayed, fmt, comp)) = wtex_dims.get(pid).copied() {
+                    (
+                        ctx.ty_storage_image(dim, arrayed, fmt, comp),
+                        dim,
+                        arrayed,
+                        comp,
+                    )
+                } else {
+                    let (dim, arrayed, comp) = tex_dims
+                        .get(pid)
+                        .copied()
+                        .or_else(|| texture_type_hints.get(pid).copied())
+                        .unwrap_or((Dim::Dim2D, false, ImageComp::Float));
+                    (ctx.ty_image(dim, arrayed, comp), dim, arrayed, comp)
+                };
             // The array length is a runtime function constant (`nImagesFC`), not a compile-time value,
             // so over-declare to `air.max_textures` (128). Vulkan lets an argument-buffer texture array
             // be over-sized; only accessed descriptors need be valid, and spirv-val does not bounds-check
@@ -719,8 +796,71 @@ pub(super) fn build_stage_input(
             bindings.push((*pid, ParamBinding::Buffer { var, wrap }));
             buffer_structs.push((var, struct_ty));
         } else if role_is("varying") {
-            // Input var of the param value type at Location loc; load at entry.
-            let pptr = ctx.ty_ptr(StorageClass::Input, *pty);
+            if matches!(stage, Stage::Fragment) && is_scalar_bool(&defs, *pty) {
+                let uint_ty = ctx.ty_uint();
+                let pptr = ctx.ty_ptr(StorageClass::Input, uint_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_location(&mut ctx.module, var, loc);
+                decorate_flat(&mut ctx.module, var);
+                ctx.interface.push(var);
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadVarBoolFromUint { var, bool_ty: *pty },
+                ));
+            } else if matches!(stage, Stage::Fragment) && type_contains_bool(&defs, *pty) {
+                return Err(format!(
+                    "fragment bool stage input at location {loc} is unsupported: Vulkan user \
+                     Input/Output interfaces cannot use OpTypeBool"
+                ));
+            } else {
+                let interface_ty = if matches!(stage, Stage::Fragment) {
+                    fragment_varying_interface_type(ctx, frag, loc, *pty, &defs)
+                } else {
+                    *pty
+                };
+                // Input var of the param value type at Location loc; load at entry.
+                let pptr = ctx.ty_ptr(StorageClass::Input, interface_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_location(&mut ctx.module, var, loc);
+                // Fragment inputs are Flat either because Vulkan forbids interpolation for their
+                // scalar type (integer / 64-bit float; VUID-StandaloneSpirv-Flat-04744) or because
+                // AIR explicitly marked the varying `air.flat`.
+                let air_flat_varying = matches!(stage, Stage::Fragment)
+                    && frag.is_some_and(|m| m.varying_is_flat(loc));
+                if matches!(stage, Stage::Fragment)
+                    && (air_flat_varying || fragment_input_needs_flat(&defs, *pty))
+                {
+                    decorate_flat(&mut ctx.module, var);
+                }
+                ctx.interface.push(var);
+                if interface_ty == *pty {
+                    bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
+                } else {
+                    bindings.push((
+                        *pid,
+                        ParamBinding::LoadVarBitcast {
+                            var,
+                            load_ty: interface_ty,
+                            param_ty: *pty,
+                        },
+                    ));
+                }
+            }
+        } else if role_is("viewport_array_index") {
+            let uint_ty = ctx.ty_uint();
+            let pptr = ctx.ty_ptr(StorageClass::Input, uint_ty);
             let var = ctx.module.fresh_id();
             ctx.new_globals.push(Instruction::new(
                 Op::Variable,
@@ -728,14 +868,21 @@ pub(super) fn build_stage_input(
                 Some(var),
                 vec![Operand::StorageClass(StorageClass::Input)],
             ));
-            decorate_location(&mut ctx.module, var, loc);
-            // Fragment Input varyings of integer / 64-bit-float type cannot be interpolated and must
-            // be Flat-decorated (VUID-StandaloneSpirv-Flat-04744; banked `2ec0065d`, `110901bc`).
-            if matches!(stage, Stage::Fragment) && fragment_input_needs_flat(&defs, *pty) {
-                decorate_flat(&mut ctx.module, var);
-            }
+            decorate_builtin(&mut ctx.module, var, BuiltIn::ViewportIndex);
+            decorate_flat(&mut ctx.module, var);
             ctx.interface.push(var);
-            bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
+            if *pty == uint_ty {
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
+            } else {
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadVarConverted {
+                        var,
+                        load_ty: uint_ty,
+                        param_ty: *pty,
+                    },
+                ));
+            }
         } else if role_is("vertex_id") || role_is("instance_id") {
             // `[[vertex_id]]`/`[[instance_id]]` -> Input BuiltIn VertexIndex/InstanceIndex. Vulkan
             // requires this builtin to be a 32-bit int Input; the AIR `uint` param lowers to `%uint`,
@@ -933,6 +1080,47 @@ pub(super) fn build_stage_input(
                 let z = ctx.const_zero(*pty, &defs);
                 bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
             }
+        } else if role_is("point_coord") {
+            let v2 = ctx.ty_vecf(2);
+            if *pty == v2 {
+                let var = if let Some(v) = pointcoord_var {
+                    v
+                } else {
+                    let pptr = ctx.ty_ptr(StorageClass::Input, v2);
+                    let var = ctx.module.fresh_id();
+                    ctx.new_globals.push(Instruction::new(
+                        Op::Variable,
+                        Some(pptr),
+                        Some(var),
+                        vec![Operand::StorageClass(StorageClass::Input)],
+                    ));
+                    decorate_builtin(&mut ctx.module, var, BuiltIn::PointCoord);
+                    ctx.interface.push(var);
+                    pointcoord_var = Some(var);
+                    var
+                };
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: v2 }));
+            } else {
+                let z = ctx.const_zero(*pty, &defs);
+                bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
+            }
+        } else if role_is("primitive_id") {
+            let uint_ty = ctx.ty_uint();
+            let var =
+                bind_kernel_uint_builtin_once(ctx, &mut primitive_id_var, BuiltIn::PrimitiveId);
+            decorate_flat(&mut ctx.module, var);
+            if *pty == uint_ty {
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
+            } else {
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadVarConverted {
+                        var,
+                        load_ty: uint_ty,
+                        param_ty: *pty,
+                    },
+                ));
+            }
         } else if let Some(pointee) = data_pointer_pointee(&defs, *pty) {
             // Unmodeled *pointer* param (an unbound `constant T&`/buffer that no role recognized). An
             // OpUndef of a data-pointer type would be dereferenced by the body's OpAccessChain/OpLoad —
@@ -981,10 +1169,9 @@ pub(super) fn build_stage_input(
     include_existing_private_globals(ctx);
 
     // Register textures embedded in an argument buffer (via `air.indirect_argument` → `air.texture`,
-    // read by an integer-coord `air.read_texture`) as standalone sampled images BEFORE applying param
-    // bindings. This lands them in `ctx.image_dims`/`ctx.image_comp` so the read-texture lowering's
-    // `single_sampled_image_for_private_read` fallback finds exactly one sampled image and fetches
-    // from it, instead of nulling the read.
+    // read/written by AIR texture intrinsics) as standalone images BEFORE applying param bindings. This
+    // lands them in `ctx.image_dims`/`ctx.image_comp` and, for writable fields, `ctx.image_storage`, so
+    // private-placeholder helper operands can recover the real descriptor.
     register_embedded_textures(ctx, entry_idx, kern, &mut binding_ctr);
 
     // Apply param bindings to the body: drop params, then splice replacements.
@@ -994,18 +1181,16 @@ pub(super) fn build_stage_input(
     Ok(defs)
 }
 
-/// Materialize a UniformConstant sampled image for each argument-buffer-embedded texture the meta
+/// Materialize a UniformConstant image for each argument-buffer-embedded texture the meta
 /// pass surfaced (see `KernMeta::embedded_textures`), decorate it at `TEXTURE_BINDING_BASE + K`
 /// (K = the synthetic texture index the meta pass assigned via `embedded_synthetic_texture_index`,
 /// the SAME convention the validation harness uses to bind the seeded texture), load it at entry, and
-/// register the loaded image in `image_dims`/`image_comp`.
+/// register the loaded image in `image_dims`/`image_comp` plus `image_storage` for writable fields.
 ///
-/// This is what turns the read of an argument-buffer-embedded texture (whose handle is a private
-/// pointer loaded from the arg buffer) into a real `OpImageFetch`: the read-texture lowering falls
-/// back to the single non-storage sampled image in `image_dims` when the operand is a private pointer,
-/// and this registration provides exactly that image. Gated entirely on AIR structure (the meta pass
-/// only fills `embedded_textures` for the `air.indirect_argument`→`air.texture`+`air.read_texture`
-/// shape), never on a name.
+/// This is what turns the use of an argument-buffer-embedded texture (whose handle is a private
+/// pointer loaded from the arg buffer) into a real `OpImageFetch`/`OpImageWrite`: the texture lowerings
+/// fall back to the unambiguous sampled/storage image when the operand is a private pointer, and this
+/// registration provides that image. Gated entirely on AIR structure, never on a shader name.
 fn register_embedded_textures(
     ctx: &mut Ctx,
     entry_idx: usize,
@@ -1019,7 +1204,11 @@ fn register_embedded_textures(
     let embedded = kern.embedded_textures.clone();
     let mut loads: Vec<Instruction> = vec![];
     for tex in embedded {
-        let image_ty = ctx.ty_image(tex.dim, false, tex.comp);
+        let image_ty = if let Some(format) = tex.storage_format {
+            ctx.ty_storage_image(tex.dim, false, format.to_spirv_format(), tex.comp)
+        } else {
+            ctx.ty_image(tex.dim, false, tex.comp)
+        };
         let pptr = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
         let var = ctx.module.fresh_id();
         ctx.new_globals.push(Instruction::new(
@@ -1045,6 +1234,9 @@ fn register_embedded_textures(
         ));
         ctx.image_dims.insert(lid, (tex.dim, false));
         ctx.image_comp.insert(lid, tex.comp);
+        if tex.storage_format.is_some() {
+            ctx.image_storage.insert(lid);
+        }
     }
     // Insert the loads at the top of the entry block, AFTER any leading OpVariables (SPIR-V requires
     // function-local OpVariables to be the first instructions of the entry block). apply_bindings
@@ -1059,6 +1251,35 @@ fn register_embedded_textures(
             first.instructions.insert(at + k, ld);
         }
     }
+}
+
+fn kernel_stage_input_bindings(kern: Option<&KernMeta>) -> HashMap<u32, u32> {
+    let Some(kern) = kern else {
+        return HashMap::new();
+    };
+    let mut occupied = kern
+        .roles
+        .iter()
+        .filter_map(|(_, role)| match role {
+            KernRole::Buffer(binding) | KernRole::AccelerationStructureShadow(binding) => {
+                Some(*binding)
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut next = 0u32;
+    let mut out = HashMap::new();
+    for (idx, role) in &kern.roles {
+        if !matches!(role, KernRole::StageInput(_)) {
+            continue;
+        }
+        while occupied.contains(&next) {
+            next = next.saturating_add(1);
+        }
+        occupied.insert(next);
+        out.insert(*idx, next);
+    }
+    out
 }
 
 impl Ctx {
@@ -1183,6 +1404,34 @@ mod tests {
         assert!(fragment_input_needs_flat(&defs, 4), "uint vector");
         assert!(!fragment_input_needs_flat(&defs, 5), "float32 vector");
         assert!(fragment_input_needs_flat(&defs, 6), "double vector");
+    }
+
+    #[test]
+    fn type_contains_bool_descends_through_vectors() {
+        let mut defs = HashMap::new();
+        defs.insert(1, ty(Op::TypeBool, 1, vec![]));
+        defs.insert(2, ty(Op::TypeFloat, 2, vec![Operand::LiteralBit32(32)]));
+        defs.insert(
+            3,
+            ty(
+                Op::TypeVector,
+                3,
+                vec![Operand::IdRef(1), Operand::LiteralBit32(2)],
+            ),
+        );
+        defs.insert(
+            4,
+            ty(
+                Op::TypeVector,
+                4,
+                vec![Operand::IdRef(2), Operand::LiteralBit32(2)],
+            ),
+        );
+
+        assert!(type_contains_bool(&defs, 1));
+        assert!(type_contains_bool(&defs, 3));
+        assert!(!type_contains_bool(&defs, 2));
+        assert!(!type_contains_bool(&defs, 4));
     }
 
     // layout_types_reachable_from collects every struct/array reached from the Block struct (these all

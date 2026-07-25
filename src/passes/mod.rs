@@ -49,6 +49,10 @@ pub struct TransformOptions {
     /// intrinsics define. Default false → emitted bytes are identical to the whole-subgroup form; the
     /// caller opts in only for a wider-subgroup driver (see kb conformance M-D2, pending G7).
     pub simd_cluster32: bool,
+    /// AIR `air.compile.denorms_disable` requests flush-to-zero behavior for floating-point
+    /// denormals. Vulkan's native execution mode is optional on real devices, so the pass pipeline
+    /// emulates f16/f32/f64 with bit-level SPIR-V instead of `DenormFlushToZero` execution modes.
+    pub denorm_flush_to_zero_f32: bool,
 }
 
 impl Default for TransformOptions {
@@ -57,6 +61,7 @@ impl Default for TransformOptions {
             kernel_local_size: [64, 1, 1],
             kernel_threads_per_grid: None,
             simd_cluster32: false,
+            denorm_flush_to_zero_f32: false,
         }
     }
 }
@@ -106,8 +111,8 @@ pub(in crate::passes) enum SynthCacheKey {
     VecType { elem: Word, lanes: u32 },
     /// `OpConstantComposite <ty> <value×lanes>` synthesized by `access::const_composite_splat`.
     CompositeSplat { ty: Word, value: Word, lanes: u32 },
-    /// The singleton `LocalInvocationIndex` builtin Input variable (`matrix_shuffle`).
-    LocalInvocationIndexInputVar,
+    /// The singleton `SubgroupLocalInvocationId` builtin Input variable (`matrix_shuffle`).
+    SubgroupLocalInvocationIdInputVar,
 }
 
 /// All state needed while rewriting; the module owns result-id allocation.
@@ -149,8 +154,8 @@ struct Ctx {
     /// the write-texture binding. `air.write_texture_*` lowers to `OpImageWrite` only on these.
     image_storage: HashSet<Word>,
     /// texture-array descriptor variable id -> (element `OpTypeImage` id, (Dim, arrayed), comp). Set
-    /// by the interface `ParamBinding::ImageArray` binding for a runtime-indexed `array_ref<texture>`
-    /// argument. `materialize_texture_array_loads` reads it to turn each `OpLoad` of a handle from a
+    /// by the interface `ParamBinding::ImageArray` binding for runtime-indexed texture-handle arrays.
+    /// `materialize_texture_array_loads` reads it to turn each `OpLoad` of a handle from a
     /// dynamically-indexed array element into `OpAccessChain %arrayvar %idx` + `OpLoad %image`.
     image_array_vars: HashMap<Word, (Word, (Dim, bool), ImageComp)>,
     /// loaded-image ids synthesized by `air.get_null_texture_*()`.
@@ -166,6 +171,8 @@ struct Ctx {
     kernel_threads_per_grid: Option<[u32; 3]>,
     /// M-D2 simd-reduce clustering opt-in (see [`TransformOptions::simd_cluster32`]).
     simd_cluster32: bool,
+    /// AIR compile-option denormal mode (see [`TransformOptions::denorm_flush_to_zero_f32`]).
+    denorm_flush_to_zero_f32: bool,
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
@@ -223,6 +230,7 @@ impl Ctx {
             kernel_local_size: options.kernel_local_size,
             kernel_threads_per_grid: options.kernel_threads_per_grid,
             simd_cluster32: options.simd_cluster32,
+            denorm_flush_to_zero_f32: options.denorm_flush_to_zero_f32,
             default_sampler_var: None,
             sampler_states: HashMap::new(),
             default_null_image_vars: HashMap::new(),
@@ -806,6 +814,7 @@ impl Ctx {
 mod access;
 mod air_calls;
 mod cfg_repair;
+mod denorm;
 mod emitted_inline;
 mod finalize;
 #[cfg(test)]
@@ -826,13 +835,14 @@ use access::{
     drop_writeonly_dead_local_array_stores, fix_noop_width_converts,
     guard_integer_division_by_zero, hoist_function_variables, lower_cross_member_subword_load,
     lower_cross_member_subword_store, lower_private_byte_aggregate_reinterpret,
-    lower_private_memory_atomics, lower_subword_scalar_store, narrow_access_chain_indices,
-    neutralize_null_access_chains, neutralize_private_placeholder_access_chains,
-    normalize_int_arith_operand_widths, normalize_scalar_store_types,
-    recover_inlined_local_pointer_fields, remap_dynamic_word_index_to_array_member,
-    remap_dynamic_word_index_to_array_struct_field, remap_overflow_word_index_to_outer_member,
-    remap_word_index_to_struct_member, remodel_workgroup_flatword_aggregate,
-    remodel_workgroup_floatarray_atomic_as_uint, repair_scalar_load_through_vector_ptr,
+    lower_private_memory_atomics, lower_scalar_i64_arithmetic_to_u32_halves,
+    lower_subword_scalar_store, narrow_access_chain_indices, neutralize_null_access_chains,
+    neutralize_private_placeholder_access_chains, normalize_int_arith_operand_widths,
+    normalize_scalar_store_types, recover_inlined_local_pointer_fields,
+    remap_dynamic_word_index_to_array_member, remap_dynamic_word_index_to_array_struct_field,
+    remap_overflow_word_index_to_outer_member, remap_word_index_to_struct_member,
+    remodel_workgroup_flatword_aggregate, remodel_workgroup_floatarray_atomic_as_uint,
+    remodel_workgroup_single_field_struct_array, repair_scalar_load_through_vector_ptr,
     repair_vector_load_through_scalar_stride, reroot_demoted_array_element_overindex,
     retype_demoted_copymemory_placeholder, rewrite_byte_buffer_chained_reinterpret,
     rewrite_chained_element_reinterpret, rewrite_dynamic_struct_index_reinterpret,
@@ -841,6 +851,7 @@ use access::{
     rewrite_scalar_slot_array_overindex, rewrite_strided_descent_access_chains,
 };
 use air_calls::lower_air_calls;
+use denorm::emulate_f32_denorm_flush_to_zero;
 use emitted_inline::{
     compose_chained_access_chains, inline_selected_helpers, prune_unreferenced_functions,
 };
@@ -946,6 +957,19 @@ pub(crate) fn inline_all_emitted_helpers(
     }
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     Ok((ctx.module, ctx.emit_sidecar))
+}
+
+pub(crate) fn lower_scalar_i64_arithmetic_module(module: &mut Module) {
+    let owned = std::mem::take(module);
+    let mut ctx = Ctx::with_options_and_sidecar(
+        owned,
+        crate::emit_sidecar::EmitSidecar::default(),
+        Stage::Kernel,
+        TransformOptions::default(),
+    );
+    lower_scalar_i64_arithmetic_to_u32_halves(&mut ctx);
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    *module = ctx.module;
 }
 
 /// Reproduce SPIR-V loader block partitioning without crossing the words boundary.
@@ -1387,7 +1411,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     let input_defs = build_stage_input(&mut ctx, entry_idx, &stage, frag, vert, kern)?;
     // 1b) return -> output vars.
     rewrite_return(&mut ctx, entry_idx, &stage, frag, vert, &input_defs)?;
-    // Turn each runtime-indexed `array_ref<texture>` element handle load into an OpAccessChain+OpLoad
+    // Turn each runtime-indexed texture-array element handle load into an OpAccessChain+OpLoad
     // into the descriptor array declared by the interface `ImageArray` binding, so the sample/query
     // lowering below sees an ordinary loaded image (no-op unless an ImageArray binding exists). Runs
     // BEFORE `recover_inlined_local_pointer_fields`, which otherwise rewrites the per-element handle
@@ -1480,6 +1504,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     rewrite_reinterpret_scalar_loads(&mut ctx, entry_idx);
     rewrite_scalar_slot_array_overindex(&mut ctx, entry_idx)?;
     remodel_workgroup_flatword_aggregate(&mut ctx, entry_idx);
+    remodel_workgroup_single_field_struct_array(&mut ctx, entry_idx);
     remodel_workgroup_floatarray_atomic_as_uint(&mut ctx, entry_idx)?;
     lower_private_byte_aggregate_reinterpret(&mut ctx, entry_idx)?;
     retype_demoted_copymemory_placeholder(&mut ctx, entry_idx);
@@ -1491,14 +1516,20 @@ pub(crate) fn transform_with_options_and_sidecar(
     //     match, purely structural (bit width only, no name matching). Runs module-wide, last, so it
     //     repairs the mismatch regardless of which earlier lowering pass introduced it.
     normalize_int_arith_operand_widths(&mut ctx);
+    // 2i) Some conformant Vulkan devices expose `shaderInt64` but execute scalar 64-bit arithmetic
+    //     via a fragile native path. Rebuild add/sub/mul from 32-bit/16-bit pieces; this is the same
+    //     modular result as the original `ulong` arithmetic and is structural over integer width.
+    lower_scalar_i64_arithmetic_to_u32_halves(&mut ctx);
 
     // 2g) deterministic threadgroup memory: zero-fill every Workgroup variable at kernel entry
     //     (stores of OpConstantNull + one control barrier), the candidate half of the harness's
     //     defined refinement of Metal's undefined threadgroup contents. Kernel-only: Workgroup
     //     variables exist only in compute, and the barrier is only legal there.
     if matches!(stage, Stage::Kernel) {
+        workgroup::unroll_small_workgroup_atomic_loops(&mut ctx, entry_idx);
         workgroup::zero_initialize_workgroup_memory(&mut ctx, entry_idx);
     }
+    emulate_f32_denorm_flush_to_zero(&mut ctx, entry_idx);
 
     // 2f) drop blocks unreachable from the entry (orphaned constructs the structured-CFG repair's
     //     clone-then-rewire steps can leave behind). spirv-val tolerates them; SPIRV-Cross (MoltenVK)

@@ -1,12 +1,12 @@
 use super::types::{struct_member_starts_at, tokenize, Tok};
-use super::{arg_type_name, role_strings, texture_shape_from_name};
+use super::{arg_type_name, role_strings, texture_shape_from_name, TextureFormat};
 use crate::passes::ImageComp;
 use spirv::Dim;
 use std::collections::HashMap;
 
 /// A texture that lives inside an `air.indirect_buffer` argument buffer, marked
-/// `air.indirect_argument` → `air.texture` in the buffer's `air.struct_type_info`, and read by the
-/// kernel body through an integer-coord `air.read_texture` (an exact texel fetch, no filtering).
+/// `air.indirect_argument` → `air.texture` in the buffer's `air.struct_type_info`, and used by the
+/// kernel body through an AIR texture read/write intrinsic.
 ///
 /// The translator materializes a synthetic UniformConstant sampled image for it and the validation
 /// harness binds the SAME deterministically-seeded texture on both the Apple-oracle side (encoded
@@ -21,8 +21,10 @@ pub struct EmbeddedTexture {
     pub field_offset: u32,
     /// Texture dimensionality (only 2D is currently detected/supported).
     pub dim: Dim,
-    /// Sampled component type (Float for `texture2d<float, sample>`).
+    /// Sampled/storage component type (Float for `texture2d<float, read/write>`).
     pub comp: ImageComp,
+    /// Storage-image format for write/read_write textures; `None` for sampled/read textures.
+    pub storage_format: Option<TextureFormat>,
     /// The synthetic texture index `K` this embedded texture binds at.
     pub synthetic_texture_index: u32,
 }
@@ -39,19 +41,19 @@ pub fn embedded_synthetic_texture_index(texture_locations: &[u32]) -> u32 {
     texture_locations.iter().copied().max().map_or(0, |m| m + 1)
 }
 
-/// True iff the kernel body calls an `air.read_texture*` intrinsic — an integer-coord exact texel
-/// fetch. `air.read_texture` is a stable AIR intrinsic symbol (part of the AIR ABI), not a shader
-/// identifier. A declaration line (`declare ... @air.read_texture_2d.*`) is only emitted when the
-/// body actually calls it, so its presence in the `.ll` text is a sound structural signal.
-pub(super) fn body_uses_read_texture(ll: &str) -> bool {
-    ll.contains("@air.read_texture")
+/// True iff the kernel body calls an AIR texture read/write intrinsic. These are stable AIR intrinsic
+/// symbols, not shader identifiers. A declaration line is only emitted when the body actually calls it,
+/// so its presence in the `.ll` text is a sound structural signal.
+pub(super) fn body_uses_texture_read_or_write(ll: &str) -> bool {
+    ll.contains("@air.read_texture") || ll.contains("@air.write_texture")
 }
 
 /// Scan each `air.indirect_buffer`'s `air.struct_type_info` for members marked
-/// `air.indirect_argument` whose nested node is an `air.texture` (sampled). Each such texture is
+/// `air.indirect_argument` whose nested node is an `air.texture`. Each such texture is
 /// surfaced as an `EmbeddedTexture` with a synthetic index K, K+1, … (K from
 /// [`embedded_synthetic_texture_index`]) so the translator and harness agree on the binding without
-/// a name key. Only 2D sampled float/int textures are detected (the shape the read path supports).
+/// a name key. Only plain 2D float/int textures are detected (the shape the current read/write paths
+/// support).
 pub(super) fn detect_embedded_textures(
     nodes: &HashMap<u32, String>,
     indirect_buffer_struct_refs: &[(u32, u32)],
@@ -65,8 +67,13 @@ pub(super) fn detect_embedded_textures(
                 continue;
             };
             let strs = role_strings(tex_node);
-            // Structural gate: the nested node must be an `air.texture` that is `air.sample`-capable.
-            if !strs.iter().any(|s| s == "texture") || !strs.iter().any(|s| s == "sample") {
+            // Structural gate: the nested node must be an `air.texture` with an access class the
+            // read/write lowerings can express.
+            if !strs.iter().any(|s| s == "texture")
+                || !strs
+                    .iter()
+                    .any(|s| matches!(s.as_str(), "sample" | "read" | "write" | "read_write"))
+            {
                 continue;
             }
             let name = arg_type_name(tex_node).unwrap_or_default();
@@ -81,6 +88,7 @@ pub(super) fn detect_embedded_textures(
                 field_offset,
                 dim,
                 comp: shape.component.to_image_comp(),
+                storage_format: shape.storage_format,
                 synthetic_texture_index: next_k,
             });
             next_k += 1;
@@ -137,4 +145,36 @@ fn embedded_texture_members(nodes: &HashMap<u32, String>, sref: u32) -> Vec<(u32
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::meta::TextureFormat;
+
+    #[test]
+    fn embedded_texture_detection_includes_read_and_write_fields() {
+        let mut nodes = HashMap::new();
+        nodes.insert(
+            10,
+            r#"i32 0, i32 8, i32 0, !"texture2d<float, read>", !"input", !"air.indirect_argument", !20, i32 8, i32 8, i32 0, !"texture2d<float, write>", !"output", !"air.indirect_argument", !21"#.to_string(),
+        );
+        nodes.insert(
+            20,
+            r#"i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>""#.to_string(),
+        );
+        nodes.insert(
+            21,
+            r#"i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>""#.to_string(),
+        );
+
+        let textures = detect_embedded_textures(&nodes, &[(0, 10)], &[]);
+        assert_eq!(textures.len(), 2);
+        assert_eq!(textures[0].field_offset, 0);
+        assert_eq!(textures[0].storage_format, None);
+        assert_eq!(textures[0].synthetic_texture_index, 0);
+        assert_eq!(textures[1].field_offset, 8);
+        assert_eq!(textures[1].storage_format, Some(TextureFormat::R32f));
+        assert_eq!(textures[1].synthetic_texture_index, 1);
+    }
 }

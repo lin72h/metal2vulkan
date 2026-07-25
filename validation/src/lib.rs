@@ -23,7 +23,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
-const RENDER_TARGET_SEED: Seed = Seed::Deterministic { tag: 197 };
+pub const RENDER_TARGET_SEED_TAG: u32 = 197;
+const RENDER_TARGET_SEED: Seed = Seed::Deterministic {
+    tag: RENDER_TARGET_SEED_TAG,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
@@ -51,10 +54,15 @@ pub enum DataFormat {
     Rgba8Unorm,
     Rgba8Uint,
     Rgba8Sint,
+    R16Uint,
+    Rg16Uint,
     Rgba16Uint,
     R32Uint,
     Rg32Uint,
     Rgba32Uint,
+    R16Sint,
+    Rg16Sint,
+    Rgba16Sint,
     R32Sint,
     Rg32Sint,
     Rgba32Sint,
@@ -87,12 +95,15 @@ impl DataFormat {
     pub const fn bytes_per_pixel(self) -> Option<usize> {
         match self {
             DataFormat::Rgba8Unorm | DataFormat::Rgba8Uint | DataFormat::Rgba8Sint => Some(4),
+            DataFormat::R16Uint | DataFormat::R16Sint => Some(2),
+            DataFormat::Rg16Uint | DataFormat::Rg16Sint => Some(4),
+            DataFormat::Rgba16Uint | DataFormat::Rgba16Sint => Some(8),
             DataFormat::R32Uint | DataFormat::R32Sint => Some(4),
             DataFormat::Rg32Uint | DataFormat::Rg32Sint => Some(8),
             DataFormat::Rgba32Uint | DataFormat::Rgba32Sint => Some(16),
             DataFormat::R16Float => Some(2),
             DataFormat::Rg16Float => Some(4),
-            DataFormat::Rgba16Uint | DataFormat::Rgba16Float => Some(8),
+            DataFormat::Rgba16Float => Some(8),
             DataFormat::Rg32Float => Some(8),
             DataFormat::Rgba32Float => Some(16),
             DataFormat::R32Float => Some(4),
@@ -363,7 +374,15 @@ pub fn seeded_unit_rgba32_float_texture_bytes(extent: Extent3d) -> Vec<u8> {
 }
 
 pub fn seeded_render_target_bytes(format: DataFormat, extent: Extent3d) -> Vec<u8> {
-    seeded_image_bytes(format, extent, RENDER_TARGET_SEED)
+    let seed = if float_element_size(format).is_some() {
+        match RENDER_TARGET_SEED {
+            Seed::Deterministic { tag } => Seed::DeterministicFinite { tag },
+            other => other,
+        }
+    } else {
+        RENDER_TARGET_SEED
+    };
+    seeded_image_bytes(format, extent, seed)
 }
 
 /// Element byte size of a float image format, or `None` if the format is not float-typed (so no
@@ -538,6 +557,31 @@ mod tests {
         assert_eq!(a.len(), 16);
         assert!(a.iter().any(|byte| *byte != 0));
         assert!(a.iter().all(|byte| *byte != 0));
+    }
+
+    #[test]
+    fn float_render_target_seed_is_finite() {
+        let extent = Extent3d::new(8, 8, 1);
+        for &(fmt, elem) in &[
+            (DataFormat::Rgba16Float, 2usize),
+            (DataFormat::Rgba32Float, 4usize),
+            (DataFormat::Depth32Float, 4usize),
+        ] {
+            let bytes = seeded_render_target_bytes(fmt, extent);
+            for chunk in bytes.chunks_exact(elem) {
+                let finite = if elem == 2 {
+                    let h = u16::from_le_bytes([chunk[0], chunk[1]]);
+                    ((h >> 10) & 0x1f) != 0x1f
+                } else {
+                    let f = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                    f.is_finite()
+                };
+                assert!(
+                    finite,
+                    "{fmt:?} render target element not finite: {chunk:02x?}"
+                );
+            }
+        }
     }
 
     #[test]

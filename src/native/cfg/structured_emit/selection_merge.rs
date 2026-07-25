@@ -85,7 +85,16 @@ pub(in crate::native) fn loop_exit_selection_convergence(
         .values()
         .flat_map(|role| [role.merge.as_str(), role.continue_target.as_str()])
         .collect();
-    let mut candidates: Vec<&str> = blocks
+    let candidate_depth = |name: &str| {
+        let mut depth = 0usize;
+        let mut cur = name;
+        while let Some(parent) = forest.idom(cur) {
+            depth += 1;
+            cur = parent;
+        }
+        depth
+    };
+    let mut candidates: Vec<(&str, usize)> = blocks
         .iter()
         .map(|block| block.name.as_str())
         .filter(|candidate| {
@@ -97,20 +106,12 @@ pub(in crate::native) fn loop_exit_selection_convergence(
                 && !nested_loop_nodes.contains(candidate)
                 && !all_loop_roles.contains(candidate)
         })
+        .map(|candidate| (candidate, candidate_depth(candidate)))
         .collect();
-    let depth = |name: &str| {
-        let mut depth = 0usize;
-        let mut cur = name;
-        while let Some(parent) = forest.idom(cur) {
-            depth += 1;
-            cur = parent;
-        }
-        depth
-    };
-    candidates.sort_by_key(|candidate| (depth(candidate), *candidate));
+    candidates.sort_by_key(|(candidate, depth)| (*depth, *candidate));
 
     let mut best: Option<(usize, usize, &str)> = None;
-    for candidate in candidates {
+    for (candidate, depth) in candidates {
         // A candidate need not be reached by every arm: an arm that only breaks/continues the
         // enclosing loop is a legal structured exit. Prefer the candidate reached by the MOST arms,
         // then the deepest one. That chooses the true outer convergence (`latch`) over a one-arm body
@@ -156,7 +157,7 @@ pub(in crate::native) fn loop_exit_selection_convergence(
             reaching_arms += reached as usize;
         }
         if valid && reaching_arms > 0 {
-            let score = (reaching_arms, depth(candidate), candidate);
+            let score = (reaching_arms, depth, candidate);
             if best
                 .as_ref()
                 .is_none_or(|current| score > (current.0, current.1, current.2))
@@ -182,8 +183,8 @@ pub(in crate::native) fn synth_unique_selection_merge(
         .iter()
         .filter(|b| {
             b.role != BlockRole::ConstructTreeRoute
-                && forest.dominates(header, &b.name)
                 && block_successors(b).iter().any(|s| s == natural)
+                && forest.dominates(header, &b.name)
         })
         .map(|b| b.name.clone())
         .collect();
@@ -231,8 +232,8 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
         .iter()
         .filter(|b| {
             b.role != BlockRole::ConstructTreeRoute
-                && forest.dominates(header, &b.name)
                 && block_successors(b).iter().any(|s| s == natural)
+                && forest.dominates(header, &b.name)
         })
         .map(|b| b.name.clone())
         .collect();
@@ -323,20 +324,19 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
 /// (the loop and the outer selection) and the loop needs a distinct synthesized merge before it can be
 /// structured. `merge` is examined against `selection_merges`, restricted to headers not in this
 /// loop's body (an in-loop conditional sharing the merge is a structured break, handled elsewhere).
-pub(in crate::native) fn merge_collides_with_outer_selection(
-    blocks: &[BodyBlock],
+pub(in crate::native) fn merge_collides_with_outer_selection_from(
+    forest: &LoopForest,
+    selection_merges: &HashMap<String, String>,
     header: &str,
     merge: &str,
     converge_inloop: bool,
 ) -> bool {
-    let forest = analyze(blocks);
     let Some(l) = forest.loop_for_header(header) else {
         return false;
     };
     let body: HashSet<&str> = l.body.iter().map(String::as_str).collect();
-    let sel = selection_merges(blocks, &forest);
     // Base: an OUTER selection (header not in this loop's body) whose post-dominator is the loop merge.
-    if sel
+    if selection_merges
         .iter()
         .any(|(h, m)| m == merge && !body.contains(h.as_str()))
     {
@@ -348,7 +348,7 @@ pub(in crate::native) fn merge_collides_with_outer_selection(
     // `cond-phi-shared/loop-role/merge-inloop` reject class (07 and the 107-fn bucket). Only enabled for
     // the retry attempt on a base-REJECTING function, so base-admitting functions stay byte-identical.
     if converge_inloop {
-        return sel
+        return selection_merges
             .iter()
             .any(|(h, m)| m == merge && body.contains(h.as_str()) && h.as_str() != header);
     }

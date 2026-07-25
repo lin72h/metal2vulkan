@@ -77,6 +77,53 @@ attributes #0 = { nounwind }
 }
 
 #[test]
+fn local_array_pointer_induction_phi_compares_by_index() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %arr = alloca [2 x i32], align 4
+  %first = getelementptr inbounds [2 x i32], ptr %arr, i64 0, i64 0
+  store i32 7, ptr %first, align 4
+  %end = getelementptr inbounds [2 x i32], ptr %arr, i64 0, i64 1
+  br label %loop
+
+loop:
+  %p = phi ptr [ %first, %entry ], [ %next, %loop ]
+  %v = load i32, ptr %p, align 4
+  store i32 %v, ptr addrspace(1) %out, align 4
+  %next = getelementptr inbounds i32, ptr %p, i64 1
+  %done = icmp eq ptr %next, %end
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_pointer_induction_phi_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpPhi"), "{asm}");
+    assert!(asm.contains("OpIEqual"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_air_fmax3_fmin3_and_fmedian3_lower_as_nested_binary_extinsts() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

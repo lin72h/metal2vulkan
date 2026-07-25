@@ -434,20 +434,10 @@ pub(in crate::passes) fn lower_simd_op(
         return Ok(Some(insts));
     }
     if name.starts_with("air.simd_shuffle_down.") && args.len() == 2 {
-        let scope = ctx.const_uint(Scope::Subgroup as u32);
-        let mut insts = Vec::new();
-        let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
-        insts.push(Instruction::new(
-            Op::GroupNonUniformShuffleDown,
-            Some(rty),
-            Some(res),
-            vec![
-                Operand::IdScope(scope),
-                Operand::IdRef(args[0]),
-                Operand::IdRef(delta),
-            ],
-        ));
-        return Ok(Some(insts));
+        return lower_simd_shuffle_down(ctx, res, rty, args).map(Some);
+    }
+    if name.starts_with("air.simd_shuffle_rotate_down.") && args.len() == 2 {
+        return lower_simd_shuffle_rotate_down(ctx, res, rty, args).map(Some);
     }
     if name.starts_with("air.simd_shuffle_and_fill_down.") && args.len() == 4 {
         return lower_simd_shuffle_and_fill_down(ctx, res, rty, args).map(Some);
@@ -456,20 +446,7 @@ pub(in crate::passes) fn lower_simd_op(
         return lower_simd_shuffle_and_fill_up(ctx, res, rty, args).map(Some);
     }
     if name.starts_with("air.simd_shuffle_up.") && args.len() == 2 {
-        let scope = ctx.const_uint(Scope::Subgroup as u32);
-        let mut insts = Vec::new();
-        let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
-        insts.push(Instruction::new(
-            Op::GroupNonUniformShuffleUp,
-            Some(rty),
-            Some(res),
-            vec![
-                Operand::IdScope(scope),
-                Operand::IdRef(args[0]),
-                Operand::IdRef(delta),
-            ],
-        ));
-        return Ok(Some(insts));
+        return lower_simd_shuffle_up(ctx, res, rty, args).map(Some);
     }
     if name.starts_with("air.simd_shuffle_xor.") && args.len() == 2 {
         let scope = ctx.const_uint(Scope::Subgroup as u32);
@@ -699,6 +676,9 @@ pub(in crate::passes) fn lower_one(
     if name.starts_with("air.write_texture") {
         return lower_write(ctx, args, v4);
     }
+    if name == "air.calculate_unclamped_lod_texture_2d" {
+        return lower_calculate_unclamped_lod_texture_2d(ctx, name, res, rty, args);
+    }
     if name.starts_with("air.write_imageblock_slice_to_texture") {
         return lower_imageblock_slice_write(ctx, name, args, v4);
     }
@@ -771,10 +751,12 @@ pub(in crate::passes) fn lower_one(
     if name.starts_with("air.is_null_texture") {
         return lower_is_null_texture(ctx, name, res, rty, args);
     }
-    // `air.get_num_mip_levels_texture_<dim>(texture)` -> OpImageQueryLevels for sampled images.
+    // `air.get_num_mip_levels_{texture,depth}_<dim>(texture)` -> OpImageQueryLevels for sampled images.
     // SPIR-V forbids OpImageQueryLevels on storage images (Sampled=2), and the current private capture sets historically
     // texture contract synthesizes one mip level for storage-write targets.
-    if name.starts_with("air.get_num_mip_levels_texture") {
+    if name.starts_with("air.get_num_mip_levels_texture")
+        || name.starts_with("air.get_num_mip_levels_depth")
+    {
         return lower_get_num_mip_levels(ctx, name, res, rty, args);
     }
     // The current conformance texture contract creates single-sample RGBA8 textures. Until the

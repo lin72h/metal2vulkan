@@ -330,6 +330,14 @@ fn structured_plan_inner7(
             &terminal_merges,
         )
     };
+    if selection_synth_growth_exceeds_ladder_cap(lblocks.len(), sblocks.len()) {
+        spi_reject!(format!(
+            "selection-synth-growth nblk={} from={}",
+            sblocks.len(),
+            lblocks.len()
+        ));
+        return None;
+    }
 
     // Every conditional/switch header must have a unique merge (else module 2 skipped it → fall back).
     // Build header→merge alongside for the structured ordering.
@@ -693,8 +701,7 @@ pub(in crate::native) fn straddle_witness_lines(blocks: &[BodyBlock]) -> Vec<Str
         append_straddle_witness_modes("source-derived-destraddled", &destraddled, &mut out);
     }
 
-    let switch_private = clone_crossarm::privatize_switch_case_continuations(blocks);
-    let deep_shared = clone_crossarm::privatize_deep_shared_continuations(&switch_private);
+    let deep_shared = privatize_shared_continuations_for_ladder(blocks);
     if blocks_changed(blocks, &deep_shared) {
         append_straddle_witness_modes("deep-shared", &deep_shared, &mut out);
     }
@@ -704,7 +711,7 @@ pub(in crate::native) fn straddle_witness_lines(blocks: &[BodyBlock]) -> Vec<Str
         append_straddle_witness_modes("trivial", &trivial, &mut out);
     }
 
-    let region = clone_crossarm::privatize_region_cross_arm(blocks);
+    let region = privatize_region_cross_arm_for_ladder(blocks);
     if blocks_changed(blocks, &region) {
         append_straddle_witness_modes("region", &region, &mut out);
     }

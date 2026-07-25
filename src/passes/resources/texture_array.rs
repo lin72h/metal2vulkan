@@ -1,6 +1,7 @@
-//! Runtime-indexed argument-buffer texture arrays (`array_ref<texture>`) → Vulkan descriptor arrays.
+//! Runtime-indexed argument-buffer texture arrays → Vulkan descriptor arrays.
 //!
-//! An `array_ref<texture2d>` kernel argument is a device buffer of texture handles indexed at runtime:
+//! An `array_ref<texture2d>` or fixed `array<texture2d, N>` argument is a device buffer of texture
+//! handles indexed at runtime:
 //! ```text
 //!   %e = getelementptr %"struct.metal::texture2d", ptr %argbuf, i64 %idx, i32 0
 //!   %h = load ptr addrspace(1), ptr %e         ; the handle for element %idx
@@ -11,13 +12,13 @@
 //! param spliced to the array VARIABLE (not a loaded image). This pass then rewrites every per-element
 //! handle load `%h = OpLoad <ptr> <chain-rooted-at-arrayvar>` in place into
 //! `%p = OpAccessChain %ptr_image %arrayvar %idx ; %h = OpLoad %image %p`, and records `%h` in
-//! `image_dims`/`image_comp` so the existing sample/size-query lowering (`resolve_image_value`) treats
-//! `%h` as an ordinary loaded image. The now-dead pointer derivations (the original access chain, any
-//! bitcast alias) are swept.
+//! `image_dims`/`image_comp` (and `image_storage` for storage-image element types) so the existing
+//! sample/read/write/size-query lowering (`resolve_image_value`) treats `%h` as an ordinary loaded
+//! image. The now-dead pointer derivations (the original access chain, any bitcast alias) are swept.
 //!
 //! Byte-safe by construction: the standard Vulkan bindless model — the descriptor at index `%idx`
 //! carries the same texture the Metal handle referenced. Floor-safe: fires ONLY on a param the
-//! stage-input pass bound as `ImageArray` (an `array_ref<texture>`, a shape whose real handle loads the
+//! stage-input pass bound as `ImageArray` (a texture-handle array shape whose real handle loads the
 //! single-image path mis-emits as an illegal `OpLoad` of a pointer from an image); no single-texture
 //! case is touched. The index is `air.is_uniform`-marked in the source, so plain uniform indexing is
 //! legal (no `ShaderNonUniform`).
@@ -28,7 +29,7 @@ use crate::spirv_module::Instruction;
 use crate::spirv_module::Operand;
 use spirv::{Op, StorageClass, Word};
 
-use super::super::{air_names, Ctx};
+use super::super::{air_names, type_def_of, Ctx};
 
 /// Materialize per-element image loads for every `ImageArray`-bound texture argument. No-op unless the
 /// stage-input pass recorded at least one array-texture variable.
@@ -48,11 +49,28 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             }
         }
     }
+    let fixed_elements = ctx
+        .emit_sidecar
+        .local_pointer_field_loads
+        .iter()
+        .filter_map(|fact| fixed_array_element(ctx, fact).map(|resolved| (fact.id, resolved)))
+        .collect::<Vec<_>>();
+    let fixed_handles: HashMap<Word, (Word, Word)> = fixed_elements
+        .into_iter()
+        .map(|(id, (arrayvar, element))| (id, (arrayvar, ctx.const_uint(element))))
+        .collect();
+    let dynamic_handles: HashMap<Word, (Word, Word)> = ctx
+        .emit_sidecar
+        .local_pointer_dynamic_field_loads
+        .iter()
+        .filter_map(|fact| dynamic_array_element(ctx, fact).map(|resolved| (fact.id, resolved)))
+        .collect();
 
     // 1. Find each texture-intrinsic call's handle operand (arg 0) whose defining load addresses an
     //    array element. Collect `(handle, load-pointer)` first (immutable module borrow), then resolve
     //    to `(arrayvar, idx)` — resolution mints a constant, which mutates `ctx`.
     let mut candidates: Vec<(Word, Word)> = Vec::new();
+    let mut handles: HashMap<Word, (Word, Word)> = HashMap::new();
     let mut seen: std::collections::HashSet<Word> = std::collections::HashSet::new();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
@@ -74,6 +92,14 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             if !seen.insert(*handle) {
                 continue;
             }
+            if let Some(&(arrayvar, idx)) = dynamic_handles.get(handle) {
+                handles.insert(*handle, (arrayvar, idx));
+                continue;
+            }
+            if let Some(&(arrayvar, idx)) = fixed_handles.get(handle) {
+                handles.insert(*handle, (arrayvar, idx));
+                continue;
+            }
             // The handle must be an OpLoad of a pointer that roots at an array variable.
             let Some(load) = defs.get(handle) else {
                 continue;
@@ -87,7 +113,6 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             candidates.push((*handle, *ptr));
         }
     }
-    let mut handles: HashMap<Word, (Word, Word)> = HashMap::new();
     for (handle, ptr) in candidates {
         if let Some((arrayvar, idx)) = resolve_array_element(ctx, &defs, ptr) {
             handles.insert(handle, (arrayvar, idx));
@@ -118,6 +143,9 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         retyped_load_ptr.insert(handle, (elem_image_ty, p));
         ctx.image_dims.insert(handle, dim);
         ctx.image_comp.insert(handle, comp);
+        if image_type_is_storage(ctx, elem_image_ty) {
+            ctx.image_storage.insert(handle);
+        }
         // The original load's pointer operand becomes dead; record its id for the sweep.
         if let Some(load) = defs.get(&handle) {
             if let Some(Operand::IdRef(old_ptr)) = load.operands.first() {
@@ -142,6 +170,7 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
                 ) {
                     rebuilt.push(chain.clone());
                     let mut load = inst;
+                    load.class.opcode = Op::Load;
                     load.result_type = Some(image_ty);
                     load.operands = vec![Operand::IdRef(p)];
                     rebuilt.push(load);
@@ -159,13 +188,13 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     sweep_dead_pointer_derivations(ctx, entry_idx, &dead_roots);
 }
 
-/// The `air.*` texture intrinsics whose arg 0 is a texture handle (sampled/read + size queries — NOT
-/// write, which the storage-image path owns).
+/// The `air.*` texture intrinsics whose arg 0 is a texture handle (sampled/read/write + size queries).
 fn is_texture_intrinsic(name: &str) -> bool {
     name.starts_with("air.sample_texture")
         || name.starts_with("air.sample_depth")
         || name.starts_with("air.read_texture")
         || name.starts_with("air.read_depth")
+        || name.starts_with("air.write_texture")
         || name.starts_with("air.gather_texture")
         || name.starts_with("air.gather_depth")
         || name.starts_with("air.get_width_texture")
@@ -176,8 +205,45 @@ fn is_texture_intrinsic(name: &str) -> bool {
         || name.starts_with("air.get_height_depth")
         || name.starts_with("air.get_depth_depth")
         || name.starts_with("air.get_num_mip_levels_texture")
+        || name.starts_with("air.get_num_mip_levels_depth")
         || name.starts_with("air.get_num_samples_texture")
         || name.starts_with("air.is_null_texture")
+}
+
+fn image_type_is_storage(ctx: &Ctx, image_ty: Word) -> bool {
+    type_def_of(ctx, image_ty)
+        .filter(|def| def.class.opcode == Op::TypeImage)
+        .and_then(|def| match def.operands.get(5) {
+            Some(Operand::LiteralBit32(sampled)) => Some(*sampled == 2),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
+fn dynamic_array_element(
+    ctx: &Ctx,
+    fact: &crate::emit_sidecar::LocalPointerDynamicFieldLoad,
+) -> Option<(Word, Word)> {
+    if !ctx.image_array_vars.contains_key(&fact.root) || !fact.prefix.is_empty() {
+        return None;
+    }
+    if !(fact.suffix.is_empty() || fact.suffix.as_slice() == [0]) {
+        return None;
+    }
+    Some((fact.root, fact.index))
+}
+
+fn fixed_array_element(
+    ctx: &Ctx,
+    fact: &crate::emit_sidecar::LocalPointerFieldLoad,
+) -> Option<(Word, u32)> {
+    if !ctx.image_array_vars.contains_key(&fact.root) {
+        return None;
+    }
+    match fact.indices.as_slice() {
+        [element] | [element, 0] => Some((fact.root, *element)),
+        _ => None,
+    }
 }
 
 /// Given the pointer operand of a handle load, return `(arrayvar, element_index)` if it addresses an

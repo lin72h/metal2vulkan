@@ -43,6 +43,7 @@ impl Emitter {
         self.pointer_payload_values.clear();
         self.pointer_phi_values.clear();
         self.pointer_phi_incoming_values.clear();
+        self.tir_phi_incomings.clear();
         self.direct_param_values.clear();
         self.direct_param_indices.clear();
         self.param_values.clear();
@@ -216,6 +217,7 @@ impl Emitter {
             // The DEFAULT emit leaves `cfg_restructure` false, so a reject emits its inferred merges
             // unrepaired (post-W4) and an admitting case can never be hijacked.
             if (self.cfg_restructure || self.construct_tree)
+                && body_blocks.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS
                 && crate::native::cfg::structured_plan(&body_blocks).is_none()
             {
                 let mut candidate = body_blocks.clone();
@@ -318,10 +320,16 @@ impl Emitter {
         }
         if !structured_active {
             self.block_labels.clear();
-            self.branch_merges = infer_branch_merges(&body_blocks);
             self.branch_merges_by_header.clear();
-            self.loop_merges = infer_loop_merges(&body_blocks);
-            self.switch_merges = infer_switch_merges(&body_blocks);
+            if relooper_feed {
+                self.branch_merges.clear();
+                self.loop_merges.clear();
+                self.switch_merges = infer_switch_merges(&body_blocks);
+            } else {
+                self.branch_merges = infer_branch_merges(&body_blocks);
+                self.loop_merges = infer_loop_merges(&body_blocks);
+                self.switch_merges = infer_switch_merges(&body_blocks);
+            }
         }
         // R3: index resolved typed operands by result name, built from the now-finalized structurized
         // block list — the exact IR the emission loop below walks. Straight-line instruction text is
@@ -374,6 +382,22 @@ impl Emitter {
                         }
                     }
                     if let Some(result) = &inst.result {
+                        if let Some((_, incoming)) = &inst.phi_incoming {
+                            let mut incoming = incoming.clone();
+                            let operands = inst
+                                .operands
+                                .iter()
+                                .map(crate::native::tir::TirOperand::as_typed_value)
+                                .collect::<Option<Vec<_>>>();
+                            if let Some(operands) = operands {
+                                if operands.len() == incoming.len() {
+                                    for (entry, operand) in incoming.iter_mut().zip(operands) {
+                                        entry.0 = operand.value;
+                                    }
+                                }
+                            }
+                            self.tir_phi_incomings.insert(result.clone(), incoming);
+                        }
                         self.tir_operands
                             .insert(result.clone(), inst.operands.clone());
                         if let Some(result_ty) = &inst.result_ty {
@@ -1180,35 +1204,54 @@ fn reorder_forward_local_def_blocks(
             ));
         }
 
-        // Flatten the per-block result names into `(name, current_index)` pairs in the CURRENT block
-        // order — the exact list the retired text scan recomputed each iteration, now sourced from the
-        // typed def/use graph (keyed by block name, valid as reorder permutes the Vec) instead of
-        // re-lexing `.lines`.
-        let mut defs: Vec<(&str, usize)> = Vec::new();
-        for (idx, block) in body_blocks.iter().enumerate() {
-            if let Some(names) = defuse.defs_by_block.get(&block.name) {
-                defs.extend(names.iter().map(|name| (name.as_str(), idx)));
+        // Index local uses by current block index once per move. We still scan definitions in current
+        // block/instruction order below, so the selected move is byte-for-byte equivalent to the old
+        // nested scan: earliest use block wins, and within that block the earliest forward definition
+        // in current order wins.
+        let mut use_indices_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (idx, block) in body_blocks.iter().enumerate().skip(1) {
+            if let Some(uses) = defuse.uses_by_block.get(&block.name) {
+                for name in uses {
+                    use_indices_by_name
+                        .entry(name.as_str())
+                        .or_default()
+                        .push(idx);
+                }
+            }
+        }
+        let mut first_forward_def_by_use_idx: Vec<Option<usize>> = vec![None; body_blocks.len()];
+        for (def_idx, block) in body_blocks.iter().enumerate() {
+            let Some(names) = defuse.defs_by_block.get(&block.name) else {
+                continue;
+            };
+            for name in names {
+                let Some(use_indices) = use_indices_by_name.get(name.as_str()) else {
+                    continue;
+                };
+                for &use_idx in use_indices {
+                    if def_idx > use_idx && first_forward_def_by_use_idx[use_idx].is_none() {
+                        first_forward_def_by_use_idx[use_idx] = Some(def_idx);
+                    }
+                }
             }
         }
         let mut moved = false;
-        'scan: for idx in 1..body_blocks.len() {
-            let Some(uses) = defuse.uses_by_block.get(&body_blocks[idx].name) else {
-                continue;
-            };
-            for (name, def_idx) in &defs {
-                if *def_idx > idx && uses.contains(*name) {
-                    let block = body_blocks.remove(*def_idx);
-                    body_blocks.insert(idx, block);
-                    moves += 1;
-                    if moves > max_moves {
-                        return Err(format!(
-                            "native emitter: forward local block reorder budget exceeded after {moves} moves"
-                        ));
-                    }
-                    moved = true;
-                    break 'scan;
-                }
+        if let Some((idx, def_idx)) = first_forward_def_by_use_idx
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(idx, def_idx)| def_idx.map(|def_idx| (idx, def_idx)))
+            .next()
+        {
+            let block = body_blocks.remove(def_idx);
+            body_blocks.insert(idx, block);
+            moves += 1;
+            if moves > max_moves {
+                return Err(format!(
+                    "native emitter: forward local block reorder budget exceeded after {moves} moves"
+                ));
             }
+            moved = true;
         }
         if !moved {
             break;

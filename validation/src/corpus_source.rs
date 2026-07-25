@@ -44,7 +44,7 @@ pub fn load_ll_text(source: &SourceFile) -> Result<String, String> {
     if source.air_ll.is_empty() {
         Err(format!("source {} has empty air_ll", source.label))
     } else {
-        Ok(source.air_ll.clone())
+        Ok(metal2vulkan::tools::sanitize_ll_text_with_datalayout(&source.air_ll).0)
     }
 }
 
@@ -92,6 +92,41 @@ fn source_file_from_data(source: SourceData) -> SourceFile {
         lib: source.lib,
         lib_sha256: source.lib_sha256,
         public_path: source.public_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_with_ll(air_ll: &str) -> SourceFile {
+        SourceFile {
+            label: "local/test.ll".into(),
+            kind: "private".into(),
+            air_sha256: "0".repeat(64),
+            shard: Some("shard_00.jsonl".into()),
+            air_ll: air_ll.into(),
+            blob_b64: None,
+            lib: None,
+            lib_sha256: None,
+            public_path: None,
+        }
+    }
+
+    #[test]
+    fn load_ll_text_sanitizes_shard_air_text() {
+        let source = source_with_ll(
+            "target datalayout = \"e-p:64:64\"\n\
+             target triple = \"air64-apple-ios\"\n\
+             @llvm.global_ctors = appending global [0 x { i32, ptr, ptr }] []\n\
+             define void @k() {\n  ret void\n}\n",
+        );
+
+        let ll = load_ll_text(&source).unwrap();
+
+        assert!(ll.contains(metal2vulkan::tools::VULKAN_TRIPLE), "{ll}");
+        assert!(!ll.contains("target datalayout"), "{ll}");
+        assert!(!ll.contains("@llvm.global_ctors"), "{ll}");
     }
 }
 

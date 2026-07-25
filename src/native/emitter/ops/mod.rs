@@ -37,6 +37,14 @@ fn bfloat_lanes(ty: &LlType) -> Option<u32> {
     }
 }
 
+fn float_lanes(ty: &LlType) -> Option<u32> {
+    match ty {
+        LlType::Float => Some(1),
+        LlType::Vector(elem, n) if **elem == LlType::Float => Some(*n),
+        _ => None,
+    }
+}
+
 /// `elem` for `n <= 1`, else `Vector(elem, n)` — the scalar-or-vector shape used by the shaped bf16
 /// widen/narrow helpers.
 fn shaped_type(elem: LlType, n: u32) -> LlType {

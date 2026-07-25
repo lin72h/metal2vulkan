@@ -147,6 +147,7 @@ impl TirBlock {
             diag_line: None,
             shuffle_mask: None,
             void_call_line: None,
+            value_call_error: None,
             bitcast: None,
             icmp_rest: None,
             pointer_pointee: None,

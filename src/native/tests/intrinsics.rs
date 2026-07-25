@@ -380,6 +380,54 @@ attributes #1 = { convergent nobuiltin nounwind "no-builtins" }
 }
 
 #[test]
+fn native_visible_function_table_value_call_reports_indirect_function_pointer() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <4 x float> @main() {
+entry:
+  %table = inttoptr i64 0 to ptr addrspace(1)
+  %fp = tail call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 0)
+  %cast = bitcast ptr %fp to ptr
+  %result = call fast <4 x float> %cast(ptr addrspace(2) null)
+  ret <4 x float> %result
+}
+
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
+"#;
+    let err = emit_vulkan_spirv(ll).expect_err("indirect value call should be unsupported");
+    assert!(err.contains("unsupported indirect call"), "{err}");
+    assert!(err.contains("function pointer %cast"), "{err}");
+    assert!(!err.contains("graph_walk_unmigrated_opcode"), "{err}");
+}
+
+#[test]
+fn native_visible_function_reference_fails_before_retry_cascade() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main() {
+entry:
+  tail call void @postfixPrimary_f.MTL_VISIBLE_FN_REF(ptr addrspace(2) null)
+  ret void
+}
+
+declare void @postfixPrimary_f.MTL_VISIBLE_FN_REF(ptr addrspace(2)) section "air.externally_defined"
+!air.visible_function_references = !{!0}
+!0 = !{!"air.visible_function_reference", ptr @postfixPrimary_f.MTL_VISIBLE_FN_REF, !"postfixPrimary_f"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_visible_function_ref_{}",
+        std::process::id()
+    ));
+    let err = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect_err("direct Metal visible function references are unsupported");
+    assert!(
+        err.contains("unsupported Metal visible function reference"),
+        "{err}"
+    );
+    assert!(err.contains("Logical SPIR-V"), "{err}");
+}
+
+#[test]
 fn native_reverse_bits_intrinsic_lowers() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -797,6 +845,102 @@ declare float @air.fast_fmod.f32(float, float)
     {
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_fast_pi_transcendentals_lower() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main() {
+entry:
+  %cos = tail call fast float @air.fast_cospi.f32(float 5.000000e-01)
+  %sin = tail call fast float @air.fast_sinpi.f32(float 2.500000e-01)
+  %tan = tail call fast float @air.fast_tanpi.f32(float 1.250000e-01)
+  %sum0 = fadd fast float %cos, %sin
+  %sum1 = fadd fast float %sum0, %tan
+  %sink = fcmp oge float %sum1, 0.000000e+00
+  ret void
+}
+
+declare float @air.fast_cospi.f32(float)
+declare float @air.fast_sinpi.f32(float)
+declare float @air.fast_tanpi.f32(float)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_fast_pi_transcendentals_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains(" Cos "), "{asm}");
+    assert!(asm.contains(" Sin "), "{asm}");
+    assert!(asm.contains(" Tan "), "{asm}");
+    assert!(asm.matches("OpFMul").count() >= 3, "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn native_fast_sincos_f32_zeroes_large_arguments() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(float %x) {
+entry:
+  %cos = tail call fast float @air.fast_cos.f32(float %x)
+  %sin = tail call fast float @air.fast_sin.f32(float %x)
+  %sum = fadd fast float %cos, %sin
+  %sink = fcmp oge float %sum, 0.000000e+00
+  ret void
+}
+
+declare float @air.fast_cos.f32(float)
+declare float @air.fast_sin.f32(float)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_fast_sincos_large_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains(" FAbs "), "{asm}");
+    assert!(asm.contains(" Trunc "), "{asm}");
+    assert!(asm.contains(" Cos "), "{asm}");
+    assert!(asm.contains(" Sin "), "{asm}");
+    assert!(asm.contains("OpFDiv"), "{asm}");
+    assert!(asm.contains("OpFSub"), "{asm}");
+    assert!(asm.contains("OpFOrdGreaterThanEqual"), "{asm}");
+    assert!(asm.contains("1073741800"), "{asm}");
+    assert!(asm.matches("OpSelect").count() >= 2, "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]

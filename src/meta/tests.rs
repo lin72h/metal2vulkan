@@ -6,11 +6,12 @@ const FRAG_LL: &str = r#"
 !15 = !{ptr @F, !16, !18}
 !16 = !{!17}
 !17 = !{!"air.render_target", i32 0, i32 0}
-!18 = !{!19, !20, !21, !22}
+!18 = !{!19, !20, !21, !22, !23}
 !19 = !{i32 0, !"air.position", !"air.center"}
 !20 = !{i32 1, !"air.fragment_input", !"generated", !"air.arg_type_name", !"float2", !"air.arg_name", !"texCoord"}
 !21 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"texture2d<float, sample>"}
 !22 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 5, i32 1}
+!23 = !{i32 4, !"air.point_coord", !"air.arg_type_name", !"float2", !"air.arg_name", !"pointCoord"}
 "#;
 
 #[test]
@@ -22,10 +23,22 @@ fn fragment_roles() {
     assert_eq!(m.role_of(1), Some(&FragRole::Varying(0)));
     assert_eq!(m.role_of(2), Some(&FragRole::Texture(0)));
     assert_eq!(m.role_of(3), Some(&FragRole::Buffer(5)));
+    assert_eq!(m.role_of(4), Some(&FragRole::PointCoord));
     assert_eq!(m.texture_type_name(2), Some("texture2d<float, sample>"));
     assert_eq!(m.varying_type(0), Some("float2"));
     assert_eq!(m.varying_name(0), Some("texCoord"));
     assert_eq!(m.varying_user_semantic(0), Some("generated"));
+    assert!(!m.varying_is_flat(0));
+}
+
+#[test]
+fn fragment_flat_varying_metadata() {
+    let ll = FRAG_LL.replace(
+        r#"!20 = !{i32 1, !"air.fragment_input", !"generated", !"air.arg_type_name", !"float2", !"air.arg_name", !"texCoord"}"#,
+        r#"!20 = !{i32 1, !"air.fragment_input", !"generated", !"air.flat", !"air.arg_type_name", !"float2", !"air.arg_name", !"texCoord"}"#,
+    );
+    let m = parse_air_fragment_meta(&ll).unwrap();
+    assert!(m.varying_is_flat(0));
 }
 
 #[test]
@@ -55,6 +68,68 @@ entry:
 "#;
     let m = parse_air_fragment_meta(ll).unwrap();
     assert_eq!(m.role_of(0), Some(&FragRole::Texture(4)));
+}
+
+#[test]
+fn fragment_function_constant_render_target_is_recognized() {
+    let ll = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!3 = !{i32 7, !"air.function_constant", !5, !"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"half2"}
+!4 = !{}
+!5 = !{ptr addrspace(2) @__metal_implicit_fc_pred_1, !"bool", !"uses_coverage"}
+"#;
+    let m = parse_air_fragment_meta(ll).unwrap();
+    assert_eq!(m.n_render_targets, 2);
+    assert_eq!(m.render_target_members, vec![(0, 0), (1, 1)]);
+    assert_eq!(m.render_target_type_name(1), Some("half2"));
+}
+
+#[test]
+fn fragment_color_input_uses_render_target_location() {
+    let ll = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{!5}
+!5 = !{i32 2, !"air.render_target", i32 2, !"air.arg_type_name", !"float", !"air.arg_name", !"d0"}
+"#;
+    let m = parse_air_fragment_meta(ll).unwrap();
+    assert_eq!(m.role_of(2), Some(&FragRole::ColorInput(2)));
+    assert_eq!(m.color_input_type_name(2), Some("float"));
+}
+
+#[test]
+fn fragment_render_target_location_uses_static_init_default() {
+    let ll = r#"
+@_ZL32__metal_implicit_attr_int_expr_5 = internal addrspace(2) global i32 0, align 4
+@_ZN2RB6Shader8Constant13_shader_stateE.MTL_FC_INIT_0_Dv4_j = internal unnamed_addr addrspace(2) externally_initialized constant <4 x i32> undef, section "air.fc_initializer", align 16
+
+define internal void @_GLOBAL__sub_I_shader.metal() section "air.static_init" {
+entry:
+  %1 = load <4 x i32>, ptr addrspace(2) @_ZN2RB6Shader8Constant13_shader_stateE.MTL_FC_INIT_0_Dv4_j
+  %2 = extractelement <4 x i32> %1, i64 0
+  %3 = and i32 %2, 131072
+  %4 = icmp eq i32 %3, 0
+  %5 = select i1 %4, i32 4, i32 6
+  store i32 %5, ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_5
+  ret void
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!3 = !{i32 9, !"air.function_constant", !5, !"air.render_target", ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_5, !"air.arg_type_name", !"half4"}
+!4 = !{}
+!5 = !{ptr addrspace(2) @__metal_implicit_fc_pred_1, !"bool", !"uses_dest"}
+"#;
+    let m = parse_air_fragment_meta(ll).unwrap();
+    assert_eq!(m.render_target_members, vec![(0, 0), (1, 4)]);
+    assert_eq!(m.render_target_indices, vec![0, 4]);
 }
 
 #[test]
@@ -134,12 +209,13 @@ fn vertex_roles() {
 const VERT_BUILTIN_LL: &str = r#"
 !air.vertex = !{!14}
 !14 = !{ptr @vmain, !15, !17}
-!15 = !{!16, !20}
+!15 = !{!16, !20, !21}
 !16 = !{!"air.position", !"air.arg_type_name", !"float4"}
 !17 = !{!18, !19}
 !18 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"vid"}
 !19 = !{i32 1, !"air.instance_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"iid"}
 !20 = !{!"air.viewport_array_index", !"air.arg_type_name", !"uint", !"air.arg_name", !"viewport"}
+!21 = !{!"air.clip_distance", !"air.arg_type_name", !"float", !"air.arg_name", !"clip"}
 "#;
 
 #[test]
@@ -149,6 +225,48 @@ fn vertex_builtin_roles() {
     assert_eq!(m.role_of(1), Some(&VertRole::InstanceId));
     assert_eq!(m.output_role_of(0), Some(&VertOutRole::Position));
     assert_eq!(m.output_role_of(1), Some(&VertOutRole::ViewportArrayIndex));
+    assert_eq!(m.output_role_of(2), Some(&VertOutRole::ClipDistance));
+}
+
+#[test]
+fn vertex_render_target_array_index_role() {
+    let ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @vmain, !1, !5}
+!1 = !{!2, !3, !4}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{!"air.render_target_array_index", !"air.arg_type_name", !"uint", !"air.arg_name", !"layer"}
+!4 = !{!"air.vertex_output", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"varying"}
+!5 = !{}
+"#;
+    let m = parse_air_vertex_meta(ll).unwrap();
+    assert_eq!(m.output_role_of(0), Some(&VertOutRole::Position));
+    assert_eq!(
+        m.output_role_of(1),
+        Some(&VertOutRole::RenderTargetArrayIndex)
+    );
+    assert_eq!(m.output_role_of(2), Some(&VertOutRole::Varying(0)));
+}
+
+#[test]
+fn vertex_function_constant_output_is_disabled_by_default() {
+    let ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @vmain, !1, !6}
+!1 = !{!2, !3, !5}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{!"air.function_constant", !4, !"air.vertex_output", !"air.arg_type_name", !"float4", !"air.arg_name", !"optional"}
+!4 = !{ptr addrspace(2) @__metal_implicit_fc_pred_0, !"bool", !"enabled"}
+!5 = !{!"air.vertex_output", !"air.arg_type_name", !"float", !"air.arg_name", !"varying"}
+!6 = !{}
+"#;
+    let m = parse_air_vertex_meta(ll).unwrap();
+    assert_eq!(m.output_role_of(0), Some(&VertOutRole::Position));
+    assert_eq!(
+        m.output_role_of(1),
+        Some(&VertOutRole::FunctionConstantDisabled)
+    );
+    assert_eq!(m.output_role_of(2), Some(&VertOutRole::Varying(0)));
 }
 
 // `!air.kernel`: buffers + compute builtins (mirrors multi_add.air + harvested app kernels).
@@ -212,6 +330,19 @@ fn kernel_texture_sampler_roles() {
     assert_eq!(m.role_of(0), Some(&KernRole::Texture(5)));
     assert_eq!(m.texture_type_name(0), Some("texture2d<uint, read>"));
     assert_eq!(m.role_of(1), Some(&KernRole::Sampler(2)));
+}
+
+#[test]
+fn kernel_stage_in_is_preserved_as_role() {
+    let ll = r#"
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.stage_in", !"air.location_index", i32 7, i32 1, !"air.arg_type_name", !"uint3", !"air.arg_name", !"pointIndices"}
+"#;
+    let m = parse_air_kernel_meta(ll).unwrap();
+    assert_eq!(m.role_of(0), Some(&KernRole::StageInput(7)));
 }
 
 #[test]
@@ -423,6 +554,26 @@ fn nested_bitfield_struct_type_info_uses_declared_storage() {
 #[test]
 fn kernel_entry_name() {
     assert_eq!(entry_name(KERN_LL, "kernel").as_deref(), Some("k"));
+}
+
+#[test]
+fn quoted_kernel_entry_name() {
+    let ll = r#"
+define void @"re::df::pack"(ptr addrspace(1) %out) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @"re::df::pack", !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = distinct !{i32 0, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+    let (meta, _, entry) = parse_air_kernel_meta_variants(ll);
+    assert_eq!(entry.as_deref(), Some("re::df::pack"));
+    let meta = meta.expect("kernel metadata");
+    assert_eq!(meta.role_of(0), Some(&KernRole::Buffer(7)));
+    assert_eq!(meta.buffer_address_space(0), Some(1));
 }
 
 // `air.struct_type_info` reconstruction, including a matrix (float3x4 -> { [3 x float4] }) and a

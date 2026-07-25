@@ -48,6 +48,14 @@ pub fn is_pointer_typing_emit_error(err: &str) -> bool {
         || err.contains("cannot store through reinterpreted pointer select")
 }
 
+/// Whether a native-emitter error came from the typed straight-line body dispatcher after it failed
+/// to find a migrated lowering/carrier for one instruction. CFG-only retry feeds cannot repair this
+/// class: they change structured merge handling around already-emitted blocks, but this error occurs
+/// before the block body is complete.
+pub fn is_graph_walk_unmigrated_emit_error(err: &str) -> bool {
+    err.contains("reason=graph_walk_unmigrated_opcode")
+}
+
 /// Whether a spirv-val rejection of a produced module (`branches to the selection construct`,
 /// `back-edge`, `header block`, `does not dominate`, …) is a control-flow structurization failure the
 /// relooper retry tiers can restructure. Used by [`classify_validation_error`] to route a rejected

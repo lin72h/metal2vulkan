@@ -266,6 +266,7 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
         field_offset: 8,
         dim: spirv::Dim::Dim2D,
         comp: crate::passes::ImageComp::Float,
+        storage_format: None,
         synthetic_texture_index: 3,
     });
 
@@ -392,8 +393,8 @@ fn vertex_builtins_report_index_and_position_usage() {
 
 #[test]
 fn texture_access_classification_matches_declared_qualifier() {
-    // write/read_write textures classify as storage images; sample/read as sampled; array_ref as a
-    // sampled descriptor array (M2, mirroring the interface pass's texture_arg_storage).
+    // write/read_write textures classify as storage images; sample/read as sampled; texture handle
+    // arrays keep descriptor-array kind while access follows the inner texture qualifier.
     let cases = [
         (
             0u32,
@@ -422,6 +423,18 @@ fn texture_access_classification_matches_declared_qualifier() {
         (
             4,
             "array_ref<texture2d<float, sample>>",
+            ResourceKind::TextureArray,
+            ResourceAccess::Sampled,
+        ),
+        (
+            5,
+            "array_ref<texture2d<float, write>>",
+            ResourceKind::TextureArray,
+            ResourceAccess::Storage,
+        ),
+        (
+            6,
+            "array<texture2d<half, sample>, 32>",
             ResourceKind::TextureArray,
             ResourceAccess::Sampled,
         ),
@@ -519,6 +532,14 @@ fn texture_shape_exports_dimensionality_arrayed_multisampled_component() {
             false,
             TC::Uint,
         ),
+        (
+            9,
+            "array_ref<texture2d_array<uint, sample>>",
+            TD::D2,
+            true,
+            false,
+            TC::Uint,
+        ),
     ];
     let mut meta = KernMeta {
         roles: cases
@@ -555,7 +576,7 @@ fn storage_image_texel_format_exported() {
     // diverge. The consumer stops walking SPIR-V for the format operand.
     use crate::meta::TextureFormat as TF;
     let cases = [
-        (0u32, "texture2d<float, write>", TF::Rgba32f),
+        (0u32, "texture2d<float, write>", TF::R32f),
         (1, "texture2d<half, write>", TF::Rgba16f),
         (2, "texture2d<uint, write>", TF::Rgba8ui),
         (3, "texture2d<ushort, read_write>", TF::Rgba16ui),

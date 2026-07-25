@@ -141,7 +141,7 @@ pub(in crate::native) fn terminal_exit_selection_merges(
             .iter()
             .flat_map(|loop_info| loop_info.body.iter().map(String::as_str))
             .collect();
-        let depth = |name: &str| {
+        let header_depth = |name: &str| {
             let mut depth = 0usize;
             let mut current = name;
             while let Some(parent) = forest.idom(current) {
@@ -150,19 +150,21 @@ pub(in crate::native) fn terminal_exit_selection_merges(
             }
             depth
         };
-        let mut headers: Vec<String> = out
+        let mut headers: Vec<(String, usize)> = out
             .iter()
             .filter(|block| !merges.contains_key(&block.name))
             .filter(|block| !loop_nodes.contains(block.name.as_str()))
             .filter(|block| conditional_branch_targets(block).is_some())
-            .map(|block| block.name.clone())
+            .map(|block| (block.name.clone(), header_depth(&block.name)))
             .collect();
         // Inner terminal guards must claim their continuation first. An outer guard then sees the
         // inner private merge as an in-arm predecessor and receives its own bridge after it.
-        headers.sort_by(|left, right| depth(right).cmp(&depth(left)).then(left.cmp(right)));
+        headers.sort_by(|(left, left_depth), (right, right_depth)| {
+            right_depth.cmp(left_depth).then(left.cmp(right))
+        });
 
         let mut applied = false;
-        'headers: for header in headers {
+        'headers: for (header, _) in headers {
             if let Some(terminal) = terminal_exit_continuation(&out, &forest, &header) {
                 // The private pass-through is the selection merge. It need only be dominated by the
                 // header; its successor is outside the selection, so a shared continuation can remain
@@ -591,7 +593,7 @@ pub(in crate::native) fn terminal_exit_convergence(
             .is_some_and(|block| block.role == BlockRole::TerminalExitReturn)
             && block_ends_in_void_return(blocks, name)
     };
-    let depth = |name: &str| {
+    let candidate_depth = |name: &str| {
         let mut depth = 0usize;
         let mut current = name;
         while let Some(parent) = forest.idom(current) {
@@ -601,7 +603,7 @@ pub(in crate::native) fn terminal_exit_convergence(
         depth
     };
 
-    let mut candidates: Vec<&str> = blocks
+    let mut candidates: Vec<(&str, usize)> = blocks
         .iter()
         .filter(|block| {
             block.name != header
@@ -610,11 +612,14 @@ pub(in crate::native) fn terminal_exit_convergence(
                 && !matches!(block.role, BlockRole::LMerge | BlockRole::TerminalExitReturn)
                 && !loop_nodes.contains(block.name.as_str())
         })
-        .map(|block| block.name.as_str())
+        .map(|block| {
+            let name = block.name.as_str();
+            (name, candidate_depth(name))
+        })
         .collect();
-    candidates.sort_by_key(|candidate| (depth(candidate), *candidate));
+    candidates.sort_by_key(|(candidate, depth)| (*depth, *candidate));
 
-    for candidate in candidates {
+    for (candidate, _) in candidates {
         let mut terminal_paths = 0usize;
         let mut valid = true;
         for arm in [&arms.0, &arms.1] {

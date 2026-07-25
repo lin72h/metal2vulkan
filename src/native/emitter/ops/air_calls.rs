@@ -142,7 +142,12 @@ impl Emitter {
                     Scope::Workgroup
                 };
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
+                let semantics_kind = if scope_kind == Scope::Workgroup {
+                    MemorySemantics::RELEASE | MemorySemantics::WORKGROUP_MEMORY
+                } else {
+                    MemorySemantics::RELAXED
+                };
+                let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicStore,
                     None,
@@ -564,7 +569,12 @@ impl Emitter {
                     Scope::Workgroup
                 };
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
+                let semantics_kind = if scope_kind == Scope::Workgroup {
+                    MemorySemantics::ACQUIRE | MemorySemantics::WORKGROUP_MEMORY
+                } else {
+                    MemorySemantics::RELAXED
+                };
+                let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicLoad,
                     Some(result_type),
@@ -699,7 +709,18 @@ impl Emitter {
                     Scope::Workgroup
                 };
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
+                let success_semantics_kind = if scope_kind == Scope::Workgroup {
+                    MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY
+                } else {
+                    MemorySemantics::RELAXED
+                };
+                let failure_semantics_kind = if scope_kind == Scope::Workgroup {
+                    MemorySemantics::ACQUIRE | MemorySemantics::WORKGROUP_MEMORY
+                } else {
+                    MemorySemantics::RELAXED
+                };
+                let success_semantics = self.const_uint(success_semantics_kind.bits())?;
+                let failure_semantics = self.const_uint(failure_semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicCompareExchange,
                     Some(result_type),
@@ -707,8 +728,8 @@ impl Emitter {
                     vec![
                         Operand::IdRef(ptr),
                         Operand::IdScope(scope),
-                        Operand::IdMemorySemantics(semantics),
-                        Operand::IdMemorySemantics(semantics),
+                        Operand::IdMemorySemantics(success_semantics),
+                        Operand::IdMemorySemantics(failure_semantics),
                         Operand::IdRef(value),
                         Operand::IdRef(compare),
                     ],
@@ -781,7 +802,12 @@ impl Emitter {
                     _ => (Scope::Workgroup, Op::AtomicIAdd),
                 };
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics = self.const_uint(MemorySemantics::RELAXED.bits())?;
+                let semantics_kind = if scope_kind == Scope::Workgroup {
+                    MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY
+                } else {
+                    MemorySemantics::RELAXED
+                };
+                let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     op,
                     Some(result_type),

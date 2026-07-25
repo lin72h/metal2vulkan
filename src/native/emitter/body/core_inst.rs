@@ -390,16 +390,24 @@ impl Emitter {
                     let (name, call) = (name.clone(), call.clone());
                     return self.emit_value_call_resolved(name, call, instructions);
                 }
+                if let Some(err) = &inst.value_call_error {
+                    return Err(err.clone());
+                }
             }
         } else if inst.opcode == "store" {
             // The one result-LESS migrated family. Source `[value, pointer]` from `inst.operands` and
             // the alignment from `inst.mem_align` (the same alignment the retired text path parsed); when
-            // the operands don't resolve it reaches the fail-visible unmigrated-opcode `Err` below.
+            // generic operand lowering cannot express a store object, fall back to the explicit
+            // `TirInst.store` carrier parsed from the same line.
             if let Some(operands) = self.tir_inst_typed_operands(inst) {
                 if let [object, ptr] = operands.as_slice() {
                     let (object, ptr) = (object.clone(), ptr.clone());
                     return self.emit_store_resolved(object, ptr, inst.mem_align, instructions);
                 }
+            }
+            if let Some((object, ptr)) = &inst.store {
+                let (object, ptr) = (object.clone(), ptr.clone());
+                return self.emit_store_resolved(object, ptr, inst.mem_align, instructions);
             }
         } else if let Some(line) = &inst.void_call_line {
             // Result-LESS (void) call, or an ignored debug/lifetime marker. All off the
@@ -668,6 +676,10 @@ impl Emitter {
             Some(result),
             ops,
         ));
+        if let LlType::Ptr(addrspace) = result_ty {
+            self.pointer_storage
+                .insert(name, llvm_pointer_storage(addrspace)?);
+        }
         Ok(())
     }
 
@@ -1250,6 +1262,10 @@ impl Emitter {
             Some(result),
             ops,
         ));
+        if let LlType::Ptr(addrspace) = result_ty {
+            self.pointer_storage
+                .insert(name, llvm_pointer_storage(addrspace)?);
+        }
         Ok(())
     }
 

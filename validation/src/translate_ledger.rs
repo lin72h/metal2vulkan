@@ -117,7 +117,8 @@ pub fn translate_source_data(source: &SourceData, tmp_prefix: &str) -> Translate
         }
     };
     let stage: metal2vulkan::passes::Stage = stage.into();
-    match metal2vulkan::translate_sanitized_native(&source.air_ll, stage, &tmp.path) {
+    let san_ll = metal2vulkan::tools::sanitize_ll_text_with_datalayout(&source.air_ll).0;
+    match metal2vulkan::translate_sanitized_native(&san_ll, stage, &tmp.path) {
         Ok(spv) if !spv.is_empty() => TranslateReport {
             status: "ok".to_string(),
             stage_name,
@@ -351,7 +352,7 @@ fn sort_rows(rows: &mut [TranslateLedgerRow]) {
 fn write_ledger_header(file: &mut File) -> Result<(), String> {
     writeln!(
         file,
-        "# metal2vulkan ledger - hashes only, no shader bodies"
+        "# metal2vulkan ledger — hashes only, no shader bodies"
     )
     .map_err(|e| format!("write ledger header: {e}"))?;
     writeln!(

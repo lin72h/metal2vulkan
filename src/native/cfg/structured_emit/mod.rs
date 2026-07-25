@@ -356,6 +356,132 @@ mod tests {
         );
     }
 
+    #[test]
+    fn large_region_cross_arm_ladder_input_skips_clone_retry() {
+        let mut blocks = vec![
+            bb("%entry", &["br i1 %outer, label %shared, label %h"]),
+            bb("%h", &["br i1 %c, label %shared, label %private"]),
+            bb("%private", &["br label %merge"]),
+            bb("%shared", &["br label %merge"]),
+            bb("%merge", &["ret void"]),
+        ];
+        assert!(
+            clone_crossarm::privatize_region_cross_arm(&blocks).len() > blocks.len(),
+            "fixture should exercise the region-cross-arm clone below the ladder cap"
+        );
+
+        while blocks.len() <= REGION_CROSS_ARM_LADDER_MAX_BLOCKS {
+            let name = format!("%pad{}", blocks.len());
+            blocks.push(bb(&name, &["ret void"]));
+        }
+
+        let capped = privatize_region_cross_arm_for_ladder(&blocks);
+        assert_eq!(
+            capped.len(),
+            blocks.len(),
+            "large CFGs should skip the retry clone and keep the fallback path bounded"
+        );
+
+        let mut grows_past_cap = vec![
+            bb("%entry", &["br i1 %outer, label %shared, label %h"]),
+            bb("%h", &["br i1 %c, label %shared, label %private"]),
+            bb("%private", &["br label %merge"]),
+            bb("%shared", &["br label %merge"]),
+            bb("%merge", &["ret void"]),
+        ];
+        while grows_past_cap.len() < REGION_CROSS_ARM_LADDER_MAX_BLOCKS {
+            let name = format!("%grow_pad{}", grows_past_cap.len());
+            grows_past_cap.push(bb(&name, &["ret void"]));
+        }
+        let raw = clone_crossarm::privatize_region_cross_arm(&grows_past_cap);
+        assert!(
+            raw.len() > REGION_CROSS_ARM_LADDER_MAX_BLOCKS,
+            "fixture should prove the raw region clone can cross the ladder cap"
+        );
+        let capped = privatize_region_cross_arm_for_ladder(&grows_past_cap);
+        assert_eq!(
+            capped.len(),
+            grows_past_cap.len(),
+            "the ladder should skip region clones whose output crosses the cap"
+        );
+    }
+
+    fn deep_shared_tail_fixture() -> Vec<BodyBlock> {
+        vec![
+            bb("%entry", &["br i1 %co, label %inner, label %outer"]),
+            bb("%inner", &["br i1 %ci, label %direct, label %inner_else"]),
+            bb("%direct", &["br label %shared"]),
+            bb(
+                "%inner_else",
+                &["br i1 %ce, label %outer_merge, label %tail"],
+            ),
+            bb("%outer", &["br label %tail"]),
+            bb("%tail", &["br label %shared"]),
+            bb("%shared", &["br label %outer_merge"]),
+            bb("%outer_merge", &["ret void"]),
+        ]
+    }
+
+    #[test]
+    fn shared_continuation_ladder_input_preserves_small_clone_and_skips_oversized_growth() {
+        let small = deep_shared_tail_fixture();
+        let small_out = privatize_shared_continuations_for_ladder(&small);
+        assert!(
+            small_out.len() > small.len(),
+            "small shared-continuation fixtures should still run the pre-ladder clone"
+        );
+
+        let mut large = deep_shared_tail_fixture();
+        while large.len() < SHARED_CONTINUATION_LADDER_MAX_BLOCKS - 2 {
+            let name = format!("%pad{}", large.len());
+            large.push(bb(&name, &["ret void"]));
+        }
+        let direct = clone_crossarm::privatize_deep_shared_continuations(&large);
+        assert!(
+            direct.len() > SHARED_CONTINUATION_LADDER_MAX_BLOCKS,
+            "fixture should prove the raw clone can cross the ladder cap"
+        );
+
+        let capped = privatize_shared_continuations_for_ladder(&large);
+        assert_eq!(
+            capped.len(),
+            large.len(),
+            "the ladder should skip an oversized shared-continuation clone"
+        );
+    }
+
+    #[test]
+    fn selection_synth_growth_cap_only_rejects_oversized_growth() {
+        assert!(!selection_synth_growth_exceeds_ladder_cap(
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS,
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS
+        ));
+        assert!(!selection_synth_growth_exceeds_ladder_cap(
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 50,
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 50
+        ));
+        assert!(selection_synth_growth_exceeds_ladder_cap(
+            63,
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 1
+        ));
+    }
+
+    #[test]
+    fn massive_structured_plan_input_declines_to_retry_path() {
+        let mut blocks = vec![bb("%entry", &["br label %pad0"])];
+        for idx in 0..=STRUCTURED_PLAN_MAX_BLOCKS {
+            let name = format!("%pad{idx}");
+            let next = format!("%pad{}", idx + 1);
+            blocks.push(bb(&name, &[&format!("br label {next}")]));
+        }
+        blocks.push(bb(
+            &format!("%pad{}", STRUCTURED_PLAN_MAX_BLOCKS + 1),
+            &["ret void"],
+        ));
+
+        assert!(structured_plan(&blocks).is_none());
+    }
+
     /// `synth_multi_latch_continue` funnels a loop's two back-edges through one synthesized latch `L`:
     /// `%l1`/`%l2` (which both branch to header `%h`) are redirected to `L`, `L` branches back to `%h`,
     /// the header's per-latch phi incomings are merged into a value phi in `L`, and the header phi keeps

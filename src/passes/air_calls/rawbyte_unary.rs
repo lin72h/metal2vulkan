@@ -305,31 +305,6 @@ pub(in crate::passes) fn descriptor_binding(ctx: &Ctx, var: Word) -> Option<u32>
     })
 }
 
-pub(in crate::passes) fn value_def_instruction(ctx: &Ctx, value: Word) -> Option<Instruction> {
-    ctx.new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-        .find(|inst| inst.result_id == Some(value))
-        .cloned()
-        .or_else(|| {
-            ctx.module.functions.iter().find_map(|func| {
-                func.parameters
-                    .iter()
-                    .find(|param| param.result_id == Some(value))
-                    .cloned()
-                    .or_else(|| {
-                        func.blocks.iter().find_map(|block| {
-                            block
-                                .instructions
-                                .iter()
-                                .find(|inst| inst.result_id == Some(value))
-                                .cloned()
-                        })
-                    })
-            })
-        })
-}
-
 pub(in crate::passes) fn vector_type_shape(ctx: &Ctx, ty: Word) -> Option<(Word, u32)> {
     let def = type_def_of(ctx, ty)?;
     if def.class.opcode != Op::TypeVector {
@@ -526,7 +501,19 @@ pub(in crate::passes) fn half_abs_pow(
     let basef = ctx.module.fresh_id();
     let exponentf = ctx.module.fresh_id();
     let abs_base = ctx.module.fresh_id();
+    let raw_powf = ctx.module.fresh_id();
     let powf = ctx.module.fresh_id();
+    let base_is_zero = ctx.module.fresh_id();
+    let exponent_is_zero = ctx.module.fresh_id();
+    let zero_zero = ctx.module.fresh_id();
+    let n = vector_len(ctx, rty);
+    let bool_ty = if n > 1 {
+        ctx.ty_vec_bool(n)
+    } else {
+        ctx.ty_bool()
+    };
+    let zero = splat_or_scalar(ctx, float_ty, 0.0, n);
+    let one = splat_or_scalar(ctx, float_ty, 1.0, n);
     vec![
         Instruction::new(
             Op::FConvert,
@@ -553,12 +540,43 @@ pub(in crate::passes) fn half_abs_pow(
         Instruction::new(
             Op::ExtInst,
             Some(float_ty),
-            Some(powf),
+            Some(raw_powf),
             vec![
                 Operand::IdRef(ext),
                 Operand::LiteralExtInstInteger(GLSLstd450::Pow as u32),
                 Operand::IdRef(abs_base),
                 Operand::IdRef(exponentf),
+            ],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(base_is_zero),
+            vec![Operand::IdRef(abs_base), Operand::IdRef(zero)],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(exponent_is_zero),
+            vec![Operand::IdRef(exponentf), Operand::IdRef(zero)],
+        ),
+        Instruction::new(
+            Op::LogicalAnd,
+            Some(bool_ty),
+            Some(zero_zero),
+            vec![
+                Operand::IdRef(base_is_zero),
+                Operand::IdRef(exponent_is_zero),
+            ],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(float_ty),
+            Some(powf),
+            vec![
+                Operand::IdRef(zero_zero),
+                Operand::IdRef(one),
+                Operand::IdRef(raw_powf),
             ],
         ),
         Instruction::new(
@@ -576,6 +594,7 @@ pub(in crate::passes) fn half_abs_pow(
 /// the result carries the SIGN of the base (a negative base yields a negative result), whereas GLSL
 /// Pow leaves x < 0 undefined (NaN on the Apple GPU via MoltenVK). `FSign` reapplies that sign; a
 /// non-negative base is unchanged (`sign>=0`, `|x|==x`), so no currently-passing case regresses.
+/// AIR also treats `pow(0, 0)` as `1`, so guard that case around GLSL Pow's undefined edge.
 pub(in crate::passes) fn f32_abs_pow(
     ctx: &mut Ctx,
     res: Word,
@@ -586,7 +605,20 @@ pub(in crate::passes) fn f32_abs_pow(
     let ext = ctx.glsl();
     let abs_base = ctx.module.fresh_id();
     let sign = ctx.module.fresh_id();
+    let raw_mag = ctx.module.fresh_id();
     let mag = ctx.module.fresh_id();
+    let signed = ctx.module.fresh_id();
+    let base_is_zero = ctx.module.fresh_id();
+    let exponent_is_zero = ctx.module.fresh_id();
+    let zero_zero = ctx.module.fresh_id();
+    let n = vector_len(ctx, rty);
+    let bool_ty = if n > 1 {
+        ctx.ty_vec_bool(n)
+    } else {
+        ctx.ty_bool()
+    };
+    let zero = splat_or_scalar(ctx, rty, 0.0, n);
+    let one = splat_or_scalar(ctx, rty, 1.0, n);
     vec![
         Instruction::new(
             Op::ExtInst,
@@ -601,12 +633,43 @@ pub(in crate::passes) fn f32_abs_pow(
         Instruction::new(
             Op::ExtInst,
             Some(rty),
-            Some(mag),
+            Some(raw_mag),
             vec![
                 Operand::IdRef(ext),
                 Operand::LiteralExtInstInteger(GLSLstd450::Pow as u32),
                 Operand::IdRef(abs_base),
                 Operand::IdRef(exponent),
+            ],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(base_is_zero),
+            vec![Operand::IdRef(abs_base), Operand::IdRef(zero)],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(exponent_is_zero),
+            vec![Operand::IdRef(exponent), Operand::IdRef(zero)],
+        ),
+        Instruction::new(
+            Op::LogicalAnd,
+            Some(bool_ty),
+            Some(zero_zero),
+            vec![
+                Operand::IdRef(base_is_zero),
+                Operand::IdRef(exponent_is_zero),
+            ],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(mag),
+            vec![
+                Operand::IdRef(zero_zero),
+                Operand::IdRef(one),
+                Operand::IdRef(raw_mag),
             ],
         ),
         Instruction::new(
@@ -622,8 +685,18 @@ pub(in crate::passes) fn f32_abs_pow(
         Instruction::new(
             Op::FMul,
             Some(rty),
-            Some(res),
+            Some(signed),
             vec![Operand::IdRef(sign), Operand::IdRef(mag)],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(zero_zero),
+                Operand::IdRef(one),
+                Operand::IdRef(signed),
+            ],
         ),
     ]
 }

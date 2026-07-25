@@ -4,14 +4,14 @@
 //! Vulkan binding to synthesize for it. Ported faithfully from `metal2vulkanspirv::parse_air_fragment_meta`,
 //! plus a sibling `!air.vertex` parser the old crate handled structurally rather than from metadata.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod embedded;
 mod function_constants;
 mod globals;
 mod textures;
 mod types;
-use embedded::{body_uses_read_texture, detect_embedded_textures};
+use embedded::{body_uses_texture_read_or_write, detect_embedded_textures};
 pub use embedded::{embedded_synthetic_texture_index, EmbeddedTexture};
 pub use function_constants::{parse_function_constants, FunctionConstant};
 use globals::{location_index_with_static, static_init_int_global_values};
@@ -26,6 +26,12 @@ pub use types::{primitive_air_type_from_name, AirMember, AirScalar, AirType};
 pub enum FragRole {
     /// `[[position]]` -> Input BuiltIn FragCoord (often unused).
     Position,
+    /// `[[point_coord]]` -> Input BuiltIn PointCoord.
+    PointCoord,
+    /// `[[primitive_id]]` -> Input BuiltIn PrimitiveId (32-bit uint).
+    PrimitiveId,
+    /// `[[viewport_array_index]]` -> Input BuiltIn ViewportIndex (32-bit uint).
+    ViewportArrayIndex,
     /// `[[stage_in]]` interpolated input -> Input var at Location N (N = order among fragment_inputs).
     Varying(u32),
     /// `[[texture(n)]]` -> UniformConstant sampled image.
@@ -54,6 +60,8 @@ pub struct FragMeta {
     /// `fragment_input` Location -> Metal user semantic, such as `user(texturecoord)`, when AIR
     /// metadata carries one.
     pub varying_user_semantics: HashMap<u32, String>,
+    /// `fragment_input` locations carrying AIR `air.flat` interpolation.
+    pub flat_varyings: HashSet<u32>,
     /// number of `air.render_target` outputs (MRT count; 1 for the common single-output case).
     pub n_render_targets: u32,
     /// Return-struct member index -> color attachment Location for actual `air.render_target`
@@ -81,6 +89,8 @@ pub struct FragMeta {
     pub buffer_type_sizes: HashMap<u32, u32>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
+    /// Framebuffer-fetch color input Location -> AIR render-target type name, e.g. `float4`.
+    pub color_input_type_names: HashMap<u32, String>,
 }
 
 impl FragMeta {
@@ -93,6 +103,11 @@ impl FragMeta {
     pub fn texture_type_name(&self, idx: u32) -> Option<&str> {
         self.texture_type_names.get(&idx).map(String::as_str)
     }
+    pub fn color_input_type_name(&self, location: u32) -> Option<&str> {
+        self.color_input_type_names
+            .get(&location)
+            .map(String::as_str)
+    }
     pub fn varying_type(&self, loc: u32) -> Option<&str> {
         self.varying_types.get(&loc).map(String::as_str)
     }
@@ -101,6 +116,9 @@ impl FragMeta {
     }
     pub fn varying_user_semantic(&self, loc: u32) -> Option<&str> {
         self.varying_user_semantics.get(&loc).map(String::as_str)
+    }
+    pub fn varying_is_flat(&self, loc: u32) -> bool {
+        self.flat_varyings.contains(&loc)
     }
     pub fn render_target_location_for_member(&self, member_idx: u32) -> Option<u32> {
         self.render_target_members
@@ -146,10 +164,16 @@ pub enum VertOutRole {
     Position,
     /// `[[point_size]]` -> Output BuiltIn PointSize. Does not consume a Location.
     PointSize,
+    /// `[[clip_distance]]` -> Output BuiltIn ClipDistance. Does not consume a Location.
+    ClipDistance,
     /// `[[viewport_array_index]]` -> Output BuiltIn ViewportIndex. Does not consume a Location.
     ViewportArrayIndex,
+    /// `[[render_target_array_index]]` -> Output BuiltIn Layer. Does not consume a Location.
+    RenderTargetArrayIndex,
     /// User varying output -> Output var at Location N.
     Varying(u32),
+    /// Function-constant-gated output disabled by the translator's default-zero FC model.
+    FunctionConstantDisabled,
     Other,
 }
 
@@ -242,6 +266,10 @@ pub enum KernRole {
     /// `[[thread_position_in_grid]]` (`uint` or `uint3`) -> GlobalInvocationId.
     /// Scalar params receive component .x; vector params receive the full v3uint.
     ThreadPositionInGrid,
+    /// Kernel `[[stage_in]]` attribute data. Metal feeds this through a stage-input descriptor keyed
+    /// by `air.location_index`; Vulkan lowering needs an explicit per-invocation data ABI and must
+    /// not silently bind it to zero.
+    StageInput(u32),
     Other,
 }
 
@@ -264,9 +292,9 @@ pub struct KernMeta {
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
     /// Textures EMBEDDED inside an `air.indirect_buffer` argument buffer (via `air.indirect_argument`
-    /// → nested `air.texture`) that the kernel body reads with an integer-coord `air.read_texture`.
-    /// Each is surfaced as a standalone sampled-image resource so the read lowers to a real
-    /// `OpImageFetch` instead of a null. See [`EmbeddedTexture`].
+    /// → nested `air.texture`) that the kernel body reads/writes with AIR texture intrinsics. Each is
+    /// surfaced as a standalone image resource so the read/write lowers to a real descriptor instead of a
+    /// private placeholder. See [`EmbeddedTexture`].
     pub embedded_textures: Vec<EmbeddedTexture>,
 }
 
@@ -425,16 +453,16 @@ fn parse_air_kernel_meta_with_nodes(
             "threads_per_simdgroup" => KernRole::ThreadsPerSimdgroup,
             "simdgroups_per_threadgroup" => KernRole::SimdgroupsPerThreadgroup,
             "thread_position_in_grid" => KernRole::ThreadPositionInGrid,
+            "stage_in" => KernRole::StageInput(location_index(node, idx)),
             _ => KernRole::Other,
         };
         roles.push((idx, role));
     }
-    // Detect argument-buffer-embedded textures that the body reads via an integer-coord
-    // `air.read_texture` (an exact texel fetch). Gated purely on AIR structure/semantics — the
-    // `air.indirect_argument` → `air.texture` marker chain and the `air.read_texture` intrinsic — so
-    // it cannot key on any shader name. The body must actually READ (not merely sample/store) an
-    // embedded texture for us to surface it; a `sample`/other use is left untouched.
-    let embedded_textures = if body_uses_read_texture(ll) {
+    // Detect argument-buffer-embedded textures that the body reads/writes through AIR texture
+    // intrinsics. Gated purely on AIR structure/semantics — the `air.indirect_argument` →
+    // `air.texture` marker chain plus stable AIR intrinsic families — so it cannot key on any shader
+    // name. The body must actually use a read/write texture intrinsic for us to surface it.
+    let embedded_textures = if body_uses_texture_read_or_write(ll) {
         detect_embedded_textures(
             nodes,
             &indirect_buffer_struct_refs,
@@ -470,14 +498,21 @@ fn collect_nodes(ll: &str) -> HashMap<u32, String> {
         let Some(rest) = l.strip_prefix('!') else {
             continue;
         };
-        // expect "<digits> = !{<body>}"
-        let Some(eq) = rest.find(" = !{") else {
+        // expect "<digits> = !{<body>}" or "<digits> = distinct !{<body>}"
+        let Some((eq, prefix_len)) =
+            rest.find(" = !{")
+                .map(|eq| (eq, " = !{".len()))
+                .or_else(|| {
+                    rest.find(" = distinct !{")
+                        .map(|eq| (eq, " = distinct !{".len()))
+                })
+        else {
             continue;
         };
         let Ok(id) = rest[..eq].parse::<u32>() else {
             continue;
         };
-        let body = &rest[eq + " = !{".len()..];
+        let body = &rest[eq + prefix_len..];
         let body = body.strip_suffix('}').unwrap_or(body);
         nodes.insert(id, body.to_string());
     }
@@ -509,18 +544,52 @@ pub fn entry_name(ll: &str, stage: &str) -> Option<String> {
 fn entry_name_from_nodes(ll: &str, stage: &str, nodes: &HashMap<u32, String>) -> Option<String> {
     let root = stage_root(ll, stage)?;
     let body = nodes.get(&root)?;
-    // body like: "ptr @BlurComposite, !16, !18"
+    // body like: `ptr @BlurComposite, !16, !18` or `ptr @"re::df::pack", !16, !18`.
     let at = body.find('@')?;
     let after = &body[at + 1..];
-    let name: String = after
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.' || *c == '$')
-        .collect();
+    let name = if let Some(quoted) = after.strip_prefix('"') {
+        quoted_symbol_name(quoted)?
+    } else {
+        after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.' || *c == '$')
+            .collect()
+    };
     if name.is_empty() {
         None
     } else {
         Some(name)
     }
+}
+
+fn quoted_symbol_name(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => {
+                let hi = chars.peek().copied();
+                let mut clone = chars.clone();
+                let lo = {
+                    clone.next();
+                    clone.peek().copied()
+                };
+                if let (Some(hi), Some(lo)) = (hi, lo) {
+                    if hi.is_ascii_hexdigit() && lo.is_ascii_hexdigit() {
+                        chars.next();
+                        chars.next();
+                        let byte = u8::from_str_radix(&format!("{hi}{lo}"), 16).ok()?;
+                        out.push(byte as char);
+                        continue;
+                    }
+                }
+                out.push(chars.next().unwrap_or('\\'));
+            }
+            _ => out.push(ch),
+        }
+    }
+    None
 }
 
 fn function_param_pointer_address_spaces(ll: &str, name: &str) -> Option<HashMap<u32, u32>> {
@@ -543,8 +612,13 @@ fn function_param_pointer_address_spaces(ll: &str, name: &str) -> Option<HashMap
 }
 
 fn function_param_list(ll: &str, name: &str) -> Option<String> {
-    let needle = format!("@{name}(");
-    let start = ll.find(&needle)? + needle.len();
+    let unquoted = format!("@{name}(");
+    let quoted = format!("@\"{name}\"(");
+    let (start, needle_len) = ll
+        .find(&unquoted)
+        .map(|start| (start, unquoted.len()))
+        .or_else(|| ll.find(&quoted).map(|start| (start, quoted.len())))?;
+    let start = start + needle_len;
     let mut depth = 1u32;
     let mut end = start;
     for (off, ch) in ll[start..].char_indices() {
@@ -639,6 +713,29 @@ fn i32_after_marker(body: &str, marker: &str) -> Option<u32> {
 
 fn location_index(body: &str, fallback: u32) -> u32 {
     i32_after_marker(body, "air.location_index").unwrap_or(fallback)
+}
+
+fn render_target_location(
+    body: &str,
+    fallback: u32,
+    static_int_globals: &HashMap<String, u32>,
+) -> u32 {
+    global_after_marker(body, "air.render_target")
+        .and_then(|global| static_int_globals.get(&global).copied())
+        .or_else(|| i32_after_marker(body, "air.render_target"))
+        .unwrap_or(fallback)
+}
+
+fn global_after_marker(body: &str, marker: &str) -> Option<String> {
+    let marker = format!("!\"{marker}\"");
+    let pos = body.find(&marker)?;
+    let after = &body[pos + marker.len()..];
+    let at = after.find('@')?;
+    let name = after[at..]
+        .chars()
+        .take_while(|c| !c.is_whitespace() && !matches!(*c, ',' | ')' | '(' | '[' | ']'))
+        .collect::<String>();
+    (name.len() > 1).then_some(name)
 }
 
 fn address_space(body: &str) -> Option<u32> {
@@ -746,11 +843,14 @@ fn parse_air_fragment_meta_with_nodes(
                 .enumerate()
                 .filter_map(|(i, r)| {
                     let node = nodes.get(&r)?;
-                    let is_render_target = role_strings(node)
-                        .first()
-                        .map(|role| role == "render_target")
-                        .unwrap_or(false);
-                    is_render_target.then(|| (i as u32, first_i32(node).unwrap_or(i as u32)))
+                    let roles = role_strings(node);
+                    let is_render_target = primary_role(&roles) == Some("render_target");
+                    is_render_target.then(|| {
+                        (
+                            i as u32,
+                            render_target_location(node, i as u32, &static_int_globals),
+                        )
+                    })
                 })
                 .collect()
         })
@@ -763,10 +863,8 @@ fn parse_air_fragment_meta_with_nodes(
                 .enumerate()
                 .filter_map(|(i, r)| {
                     let node = nodes.get(&r)?;
-                    let is_depth = role_strings(node)
-                        .first()
-                        .map(|role| role == "depth")
-                        .unwrap_or(false);
+                    let roles = role_strings(node);
+                    let is_depth = primary_role(&roles) == Some("depth");
                     is_depth.then_some(i as u32)
                 })
                 .collect()
@@ -780,10 +878,8 @@ fn parse_air_fragment_meta_with_nodes(
                 .enumerate()
                 .filter_map(|(i, r)| {
                     let node = nodes.get(&r)?;
-                    let is_stencil = role_strings(node)
-                        .first()
-                        .map(|role| role == "stencil")
-                        .unwrap_or(false);
+                    let roles = role_strings(node);
+                    let is_stencil = primary_role(&roles) == Some("stencil");
                     is_stencil.then_some(i as u32)
                 })
                 .collect()
@@ -802,10 +898,8 @@ fn parse_air_fragment_meta_with_nodes(
                 .enumerate()
                 .filter_map(|(i, r)| {
                     let node = nodes.get(&r)?;
-                    let is_render_target = role_strings(node)
-                        .first()
-                        .map(|role| role == "render_target")
-                        .unwrap_or(false);
+                    let roles = role_strings(node);
+                    let is_render_target = primary_role(&roles) == Some("render_target");
                     if is_render_target {
                         arg_type_name(node).map(|name| (i as u32, name))
                     } else {
@@ -821,9 +915,10 @@ fn parse_air_fragment_meta_with_nodes(
     let mut varying_types = HashMap::new();
     let mut varying_names = HashMap::new();
     let mut varying_user_semantics = HashMap::new();
+    let mut flat_varyings = HashSet::new();
     let mut texture_type_names = HashMap::new();
+    let mut color_input_type_names = HashMap::new();
     let mut varying_loc = 0u32;
-    let mut color_input_idx = 0u32;
     let mut buffer_address_spaces = HashMap::new();
     let mut buffer_type_sizes = HashMap::new();
     // AIR function-param pointer address spaces for the fragment entry, the fallback the kernel
@@ -846,6 +941,9 @@ fn parse_air_fragment_meta_with_nodes(
         };
         let role = match role_str {
             "position" => FragRole::Position,
+            "point_coord" => FragRole::PointCoord,
+            "primitive_id" => FragRole::PrimitiveId,
+            "viewport_array_index" => FragRole::ViewportArrayIndex,
             "fragment_input" => {
                 let l = varying_loc;
                 varying_loc += 1;
@@ -857,6 +955,9 @@ fn parse_air_fragment_meta_with_nodes(
                 }
                 if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
                     varying_user_semantics.insert(l, semantic);
+                }
+                if strs.iter().any(|s| s == "flat") {
+                    flat_varyings.insert(l);
                 }
                 FragRole::Varying(l)
             }
@@ -886,9 +987,11 @@ fn parse_air_fragment_meta_with_nodes(
             }
             // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
             "render_target" => {
-                let ci = color_input_idx;
-                color_input_idx += 1;
-                FragRole::ColorInput(ci)
+                let location = render_target_location(node, idx, &static_int_globals);
+                if let Some(name) = arg_type_name(node) {
+                    color_input_type_names.insert(location, name);
+                }
+                FragRole::ColorInput(location)
             }
             _ => FragRole::Other,
         };
@@ -899,6 +1002,7 @@ fn parse_air_fragment_meta_with_nodes(
         varying_types,
         varying_names,
         varying_user_semantics,
+        flat_varyings,
         n_render_targets,
         render_target_members,
         render_target_type_names,
@@ -909,6 +1013,7 @@ fn parse_air_fragment_meta_with_nodes(
         buffer_address_spaces,
         buffer_type_sizes,
         texture_type_names,
+        color_input_type_names,
     })
 }
 
@@ -946,9 +1051,12 @@ fn parse_air_vertex_meta_with_nodes(
             continue;
         };
         let role = match first {
+            "function_constant" => VertOutRole::FunctionConstantDisabled,
             "position" => VertOutRole::Position,
             "point_size" => VertOutRole::PointSize,
+            "clip_distance" => VertOutRole::ClipDistance,
             "viewport_array_index" => VertOutRole::ViewportArrayIndex,
+            "render_target_array_index" => VertOutRole::RenderTargetArrayIndex,
             "vertex_output" => {
                 let l = location_index_with_static(node, out_loc, &static_int_globals);
                 out_loc += 1;

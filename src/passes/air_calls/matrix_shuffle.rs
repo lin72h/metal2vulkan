@@ -489,6 +489,191 @@ pub(in crate::passes) fn lower_quad_shuffle_rotate_down(
     Ok(insts)
 }
 
+/// `air.simd_shuffle_rotate_down(value, delta)` rotates values down within Metal's 32-lane simdgroup,
+/// wrapping at the simdgroup boundary: source lane = `(lane + delta) & 31`.
+pub(in crate::passes) fn lower_simd_shuffle_rotate_down(
+    ctx: &mut Ctx,
+    result: Word,
+    result_type: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let mut insts = Vec::new();
+    let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
+    let uint = ctx.ty_uint();
+    let subgroup_lane = subgroup_lane_index_u32(ctx, &mut insts);
+    let simd_lane = metal_simd_lane_local_u32(ctx, subgroup_lane, &mut insts);
+    let simd_base = metal_simd_lane_base_u32(ctx, subgroup_lane, simd_lane, &mut insts);
+    let local_plus_delta = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(local_plus_delta),
+        vec![Operand::IdRef(simd_lane), Operand::IdRef(delta)],
+    ));
+    let source_local = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(source_local),
+        vec![
+            Operand::IdRef(local_plus_delta),
+            Operand::IdRef(ctx.const_uint(31)),
+        ],
+    ));
+    let source_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(source_lane),
+        vec![Operand::IdRef(simd_base), Operand::IdRef(source_local)],
+    ));
+    insts.push(Instruction::new(
+        Op::GroupNonUniformShuffle,
+        Some(result_type),
+        Some(result),
+        vec![
+            Operand::IdScope(scope),
+            Operand::IdRef(args[0]),
+            Operand::IdRef(source_lane),
+        ],
+    ));
+    Ok(insts)
+}
+
+/// `air.simd_shuffle_down(value, delta)` reads `value` from lane `lane + delta` within Metal's
+/// 32-lane simdgroup. Lower via absolute shuffle instead of `ShuffleDown` so wider Vulkan subgroups
+/// cannot cross the Metal simdgroup boundary. Out-of-range reads select the current lane to avoid
+/// emitting an undefined SPIR-V source lane.
+pub(in crate::passes) fn lower_simd_shuffle_down(
+    ctx: &mut Ctx,
+    result: Word,
+    result_type: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let mut insts = Vec::new();
+    let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
+    let uint = ctx.ty_uint();
+    let lane = subgroup_lane_index_u32(ctx, &mut insts);
+    let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
+    let simd_base = metal_simd_lane_base_u32(ctx, lane, simd_lane, &mut insts);
+    let remaining = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::ISub,
+        Some(uint),
+        Some(remaining),
+        vec![
+            Operand::IdRef(ctx.const_uint(32)),
+            Operand::IdRef(simd_lane),
+        ],
+    ));
+    let in_bounds = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::ULessThan,
+        Some(ctx.ty_bool()),
+        Some(in_bounds),
+        vec![Operand::IdRef(delta), Operand::IdRef(remaining)],
+    ));
+    let shifted_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(shifted_lane),
+        vec![Operand::IdRef(simd_lane), Operand::IdRef(delta)],
+    ));
+    let shifted_subgroup_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(shifted_subgroup_lane),
+        vec![Operand::IdRef(simd_base), Operand::IdRef(shifted_lane)],
+    ));
+    let source_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::Select,
+        Some(uint),
+        Some(source_lane),
+        vec![
+            Operand::IdRef(in_bounds),
+            Operand::IdRef(shifted_subgroup_lane),
+            Operand::IdRef(lane),
+        ],
+    ));
+    insts.push(Instruction::new(
+        Op::GroupNonUniformShuffle,
+        Some(result_type),
+        Some(result),
+        vec![
+            Operand::IdScope(scope),
+            Operand::IdRef(args[0]),
+            Operand::IdRef(source_lane),
+        ],
+    ));
+    Ok(insts)
+}
+
+/// `air.simd_shuffle_up(value, delta)` reads `value` from lane `lane - delta` within Metal's
+/// 32-lane simdgroup. Use absolute shuffle to keep semantics independent of the Vulkan subgroup
+/// width.
+pub(in crate::passes) fn lower_simd_shuffle_up(
+    ctx: &mut Ctx,
+    result: Word,
+    result_type: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let mut insts = Vec::new();
+    let delta = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
+    let uint = ctx.ty_uint();
+    let lane = subgroup_lane_index_u32(ctx, &mut insts);
+    let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
+    let simd_base = metal_simd_lane_base_u32(ctx, lane, simd_lane, &mut insts);
+    let in_bounds = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::UGreaterThanEqual,
+        Some(ctx.ty_bool()),
+        Some(in_bounds),
+        vec![Operand::IdRef(simd_lane), Operand::IdRef(delta)],
+    ));
+    let shifted_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::ISub,
+        Some(uint),
+        Some(shifted_lane),
+        vec![Operand::IdRef(simd_lane), Operand::IdRef(delta)],
+    ));
+    let shifted_subgroup_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(shifted_subgroup_lane),
+        vec![Operand::IdRef(simd_base), Operand::IdRef(shifted_lane)],
+    ));
+    let source_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::Select,
+        Some(uint),
+        Some(source_lane),
+        vec![
+            Operand::IdRef(in_bounds),
+            Operand::IdRef(shifted_subgroup_lane),
+            Operand::IdRef(lane),
+        ],
+    ));
+    insts.push(Instruction::new(
+        Op::GroupNonUniformShuffle,
+        Some(result_type),
+        Some(result),
+        vec![
+            Operand::IdScope(scope),
+            Operand::IdRef(args[0]),
+            Operand::IdRef(source_lane),
+        ],
+    ));
+    Ok(insts)
+}
+
 /// `air.quad_shuffle_up(value, delta)` reads `value` from lane `local - delta` within the 4-lane quad;
 /// when `local - delta` underflows the quad, Apple Metal returns the lane's OWN value (verified: lane
 /// 0 up(1) and lane 1 up(2) return their own value, not a cross-quad lane). Lowered quad-boundary-safe
@@ -835,31 +1020,59 @@ pub(in crate::passes) fn subgroup_lane_index_u32(
     insts: &mut Vec<Instruction>,
 ) -> Word {
     let uint = ctx.ty_uint();
-    let var = local_invocation_index_input_var(ctx, uint);
-    let local_index = ctx.module.fresh_id();
+    let var = subgroup_local_invocation_id_input_var(ctx, uint);
+    let lane = ctx.module.fresh_id();
     insts.push(Instruction::new(
         Op::Load,
         Some(uint),
-        Some(local_index),
-        vec![Operand::IdRef(var)],
-    ));
-    let mask = ctx.const_uint(31);
-    let lane = ctx.module.fresh_id();
-    insts.push(Instruction::new(
-        Op::BitwiseAnd,
-        Some(uint),
         Some(lane),
-        vec![Operand::IdRef(local_index), Operand::IdRef(mask)],
+        vec![Operand::IdRef(var)],
     ));
     lane
 }
 
-pub(in crate::passes) fn local_invocation_index_input_var(ctx: &mut Ctx, uint: Word) -> Word {
-    let key = SynthCacheKey::LocalInvocationIndexInputVar;
+fn metal_simd_lane_local_u32(
+    ctx: &mut Ctx,
+    subgroup_lane: Word,
+    insts: &mut Vec<Instruction>,
+) -> Word {
+    let uint = ctx.ty_uint();
+    let simd_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(simd_lane),
+        vec![
+            Operand::IdRef(subgroup_lane),
+            Operand::IdRef(ctx.const_uint(31)),
+        ],
+    ));
+    simd_lane
+}
+
+fn metal_simd_lane_base_u32(
+    ctx: &mut Ctx,
+    subgroup_lane: Word,
+    simd_lane: Word,
+    insts: &mut Vec<Instruction>,
+) -> Word {
+    let uint = ctx.ty_uint();
+    let simd_base = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::ISub,
+        Some(uint),
+        Some(simd_base),
+        vec![Operand::IdRef(subgroup_lane), Operand::IdRef(simd_lane)],
+    ));
+    simd_base
+}
+
+pub(in crate::passes) fn subgroup_local_invocation_id_input_var(ctx: &mut Ctx, uint: Word) -> Word {
+    let key = SynthCacheKey::SubgroupLocalInvocationIdInputVar;
     if let Some(&var) = ctx.synth_cache.get(&key) {
         return var;
     }
-    if let Some(var) = existing_builtin_input_var(ctx, BuiltIn::LocalInvocationIndex, uint) {
+    if let Some(var) = existing_builtin_input_var(ctx, BuiltIn::SubgroupLocalInvocationId, uint) {
         ctx.synth_cache.insert(key, var);
         return var;
     }
@@ -878,7 +1091,7 @@ pub(in crate::passes) fn local_invocation_index_input_var(ctx: &mut Ctx, uint: W
         vec![
             Operand::IdRef(var),
             Operand::Decoration(Decoration::BuiltIn),
-            Operand::BuiltIn(BuiltIn::LocalInvocationIndex),
+            Operand::BuiltIn(BuiltIn::SubgroupLocalInvocationId),
         ],
     ));
     ctx.interface.push(var);

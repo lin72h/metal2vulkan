@@ -205,8 +205,7 @@ pub(in crate::native) fn structured_reject_reason(blocks: &[BodyBlock]) -> Optio
     // function the base path admits has no reason; otherwise classify the graph the pre-pass actually
     // hands to emission (the privatized one), so a function rescued by trivial cross-arm privatization
     // reports ADMIT, not its pre-privatization cross-arm class.
-    let switch_private = super::clone_crossarm::privatize_switch_case_continuations(blocks);
-    let deep_shared = super::clone_crossarm::privatize_deep_shared_continuations(&switch_private);
+    let deep_shared = super::privatize_shared_continuations_for_ladder(blocks);
     if deep_shared.len() != blocks.len() && structured_plan(&deep_shared).is_some() {
         return None;
     }
@@ -223,7 +222,7 @@ pub(in crate::native) fn structured_reject_reason(blocks: &[BodyBlock]) -> Optio
     // Mirror `structured_plan`'s third (region-clone) attempt so the diagnostic never drifts: classify
     // the graph the region pre-pass actually hands emission, so a function rescued by the merge-
     // preserving dominated-region clone reports ADMIT, not its pre-clone cross-arm class.
-    let region = super::clone_crossarm::privatize_region_cross_arm(blocks);
+    let region = super::privatize_region_cross_arm_for_ladder(blocks);
     if region.len() != blocks.len()
         && structured_plan_inner4(&region, force_converge, false, false, false).is_some()
     {
@@ -262,7 +261,7 @@ pub(in crate::native) fn structured_reject_reason(blocks: &[BodyBlock]) -> Optio
             {
                 return None;
             }
-            let region2 = super::clone_crossarm::privatize_region_cross_arm(&destraddled);
+            let region2 = super::privatize_region_cross_arm_for_ladder(&destraddled);
             if region2.len() != destraddled.len()
                 && (structured_plan_inner4(&region2, true, false, false, false).is_some()
                     || structured_plan_inner4(&region2, true, true, false, false).is_some())
@@ -681,8 +680,7 @@ pub(in crate::native) fn cond_other_witness_lines(blocks: &[BodyBlock]) -> Vec<S
     let mut out = Vec::new();
     append_cond_other_witness_lines("source", blocks, &mut out);
 
-    let switch_private = super::clone_crossarm::privatize_switch_case_continuations(blocks);
-    let deep_shared = super::clone_crossarm::privatize_deep_shared_continuations(&switch_private);
+    let deep_shared = super::privatize_shared_continuations_for_ladder(blocks);
     if blocks_changed(blocks, &deep_shared) {
         append_cond_other_witness_lines("deep-shared", &deep_shared, &mut out);
     }
@@ -692,7 +690,7 @@ pub(in crate::native) fn cond_other_witness_lines(blocks: &[BodyBlock]) -> Vec<S
         append_cond_other_witness_lines("trivial", &privatized, &mut out);
     }
 
-    let region = super::clone_crossarm::privatize_region_cross_arm(blocks);
+    let region = super::privatize_region_cross_arm_for_ladder(blocks);
     if blocks_changed(blocks, &region) {
         append_cond_other_witness_lines("region", &region, &mut out);
     }

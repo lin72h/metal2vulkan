@@ -82,6 +82,10 @@ pub(crate) struct RetryCtx<'a> {
     /// G4/G5) is unchanged. `None` = not computed yet; `Some(Err)` caches an emit failure too.
     raw_reemit_cache: std::cell::RefCell<Option<Result<FinishedModule, String>>>,
     raw_reemit_wg_cache: std::cell::RefCell<Option<Result<FinishedModule, String>>>,
+    /// M-C2 counterpart for BDA re-emission. `bda_retry` runs before `bda_then_relooper`; caching lets
+    /// the second tier skip a full BDA feed when the ordinary BDA emit already failed in the
+    /// straight-line graph walk.
+    bda_reemit_cache: std::cell::RefCell<Option<Result<FinishedModule, String>>>,
 }
 
 impl<'a> RetryCtx<'a> {
@@ -120,6 +124,7 @@ impl<'a> RetryCtx<'a> {
             adopted_tier: std::cell::Cell::new(None),
             raw_reemit_cache: std::cell::RefCell::new(None),
             raw_reemit_wg_cache: std::cell::RefCell::new(None),
+            bda_reemit_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -169,6 +174,27 @@ impl<'a> RetryCtx<'a> {
 
     fn raw_reemit_wg(&self) -> Result<Vec<u8>, String> {
         self.raw_reemit_wg_finished().map(|finished| finished.bytes)
+    }
+
+    fn bda_reemit_finished(&self) -> Result<FinishedModule, String> {
+        let mut cache = self.bda_reemit_cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(
+                tools::llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
+                    self.san_ll,
+                    self.tmp,
+                    self.kern,
+                    self.entry_name,
+                    self.buffer_layouts(),
+                )
+                .and_then(|b| self.finish_carrier(b)),
+            );
+        }
+        cache.as_ref().unwrap().clone()
+    }
+
+    fn bda_reemit(&self) -> Result<Vec<u8>, String> {
+        self.bda_reemit_finished().map(|finished| finished.bytes)
     }
 
     /// Raw re-emission whose rejected-CFG repair is intentionally skipped because this caller feeds
@@ -591,16 +617,49 @@ impl<'a> RetryCtx<'a> {
     // construction (exact loaded address bits, no tag-bit manipulation across the cluster); `synth=false`
     // so byte-axis [M]/pending like the other PSB-tier clears.
     pub(crate) fn bda_retry(&self) -> Option<Vec<u8>> {
-        tools::llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
+        self.bda_reemit().ok().filter(|b| self.validates(b))
+    }
+
+    /// BDA + relooper retry: the BDA physical-address model clears raw `store ptr addrspace(1)`
+    /// shapes, but loop-budget instrumentation can leave the emitted CFG needing the same relooper
+    /// repair as the raw retry path. Emit a BDA relooper-feed intermediate, rebuild the CFG, and adopt
+    /// only if the final module validates. Plain [`Self::bda_retry`] stays first so existing BDA wins
+    /// keep their bytes. If the ordinary BDA emit already failed in the straight-line typed graph
+    /// walk, skip the feed because CFG repair cannot make the missing body opcode emit.
+    pub(crate) fn bda_then_relooper(&self) -> Option<Vec<u8>> {
+        if let Err(error) = self.bda_reemit_finished() {
+            if native::is_graph_walk_unmigrated_emit_error(&error) {
+                if self.retry_debug_on {
+                    eprintln!(
+                        "[retry-debug] bda_then_relooper: bda feed skipped after typed graph-walk emit failure"
+                    );
+                }
+                return None;
+            }
+        }
+        let fed = tools::llc_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
             self.entry_name,
             self.buffer_layouts(),
         )
-        .and_then(|b| self.finish(b))
-        .ok()
-        .filter(|b| self.validates(b))
+        .and_then(|b| self.finish(b));
+        if self.retry_debug_on {
+            if let Err(error) = &fed {
+                eprintln!("[retry-debug] bda_then_relooper: bda feed emit failed: {error}");
+            }
+        }
+        let fed = fed.ok()?;
+        let relooped = load_relooper_module(&fed);
+        if self.retry_debug_on {
+            if let Err(error) = &relooped {
+                eprintln!("[retry-debug] bda_then_relooper: relooper rewrite failed: {error}");
+            }
+        }
+        let bytes = module_bytes(&relooped.ok()?);
+        self.validates_dbg("bda_then_relooper", &bytes)
+            .then_some(bytes)
     }
 
     // Inline + SROA retry — the MPS NDArray multi-destination (TopK) `missing pointer storage` class:
@@ -944,7 +1003,9 @@ impl<'a> RetryCtx<'a> {
     // and adopt ONLY if it independently validates. Byte-correct by construction (the raw byte model is
     // a faithful byte view, golden-verified on banked cases; the relooper structurizes the SAME
     // reachable CFG, byte-neutrally) and floor-safe by construction (adopt-if-validates — a banked case
-    // emits + validates on the default path and never reaches here).
+    // emits + validates on the default path and never reaches here). If both ordinary raw emissions
+    // fail in the straight-line typed graph walk, skip the unrepaired CFG feed: it only changes
+    // merge/structuring work around emitted blocks and cannot make an unmigrated body opcode emit.
     pub(crate) fn raw_then_relooper(&self) -> Option<Vec<u8>> {
         let raw1 = self.raw_reemit();
         if self.retry_debug_on {
@@ -952,26 +1013,41 @@ impl<'a> RetryCtx<'a> {
                 eprintln!("[retry-debug] raw_then_relooper: raw emit failed: {e}");
             }
         }
-        let raw_bytes = raw1
-            .ok()
-            .or_else(|| {
+        let raw_bytes = match raw1 {
+            Ok(bytes) => bytes,
+            Err(raw1_err) => {
                 let raw2 = self.raw_reemit_wg();
                 if self.retry_debug_on {
                     if let Err(e) = &raw2 {
                         eprintln!("[retry-debug] raw_then_relooper: raw+wg emit failed: {e}");
                     }
                 }
-                raw2.ok()
-            })
-            .or_else(|| {
-                let raw_feed = self.raw_reemit_relooper_feed();
-                if self.retry_debug_on {
-                    if let Err(e) = &raw_feed {
-                        eprintln!("[retry-debug] raw_then_relooper: raw feed emit failed: {e}");
+                match raw2 {
+                    Ok(bytes) => bytes,
+                    Err(raw2_err) => {
+                        if native::is_graph_walk_unmigrated_emit_error(&raw1_err)
+                            && native::is_graph_walk_unmigrated_emit_error(&raw2_err)
+                        {
+                            if self.retry_debug_on {
+                                eprintln!(
+                                    "[retry-debug] raw_then_relooper: raw feed skipped after typed graph-walk emit failures"
+                                );
+                            }
+                            return None;
+                        }
+                        let raw_feed = self.raw_reemit_relooper_feed();
+                        if self.retry_debug_on {
+                            if let Err(e) = &raw_feed {
+                                eprintln!(
+                                    "[retry-debug] raw_then_relooper: raw feed emit failed: {e}"
+                                );
+                            }
+                        }
+                        raw_feed.ok()?
                     }
                 }
-                raw_feed.ok()
-            })?;
+            }
+        };
         // Adopt a relooped raw module if it validates as-is, OR — when it still carries a WHOLE-buffer
         // cross-binding select (the pointer mistyping's real shape, e.g. the `createBVHNodesKernelMotion`
         // BVH builders: a ~1340-block unstructured switch that, once structured, selects among distinct

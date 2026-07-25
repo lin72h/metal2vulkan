@@ -31,25 +31,19 @@ pub(in crate::passes) fn lower_sample(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
+    let mut out = vec![];
+    img = load_image_if_pointer(ctx, img, &mut out);
     // Build the sampled-image type matching the texture's dimension (recorded when the image var was
     // created). Defaults to 2D for the common case.
-    let (dim, arrayed) = ctx
-        .image_dims
-        .get(&img)
-        .copied()
-        .unwrap_or((Dim::Dim2D, false));
-    let comp = ctx
-        .image_comp
-        .get(&img)
-        .copied()
-        .unwrap_or(crate::passes::ImageComp::Float);
+    let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+    let (img_ty, dim, arrayed, comp) =
+        sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
     // The sample result vector component type must match the image's sampled type (v4uint/v4int for
     // integer textures); a float sample with explicit LOD is needed at fragment scope for integer
     // textures (implicit-LOD sampling of integer images is invalid).
     let sample_v4 = image_fetch_v4(ctx, img, v4);
     let is_int_tex = comp != crate::passes::ImageComp::Float;
 
-    let mut out = vec![];
     if let Some(sampler_state) = ctx
         .sampler_states
         .get(&samp)
@@ -165,7 +159,6 @@ pub(in crate::passes) fn lower_sample(
         }
     }
 
-    let img_ty = ctx.ty_image(dim, arrayed, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
     let si = ctx.module.fresh_id();
     let color = ctx.module.fresh_id();

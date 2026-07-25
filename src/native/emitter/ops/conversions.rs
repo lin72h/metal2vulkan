@@ -102,11 +102,24 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let src_ty = self.resolve_type(&src.ty)?;
-        if src_ty == LlType::BFloat && dst_ty == LlType::Float {
-            return self.emit_bfloat_to_float(&src, name, instructions);
+        if let (Some(src_lanes), Some(dst_lanes)) = (bfloat_lanes(&src_ty), float_lanes(&dst_ty)) {
+            if src_lanes == dst_lanes {
+                let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
+                let result = self.result_id(&name, &dst_ty)?;
+                return self.bfloat_bits_to_float_shaped(src_id, result, src_lanes, instructions);
+            }
         }
-        if src_ty == LlType::Float && dst_ty == LlType::BFloat {
-            return self.emit_float_to_bfloat(&src, name, instructions);
+        if let (Some(src_lanes), Some(dst_lanes)) = (float_lanes(&src_ty), bfloat_lanes(&dst_ty)) {
+            if src_lanes == dst_lanes {
+                let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
+                let result = self.result_id(&name, &dst_ty)?;
+                return self.emit_float_to_bfloat_bits_shaped(
+                    src_id,
+                    result,
+                    src_lanes,
+                    instructions,
+                );
+            }
         }
         if !float_convert_supported(&src_ty, &dst_ty) {
             return Err(format!(
@@ -153,26 +166,6 @@ impl Emitter {
             vec![Operand::IdRef(src_id)],
         ));
         Ok(())
-    }
-
-    pub(in crate::native::emitter) fn emit_bfloat_to_float(
-        &mut self,
-        src: &TypedValue,
-        name: String,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
-        let result = self.result_id(&name, &LlType::Float)?;
-        self.emit_bfloat_bits_to_float(src_id, result, instructions)
-    }
-
-    pub(in crate::native::emitter) fn emit_bfloat_bits_to_float(
-        &mut self,
-        src_id: Word,
-        result: Word,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        self.bfloat_bits_to_float_shaped(src_id, result, 1, instructions)
     }
 
     /// Like [`Self::bfloat_bits_to_float_shaped`] but allocating the result id.
@@ -223,29 +216,10 @@ impl Emitter {
         Ok(())
     }
 
-    pub(in crate::native::emitter) fn emit_float_to_bfloat(
-        &mut self,
-        src: &TypedValue,
-        name: String,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
-        let result = self.result_id(&name, &LlType::BFloat)?;
-        self.emit_float_to_bfloat_bits(src_id, result, instructions)
-    }
-
-    pub(in crate::native::emitter) fn emit_float_to_bfloat_bits(
-        &mut self,
-        src_id: Word,
-        result: Word,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        self.emit_float_to_bfloat_bits_shaped(src_id, result, 1, instructions)
-    }
-
-    /// Narrow an f32 (scalar or `n`-lane vector) to a bf16 bit pattern (its `Int(16)` storage): take the
-    /// top 16 bits (`bitcast<u32>(f) >> 16`, truncating). Shaped by `n` (1 = scalar) so `Vector(Float,
-    /// n)` results can be re-narrowed to `Vector(BFloat, n)` storage.
+    /// Narrow an f32 (scalar or `n`-lane vector) to a bf16 bit pattern (its `Int(16)` storage).
+    /// LLVM `fptrunc float to bfloat` rounds to nearest-even, so add the bf16 rounding bias before
+    /// taking the top 16 bits. Shaped by `n` (1 = scalar) so `Vector(Float, n)` results can be
+    /// re-narrowed to `Vector(BFloat, n)` storage.
     pub(in crate::native::emitter) fn emit_float_to_bfloat_bits_shaped(
         &mut self,
         src_id: Word,
@@ -263,20 +237,117 @@ impl Emitter {
             vec![Operand::IdRef(src_id)],
         ));
         let shift = self.const_uint_shaped(16, n)?;
+        let high = self.fresh();
+        instructions.push(Self::inst(
+            Op::ShiftRightLogical,
+            Some(i32_ty),
+            Some(high),
+            vec![Operand::IdRef(bits), Operand::IdRef(shift)],
+        ));
+        let one = self.const_uint_shaped(1, n)?;
+        let lsb = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitwiseAnd,
+            Some(i32_ty),
+            Some(lsb),
+            vec![Operand::IdRef(high), Operand::IdRef(one)],
+        ));
+        let bias_base = self.const_uint_shaped(0x7fff, n)?;
+        let bias = self.fresh();
+        instructions.push(Self::inst(
+            Op::IAdd,
+            Some(i32_ty),
+            Some(bias),
+            vec![Operand::IdRef(bias_base), Operand::IdRef(lsb)],
+        ));
+        let rounded = self.fresh();
+        instructions.push(Self::inst(
+            Op::IAdd,
+            Some(i32_ty),
+            Some(rounded),
+            vec![Operand::IdRef(bits), Operand::IdRef(bias)],
+        ));
         let shifted = self.fresh();
         instructions.push(Self::inst(
             Op::ShiftRightLogical,
             Some(i32_ty),
             Some(shifted),
-            vec![Operand::IdRef(bits), Operand::IdRef(shift)],
+            vec![Operand::IdRef(rounded), Operand::IdRef(shift)],
         ));
+        let narrowed = self.select_canonical_bfloat_nan_bits(bits, shifted, n, instructions)?;
         instructions.push(Self::inst(
             Op::UConvert,
             Some(result_type),
             Some(result),
-            vec![Operand::IdRef(shifted)],
+            vec![Operand::IdRef(narrowed)],
         ));
         Ok(())
+    }
+
+    fn select_canonical_bfloat_nan_bits(
+        &mut self,
+        bits: Word,
+        narrowed: Word,
+        n: u32,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let i32_ty = self.type_id(&shaped_type(LlType::Int(32), n))?;
+        let bool_ty = self.type_id(&shaped_type(LlType::Bool, n))?;
+        let exp_mask = self.const_uint_shaped(0x7f80_0000, n)?;
+        let mant_mask = self.const_uint_shaped(0x007f_ffff, n)?;
+        let zero = self.const_uint_shaped(0, n)?;
+
+        let exp_bits = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitwiseAnd,
+            Some(i32_ty),
+            Some(exp_bits),
+            vec![Operand::IdRef(bits), Operand::IdRef(exp_mask)],
+        ));
+        let exp_all_ones = self.fresh();
+        instructions.push(Self::inst(
+            Op::IEqual,
+            Some(bool_ty),
+            Some(exp_all_ones),
+            vec![Operand::IdRef(exp_bits), Operand::IdRef(exp_mask)],
+        ));
+
+        let mant_bits = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitwiseAnd,
+            Some(i32_ty),
+            Some(mant_bits),
+            vec![Operand::IdRef(bits), Operand::IdRef(mant_mask)],
+        ));
+        let mant_nonzero = self.fresh();
+        instructions.push(Self::inst(
+            Op::INotEqual,
+            Some(bool_ty),
+            Some(mant_nonzero),
+            vec![Operand::IdRef(mant_bits), Operand::IdRef(zero)],
+        ));
+
+        let is_nan = self.fresh();
+        instructions.push(Self::inst(
+            Op::LogicalAnd,
+            Some(bool_ty),
+            Some(is_nan),
+            vec![Operand::IdRef(exp_all_ones), Operand::IdRef(mant_nonzero)],
+        ));
+
+        let canonical_nan = self.const_uint_shaped(0x7fc0, n)?;
+        let selected = self.fresh();
+        instructions.push(Self::inst(
+            Op::Select,
+            Some(i32_ty),
+            Some(selected),
+            vec![
+                Operand::IdRef(is_nan),
+                Operand::IdRef(canonical_nan),
+                Operand::IdRef(narrowed),
+            ],
+        ));
+        Ok(selected)
     }
 
     pub(in crate::native::emitter) fn emit_i32_to_v4i8(

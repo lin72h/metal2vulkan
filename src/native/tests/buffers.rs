@@ -358,6 +358,53 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 }
 
 #[test]
+fn native_memcpy_between_named_prefix_wrappers_lowers_both_directions() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%struct.Frame = type { %union.FrameUnion }
+%union.FrameUnion = type { %struct.FrameInner }
+%struct.FrameInner = type { <3 x float>, <3 x float>, <3 x float> }
+%struct.Geometry = type { %struct.Frame, <3 x float> }
+
+define void @main() {
+entry:
+  %frame = alloca %struct.Frame, align 16
+  %geometry = alloca %struct.Geometry, align 16
+  %frame_raw = bitcast ptr %frame to ptr
+  %geometry_raw = bitcast ptr %geometry to ptr
+  call void @llvm.memcpy.p0.p0.i64(ptr %geometry_raw, ptr %frame_raw, i64 48, i1 false)
+  call void @llvm.memcpy.p0.p0.i64(ptr %frame_raw, ptr %geometry_raw, i64 48, i1 false)
+  ret void
+}
+
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_named_prefix_memcpy_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert_eq!(asm.matches("OpCopyMemory").count(), 2, "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert!(!asm.contains("llvm.memcpy"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_memcpy_struct_prefix_skips_trailing_padding_field() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -1930,7 +1977,7 @@ declare float @air.quad_shuffle.f32(float, i16)
         asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
         "{asm}"
     );
-    assert!(asm.contains("BuiltIn LocalInvocationIndex"), "{asm}");
+    assert!(asm.contains("BuiltIn SubgroupLocalInvocationId"), "{asm}");
     assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
     assert!(asm.contains("OpBitwiseAnd"), "{asm}");
     assert!(asm.contains("OpIAdd"), "{asm}");
@@ -2504,6 +2551,7 @@ entry:
             kernel_local_size: [256, 2, 1],
             kernel_threads_per_grid: None,
             simd_cluster32: false,
+            ..passes::TransformOptions::default()
         },
     )
     .expect("translate");
@@ -3139,6 +3187,92 @@ entry:
 }
 
 #[test]
+fn typed_inline_materializes_pointer_field_gep_for_helper_parameter_store() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%Wrap = type { ptr addrspace(1), i64 }
+
+define void @k(ptr addrspace(1) %src) {
+entry:
+  %wrap = alloca %Wrap, align 8
+  call void @init(ptr %wrap, ptr addrspace(1) %src)
+  ret void
+}
+
+define internal void @init(ptr %w, ptr addrspace(1) %p) {
+entry:
+  %field = getelementptr inbounds %Wrap, ptr %w, i64 0, i32 0
+  store ptr addrspace(1) %p, ptr %field, align 8
+  ret void
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load native spv");
+    assert_eq!(
+        module
+            .functions
+            .iter()
+            .filter(|function| !function.blocks.is_empty())
+            .count(),
+        1,
+        "the helper body is typed-inlined before emission"
+    );
+    let definitions = module
+        .all_inst_iter()
+        .filter_map(|instruction| instruction.result_id)
+        .collect::<HashSet<_>>();
+    assert!(
+        module.all_inst_iter().all(|instruction| {
+            instruction.operands.iter().all(|operand| match operand {
+                Operand::IdRef(id) => definitions.contains(id),
+                _ => true,
+            })
+        }),
+        "inlined pointer-field store must not reference a missing helper GEP"
+    );
+}
+
+#[test]
+fn typed_inline_records_storage_for_extracted_pointer_field() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%Ext = type { ptr addrspace(2), ptr addrspace(2), ptr addrspace(2) }
+%Entity = type { float, i32 }
+
+define void @k(ptr addrspace(2) %a, ptr addrspace(2) %b, ptr addrspace(2) %c, ptr addrspace(1) %out) {
+entry:
+  %ext0 = insertvalue %Ext poison, ptr addrspace(2) %a, 0
+  %ext1 = insertvalue %Ext %ext0, ptr addrspace(2) %b, 1
+  %ext2 = insertvalue %Ext %ext1, ptr addrspace(2) %c, 2
+  %value = call i32 @read_entity(%Ext %ext2)
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+define internal i32 @read_entity(%Ext %ext) {
+entry:
+  %entity = extractvalue %Ext %ext, 2
+  %field = getelementptr inbounds %Entity, ptr addrspace(2) %entity, i64 0, i32 1
+  %value = load i32, ptr addrspace(2) %field, align 4
+  ret i32 %value
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load native SPIR-V");
+    assert_eq!(
+        module
+            .functions
+            .iter()
+            .filter(|function| !function.blocks.is_empty())
+            .count(),
+        1,
+        "the helper body is typed-inlined before emission"
+    );
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+}
+
+#[test]
 fn typed_inline_retains_pruned_helper_type_capability() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -3208,6 +3342,43 @@ entry:
         .expect("infer nonnull params");
     assert!(nonnull.contains(&("nonnull_helper".to_string(), 0)));
     assert!(!nonnull.contains(&("nullable_helper".to_string(), 0)));
+}
+
+#[test]
+fn native_internal_pointer_param_from_entry_gep_is_nonnull() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%Params = type { [4 x i32], [4 x i32] }
+
+define void @k(ptr addrspace(2) %params) {
+entry:
+  %field = getelementptr inbounds %Params, ptr addrspace(2) %params, i64 0, i32 1, i64 0
+  call fastcc void @helper(ptr addrspace(2) %field)
+  ret void
+}
+
+define internal fastcc void @helper(ptr addrspace(2) %maybe) {
+entry:
+  %isnull = icmp eq ptr addrspace(2) %maybe, null
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+"#;
+    let ir = super::super::ir::LlModule::parse(ll).expect("parse");
+    let emitter = Emitter::new(ir.clone());
+    let nonnull = emitter
+        .infer_function_param_nonnull(&ir.functions)
+        .expect("infer nonnull params");
+    assert!(nonnull.contains(&("helper".to_string(), 0)));
+
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(asm.contains("OpConstantFalse"), "{asm}");
+    assert!(!asm.contains("OpPtrEqual"), "{asm}");
 }
 
 #[test]
@@ -3348,9 +3519,8 @@ declare i32 @air.atomic.local.load.i32(ptr addrspace(3) captures(none), i32, i32
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpAtomicStore"), "{asm}");
     assert!(asm.contains("OpAtomicLoad"), "{asm}");
-    // The atomic pointer must be a chain reaching the uint member THROUGH the backing array
-    // element: two indices (element + member) — never a one-index chain stopping at the wrapper
-    // struct. spirv-val (below) enforces the scalar pointee; lock the index count here.
+    // The atomic backing array is flattened from `[N x struct { uint }]` to `[N x uint]`, so the
+    // atomic pointer should chain directly to the scalar element with one index.
     let store_ptr = asm
         .lines()
         .find(|l| l.contains("OpAtomicStore"))
@@ -3367,7 +3537,10 @@ declare i32 @air.atomic.local.load.i32(ptr addrspace(3) captures(none), i32, i32
             .count()
             - 2 // type + base
     });
-    assert_eq!(n_indices, 2, "expected element+member indices: {chain}");
+    assert_eq!(
+        n_indices, 1,
+        "expected flattened scalar element index: {chain}"
+    );
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -4520,6 +4693,66 @@ entry:
         !asm.contains("OpPtrAccessChain %_ptr_Workgroup_uint"),
         "{asm}"
     );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_threadgroup_dynamic_gep_allows_negative_constant_rebase() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out, i32 %i) {
+entry:
+  %ok = icmp uge i32 %i, 128
+  br i1 %ok, label %body, label %exit
+
+body:
+  %idx = zext i32 %i to i64
+  %halfp = getelementptr inbounds half, ptr addrspace(3) %scratch, i64 0
+  store half 0xH3C00, ptr addrspace(3) %halfp, align 2
+  %raw = bitcast ptr addrspace(3) %halfp to ptr addrspace(3)
+  %advanced = getelementptr inbounds i32, ptr addrspace(3) %raw, i64 %idx
+  %rebased = getelementptr inbounds i32, ptr addrspace(3) %advanced, i64 -128
+  store i32 %i, ptr addrspace(3) %rebased, align 4
+  %loaded = load i32, ptr addrspace(3) %rebased, align 4
+  %as_float = bitcast i32 %loaded to float
+  store float %as_float, ptr addrspace(1) %out, align 4
+  br label %exit
+
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"scratch"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"i"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_threadgroup_negative_raw_rebase_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    assert!(
+        module.all_inst_iter().any(|inst| {
+            inst.class.opcode == Op::Constant
+                && inst.operands.last() == Some(&Operand::LiteralBit32(4294967168))
+        }),
+        "{asm}"
+    );
+    assert!(asm.contains("OpIAdd"), "{asm}");
+    assert!(asm.contains("Workgroup"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -6883,6 +7116,29 @@ entry:
 }
 
 #[test]
+fn native_direct_call_pointer_result_carries_storage_to_followup_gep() {
+    let ll = r#"
+target triple = "air64-apple-macosx14.0.0"
+%Matrix = type { [4 x <4 x float>] }
+%View = type { [2 x %Matrix] }
+
+define void @k(ptr addrspace(2) %view, ptr addrspace(1) %out, i16 %eye) {
+entry:
+  %ret = tail call ptr addrspace(2) @helper(i16 %eye, ptr addrspace(2) %view)
+  %lane = getelementptr inbounds %Matrix, ptr addrspace(2) %ret, i64 0, i32 0, i64 0
+  %value = load <4 x float>, ptr addrspace(2) %lane, align 16
+  store <4 x float> %value, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare ptr addrspace(2) @helper(i16, ptr addrspace(2))
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(asm.contains("OpFunctionCall"), "{asm}");
+    assert!(asm.contains("OpLoad"), "{asm}");
+}
+
+#[test]
 fn native_union_head_bitcast_load_does_not_create_same_binding_raw_alias() {
     let ll = r#"
 target triple = "air64-apple-macosx14.0.0"
@@ -7094,6 +7350,57 @@ define void @raw_ptr_induction(ptr addrspace(1) noundef readonly captures(none) 
     assert!(
         asm.lines().filter(|l| l.contains("OpLoad")).count() >= 4,
         "expected the <4 x float> load modeled as real raw word loads:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_dead_null_storage_buffer_pointer_phi_prunes_before_final_normalization() {
+    let ll = r#"
+define void @dead_null_phi(ptr addrspace(1) noundef writeonly "air-buffer-no-alias" %out, ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, <3 x i32> %gid) local_unnamed_addr #0 {
+entry:
+  br i1 false, label %null_arm, label %real_arm
+
+null_arm:
+  br label %merge
+
+real_arm:
+  %p = getelementptr inbounds i8, ptr addrspace(1) %src, i64 4
+  br label %merge
+
+merge:
+  %q = phi ptr addrspace(1) [ null, %null_arm ], [ %p, %real_arm ]
+  %v = load i8, ptr addrspace(1) %q, align 1
+  store i8 %v, ptr addrspace(1) %out, align 1
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @dead_null_phi, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_dead_null_phi_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&out).expect("disassemble");
+    assert!(!asm.contains("VariablePointersStorageBuffer"), "{asm}");
+    assert!(
+        !asm.lines()
+            .any(|line| line.contains("OpPhi %_ptr_StorageBuffer")),
+        "{asm}"
     );
     if std::process::Command::new("spirv-val")
         .arg("--version")

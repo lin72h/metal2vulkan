@@ -11,6 +11,32 @@ pub(in crate::passes) fn type_def_of(ctx: &Ctx, ty: Word) -> Option<Instruction>
         .cloned()
 }
 
+/// Find the defining instruction for a value id in globals, parameters, or function bodies.
+pub(in crate::passes) fn value_def_instruction(ctx: &Ctx, value: Word) -> Option<Instruction> {
+    ctx.new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .find(|inst| inst.result_id == Some(value))
+        .cloned()
+        .or_else(|| {
+            ctx.module.functions.iter().find_map(|func| {
+                func.parameters
+                    .iter()
+                    .find(|param| param.result_id == Some(value))
+                    .cloned()
+                    .or_else(|| {
+                        func.blocks.iter().find_map(|block| {
+                            block
+                                .instructions
+                                .iter()
+                                .find(|inst| inst.result_id == Some(value))
+                                .cloned()
+                        })
+                    })
+            })
+        })
+}
+
 /// The `result_type` of a value id `v`: search global constants/types and every function body.
 pub(in crate::passes) fn value_result_type(ctx: &Ctx, v: Word) -> Option<Word> {
     for g in ctx

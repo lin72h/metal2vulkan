@@ -91,6 +91,35 @@ pub(in crate::native) const CROSS_ARM_EDGE_MAX_BLOCKS: usize = 300;
 /// giant descriptor-index functions. A skipped graph follows the existing repair path unchanged.
 pub(in crate::native) const LOOP_EXIT_SELECTION_MAX_BLOCKS: usize = 300;
 
+/// Merge-preserving region-cross-arm planning is also bounded to modest CFGs in the default ladder.
+/// The clone driver has per-region and total-growth caps, but a grown candidate is fed back through
+/// several planner variants. Large residual CFGs can spend minutes cloning and re-planning before
+/// rejecting, so the ladder bounds both the input and cloned output; skipped candidates remain on the
+/// established fallback path. The lower-level clone remains available to single-shot callers with
+/// their own proof/budget.
+pub(in crate::native) const REGION_CROSS_ARM_LADDER_MAX_BLOCKS: usize = 300;
+
+/// The pre-ladder shared-continuation privatization is a safety repair for malformed nested
+/// selection/switch continuations that can otherwise look admissible to the source-CFG planner. Keep
+/// that repair on modest CFGs: on broad descriptor/indexing bodies the combined switch/deep clone can
+/// inflate a small function into several hundred synthetic merge blocks, then feed that large graph
+/// through every later ladder rung before the planner returns to the original CFG.
+pub(in crate::native) const SHARED_CONTINUATION_LADDER_MAX_BLOCKS: usize = 300;
+
+/// Selection-merge synthesis can turn compact straight-line decision trees into hundreds of
+/// `%metal2vulkan.lmerge.sel*` pass-through blocks. That growth is useful for modest CFGs, but an
+/// oversized synthesized candidate is then fed into repeated dominator/loop-forest analyses. Reject
+/// only synthesized-growth candidates above this cap; already-large inputs that do not grow continue
+/// through the normal planner.
+pub(in crate::native) const SELECTION_SYNTH_GROWTH_MAX_BLOCKS: usize = 300;
+
+/// Hard ceiling for the source-CFG structured planner. The ordinary reject path emits inferred merges
+/// and lets the retry cascade's relooper tiers rebuild control flow; on massive functions, proving that
+/// the structured planner cannot help can cost minutes before reaching that same path. This bound is
+/// deliberately far above the targeted retry caps so normal and moderately large CFGs still get the
+/// full ladder.
+pub(in crate::native) const STRUCTURED_PLAN_MAX_BLOCKS: usize = 3000;
+
 /// Whether a structural retry actually changed its source CFG. `BodyBlock` deliberately does not need
 /// a public `PartialEq`; the planner only needs this local name/carrier comparison to distinguish a
 /// forced lowering that preserves block count (for example an empty switch) from a true no-op. The
@@ -116,14 +145,16 @@ fn block_body_changed(left: &BodyBlock, right: &BodyBlock) -> bool {
 }
 
 pub(in crate::native) fn structured_plan(blocks: &[BodyBlock]) -> Option<StructuredPlan> {
+    if blocks.len() > STRUCTURED_PLAN_MAX_BLOCKS {
+        return None;
+    }
     // A nested conditional or switch case can enter a continuation also reached by a sibling/enclosing
     // arm before either reaches its shared natural merge. The normal unique-merge synth can only
     // redirect direct predecessors of that merge, so the nested construct would otherwise escape through
     // the shared continuation. Privatize the continuation first; this is intentionally before the base
     // admission attempt because that malformed graph can look structurally admissible to the source-CFG
     // planner while still failing spirv-val. A no-op leaves every other graph byte-identical.
-    let switch_private = super::clone_crossarm::privatize_switch_case_continuations(blocks);
-    let deep_shared = super::clone_crossarm::privatize_deep_shared_continuations(&switch_private);
+    let deep_shared = privatize_shared_continuations_for_ladder(blocks);
     if deep_shared.len() != blocks.len() {
         if let Some(plan) = structured_plan_ladder(&deep_shared, false) {
             return Some(plan);
@@ -220,7 +251,7 @@ pub(in crate::native) fn structured_plan_ladder(
     // region-on-trivial variant hit (which needed a structured-exit completeness self-check that a
     // dominance model cannot express — see the journal). The clone also stays wired into the
     // spirv-val-gated `cfg_restructure` retry for the residual cross-arm shapes this does not admit.
-    let region = super::clone_crossarm::privatize_region_cross_arm(blocks);
+    let region = privatize_region_cross_arm_for_ladder(blocks);
     if region.len() != blocks.len() {
         if let Some(plan) =
             structured_plan_inner4(&region, force_converge, false, false, allow_bare_exit)
@@ -356,7 +387,7 @@ pub(in crate::native) fn structured_plan_ladder(
             // The straddle split can reveal a residual cross-arm-shared selection underneath (the loop
             // now has its own merge, but a post-loop selection still shares an arm). Chain the
             // merge-preserving region clone on the destraddled graph and re-run the ladder.
-            let region2 = super::clone_crossarm::privatize_region_cross_arm(&destraddled);
+            let region2 = privatize_region_cross_arm_for_ladder(&destraddled);
             if region2.len() != destraddled.len() {
                 if let Some(plan) =
                     structured_plan_inner4(&region2, true, false, false, allow_bare_exit)
@@ -427,7 +458,7 @@ pub(in crate::native) fn structured_plan_ladder(
     // cloned graph, so an unfixable residue rejects honestly and falls to repair.
     if blocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
         let cloned = super::clone_crossarm::privatize_cross_arm_edge(blocks);
-        if cloned.len() != blocks.len() {
+        if cloned.len() != blocks.len() && cloned.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
             for &(cv, br) in &[(force_converge, false), (true, false), (true, true)] {
                 if let Some(plan) = structured_plan_inner4(&cloned, cv, br, false, allow_bare_exit)
                 {
@@ -445,7 +476,7 @@ pub(in crate::native) fn structured_plan_ladder(
     if blocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
         for &(dcv, dbr) in &[(true, true), (force_converge, false), (true, false)] {
             let cloned = privatize_synthesized_cross_arm_shared(blocks, dcv, dbr);
-            if cloned.len() != blocks.len() {
+            if cloned.len() != blocks.len() && cloned.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
                 for &(cv, br) in &[(force_converge, false), (true, false), (true, true)] {
                     if let Some(plan) =
                         structured_plan_inner4(&cloned, cv, br, false, allow_bare_exit)
@@ -457,6 +488,46 @@ pub(in crate::native) fn structured_plan_ladder(
         }
     }
     None
+}
+
+pub(in crate::native) fn privatize_region_cross_arm_for_ladder(
+    blocks: &[BodyBlock],
+) -> Vec<BodyBlock> {
+    if blocks.len() > REGION_CROSS_ARM_LADDER_MAX_BLOCKS {
+        blocks.to_vec()
+    } else {
+        let cloned = super::clone_crossarm::privatize_region_cross_arm(blocks);
+        if cloned.len() > REGION_CROSS_ARM_LADDER_MAX_BLOCKS {
+            blocks.to_vec()
+        } else {
+            cloned
+        }
+    }
+}
+
+pub(in crate::native) fn privatize_shared_continuations_for_ladder(
+    blocks: &[BodyBlock],
+) -> Vec<BodyBlock> {
+    if blocks.len() > SHARED_CONTINUATION_LADDER_MAX_BLOCKS {
+        return blocks.to_vec();
+    }
+    let switch_private = super::clone_crossarm::privatize_switch_case_continuations(blocks);
+    if switch_private.len() > SHARED_CONTINUATION_LADDER_MAX_BLOCKS {
+        return blocks.to_vec();
+    }
+    let deep_shared = super::clone_crossarm::privatize_deep_shared_continuations(&switch_private);
+    if deep_shared.len() > SHARED_CONTINUATION_LADDER_MAX_BLOCKS {
+        blocks.to_vec()
+    } else {
+        deep_shared
+    }
+}
+
+pub(in crate::native) fn selection_synth_growth_exceeds_ladder_cap(
+    source_blocks: usize,
+    synthesized_blocks: usize,
+) -> bool {
+    synthesized_blocks > SELECTION_SYNTH_GROWTH_MAX_BLOCKS && synthesized_blocks > source_blocks
 }
 
 pub(in crate::native) fn is_switch_block(b: &BodyBlock) -> bool {

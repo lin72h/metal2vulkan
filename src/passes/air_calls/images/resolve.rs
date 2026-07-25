@@ -6,7 +6,13 @@ pub(in crate::passes) fn resolve_image_value(ctx: &Ctx, value: Word) -> Word {
     let mut current = value;
     for _ in 0..8 {
         if ctx.image_dims.contains_key(&current) || ctx.image_storage.contains(&current) {
-            return current;
+            if !value_is_pointer(ctx, current) {
+                return current;
+            }
+            if let Some(loaded) = single_loaded_value(ctx, current) {
+                current = loaded;
+                continue;
+            }
         }
         let Some(inst) = value_inst(ctx, current) else {
             return current;
@@ -36,6 +42,12 @@ pub(in crate::passes) fn resolve_image_value(ctx: &Ctx, value: Word) -> Word {
                     return current;
                 };
                 current = stored;
+            }
+            Op::Variable if value_is_pointer(ctx, current) => {
+                let Some(loaded) = single_loaded_value(ctx, current) else {
+                    return current;
+                };
+                current = loaded;
             }
             _ => return current,
         }
@@ -118,6 +130,29 @@ pub(in crate::passes) fn single_stored_value(ctx: &Ctx, pointer: Word) -> Option
             return None;
         };
         if found.replace(*value).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+pub(in crate::passes) fn single_loaded_value(ctx: &Ctx, pointer: Word) -> Option<Word> {
+    let mut found = None;
+    for inst in ctx
+        .module
+        .functions
+        .iter()
+        .flat_map(|function| function.blocks.iter())
+        .flat_map(|block| block.instructions.iter())
+    {
+        if inst.class.opcode != Op::Load {
+            continue;
+        }
+        if inst.operands.first() != Some(&Operand::IdRef(pointer)) {
+            continue;
+        }
+        let value = inst.result_id?;
+        if found.replace(value).is_some() {
             return None;
         }
     }

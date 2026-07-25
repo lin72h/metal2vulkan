@@ -211,6 +211,538 @@ pub(in crate::passes) fn normalize_int_arith_operand_widths(ctx: &mut Ctx) {
     }
 }
 
+pub(in crate::passes) fn lower_scalar_i64_arithmetic_to_u32_halves(ctx: &mut Ctx) {
+    let mut int_types: HashMap<Word, (u32, u32)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode != Op::TypeInt {
+            continue;
+        }
+        let (Some(id), Some(Operand::LiteralBit32(width)), Some(Operand::LiteralBit32(signed))) =
+            (inst.result_id, inst.operands.first(), inst.operands.get(1))
+        else {
+            continue;
+        };
+        int_types.insert(id, (*width, *signed));
+    }
+
+    let mut value_types: HashMap<Word, Word> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if let (Some(result), Some(ty)) = (inst.result_id, inst.result_type) {
+            value_types.insert(result, ty);
+        }
+    }
+    for function in &ctx.module.functions {
+        for param in &function.parameters {
+            if let (Some(result), Some(ty)) = (param.result_id, param.result_type) {
+                value_types.insert(result, ty);
+            }
+        }
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                if let (Some(result), Some(ty)) = (inst.result_id, inst.result_type) {
+                    value_types.insert(result, ty);
+                }
+            }
+        }
+    }
+
+    let uint = ctx.ty_uint();
+    let ulong = ctx.ty_ulong();
+    let bool_ty = ctx.ty_bool();
+    let shift32 = ctx.const_int_of(ulong, 32);
+    let shift16 = ctx.const_uint(16);
+    let mask16 = ctx.const_uint(0xffff);
+    let zero = ctx.const_uint(0);
+    let one = ctx.const_uint(1);
+
+    for function_idx in 0..ctx.module.functions.len() {
+        for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
+            let insts = std::mem::take(
+                &mut ctx.module.functions[function_idx].blocks[block_idx].instructions,
+            );
+            let mut out = Vec::with_capacity(insts.len());
+            for inst in insts {
+                if !matches!(inst.class.opcode, Op::IAdd | Op::ISub | Op::IMul)
+                    || inst.operands.len() != 2
+                    || !matches!(
+                        inst.result_type.and_then(|ty| int_types.get(&ty).copied()),
+                        Some((64, _))
+                    )
+                {
+                    out.push(inst);
+                    continue;
+                }
+                let (Operand::IdRef(lhs), Operand::IdRef(rhs)) =
+                    (inst.operands[0].clone(), inst.operands[1].clone())
+                else {
+                    out.push(inst);
+                    continue;
+                };
+                let Some(result_ty) = inst.result_type else {
+                    out.push(inst);
+                    continue;
+                };
+                let Some(result_id) = inst.result_id else {
+                    out.push(inst);
+                    continue;
+                };
+                let Some(lhs_ty) = value_types.get(&lhs).copied() else {
+                    out.push(inst);
+                    continue;
+                };
+                let Some(rhs_ty) = value_types.get(&rhs).copied() else {
+                    out.push(inst);
+                    continue;
+                };
+                if !matches!(int_types.get(&lhs_ty).copied(), Some((64, _)))
+                    || !matches!(int_types.get(&rhs_ty).copied(), Some((64, _)))
+                {
+                    out.push(inst);
+                    continue;
+                }
+
+                let lhs_u64 = bitcast_i64_to_ulong(ctx, &mut out, lhs, lhs_ty, ulong);
+                let rhs_u64 = bitcast_i64_to_ulong(ctx, &mut out, rhs, rhs_ty, ulong);
+                let lowered = match inst.class.opcode {
+                    Op::IAdd => scalar_i64_add_as_u32_halves(
+                        ctx, &mut out, lhs_u64, rhs_u64, uint, ulong, bool_ty, shift32, zero, one,
+                    ),
+                    Op::ISub => scalar_i64_sub_as_u32_halves(
+                        ctx, &mut out, lhs_u64, rhs_u64, uint, ulong, bool_ty, shift32, zero, one,
+                    ),
+                    Op::IMul => scalar_i64_mul_as_u32_halves(
+                        ctx, &mut out, lhs_u64, rhs_u64, uint, ulong, shift32, shift16, mask16,
+                    ),
+                    _ => unreachable!(),
+                };
+                if result_ty == ulong {
+                    out.last_mut()
+                        .expect("lowering emits a final instruction")
+                        .result_id = Some(result_id);
+                    value_types.insert(result_id, ulong);
+                } else {
+                    out.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(result_ty),
+                        Some(result_id),
+                        vec![Operand::IdRef(lowered)],
+                    ));
+                    value_types.insert(result_id, result_ty);
+                }
+            }
+            ctx.module.functions[function_idx].blocks[block_idx].instructions = out;
+        }
+    }
+}
+
+fn bitcast_i64_to_ulong(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    value: Word,
+    value_ty: Word,
+    ulong: Word,
+) -> Word {
+    if value_ty == ulong {
+        return value;
+    }
+    let cast = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Bitcast,
+        Some(ulong),
+        Some(cast),
+        vec![Operand::IdRef(value)],
+    ));
+    cast
+}
+
+fn scalar_i64_add_as_u32_halves(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    lhs: Word,
+    rhs: Word,
+    uint: Word,
+    ulong: Word,
+    bool_ty: Word,
+    shift32: Word,
+    zero: Word,
+    one: Word,
+) -> Word {
+    let (lhs_lo, lhs_hi) = u64_halves(ctx, out, lhs, uint, ulong, shift32);
+    let (rhs_lo, rhs_hi) = u64_halves(ctx, out, rhs, uint, ulong, shift32);
+    let low = iadd_u32(ctx, out, lhs_lo, rhs_lo, uint);
+    let carry = ult_u32_select_bit(ctx, out, low, lhs_lo, uint, bool_ty, zero, one);
+    let high_base = iadd_u32(ctx, out, lhs_hi, rhs_hi, uint);
+    let high = iadd_u32(ctx, out, high_base, carry, uint);
+    assemble_u64_halves(ctx, out, low, high, ulong, shift32)
+}
+
+fn scalar_i64_sub_as_u32_halves(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    lhs: Word,
+    rhs: Word,
+    uint: Word,
+    ulong: Word,
+    bool_ty: Word,
+    shift32: Word,
+    zero: Word,
+    one: Word,
+) -> Word {
+    let (lhs_lo, lhs_hi) = u64_halves(ctx, out, lhs, uint, ulong, shift32);
+    let (rhs_lo, rhs_hi) = u64_halves(ctx, out, rhs, uint, ulong, shift32);
+    let borrow = ult_u32_select_bit(ctx, out, lhs_lo, rhs_lo, uint, bool_ty, zero, one);
+    let low = isub_u32(ctx, out, lhs_lo, rhs_lo, uint);
+    let high_base = isub_u32(ctx, out, lhs_hi, rhs_hi, uint);
+    let high = isub_u32(ctx, out, high_base, borrow, uint);
+    assemble_u64_halves(ctx, out, low, high, ulong, shift32)
+}
+
+fn scalar_i64_mul_as_u32_halves(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    lhs: Word,
+    rhs: Word,
+    uint: Word,
+    ulong: Word,
+    shift32: Word,
+    shift16: Word,
+    mask16: Word,
+) -> Word {
+    let lhs_lo = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(lhs_lo),
+        vec![Operand::IdRef(lhs)],
+    ));
+    let rhs_lo = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(rhs_lo),
+        vec![Operand::IdRef(rhs)],
+    ));
+
+    let lhs_shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(ulong),
+        Some(lhs_shifted),
+        vec![Operand::IdRef(lhs), Operand::IdRef(shift32)],
+    ));
+    let lhs_hi = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(lhs_hi),
+        vec![Operand::IdRef(lhs_shifted)],
+    ));
+    let rhs_shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(ulong),
+        Some(rhs_shifted),
+        vec![Operand::IdRef(rhs), Operand::IdRef(shift32)],
+    ));
+    let rhs_hi = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(rhs_hi),
+        vec![Operand::IdRef(rhs_shifted)],
+    ));
+
+    let (lo, carry) =
+        mul_u32_to_u64_halves_via_u16(ctx, out, lhs_lo, rhs_lo, uint, shift16, mask16);
+
+    let lhs_hi_rhs_lo = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IMul,
+        Some(uint),
+        Some(lhs_hi_rhs_lo),
+        vec![Operand::IdRef(lhs_hi), Operand::IdRef(rhs_lo)],
+    ));
+    let lhs_lo_rhs_hi = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IMul,
+        Some(uint),
+        Some(lhs_lo_rhs_hi),
+        vec![Operand::IdRef(lhs_lo), Operand::IdRef(rhs_hi)],
+    ));
+    let high_partial = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(high_partial),
+        vec![Operand::IdRef(carry), Operand::IdRef(lhs_hi_rhs_lo)],
+    ));
+    let high = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(high),
+        vec![Operand::IdRef(high_partial), Operand::IdRef(lhs_lo_rhs_hi)],
+    ));
+
+    let low64 = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(ulong),
+        Some(low64),
+        vec![Operand::IdRef(lo)],
+    ));
+    let high64 = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(ulong),
+        Some(high64),
+        vec![Operand::IdRef(high)],
+    ));
+    let high_shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftLeftLogical,
+        Some(ulong),
+        Some(high_shifted),
+        vec![Operand::IdRef(high64), Operand::IdRef(shift32)],
+    ));
+    let product = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseOr,
+        Some(ulong),
+        Some(product),
+        vec![Operand::IdRef(high_shifted), Operand::IdRef(low64)],
+    ));
+    product
+}
+
+fn mul_u32_to_u64_halves_via_u16(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    lhs: Word,
+    rhs: Word,
+    uint: Word,
+    shift16: Word,
+    mask16: Word,
+) -> (Word, Word) {
+    let lhs_lo = and_u32(ctx, out, lhs, mask16, uint);
+    let lhs_hi_shifted = shr_u32(ctx, out, lhs, shift16, uint);
+    let lhs_hi = and_u32(ctx, out, lhs_hi_shifted, mask16, uint);
+    let rhs_lo = and_u32(ctx, out, rhs, mask16, uint);
+    let rhs_hi_shifted = shr_u32(ctx, out, rhs, shift16, uint);
+    let rhs_hi = and_u32(ctx, out, rhs_hi_shifted, mask16, uint);
+
+    let p0 = imul_u32(ctx, out, lhs_lo, rhs_lo, uint);
+    let p1 = imul_u32(ctx, out, lhs_hi, rhs_lo, uint);
+    let p2 = imul_u32(ctx, out, lhs_lo, rhs_hi, uint);
+    let p3 = imul_u32(ctx, out, lhs_hi, rhs_hi, uint);
+
+    let p0_lo = and_u32(ctx, out, p0, mask16, uint);
+    let p0_hi = shr_u32(ctx, out, p0, shift16, uint);
+    let p1_lo = and_u32(ctx, out, p1, mask16, uint);
+    let p1_hi = shr_u32(ctx, out, p1, shift16, uint);
+    let p2_lo = and_u32(ctx, out, p2, mask16, uint);
+    let p2_hi = shr_u32(ctx, out, p2, shift16, uint);
+
+    let middle_a = iadd_u32(ctx, out, p0_hi, p1_lo, uint);
+    let middle = iadd_u32(ctx, out, middle_a, p2_lo, uint);
+    let middle_lo = and_u32(ctx, out, middle, mask16, uint);
+    let middle_carry = shr_u32(ctx, out, middle, shift16, uint);
+    let middle_lo_shifted = shl_u32(ctx, out, middle_lo, shift16, uint);
+    let low = or_u32(ctx, out, p0_lo, middle_lo_shifted, uint);
+
+    let high_a = iadd_u32(ctx, out, p3, p1_hi, uint);
+    let high_b = iadd_u32(ctx, out, high_a, p2_hi, uint);
+    let high = iadd_u32(ctx, out, high_b, middle_carry, uint);
+    (low, high)
+}
+
+fn u64_halves(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    value: Word,
+    uint: Word,
+    ulong: Word,
+    shift32: Word,
+) -> (Word, Word) {
+    let lo = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(lo),
+        vec![Operand::IdRef(value)],
+    ));
+    let shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(ulong),
+        Some(shifted),
+        vec![Operand::IdRef(value), Operand::IdRef(shift32)],
+    ));
+    let hi = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(uint),
+        Some(hi),
+        vec![Operand::IdRef(shifted)],
+    ));
+    (lo, hi)
+}
+
+fn assemble_u64_halves(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    lo: Word,
+    hi: Word,
+    ulong: Word,
+    shift32: Word,
+) -> Word {
+    let low64 = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(ulong),
+        Some(low64),
+        vec![Operand::IdRef(lo)],
+    ));
+    let high64 = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(ulong),
+        Some(high64),
+        vec![Operand::IdRef(hi)],
+    ));
+    let high_shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftLeftLogical,
+        Some(ulong),
+        Some(high_shifted),
+        vec![Operand::IdRef(high64), Operand::IdRef(shift32)],
+    ));
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseOr,
+        Some(ulong),
+        Some(result),
+        vec![Operand::IdRef(high_shifted), Operand::IdRef(low64)],
+    ));
+    result
+}
+
+fn imul_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, lhs: Word, rhs: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IMul,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+    ));
+    result
+}
+
+fn isub_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, lhs: Word, rhs: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ISub,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+    ));
+    result
+}
+
+fn iadd_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, lhs: Word, rhs: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IAdd,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+    ));
+    result
+}
+
+fn ult_u32_select_bit(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    lhs: Word,
+    rhs: Word,
+    uint: Word,
+    bool_ty: Word,
+    zero: Word,
+    one: Word,
+) -> Word {
+    let pred = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ULessThan,
+        Some(bool_ty),
+        Some(pred),
+        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+    ));
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Select,
+        Some(uint),
+        Some(result),
+        vec![
+            Operand::IdRef(pred),
+            Operand::IdRef(one),
+            Operand::IdRef(zero),
+        ],
+    ));
+    result
+}
+
+fn and_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, lhs: Word, rhs: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+    ));
+    result
+}
+
+fn or_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, lhs: Word, rhs: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseOr,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+    ));
+    result
+}
+
+fn shl_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, base: Word, shift: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftLeftLogical,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(base), Operand::IdRef(shift)],
+    ));
+    result
+}
+
+fn shr_u32(ctx: &mut Ctx, out: &mut Vec<Instruction>, base: Word, shift: Word, uint: Word) -> Word {
+    let result = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(uint),
+        Some(result),
+        vec![Operand::IdRef(base), Operand::IdRef(shift)],
+    ));
+    result
+}
+
 /// After helper inlining and access-chain composition, scalar pointer arithmetic can appear as
 /// `OpInBoundsAccessChain %ptr_T %already_ptr_T %idx`. In Logical SPIR-V, that tries to index
 /// through scalar `T`. Storage classes that Vulkan allows as `OpPtrAccessChain` bases use that form;

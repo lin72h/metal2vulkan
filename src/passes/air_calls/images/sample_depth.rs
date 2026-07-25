@@ -29,33 +29,27 @@ pub(in crate::passes) fn lower_sample_depth(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
-    let (dim, arrayed) = ctx
-        .image_dims
-        .get(&img)
-        .copied()
-        .unwrap_or((Dim::Dim2D, false));
-    let comp = ctx
-        .image_comp
-        .get(&img)
-        .copied()
-        .unwrap_or(crate::passes::ImageComp::Float);
+    let mut out = vec![];
+    img = load_image_if_pointer(ctx, img, &mut out);
+    let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+    let (img_ty, dim, arrayed, comp) =
+        sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
     if arrayed {
         return Err("air.sample_depth array textures are unsupported".into());
     }
     if comp != crate::passes::ImageComp::Float {
         return Err("air.sample_depth on non-float texture".into());
     }
-    let img_ty = ctx.ty_image(dim, arrayed, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
     let si = ctx.module.fresh_id();
     let color = ctx.module.fresh_id();
     let depth = ctx.module.fresh_id();
-    let mut out = vec![Instruction::new(
+    out.push(Instruction::new(
         Op::SampledImage,
         Some(si_ty),
         Some(si),
         vec![Operand::IdRef(img), Operand::IdRef(samp)],
-    )];
+    ));
     let coord_for_sample = build_sample_coord(ctx, dim, arrayed, coord, args, &mut out)?;
     push_image_sample(
         ctx,
@@ -129,23 +123,17 @@ pub(in crate::passes) fn lower_sample_compare_depth(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
-    let (dim, arrayed) = ctx
-        .image_dims
-        .get(&img)
-        .copied()
-        .unwrap_or((Dim::Dim2D, false));
-    let comp = ctx
-        .image_comp
-        .get(&img)
-        .copied()
-        .unwrap_or(crate::passes::ImageComp::Float);
+    let mut out = vec![];
+    img = load_image_if_pointer(ctx, img, &mut out);
+    let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+    let (img_ty, dim, arrayed, comp) =
+        sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
     if arrayed {
         return Err("air.sample_compare_depth array textures are unsupported".into());
     }
     if comp != crate::passes::ImageComp::Float {
         return Err("air.sample_compare_depth on non-float texture".into());
     }
-    let img_ty = ctx.ty_image(dim, arrayed, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
     let float_ty = ctx.ty_float();
     let bool_ty = ctx.ty_bool();
@@ -156,12 +144,12 @@ pub(in crate::passes) fn lower_sample_compare_depth(
     let shadow = ctx.module.fresh_id();
     let one = ctx.const_float(1.0);
     let zero = ctx.const_float(0.0);
-    let mut out = vec![Instruction::new(
+    out.push(Instruction::new(
         Op::SampledImage,
         Some(si_ty),
         Some(si),
         vec![Operand::IdRef(img), Operand::IdRef(samp)],
-    )];
+    ));
     let coord_for_sample = build_sample_coord(ctx, dim, arrayed, coord, args, &mut out)?;
     push_image_sample(
         ctx,

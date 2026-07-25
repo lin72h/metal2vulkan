@@ -96,6 +96,7 @@ pub(in crate::native) fn infer_branch_merges(
     let switch_merges = infer_switch_merges(blocks);
     let loop_merges = infer_loop_merges(blocks);
     let mut merges = HashMap::new();
+    let mut reachable_cache: HashMap<String, HashSet<String>> = HashMap::new();
     loop {
         let mut changed = false;
         for block in blocks {
@@ -123,9 +124,11 @@ pub(in crate::native) fn infer_branch_merges(
                 &loop_merges,
             );
             let true_reaches_false =
-                reachable_from(&true_label, &successors).contains(&false_label);
+                cached_reachable_from(&true_label, &successors, &mut reachable_cache)
+                    .contains(&false_label);
             let false_reaches_true =
-                reachable_from(&false_label, &successors).contains(&true_label);
+                cached_reachable_from(&false_label, &successors, &mut reachable_cache)
+                    .contains(&true_label);
             let is_loop_continue =
                 is_loop_continue_branch(&block.name, &true_label, &false_label, &loop_merges);
             let merge = match (true_exit, false_exit) {
@@ -208,6 +211,7 @@ pub(in crate::native) fn infer_branch_merges(
                     blocks,
                     &successors,
                     &by_name,
+                    &mut reachable_cache,
                 ),
                 _ if block_is_unreachable(&true_label, &by_name) => reachable_merge_after_header(
                     &block.name,
@@ -215,6 +219,7 @@ pub(in crate::native) fn infer_branch_merges(
                     blocks,
                     &successors,
                     &by_name,
+                    &mut reachable_cache,
                 ),
                 _ if loop_merges.get(&true_label).is_some_and(|info| {
                     info.merge == false_label && info.continue_target != block.name
@@ -370,12 +375,13 @@ fn reachable_merge_after_header(
     blocks: &[BodyBlock],
     successors: &HashMap<String, Vec<String>>,
     by_name: &HashMap<String, &BodyBlock>,
+    reachable_cache: &mut HashMap<String, HashSet<String>>,
 ) -> Option<String> {
     let start = blocks
         .iter()
         .position(|block| block.name == header)
         .map(|idx| idx + 1)?;
-    let reachable = reachable_from(label, successors);
+    let reachable = cached_reachable_from(label, successors, reachable_cache);
     blocks
         .iter()
         .skip(start)
@@ -385,6 +391,17 @@ fn reachable_merge_after_header(
                 && all_paths_reach_target_or_unreachable(label, candidate, successors, by_name)
         })
         .cloned()
+}
+
+fn cached_reachable_from<'a>(
+    label: &str,
+    successors: &HashMap<String, Vec<String>>,
+    cache: &'a mut HashMap<String, HashSet<String>>,
+) -> &'a HashSet<String> {
+    if !cache.contains_key(label) {
+        cache.insert(label.to_string(), reachable_from(label, successors));
+    }
+    cache.get(label).unwrap()
 }
 
 fn all_paths_reach_target(

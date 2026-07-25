@@ -74,6 +74,7 @@ impl TextureComponent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextureFormat {
+    R32f,
     Rgba32f,
     Rgba16f,
     Rgba8ui,
@@ -85,6 +86,7 @@ impl TextureFormat {
     /// The SPIR-V `ImageFormat` the emitter decorates the storage image with.
     pub fn to_spirv_format(self) -> ImageFormat {
         match self {
+            TextureFormat::R32f => ImageFormat::R32f,
             TextureFormat::Rgba32f => ImageFormat::Rgba32f,
             TextureFormat::Rgba16f => ImageFormat::Rgba16f,
             TextureFormat::Rgba8ui => ImageFormat::Rgba8ui,
@@ -108,7 +110,7 @@ pub struct TextureShape {
     pub component: TextureComponent,
     /// The access qualifier declares `write`/`read_write` — a storage image (vs `sample`/`read`).
     pub writable: bool,
-    /// The argument is an `array_ref<texture...>` runtime-indexed descriptor array.
+    /// The argument is a runtime-indexed descriptor array of texture handles.
     pub array_ref: bool,
     /// For a `writable` texture, the storage-image texel format the emitter decorates the
     /// `OpTypeImage` with; `None` for a sampled texture.
@@ -120,7 +122,18 @@ pub struct TextureShape {
 /// and matches exactly what the interface pass decorates the emitted image type with; `multisampled`
 /// is an additive flag the emit path ignores.
 pub fn texture_shape_from_name(name: &str) -> TextureShape {
-    let head = name.split_once('<').map(|(h, _)| h).unwrap_or(name);
+    let (writable, array_ref) = texture_access_from_name(name);
+    let shape_name = if array_ref {
+        name.find("texture")
+            .and_then(|start| name.get(start..))
+            .unwrap_or(name)
+    } else {
+        name
+    };
+    let head = shape_name
+        .split_once('<')
+        .map(|(h, _)| h)
+        .unwrap_or(shape_name);
     let (dimension, arrayed) = if head.contains("texture_buffer") {
         (TextureDimension::Buffer, false)
     } else if head.contains("1d_array") {
@@ -139,8 +152,7 @@ pub fn texture_shape_from_name(name: &str) -> TextureShape {
         (TextureDimension::D2, false)
     };
     let multisampled = head.contains("_ms");
-    let component = texture_component_from_name(name);
-    let (writable, array_ref) = texture_access_from_name(name);
+    let component = texture_component_from_name(shape_name);
     let storage_format = if writable {
         Some(storage_format_from_name(name, component))
     } else {
@@ -164,6 +176,8 @@ fn storage_format_from_name(name: &str, component: TextureComponent) -> TextureF
         TextureComponent::Float => {
             if name.contains("<half") {
                 TextureFormat::Rgba16f
+            } else if name.contains("<float") {
+                TextureFormat::R32f
             } else {
                 TextureFormat::Rgba32f
             }
@@ -197,9 +211,13 @@ fn texture_component_from_name(name: &str) -> TextureComponent {
 }
 
 /// `(writable, array_ref)` decoded from the access qualifier — the second template field
-/// (`texture2d<float, write>`) and the `array_ref<...>` wrapper.
+/// (`texture2d<float, write>`) and texture-handle array wrappers.
 fn texture_access_from_name(name: &str) -> (bool, bool) {
-    let array_ref = name.contains("array_ref<") || name.contains("array_ref <");
+    let compact = name
+        .chars()
+        .filter(|ch| !ch.is_ascii_whitespace())
+        .collect::<String>();
+    let array_ref = compact.contains("array_ref<texture") || compact.contains("array<texture");
     let Some((_, rest)) = name.split_once('<') else {
         return (false, array_ref);
     };

@@ -314,8 +314,8 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
 /// Emit the all-device/constant-buffer raw view with the structured-plan attempt forced off (the
 /// `relooper_feed` path) so a caller that immediately runs the relooper can rebuild the CFG directly
 /// from a guaranteed-unstructured complete module. This is an intermediate-only form:
-/// its inferred merges are intentionally not valid SPIR-V, and it must never be adopted before the
-/// relooper (and any required pointer rewrite) independently validates the result.
+/// it intentionally omits branch/loop structured merge hints, and it must never be adopted before
+/// the relooper (and any required pointer rewrite) independently validates the result.
 pub fn emit_vulkan_spirv_all_buffers_raw_relooper_feed(san_ll: &str) -> Result<Vec<u8>, String> {
     let kern = meta::parse_air_kernel_meta(san_ll);
     let entry_name = meta::entry_name(san_ll, "kernel");
@@ -375,6 +375,26 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
     mark_all_device_buffers_raw(&mut parsed, false);
     finalize_emission(
         Emitter::new(parsed).with_bda_device_pointers(),
+        buffer_layouts,
+    )
+}
+
+/// BDA counterpart of [`emit_vulkan_spirv_all_buffers_raw_relooper_feed`]: emit the raw+BDA
+/// physical-address model while deliberately skipping CFG repair so the retry cascade can rebuild
+/// guarded/unstructured control flow with the relooper before validation/adoption.
+pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
+    san_ll: &str,
+    kern: Option<&meta::KernMeta>,
+    entry_name: Option<&str>,
+    buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
+) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
+    let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(san_ll);
+    let mut parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
+    mark_all_device_buffers_raw(&mut parsed, false);
+    finalize_emission(
+        Emitter::new(parsed)
+            .with_bda_device_pointers()
+            .with_relooper_feed(),
         buffer_layouts,
     )
 }

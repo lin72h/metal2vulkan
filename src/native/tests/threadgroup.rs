@@ -488,7 +488,7 @@ declare half @air.simd_shuffle_and_fill_down.f16(half, half, i16, i16)
         !asm_has_line(&asm, "OpCapability GroupNonUniformShuffleRelative"),
         "{asm}"
     );
-    assert!(asm.contains("LocalInvocationIndex"), "{asm}");
+    assert!(asm.contains("SubgroupLocalInvocationId"), "{asm}");
     assert_eq!(
         asm.lines()
             .filter(|line| line.contains("= OpGroupNonUniformShuffle "))
@@ -496,7 +496,6 @@ declare half @air.simd_shuffle_and_fill_down.f16(half, half, i16, i16)
         2,
         "{asm}"
     );
-    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
     assert!(asm.contains("OpUMod"), "{asm}");
     assert!(asm.contains("OpISub"), "{asm}");
     assert!(asm.contains("OpULessThan"), "{asm}");
@@ -561,7 +560,7 @@ declare float @air.simd_broadcast.f32(float, i16)
 }
 
 #[test]
-fn native_air_simd_shuffle_down_lowers_to_subgroup_shuffle_down() {
+fn native_air_simd_shuffle_down_lowers_to_32_lane_absolute_shuffle() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 define void @k(float %x, half %h, i16 %delta, ptr addrspace(1) %out) {
@@ -592,18 +591,18 @@ declare half @air.simd_shuffle_down.f16(half, i16)
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
     assert!(
-        asm_has_line(&asm, "OpCapability GroupNonUniformShuffleRelative"),
+        asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
         "{asm}"
     );
     assert!(
-        !asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
+        !asm_has_line(&asm, "OpCapability GroupNonUniformShuffleRelative"),
         "{asm}"
     );
-    assert_eq!(
-        asm.matches("OpGroupNonUniformShuffleDown").count(),
-        2,
-        "{asm}"
-    );
+    assert_eq!(asm.matches("OpGroupNonUniformShuffle").count(), 2, "{asm}");
+    assert!(!asm.contains("OpGroupNonUniformShuffleDown"), "{asm}");
+    assert!(asm.contains("SubgroupLocalInvocationId"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
     assert!(asm.contains("OpUConvert"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -615,7 +614,56 @@ declare half @air.simd_shuffle_down.f16(half, i16)
 }
 
 #[test]
-fn native_air_simd_shuffle_up_lowers_to_subgroup_shuffle_up() {
+fn native_air_simd_shuffle_rotate_down_lowers_to_wrapping_subgroup_shuffle() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(float %x, i16 %delta, ptr addrspace(1) %out) {
+entry:
+  %sx = tail call float @air.simd_shuffle_rotate_down.f32(float %x, i16 %delta)
+  store float %sx, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare float @air.simd_shuffle_rotate_down.f32(float, i16)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_shuffle_rotate_down_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
+    assert!(
+        asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
+        "{asm}"
+    );
+    assert!(
+        !asm_has_line(&asm, "OpCapability GroupNonUniformShuffleRelative"),
+        "{asm}"
+    );
+    assert_eq!(asm.matches("OpGroupNonUniformShuffle").count(), 1, "{asm}");
+    assert!(asm.contains("OpIAdd"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpUConvert"), "{asm}");
+    assert!(!asm.contains("air.simd_shuffle_rotate_down"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_air_simd_shuffle_up_lowers_to_32_lane_absolute_shuffle() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 define void @k(i32 %x, i16 %delta, ptr addrspace(1) %out) {
@@ -642,14 +690,18 @@ declare i32 @air.simd_shuffle_up.u.i32(i32, i16)
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
     assert!(
-        asm_has_line(&asm, "OpCapability GroupNonUniformShuffleRelative"),
+        asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
         "{asm}"
     );
     assert!(
-        !asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
+        !asm_has_line(&asm, "OpCapability GroupNonUniformShuffleRelative"),
         "{asm}"
     );
-    assert!(asm.contains("OpGroupNonUniformShuffleUp"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
+    assert!(!asm.contains("OpGroupNonUniformShuffleUp"), "{asm}");
+    assert!(asm.contains("SubgroupLocalInvocationId"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
     assert!(asm.contains("OpUConvert"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -966,6 +1018,7 @@ entry:
             kernel_local_size: [32, 2, 1],
             kernel_threads_per_grid: None,
             simd_cluster32: false,
+            ..passes::TransformOptions::default()
         },
     )
     .expect("translate");
@@ -1026,6 +1079,7 @@ entry:
             kernel_local_size: [5, 2, 1],
             kernel_threads_per_grid: Some([21, 3, 1]),
             simd_cluster32: false,
+            ..passes::TransformOptions::default()
         },
     )
     .expect("translate");
@@ -1223,6 +1277,60 @@ declare i32 @air.atomic.local.or.u.i32(ptr addrspace(3), i32, i32, i32, i1)
     assert!(asm.contains("OpAtomicUMin"), "{asm}");
     assert!(asm.contains("OpAtomicAnd"), "{asm}");
     assert!(asm.contains("OpAtomicOr"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_threadgroup_atomic_fixed_loop_is_flattened_and_unrolled() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%"struct.metal::_atomic" = type { i32 }
+@local_counts = internal addrspace(3) global [4 x %"struct.metal::_atomic"] zeroinitializer, align 4
+
+define void @k() {
+entry:
+  %initp = getelementptr inbounds [4 x %"struct.metal::_atomic"], ptr addrspace(3) @local_counts, i64 0, i64 0, i32 0
+  store i32 0, ptr addrspace(3) %initp, align 4
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %bin64 = zext i32 %i to i64
+  %p = getelementptr inbounds [4 x %"struct.metal::_atomic"], ptr addrspace(3) @local_counts, i64 0, i64 %bin64, i32 0
+  %old = tail call i32 @air.atomic.local.add.u.i32(ptr addrspace(3) %p, i32 1, i32 0, i32 1, i1 true)
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, 4
+  br i1 %done, label %exit, label %loop
+
+exit:
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_threadgroup_atomic_unroll_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("OpTypeStruct %uint"), "{asm}");
+    assert_eq!(asm.matches("OpAtomicIAdd").count(), 4, "{asm}");
+    assert!(!asm.contains("OpLoopMerge"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

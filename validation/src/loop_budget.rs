@@ -26,10 +26,11 @@
 use std::collections::{HashMap, HashSet};
 
 /// Per-thread, per-function back-edge budget. Every loop iteration traverses a back-edge, which
-/// decrements this counter; when it reaches zero control jumps to the function's exit. Under the
-/// harness's bounded seeds (dims ≤ 16, buffers ≤ 4 KB) legitimate trip counts are ≤ ~10⁶, so
-/// ~16.7M gives ample headroom while a genuine runaway (≥10⁸) is caught in tens of ms of GPU time.
-pub const LOOP_BUDGET_BACKEDGES: i32 = 1 << 24;
+/// decrements this counter; when it reaches zero control jumps to the function's exit. The oracle
+/// marks instrumented kernels as `compare=none`; this cap is therefore a validation liveness guard,
+/// not a product semantic contract. Keep it large enough for bounded harness work but small enough
+/// that runaway SIMT reductions do not run into the corpus worker's wall timeout.
+pub const LOOP_BUDGET_BACKEDGES: i32 = 1 << 18;
 
 /// Result of classifying one module (entry + all defined functions).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +77,12 @@ pub fn classify_and_instrument(module_text: &str, entry: &str) -> GuardPlan {
     for f in &parsed {
         if f.back_edges.is_empty() {
             continue;
+        }
+        if f.loop_has_workgroup_barrier {
+            return GuardPlan::Quarantine(format!(
+                "loop in {:?} contains air.wg.barrier (cannot preserve uniform barrier semantics)",
+                f.name
+            ));
         }
         for callee in &f.calls {
             if *trans_loopy.get(callee.as_str()).unwrap_or(&false) {
@@ -262,12 +269,27 @@ fn symbol_after_at(s: &str) -> Option<String> {
 /// Metal's textual IR uses opaque `ptr` in modern toolchains; detect it so injected loads/stores
 /// use the matching pointer syntax (`ptr %p` vs `i32* %p`).
 fn uses_opaque_pointers(module_text: &str) -> bool {
-    module_text.contains("ptr addrspace(")
+    if module_text.contains("ptr addrspace(")
         || module_text.contains("(ptr ")
         || module_text.contains(", ptr ")
         || module_text.contains(" ptr,")
         || module_text.contains(" ptr)")
         || module_text.contains(" ptr ")
+    {
+        return true;
+    }
+    if uses_typed_pointer_spelling(module_text) {
+        return false;
+    }
+    module_text.contains("target triple = \"air64_v")
+}
+
+fn uses_typed_pointer_spelling(module_text: &str) -> bool {
+    module_text.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with(';')
+            && (line.contains(")*") || line.contains("* ") || line.contains("*,"))
+    })
 }
 
 // --- per-function parse --------------------------------------------------------------------------
@@ -297,6 +319,8 @@ struct ParsedFunc {
     blocks: Vec<Block>,
     /// (source block index, target block index) back-edges, over a DFS of *all* blocks.
     back_edges: Vec<(usize, usize)>,
+    /// True when a natural loop body contains a workgroup barrier call.
+    loop_has_workgroup_barrier: bool,
     /// Directly-called function symbols (for the compose gate).
     calls: Vec<String>,
 }
@@ -327,7 +351,15 @@ fn parse_func(lines: &[&str], f: &FuncSpan) -> Result<ParsedFunc, String> {
         succ_idx.push(v);
     }
 
-    let back_edges = back_edges(&succ_idx);
+    let back_edges = back_edges(&succ_idx)
+        .into_iter()
+        .filter(|&(src, dst)| !small_fixed_trip_loop(body, &blocks, &succ_idx, src, dst))
+        .collect::<Vec<_>>();
+    let loop_has_workgroup_barrier = back_edges.iter().any(|&(src, dst)| {
+        natural_loop_nodes(&succ_idx, src, dst)
+            .into_iter()
+            .any(|idx| block_contains_workgroup_barrier(body, &blocks[idx]))
+    });
 
     let mut calls = Vec::new();
     for line in body {
@@ -339,6 +371,7 @@ fn parse_func(lines: &[&str], f: &FuncSpan) -> Result<ParsedFunc, String> {
         ret_ty: f.ret_ty.clone(),
         blocks,
         back_edges,
+        loop_has_workgroup_barrier,
         calls,
     })
 }
@@ -613,6 +646,42 @@ fn back_edges(succ: &[Vec<usize>]) -> Vec<(usize, usize)> {
     edges
 }
 
+fn natural_loop_nodes(succ: &[Vec<usize>], src: usize, dst: usize) -> Vec<usize> {
+    let mut pred = vec![Vec::<usize>::new(); succ.len()];
+    for (from, targets) in succ.iter().enumerate() {
+        for &to in targets {
+            pred[to].push(from);
+        }
+    }
+
+    let mut seen = vec![false; succ.len()];
+    let mut stack = vec![src];
+    seen[dst] = true;
+    while let Some(node) = stack.pop() {
+        if seen[node] {
+            continue;
+        }
+        seen[node] = true;
+        for &p in &pred[node] {
+            stack.push(p);
+        }
+    }
+    seen.iter()
+        .enumerate()
+        .filter_map(|(idx, &is_loop)| is_loop.then_some(idx))
+        .collect()
+}
+
+fn block_contains_workgroup_barrier(body: &[&str], block: &Block) -> bool {
+    body[block.start..=block.end]
+        .iter()
+        .any(|line| line_calls_workgroup_barrier(line))
+}
+
+fn line_calls_workgroup_barrier(line: &str) -> bool {
+    line.contains("@air.wg.barrier(") || line.contains("@\"air.wg.barrier\"(")
+}
+
 fn transitive_loopy<'a>(
     parsed: &'a [ParsedFunc],
     direct: &HashMap<&'a str, bool>,
@@ -659,7 +728,9 @@ fn transform_func(
     let budget = "%m2v.bd";
 
     // 1) In-place rewrites (before any insertion, so body indices stay valid).
-    let mut guards: Vec<String> = Vec::new();
+    let mut guards_after: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut budget_before: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut metadata_rewritten_sources = HashSet::new();
     for (k, &(u, v)) in pf.back_edges.iter().enumerate() {
         let ub = &pf.blocks[u];
         let vb = &pf.blocks[v];
@@ -677,8 +748,78 @@ fn transform_func(
 
         // Redirect u's back-edge target to the guard (exactly one occurrence expected).
         let term = &body[ub.term_idx];
-        let rewritten = replace_branch_target(term, v_label, &guard_label)
-            .ok_or_else(|| format!("{:?}: ambiguous back-edge target {v_label:?}", pf.name))?;
+        let (term_without_loop_metadata, loop_metadata) = split_loop_metadata(term);
+        if !loop_metadata.is_empty() {
+            if !metadata_rewritten_sources.insert(u) {
+                return Err(format!(
+                    "{:?}: multiple metadata back-edges from one branch terminator are not split",
+                    pf.name
+                ));
+            }
+            let targets = extract_label_targets(&term_without_loop_metadata);
+            match targets.as_slice() {
+                [only] if only == v_label => {
+                    budget_before.entry(ub.term_idx).or_default().extend([
+                        format!("  %m2v.{k}.a = load i32, {ptr} {budget}, align 4"),
+                        format!("  %m2v.{k}.b = sub i32 %m2v.{k}.a, 1"),
+                        format!("  store i32 %m2v.{k}.b, {ptr} {budget}, align 4"),
+                        format!("  %m2v.{k}.ex = icmp sle i32 %m2v.{k}.b, 0"),
+                    ]);
+                    body[ub.term_idx] = format!(
+                        "  br i1 %m2v.{k}.ex, label %m2v.exit, label %{v_label}{loop_metadata}"
+                    );
+                    continue;
+                }
+                [true_target, false_target] => {
+                    let cond =
+                        branch_condition_operand(&term_without_loop_metadata).ok_or_else(|| {
+                            format!(
+                                "{:?}: conditional back-edge branch has no condition",
+                                pf.name
+                            )
+                        })?;
+                    if true_target == v_label {
+                        budget_before.entry(ub.term_idx).or_default().extend([
+                            format!("  %m2v.{k}.a = load i32, {ptr} {budget}, align 4"),
+                            format!("  %m2v.{k}.b = sub i32 %m2v.{k}.a, 1"),
+                            format!("  store i32 %m2v.{k}.b, {ptr} {budget}, align 4"),
+                            format!("  %m2v.{k}.ok = icmp sgt i32 %m2v.{k}.b, 0"),
+                            format!("  %m2v.{k}.keep = and i1 {cond}, %m2v.{k}.ok"),
+                        ]);
+                        body[ub.term_idx] = format!(
+                            "  br i1 %m2v.{k}.keep, label %{true_target}, label %{false_target}{loop_metadata}"
+                        );
+                        continue;
+                    }
+                    if false_target == v_label {
+                        budget_before.entry(ub.term_idx).or_default().extend([
+                            format!("  %m2v.{k}.a = load i32, {ptr} {budget}, align 4"),
+                            format!("  %m2v.{k}.b = sub i32 %m2v.{k}.a, 1"),
+                            format!("  store i32 %m2v.{k}.b, {ptr} {budget}, align 4"),
+                            format!("  %m2v.{k}.ex = icmp sle i32 %m2v.{k}.b, 0"),
+                            format!("  %m2v.{k}.leave = or i1 {cond}, %m2v.{k}.ex"),
+                        ]);
+                        body[ub.term_idx] = format!(
+                            "  br i1 %m2v.{k}.leave, label %{true_target}, label %{false_target}{loop_metadata}"
+                        );
+                        continue;
+                    }
+                    return Err(format!(
+                        "{:?}: loop metadata branch does not target loop header {v_label:?}",
+                        pf.name
+                    ));
+                }
+                _ => {
+                    return Err(format!(
+                        "{:?}: unsupported loop metadata branch shape",
+                        pf.name
+                    ));
+                }
+            }
+        }
+        let rewritten =
+            replace_branch_target(&term_without_loop_metadata, v_label, &guard_label)
+                .ok_or_else(|| format!("{:?}: ambiguous back-edge target {v_label:?}", pf.name))?;
         body[ub.term_idx] = rewritten;
 
         // Rename v's phi predecessor u → guard (u's label, since v's phis name their predecessors).
@@ -690,17 +831,20 @@ fn transform_func(
             }
         }
 
-        guards.push(format!("{guard_label}:"));
-        guards.push(format!("  %m2v.{k}.a = load i32, {ptr} {budget}, align 4"));
-        guards.push(format!("  %m2v.{k}.b = sub i32 %m2v.{k}.a, 1"));
-        guards.push(format!("  store i32 %m2v.{k}.b, {ptr} {budget}, align 4"));
-        guards.push(format!("  %m2v.{k}.c = icmp sle i32 %m2v.{k}.b, 0"));
-        guards.push(format!(
-            "  br i1 %m2v.{k}.c, label %m2v.exit, label %{v_label}"
-        ));
+        guards_after.entry(ub.end).or_default().extend([
+            format!("{guard_label}:"),
+            format!("  %m2v.{k}.a = load i32, {ptr} {budget}, align 4"),
+            format!("  %m2v.{k}.b = sub i32 %m2v.{k}.a, 1"),
+            format!("  store i32 %m2v.{k}.b, {ptr} {budget}, align 4"),
+            format!("  %m2v.{k}.c = icmp sle i32 %m2v.{k}.b, 0"),
+            format!("  br i1 %m2v.{k}.c, label %m2v.exit, label %{v_label}{loop_metadata}"),
+        ]);
     }
 
-    // 2) Prepend the budget alloca + init to the entry block (index 0).
+    // 2) Prepend the budget alloca + init to the entry block (index 0), and emit each guard block
+    // immediately after the latch block whose back-edge it split. Keeping the synthetic back-edge
+    // block next to the source loop makes the downstream native structurizer see an ordinary loop
+    // instead of a post-return block that branches back into earlier code.
     let entry = &pf.blocks[0];
     let insert_at = if entry.label.is_some() {
         entry.start + 1
@@ -711,24 +855,530 @@ fn transform_func(
         format!("  {budget} = alloca i32, align 4"),
         format!("  store i32 {LOOP_BUDGET_BACKEDGES}, {ptr} {budget}, align 4"),
     ];
-    body.splice(insert_at..insert_at, init);
+    let mut emitted_body = Vec::with_capacity(
+        body.len() + init.len() + guards_after.len() * 6 + budget_before.len() * 5 + 2,
+    );
+    for (idx, line) in body.into_iter().enumerate() {
+        if idx == insert_at {
+            emitted_body.extend(init.iter().cloned());
+        }
+        if let Some(budget_lines) = budget_before.remove(&idx) {
+            emitted_body.extend(budget_lines);
+        }
+        emitted_body.push(line);
+        if let Some(guard_lines) = guards_after.remove(&idx) {
+            emitted_body.extend(guard_lines);
+        }
+    }
+    if insert_at == body_src.len() {
+        emitted_body.extend(init);
+    }
+    if !guards_after.is_empty() {
+        return Err(format!("{:?}: guard insertion point went stale", pf.name));
+    }
+    if !budget_before.is_empty() {
+        return Err(format!("{:?}: budget insertion point went stale", pf.name));
+    }
 
-    // 3) Append the guard blocks and the single exit block.
-    body.extend(guards);
-    body.push("m2v.exit:".to_string());
+    // 3) Append the single budget-exhausted exit block.
+    emitted_body.push("m2v.exit:".to_string());
     if pf.ret_ty == "void" {
-        body.push("  ret void".to_string());
+        emitted_body.push("  ret void".to_string());
     } else {
         // `undef` is a valid value of any type; the exit is only reached on a runaway.
-        body.push(format!("  ret {} undef", pf.ret_ty));
+        emitted_body.push(format!("  ret {} undef", pf.ret_ty));
     }
 
     // 4) Reassemble the function.
-    let mut out = Vec::with_capacity(body.len() + 2);
+    let mut out = Vec::with_capacity(emitted_body.len() + 2);
     out.push(lines[f.define_idx].to_string());
-    out.extend(body);
+    out.extend(emitted_body);
     out.push(lines[f.close_idx].to_string());
     Ok(out)
+}
+
+fn small_fixed_trip_loop(
+    body: &[&str],
+    blocks: &[Block],
+    succ: &[Vec<usize>],
+    src: usize,
+    dst: usize,
+) -> bool {
+    let has_workgroup_barrier = loop_contains_workgroup_barrier(body, blocks, succ, src, dst);
+    let bounded = counted_const_loop(body, blocks, src, dst)
+        || counted_small_symbolic_loop(body, blocks, src, dst);
+    bool_toggle_loop(body, blocks, src, dst)
+        || ((has_workgroup_barrier
+            || loop_contains_air_local_atomic(body, blocks, succ, src, dst)
+            || loop_contains_workgroup_memory_access(body, blocks, succ, src, dst))
+            && bounded)
+}
+
+fn bool_toggle_loop(body: &[&str], blocks: &[Block], src: usize, dst: usize) -> bool {
+    let header = &blocks[dst];
+    let Some(src_label) = blocks[src].label.as_deref() else {
+        return false;
+    };
+    block_lines(body, header).any(|line| {
+        line.contains(" = phi i1 ")
+            && line.contains("[ true,")
+            && line.contains("[ false,")
+            && line.contains(&format!("%{src_label}"))
+    })
+}
+
+fn counted_const_loop(body: &[&str], blocks: &[Block], src: usize, dst: usize) -> bool {
+    let header = &blocks[dst];
+    let latch = &blocks[src];
+    let Some(src_label) = latch.label.as_deref() else {
+        return false;
+    };
+    let has_zero_counter = block_lines(body, header).any(|line| {
+        (line.contains(" = phi i32 ") || line.contains(" = phi i64 "))
+            && line.contains("[ 0,")
+            && line.contains(&format!("%{src_label}"))
+    });
+    if !has_zero_counter {
+        return false;
+    }
+    block_lines(body, latch).any(|line| {
+        (line.contains(" = icmp eq i32 ") || line.contains(" = icmp eq i64 "))
+            && trailing_small_const(line).is_some_and(|trip| (1..=256).contains(&trip))
+    })
+}
+
+fn counted_small_symbolic_loop(body: &[&str], blocks: &[Block], src: usize, dst: usize) -> bool {
+    let header = &blocks[dst];
+    let latch = &blocks[src];
+    let Some(src_label) = latch.label.as_deref() else {
+        return false;
+    };
+    let Some(dst_label) = header.label.as_deref() else {
+        return false;
+    };
+    let loop_lines = block_lines(body, header)
+        .chain(block_lines(body, latch))
+        .collect::<Vec<_>>();
+    let def_lines = body.to_vec();
+    let latch_lines = block_lines(body, latch).collect::<Vec<_>>();
+    let Some(branch) = latch_lines
+        .iter()
+        .rev()
+        .copied()
+        .find(|line| line.trim_start().starts_with("br i1 "))
+    else {
+        return false;
+    };
+    let Some(cond) = branch_condition(branch) else {
+        return false;
+    };
+    let backedge_on_true = branch_backedge_on_true(branch, dst_label);
+    let Some(cond_line) = loop_lines
+        .iter()
+        .copied()
+        .find(|line| result_name(line).as_deref() == Some(cond.as_str()))
+    else {
+        return false;
+    };
+    let Some((pred, lhs, rhs)) = parse_icmp(cond_line) else {
+        return false;
+    };
+    for line in block_lines(body, header).filter(|line| line.contains(" = phi i32 ")) {
+        let Some(phi) = parse_i32_phi(line, src_label) else {
+            continue;
+        };
+        let Some((step_base, step)) = add_step(&def_lines, &phi.recur) else {
+            continue;
+        };
+        if step_base != phi.name || step == 0 || step.unsigned_abs() > 16 {
+            continue;
+        }
+        if pred == "eq" && step > 0 && backedge_on_true == Some(false) {
+            if let Some(trip) = symbolic_span(&def_lines, &phi.init, &lhs, &rhs, &phi.name, true) {
+                if small_trip_from_span(trip, step.unsigned_abs(), true) {
+                    return true;
+                }
+            }
+        }
+        if pred == "ugt" && step < 0 && backedge_on_true == Some(true) {
+            if let Some(trip) = symbolic_span(&def_lines, &phi.init, &lhs, &rhs, &phi.recur, true) {
+                if small_trip_from_span(trip, step.unsigned_abs(), false) {
+                    return true;
+                }
+            }
+        }
+        if pred == "ult" && step > 0 && backedge_on_true == Some(true) {
+            if let Some(trip) = symbolic_span(&def_lines, &phi.init, &lhs, &rhs, &phi.recur, true) {
+                if small_trip_from_span(trip, step.unsigned_abs(), false) {
+                    return true;
+                }
+            }
+        }
+    }
+    small_power_of_two_loop(body, header, latch, src_label, dst_label)
+}
+
+#[derive(Clone)]
+struct PhiInfo {
+    name: String,
+    init: String,
+    recur: String,
+}
+
+fn branch_condition(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("br i1 ")?;
+    Some(
+        rest.split(',')
+            .next()?
+            .trim()
+            .trim_start_matches('%')
+            .to_string(),
+    )
+}
+
+fn branch_condition_operand(line: &str) -> Option<String> {
+    let cond = line
+        .trim_start()
+        .strip_prefix("br i1 ")?
+        .split(',')
+        .next()?
+        .trim();
+    if cond.starts_with('%') || matches!(cond, "true" | "false") {
+        Some(cond.to_string())
+    } else {
+        Some(format!("%{cond}"))
+    }
+}
+
+fn parse_icmp(line: &str) -> Option<(&str, String, String)> {
+    let (_, rhs) = line.split_once(" = icmp ")?;
+    let mut parts = rhs.split_whitespace();
+    let pred = parts.next()?;
+    let ty = parts.next()?;
+    if ty != "i32" && ty != "i64" {
+        return None;
+    }
+    let lhs = parts.next()?.trim_end_matches(',').trim_start_matches('%');
+    let rhs = parts.next()?.trim_end_matches(',').trim_start_matches('%');
+    Some((pred, lhs.to_string(), rhs.to_string()))
+}
+
+fn parse_i32_phi(line: &str, src_label: &str) -> Option<PhiInfo> {
+    let name = result_name(line)?;
+    let (_, rhs) = line.split_once(" = phi i32 ")?;
+    let mut init = None;
+    let mut recur = None;
+    for part in rhs.split('[').skip(1) {
+        let part = part.split(']').next()?;
+        let (value, parent) = part.split_once(',')?;
+        let value = value.trim().trim_start_matches('%').to_string();
+        let parent = parent.trim().trim_start_matches('%');
+        if parent == src_label {
+            recur = Some(value);
+        } else {
+            init = Some(value);
+        }
+    }
+    Some(PhiInfo {
+        name,
+        init: init?,
+        recur: recur?,
+    })
+}
+
+fn add_step(lines: &[&str], id: &str) -> Option<(String, i32)> {
+    let line = lines
+        .iter()
+        .copied()
+        .find(|line| result_name(line).as_deref() == Some(id))?;
+    let (_, rhs) = line.split_once(" = add ")?;
+    let mut parts = rhs.split_whitespace();
+    let ty = loop {
+        let part = parts.next()?;
+        if part == "i32" || part == "i64" {
+            break part;
+        }
+    };
+    let lhs = parts.next()?.trim_end_matches(',').trim_start_matches('%');
+    let rhs = parts.next()?.trim_end_matches(',').trim_start_matches('%');
+    if let Ok(step) = rhs.parse::<i32>() {
+        return Some((lhs.to_string(), step));
+    }
+    if let Ok(step) = lhs.parse::<i32>() {
+        return Some((rhs.to_string(), step));
+    }
+    let _ = ty;
+    None
+}
+
+fn branch_backedge_on_true(branch: &str, dst_label: &str) -> Option<bool> {
+    let targets = extract_label_targets(branch);
+    match targets.as_slice() {
+        [true_target, false_target] if true_target == dst_label => {
+            let _ = false_target;
+            Some(true)
+        }
+        [true_target, false_target] if false_target == dst_label => {
+            let _ = true_target;
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn small_trip_from_span(span: i32, step: u32, inclusive: bool) -> bool {
+    if span < 0 || step == 0 {
+        return false;
+    }
+    let span = span as u32;
+    let trips = span.div_ceil(step) + u32::from(inclusive);
+    (1..=256).contains(&trips)
+}
+
+fn symbolic_span(
+    lines: &[&str],
+    init: &str,
+    lhs: &str,
+    rhs: &str,
+    induction: &str,
+    exclusive_upper: bool,
+) -> Option<i32> {
+    let limit = if lhs == induction {
+        rhs
+    } else if rhs == induction {
+        lhs
+    } else {
+        return None;
+    };
+    let (base_a, start) = affine_small_const(lines, init)?;
+    let (base_b, end) = affine_small_const(lines, limit)?;
+    if base_a != base_b {
+        return None;
+    }
+    let span = if end >= start {
+        end - start
+    } else {
+        start - end
+    };
+    Some(if exclusive_upper { span } else { span + 1 })
+}
+
+fn small_power_of_two_loop(
+    body: &[&str],
+    header: &Block,
+    latch: &Block,
+    src_label: &str,
+    dst_label: &str,
+) -> bool {
+    let def_lines = body.to_vec();
+    let latch_lines = block_lines(body, latch).collect::<Vec<_>>();
+    let Some(branch) = latch_lines
+        .iter()
+        .rev()
+        .copied()
+        .find(|line| line.trim_start().starts_with("br i1 "))
+    else {
+        return false;
+    };
+    let Some(cond) = branch_condition(branch) else {
+        return false;
+    };
+    let Some(backedge_on_true) = branch_backedge_on_true(branch, dst_label) else {
+        return false;
+    };
+    let Some(cond_line) =
+        block_lines(body, latch).find(|line| result_name(line).as_deref() == Some(cond.as_str()))
+    else {
+        return false;
+    };
+    let Some((pred, lhs, rhs)) = parse_icmp(cond_line) else {
+        return false;
+    };
+    if pred != "ult" {
+        return false;
+    }
+    for line in block_lines(body, header).filter(|line| line.contains(" = phi i32 ")) {
+        let Some(phi) = parse_i32_phi(line, src_label) else {
+            continue;
+        };
+        let Some((base, shift)) = shift_by_one(&def_lines, &phi.recur) else {
+            continue;
+        };
+        if base != phi.name {
+            continue;
+        }
+        let induction = if lhs == phi.name {
+            rhs.as_str()
+        } else if rhs == phi.name {
+            lhs.as_str()
+        } else {
+            continue;
+        };
+        let Some((start_base, start)) = affine_small_const(&def_lines, &phi.init) else {
+            continue;
+        };
+        let Some((limit_base, limit)) = affine_small_const(&def_lines, induction) else {
+            continue;
+        };
+        if !start_base.is_empty() || !limit_base.is_empty() {
+            continue;
+        }
+        let Some(trips) = power_of_two_trip_count(start, limit, shift, backedge_on_true) else {
+            continue;
+        };
+        if (1..=256).contains(&trips) {
+            return true;
+        }
+    }
+    false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShiftStep {
+    Shl1,
+    LShr1,
+}
+
+fn shift_by_one(lines: &[&str], id: &str) -> Option<(String, ShiftStep)> {
+    let line = lines
+        .iter()
+        .copied()
+        .find(|line| result_name(line).as_deref() == Some(id))?;
+    for (op, step) in [("shl", ShiftStep::Shl1), ("lshr", ShiftStep::LShr1)] {
+        let needle = format!(" = {op} ");
+        if let Some((_, rhs)) = line.split_once(&needle) {
+            let mut parts = rhs.split_whitespace();
+            let ty = loop {
+                let part = parts.next()?;
+                if part == "i32" || part == "i64" {
+                    break part;
+                }
+            };
+            if ty != "i32" {
+                return None;
+            }
+            let lhs = parts.next()?.trim_end_matches(',').trim_start_matches('%');
+            let amount = parts.next()?.trim_end_matches(',');
+            if amount == "1" {
+                return Some((lhs.to_string(), step));
+            }
+        }
+    }
+    None
+}
+
+fn power_of_two_trip_count(
+    start: i32,
+    limit: i32,
+    shift: ShiftStep,
+    backedge_on_true: bool,
+) -> Option<u32> {
+    let mut value = u32::try_from(start).ok()?;
+    let limit = u32::try_from(limit).ok()?;
+    let mut trips = 0u32;
+    loop {
+        trips = trips.checked_add(1)?;
+        if trips > 256 {
+            return None;
+        }
+        let cond = value < limit;
+        if cond != backedge_on_true {
+            return Some(trips);
+        }
+        value = match shift {
+            ShiftStep::Shl1 => value.checked_mul(2)?,
+            ShiftStep::LShr1 => {
+                if value == 0 {
+                    return None;
+                }
+                value / 2
+            }
+        };
+    }
+}
+
+fn affine_small_const(lines: &[&str], id: &str) -> Option<(String, i32)> {
+    if let Ok(value) = id.parse::<i32>() {
+        return Some(("".into(), value));
+    }
+    let Some(line) = lines
+        .iter()
+        .copied()
+        .find(|line| result_name(line).as_deref() == Some(id))
+    else {
+        return Some((id.to_string(), 0));
+    };
+    for op in ["or", "add"] {
+        let needle = format!(" = {op} i32 ");
+        if let Some((_, rhs)) = line.split_once(&needle) {
+            let (a, b) = rhs.split_once(',')?;
+            let a = a.trim().trim_start_matches('%');
+            let b = b.trim().trim_start_matches('%');
+            if let Ok(value) = b.parse::<i32>() {
+                return Some((a.to_string(), value));
+            }
+            if let Ok(value) = a.parse::<i32>() {
+                return Some((b.to_string(), value));
+            }
+        }
+    }
+    Some((id.to_string(), 0))
+}
+
+fn result_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('%')?;
+    let (name, _) = rest.split_once(" = ")?;
+    Some(name.to_string())
+}
+
+fn block_lines<'a>(body: &'a [&'a str], block: &'a Block) -> impl Iterator<Item = &'a str> {
+    body[block.start..=block.end].iter().copied()
+}
+
+fn trailing_small_const(line: &str) -> Option<i32> {
+    let value = line.rsplit_once(',')?.1.trim();
+    value.parse().ok()
+}
+
+fn loop_contains_air_local_atomic(
+    body: &[&str],
+    blocks: &[Block],
+    succ: &[Vec<usize>],
+    src: usize,
+    dst: usize,
+) -> bool {
+    natural_loop_nodes(succ, src, dst)
+        .into_iter()
+        .any(|idx| block_lines(body, &blocks[idx]).any(line_calls_air_local_atomic))
+}
+
+fn loop_contains_workgroup_memory_access(
+    body: &[&str],
+    blocks: &[Block],
+    succ: &[Vec<usize>],
+    src: usize,
+    dst: usize,
+) -> bool {
+    natural_loop_nodes(succ, src, dst)
+        .into_iter()
+        .any(|idx| block_lines(body, &blocks[idx]).any(|line| line.contains("addrspace(3)")))
+}
+
+fn loop_contains_workgroup_barrier(
+    body: &[&str],
+    blocks: &[Block],
+    succ: &[Vec<usize>],
+    src: usize,
+    dst: usize,
+) -> bool {
+    natural_loop_nodes(succ, src, dst)
+        .into_iter()
+        .any(|idx| block_contains_workgroup_barrier(body, &blocks[idx]))
+}
+
+fn line_calls_air_local_atomic(line: &str) -> bool {
+    line.contains("@air.atomic.local.") || line.contains("@\"air.atomic.local.")
 }
 
 /// Replace a single `label %<from>` branch target with `label %<to>`. Returns `None` if `<from>`
@@ -760,6 +1410,14 @@ fn replace_branch_target(line: &str, from: &str, to: &str) -> Option<String> {
     out.push_str(&format!("label %{to}"));
     out.push_str(&line[abs + needle.len()..]);
     Some(out)
+}
+
+fn split_loop_metadata(line: &str) -> (String, String) {
+    if let Some(pos) = line.find(", !llvm.loop") {
+        (line[..pos].to_string(), line[pos..].to_string())
+    } else {
+        (line.to_string(), String::new())
+    }
 }
 
 /// Rename a phi's predecessor block `%<from>` → `%<to>`. The predecessor is the token immediately
@@ -888,6 +1546,42 @@ exit:
     }
 
     #[test]
+    fn loop_metadata_backedge_is_guarded_in_place() {
+        let ll = "\
+define void @counted(ptr addrspace(1) %0) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, 1000
+  br i1 %done, label %exit, label %loop, !llvm.loop !0
+exit:
+  ret void
+}
+
+!0 = distinct !{!0}
+";
+        let out = instrumented(ll, "counted");
+        assert!(
+            !out.contains("m2v.g.0:"),
+            "metadata-bearing loop should not gain a synthetic back-edge predecessor:\n{out}"
+        );
+        assert!(
+            out.contains("  %m2v.0.ex = icmp sle i32 %m2v.0.b, 0"),
+            "budget exhaustion check missing:\n{out}"
+        );
+        assert!(
+            out.contains("  %m2v.0.leave = or i1 %done, %m2v.0.ex"),
+            "budget condition not composed with original exit condition:\n{out}"
+        );
+        assert!(
+            out.contains("br i1 %m2v.0.leave, label %exit, label %loop, !llvm.loop !0"),
+            "loop metadata back-edge should remain on the real header branch:\n{out}"
+        );
+    }
+
+    #[test]
     fn nested_loops_guard_every_back_edge() {
         let ll = "\
 define void @nested(ptr addrspace(1) %0) {
@@ -920,6 +1614,219 @@ exit:
         match classify_and_instrument(ll, "sw") {
             GuardPlan::Quarantine(_) => {}
             other => panic!("expected Quarantine for switch back-edge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_with_workgroup_barrier_is_quarantined() {
+        let ll = "\
+define void @barrier_loop(ptr addrspace(1) %0) {
+  br label %loop
+loop:
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br label %loop
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        match classify_and_instrument(ll, "barrier_loop") {
+            GuardPlan::Quarantine(msg) => assert!(msg.contains("air.wg.barrier"), "{msg}"),
+            other => panic!("expected Quarantine for barrier loop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_counted_barrier_loop_is_left_unguarded() {
+        let ll = "\
+define void @barrier_counted(ptr addrspace(1) %0) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %n, %loop ]
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %n = add i32 %i, 1
+  %done = icmp eq i32 %n, 4
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        match classify_and_instrument(ll, "barrier_counted") {
+            GuardPlan::LoopFree => {}
+            other => panic!("expected small barrier loop to be treated as bounded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_symbolic_barrier_loop_is_left_unguarded() {
+        let ll = "\
+define void @barrier_prefix(ptr addrspace(1) %0, i32 %base) {
+entry:
+  br label %setup
+setup:
+  %start = or i32 %base, 1
+  %limit = or i32 %base, 31
+  br label %loop
+loop:
+  %i = phi i32 [ %start, %setup ], [ %next, %loop ]
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %next = add nuw i32 %i, 1
+  %done = icmp eq i32 %i, %limit
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        match classify_and_instrument(ll, "barrier_prefix") {
+            GuardPlan::LoopFree => {}
+            other => {
+                panic!("expected symbolic barrier loop to be treated as bounded, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn barrier_before_loop_is_still_instrumented() {
+        let ll = "\
+define void @barrier_before_loop(ptr addrspace(1) %0) {
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br label %loop
+loop:
+  br label %loop
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        let out = instrumented(ll, "barrier_before_loop");
+        assert!(out.contains("m2v.g.0:"), "loop guard missing:\n{out}");
+    }
+
+    #[test]
+    fn small_fixed_trip_loops_are_left_unguarded() {
+        let ll = "\
+define void @fixed(ptr addrspace(1) %0) {
+entry:
+  br label %two
+two:
+  %b = phi i1 [ true, %entry ], [ false, %two ]
+  br i1 %b, label %two, label %count
+count:
+  %i = phi i32 [ 0, %two ], [ %n, %count ]
+  %p = inttoptr i64 0 to ptr addrspace(3)
+  %old = call i32 @air.atomic.local.add.u.i32(ptr addrspace(3) %p, i32 1, i32 0, i32 1, i1 true)
+  %n = add i32 %i, 1
+  %done = icmp eq i32 %n, 4
+  br i1 %done, label %exit, label %count
+exit:
+  ret void
+}
+
+declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
+";
+        match classify_and_instrument(ll, "fixed") {
+            GuardPlan::LoopFree => {}
+            other => panic!("expected fixed loops to be treated as bounded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_workgroup_symbolic_loops_are_left_unguarded() {
+        let ll = "\
+define void @prefix(ptr addrspace(3) %shared, i32 %base) {
+entry:
+  br label %up
+up:
+  %start = or i32 %base, 1
+  %limit = or i32 %base, 31
+  br label %loop
+loop:
+  %i = phi i32 [ %start, %up ], [ %next, %loop ]
+  %p = getelementptr inbounds i32, ptr addrspace(3) %shared, i32 %i
+  %v = load i32, ptr addrspace(3) %p, align 4
+  store i32 %v, ptr addrspace(3) %p, align 4
+  %next = add nuw i32 %i, 1
+  %done = icmp eq i32 %i, %limit
+  br i1 %done, label %down, label %loop
+down:
+  br label %down_loop
+down_loop:
+  %j = phi i32 [ %limit, %down ], [ %prev, %down_loop ]
+  %prev = add nsw i32 %j, -1
+  %q = getelementptr inbounds i32, ptr addrspace(3) %shared, i32 %prev
+  %w = load i32, ptr addrspace(3) %q, align 4
+  store i32 %w, ptr addrspace(3) %q, align 4
+  %keep = icmp ugt i32 %prev, %base
+  br i1 %keep, label %down_loop, label %exit
+exit:
+  ret void
+}
+";
+        match classify_and_instrument(ll, "prefix") {
+            GuardPlan::LoopFree => {}
+            other => panic!("expected symbolic workgroup loops to be bounded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_stride_barrier_loop_is_left_unguarded() {
+        let ll = "\
+define void @radix(ptr addrspace(3) %shared, i32 %base) {
+entry:
+  %limit = add i32 %base, 8
+  br label %loop
+loop:
+  %i = phi i32 [ %base, %entry ], [ %next, %loop ]
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %p = getelementptr inbounds i32, ptr addrspace(3) %shared, i32 %i
+  store i32 %i, ptr addrspace(3) %p, align 4
+  %next = add nuw i32 %i, 2
+  %keep = icmp ult i32 %next, %limit
+  br i1 %keep, label %loop, label %exit
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        match classify_and_instrument(ll, "radix") {
+            GuardPlan::LoopFree => {}
+            other => panic!("expected stride barrier loop to be bounded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_shift_barrier_loops_are_left_unguarded() {
+        let ll = "\
+define void @scan(ptr addrspace(3) %shared) {
+entry:
+  br label %up
+up:
+  %i = phi i32 [ 2, %entry ], [ %next, %up ]
+  %next = shl nuw nsw i32 %i, 1
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %more = icmp ult i32 %i, 512
+  br i1 %more, label %up, label %down
+down:
+  br label %down_loop
+down_loop:
+  %j = phi i32 [ 512, %down ], [ %prev, %down_loop ]
+  %prev = lshr i32 %j, 1
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %done = icmp ult i32 %j, 2
+  br i1 %done, label %exit, label %down_loop
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        match classify_and_instrument(ll, "scan") {
+            GuardPlan::LoopFree => {}
+            other => panic!("expected shift barrier loops to be bounded, got {other:?}"),
         }
     }
 
@@ -999,6 +1906,32 @@ define void @spin(i32 addrspace(1)* %0) {
         assert!(
             !out.contains("load i32, ptr %m2v.bd"),
             "unexpected opaque load:\n{out}"
+        );
+    }
+
+    #[test]
+    fn air64_opaque_module_without_pointer_operands_uses_opaque_budget_pointer() {
+        let ll = "\
+target triple = \"air64_v28-apple-macosx26.5.0\"
+
+define <4 x i32> @frag(<4 x float> %0) {
+  br label %1
+1:
+  br label %1
+}
+";
+        let out = instrumented(ll, "frag");
+        assert!(
+            out.contains(&format!("store i32 {LOOP_BUDGET_BACKEDGES}, ptr %m2v.bd")),
+            "expected opaque budget store:\n{out}"
+        );
+        assert!(
+            out.contains("load i32, ptr %m2v.bd"),
+            "expected opaque budget load:\n{out}"
+        );
+        assert!(
+            !out.contains("i32* %m2v.bd"),
+            "unexpected typed budget pointer:\n{out}"
         );
     }
 

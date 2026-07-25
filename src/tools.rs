@@ -194,6 +194,15 @@ pub fn air_to_sanitized_ll_with_datalayout(
         text?
     };
 
+    Ok(sanitize_ll_text_with_datalayout(&ll_text))
+}
+
+/// Sanitize LLVM IR text that is already in `.ll` form.
+///
+/// This is the text-only core used by [`air_to_sanitized_ll_with_datalayout`]: rewrite the target
+/// triple to Vulkan, drop the AIR datalayout, and remove LLVM metadata/runtime root globals that are
+/// not part of the shader entry body.
+pub fn sanitize_ll_text_with_datalayout(ll_text: &str) -> (String, Option<String>) {
     let mut out = String::with_capacity(ll_text.len());
     let mut datalayout = None;
     for line in ll_text.lines() {
@@ -216,7 +225,7 @@ pub fn air_to_sanitized_ll_with_datalayout(
         out.push_str(line);
         out.push('\n');
     }
-    Ok((out, datalayout))
+    (out, datalayout)
 }
 
 /// The quoted value of a `target datalayout = "..."` line.
@@ -343,6 +352,21 @@ pub(crate) fn llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
     buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
     native::emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
+        san_ll,
+        kern,
+        entry_name,
+        buffer_layouts,
+    )
+}
+
+pub(crate) fn llc_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
+    san_ll: &str,
+    _tmp: &Path,
+    kern: Option<&crate::meta::KernMeta>,
+    entry_name: Option<&str>,
+    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
+    native::emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
         san_ll,
         kern,
         entry_name,
@@ -510,6 +534,24 @@ mod tests {
             san
         );
         std::fs::remove_file(&src).ok();
+    }
+
+    #[test]
+    fn text_sanitizer_matches_file_sanitizer_rules() {
+        let (san, datalayout) = sanitize_ll_text_with_datalayout(
+            "target datalayout = \"e-p:64:64\"\n\
+             target triple = \"air64-apple-ios\"\n\
+             @llvm.global_ctors = appending global [0 x { i32, ptr, ptr }] []\n\
+             @llvm.compiler.used = appending global [0 x ptr] [], section \"llvm.metadata\"\n\
+             define void @k() {\n  ret void\n}\n",
+        );
+
+        assert_eq!(datalayout.as_deref(), Some("e-p:64:64"));
+        assert!(san.contains(&format!("target triple = \"{VULKAN_TRIPLE}\"")));
+        assert!(!san.contains("target datalayout"));
+        assert!(!san.contains("@llvm.global_ctors"));
+        assert!(!san.contains("@llvm.compiler.used"));
+        assert!(san.contains("define void @k()"));
     }
 
     #[test]

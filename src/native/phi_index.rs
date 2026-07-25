@@ -216,6 +216,25 @@ pub(super) fn rewrite_integer_width_phis(module: &mut Module) -> bool {
     any
 }
 
+struct SelectInductionPlan {
+    block: usize,
+    phi_result: Word,
+    ptr_ty: Word,
+    base: Word,
+    chain_opcode: Op,
+    prefix_indices: Vec<Word>,
+    init_index: Word,
+    init_pred: Word,
+    index_ty: Word,
+    select_id: Word,
+    select_block: usize,
+    cond: Word,
+    advanced_on_true: bool,
+    step: Word,
+    advanced_ptr: Word,
+    back_pred: Word,
+}
+
 fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: bool) -> bool {
     // type-id -> OpTypePointer storage class, and the set of module-scope OpVariable ids (a legal,
     // everything-dominating access-chain base).
@@ -265,15 +284,27 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
                 }
             }
         }
-        // value-id -> defining instruction + result type, across the whole function.
+        // value-id -> defining instruction + result type/block, across the whole function.
         let mut value_def: HashMap<Word, Instruction> = HashMap::new();
         let mut value_type: HashMap<Word, Word> = HashMap::new();
-        for block in &function.blocks {
+        let mut value_block: HashMap<Word, usize> = HashMap::new();
+        for (bi, block) in function.blocks.iter().enumerate() {
             for inst in &block.instructions {
                 if let Some(rid) = inst.result_id {
                     value_def.insert(rid, inst.clone());
+                    value_block.insert(rid, bi);
                     if let Some(rty) = inst.result_type {
                         value_type.insert(rid, rty);
+                    }
+                }
+            }
+        }
+        let mut use_count: HashMap<Word, usize> = HashMap::new();
+        for block in &function.blocks {
+            for inst in &block.instructions {
+                for op in &inst.operands {
+                    if let Operand::IdRef(id) = op {
+                        *use_count.entry(*id).or_default() += 1;
                     }
                 }
             }
@@ -285,6 +316,17 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
                 .copied()
                 .or_else(|| type_defs.get(&id).and_then(|i| i.result_type))
         };
+        let zero_by_type: HashMap<Word, Word> = type_defs
+            .iter()
+            .filter_map(|(&id, inst)| {
+                let ty = inst.result_type?;
+                is_zero_int_constant(&type_defs, inst).then_some((ty, id))
+            })
+            .collect();
+        let zero_ids: std::collections::HashSet<Word> = type_defs
+            .iter()
+            .filter_map(|(&id, inst)| is_zero_int_constant(&type_defs, inst).then_some(id))
+            .collect();
 
         // Plan rewrites first (immutable scan), then mutate the blocks.
         // Per index position: either reuse a single operand all arms share (REQUIRED for struct member
@@ -303,6 +345,7 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
             index_srcs: Vec<IndexSrc>,
         }
         let mut plans: Vec<Plan> = Vec::new();
+        let mut induction_plans: Vec<SelectInductionPlan> = Vec::new();
 
         for (bi, block) in function.blocks.iter().enumerate() {
             for inst in &block.instructions {
@@ -337,6 +380,24 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
                     .collect();
                 if arms.len() < 2 || arms.len() * 2 != inst.operands.len() {
                     continue;
+                }
+                if arms.len() == 2 {
+                    if let Some(plan) = select_induction_plan(
+                        bi,
+                        phi_result,
+                        ptr_ty,
+                        &arms,
+                        &value_def,
+                        &value_block,
+                        &use_count,
+                        &eligible_bases,
+                        &const_type,
+                        &zero_by_type,
+                        &zero_ids,
+                    ) {
+                        induction_plans.push(plan);
+                        continue;
+                    }
                 }
                 // Every arm must be an (In)BoundsAccessChain into the SAME global-var base with equal
                 // arity.
@@ -427,13 +488,108 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
             }
         }
 
-        if plans.is_empty() {
+        if plans.is_empty() && induction_plans.is_empty() {
             continue;
+        }
+
+        let mut remap: HashMap<Word, Word> = HashMap::new();
+        let mut remove_results: std::collections::HashSet<Word> = Default::default();
+
+        // Apply select-fed pointer inductions first: `%p = phi(base, select(cond, gep(%p, step), %p))`
+        // becomes an integer-index phi plus a rematerialized access chain from the stable base.
+        for plan in &induction_plans {
+            let index_phi_id = fresh();
+            let next_sum_id = fresh();
+            let next_index_id = fresh();
+            let new_ptr_id = fresh();
+
+            let block = &mut function.blocks[plan.block];
+            block
+                .instructions
+                .retain(|i| i.result_id != Some(plan.phi_result));
+            let phi_insert = block
+                .instructions
+                .iter()
+                .position(|i| i.class.opcode != Op::Phi)
+                .unwrap_or(block.instructions.len());
+            block.instructions.insert(
+                phi_insert,
+                Instruction::new(
+                    Op::Phi,
+                    Some(plan.index_ty),
+                    Some(index_phi_id),
+                    vec![
+                        Operand::IdRef(plan.init_index),
+                        Operand::IdRef(plan.init_pred),
+                        Operand::IdRef(next_index_id),
+                        Operand::IdRef(plan.back_pred),
+                    ],
+                ),
+            );
+            let mut chain_args: Vec<Operand> = Vec::with_capacity(2 + plan.prefix_indices.len());
+            chain_args.push(Operand::IdRef(plan.base));
+            chain_args.extend(plan.prefix_indices.iter().copied().map(Operand::IdRef));
+            chain_args.push(Operand::IdRef(index_phi_id));
+            let after_phis = block
+                .instructions
+                .iter()
+                .position(|i| i.class.opcode != Op::Phi)
+                .unwrap_or(block.instructions.len());
+            block.instructions.insert(
+                after_phis,
+                Instruction::new(
+                    plan.chain_opcode,
+                    Some(plan.ptr_ty),
+                    Some(new_ptr_id),
+                    chain_args,
+                ),
+            );
+
+            let select_block = &mut function.blocks[plan.select_block];
+            if let Some(select_pos) = select_block
+                .instructions
+                .iter()
+                .position(|i| i.result_id == Some(plan.select_id))
+            {
+                select_block.instructions.insert(
+                    select_pos,
+                    Instruction::new(
+                        Op::IAdd,
+                        Some(plan.index_ty),
+                        Some(next_sum_id),
+                        vec![Operand::IdRef(index_phi_id), Operand::IdRef(plan.step)],
+                    ),
+                );
+                let (true_value, false_value) = if plan.advanced_on_true {
+                    (next_sum_id, index_phi_id)
+                } else {
+                    (index_phi_id, next_sum_id)
+                };
+                select_block.instructions.insert(
+                    select_pos + 1,
+                    Instruction::new(
+                        Op::Select,
+                        Some(plan.index_ty),
+                        Some(next_index_id),
+                        vec![
+                            Operand::IdRef(plan.cond),
+                            Operand::IdRef(true_value),
+                            Operand::IdRef(false_value),
+                        ],
+                    ),
+                );
+            }
+
+            remap.insert(plan.phi_result, new_ptr_id);
+            remove_results.insert(plan.select_id);
+            if use_count.get(&plan.advanced_ptr).copied().unwrap_or(0) == 1 {
+                remove_results.insert(plan.advanced_ptr);
+            }
+            any = true;
         }
 
         // Apply: for each plan synthesize index phis + a rematerialized access chain, splice into the
         // block, and remap the old phi result to the new access chain.
-        let mut remap: HashMap<Word, Word> = HashMap::new();
         for plan in &plans {
             let block = &mut function.blocks[plan.block];
             let mut new_phis: Vec<Instruction> = Vec::new();
@@ -498,6 +654,14 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
                 }
             }
         }
+
+        if !remove_results.is_empty() {
+            for block in &mut function.blocks {
+                block
+                    .instructions
+                    .retain(|i| i.result_id.is_none_or(|id| !remove_results.contains(&id)));
+            }
+        }
     }
 
     if any {
@@ -506,6 +670,137 @@ fn rewrite_pointer_phis(module: &mut Module, include_variable_pointer_classes: b
         }
     }
     any
+}
+
+fn select_induction_plan<F>(
+    block: usize,
+    phi_result: Word,
+    ptr_ty: Word,
+    arms: &[(Word, Word)],
+    value_def: &HashMap<Word, Instruction>,
+    value_block: &HashMap<Word, usize>,
+    use_count: &HashMap<Word, usize>,
+    eligible_bases: &std::collections::HashSet<Word>,
+    const_type: &F,
+    zero_by_type: &HashMap<Word, Word>,
+    zero_ids: &std::collections::HashSet<Word>,
+) -> Option<SelectInductionPlan>
+where
+    F: Fn(Word) -> Option<Word>,
+{
+    let mut base_arm: Option<(&Instruction, Word)> = None;
+    let mut select_arm: Option<(&Instruction, Word)> = None;
+    for (value, pred) in arms {
+        let def = value_def.get(value)?;
+        if matches!(def.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
+            base_arm = Some((def, *pred));
+        } else if def.class.opcode == Op::Select && def.result_type == Some(ptr_ty) {
+            select_arm = Some((def, *pred));
+        } else {
+            return None;
+        }
+    }
+
+    let (base_def, init_pred) = base_arm?;
+    let (select_def, back_pred) = select_arm?;
+    let select_id = select_def.result_id?;
+    if use_count.get(&select_id).copied().unwrap_or(0) != 1 {
+        return None;
+    }
+
+    let Operand::IdRef(base) = base_def.operands.first()? else {
+        return None;
+    };
+    if !eligible_bases.contains(base) || base_def.operands.len() < 2 {
+        return None;
+    }
+    let mut base_indices = Vec::with_capacity(base_def.operands.len() - 1);
+    for operand in &base_def.operands[1..] {
+        let Operand::IdRef(index) = operand else {
+            return None;
+        };
+        base_indices.push(*index);
+    }
+    let init_index = *base_indices.last()?;
+    let prefix_indices = base_indices[..base_indices.len() - 1].to_vec();
+
+    let [Operand::IdRef(cond), Operand::IdRef(true_value), Operand::IdRef(false_value)] =
+        select_def.operands.as_slice()
+    else {
+        return None;
+    };
+    let (advanced_ptr, advanced_on_true) = if *true_value == phi_result {
+        (*false_value, false)
+    } else if *false_value == phi_result {
+        (*true_value, true)
+    } else {
+        return None;
+    };
+    let advanced_def = value_def.get(&advanced_ptr)?;
+    if !matches!(
+        advanced_def.class.opcode,
+        Op::PtrAccessChain | Op::InBoundsPtrAccessChain
+    ) || advanced_def.result_type != Some(ptr_ty)
+    {
+        return None;
+    }
+    let [Operand::IdRef(advanced_base), Operand::IdRef(step)] = advanced_def.operands.as_slice()
+    else {
+        return None;
+    };
+    if *advanced_base != phi_result {
+        return None;
+    }
+    let step_ty = const_type(*step)?;
+    let init_ty = const_type(init_index)?;
+    let init_index = if init_ty == step_ty {
+        init_index
+    } else if zero_ids.contains(&init_index) {
+        *zero_by_type.get(&step_ty)?
+    } else {
+        return None;
+    };
+    let index_ty = step_ty;
+    let select_block = *value_block.get(&select_id)?;
+
+    Some(SelectInductionPlan {
+        block,
+        phi_result,
+        ptr_ty,
+        base: *base,
+        chain_opcode: base_def.class.opcode,
+        prefix_indices,
+        init_index,
+        init_pred,
+        index_ty,
+        select_id,
+        select_block,
+        cond: *cond,
+        advanced_on_true,
+        step: *step,
+        advanced_ptr,
+        back_pred,
+    })
+}
+
+fn is_zero_int_constant(defs: &HashMap<Word, Instruction>, inst: &Instruction) -> bool {
+    if let Some(ty) = inst.result_type {
+        if !defs.is_empty()
+            && defs
+                .get(&ty)
+                .is_none_or(|ty_inst| ty_inst.class.opcode != Op::TypeInt)
+        {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    matches!(
+        (inst.class.opcode, inst.operands.as_slice()),
+        (Op::ConstantNull, [])
+            | (Op::Constant, [Operand::LiteralBit32(0)])
+            | (Op::Constant, [Operand::LiteralBit64(0)])
+    )
 }
 
 #[cfg(test)]
@@ -754,5 +1049,196 @@ mod tests {
             .find(|i| i.class.opcode == Op::Load)
             .unwrap();
         assert_eq!(load.operands[0], Operand::IdRef(chain.result_id.unwrap()));
+    }
+
+    #[test]
+    fn rewrites_storage_buffer_select_induction_phi_to_index_phi() {
+        // `%p = phi [base, entry], [select(cond, gep(%p, step), %p), latch]` is legal with
+        // VariablePointersStorageBuffer, but it can be represented without pointer SSA merges by
+        // phi'ing the trailing array index and rematerializing one access chain from the root buffer.
+        let uint = 1;
+        let block_ty = 2;
+        let ptr_block = 3;
+        let ptr_uint = 4;
+        let zero = 10;
+        let one = 11;
+        let cond = 12;
+        let buffer = 20;
+        let base = 21;
+        let ptr_phi = 22;
+        let advanced = 23;
+        let selected = 24;
+        let loaded = 25;
+        let entry_label = 30;
+        let loop_label = 31;
+        let latch_label = 32;
+        let mut m = Module::new();
+        m.header = Some(ModuleHeader::new(40));
+        m.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(uint),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(uint),
+                Some(zero),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(uint),
+                Some(one),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(
+                Op::TypeRuntimeArray,
+                None,
+                Some(9),
+                vec![Operand::IdRef(uint)],
+            ),
+            inst(
+                Op::TypeStruct,
+                None,
+                Some(block_ty),
+                vec![Operand::IdRef(9)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(ptr_block),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(block_ty),
+                ],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(ptr_uint),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(uint),
+                ],
+            ),
+            inst(
+                Op::Variable,
+                Some(ptr_block),
+                Some(buffer),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+        ];
+        let entry = Block {
+            label: Some(inst(Op::Label, None, Some(entry_label), vec![])),
+            instructions: vec![inst(
+                Op::AccessChain,
+                Some(ptr_uint),
+                Some(base),
+                vec![
+                    Operand::IdRef(buffer),
+                    Operand::IdRef(zero),
+                    Operand::IdRef(zero),
+                ],
+            )],
+        };
+        let loop_block = Block {
+            label: Some(inst(Op::Label, None, Some(loop_label), vec![])),
+            instructions: vec![
+                inst(
+                    Op::Phi,
+                    Some(ptr_uint),
+                    Some(ptr_phi),
+                    vec![
+                        Operand::IdRef(base),
+                        Operand::IdRef(entry_label),
+                        Operand::IdRef(selected),
+                        Operand::IdRef(latch_label),
+                    ],
+                ),
+                inst(
+                    Op::PtrAccessChain,
+                    Some(ptr_uint),
+                    Some(advanced),
+                    vec![Operand::IdRef(ptr_phi), Operand::IdRef(one)],
+                ),
+                inst(
+                    Op::Select,
+                    Some(ptr_uint),
+                    Some(selected),
+                    vec![
+                        Operand::IdRef(cond),
+                        Operand::IdRef(advanced),
+                        Operand::IdRef(ptr_phi),
+                    ],
+                ),
+                inst(
+                    Op::Load,
+                    Some(uint),
+                    Some(loaded),
+                    vec![Operand::IdRef(ptr_phi)],
+                ),
+            ],
+        };
+        let latch = Block {
+            label: Some(inst(Op::Label, None, Some(latch_label), vec![])),
+            instructions: vec![],
+        };
+        let mut func = Function::new();
+        func.blocks = vec![entry, loop_block, latch];
+        m.functions = vec![func];
+
+        assert!(rewrite_variable_pointer_phis(&mut m));
+
+        let loop_block = &m.functions[0].blocks[1];
+        assert!(
+            !loop_block
+                .instructions
+                .iter()
+                .any(|i| i.class.opcode == Op::Phi && i.result_type == Some(ptr_uint)),
+            "pointer phi should be removed: {loop_block:?}"
+        );
+        assert!(
+            !loop_block
+                .instructions
+                .iter()
+                .any(|i| i.class.opcode == Op::Select && i.result_type == Some(ptr_uint)),
+            "pointer select should be removed: {loop_block:?}"
+        );
+        let index_phi = loop_block
+            .instructions
+            .iter()
+            .find(|i| i.class.opcode == Op::Phi && i.result_type == Some(uint))
+            .expect("index phi");
+        let next_index = match index_phi.operands[2] {
+            Operand::IdRef(id) => id,
+            ref other => panic!("backedge index should be an id ref, got {other:?}"),
+        };
+        assert_eq!(index_phi.operands[0], Operand::IdRef(zero));
+        assert_eq!(index_phi.operands[1], Operand::IdRef(entry_label));
+        assert_eq!(index_phi.operands[3], Operand::IdRef(latch_label));
+        let index_select = loop_block
+            .instructions
+            .iter()
+            .find(|i| i.result_id == Some(next_index))
+            .expect("next-index select");
+        assert_eq!(index_select.class.opcode, Op::Select);
+        assert_eq!(index_select.result_type, Some(uint));
+        let remat = loop_block
+            .instructions
+            .iter()
+            .find(|i| {
+                matches!(i.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                    && i.result_type == Some(ptr_uint)
+                    && i.result_id != Some(base)
+            })
+            .expect("rematerialized pointer");
+        let load = loop_block
+            .instructions
+            .iter()
+            .find(|i| i.result_id == Some(loaded))
+            .expect("load");
+        assert_eq!(load.operands[0], Operand::IdRef(remat.result_id.unwrap()));
     }
 }

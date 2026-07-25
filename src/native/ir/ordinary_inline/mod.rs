@@ -54,8 +54,8 @@ fn is_literal(value: &LlValue) -> bool {
     }
 }
 
-/// Admit one closed mechanism class: a typed helper with no alloca and no bodied or indirect
-/// callee. Body opcode, signature, arity, block count, and return-value shape are irrelevant.
+/// Admit one closed mechanism class: a one-block typed helper with no alloca and no bodied or
+/// indirect callee. Body opcode, signature, arity, and return-value shape are irrelevant.
 fn eligible_ordinary_helper(
     function: &LlFunction,
     bodied_functions: &HashSet<String>,
@@ -65,7 +65,7 @@ fn eligible_ordinary_helper(
         .iter()
         .map(|block| block.typed.as_ref())
         .collect::<Option<Vec<_>>>()?;
-    if blocks.is_empty()
+    if blocks.len() != 1
         || blocks.iter().any(|block| {
             block.insts.iter().any(|instruction| {
                 instruction.opcode == "alloca"

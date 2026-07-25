@@ -624,6 +624,7 @@ pub(in crate::passes) fn cube_fetch_as_center_sample(
     color: Word,
     sampler_arg: Option<Word>,
 ) -> Result<(), String> {
+    let img = load_image_if_pointer(ctx, img, out);
     let float = ctx.ty_float();
     let v3f = ctx.ty_vecf(3);
     // Integer texel coord -> uint32 x,y.
@@ -784,7 +785,9 @@ pub(in crate::passes) fn cube_fetch_as_center_sample(
             loaded
         }
     };
-    let img_ty = value_result_type(ctx, img).ok_or("air.read_texture cube image has no type")?;
+    let (fallback_dim, fallback_arrayed, fallback_comp) = image_shape_or_recorded(ctx, img);
+    let (img_ty, _, _, _) =
+        sampled_operand_image_info(ctx, img, fallback_dim, fallback_arrayed, fallback_comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
     let si = ctx.module.fresh_id();
     out.push(Instruction::new(

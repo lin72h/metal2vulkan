@@ -86,6 +86,7 @@ pub(super) struct Emitter {
     pointer_payload_values: HashSet<String>,
     pointer_phi_values: HashSet<String>,
     pointer_phi_incoming_values: HashSet<String>,
+    tir_phi_incomings: HashMap<String, Vec<(LlValue, String)>>,
     function_param_pointees: HashMap<(String, usize), LlType>,
     function_param_nonnull: HashSet<(String, usize)>,
     direct_param_values: HashSet<String>,
@@ -188,13 +189,13 @@ pub(super) struct Emitter {
     /// it only after the primary module fails CFG validation and adopts only a validating module.
     construct_tree: bool,
     /// When true, `emit_function` SKIPS the structured-plan attempt entirely — even for a function
-    /// `structured_plan` WOULD admit — emitting the blocks with their inferred merges but no
-    /// structuring. The result is an UNSTRUCTURED (spirv-val-illegal) but complete module whose only
-    /// consumer is the W2 relooper, which strips the stale merges and rebuilds a structured CFG from
-    /// scratch. (The DEFAULT path already emits a *reject* unstructured since the W4 repair-roster
-    /// deletion; this flag forces the same for an admitting function, so a guaranteed-unstructured
-    /// complete module always exists to reloop.) Set via [`with_relooper_feed`]; never on the
-    /// production path (the caller adopts only the relooper's validating output).
+    /// `structured_plan` WOULD admit — emitting the raw blocks without branch/loop inferred merge
+    /// hints or structuring. Switches still need a merge target to encode `OpSwitch`; the W2 relooper
+    /// strips that stale hint and rebuilds a structured CFG from scratch. (The DEFAULT path already
+    /// emits a *reject* unstructured since the W4 repair-roster deletion; this flag forces the same for
+    /// an admitting function, so a guaranteed-unstructured complete module always exists to reloop.)
+    /// Set via [`with_relooper_feed`]; never on the production path (the caller adopts only the
+    /// relooper's validating output).
     relooper_feed: bool,
     /// M1 storage-carrier measurement: when set, `emit_function` snapshots its final per-value
     /// `pointer_storage` map (the emitter's stateful storage derivation) into `storage_snapshots`,
@@ -427,6 +428,7 @@ impl Emitter {
             pointer_payload_values: HashSet::new(),
             pointer_phi_values: HashSet::new(),
             pointer_phi_incoming_values: HashSet::new(),
+            tir_phi_incomings: HashMap::new(),
             function_param_pointees: HashMap::new(),
             function_param_nonnull: HashSet::new(),
             direct_param_values: HashSet::new(),
@@ -629,6 +631,13 @@ impl Emitter {
         function: &LlFunction,
     ) -> Result<HashSet<String>, String> {
         let mut nonnull = HashSet::new();
+        if self.ir.entry_functions.contains(&function.name) {
+            for (param, ty) in &function.params {
+                if matches!(self.resolve_type(ty)?, LlType::Ptr(_)) {
+                    nonnull.insert(param.clone());
+                }
+            }
+        }
         for inst in function.carrier_insts() {
             if inst.opcode == "alloca" {
                 if let Some(name) = &inst.result {

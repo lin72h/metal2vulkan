@@ -104,6 +104,8 @@ pub(in crate::passes) fn lower_write(
         }
     };
 
+    let texel32 = preserve_defined_texel_lanes(ctx, &mut out, img, coord32, texel, texel32);
+
     out.push(Instruction::new(
         Op::ImageWrite,
         None,
@@ -115,6 +117,131 @@ pub(in crate::passes) fn lower_write(
         ],
     ));
     Ok(out)
+}
+
+fn preserve_defined_texel_lanes(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    img: Word,
+    coord32: Word,
+    source_texel: Word,
+    write_texel: Word,
+) -> Word {
+    let undefined = (0..4)
+        .map(|lane| texel_lane_is_statically_undef(ctx, out, source_texel, lane))
+        .collect::<Vec<_>>();
+    if undefined.iter().all(|is_undef| !*is_undef) {
+        return write_texel;
+    }
+
+    let Some(write_ty) = pending_or_module_result_type(ctx, out, write_texel) else {
+        return write_texel;
+    };
+    let lane_ty = element_type(ctx, write_ty);
+    let current = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ImageRead,
+        Some(write_ty),
+        Some(current),
+        vec![Operand::IdRef(img), Operand::IdRef(coord32)],
+    ));
+
+    let mut merged = current;
+    for (lane, is_undef) in undefined.into_iter().enumerate() {
+        if is_undef {
+            continue;
+        }
+        let lane_value = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::CompositeExtract,
+            Some(lane_ty),
+            Some(lane_value),
+            vec![
+                Operand::IdRef(write_texel),
+                Operand::LiteralBit32(lane as u32),
+            ],
+        ));
+        let next = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::CompositeInsert,
+            Some(write_ty),
+            Some(next),
+            vec![
+                Operand::IdRef(lane_value),
+                Operand::IdRef(merged),
+                Operand::LiteralBit32(lane as u32),
+            ],
+        ));
+        merged = next;
+    }
+    merged
+}
+
+fn pending_or_module_result_type(ctx: &Ctx, pending: &[Instruction], value: Word) -> Option<Word> {
+    pending
+        .iter()
+        .rev()
+        .find(|inst| inst.result_id == Some(value))
+        .and_then(|inst| inst.result_type)
+        .or_else(|| value_result_type(ctx, value))
+}
+
+fn texel_lane_is_statically_undef(
+    ctx: &Ctx,
+    pending: &[Instruction],
+    value: Word,
+    lane: usize,
+) -> bool {
+    let Some(inst) = pending
+        .iter()
+        .rev()
+        .find(|inst| inst.result_id == Some(value))
+        .or_else(|| value_inst(ctx, value))
+    else {
+        return false;
+    };
+    match inst.class.opcode {
+        Op::Undef => true,
+        Op::CompositeConstruct => inst
+            .operands
+            .get(lane)
+            .and_then(|operand| match operand {
+                Operand::IdRef(id) => Some(texel_lane_is_statically_undef(ctx, pending, *id, 0)),
+                _ => None,
+            })
+            .unwrap_or(false),
+        Op::CompositeInsert => {
+            let inserted = inst.operands.first().and_then(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            });
+            let base = inst.operands.get(1).and_then(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            });
+            let target_lane = inst.operands.get(2).and_then(|operand| match operand {
+                Operand::LiteralBit32(index) => Some(*index as usize),
+                _ => None,
+            });
+            if target_lane == Some(lane) {
+                inserted
+                    .map(|id| texel_lane_is_statically_undef(ctx, pending, id, 0))
+                    .unwrap_or(false)
+            } else {
+                base.map(|id| texel_lane_is_statically_undef(ctx, pending, id, lane))
+                    .unwrap_or(false)
+            }
+        }
+        Op::CopyObject | Op::UConvert | Op::SConvert | Op::FConvert | Op::Bitcast => inst
+            .operands
+            .first()
+            .and_then(|operand| match operand {
+                Operand::IdRef(id) => Some(texel_lane_is_statically_undef(ctx, pending, *id, lane)),
+                _ => None,
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 /// Lower `air.read_texture_<dim>.<ret>`: a sampler-less texel read by integer coordinate (Metal's

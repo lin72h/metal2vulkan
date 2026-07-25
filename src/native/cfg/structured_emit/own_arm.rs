@@ -23,6 +23,7 @@ const FINAL: &str = "%metal2vulkan.ct.oa.final";
 const OUTER_PC: &str = "%metal2vulkan.ct.oa.outer.pc";
 const INNER_PC: &str = "%metal2vulkan.ct.oa.inner.pc";
 const COMMON_PC: &str = "%metal2vulkan.ct.oa.common.pc";
+const OWN_ARM_MAX_BLOCKS: usize = 300;
 
 #[derive(Clone, Debug)]
 struct Witness {
@@ -676,6 +677,9 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
 pub(in crate::native) fn renest_cond_phi_shared_own_arm(
     blocks: &[BodyBlock],
 ) -> Result<Option<Vec<BodyBlock>>, String> {
+    if blocks.len() > OWN_ARM_MAX_BLOCKS {
+        return Ok(None);
+    }
     if structured_reject_reason(blocks).as_deref() != Some("selection:cond-phi-shared/own-arm") {
         return Ok(None);
     }
@@ -769,5 +773,18 @@ mod tests {
             .blocks
             .iter()
             .any(|block| block.name == "%metal2vulkan.ct.oa.common"));
+    }
+
+    #[test]
+    fn r2_own_arm_large_input_declines_before_witness_derivation() {
+        let mut source = lazy_own_arm_loop();
+        while source.len() <= OWN_ARM_MAX_BLOCKS {
+            let name = format!("%pad{}", source.len());
+            source.push(bb(&name, &["ret void"]));
+        }
+
+        assert!(renest_cond_phi_shared_own_arm(&source)
+            .expect("large own-arm gate")
+            .is_none());
     }
 }

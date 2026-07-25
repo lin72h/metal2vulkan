@@ -40,7 +40,7 @@ pub(super) use structured_emit::{
     cond_other_witness_lines, cond_phi_shared_witness_lines, construct_tree_gate_witness_lines,
     construct_tree_reject_reason, renest_cond_phi_shared_own_arm, renest_straddle_loop_merge,
     restructure_straddle_loop_merges, straddle_witness_lines, structured_plan,
-    structured_plan_construct_tree, structured_reject_reason,
+    structured_plan_construct_tree, structured_reject_reason, CROSS_ARM_EDGE_MAX_BLOCKS,
 };
 
 pub(super) use blocks::{

@@ -303,6 +303,18 @@ impl Emitter {
                 .unwrap_or_else(|| indices.clone());
             let storage_source_ty = function_storage_local_type(&source_ty);
             let access_pointee = gep_pointee(&storage_source_ty, &logical_indices)?;
+            let ptr_type = self.ptr_type_id(StorageClass::Function, &access_pointee)?;
+            let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+            let mut ops = vec![Operand::IdRef(root)];
+            for idx in gep_spirv_indices(&logical_indices)? {
+                ops.push(Operand::IdRef(self.value_id(&idx.value, &idx.ty)?));
+            }
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(ptr_type),
+                Some(result),
+                ops,
+            ));
             self.pointer_storage
                 .insert(name.to_string(), StorageClass::Function);
             self.pointer_pointees
@@ -326,7 +338,7 @@ impl Emitter {
                         || self.is_indexed_container_root(root, None),
                 },
             );
-            return Ok(None);
+            return Ok(Some(result));
         }
         if let Some(raw) = self.byte_array_reinterpret_raw_gep(
             &gep.base.value,

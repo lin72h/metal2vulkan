@@ -325,6 +325,7 @@ pub(in crate::passes) fn texture_dims(
                 || name.starts_with("air.get_height_depth")
                 || name.starts_with("air.get_depth_depth")
                 || name.starts_with("air.get_num_mip_levels_texture")
+                || name.starts_with("air.get_num_mip_levels_depth")
                 || name.starts_with("air.get_num_samples_texture"))
             {
                 continue;
@@ -410,6 +411,7 @@ fn is_size_query(name: &str) -> bool {
         || name.starts_with("air.get_height_depth")
         || name.starts_with("air.get_depth_depth")
         || name.starts_with("air.get_num_mip_levels_texture")
+        || name.starts_with("air.get_num_mip_levels_depth")
         || name.starts_with("air.get_num_samples_texture")
 }
 

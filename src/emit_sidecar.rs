@@ -41,6 +41,7 @@ pub(crate) struct LocalPointerDynamicFieldLoad {
     pub(crate) id: Word,
     pub(crate) root: Word,
     pub(crate) prefix: Vec<u32>,
+    pub(crate) index: Word,
     pub(crate) suffix: Vec<u32>,
 }
 
@@ -70,6 +71,7 @@ impl EmitSidecar {
         for fact in &mut self.local_pointer_dynamic_field_loads {
             replace(&mut fact.id);
             replace(&mut fact.root);
+            replace(&mut fact.index);
         }
         self.air_struct_offsets = std::mem::take(&mut self.air_struct_offsets)
             .into_iter()
@@ -91,6 +93,21 @@ impl EmitSidecar {
             })
             .collect::<Vec<_>>();
         self.local_pointer_field_loads.extend(clones);
+        let clones = self
+            .local_pointer_dynamic_field_loads
+            .iter()
+            .filter_map(|fact| {
+                let id = remap.get(&fact.id).copied()?;
+                Some(LocalPointerDynamicFieldLoad {
+                    id,
+                    root: remap.get(&fact.root).copied().unwrap_or(fact.root),
+                    prefix: fact.prefix.clone(),
+                    index: remap.get(&fact.index).copied().unwrap_or(fact.index),
+                    suffix: fact.suffix.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.local_pointer_dynamic_field_loads.extend(clones);
     }
 
     pub(crate) fn remap_local_pointer_field_store_sources(&mut self, remap: &HashMap<Word, Word>) {
@@ -135,11 +152,12 @@ mod tests {
                 id: 50,
                 root: 60,
                 prefix: vec![3],
+                index: 70,
                 suffix: vec![4],
             }],
             ..EmitSidecar::default()
         };
-        let remap = HashMap::from([(20, 120), (30, 130), (40, 140)]);
+        let remap = HashMap::from([(20, 120), (30, 130), (40, 140), (50, 150), (60, 160)]);
 
         sidecar.clone_inlined_local_pointer_field_loads(&remap);
         sidecar.remap_local_pointer_field_store_sources(&remap);
@@ -168,12 +186,22 @@ mod tests {
         );
         assert_eq!(
             sidecar.local_pointer_dynamic_field_loads,
-            vec![LocalPointerDynamicFieldLoad {
-                id: 50,
-                root: 60,
-                prefix: vec![3],
-                suffix: vec![4],
-            }]
+            vec![
+                LocalPointerDynamicFieldLoad {
+                    id: 50,
+                    root: 60,
+                    prefix: vec![3],
+                    index: 70,
+                    suffix: vec![4],
+                },
+                LocalPointerDynamicFieldLoad {
+                    id: 150,
+                    root: 160,
+                    prefix: vec![3],
+                    index: 70,
+                    suffix: vec![4],
+                },
+            ]
         );
     }
 
@@ -196,6 +224,7 @@ mod tests {
                 id: 40,
                 root: 41,
                 prefix: vec![5],
+                index: 42,
                 suffix: vec![6],
             }],
         };
@@ -207,6 +236,7 @@ mod tests {
             (31, 131),
             (40, 140),
             (41, 141),
+            (42, 142),
             (5, 105),
         ]);
 
@@ -221,5 +251,6 @@ mod tests {
         assert_eq!(sidecar.local_pointer_field_loads[0].root, 131);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].id, 140);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].root, 141);
+        assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].index, 142);
     }
 }

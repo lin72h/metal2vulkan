@@ -67,7 +67,7 @@ Bindings are a fixed base plus the Metal resource index `n`:
 |---|---|---|
 | `[[buffer(n)]]` (device / constant) | `Buffer` | `BUFFER_BINDING_BASE + n` → **`n`** (`0..32`) |
 | `[[buffer(n)]]` (threadgroup) | `ThreadgroupBuffer` | **no descriptor** (`descriptor: None`) |
-| `[[texture(n)]]` | `Texture` / `StorageImage` / `TextureArray` | `TEXTURE_BINDING_BASE + n` → **`32 + n`** |
+| `[[texture(n)]]` | `Texture` / `StorageImage` / `TextureArray` (`access` distinguishes sampled vs storage arrays) | `TEXTURE_BINDING_BASE + n` → **`32 + n`** |
 | `[[sampler(n)]]` | `Sampler` | `SAMPLER_BINDING_BASE + n` → **`64 + n`** |
 | AIR `constexpr sampler` | `StaticSampler` | first free binding in **`64..96`** |
 | `[[color(n)]]` (framebuffer fetch) | `ColorInput` | `COLOR_INPUT_BINDING_BASE + n` → **`96 + n`** |

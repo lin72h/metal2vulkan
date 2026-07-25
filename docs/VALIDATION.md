@@ -192,6 +192,9 @@ cargo run -p metal2vulkan-validation --release --bin corpus-remint
 
 # only status != ok (fallback / timeout / …)
 cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
+
+# bounded timeout-row cleanup; each row runs in a killable subprocess
+cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --status timeout --skip 50 --limit 50 --case-timeout-secs 60
 ```
 
 Rows without a matching public fixture or shard row are left alone. Prefer `--dry-run` first.
@@ -247,6 +250,7 @@ Candidate statuses:
 |---|---|---|
 | `ok` | exact byte match | leave it alone |
 | `tolerance` | float-like output is within recorded tolerance | accepted; leave it alone unless the policy is wrong |
+| `smoke` | candidate executed and captured bytes, but the Metal row is `compare=none` rather than a semantic golden | accepted as an execution smoke; rebank Metal for semantic comparison |
 | `failure` | candidate ran and produced bytes, but they do not match / exceed tolerance | inspect output class; reduce to a synthetic test when possible |
 | `fallback` | translate, bind, pipeline creation, dispatch, readback, or harness panic before comparable bytes | inspect `error`; usually a harness or executor gap |
 | `missing` | no usable Metal golden for this hash | rerun/fix `corpus-run-metal` first |

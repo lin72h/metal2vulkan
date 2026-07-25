@@ -2,7 +2,10 @@
 
 use super::*;
 use crate::native::ir::{LlGep, LlType, LlValue};
-use crate::native::parse::{parse_phi, parse_switch, parse_typed_value, strip_comment, LlSwitch};
+use crate::native::parse::{
+    parse_call, parse_phi, parse_switch, parse_typed_value, strip_call_prefix, strip_comment,
+    LlSwitch,
+};
 use std::collections::{HashMap, HashSet};
 
 /// Compute the emit-ready `ret` decision for a block's terminator line (see [`RetEmit`]). Uses
@@ -496,6 +499,16 @@ pub(in crate::native) fn push_inst_line(
     } else {
         None
     };
+    let value_call_error =
+        if matches!(opcode.as_str(), "call" | "tail") && result.is_some() && call.is_none() {
+            let cleaned = crate::native::lex::strip_comment(line).trim();
+            let call_text = cleaned
+                .split_once(" = ")
+                .and_then(|(_, rhs)| strip_call_prefix(rhs.trim()));
+            call_text.and_then(|text| parse_call(text).err())
+        } else {
+            None
+        };
     cur_insts.push(TirInst {
         result,
         result_ty,
@@ -513,6 +526,7 @@ pub(in crate::native) fn push_inst_line(
         diag_line,
         shuffle_mask,
         void_call_line,
+        value_call_error,
         bitcast,
         icmp_rest,
         pointer_pointee,

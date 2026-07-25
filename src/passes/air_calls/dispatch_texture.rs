@@ -794,6 +794,82 @@ pub(in crate::passes) fn lower_get_num_samples_texture(
     )])
 }
 
+/// `air.calculate_unclamped_lod_texture_2d(texture, sampler, coord, flags)` returns the implicit
+/// fragment LOD for a hypothetical sample. SPIR-V exposes the same query as `OpImageQueryLod`,
+/// whose second component is the implicit level of detail relative to the image base level.
+pub(in crate::passes) fn lower_calculate_unclamped_lod_texture_2d(
+    ctx: &mut Ctx,
+    name: &str,
+    res: Option<Word>,
+    rty: Option<Word>,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    let res = res.ok_or_else(|| format!("{name} has no result"))?;
+    let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
+    if args.len() < 3 {
+        return Err(format!("{name} missing texture/sampler/coord"));
+    }
+    if ctx.stage != Stage::Fragment {
+        return Err(format!("{name} requires fragment implicit derivatives"));
+    }
+
+    let mut img = resolve_image_value(ctx, args[0]);
+    if texture_operand_is_private_pointer(ctx, img) {
+        img = single_sampled_image_for_private_read(ctx, img)
+            .ok_or_else(|| format!("{name} private texture operand is ambiguous"))?;
+    }
+    if image_is_storage(ctx, img) {
+        return Err(format!("{name} requires a sampled texture"));
+    }
+
+    let mut out = Vec::new();
+    img = load_image_if_pointer(ctx, img, &mut out);
+    let (dim, arrayed, comp) = image_shape_or_recorded(ctx, img);
+    if dim != Dim::Dim2D || arrayed {
+        return Err(format!("{name} requires a non-array 2D texture"));
+    }
+    let (img_ty, _, _, _) = sampled_operand_image_info(ctx, img, dim, false, comp);
+    let si_ty = ctx.ty_sampled_image(img_ty);
+    let samp = valid_sampler_value(ctx, args[1], &mut out)?;
+    let si = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::SampledImage,
+        Some(si_ty),
+        Some(si),
+        vec![Operand::IdRef(img), Operand::IdRef(samp)],
+    ));
+    let lod_pair_ty = ctx.ty_vecf(2);
+    let lod_pair = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ImageQueryLod,
+        Some(lod_pair_ty),
+        Some(lod_pair),
+        vec![Operand::IdRef(si), Operand::IdRef(args[2])],
+    ));
+
+    let float_ty = ctx.ty_float();
+    let lod = if rty == float_ty {
+        res
+    } else {
+        ctx.module.fresh_id()
+    };
+    out.push(Instruction::new(
+        Op::CompositeExtract,
+        Some(float_ty),
+        Some(lod),
+        vec![Operand::IdRef(lod_pair), Operand::LiteralBit32(1)],
+    ));
+    if lod != res {
+        out.push(Instruction::new(
+            Op::FConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(lod)],
+        ));
+    }
+    Ok(out)
+}
+
 /// `air.get_null_texture_<dim>()` -> load a synthesized default image (a function-constant-gated
 /// optional attachment that, with our FCs folded off, resolves to a null texture), recording its
 /// dims so a later sample works.

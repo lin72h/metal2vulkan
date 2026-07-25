@@ -60,6 +60,7 @@ pub use emit_tiers::{
     emit_vulkan_spirv_with_primitive_phi_metadata,
 };
 pub(crate) use emit_tiers::{
+    emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar,
     emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar,
     emit_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar,
     emit_vulkan_spirv_all_buffers_raw_with_sidecar,
@@ -73,8 +74,9 @@ use emitter::Emitter;
 pub use error_class::{
     classify_emit_error, classify_validation_error, is_cfg_structurization_error,
     is_cross_binding_pointer_merge_error, is_dynamic_struct_index_error,
-    is_logical_pointer_operand_error, is_logical_pointer_phi_error, is_pointer_typing_emit_error,
-    is_pointer_typing_validation_error, EmitErrorClass, ValidationClass,
+    is_graph_walk_unmigrated_emit_error, is_logical_pointer_operand_error,
+    is_logical_pointer_phi_error, is_pointer_typing_emit_error, is_pointer_typing_validation_error,
+    EmitErrorClass, ValidationClass,
 };
 use ir::LlModule;
 pub(crate) use rewrites::{

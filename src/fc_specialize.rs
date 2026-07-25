@@ -14,6 +14,201 @@ fn fc_init_index(name: &str) -> Option<u32> {
     digits.parse::<u32>().ok()
 }
 
+fn materialize_zero_fc_initializers(module: &mut crate::spirv_module::Module) -> bool {
+    use crate::spirv_module::{Instruction, Operand};
+    use spirv::Op;
+
+    let mut fc_init_vars: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for inst in &module.debug_names {
+        if inst.class.opcode != Op::Name {
+            continue;
+        }
+        if let (Some(Operand::IdRef(id)), Some(Operand::LiteralString(name))) =
+            (inst.operands.first(), inst.operands.get(1))
+        {
+            if fc_init_index(name).is_some() {
+                fc_init_vars.insert(*id);
+            }
+        }
+    }
+
+    let mut pointee: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut int_types: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut int_vectors: std::collections::HashMap<u32, (u32, u32)> =
+        std::collections::HashMap::new();
+    for inst in &module.types_global_values {
+        match inst.class.opcode {
+            Op::TypePointer => {
+                if let (Some(id), Some(Operand::IdRef(pointee_id))) =
+                    (inst.result_id, inst.operands.get(1))
+                {
+                    pointee.insert(id, *pointee_id);
+                }
+            }
+            Op::TypeInt => {
+                if let Some(id) = inst.result_id {
+                    int_types.insert(id);
+                }
+            }
+            Op::TypeVector => {
+                if let (
+                    Some(id),
+                    Some(Operand::IdRef(component_ty)),
+                    Some(Operand::LiteralBit32(count)),
+                ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
+                {
+                    int_vectors.insert(id, (*component_ty, *count));
+                }
+            }
+            _ => {}
+        }
+    }
+    int_vectors.retain(|_, (component_ty, _)| int_types.contains(component_ty));
+
+    let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(1);
+    let mut scalar_zero_for: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut vector_zero_for: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut new_consts: std::collections::HashMap<u32, Instruction> =
+        std::collections::HashMap::new();
+    let mut edits: Vec<(usize, Vec<u32>, u32)> = vec![];
+
+    for (vi, inst) in module.types_global_values.iter().enumerate() {
+        if inst.class.opcode != Op::Variable {
+            continue;
+        }
+        let Some(var_id) = inst.result_id else {
+            continue;
+        };
+        if !fc_init_vars.contains(&var_id) {
+            continue;
+        }
+        let Some(ptr_ty) = inst.result_type else {
+            continue;
+        };
+        let Some(&value_ty) = pointee.get(&ptr_ty) else {
+            continue;
+        };
+
+        if int_types.contains(&value_ty) {
+            let const_id = *scalar_zero_for.entry(value_ty).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                new_consts.insert(
+                    id,
+                    Instruction::new(
+                        Op::Constant,
+                        Some(value_ty),
+                        Some(id),
+                        vec![Operand::LiteralBit32(0)],
+                    ),
+                );
+                id
+            });
+            edits.push((vi, vec![const_id], const_id));
+            continue;
+        }
+
+        if let Some(&(component_ty, count)) = int_vectors.get(&value_ty) {
+            let scalar_id = *scalar_zero_for.entry(component_ty).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                new_consts.insert(
+                    id,
+                    Instruction::new(
+                        Op::Constant,
+                        Some(component_ty),
+                        Some(id),
+                        vec![Operand::LiteralBit32(0)],
+                    ),
+                );
+                id
+            });
+            let composite_id = *vector_zero_for.entry(value_ty).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                new_consts.insert(
+                    id,
+                    Instruction::new(
+                        Op::ConstantComposite,
+                        Some(value_ty),
+                        Some(id),
+                        (0..count).map(|_| Operand::IdRef(scalar_id)).collect(),
+                    ),
+                );
+                id
+            });
+            edits.push((vi, vec![scalar_id, composite_id], composite_id));
+        }
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+
+    let var_to_consts: std::collections::HashMap<u32, (Vec<u32>, u32)> = edits
+        .iter()
+        .filter_map(|(vi, consts, initializer)| {
+            module.types_global_values[*vi]
+                .result_id
+                .map(|var_id| (var_id, (consts.clone(), *initializer)))
+        })
+        .collect();
+    let mut rebuilt = Vec::with_capacity(module.types_global_values.len() + new_consts.len());
+    let mut emitted = std::collections::HashSet::new();
+    for mut inst in module.types_global_values.drain(..) {
+        if inst.class.opcode == Op::Variable {
+            if let Some((consts, initializer)) =
+                inst.result_id.as_ref().and_then(|id| var_to_consts.get(id))
+            {
+                for const_id in consts {
+                    if emitted.insert(*const_id) {
+                        if let Some(new_const) = new_consts.remove(const_id) {
+                            rebuilt.push(new_const);
+                        }
+                    }
+                }
+                if inst.operands.len() >= 2 {
+                    inst.operands[1] = Operand::IdRef(*initializer);
+                } else {
+                    inst.operands.push(Operand::IdRef(*initializer));
+                }
+            }
+        }
+        rebuilt.push(inst);
+    }
+    module.types_global_values = rebuilt;
+    if let Some(header) = module.header.as_mut() {
+        header.bound = next_id;
+    }
+    true
+}
+
+/// Bake every discovered Metal function constant to its zero/default value.
+///
+/// This is distinct from a no-op: after materializing explicit zero constants, the same structural
+/// branch-prune/interface-drop pass runs as for nonzero specialization. That lets validation compare
+/// against Metal oracle rows recorded with `fc_specialization=zero`, where mutually-exclusive
+/// FC-gated resources must collapse to one Vulkan descriptor shape.
+pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String> {
+    let mut module = load_bytes(spv).map_err(|e| format!("SPIR-V load: {e:?}"))?;
+    if !materialize_zero_fc_initializers(&mut module) {
+        if prune_static_fc_branches_and_drop_interface(&mut module) {
+            return Ok(module
+                .assemble()
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect());
+        }
+        return Ok(spv.to_vec());
+    }
+    prune_static_fc_branches_and_drop_interface(&mut module);
+    Ok(module
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect())
+}
+
 /// Bake explicit values into a module's Metal function constants, in place on assembled SPIR-V.
 ///
 /// The AIR/LLVM backend lowers each `[[function_constant(N)]]` to a module-scope **Private**
@@ -184,19 +379,26 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     // cannot bind two image view types to one descriptor in one specialized module. The pruning pass
     // is structural and already used by native retry tiers; this helper is opt-in because it only runs
     // for explicit harness/user-provided FC values.
-    if !module.entry_points.is_empty() {
-        let before_prune = module.clone();
-        if crate::native::prune_constant_branches_module(&mut module).is_ok() {
-            restore_loop_merges_removed_by_fc_prune(&before_prune, &mut module);
-            drop_unreferenced_entry_interface_globals(&mut module);
-        }
-    }
+    prune_static_fc_branches_and_drop_interface(&mut module);
 
     Ok(module
         .assemble()
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect())
+}
+
+fn prune_static_fc_branches_and_drop_interface(module: &mut crate::spirv_module::Module) -> bool {
+    if module.entry_points.is_empty() {
+        return false;
+    }
+    let before_prune = module.clone();
+    if crate::native::prune_constant_branches_module(module).is_err() {
+        return false;
+    }
+    restore_loop_merges_removed_by_fc_prune(&before_prune, module);
+    drop_unreferenced_entry_interface_globals(module);
+    true
 }
 
 fn restore_loop_merges_removed_by_fc_prune(
@@ -819,6 +1021,399 @@ mod tests {
 
         // Unknown index must error rather than silently no-op.
         assert!(specialize_function_constants(&bytes, &[(9, 1)]).is_err());
+    }
+
+    #[test]
+    fn zero_specialization_discovers_fc_initializers() {
+        let bytes = fixture_bytes(
+            5,
+            vec![
+                Instruction::new(
+                    Op::TypeInt,
+                    None,
+                    Some(1),
+                    vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+                ),
+                Instruction::new(
+                    Op::TypePointer,
+                    None,
+                    Some(2),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(1),
+                    ],
+                ),
+                Instruction::new(Op::ConstantNull, Some(1), Some(3), vec![]),
+                Instruction::new(
+                    Op::Variable,
+                    Some(2),
+                    Some(4),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(3),
+                    ],
+                ),
+            ],
+            vec![name(4, "_ZN3app7enabledE.MTL_FC_INIT_7_b")],
+        );
+
+        let out = specialize_function_constants_zero(&bytes).expect("zero specialize");
+        let m = load_bytes(&out).expect("reload");
+        let init_var = m
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(4))
+            .expect("init var");
+        let init_id = match init_var.operands.get(1) {
+            Some(Operand::IdRef(id)) => *id,
+            other => panic!("init var has no initializer: {other:?}"),
+        };
+        let init_const = m
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Constant && inst.result_id == Some(init_id))
+            .expect("zero constant def");
+        assert_eq!(init_const.operands, vec![Operand::LiteralBit32(0)]);
+    }
+
+    #[test]
+    fn zero_specialization_materializes_vector_int_fc_initializers() {
+        let bytes = fixture_bytes(
+            9,
+            vec![
+                Instruction::new(
+                    Op::TypeInt,
+                    None,
+                    Some(1),
+                    vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+                ),
+                Instruction::new(
+                    Op::TypePointer,
+                    None,
+                    Some(2),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(1),
+                    ],
+                ),
+                Instruction::new(Op::ConstantNull, Some(1), Some(3), vec![]),
+                Instruction::new(
+                    Op::Variable,
+                    Some(2),
+                    Some(4),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(3),
+                    ],
+                ),
+                Instruction::new(
+                    Op::TypeVector,
+                    None,
+                    Some(5),
+                    vec![Operand::IdRef(1), Operand::LiteralBit32(4)],
+                ),
+                Instruction::new(
+                    Op::TypePointer,
+                    None,
+                    Some(6),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(5),
+                    ],
+                ),
+                Instruction::new(Op::ConstantNull, Some(5), Some(7), vec![]),
+                Instruction::new(
+                    Op::Variable,
+                    Some(6),
+                    Some(8),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(7),
+                    ],
+                ),
+            ],
+            vec![
+                name(4, "_ZN3app7enabledE.MTL_FC_INIT_7_b"),
+                name(8, "_ZN3app9thresholdE.MTL_FC_INIT_9_Dv4_h"),
+            ],
+        );
+
+        let out = specialize_function_constants_zero(&bytes).expect("zero specialize");
+        let m = load_bytes(&out).expect("reload");
+        let scalar_init = m
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(4))
+            .and_then(|inst| inst.operands.get(1))
+            .and_then(|op| match op {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .expect("scalar initializer");
+        assert!(
+            m.types_global_values
+                .iter()
+                .any(|inst| inst.class.opcode == Op::Constant
+                    && inst.result_id == Some(scalar_init)
+                    && inst.result_type == Some(1)),
+            "scalar FC initializer should be materialized as an OpConstant"
+        );
+
+        let vector_init = m
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(8))
+            .and_then(|inst| inst.operands.get(1))
+            .and_then(|op| match op {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .expect("vector initializer");
+        let vector_const = m
+            .types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == Op::ConstantComposite && inst.result_id == Some(vector_init)
+            })
+            .expect("vector zero composite");
+        assert_eq!(vector_const.result_type, Some(5));
+        assert_eq!(
+            vector_const.operands,
+            vec![
+                Operand::IdRef(scalar_init),
+                Operand::IdRef(scalar_init),
+                Operand::IdRef(scalar_init),
+                Operand::IdRef(scalar_init),
+            ],
+            "vector FC initializer should be an explicit zero composite"
+        );
+    }
+
+    #[test]
+    fn zero_specialization_prunes_static_fc_predicate_without_init_global() {
+        let mut module = Module::new();
+        let mut header = ModuleHeader::new(40);
+        header.set_version(1, 4);
+        module.header = Some(header);
+        module.capabilities.push(Instruction::new(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(Capability::Shader)],
+        ));
+        module.memory_model = Some(Instruction::new(
+            Op::MemoryModel,
+            None,
+            None,
+            vec![
+                Operand::AddressingModel(AddressingModel::Logical),
+                Operand::MemoryModel(MemoryModel::GLSL450),
+            ],
+        ));
+        module.entry_points.push(Instruction::new(
+            Op::EntryPoint,
+            None,
+            None,
+            vec![
+                Operand::ExecutionModel(ExecutionModel::GLCompute),
+                Operand::IdRef(13),
+                Operand::LiteralString("main".into()),
+                Operand::IdRef(9),
+                Operand::IdRef(10),
+            ],
+        ));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
+            Instruction::new(Op::TypeBool, None, Some(2), vec![]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(3),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(4),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(Op::ConstantNull, Some(3), Some(6), vec![]),
+            Instruction::new(
+                Op::Constant,
+                Some(3),
+                Some(7),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            Instruction::new(Op::ConstantFalse, Some(2), Some(8), vec![]),
+            Instruction::new(
+                Op::Variable,
+                Some(4),
+                Some(9),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(6),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(4),
+                Some(10),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(6),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(4),
+                Some(11),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(6),
+                ],
+            ),
+            Instruction::new(Op::TypeFunction, None, Some(12), vec![Operand::IdRef(1)]),
+        ];
+        module.debug_names = vec![name(9, "live_global"), name(10, "dead_global")];
+
+        let mut function = Function::new();
+        function.def = Some(Instruction::new(
+            Op::Function,
+            Some(1),
+            Some(13),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(12),
+            ],
+        ));
+        function.blocks = vec![
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::Variable,
+                        Some(5),
+                        Some(19),
+                        vec![Operand::StorageClass(StorageClass::Function)],
+                    ),
+                    Instruction::new(
+                        Op::Select,
+                        Some(3),
+                        Some(20),
+                        vec![Operand::IdRef(8), Operand::IdRef(7), Operand::IdRef(6)],
+                    ),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(11), Operand::IdRef(20)],
+                    ),
+                    Instruction::new(Op::Load, Some(3), Some(21), vec![Operand::IdRef(11)]),
+                    Instruction::new(
+                        Op::IEqual,
+                        Some(2),
+                        Some(22),
+                        vec![Operand::IdRef(21), Operand::IdRef(6)],
+                    ),
+                    Instruction::new(
+                        Op::SelectionMerge,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(25),
+                            Operand::SelectionControl(SelectionControl::NONE),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::BranchConditional,
+                        None,
+                        None,
+                        vec![Operand::IdRef(22), Operand::IdRef(23), Operand::IdRef(24)],
+                    ),
+                ],
+            },
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(23), vec![])),
+                instructions: vec![
+                    Instruction::new(Op::Load, Some(3), Some(26), vec![Operand::IdRef(9)]),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(19), Operand::IdRef(26)],
+                    ),
+                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(25)]),
+                ],
+            },
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(24), vec![])),
+                instructions: vec![
+                    Instruction::new(Op::Load, Some(3), Some(27), vec![Operand::IdRef(10)]),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(19), Operand::IdRef(27)],
+                    ),
+                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(25)]),
+                ],
+            },
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(25), vec![])),
+                instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
+            },
+        ];
+        function.end = Some(Instruction::new(Op::FunctionEnd, None, None, vec![]));
+        module.functions.push(function);
+
+        let bytes = module
+            .assemble()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let out = specialize_function_constants_zero(&bytes).expect("zero specialize");
+        let m = load_bytes(&out).expect("reload");
+        let entry_interface = m.entry_points[0]
+            .operands
+            .iter()
+            .skip(3)
+            .filter_map(|op| match op {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let variables = m
+            .types_global_values
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Variable)
+            .filter_map(|inst| inst.result_id)
+            .collect::<std::collections::HashSet<_>>();
+
+        assert!(
+            entry_interface.contains(&9),
+            "live global stays in interface"
+        );
+        assert!(
+            !entry_interface.contains(&10),
+            "dead static-FC arm leaves interface"
+        );
+        assert!(variables.contains(&9), "live global variable stays");
+        assert!(
+            !variables.contains(&10),
+            "dead static-FC arm global is dropped"
+        );
     }
 
     /// Regression: real modules INTERLEAVE types and variables (a `%ushort` type defined AFTER an

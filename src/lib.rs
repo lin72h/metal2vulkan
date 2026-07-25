@@ -37,7 +37,7 @@ mod spirv_variable_ptr;
 pub mod tools;
 pub(crate) mod types;
 
-pub use fc_specialize::specialize_function_constants;
+pub use fc_specialize::{specialize_function_constants, specialize_function_constants_zero};
 pub use passthrough::translate_passthrough;
 use primary_retry::*;
 
@@ -98,6 +98,28 @@ pub fn translate_sanitized_native(
 /// `air.simdgroup_async_copy_2d` (such modules fail the emitter outright otherwise).
 fn lower_async_copy_if_enabled(san_ll: &str) -> String {
     native::lower_simdgroup_async_copy(san_ll)
+}
+
+fn reject_visible_function_references(san_ll: &str) -> Result<(), String> {
+    if san_ll.contains(".MTL_VISIBLE_FN_REF") || san_ll.contains("!air.visible_function_references")
+    {
+        return Err(
+            "native emitter: unsupported Metal visible function reference; dynamic linked \
+             functions are not expressible in Logical SPIR-V"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn options_for_air(
+    san_ll: &str,
+    mut options: passes::TransformOptions,
+) -> passes::TransformOptions {
+    if san_ll.contains("air.compile.denorms_disable") {
+        options.denorm_flush_to_zero_f32 = true;
+    }
+    options
 }
 
 /// Per-stage interface metadata parsed once from sanitized AIR and shared by emission, passes,
@@ -198,7 +220,9 @@ pub fn translate_pre_psb_probe(
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
+    reject_visible_function_references(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
+    let options = options_for_air(san_ll, passes::TransformOptions::default());
     translate_sanitized_with_meta(
         san_ll,
         stage,
@@ -208,7 +232,7 @@ pub fn translate_pre_psb_probe(
         stage_meta.promoted_kern.as_ref(),
         stage_meta.entry_name.as_deref(),
         tmp,
-        passes::TransformOptions::default(),
+        options,
         false,
     )
 }
@@ -229,7 +253,9 @@ pub fn translate_sanitized_native_with_options(
     // the emitter outright today. See `native::async_copy` + journal AIR2VK-ASYNC-COPY-CLEAR.
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
+    reject_visible_function_references(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
+    let options = options_for_air(san_ll, options);
     translate_sanitized_with_meta(
         san_ll,
         stage,
@@ -280,7 +306,9 @@ pub fn translate_sanitized_native_reflected(
 ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
+    reject_visible_function_references(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
+    let options = options_for_air(san_ll, options);
     let mut reflection = build_reflection(
         stage,
         stage_meta.frag.as_ref(),
@@ -324,6 +352,7 @@ pub fn translate_native_no_retry(san_ll: &str, stage: passes::Stage) -> Result<V
     // Mirror the pre-spirv-val prologue of `translate_sanitized_native_with_options` exactly so BC
     // measures the bytes production would actually validate: async-copy lowering, then stage meta.
     let lowered = lower_async_copy_if_enabled(san_ll);
+    reject_visible_function_references(&lowered)?;
     let stage_meta = parse_stage_meta(&lowered, stage);
     translate_native_no_retry_with_meta(
         &lowered,
@@ -373,6 +402,7 @@ pub fn translate_native_primary_validated(
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
+    reject_visible_function_references(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let finished = emit_finish_primary_module(
         san_ll,
@@ -617,6 +647,9 @@ pub fn translate_raw_tiers_probe(
 ) -> Vec<Result<Vec<u8>, String>> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
+    if let Err(error) = reject_visible_function_references(san_ll) {
+        return vec![Err(error.clone()), Err(error)];
+    }
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
     let run = |emitted: Result<emit_sidecar::EmittedSpirv, String>| -> Result<Vec<u8>, String> {
@@ -675,6 +708,7 @@ pub fn translate_bda_probe(
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
+    reject_visible_function_references(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
     tools::llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
@@ -1106,6 +1140,7 @@ fn translate_sanitized_with_meta(
                 // device address but the BDA passthrough does. Adopt-if-validates, so a `missing pointer
                 // storage` case the BDA tier cannot emit (e.g. the TopK array-of-pointers) is untouched.
                 .or_else(|| rc.census("emit-ptr:bda", rc.bda_retry()))
+                .or_else(|| rc.census("emit-ptr:bda_then_relooper", rc.bda_then_relooper()))
                 // The `missing pointer storage` can also be a Function-pointer store staged for a by-value
                 // struct forwarded into an internal helper (the TopK MPS NDArray multi-destination class):
                 // inline the helper chain + SROA the staging so the device pointer is used directly.
@@ -1134,6 +1169,7 @@ fn translate_sanitized_with_meta(
         // MPSmatrixEmbeddings chained-multiplexer frontier fails (b511a833/f8b6205d/37967b8c).
         Err(emit_err) => rc
             .census("emit-other:bda", rc.bda_retry())
+            .or_else(|| rc.census("emit-other:bda_then_relooper", rc.bda_then_relooper()))
             .or_else(|| rc.raw_then_psb_chain("emit-other:raw_then_relooper", "emit-other:raw_psb"))
             .ok_or(emit_err),
     };
@@ -1155,12 +1191,28 @@ fn translate_sanitized_with_meta(
     // `cannot initialize a variable of type 'device float *' with an lvalue of type 'device float'`
     // (the MPSLSTM/MPSRNN class). Such a phi can survive not only the untouched success path but any
     // retry arm (e.g. value_select clears a cross-binding merge yet leaves an intra-buffer pointer
-    // phi standing). The index-phi form is semantically identical and needs no variable pointers, so
-    // adopt it whenever it independently validates; keep the arm's bytes otherwise. Floor-safe by
-    // construction (adopt-if-validates).
+    // phi standing). A statically-dead arm can also be the only thing keeping a null/placeholder
+    // pointer incoming alive, so run the existing constant-branch prune first when the module already
+    // declares variable-pointer capability. The index-phi/pruned form is semantically identical and
+    // needs no variable pointers, so adopt it whenever it independently validates; keep the arm's bytes
+    // otherwise. Floor-safe by construction (adopt-if-validates).
     translated.map(|out| {
         let candidate = load_owned_module(&out).ok().and_then(|mut module| {
-            native::rewrite_variable_pointer_phis_module(&mut module).ok()?;
+            let has_variable_pointer_capability = module.capabilities.iter().any(|inst| {
+                matches!(
+                    inst.operands.as_slice(),
+                    [spirv_module::Operand::Capability(
+                        spirv::Capability::VariablePointers
+                            | spirv::Capability::VariablePointersStorageBuffer
+                    )]
+                )
+            });
+            let pruned = has_variable_pointer_capability
+                && native::prune_constant_branches_module(&mut module).is_ok();
+            let rewrote = native::rewrite_variable_pointer_phis_module(&mut module).is_ok();
+            if !pruned && !rewrote {
+                return None;
+            }
             let bytes = module
                 .assemble()
                 .iter()

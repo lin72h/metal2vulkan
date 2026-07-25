@@ -6,9 +6,9 @@
 
 use super::super::{
     classify_emit_error, classify_validation_error, is_cfg_structurization_error,
-    is_cross_binding_pointer_merge_error, is_logical_pointer_phi_error,
-    is_pointer_typing_emit_error, is_pointer_typing_validation_error, EmitErrorClass,
-    ValidationClass,
+    is_cross_binding_pointer_merge_error, is_graph_walk_unmigrated_emit_error,
+    is_logical_pointer_phi_error, is_pointer_typing_emit_error, is_pointer_typing_validation_error,
+    EmitErrorClass, ValidationClass,
 };
 
 /// The legacy validation guard chain, in lib.rs precedence order — what the classifier must match.
@@ -127,6 +127,11 @@ const EMIT_CASES: &[(&str, EmitErrorClass)] = &[
         "native emitter: unknown callee @air.intersect.f32.i32",
         EmitErrorClass::Other,
     ),
+    (
+        "native emitter: instruction not handled by the typed graph walk \
+         (reason=graph_walk_unmigrated_opcode, opcode=load)",
+        EmitErrorClass::Other,
+    ),
     ("", EmitErrorClass::Other),
 ];
 
@@ -154,6 +159,17 @@ fn emit_classifier_matches_expected_and_legacy_chain() {
             "classifier diverged from the legacy guard chain for {msg:?}"
         );
     }
+}
+
+#[test]
+fn graph_walk_unmigrated_emit_error_is_detected_for_retry_feed_budgeting() {
+    assert!(is_graph_walk_unmigrated_emit_error(
+        "native emitter: instruction not handled by the typed graph walk \
+         (reason=graph_walk_unmigrated_opcode, opcode=load)"
+    ));
+    assert!(!is_graph_walk_unmigrated_emit_error(
+        "native emitter: missing pointer storage for %ptr"
+    ));
 }
 
 // The precedence is load-bearing: a message matching BOTH pointer-typing and cfg families must

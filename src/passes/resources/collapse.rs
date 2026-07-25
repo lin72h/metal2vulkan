@@ -52,6 +52,25 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 splices.push((pid, lid));
             }
+            ParamBinding::LoadVarBoolFromUint { var, bool_ty } => {
+                let uint_ty = ctx.ty_uint();
+                let lid = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(uint_ty),
+                    Some(lid),
+                    vec![Operand::IdRef(var)],
+                ));
+                let converted = ctx.module.fresh_id();
+                let zero = ctx.const_uint(0);
+                loads.push(Instruction::new(
+                    Op::INotEqual,
+                    Some(bool_ty),
+                    Some(converted),
+                    vec![Operand::IdRef(lid), Operand::IdRef(zero)],
+                ));
+                splices.push((pid, converted));
+            }
             ParamBinding::LoadVarConverted {
                 var,
                 load_ty,
@@ -73,6 +92,27 @@ pub(in crate::passes) fn apply_bindings(
                     vec![Operand::IdRef(lid)],
                 ));
                 splices.push((pid, cid));
+            }
+            ParamBinding::LoadVarBitcast {
+                var,
+                load_ty,
+                param_ty,
+            } => {
+                let lid = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(load_ty),
+                    Some(lid),
+                    vec![Operand::IdRef(var)],
+                ));
+                let bid = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Bitcast,
+                    Some(param_ty),
+                    Some(bid),
+                    vec![Operand::IdRef(lid)],
+                ));
+                splices.push((pid, bid));
             }
             ParamBinding::LoadVarBitAnd {
                 var,
@@ -385,18 +425,8 @@ pub(in crate::passes) fn apply_bindings(
                     Some(read),
                     vec![Operand::IdRef(image), Operand::IdRef(coord)],
                 ));
-                if read_ty == param_ty {
-                    splices.push((pid, read));
-                } else {
-                    let converted = ctx.module.fresh_id();
-                    loads.push(Instruction::new(
-                        Op::FConvert,
-                        Some(param_ty),
-                        Some(converted),
-                        vec![Operand::IdRef(read)],
-                    ));
-                    splices.push((pid, converted));
-                }
+                let value = adapt_input_attachment_read(ctx, &mut loads, read, read_ty, param_ty)?;
+                splices.push((pid, value));
             }
             ParamBinding::Buffer { var, wrap } => match wrap {
                 BufWrap::Direct => {
@@ -415,6 +445,45 @@ pub(in crate::passes) fn apply_bindings(
                     record_array_buffers.push((pid, var, block_ty, elem_ty));
                 }
             },
+            ParamBinding::StageInput {
+                var,
+                value_ty,
+                index_var,
+            } => {
+                let v3u = ctx.ty_vec_uint(3);
+                let uint_ty = ctx.ty_uint();
+                let gid = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(v3u),
+                    Some(gid),
+                    vec![Operand::IdRef(index_var)],
+                ));
+                let x = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::CompositeExtract,
+                    Some(uint_ty),
+                    Some(x),
+                    vec![Operand::IdRef(gid), Operand::LiteralBit32(0)],
+                ));
+                let zero = ctx.const_uint(0);
+                let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, value_ty);
+                let ptr = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::AccessChain,
+                    Some(ptr_ty),
+                    Some(ptr),
+                    vec![Operand::IdRef(var), Operand::IdRef(zero), Operand::IdRef(x)],
+                ));
+                let value = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(value_ty),
+                    Some(value),
+                    vec![Operand::IdRef(ptr)],
+                ));
+                splices.push((pid, value));
+            }
             ParamBinding::WorkgroupMemory { var } => {
                 splices.push((pid, var));
                 workgroup_vars.push(var);
@@ -453,11 +522,11 @@ pub(in crate::passes) fn apply_bindings(
         }
     }
 
-    // Keep typed pointer-field store provenance in step with the interface splice so
-    // cross-function helper-field recovery can replay texture handles after entry parameters become
-    // loaded image ids.
+    // Keep typed pointer-field provenance in step with the interface splice so cross-function helper
+    // recovery can replay texture handles after entry parameters become loaded image ids or descriptor
+    // array variables.
     ctx.emit_sidecar
-        .remap_local_pointer_field_store_sources(&splices.iter().copied().collect());
+        .remap_ids(&splices.iter().copied().collect());
 
     // Splice param ids -> their replacement ids.
     {
@@ -524,6 +593,118 @@ pub(in crate::passes) fn apply_bindings(
     rewrite_structural_load_result_types(ctx, entry_idx, defs);
     rewrite_ulong_uint2_memory_reinterprets(ctx, entry_idx, defs);
     Ok(())
+}
+
+fn adapt_input_attachment_read(
+    ctx: &mut Ctx,
+    loads: &mut Vec<Instruction>,
+    read: Word,
+    read_ty: Word,
+    param_ty: Word,
+) -> Result<Word, String> {
+    if read_ty == param_ty {
+        return Ok(read);
+    }
+
+    let Some((read_component, Some(read_lanes))) = scalar_or_vector_component_live(ctx, read_ty)
+    else {
+        return Err(format!(
+            "input attachment read type {read_ty} is not a vector"
+        ));
+    };
+    let (param_component, param_lanes) = scalar_or_vector_component_live(ctx, param_ty)
+        .ok_or_else(|| format!("input attachment param type {param_ty} is not scalar/vector"))?;
+    let needed_lanes = param_lanes.unwrap_or(1);
+    if needed_lanes > read_lanes {
+        return Err(format!(
+            "input attachment param type {param_ty} needs {needed_lanes} components, read type {read_ty} has {read_lanes}"
+        ));
+    }
+
+    let (shaped, shaped_ty) = match param_lanes {
+        None => {
+            let extracted = ctx.module.fresh_id();
+            loads.push(Instruction::new(
+                Op::CompositeExtract,
+                Some(read_component),
+                Some(extracted),
+                vec![Operand::IdRef(read), Operand::LiteralBit32(0)],
+            ));
+            (extracted, read_component)
+        }
+        Some(lanes) if lanes == read_lanes => (read, read_ty),
+        Some(lanes) => {
+            let prefix_ty = input_attachment_vector_type(ctx, read_component, lanes);
+            let mut components = Vec::with_capacity(lanes as usize);
+            for lane in 0..lanes {
+                let extracted = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::CompositeExtract,
+                    Some(read_component),
+                    Some(extracted),
+                    vec![Operand::IdRef(read), Operand::LiteralBit32(lane)],
+                ));
+                components.push(Operand::IdRef(extracted));
+            }
+            let vector = ctx.module.fresh_id();
+            loads.push(Instruction::new(
+                Op::CompositeConstruct,
+                Some(prefix_ty),
+                Some(vector),
+                components,
+            ));
+            (vector, prefix_ty)
+        }
+    };
+    if shaped_ty == param_ty {
+        return Ok(shaped);
+    }
+
+    if !is_float_type_live(ctx, read_component) || !is_float_type_live(ctx, param_component) {
+        return Err(format!(
+            "input attachment read type {read_ty} cannot be converted to param type {param_ty}"
+        ));
+    }
+
+    let converted = ctx.module.fresh_id();
+    loads.push(Instruction::new(
+        Op::FConvert,
+        Some(param_ty),
+        Some(converted),
+        vec![Operand::IdRef(shaped)],
+    ));
+    Ok(converted)
+}
+
+fn scalar_or_vector_component_live(ctx: &Ctx, ty: Word) -> Option<(Word, Option<u32>)> {
+    let def = type_def_of(ctx, ty)?;
+    match def.class.opcode {
+        Op::TypeVector => {
+            let component = match def.operands.first()? {
+                Operand::IdRef(component) => *component,
+                _ => return None,
+            };
+            let lanes = match def.operands.get(1)? {
+                Operand::LiteralBit32(lanes) => *lanes,
+                _ => return None,
+            };
+            Some((component, Some(lanes)))
+        }
+        Op::TypeFloat | Op::TypeInt | Op::TypeBool => Some((ty, None)),
+        _ => None,
+    }
+}
+
+fn is_float_type_live(ctx: &Ctx, ty: Word) -> bool {
+    type_def_of(ctx, ty).is_some_and(|def| def.class.opcode == Op::TypeFloat)
+}
+
+fn input_attachment_vector_type(ctx: &mut Ctx, component_ty: Word, lanes: u32) -> Word {
+    ctx.get_or_create(
+        Op::TypeVector,
+        None,
+        vec![Operand::IdRef(component_ty), Operand::LiteralBit32(lanes)],
+    )
 }
 
 pub(in crate::passes) fn rewrite_ulong_uint2_memory_reinterprets(

@@ -216,6 +216,144 @@ fn native_capability_closure_lowers_zero_base_storage_buffer_ptr_access_chain() 
 }
 
 #[test]
+fn native_capability_closure_lowers_dynamic_base_storage_buffer_ptr_access_chain() {
+    let uint = 1;
+    let runtime_array = 2;
+    let block_ty = 3;
+    let storage_buffer_block_ptr = 4;
+    let storage_buffer_uint_ptr = 5;
+    let zero = 6;
+    let base_index = 7;
+    let ptr_index = 8;
+    let buffer = 9;
+    let base = 10;
+    let ptr = 11;
+    let mut module = Module::new();
+    module.header = Some(crate::spirv_module::ModuleHeader::new(20));
+    module.capabilities = vec![
+        cap(Capability::Shader),
+        cap(Capability::VariablePointersStorageBuffer),
+    ];
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(zero),
+            vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(base_index),
+            vec![Operand::LiteralBit32(5)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(ptr_index),
+            vec![Operand::LiteralBit32(11)],
+        ),
+        Instruction::new(
+            Op::TypeRuntimeArray,
+            None,
+            Some(runtime_array),
+            vec![Operand::IdRef(uint)],
+        ),
+        Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(block_ty),
+            vec![Operand::IdRef(runtime_array)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(storage_buffer_block_ptr),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(block_ty),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(storage_buffer_uint_ptr),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(uint),
+            ],
+        ),
+        Instruction::new(
+            Op::Variable,
+            Some(storage_buffer_block_ptr),
+            Some(buffer),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ),
+    ];
+    module.functions.push(Function {
+        def: None,
+        end: None,
+        parameters: vec![],
+        blocks: vec![Block {
+            label: None,
+            instructions: vec![
+                Instruction::new(
+                    Op::AccessChain,
+                    Some(storage_buffer_uint_ptr),
+                    Some(base),
+                    vec![
+                        Operand::IdRef(buffer),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(base_index),
+                    ],
+                ),
+                Instruction::new(
+                    Op::PtrAccessChain,
+                    Some(storage_buffer_uint_ptr),
+                    Some(ptr),
+                    vec![Operand::IdRef(base), Operand::IdRef(ptr_index)],
+                ),
+            ],
+        }],
+    });
+
+    super::super::add_native_module_capabilities(&mut module);
+
+    let block = &module.functions[0].blocks[0];
+    let add = block
+        .instructions
+        .iter()
+        .find(|inst| inst.class.opcode == Op::IAdd)
+        .expect("base index + pointer offset");
+    assert_eq!(add.result_type, Some(uint));
+    assert_eq!(
+        add.operands,
+        vec![Operand::IdRef(base_index), Operand::IdRef(ptr_index)]
+    );
+    let rewritten = block
+        .instructions
+        .iter()
+        .find(|inst| inst.result_id == Some(ptr))
+        .expect("rewritten pointer");
+    assert_eq!(rewritten.class.opcode, Op::AccessChain);
+    assert_eq!(
+        rewritten.operands,
+        vec![
+            Operand::IdRef(buffer),
+            Operand::IdRef(zero),
+            Operand::IdRef(add.result_id.unwrap()),
+        ]
+    );
+    assert!(!has_cap(&module, Capability::VariablePointersStorageBuffer));
+}
+
+#[test]
 fn native_capability_closure_keeps_struct_member_ptr_access_chain() {
     let uint = 1;
     let block_ty = 2;
