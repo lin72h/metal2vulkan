@@ -108,9 +108,9 @@ pub(in crate::native) const SHARED_CONTINUATION_LADDER_MAX_BLOCKS: usize = 300;
 
 /// Selection-merge synthesis can turn compact straight-line decision trees into hundreds of
 /// `%metal2vulkan.lmerge.sel*` pass-through blocks. That growth is useful for modest CFGs, but an
-/// oversized synthesized candidate is then fed into repeated dominator/loop-forest analyses. Reject
-/// only synthesized-growth candidates above this cap; already-large inputs that do not grow continue
-/// through the normal planner.
+/// oversized synthesized candidate is then fed into repeated dominator/loop-forest analyses. Cap the
+/// number of blocks added by synthesis, not the total candidate size, so already-large functions do
+/// not fall to the slow relooper path for one required merge split.
 pub(in crate::native) const SELECTION_SYNTH_GROWTH_MAX_BLOCKS: usize = 300;
 
 /// Hard ceiling for the source-CFG structured planner. The ordinary reject path emits inferred merges
@@ -527,7 +527,7 @@ pub(in crate::native) fn selection_synth_growth_exceeds_ladder_cap(
     source_blocks: usize,
     synthesized_blocks: usize,
 ) -> bool {
-    synthesized_blocks > SELECTION_SYNTH_GROWTH_MAX_BLOCKS && synthesized_blocks > source_blocks
+    synthesized_blocks.saturating_sub(source_blocks) > SELECTION_SYNTH_GROWTH_MAX_BLOCKS
 }
 
 pub(in crate::native) fn is_switch_block(b: &BodyBlock) -> bool {

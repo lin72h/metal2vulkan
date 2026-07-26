@@ -19,8 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[[primitive_id]]`, flat fragment varyings, framebuffer-fetch color inputs, vertex builtins, and
   fragment outputs with nonzero render-target locations.
 - Native lowering support for fixed and runtime-indexed texture arrays, storage-image array access,
-  more texture gather/sample/read/write shapes, half/integer render-target formats, scalar 64-bit
-  integer arithmetic emulation, and AIR denorm flush-to-zero emulation for floating-point paths.
+  more texture gather/sample/read/write shapes, half/integer render-target formats, and scalar
+  64-bit integer arithmetic emulation.
 - Workgroup-memory lowering for deterministic zero initialization, small Workgroup atomic-loop
   unrolling, and additional atomic reinterpretation patterns used by shared-memory reductions.
 - Rust validation/corpus tooling: `corpus-harvest`, `corpus-mint`, `corpus-remint`, `corpus-why`,
@@ -35,15 +35,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The retry cascade and structured-CFG repair path were bounded and hardened: planner clone/search
   growth is capped, fallback classification is more specific, graph-walk retry inputs are cached,
   and timeout-prone retry rows are handled with per-case limits in validation tooling.
-- Floating-point behavior is closer to AIR for the covered cases, including denorm flush-to-zero,
-  f32-to-f16 clamping, bf16 narrowing/NaN handling, fast `sin`/`cos` large-argument behavior,
-  `pow` zero edges, and exact `mix` endpoints.
+- Floating-point behavior is closer to AIR for the covered cases, including f32-to-f16 clamping,
+  bf16 narrowing/NaN handling, fast `sin`/`cos` large-argument behavior, `pow` zero edges, and
+  exact `mix` endpoints.
 - Buffer, pointer, and access-chain lowering handles more structural cases, including dynamic
   struct/word indices, local pointer tables, pointer-select loads, aggregate memcpy forms, raw
   subword loads/stores, unaligned metadata byte fields, and direct call pointer results.
 - Validation now uses local shard JSONL as the private corpus source of truth and committed
   `metal2vulkan-ledger*.jsonl` files for hash-identified translate/execution evidence. The ledger
   files are tracked with Git LFS.
+- Vulkan validation reruns now account stale or non-comparable Metal goldens as `missing`/skip
+  diagnostic rows instead of failed candidate regressions, so `--status ok --force` is usable as a
+  regression gate.
 - Developer documentation now describes the ledger-based validation ladder and the updated
   reflection v3 descriptor contract.
 
@@ -58,6 +61,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SPIR-V generation avoids several invalid Logical-addressing forms by normalizing pointer phis,
   pointer selects, reinterpret loads/stores, access-chain index widths, and cross-binding pointer
   merges before final validation.
+- Avoided a large-shader performance and size regression by measuring structured-CFG synthetic
+  growth as added blocks rather than total module blocks, keeping large already-structured shaders
+  on the primary emit path instead of falling back to the relooper tier.
+- Removed inline denorm flush-to-zero emulation and avoided emitting `DenormFlushToZero`
+  capability/execution modes on Vulkan devices that do not advertise float-controls support,
+  restoring expected output size and compile time for affected shaders.
+- Corrected imageblock explicit-slice stores so out-of-bounds oversized writes are discarded while
+  zero-area writes still materialize transparent zero.
+- Corrected integer `air.calculate_unclamped_lod_texture_2d` lowering so `OpImageQueryLod` uses a
+  translator-owned default nearest sampler when the source AIR does not provide one.
+- Hardened validation seed planning for bounded control data: byte-addressed dynamic GEP stride
+  controls and typed `bool` fields now receive valid bounded values, and stale goldens with older
+  layouts are marked for rebanking instead of producing backend-dependent mismatches.
+- Expanded finite-struct float validation seeding to cover repeated scalar/vector float fields and
+  repeated nested structs.
 
 ### Removed
 

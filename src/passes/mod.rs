@@ -50,8 +50,8 @@ pub struct TransformOptions {
     /// caller opts in only for a wider-subgroup driver (see kb conformance M-D2, pending G7).
     pub simd_cluster32: bool,
     /// AIR `air.compile.denorms_disable` requests flush-to-zero behavior for floating-point
-    /// denormals. Vulkan's native execution mode is optional on real devices, so the pass pipeline
-    /// emulates f16/f32/f64 with bit-level SPIR-V instead of `DenormFlushToZero` execution modes.
+    /// denormals. Vulkan exposes this only through optional float-controls features, so the native
+    /// path records the request but does not emit a portability-breaking execution mode.
     pub denorm_flush_to_zero_f32: bool,
 }
 
@@ -171,8 +171,6 @@ struct Ctx {
     kernel_threads_per_grid: Option<[u32; 3]>,
     /// M-D2 simd-reduce clustering opt-in (see [`TransformOptions::simd_cluster32`]).
     simd_cluster32: bool,
-    /// AIR compile-option denormal mode (see [`TransformOptions::denorm_flush_to_zero_f32`]).
-    denorm_flush_to_zero_f32: bool,
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
@@ -230,7 +228,6 @@ impl Ctx {
             kernel_local_size: options.kernel_local_size,
             kernel_threads_per_grid: options.kernel_threads_per_grid,
             simd_cluster32: options.simd_cluster32,
-            denorm_flush_to_zero_f32: options.denorm_flush_to_zero_f32,
             default_sampler_var: None,
             sampler_states: HashMap::new(),
             default_null_image_vars: HashMap::new(),
@@ -814,7 +811,6 @@ impl Ctx {
 mod access;
 mod air_calls;
 mod cfg_repair;
-mod denorm;
 mod emitted_inline;
 mod finalize;
 #[cfg(test)]
@@ -851,7 +847,6 @@ use access::{
     rewrite_scalar_slot_array_overindex, rewrite_strided_descent_access_chains,
 };
 use air_calls::lower_air_calls;
-use denorm::emulate_f32_denorm_flush_to_zero;
 use emitted_inline::{
     compose_chained_access_chains, inline_selected_helpers, prune_unreferenced_functions,
 };
@@ -1529,8 +1524,6 @@ pub(crate) fn transform_with_options_and_sidecar(
         workgroup::unroll_small_workgroup_atomic_loops(&mut ctx, entry_idx);
         workgroup::zero_initialize_workgroup_memory(&mut ctx, entry_idx);
     }
-    emulate_f32_denorm_flush_to_zero(&mut ctx, entry_idx);
-
     // 2f) drop blocks unreachable from the entry (orphaned constructs the structured-CFG repair's
     //     clone-then-rewire steps can leave behind). spirv-val tolerates them; SPIRV-Cross (MoltenVK)
     //     throws on them at pipeline creation. See `prune.rs`.

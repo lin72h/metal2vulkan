@@ -1063,10 +1063,9 @@ struct ImageblockRegionGate {
 /// implicit extent is the imageblock dimensions, which for a compute kernel are the threadgroup x/y
 /// dimensions. The Apple GPU discards the whole implicit-region write when that region extends past
 /// the texture bounds, so OR the write coordinate with all-ones in that case and let Vulkan's OOB
-/// store rule drop the single `OpImageWrite` this lowering emits. Constant explicit-size calls are
-/// different: observed AIR goldens keep the destination coordinate even when the explicit size is
-/// larger than the target, but write a transparent-zero texel for zero-area or non-fitting explicit
-/// regions.
+/// store rule drop the single `OpImageWrite` this lowering emits. Explicit zero-area regions keep
+/// the destination coordinate and write a transparent-zero texel; explicit non-empty regions that
+/// extend past the texture bounds are discarded by the same out-of-bounds coordinate gate.
 fn gate_imageblock_region_in_bounds(
     ctx: &mut Ctx,
     args: &[Word],
@@ -1233,28 +1232,6 @@ fn gate_imageblock_region_in_bounds(
     }
     let fits = fits.ok_or("gate_imageblock_region_in_bounds: at least one spatial axis")?;
     let empty = empty.ok_or("gate_imageblock_region_in_bounds: at least one spatial axis")?;
-    let skip_fit_gate = matches!(has_size_flag, Some(Op::ConstantTrue)) && explicit_usable;
-    if skip_fit_gate {
-        let not_fits = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::LogicalNot,
-            Some(bool_ty),
-            Some(not_fits),
-            vec![Operand::IdRef(fits)],
-        ));
-        let zero_texel = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::LogicalOr,
-            Some(bool_ty),
-            Some(zero_texel),
-            vec![Operand::IdRef(empty), Operand::IdRef(not_fits)],
-        ));
-        return Ok(ImageblockRegionGate {
-            coord: coord32,
-            empty: zero_texel,
-        });
-    }
-
     // mask = fits ? 0 : 0xffffffff; OR-ing it into the coordinate forces the store out of bounds
     // (and thus discarded) exactly when the implicit/runtime-selected block region does not fit.
     let all_ones = ctx.const_uint(u32::MAX);

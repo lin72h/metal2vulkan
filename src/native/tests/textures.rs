@@ -2024,7 +2024,6 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1
     assert!(asm.contains("OpIEqual"), "{asm}");
     assert!(asm.contains("OpConstantNull"), "{asm}");
     assert!(asm.contains("OpSelect"), "{asm}");
-    assert!(!asm.contains("4294967295"), "{asm}");
     assert!(!asm.contains("air.imageblock"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -2036,7 +2035,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1
 }
 
 #[test]
-fn native_kernel_imageblock_explicit_oversized_slice_preserves_coordinate() {
+fn native_kernel_imageblock_explicit_oversized_slice_discards_region() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
@@ -2072,7 +2071,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("OpSConvert"), "{asm}");
-    assert!(!asm.contains("4294967295"), "{asm}");
+    assert!(asm.contains("4294967295"), "{asm}");
     assert!(!asm.contains("air.imageblock"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")

@@ -460,9 +460,13 @@ mod tests {
             SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 50,
             SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 50
         ));
+        assert!(!selection_synth_growth_exceeds_ladder_cap(
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS * 3,
+            SELECTION_SYNTH_GROWTH_MAX_BLOCKS * 3 + 1
+        ));
         assert!(selection_synth_growth_exceeds_ladder_cap(
             63,
-            SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 1
+            63 + SELECTION_SYNTH_GROWTH_MAX_BLOCKS + 1
         ));
     }
 

@@ -606,7 +606,7 @@ entry:
 }
 
 #[test]
-fn native_air_denorms_disable_emulates_f32_flush_to_zero() {
+fn native_air_denorms_disable_f32_stays_portable_and_compact() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 
@@ -634,12 +634,9 @@ entry:
     let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(!asm.contains("OpCapability DenormFlushToZero"), "{asm}");
-    assert!(!asm.contains("DenormFlushToZero 32"), "{asm}");
-    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
-    assert!(asm.contains("2143289344"), "{asm}");
-    assert!(asm.contains("OpIEqual"), "{asm}");
-    assert!(asm.contains("OpULessThan"), "{asm}");
-    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("DenormFlushToZero"), "{asm}");
+    assert!(!asm.contains("2143289344"), "{asm}");
+    assert!(!asm.contains("OpULessThan"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -650,7 +647,7 @@ entry:
 }
 
 #[test]
-fn native_air_denorms_disable_emulates_f16_flush_to_zero() {
+fn native_air_denorms_disable_f16_stays_portable_and_compact() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 
@@ -679,13 +676,9 @@ entry:
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(!asm.contains("OpCapability DenormFlushToZero"), "{asm}");
-    assert!(!asm.contains("DenormFlushToZero 16"), "{asm}");
-    assert!(asm.contains("OpTypeInt 16 0"), "{asm}");
-    assert!(asm.contains("32767"), "{asm}");
-    assert!(asm.contains("1024"), "{asm}");
-    assert!(asm.contains("32768"), "{asm}");
-    assert!(asm.contains("32256"), "{asm}");
-    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("DenormFlushToZero"), "{asm}");
+    assert!(!asm.contains("32767"), "{asm}");
+    assert!(!asm.contains("32256"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -696,7 +689,7 @@ entry:
 }
 
 #[test]
-fn native_air_denorms_disable_clamps_f32_to_f16_convert() {
+fn native_air_denorms_disable_f32_to_f16_convert_stays_portable_and_compact() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 
@@ -724,10 +717,12 @@ declare <4 x half> @air.convert.f.v4f16.f.v4f32(<4 x float>)
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("65504"), "{asm}");
-    assert!(asm.contains("-65504"), "{asm}");
-    assert!(asm.contains("OpFOrdGreaterThan"), "{asm}");
-    assert!(asm.contains("OpFOrdLessThan"), "{asm}");
+    assert!(!asm.contains("OpCapability DenormFlushToZero"), "{asm}");
+    assert!(!asm.contains("DenormFlushToZero"), "{asm}");
+    assert!(!asm.contains("65504"), "{asm}");
+    assert!(!asm.contains("-65504"), "{asm}");
+    assert!(!asm.contains("OpFOrdGreaterThan"), "{asm}");
+    assert!(!asm.contains("OpFOrdLessThan"), "{asm}");
     assert!(asm.contains("OpFConvert"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")

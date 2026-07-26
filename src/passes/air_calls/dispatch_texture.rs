@@ -830,7 +830,23 @@ pub(in crate::passes) fn lower_calculate_unclamped_lod_texture_2d(
     }
     let (img_ty, _, _, _) = sampled_operand_image_info(ctx, img, dim, false, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
-    let samp = valid_sampler_value(ctx, args[1], &mut out)?;
+    let samp = if comp == crate::passes::ImageComp::Float {
+        valid_sampler_value(ctx, args[1], &mut out)?
+    } else {
+        // Vulkan rejects linear-filter samplers paired with integer sampled images even for LOD
+        // queries. The query only needs a valid sampler/image pair, not the AIR filter mode, so use
+        // the translator-owned nearest sampler for integer textures.
+        let var = ctx.default_read_sampler();
+        let sty = ctx.ty_sampler();
+        let id = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::Load,
+            Some(sty),
+            Some(id),
+            vec![Operand::IdRef(var)],
+        ));
+        id
+    };
     let si = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::SampledImage,

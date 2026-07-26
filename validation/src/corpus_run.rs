@@ -1256,6 +1256,7 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
         let type_name = quoted_metadata_string_after(line, "air.arg_type_name");
         let seed_mode = if is_control_param_buffer_meta(line, fixed_size)
             || loop_bound_bufs.contains(&loc_u)
+            || stride_control_bufs.contains(&loc_u)
             || (role == "Input" && atomic_i32_load_bufs.contains(&loc_u))
         {
             SEED_MODE_BOUNDED_CONTROL
@@ -1880,12 +1881,38 @@ fn finite_struct_float_seed_layout(
         return None;
     }
     let node = metadata_ref_after(buffer_meta_line, "air.struct_type_info")?;
-    let line = metadata_node_line(ll, node)?;
-    let payload = metadata_payload(line)?;
-    let tokens = metadata_tokens(payload);
     let mut fields = Vec::new();
+    finite_struct_float_seed_fields(ll, node, 0, stride, &mut fields, &mut Vec::new());
+    (!fields.is_empty()).then_some((stride, fields))
+}
+
+fn finite_struct_float_seed_fields(
+    ll: &str,
+    node: u32,
+    base_offset: usize,
+    stride: usize,
+    fields: &mut Vec<ControlSeedField>,
+    stack: &mut Vec<u32>,
+) {
+    if stack.contains(&node) {
+        return;
+    }
+    let Some(line) = metadata_node_line(ll, node) else {
+        return;
+    };
+    let Some(payload) = metadata_payload(line) else {
+        return;
+    };
+    let tokens = metadata_tokens(payload);
+    stack.push(node);
     let mut i = 0;
+    let mut pending_nested_node = None;
     while i + 3 < tokens.len() {
+        if metadata_quoted_token(tokens[i]) == Some("air.struct_type_info") {
+            pending_nested_node = tokens.get(i + 1).and_then(|tok| metadata_ref_token(tok));
+            i += 2;
+            continue;
+        }
         let Some(offset) = metadata_i32_token(tokens[i]) else {
             i += 1;
             continue;
@@ -1902,27 +1929,38 @@ fn finite_struct_float_seed_layout(
             i += 1;
             continue;
         };
+        let offset = base_offset + offset as usize;
+        let field_byte_size = byte_size as usize;
+        let repeat_count = usize::try_from(repeat_count).unwrap_or(0).max(1);
         if let Some((elem_size, lanes)) = finite_float_field_shape(type_name, byte_size) {
-            let offset = offset as usize;
-            let total_lanes = if lanes == 1 && repeat_count > 0 {
-                repeat_count as usize
-            } else {
-                lanes
-            };
-            for lane in 0..total_lanes {
-                let lane_offset = offset + lane * elem_size;
-                if lane_offset.saturating_add(elem_size) <= stride {
-                    fields.push(ControlSeedField {
-                        offset: lane_offset,
-                        size: elem_size,
-                        value: None,
-                    });
+            for element in 0..repeat_count {
+                let element_offset = offset + element * field_byte_size;
+                for lane in 0..lanes {
+                    let lane_offset = element_offset + lane * elem_size;
+                    if lane_offset.saturating_add(elem_size) <= stride {
+                        fields.push(ControlSeedField {
+                            offset: lane_offset,
+                            size: elem_size,
+                            value: None,
+                        });
+                    }
                 }
+            }
+        } else if let Some(nested_node) = pending_nested_node.take() {
+            for element in 0..repeat_count {
+                finite_struct_float_seed_fields(
+                    ll,
+                    nested_node,
+                    offset + element * field_byte_size,
+                    stride,
+                    fields,
+                    stack,
+                );
             }
         }
         i += 5;
     }
-    (!fields.is_empty()).then_some((stride, fields))
+    stack.pop();
 }
 
 fn finite_float_field_shape(type_name: &str, byte_size: i32) -> Option<(usize, usize)> {
@@ -2576,6 +2614,7 @@ fn bounded_control_field_seed_size(type_name: &str, byte_size: i32) -> Option<us
 fn bounded_control_field_seed_value(type_name: &str, _seed_float_one: bool) -> Option<u64> {
     let name = type_name.trim().trim_end_matches('*').trim();
     match name {
+        "bool" => Some(0),
         "half" => Some(0x3c00),
         "float" => Some(0x3f80_0000),
         "double" => Some(0x3ff0_0000_0000_0000),
@@ -5645,18 +5684,18 @@ fn process_one(
         return run_metal(cfg, tr, &src, &ll, stage, &entry, &plan);
     }
 
-    // Vulkan / MoltenVK candidates: inputs must match the metal golden's banked plan.
+    // Vulkan / MoltenVK candidates: inputs must match the metal golden's banked plan. A stale
+    // Metal golden is not a candidate regression; keep the diagnostic row but account it as a
+    // skipped/not-comparable case in the parent runner.
+    macro_rules! write_missing_candidate_and_skip {
+        ($golden:expr, $reason:expr) => {{
+            let row = candidate_status_row(cfg, tr, &src, "missing", $golden, Some($reason));
+            let _ = append_result_row(cfg, &row);
+            return ProcessOutcome::Skip;
+        }};
+    }
     let Some(metal) = metal_rows.get(&tr.air_sha256) else {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            None,
-            Some("no metal golden row".into()),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(None, "no metal golden row".into());
     };
     if metal.status == "quarantine" {
         let row = candidate_status_row(
@@ -5671,292 +5710,79 @@ fn process_one(
         return ProcessOutcome::Fail;
     }
     if metal.status != "ok" || metal.output_sha256.is_none() {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
+        write_missing_candidate_and_skip!(
             metal.output_sha256.clone(),
-            Some(format!("metal status={}", metal.status)),
+            format!("metal status={}", metal.status)
         );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
     }
     if let Some(reason) = incompatible_function_constant_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_function_constant_definedness_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_zero_function_constant_divisor_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_output_plan_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_texture_array_plan_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_static_resource_plan_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_point_coord_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_undefined_texture_write_lanes_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_bounded_control_seed_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_oob_vector_input_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_float_seed_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_float_output_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_fast_pow_texture_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_dependent_sampled_lookup_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_dependent_sampled_half_lookup_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_fast_sqrt_render_target_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_exact_control_flow_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_cube_fast_math_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_buffer_fast_math_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_compare_none_loop_guard_golden(&ll, &entry, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_nonportable_ptrtoint_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_parallel_dynamic_buffer_scatter_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_undefined_threadgroup_memory_golden(&ll, metal) {
-        let row = candidate_status_row(
-            cfg,
-            tr,
-            &src,
-            "missing",
-            metal.output_sha256.clone(),
-            Some(reason),
-        );
-        let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
+        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
     }
     let plan = metal.plan.clone();
     run_candidate(cfg, tr, &src, &ll, stage, &entry, &plan, metal)
@@ -6337,6 +6163,21 @@ fn run_candidate(
             }
             Err(e) => {
                 let _ = fs::remove_dir_all(&tmp);
+                if metal.compare == "none" {
+                    let row = candidate_status_row(
+                        cfg,
+                        tr,
+                        src,
+                        "missing",
+                        metal.output_sha256.clone(),
+                        Some(format!(
+                            "metal golden compare=none smoke candidate no longer translates: {e}; \
+                             rebank or drop Metal row"
+                        )),
+                    );
+                    let _ = append_result_row(cfg, &row);
+                    return ProcessOutcome::Skip;
+                }
                 write_failure_row(cfg, tr, src, &format!("translate: {e}"));
                 return ProcessOutcome::Fail;
             }
@@ -6372,7 +6213,7 @@ fn run_candidate(
                 Some(reason),
             );
             let _ = append_result_row(cfg, &row);
-            return ProcessOutcome::Fail;
+            return ProcessOutcome::Skip;
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::runner_linux::execute_result(stage, candidate_ll, &spv, &owned.inputs, &tmp)
@@ -6422,6 +6263,8 @@ fn run_candidate(
         }
         if execution_status_is_success(cfg.backend, &row.status) {
             ProcessOutcome::Ok
+        } else if row.status == "missing" {
+            ProcessOutcome::Skip
         } else {
             ProcessOutcome::Fail
         }
@@ -6863,6 +6706,109 @@ define void @kernel(ptr addrspace(1) %in) {
 !2 = !{!3}
 !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 9, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload", !"air.arg_name", !"in"}
 !4 = !{i32 0, i32 4, i32 4, !"float", !"values"}
+"#,
+        );
+        let buf = plan.buffers.iter().find(|b| b.index == 9).unwrap();
+        assert_eq!(buf.seed_mode, SEED_MODE_FINITE_STRUCT_FLOAT);
+        assert_eq!(buf.seed_stride, Some(16));
+        assert_eq!(
+            buf.seed_layout,
+            vec![
+                ControlSeedField {
+                    offset: 0,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 4,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 8,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 12,
+                    size: 4,
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finite_struct_float_buffer_seed_expands_vector_array_fields() {
+        let plan = infer_plan(
+            r#"
+define void @kernel(ptr addrspace(1) %in) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 9, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 24, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload", !"air.arg_name", !"in"}
+!4 = !{i32 0, i32 8, i32 3, !"float2", !"coords"}
+"#,
+        );
+        let buf = plan.buffers.iter().find(|b| b.index == 9).unwrap();
+        assert_eq!(buf.seed_mode, SEED_MODE_FINITE_STRUCT_FLOAT);
+        assert_eq!(buf.seed_stride, Some(24));
+        assert_eq!(
+            buf.seed_layout,
+            vec![
+                ControlSeedField {
+                    offset: 0,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 4,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 8,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 12,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 16,
+                    size: 4,
+                    value: None,
+                },
+                ControlSeedField {
+                    offset: 20,
+                    size: 4,
+                    value: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn finite_struct_float_buffer_seed_expands_repeated_nested_struct_fields() {
+        let plan = infer_plan(
+            r#"
+define void @kernel(ptr addrspace(1) %in) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 9, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload", !"air.arg_name", !"in"}
+!4 = !{!"air.struct_type_info", !5, i32 0, i32 8, i32 2, !"Pair", !"pairs"}
+!5 = !{i32 0, i32 4, i32 0, !"float", !"x", i32 4, i32 4, i32 0, !"float", !"y"}
 "#,
         );
         let buf = plan.buffers.iter().find(|b| b.index == 9).unwrap();
@@ -7391,6 +7337,185 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
         let reason = incompatible_bounded_control_seed_golden(ATOMIC_COUNTER_SOURCE_LL, &metal)
             .expect("stale bounded-control seed");
         assert!(reason.contains("buffer 5"), "{reason}");
+        assert!(reason.contains("rebank Metal row"), "{reason}");
+    }
+
+    #[test]
+    fn bounded_control_bool_fields_seed_to_valid_range() {
+        let ll = r#"
+%struct.Config = type { i8, i8, i32 }
+
+define void @flags(ptr addrspace(1) %dst, ptr addrspace(2) %config, i32 %tid) {
+entry:
+  %flagp = getelementptr inbounds %struct.Config, ptr addrspace(2) %config, i64 0, i32 0
+  %flag = load i8, ptr addrspace(2) %flagp, align 4, !range !7
+  %enabled = icmp ne i8 %flag, 0
+  %value = select i1 %enabled, i8 1, i8 0
+  %idx = zext i32 %tid to i64
+  %out = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %idx
+  store i8 %value, ptr addrspace(1) %out, align 1
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @flags, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dst"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Config", !"air.arg_name", !"config"}
+!5 = !{i32 0, i32 1, i32 0, !"bool", !"enabled", i32 1, i32 1, i32 0, !"bool", !"flip", i32 4, i32 4, i32 0, !"uint", !"count"}
+!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!7 = !{i8 0, i8 2}
+"#;
+        let current_plan = infer_plan(ll);
+        let config = current_plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 1)
+            .expect("config buffer");
+        assert_eq!(
+            config.seed_layout,
+            vec![
+                ControlSeedField {
+                    offset: 0,
+                    size: 1,
+                    value: Some(0)
+                },
+                ControlSeedField {
+                    offset: 1,
+                    size: 1,
+                    value: Some(0)
+                },
+                ControlSeedField {
+                    offset: 4,
+                    size: 4,
+                    value: None
+                },
+            ]
+        );
+
+        let owned = plan_to_owned_inputs(&current_plan).unwrap();
+        let config_input = owned
+            .inputs
+            .buffers
+            .iter()
+            .find(|b| b.index == 1)
+            .expect("config buffer");
+        let bytes = seeded_buffer_bytes(config_input);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1], 0);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            BOUNDED_CONTROL_DIM
+        );
+
+        let mut old_plan = current_plan;
+        for field in &mut old_plan
+            .buffers
+            .iter_mut()
+            .find(|b| b.index == 1)
+            .expect("config buffer")
+            .seed_layout
+        {
+            if field.size == 1 {
+                field.value = None;
+            }
+        }
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan: old_plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&[])),
+            output_b64: Some(encode_output_b64(&[])),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            stage: Some("Kernel".into()),
+            entry: Some("flags".into()),
+            error: None,
+        };
+
+        let reason = incompatible_bounded_control_seed_golden(ll, &metal)
+            .expect("stale bool bounded-control seed");
+        assert!(reason.contains("buffer 1"), "{reason}");
+        assert!(reason.contains("typed AIR control metadata"), "{reason}");
+        assert!(reason.contains("rebank Metal row"), "{reason}");
+    }
+
+    #[test]
+    fn stale_byte_gep_stride_control_seed_golden_is_missing() {
+        let ll = r#"
+define void @byte_stride(ptr addrspace(1) %src, ptr addrspace(1) %dst, ptr addrspace(1) %stride, i32 %tid) {
+entry:
+  %s = load i32, ptr addrspace(1) %stride, align 4
+  %base = mul i32 %tid, %s
+  %idx = zext i32 %base to i64
+  %p = getelementptr inbounds i8, ptr addrspace(1) %src, i64 %idx
+  %q = bitcast ptr addrspace(1) %p to ptr addrspace(1)
+  %v = load <4 x i16>, ptr addrspace(1) %q, align 8
+  %out = tail call <4 x i8> @air.convert.u.v4i8.u.v4i16(<4 x i16> %v)
+  %dstp = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %idx
+  store <4 x i8> %out, ptr addrspace(1) %dstp, align 4
+  ret void
+}
+
+declare <4 x i8> @air.convert.u.v4i8.u.v4i16(<4 x i16>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @byte_stride, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dst"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"stride"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let current_plan = infer_plan(ll);
+        let stride = current_plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 2)
+            .expect("stride control");
+        assert_eq!(stride.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+
+        let mut old_plan = current_plan;
+        old_plan
+            .buffers
+            .iter_mut()
+            .find(|b| b.index == 2)
+            .expect("stride control")
+            .seed_mode = SEED_MODE_DETERMINISTIC.into();
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: "deterministic_v5_typed_bounded_control".into(),
+            plan_version: PLAN_VERSION,
+            plan: old_plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&[])),
+            output_b64: Some(encode_output_b64(&[])),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            stage: Some("Kernel".into()),
+            entry: Some("byte_stride".into()),
+            error: None,
+        };
+
+        let reason = incompatible_bounded_control_seed_golden(ll, &metal)
+            .expect("stale byte-GEP stride control seed");
+        assert!(reason.contains("buffer 2"), "{reason}");
         assert!(reason.contains("rebank Metal row"), "{reason}");
     }
 

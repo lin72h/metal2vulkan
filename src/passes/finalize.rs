@@ -117,7 +117,6 @@ pub(in crate::passes) fn finalize(
             ],
         ));
     }
-
     let air_ids: HashSet<Word> = air_names(&ctx.module).keys().copied().collect();
     ctx.module.functions.retain(|function| {
         let is_decl = function.blocks.is_empty();
