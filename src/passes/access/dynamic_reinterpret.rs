@@ -326,6 +326,757 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_reinterpret(
     Ok(())
 }
 
+/// Rewrite an invalid dynamic sub-word view of a raw word buffer-block element.
+///
+/// This is the sub-word sibling of [`rewrite_dynamic_struct_index_reinterpret`]. Raw-buffer retries
+/// model device memory as `{ RuntimeArray<uint> }`; a later typed `half*`/`ushort*`/`uchar*` view can
+/// survive as `OpInBoundsAccessChain %ptr_half %buf %dyn`, which is invalid because `%dyn` indexes the
+/// wrapper struct. It is also not a same-width reinterpret: `%dyn` is a sub-word element index over a
+/// 32-bit backing word. The byte-correct lowering uses `%dyn / lanes_per_word` to address member-0's
+/// `uint` word and `%dyn & (lanes_per_word - 1)` to extract or replace the selected 8/16-bit lane.
+///
+/// Floor-safe gates: one non-constant index, `StorageBuffer`, base pointee exactly a single-member
+/// array/runtime-array of unsigned 32-bit words, result pointee exactly an 8/16-bit int/float scalar, and
+/// every use is a plain `OpLoad`/`OpStore` of that pointee. Anything else remains visible to
+/// spirv-val instead of guessing.
+#[derive(Clone, Copy)]
+struct DynamicSubwordPlan {
+    bi: usize,
+    ii: usize,
+    opcode: Op,
+    ac_id: Word,
+    base: Word,
+    dyn_idx: Word,
+    index_ty: Word,
+    result_pointee: Word,
+    result_bits: u32,
+}
+
+pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*sc, *pointee));
+            }
+        }
+    }
+
+    let mut plans = Vec::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                || inst.operands.len() != 2
+            {
+                continue;
+            }
+            let (Some(ac_id), Some(result_ptr_ty)) = (inst.result_id, inst.result_type) else {
+                continue;
+            };
+            let Some(&(sc, result_pointee)) = ptr_info.get(&result_ptr_ty) else {
+                continue;
+            };
+            let Some(result_bits) = direct_scalar_width(ctx, result_pointee) else {
+                continue;
+            };
+            if sc != StorageClass::StorageBuffer
+                || !(8..32).contains(&result_bits)
+                || 32 % result_bits != 0
+            {
+                continue;
+            }
+            let (Some(Operand::IdRef(base)), Some(Operand::IdRef(dyn_idx))) =
+                (inst.operands.first(), inst.operands.get(1))
+            else {
+                continue;
+            };
+            if const_u32(ctx, *dyn_idx).is_some() {
+                continue;
+            }
+            let Some(index_ty) = value_result_type(ctx, *dyn_idx) else {
+                continue;
+            };
+            if type_def_of(ctx, index_ty).is_none_or(|def| def.class.opcode != Op::TypeInt) {
+                continue;
+            }
+            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+                continue;
+            };
+            let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
+                continue;
+            };
+            let Some(elem_ty) = single_member_array_scalar_elem(ctx, base_pointee) else {
+                continue;
+            };
+            if !is_unsigned_int_width(ctx, elem_ty, 32) {
+                continue;
+            }
+            if walk_into_type(ctx, base_pointee, &inst.operands[1..]).is_some() {
+                continue;
+            }
+            plans.push(DynamicSubwordPlan {
+                bi,
+                ii,
+                opcode: inst.class.opcode,
+                ac_id,
+                base: *base,
+                dyn_idx: *dyn_idx,
+                index_ty,
+                result_pointee,
+                result_bits,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let plan_ids: HashSet<Word> = plans.iter().map(|plan| plan.ac_id).collect();
+    let result_pointee_of: HashMap<Word, Word> = plans
+        .iter()
+        .map(|plan| (plan.ac_id, plan.result_pointee))
+        .collect();
+    let mut use_sites: HashMap<Word, Vec<(usize, usize, bool)>> = HashMap::new();
+    let mut disqualified = HashSet::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.result_id.is_some_and(|id| plan_ids.contains(&id))
+                && matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+            {
+                continue;
+            }
+            for chain_id in inst.operands.iter().filter_map(|operand| match operand {
+                Operand::IdRef(id) if plan_ids.contains(id) => Some(*id),
+                _ => None,
+            }) {
+                let exact_load = inst.class.opcode == Op::Load
+                    && inst.operands.len() == 1
+                    && inst.result_type == result_pointee_of.get(&chain_id).copied();
+                let exact_store = inst.class.opcode == Op::Store
+                    && inst.operands.len() == 2
+                    && inst.operands.first() == Some(&Operand::IdRef(chain_id))
+                    && inst.operands.get(1).and_then(|operand| match operand {
+                        Operand::IdRef(value) => value_result_type(ctx, *value),
+                        _ => None,
+                    }) == result_pointee_of.get(&chain_id).copied();
+                if exact_load {
+                    use_sites.entry(chain_id).or_default().push((bi, ii, true));
+                } else if exact_store {
+                    use_sites.entry(chain_id).or_default().push((bi, ii, false));
+                } else {
+                    disqualified.insert(chain_id);
+                }
+            }
+        }
+    }
+    plans.retain(|plan| !disqualified.contains(&plan.ac_id) && use_sites.contains_key(&plan.ac_id));
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let uint = ctx.ty_uint();
+    let ptr_uint = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+    let member0 = ctx.const_uint(0);
+    let chain_at: HashSet<(usize, usize)> = plans.iter().map(|plan| (plan.bi, plan.ii)).collect();
+    let plan_by_id: HashMap<Word, DynamicSubwordPlan> =
+        plans.iter().map(|plan| (plan.ac_id, *plan)).collect();
+    let use_at: HashMap<(usize, usize), Word> = plans
+        .iter()
+        .flat_map(|plan| {
+            use_sites
+                .get(&plan.ac_id)
+                .into_iter()
+                .flatten()
+                .map(move |&(bi, ii, _)| ((bi, ii), plan.ac_id))
+        })
+        .collect();
+
+    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
+    for bi in 0..n_blocks {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len() + 10);
+        for (ii, inst) in old.into_iter().enumerate() {
+            if chain_at.contains(&(bi, ii)) {
+                continue;
+            }
+            let Some(chain_id) = use_at.get(&(bi, ii)).copied() else {
+                rewritten.push(inst);
+                continue;
+            };
+            let plan = plan_by_id[&chain_id];
+            let (word_ptr, shift_bits) =
+                emit_dynamic_halfword_address(ctx, &plan, ptr_uint, member0, &mut rewritten);
+            match inst.class.opcode {
+                Op::Load => {
+                    let result_uint_ty = uint_type_of_width(ctx, plan.result_bits);
+                    let result = inst.result_id.ok_or("subword load has a result id")?;
+                    let loaded_word = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::Load,
+                        Some(uint),
+                        Some(loaded_word),
+                        vec![Operand::IdRef(word_ptr)],
+                    ));
+                    let shifted = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::ShiftRightLogical,
+                        Some(uint),
+                        Some(shifted),
+                        vec![Operand::IdRef(loaded_word), Operand::IdRef(shift_bits)],
+                    ));
+                    let mask = ctx.const_uint((1u32 << plan.result_bits) - 1);
+                    let masked = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::BitwiseAnd,
+                        Some(uint),
+                        Some(masked),
+                        vec![Operand::IdRef(shifted), Operand::IdRef(mask)],
+                    ));
+                    let narrowed = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::UConvert,
+                        Some(result_uint_ty),
+                        Some(narrowed),
+                        vec![Operand::IdRef(masked)],
+                    ));
+                    let op = if plan.result_pointee == result_uint_ty {
+                        Op::CopyObject
+                    } else {
+                        Op::Bitcast
+                    };
+                    rewritten.push(Instruction::new(
+                        op,
+                        Some(plan.result_pointee),
+                        Some(result),
+                        vec![Operand::IdRef(narrowed)],
+                    ));
+                }
+                Op::Store => {
+                    let result_uint_ty = uint_type_of_width(ctx, plan.result_bits);
+                    let object = match inst.operands.get(1) {
+                        Some(Operand::IdRef(value)) => *value,
+                        _ => return Err("subword store lost its object operand".to_string()),
+                    };
+                    let object_bits = if plan.result_pointee == result_uint_ty {
+                        object
+                    } else {
+                        let bits = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::Bitcast,
+                            Some(result_uint_ty),
+                            Some(bits),
+                            vec![Operand::IdRef(object)],
+                        ));
+                        bits
+                    };
+                    let object_word = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::UConvert,
+                        Some(uint),
+                        Some(object_word),
+                        vec![Operand::IdRef(object_bits)],
+                    ));
+                    let shifted_object = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::ShiftLeftLogical,
+                        Some(uint),
+                        Some(shifted_object),
+                        vec![Operand::IdRef(object_word), Operand::IdRef(shift_bits)],
+                    ));
+                    let lane_mask_base = ctx.const_uint((1u32 << plan.result_bits) - 1);
+                    let lane_mask = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::ShiftLeftLogical,
+                        Some(uint),
+                        Some(lane_mask),
+                        vec![Operand::IdRef(lane_mask_base), Operand::IdRef(shift_bits)],
+                    ));
+                    let keep_mask = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::Not,
+                        Some(uint),
+                        Some(keep_mask),
+                        vec![Operand::IdRef(lane_mask)],
+                    ));
+                    let old_word = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::Load,
+                        Some(uint),
+                        Some(old_word),
+                        vec![Operand::IdRef(word_ptr)],
+                    ));
+                    let kept_word = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::BitwiseAnd,
+                        Some(uint),
+                        Some(kept_word),
+                        vec![Operand::IdRef(old_word), Operand::IdRef(keep_mask)],
+                    ));
+                    let merged = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::BitwiseOr,
+                        Some(uint),
+                        Some(merged),
+                        vec![Operand::IdRef(kept_word), Operand::IdRef(shifted_object)],
+                    ));
+                    rewritten.push(Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(word_ptr), Operand::IdRef(merged)],
+                    ));
+                }
+                _ => return Err("subword dynamic-chain use was not load/store".to_string()),
+            }
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+    Ok(())
+}
+
+fn is_unsigned_int_width(ctx: &Ctx, ty: Word, bits: u32) -> bool {
+    type_def_of(ctx, ty).is_some_and(|def| {
+        def.class.opcode == Op::TypeInt
+            && def.operands.first() == Some(&Operand::LiteralBit32(bits))
+            && def.operands.get(1) == Some(&Operand::LiteralBit32(0))
+    })
+}
+
+fn emit_dynamic_halfword_address(
+    ctx: &mut Ctx,
+    plan: &DynamicSubwordPlan,
+    ptr_uint: Word,
+    member0: Word,
+    out: &mut Vec<Instruction>,
+) -> (Word, Word) {
+    let lanes_per_word = 32 / plan.result_bits;
+    let divisor = ctx.const_int_of(plan.index_ty, i64::from(lanes_per_word));
+    let word_idx = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UDiv,
+        Some(plan.index_ty),
+        Some(word_idx),
+        vec![Operand::IdRef(plan.dyn_idx), Operand::IdRef(divisor)],
+    ));
+    let lane_mask = ctx.const_int_of(plan.index_ty, i64::from(lanes_per_word - 1));
+    let lane = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(plan.index_ty),
+        Some(lane),
+        vec![Operand::IdRef(plan.dyn_idx), Operand::IdRef(lane_mask)],
+    ));
+    let uint = ctx.ty_uint();
+    let lane32 = if plan.index_ty == uint {
+        lane
+    } else {
+        let converted = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::UConvert,
+            Some(uint),
+            Some(converted),
+            vec![Operand::IdRef(lane)],
+        ));
+        converted
+    };
+    let lane_bits = ctx.const_uint(plan.result_bits);
+    let shift_bits = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IMul,
+        Some(uint),
+        Some(shift_bits),
+        vec![Operand::IdRef(lane32), Operand::IdRef(lane_bits)],
+    ));
+    let word_ptr = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        plan.opcode,
+        Some(ptr_uint),
+        Some(word_ptr),
+        vec![
+            Operand::IdRef(plan.base),
+            Operand::IdRef(member0),
+            Operand::IdRef(word_idx),
+        ],
+    ));
+    (word_ptr, shift_bits)
+}
+
+#[derive(Clone, Copy)]
+struct DynamicWideWordPlan {
+    bi: usize,
+    ii: usize,
+    opcode: Op,
+    ac_id: Word,
+    base: Word,
+    dyn_idx: Word,
+    index_ty: Word,
+    result_pointee: Word,
+    result_bits: u32,
+}
+
+/// Rewrite an invalid dynamic 64-bit scalar view of a raw word buffer-block element.
+///
+/// Raw-buffer retries use `{ RuntimeArray<uint> }`. A `ulong*`/`long*`/`double*` view can survive as
+/// `OpInBoundsAccessChain %ptr_ulong %buf %dyn`: the single dynamic index illegally indexes the Block
+/// struct, and the desired element spans two backing words. For plain loads/stores, lower `%dyn` to
+/// `word = dyn * 2`, access member-0 at `word` and `word + 1`, and assemble/split the 64-bit scalar in
+/// little-endian order.
+pub(in crate::passes) fn rewrite_dynamic_struct_index_wide_word_reinterpret(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*sc, *pointee));
+            }
+        }
+    }
+
+    let mut plans = Vec::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                || inst.operands.len() != 2
+            {
+                continue;
+            }
+            let (Some(ac_id), Some(result_ptr_ty)) = (inst.result_id, inst.result_type) else {
+                continue;
+            };
+            let Some(&(sc, result_pointee)) = ptr_info.get(&result_ptr_ty) else {
+                continue;
+            };
+            let Some(result_bits) = direct_scalar_width(ctx, result_pointee) else {
+                continue;
+            };
+            if sc != StorageClass::StorageBuffer || result_bits != 64 {
+                continue;
+            }
+            let (Some(Operand::IdRef(base)), Some(Operand::IdRef(dyn_idx))) =
+                (inst.operands.first(), inst.operands.get(1))
+            else {
+                continue;
+            };
+            if const_u32(ctx, *dyn_idx).is_some() {
+                continue;
+            }
+            let Some(index_ty) = value_result_type(ctx, *dyn_idx) else {
+                continue;
+            };
+            if type_def_of(ctx, index_ty).is_none_or(|def| def.class.opcode != Op::TypeInt) {
+                continue;
+            }
+            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+                continue;
+            };
+            let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
+                continue;
+            };
+            let Some(elem_ty) = single_member_array_scalar_elem(ctx, base_pointee) else {
+                continue;
+            };
+            if !is_unsigned_int_width(ctx, elem_ty, 32) {
+                continue;
+            }
+            if walk_into_type(ctx, base_pointee, &inst.operands[1..]).is_some() {
+                continue;
+            }
+            plans.push(DynamicWideWordPlan {
+                bi,
+                ii,
+                opcode: inst.class.opcode,
+                ac_id,
+                base: *base,
+                dyn_idx: *dyn_idx,
+                index_ty,
+                result_pointee,
+                result_bits,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let plan_ids: HashSet<Word> = plans.iter().map(|plan| plan.ac_id).collect();
+    let result_pointee_of: HashMap<Word, Word> = plans
+        .iter()
+        .map(|plan| (plan.ac_id, plan.result_pointee))
+        .collect();
+    let mut use_sites: HashMap<Word, Vec<(usize, usize, bool)>> = HashMap::new();
+    let mut disqualified = HashSet::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.result_id.is_some_and(|id| plan_ids.contains(&id))
+                && matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+            {
+                continue;
+            }
+            for chain_id in inst.operands.iter().filter_map(|operand| match operand {
+                Operand::IdRef(id) if plan_ids.contains(id) => Some(*id),
+                _ => None,
+            }) {
+                let exact_load = inst.class.opcode == Op::Load
+                    && inst.operands.len() == 1
+                    && inst.result_type == result_pointee_of.get(&chain_id).copied();
+                let exact_store = inst.class.opcode == Op::Store
+                    && inst.operands.len() == 2
+                    && inst.operands.first() == Some(&Operand::IdRef(chain_id))
+                    && inst.operands.get(1).and_then(|operand| match operand {
+                        Operand::IdRef(value) => value_result_type(ctx, *value),
+                        _ => None,
+                    }) == result_pointee_of.get(&chain_id).copied();
+                if exact_load {
+                    use_sites.entry(chain_id).or_default().push((bi, ii, true));
+                } else if exact_store {
+                    use_sites.entry(chain_id).or_default().push((bi, ii, false));
+                } else {
+                    disqualified.insert(chain_id);
+                }
+            }
+        }
+    }
+    plans.retain(|plan| !disqualified.contains(&plan.ac_id) && use_sites.contains_key(&plan.ac_id));
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let uint = ctx.ty_uint();
+    let ptr_uint = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+    let member0 = ctx.const_uint(0);
+    let chain_at: HashSet<(usize, usize)> = plans.iter().map(|plan| (plan.bi, plan.ii)).collect();
+    let plan_by_id: HashMap<Word, DynamicWideWordPlan> =
+        plans.iter().map(|plan| (plan.ac_id, *plan)).collect();
+    let use_at: HashMap<(usize, usize), Word> = plans
+        .iter()
+        .flat_map(|plan| {
+            use_sites
+                .get(&plan.ac_id)
+                .into_iter()
+                .flatten()
+                .map(move |&(bi, ii, _)| ((bi, ii), plan.ac_id))
+        })
+        .collect();
+
+    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
+    for bi in 0..n_blocks {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len() + 10);
+        for (ii, inst) in old.into_iter().enumerate() {
+            if chain_at.contains(&(bi, ii)) {
+                continue;
+            }
+            let Some(chain_id) = use_at.get(&(bi, ii)).copied() else {
+                rewritten.push(inst);
+                continue;
+            };
+            let plan = plan_by_id[&chain_id];
+            let result_uint_ty = uint_type_of_width(ctx, plan.result_bits);
+            let word_base = emit_dynamic_wide_word_base(ctx, &plan, &mut rewritten);
+            match inst.class.opcode {
+                Op::Load => {
+                    let result = inst.result_id.ok_or("wide-word load has a result id")?;
+                    let mut assembled: Option<Word> = None;
+                    for word_lane in 0..2 {
+                        let word_ptr = emit_dynamic_word_lane_pointer(
+                            ctx,
+                            &plan,
+                            ptr_uint,
+                            member0,
+                            word_base,
+                            word_lane,
+                            &mut rewritten,
+                        );
+                        let loaded = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::Load,
+                            Some(uint),
+                            Some(loaded),
+                            vec![Operand::IdRef(word_ptr)],
+                        ));
+                        let widened = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::UConvert,
+                            Some(result_uint_ty),
+                            Some(widened),
+                            vec![Operand::IdRef(loaded)],
+                        ));
+                        let placed = if word_lane == 0 {
+                            widened
+                        } else {
+                            let shift = ctx.const_uint(32);
+                            let id = ctx.module.fresh_id();
+                            rewritten.push(Instruction::new(
+                                Op::ShiftLeftLogical,
+                                Some(result_uint_ty),
+                                Some(id),
+                                vec![Operand::IdRef(widened), Operand::IdRef(shift)],
+                            ));
+                            id
+                        };
+                        assembled = Some(match assembled {
+                            None => placed,
+                            Some(prev) => {
+                                let id = ctx.module.fresh_id();
+                                rewritten.push(Instruction::new(
+                                    Op::BitwiseOr,
+                                    Some(result_uint_ty),
+                                    Some(id),
+                                    vec![Operand::IdRef(prev), Operand::IdRef(placed)],
+                                ));
+                                id
+                            }
+                        });
+                    }
+                    let packed =
+                        assembled.ok_or("wide-word load should assemble at least one word")?;
+                    let op = if plan.result_pointee == result_uint_ty {
+                        Op::CopyObject
+                    } else {
+                        Op::Bitcast
+                    };
+                    rewritten.push(Instruction::new(
+                        op,
+                        Some(plan.result_pointee),
+                        Some(result),
+                        vec![Operand::IdRef(packed)],
+                    ));
+                }
+                Op::Store => {
+                    let object = match inst.operands.get(1) {
+                        Some(Operand::IdRef(value)) => *value,
+                        _ => return Err("wide-word store lost its object operand".to_string()),
+                    };
+                    let object_bits = if plan.result_pointee == result_uint_ty {
+                        object
+                    } else {
+                        let bits = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::Bitcast,
+                            Some(result_uint_ty),
+                            Some(bits),
+                            vec![Operand::IdRef(object)],
+                        ));
+                        bits
+                    };
+                    for word_lane in 0..2 {
+                        let shifted = if word_lane == 0 {
+                            object_bits
+                        } else {
+                            let shift = ctx.const_uint(32);
+                            let id = ctx.module.fresh_id();
+                            rewritten.push(Instruction::new(
+                                Op::ShiftRightLogical,
+                                Some(result_uint_ty),
+                                Some(id),
+                                vec![Operand::IdRef(object_bits), Operand::IdRef(shift)],
+                            ));
+                            id
+                        };
+                        let word_value = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::UConvert,
+                            Some(uint),
+                            Some(word_value),
+                            vec![Operand::IdRef(shifted)],
+                        ));
+                        let word_ptr = emit_dynamic_word_lane_pointer(
+                            ctx,
+                            &plan,
+                            ptr_uint,
+                            member0,
+                            word_base,
+                            word_lane,
+                            &mut rewritten,
+                        );
+                        rewritten.push(Instruction::new(
+                            Op::Store,
+                            None,
+                            None,
+                            vec![Operand::IdRef(word_ptr), Operand::IdRef(word_value)],
+                        ));
+                    }
+                }
+                _ => return Err("wide-word dynamic-chain use was not load/store".to_string()),
+            }
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+    Ok(())
+}
+
+fn emit_dynamic_wide_word_base(
+    ctx: &mut Ctx,
+    plan: &DynamicWideWordPlan,
+    out: &mut Vec<Instruction>,
+) -> Word {
+    let words_per_value = ctx.const_int_of(plan.index_ty, i64::from(plan.result_bits / 32));
+    let word_base = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IMul,
+        Some(plan.index_ty),
+        Some(word_base),
+        vec![
+            Operand::IdRef(plan.dyn_idx),
+            Operand::IdRef(words_per_value),
+        ],
+    ));
+    word_base
+}
+
+fn emit_dynamic_word_lane_pointer(
+    ctx: &mut Ctx,
+    plan: &DynamicWideWordPlan,
+    ptr_uint: Word,
+    member0: Word,
+    word_base: Word,
+    word_lane: u32,
+    out: &mut Vec<Instruction>,
+) -> Word {
+    let word_index = if word_lane == 0 {
+        word_base
+    } else {
+        let offset = ctx.const_int_of(plan.index_ty, i64::from(word_lane));
+        let id = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::IAdd,
+            Some(plan.index_ty),
+            Some(id),
+            vec![Operand::IdRef(word_base), Operand::IdRef(offset)],
+        ));
+        id
+    };
+    let ptr = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        plan.opcode,
+        Some(ptr_uint),
+        Some(ptr),
+        vec![
+            Operand::IdRef(plan.base),
+            Operand::IdRef(member0),
+            Operand::IdRef(word_index),
+        ],
+    ));
+    ptr
+}
+
 /// Rewrite an invalid dynamic vector view of a single-member runtime-array buffer into scalar lane
 /// loads or stores.  This is the vector counterpart of
 /// [`rewrite_dynamic_struct_index_reinterpret`]: LLVM's `getelementptr <N x T>, ptr %buf, i` can
@@ -537,7 +1288,7 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_vector_reinterpret(
                 rewritten.push(inst);
                 continue;
             };
-            let plan = plan_by_id[&chain_id];
+            let plan = &plan_by_id[&chain_id];
             let lane_base = ctx.module.fresh_id();
             let lane_factor = ctx.const_int_of(plan.index_ty, i64::from(plan.lanes));
             rewritten.push(Instruction::new(
@@ -643,6 +1394,316 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_vector_reinterpret(
                     }
                 }
                 _ => return Err("vector dynamic-chain use was not load/store".to_string()),
+            }
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+    Ok(())
+}
+
+/// Replace an invalid dynamic member access into a homogeneous struct with value selection.
+///
+/// LLVM bitcasts sometimes expose `[N x T]` private/function storage as a SPIR-V `OpTypeStruct`
+/// containing N identical `T` members. A dynamic `getelementptr` into the original array then becomes
+/// `OpInBoundsAccessChain %ptr_T %base %dyn`, which is invalid because SPIR-V struct indices must be
+/// constants. If every struct member has the same type and the dynamic pointer is only loaded, the
+/// value is exactly a select over constant-member loads.
+pub(in crate::passes) fn rewrite_dynamic_homogeneous_struct_index_load(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*sc, *pointee));
+            }
+        }
+    }
+
+    fn homogeneous_struct_member_path(
+        ctx: &Ctx,
+        ty: Word,
+        result_pointee: Word,
+    ) -> Option<(Word, u32, Vec<u32>)> {
+        let def = type_def_of(ctx, ty)?;
+        if def.class.opcode != Op::TypeStruct || def.operands.is_empty() {
+            return None;
+        }
+        let first = match def.operands.first()? {
+            Operand::IdRef(member) => *member,
+            _ => return None,
+        };
+        if def
+            .operands
+            .iter()
+            .all(|operand| matches!(operand, Operand::IdRef(member) if *member == first))
+            && first == result_pointee
+        {
+            return Some((first, def.operands.len() as u32, Vec::new()));
+        }
+        if def.operands.len() == 1 {
+            let (member, len, mut prefix) =
+                homogeneous_struct_member_path(ctx, first, result_pointee)?;
+            prefix.insert(0, 0);
+            Some((member, len, prefix))
+        } else {
+            None
+        }
+    }
+    let bool_select_type = |ctx: &mut Ctx, ty: Word| -> Option<Word> {
+        match type_def_of(ctx, ty).map(|def| def.class.opcode) {
+            Some(Op::TypeInt | Op::TypeFloat | Op::TypeBool | Op::TypePointer) => {
+                Some(ctx.ty_bool())
+            }
+            Some(Op::TypeVector) => {
+                let def = type_def_of(ctx, ty)?;
+                let Some(Operand::LiteralBit32(lanes)) = def.operands.get(1) else {
+                    return None;
+                };
+                Some(ctx.ty_vec_bool(*lanes))
+            }
+            _ => None,
+        }
+    };
+    let selectable_member_type = |ctx: &Ctx, ty: Word| -> bool {
+        match type_def_of(ctx, ty).map(|def| def.class.opcode) {
+            Some(Op::TypeInt | Op::TypeFloat | Op::TypeBool | Op::TypePointer) => true,
+            Some(Op::TypeVector) => type_def_of(ctx, ty)
+                .is_some_and(|def| matches!(def.operands.get(1), Some(Operand::LiteralBit32(_)))),
+            _ => false,
+        }
+    };
+
+    #[derive(Clone)]
+    struct Plan {
+        bi: usize,
+        ii: usize,
+        chain_id: Word,
+        base: Word,
+        dyn_idx: Word,
+        index_ty: Word,
+        member_ty: Word,
+        ptr_ty: Word,
+        opcode: Op,
+        members: u32,
+        prefix: Vec<u32>,
+    }
+    let mut plans = Vec::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                || inst.operands.len() != 2
+            {
+                continue;
+            }
+            let (Some(chain_id), Some(ptr_ty)) = (inst.result_id, inst.result_type) else {
+                continue;
+            };
+            let Some(&(_, result_pointee)) = ptr_info.get(&ptr_ty) else {
+                continue;
+            };
+            let (Some(Operand::IdRef(base)), Some(Operand::IdRef(dyn_idx))) =
+                (inst.operands.first(), inst.operands.get(1))
+            else {
+                continue;
+            };
+            if const_u32(ctx, *dyn_idx).is_some() {
+                continue;
+            }
+            let Some(index_ty) = value_result_type(ctx, *dyn_idx) else {
+                continue;
+            };
+            if type_def_of(ctx, index_ty).is_none_or(|def| def.class.opcode != Op::TypeInt) {
+                continue;
+            }
+            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+                continue;
+            };
+            let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
+                continue;
+            };
+            let Some((member_ty, members, prefix)) =
+                homogeneous_struct_member_path(ctx, base_pointee, result_pointee)
+            else {
+                continue;
+            };
+            if !selectable_member_type(ctx, member_ty) {
+                continue;
+            }
+            plans.push(Plan {
+                bi,
+                ii,
+                chain_id,
+                base: *base,
+                dyn_idx: *dyn_idx,
+                index_ty,
+                member_ty,
+                ptr_ty,
+                opcode: inst.class.opcode,
+                members,
+                prefix,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let plan_ids: HashSet<Word> = plans.iter().map(|plan| plan.chain_id).collect();
+    let mut use_sites: HashMap<Word, Vec<(usize, usize)>> = HashMap::new();
+    let mut disqualified = HashSet::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if inst.result_id.is_some_and(|id| plan_ids.contains(&id))
+                && matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+            {
+                continue;
+            }
+            for chain_id in inst.operands.iter().filter_map(|operand| match operand {
+                Operand::IdRef(id) if plan_ids.contains(id) => Some(*id),
+                _ => None,
+            }) {
+                if inst.class.opcode == Op::Load
+                    && inst.operands.len() == 1
+                    && matches!(inst.operands.first(), Some(Operand::IdRef(id)) if *id == chain_id)
+                {
+                    use_sites.entry(chain_id).or_default().push((bi, ii));
+                } else {
+                    disqualified.insert(chain_id);
+                }
+            }
+        }
+    }
+    plans.retain(|plan| {
+        !disqualified.contains(&plan.chain_id) && use_sites.contains_key(&plan.chain_id)
+    });
+    if plans.is_empty() {
+        return Ok(());
+    }
+
+    let plan_by_id: HashMap<Word, Plan> = plans
+        .iter()
+        .map(|plan| (plan.chain_id, plan.clone()))
+        .collect();
+    let chain_at: HashMap<(usize, usize), Word> = plans
+        .iter()
+        .map(|plan| ((plan.bi, plan.ii), plan.chain_id))
+        .collect();
+    let use_at: HashMap<(usize, usize), Word> = plans
+        .iter()
+        .flat_map(|plan| {
+            use_sites
+                .get(&plan.chain_id)
+                .into_iter()
+                .flatten()
+                .map(move |&(bi, ii)| ((bi, ii), plan.chain_id))
+        })
+        .collect();
+
+    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
+    for bi in 0..n_blocks {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len() + 16);
+        for (ii, inst) in old.into_iter().enumerate() {
+            if chain_at.contains_key(&(bi, ii)) {
+                continue;
+            }
+            let Some(chain_id) = use_at.get(&(bi, ii)).copied() else {
+                rewritten.push(inst);
+                continue;
+            };
+            let plan = &plan_by_id[&chain_id];
+            let result = inst
+                .result_id
+                .ok_or("dynamic homogeneous struct load lost result id")?;
+            let Some(cond_ty) = bool_select_type(ctx, plan.member_ty) else {
+                rewritten.push(inst);
+                continue;
+            };
+            let mut selected = None;
+            for member in 0..plan.members {
+                let member_idx = ctx.const_int_of(plan.index_ty, i64::from(member));
+                let ptr = ctx.module.fresh_id();
+                let mut chain_ops = Vec::with_capacity(plan.prefix.len() + 2);
+                chain_ops.push(Operand::IdRef(plan.base));
+                for prefix in &plan.prefix {
+                    chain_ops.push(Operand::IdRef(ctx.const_uint(*prefix)));
+                }
+                chain_ops.push(Operand::IdRef(member_idx));
+                rewritten.push(Instruction::new(
+                    plan.opcode,
+                    Some(plan.ptr_ty),
+                    Some(ptr),
+                    chain_ops,
+                ));
+                let loaded = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::Load,
+                    Some(plan.member_ty),
+                    Some(loaded),
+                    vec![Operand::IdRef(ptr)],
+                ));
+                let Some(prev) = selected else {
+                    selected = Some(loaded);
+                    continue;
+                };
+                let cmp = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::IEqual,
+                    Some(ctx.ty_bool()),
+                    Some(cmp),
+                    vec![Operand::IdRef(plan.dyn_idx), Operand::IdRef(member_idx)],
+                ));
+                let cond = if cond_ty == ctx.ty_bool() {
+                    cmp
+                } else {
+                    let cond = ctx.module.fresh_id();
+                    let lanes = type_def_of(ctx, cond_ty)
+                        .and_then(|def| match def.operands.get(1) {
+                            Some(Operand::LiteralBit32(lanes)) => Some(*lanes),
+                            _ => None,
+                        })
+                        .ok_or("vector bool type missing lane count")?;
+                    rewritten.push(Instruction::new(
+                        Op::CompositeConstruct,
+                        Some(cond_ty),
+                        Some(cond),
+                        (0..lanes).map(|_| Operand::IdRef(cmp)).collect(),
+                    ));
+                    cond
+                };
+                let select = if member + 1 == plan.members {
+                    result
+                } else {
+                    ctx.module.fresh_id()
+                };
+                rewritten.push(Instruction::new(
+                    Op::Select,
+                    Some(plan.member_ty),
+                    Some(select),
+                    vec![
+                        Operand::IdRef(cond),
+                        Operand::IdRef(loaded),
+                        Operand::IdRef(prev),
+                    ],
+                ));
+                selected = Some(select);
+            }
+            if plan.members == 1 {
+                let selected = selected.ok_or("homogeneous struct member load missing value")?;
+                rewritten.push(Instruction::new(
+                    Op::CopyObject,
+                    Some(plan.member_ty),
+                    Some(result),
+                    vec![Operand::IdRef(selected)],
+                ));
             }
         }
         ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;

@@ -135,6 +135,383 @@ fn is_spirv_memory_write(op: Op) -> bool {
     )
 }
 
+/// Drop byte-addressed Workgroup padding clears that the native emitter can produce from AIR
+/// `llvm.memset.p3` over struct tail padding.
+///
+/// SPIR-V Logical addressing cannot express `OpPtrAccessChain %uchar*` from a `%struct*` base. When
+/// the byte offset does not match any `Offset`-decorated struct member and every use is a zero
+/// `OpStore`, the store only clears padding. Workgroup memory has already been zero-filled by the
+/// harness prologue, and no typed load can observe the padding byte, so removing the invalid chain
+/// and its zero stores is value-preserving.
+pub(crate) fn drop_workgroup_struct_padding_byte_zero_stores_module(module: &mut Module) -> bool {
+    use spirv::Decoration;
+
+    let mut type_defs: HashMap<Word, &Instruction> = HashMap::new();
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    let mut result_type: HashMap<Word, Word> = HashMap::new();
+    let mut constants: HashMap<Word, u64> = HashMap::new();
+    let mut member_offsets: HashMap<Word, HashMap<u32, u32>> = HashMap::new();
+
+    for inst in module.all_inst_iter() {
+        if let Some(id) = inst.result_id {
+            if let Some(ty) = inst.result_type {
+                result_type.insert(id, ty);
+            }
+            match inst.class.opcode {
+                Op::TypeInt | Op::TypePointer | Op::TypeStruct => {
+                    type_defs.insert(id, inst);
+                }
+                Op::Constant => {
+                    let value = match inst.operands.first() {
+                        Some(Operand::LiteralBit32(value)) => u64::from(*value),
+                        Some(Operand::LiteralBit64(value)) => *value,
+                        _ => continue,
+                    };
+                    constants.insert(id, value);
+                }
+                Op::ConstantNull => {
+                    constants.insert(id, 0);
+                }
+                _ => {}
+            }
+        }
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*sc, *pointee));
+            }
+        }
+        if inst.class.opcode == Op::MemberDecorate {
+            let (
+                Some(Operand::IdRef(struct_ty)),
+                Some(Operand::LiteralBit32(member)),
+                Some(Operand::Decoration(Decoration::Offset)),
+                Some(Operand::LiteralBit32(offset)),
+            ) = (
+                inst.operands.first(),
+                inst.operands.get(1),
+                inst.operands.get(2),
+                inst.operands.get(3),
+            )
+            else {
+                continue;
+            };
+            member_offsets
+                .entry(*struct_ty)
+                .or_default()
+                .insert(*member, *offset);
+        }
+    }
+
+    let is_uchar = |ty: Word| -> bool {
+        matches!(
+            type_defs.get(&ty).map(|inst| inst.operands.as_slice()),
+            Some([Operand::LiteralBit32(8), Operand::LiteralBit32(0)])
+        )
+    };
+    fn align_to(value: u32, align: u32) -> u32 {
+        if align <= 1 {
+            value
+        } else {
+            value.div_ceil(align) * align
+        }
+    }
+    fn type_size_align(
+        type_defs: &HashMap<Word, &Instruction>,
+        constants: &HashMap<Word, u64>,
+        ty: Word,
+    ) -> Option<(u32, u32)> {
+        let def = type_defs.get(&ty)?;
+        match def.class.opcode {
+            Op::TypeInt | Op::TypeFloat => {
+                let Some(Operand::LiteralBit32(width)) = def.operands.first() else {
+                    return None;
+                };
+                let bytes = width.div_ceil(8).max(1);
+                Some((bytes, bytes))
+            }
+            Op::TypeVector => {
+                let (Some(Operand::IdRef(component)), Some(Operand::LiteralBit32(count))) =
+                    (def.operands.first(), def.operands.get(1))
+                else {
+                    return None;
+                };
+                let (size, align) = type_size_align(type_defs, constants, *component)?;
+                Some((size.checked_mul(*count)?, align))
+            }
+            Op::TypeArray => {
+                let (Some(Operand::IdRef(element)), Some(Operand::IdRef(length))) =
+                    (def.operands.first(), def.operands.get(1))
+                else {
+                    return None;
+                };
+                let (size, align) = type_size_align(type_defs, constants, *element)?;
+                let count = u32::try_from(*constants.get(length)?).ok()?;
+                Some((align_to(size, align).checked_mul(count)?, align))
+            }
+            Op::TypeStruct => {
+                let mut offset = 0u32;
+                let mut max_align = 1u32;
+                for operand in &def.operands {
+                    let Operand::IdRef(member_ty) = operand else {
+                        return None;
+                    };
+                    let (member_size, member_align) =
+                        type_size_align(type_defs, constants, *member_ty)?;
+                    max_align = max_align.max(member_align);
+                    offset = align_to(offset, member_align);
+                    offset = offset.checked_add(member_size)?;
+                }
+                Some((align_to(offset, max_align), max_align))
+            }
+            _ => None,
+        }
+    }
+    let inferred_struct_offsets = |ty: Word| -> Option<HashSet<u32>> {
+        let def = type_defs.get(&ty)?;
+        if def.class.opcode != Op::TypeStruct {
+            return None;
+        }
+        let mut offsets = HashSet::new();
+        let mut offset = 0u32;
+        for operand in &def.operands {
+            let Operand::IdRef(member_ty) = operand else {
+                return None;
+            };
+            let (member_size, member_align) = type_size_align(&type_defs, &constants, *member_ty)?;
+            offset = align_to(offset, member_align);
+            offsets.insert(offset);
+            offset = offset.checked_add(member_size)?;
+        }
+        Some(offsets)
+    };
+    let is_struct_padding_offset = |ty: Word, offset: u32| -> bool {
+        let Some(def) = type_defs.get(&ty) else {
+            return false;
+        };
+        if def.class.opcode != Op::TypeStruct {
+            return false;
+        }
+        if let Some(offsets) = member_offsets.get(&ty) {
+            return !offsets
+                .values()
+                .any(|member_offset| *member_offset == offset);
+        };
+        inferred_struct_offsets(ty).is_some_and(|offsets| !offsets.contains(&offset))
+    };
+
+    let mut chain_base: HashMap<Word, (usize, usize, usize, Word, u32)> = HashMap::new();
+    for (fi, function) in module.functions.iter().enumerate() {
+        for (bi, block) in function.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if inst.class.opcode != Op::PtrAccessChain || inst.operands.len() != 2 {
+                    continue;
+                }
+                let (Some(chain), Some(result_ptr_ty)) = (inst.result_id, inst.result_type) else {
+                    continue;
+                };
+                let Some(&(StorageClass::Workgroup, result_pointee)) = ptr_info.get(&result_ptr_ty)
+                else {
+                    continue;
+                };
+                if !is_uchar(result_pointee) {
+                    continue;
+                }
+                let (Some(Operand::IdRef(base)), Some(Operand::IdRef(offset_id))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                else {
+                    continue;
+                };
+                let Some(offset) = constants
+                    .get(offset_id)
+                    .and_then(|value| u32::try_from(*value).ok())
+                else {
+                    continue;
+                };
+                let Some(base_ptr_ty) = result_type.get(base).copied() else {
+                    continue;
+                };
+                let Some(&(StorageClass::Workgroup, base_pointee)) = ptr_info.get(&base_ptr_ty)
+                else {
+                    continue;
+                };
+                if is_struct_padding_offset(base_pointee, offset) {
+                    chain_base.insert(chain, (fi, bi, ii, base_pointee, offset));
+                }
+            }
+        }
+    }
+    let mut changed_candidates = true;
+    while changed_candidates {
+        changed_candidates = false;
+        for (fi, function) in module.functions.iter().enumerate() {
+            for (bi, block) in function.blocks.iter().enumerate() {
+                for (ii, inst) in block.instructions.iter().enumerate() {
+                    if inst.class.opcode != Op::PtrAccessChain || inst.operands.len() != 2 {
+                        continue;
+                    }
+                    let (Some(chain), Some(result_ptr_ty)) = (inst.result_id, inst.result_type)
+                    else {
+                        continue;
+                    };
+                    if chain_base.contains_key(&chain) {
+                        continue;
+                    }
+                    let Some(&(StorageClass::Workgroup, result_pointee)) =
+                        ptr_info.get(&result_ptr_ty)
+                    else {
+                        continue;
+                    };
+                    if !is_uchar(result_pointee) {
+                        continue;
+                    }
+                    let (Some(Operand::IdRef(base)), Some(Operand::IdRef(offset_id))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    else {
+                        continue;
+                    };
+                    let Some((_, _, _, root_struct, base_offset)) = chain_base.get(base).copied()
+                    else {
+                        continue;
+                    };
+                    let Some(offset) = constants
+                        .get(offset_id)
+                        .and_then(|value| u32::try_from(*value).ok())
+                        .and_then(|offset| base_offset.checked_add(offset))
+                    else {
+                        continue;
+                    };
+                    if is_struct_padding_offset(root_struct, offset) {
+                        chain_base.insert(chain, (fi, bi, ii, root_struct, offset));
+                        changed_candidates = true;
+                    }
+                }
+            }
+        }
+    }
+    if chain_base.is_empty() {
+        return false;
+    }
+
+    let mut zero_values: HashSet<Word> = constants
+        .iter()
+        .filter_map(|(id, value)| (*value == 0).then_some(*id))
+        .collect();
+    let mut changed_zero = true;
+    while changed_zero {
+        changed_zero = false;
+        for inst in module.all_inst_iter() {
+            let Some(id) = inst.result_id else {
+                continue;
+            };
+            if zero_values.contains(&id) {
+                continue;
+            }
+            let zero_operand0 = inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(value) if zero_values.contains(value)),
+            );
+            let zero = match inst.class.opcode {
+                Op::CopyObject | Op::UConvert | Op::SConvert | Op::Bitcast => zero_operand0,
+                Op::ShiftRightLogical | Op::ShiftRightArithmetic | Op::ShiftLeftLogical => {
+                    zero_operand0
+                }
+                _ => false,
+            };
+            if zero {
+                zero_values.insert(id);
+                changed_zero = true;
+            }
+        }
+    }
+
+    let mut store_sites: HashSet<(usize, usize, usize)> = HashSet::new();
+    let mut disqualified: HashSet<Word> = HashSet::new();
+    for (fi, function) in module.functions.iter().enumerate() {
+        for (bi, block) in function.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                for (oi, operand) in inst.operands.iter().enumerate() {
+                    let Operand::IdRef(id) = operand else {
+                        continue;
+                    };
+                    if !chain_base.contains_key(id) {
+                        continue;
+                    }
+                    if inst.class.opcode == Op::PtrAccessChain
+                        && oi == 0
+                        && inst
+                            .result_id
+                            .is_some_and(|result| chain_base.contains_key(&result))
+                    {
+                        continue;
+                    }
+                    if inst.class.opcode == Op::Store
+                        && oi == 0
+                        && inst.operands.get(1).and_then(|operand| match operand {
+                            Operand::IdRef(value) => zero_values.contains(value).then_some(0),
+                            _ => None,
+                        }) == Some(0)
+                    {
+                        store_sites.insert((fi, bi, ii));
+                    } else {
+                        disqualified.insert(*id);
+                    }
+                }
+            }
+        }
+    }
+    chain_base.retain(|chain, _| !disqualified.contains(chain));
+    if chain_base.is_empty() || store_sites.is_empty() {
+        return false;
+    }
+
+    let chain_sites: HashSet<(usize, usize, usize)> = chain_base
+        .into_values()
+        .map(|(fi, bi, ii, _, _)| (fi, bi, ii))
+        .collect();
+    let mut changed = false;
+    for (fi, function) in module.functions.iter_mut().enumerate() {
+        for (bi, block) in function.blocks.iter_mut().enumerate() {
+            let old = std::mem::take(&mut block.instructions);
+            block.instructions = old
+                .into_iter()
+                .enumerate()
+                .filter_map(|(ii, inst)| {
+                    if chain_sites.contains(&(fi, bi, ii)) || store_sites.contains(&(fi, bi, ii)) {
+                        changed = true;
+                        None
+                    } else {
+                        Some(inst)
+                    }
+                })
+                .collect();
+        }
+    }
+    changed
+}
+
+/// Remove debug/decorate records whose target id was deleted by a prior module rewrite.
+///
+/// Rewrites such as constant-branch pruning can delete function-constant helper globals, and a later
+/// CFG rebuild may preserve their `OpName` records. `OpName` is non-semantic, but SPIR-V still
+/// requires its target id to be defined. This cleanup never touches executable instructions or
+/// interface declarations; it only drops annotations/debug names that already point at nothing.
+pub(crate) fn drop_dangling_debug_targets_module(module: &mut Module) -> bool {
+    let defined: HashSet<Word> = module
+        .all_inst_iter()
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    let target_is_dangling = |inst: &Instruction| -> bool {
+        matches!(inst.operands.first(), Some(Operand::IdRef(id)) if !defined.contains(id))
+    };
+
+    let before_names = module.debug_names.len();
+    let before_annotations = module.annotations.len();
+    module.debug_names.retain(|inst| !target_is_dangling(inst));
+    module.annotations.retain(|inst| !target_is_dangling(inst));
+    module.debug_names.len() != before_names || module.annotations.len() != before_annotations
+}
+
 /// Apply the W1 PhysicalStorageBuffer64 lowering in place. Errors if no cross-binding pointer-merge
 /// sub-graph was rewritten. The caller (the failure-triggered retry) adopts the result ONLY if it
 /// independently validates, so this is floor-safe by construction.
@@ -346,6 +723,7 @@ pub(crate) fn prune_constant_branches_module(module: &mut Module) -> Result<(), 
     if !constfold::prune_constant_branches(module) {
         return Err("native emitter: no constant branch to prune".to_string());
     }
+    drop_dangling_debug_targets_module(module);
     add_native_module_capabilities(module);
     Ok(())
 }
@@ -357,7 +735,9 @@ pub(crate) fn prune_constant_branches_module_preserving(
     preserved_global_ids: &[Word],
 ) -> bool {
     let roots = preserved_global_ids.iter().copied().collect();
-    constfold::prune_constant_branches_preserving(module, &roots)
+    let changed = constfold::prune_constant_branches_preserving(module, &roots);
+    let dropped = drop_dangling_debug_targets_module(module);
+    changed || dropped
 }
 
 /// Whether the module contains an `OpFunctionCall` to a BODILESS `llvm.agx*` hardware-intrinsic
@@ -452,6 +832,282 @@ pub(crate) fn rewrite_to_relooper_module_capped(
     if !relooper::rewrite_to_relooper(module, max_blocks) {
         return Err("native emitter: no function to relooper".to_string());
     }
+    drop_dangling_debug_targets_module(module);
     add_native_module_capabilities(module);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function};
+    use spirv::Decoration;
+
+    fn inst(op: Op, ty: Option<Word>, id: Option<Word>, operands: Vec<Operand>) -> Instruction {
+        Instruction::new(op, ty, id, operands)
+    }
+
+    fn workgroup_struct_byte_store_module(byte_offset: u32) -> Module {
+        let mut module = Module::default();
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeStruct,
+                None,
+                Some(3),
+                vec![Operand::IdRef(2), Operand::IdRef(1)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(4),
+                vec![
+                    Operand::StorageClass(StorageClass::Workgroup),
+                    Operand::IdRef(3),
+                ],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::Workgroup),
+                    Operand::IdRef(1),
+                ],
+            ),
+            inst(
+                Op::Constant,
+                Some(2),
+                Some(6),
+                vec![Operand::LiteralBit32(byte_offset)],
+            ),
+            inst(Op::ConstantNull, Some(1), Some(7), vec![]),
+            inst(
+                Op::Variable,
+                Some(4),
+                Some(8),
+                vec![Operand::StorageClass(StorageClass::Workgroup)],
+            ),
+        ];
+        module.annotations = vec![
+            inst(
+                Op::MemberDecorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(3),
+                    Operand::LiteralBit32(0),
+                    Operand::Decoration(Decoration::Offset),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            inst(
+                Op::MemberDecorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(3),
+                    Operand::LiteralBit32(1),
+                    Operand::Decoration(Decoration::Offset),
+                    Operand::LiteralBit32(4),
+                ],
+            ),
+        ];
+        module.functions = vec![Function {
+            blocks: vec![Block {
+                label: None,
+                instructions: vec![
+                    inst(
+                        Op::PtrAccessChain,
+                        Some(5),
+                        Some(9),
+                        vec![Operand::IdRef(8), Operand::IdRef(6)],
+                    ),
+                    inst(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(9), Operand::IdRef(7)],
+                    ),
+                ],
+            }],
+            ..Default::default()
+        }];
+        module
+    }
+
+    #[test]
+    fn drops_workgroup_struct_padding_byte_zero_store() {
+        let mut module = workgroup_struct_byte_store_module(5);
+
+        assert!(drop_workgroup_struct_padding_byte_zero_stores_module(
+            &mut module
+        ));
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(9)),
+            "padding byte chain should be removed"
+        );
+        assert!(
+            !insts.iter().any(|inst| {
+                inst.class.opcode == Op::Store
+                    && matches!(inst.operands.first(), Some(Operand::IdRef(9)))
+            }),
+            "padding zero store should be removed"
+        );
+    }
+
+    #[test]
+    fn drops_derived_workgroup_struct_padding_byte_zero_stores() {
+        let mut module = workgroup_struct_byte_store_module(6);
+        module.types_global_values.extend([
+            inst(
+                Op::Constant,
+                Some(2),
+                Some(10),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(12),
+                vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
+            ),
+            inst(Op::ConstantNull, Some(12), Some(13), vec![]),
+            inst(
+                Op::Constant,
+                Some(2),
+                Some(16),
+                vec![Operand::LiteralBit32(8)],
+            ),
+        ]);
+        module.functions[0].blocks[0].instructions = vec![
+            inst(
+                Op::PtrAccessChain,
+                Some(5),
+                Some(9),
+                vec![Operand::IdRef(8), Operand::IdRef(6)],
+            ),
+            inst(Op::UConvert, Some(1), Some(14), vec![Operand::IdRef(13)]),
+            inst(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(9), Operand::IdRef(14)],
+            ),
+            inst(
+                Op::PtrAccessChain,
+                Some(5),
+                Some(11),
+                vec![Operand::IdRef(9), Operand::IdRef(10)],
+            ),
+            inst(
+                Op::ShiftRightLogical,
+                Some(12),
+                Some(15),
+                vec![Operand::IdRef(13), Operand::IdRef(16)],
+            ),
+            inst(Op::UConvert, Some(1), Some(17), vec![Operand::IdRef(15)]),
+            inst(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(11), Operand::IdRef(17)],
+            ),
+        ];
+
+        assert!(drop_workgroup_struct_padding_byte_zero_stores_module(
+            &mut module
+        ));
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts
+                .iter()
+                .any(|inst| inst.result_id == Some(9) || inst.result_id == Some(11)),
+            "direct and derived padding byte chains should be removed"
+        );
+        assert!(
+            !insts.iter().any(|inst| inst.class.opcode == Op::Store),
+            "all zero padding byte stores should be removed"
+        );
+    }
+
+    #[test]
+    fn keeps_workgroup_struct_member_byte_zero_store() {
+        let mut module = workgroup_struct_byte_store_module(4);
+
+        assert!(!drop_workgroup_struct_padding_byte_zero_stores_module(
+            &mut module
+        ));
+        let insts = &module.functions[0].blocks[0].instructions;
+        assert!(insts.iter().any(|inst| inst.result_id == Some(9)));
+    }
+
+    #[test]
+    fn drops_debug_records_for_undefined_targets() {
+        let mut module = Module::default();
+        module.types_global_values = vec![inst(
+            Op::TypeInt,
+            None,
+            Some(1),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        )];
+        module.debug_names = vec![
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![Operand::IdRef(1), Operand::LiteralString("live".into())],
+            ),
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![Operand::IdRef(99), Operand::LiteralString("dead".into())],
+            ),
+        ];
+        module.annotations = vec![
+            inst(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(1),
+                    Operand::Decoration(Decoration::RelaxedPrecision),
+                ],
+            ),
+            inst(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(99),
+                    Operand::Decoration(Decoration::RelaxedPrecision),
+                ],
+            ),
+        ];
+
+        assert!(drop_dangling_debug_targets_module(&mut module));
+        assert_eq!(module.debug_names.len(), 1);
+        assert_eq!(module.annotations.len(), 1);
+        assert_eq!(
+            module.debug_names[0].operands.first(),
+            Some(&Operand::IdRef(1))
+        );
+        assert_eq!(
+            module.annotations[0].operands.first(),
+            Some(&Operand::IdRef(1))
+        );
+    }
 }

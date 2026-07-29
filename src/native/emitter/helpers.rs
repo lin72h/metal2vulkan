@@ -320,6 +320,35 @@ pub(super) fn i8_leaf_byte_size(ty: &LlType) -> Option<u32> {
     }
 }
 
+pub(super) fn flat_scalar_leaf_count(ty: &LlType) -> Option<(LlType, u32)> {
+    match ty {
+        LlType::Bool | LlType::Half | LlType::BFloat | LlType::Float | LlType::Int(_) => {
+            Some((ty.clone(), 1))
+        }
+        LlType::Array(elem, len) => {
+            let (leaf, count) = flat_scalar_leaf_count(elem)?;
+            Some((leaf, count.checked_mul(*len)?))
+        }
+        LlType::Struct(fields) => {
+            let mut leaf = None;
+            let mut count = 0u32;
+            for field in fields {
+                let (field_leaf, field_count) = flat_scalar_leaf_count(field)?;
+                if leaf
+                    .as_ref()
+                    .is_some_and(|existing| !types_compatible(existing, &field_leaf))
+                {
+                    return None;
+                }
+                leaf.get_or_insert(field_leaf);
+                count = count.checked_add(field_count)?;
+            }
+            leaf.map(|leaf| (leaf, count))
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn raw_buffer_block_type() -> LlType {
     LlType::Struct(vec![LlType::Array(Box::new(LlType::Int(32)), 0)])
 }

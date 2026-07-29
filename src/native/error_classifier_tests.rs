@@ -60,6 +60,9 @@ fn pointer_typing_validation_matches_access_chain_messages() {
     assert!(is_pointer_typing_validation_error(
         "Result Type does not match the type used to index into the composite"
     ));
+    assert!(is_pointer_typing_validation_error(
+        "The Object type (OpTypePointer) does not match the type that results from indexing into the Composite (OpTypePointer)."
+    ));
     assert!(!is_pointer_typing_validation_error(
         "some unrelated parser failure"
     ));

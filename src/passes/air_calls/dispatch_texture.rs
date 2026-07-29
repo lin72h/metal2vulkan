@@ -655,7 +655,7 @@ pub(in crate::passes) fn lower_image_size_query(
     };
     let size = ctx.module.fresh_id();
     let mut out = vec![];
-    let query_op = if image_is_storage(ctx, img) {
+    let query_op = if image_is_storage(ctx, img) || image_value_is_multisampled(ctx, img) {
         Op::ImageQuerySize
     } else {
         Op::ImageQuerySizeLod

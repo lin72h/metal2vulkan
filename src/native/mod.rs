@@ -85,6 +85,7 @@ pub(crate) use rewrites::{
     value_lower_cross_binding_pointer_merges_module,
 };
 pub(crate) use rewrites::{
+    drop_dangling_debug_targets_module, drop_workgroup_struct_padding_byte_zero_stores_module,
     has_bodiless_agx_call_module, has_cross_binding_pointer_phi_module,
     module_has_wide_raw_store_guard, prune_constant_branches_module,
     prune_constant_branches_module_preserving, reconcile_whole_buffer_scalar_arms_module,

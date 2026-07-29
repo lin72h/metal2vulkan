@@ -623,6 +623,39 @@ entry:
 }
 
 #[test]
+fn native_function_aggregate_scalar_reinterpret_store_targets_first_field() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%Wrapper = type { i64 }
+%Outer = type { float, %Wrapper }
+
+define void @main() {
+entry:
+  %outer = alloca %Outer, align 8
+  %slot = getelementptr inbounds %Outer, ptr %outer, i64 0, i32 1
+  %raw = bitcast ptr %slot to ptr
+  store i64 0, ptr %raw, align 8
+  ret void
+}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_function_aggregate_scalar_store_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_i1_uses_bool_type_for_logic_and_extension() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -1940,6 +1973,27 @@ entry:
     let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
     assert!(asm.contains("OpVectorExtractDynamic"), "{asm}");
     assert!(asm.contains("OpVectorInsertDynamic"), "{asm}");
+}
+
+#[test]
+fn native_large_dynamic_vector_extract_insert_uses_composite_selects() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <10 x float> @lane(<10 x float> %x, <10 x float> %y, i32 %idx) {
+entry:
+  %v = extractelement <10 x float> %x, i32 %idx
+  %out = insertelement <10 x float> %y, float %v, i32 %idx
+  ret <10 x float> %out
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpTypeArray"), "{asm}");
+    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+    assert!(asm.contains("OpCompositeInsert"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(!asm.contains("OpVectorExtractDynamic"), "{asm}");
+    assert!(!asm.contains("OpVectorInsertDynamic"), "{asm}");
 }
 
 #[test]

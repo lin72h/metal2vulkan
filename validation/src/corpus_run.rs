@@ -25,7 +25,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 /// Bumped when default seed construction changes.
-pub const SEED_PROFILE: &str = "deterministic_v6_finite_float_render_targets";
+pub const SEED_PROFILE: &str = "deterministic_v7_thread_indexed_inputs";
 pub const PLAN_VERSION: u32 = 1;
 const POINT_COORD_TOPOLOGY_PLAN_VERSION: u32 = 2;
 pub const DEFAULT_BUFFER_LEN: usize = 256;
@@ -37,14 +37,15 @@ pub const CASE_TIMEOUT_ENV: &str = "METAL2VULKAN_CORPUS_TIMEOUT_SECS";
 /// NOTE: this frees the CPU worker (and `metal-as`/helper descendants) but does **not** cancel an
 /// in-flight GPU kernel — a committed Metal command buffer cannot be cancelled; only a reboot
 /// recovers a wedged GPU. Infinite-loop safety therefore comes from the pre-submission loop-budget
-/// guard in `oracle_macos`, not from this timeout. With that guard, bounded GPU work finishes in
-/// well under a second, so a case still running at this bound means a CPU-side tool hang, not a
-/// GPU loop — hence the short default (was 300s, which merely prolonged a wedge).
-pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 60;
+/// guard in `oracle_macos`, not from this timeout. Some large bounded kernels still spend minutes in
+/// debug validation builds (for example ASTC decode compile+execute completed in 266.7s locally), so
+/// keep the default high enough for those while retaining the env override for shorter local sweeps.
+pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 300;
 /// Log `# SLOW <air_sha256> …` when a case is still running (or finished) past this wall time.
 pub const SLOW_CASE_SECS: u64 = 30;
 const FC_SPECIALIZATION_ZERO: &str = "zero";
 const FC_SPECIALIZATION_VALUES: &str = "values";
+const INPUT_SPECIALIZATION_EXPLICIT: &str = "explicit";
 
 /// Seed mode written into [`PlanBuffer::seed_mode`].
 pub const SEED_MODE_DETERMINISTIC: &str = "deterministic";
@@ -162,6 +163,10 @@ pub struct MetalRow {
     pub fc_specialization: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fc_values: Option<Vec<FunctionConstantValueJson>>,
+    /// Validation-only marker that says `metal.plan` is a deliberately banked input plan and may
+    /// be reused by forced Metal oracle reruns even when no function constants are involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_specialization: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -299,7 +304,23 @@ fn tolerance_for_metal_context(
 ) -> Option<ToleranceSpecJson> {
     let mut tolerance = tolerance_for_context(format, ll)?;
     if sampled_half_render_target_fast_math_tolerance_applies(format, ll, metal) {
-        tolerance.max_abs = Some(tolerance.max_abs.unwrap_or(0.0).max(0.007_812_5));
+        let max_abs = if sampled_half_render_target_palette_tolerance_applies(ll) {
+            0.023_437_5
+        } else {
+            0.007_812_5
+        };
+        tolerance.max_abs = Some(tolerance.max_abs.unwrap_or(0.0).max(max_abs));
+    }
+    if sampled_f32_storage_texture_tolerance_applies(format, ll, metal) {
+        let max_abs = if ll.is_some_and(|ll| {
+            sampled_f32_storage_texture_uses_half_imageblock(ll)
+                || sampled_f32_storage_texture_uses_half_coordinate_texture(ll)
+        }) {
+            0.003_906_25
+        } else {
+            0.001_953_125
+        };
+        tolerance.max_abs = Some(tolerance.max_abs.unwrap_or(0.0).max(max_abs));
     }
     Some(tolerance)
 }
@@ -322,6 +343,60 @@ fn sampled_half_render_target_fast_math_tolerance_applies(
     ll_has_fast_no_nans_float_semantics(ll)
         && ll.contains("@air.sample_texture")
         && ll.contains(".v4f16")
+}
+
+fn sampled_half_render_target_palette_tolerance_applies(ll: Option<&str>) -> bool {
+    let Some(ll) = ll else {
+        return false;
+    };
+    (ll.contains("@air.dot.v2f16")
+        || ll.contains("@air.dot.v3f16")
+        || ll.contains("@air.dot.v4f16"))
+        && (ll.contains("@air.mix.v2f16")
+            || ll.contains("@air.mix.v3f16")
+            || ll.contains("@air.mix.v4f16"))
+}
+
+fn sampled_f32_storage_texture_tolerance_applies(
+    format: DataFormat,
+    ll: Option<&str>,
+    metal: &MetalRow,
+) -> bool {
+    if !matches!(
+        format,
+        DataFormat::R32Float | DataFormat::Rg32Float | DataFormat::Rgba32Float
+    ) || metal.plan.output.kind != "texture"
+    {
+        return false;
+    }
+    let Some(ll) = ll else {
+        return false;
+    };
+    if !ll.contains("@air.sample_texture") {
+        return false;
+    }
+    infer_textures(ll).into_iter().any(|texture| {
+        texture.role == "Sampled"
+            && texture.format == "Rgba32Float"
+            && texture.seed_mode == SEED_MODE_FINITE_FLOAT32
+    })
+}
+
+fn sampled_f32_storage_texture_uses_half_imageblock(ll: &str) -> bool {
+    ll.contains("@air.imageblock_data")
+        && ll.contains("@air.write_imageblock_slice_to_texture_2d")
+        && ll.contains(".v4f16")
+}
+
+fn sampled_f32_storage_texture_uses_half_coordinate_texture(ll: &str) -> bool {
+    ll.contains("@air.read_texture_2d.v4f16")
+        && ll.contains("@air.convert.f.v2f32.f.v2f16")
+        && ll.contains("@air.sample_texture_2d.v4f32")
+        && infer_textures(ll).into_iter().any(|texture| {
+            texture.role == "StorageRead"
+                && texture.format == "Rgba16Float"
+                && texture.seed_mode == SEED_MODE_FINITE_FLOAT16
+        })
 }
 
 fn packed_unorm_raw_byte_tolerance_applies(format: DataFormat, ll: &str) -> bool {
@@ -428,12 +503,13 @@ pub struct RunConfig {
     pub limit: Option<usize>,
     pub dry_run: bool,
     pub quiet: bool,
+    pub compile_missing: bool,
     pub only_air: Option<String>,
     pub only_air_list: Option<PathBuf>,
     pub jobs: usize,
     /// When true, process in-process (worker mode) and exit with outcome code.
     pub oneshot: bool,
-    /// Per-case wall timeout for worker subprocesses (default 60s; env override in CLI parsing).
+    /// Per-case wall timeout for worker subprocesses (env override in CLI parsing).
     pub timeout_secs: u64,
 }
 
@@ -459,12 +535,21 @@ impl RunConfig {
             limit: None,
             dry_run: false,
             quiet: false,
+            compile_missing: false,
             only_air: None,
             only_air_list: None,
             jobs: default_workers(),
             oneshot: false,
             timeout_secs: DEFAULT_CASE_TIMEOUT_SECS,
         }
+    }
+
+    fn reruns_existing_backend_rows(&self) -> bool {
+        self.force
+            || self.failed_only
+            || self.only_status.is_some()
+            || self.only_bucket.is_some()
+            || self.contains.is_some()
     }
 }
 
@@ -531,6 +616,7 @@ pub fn parse_run_args(backend: RunBackend) -> Option<RunConfig> {
             }
             "--dry-run" => cfg.dry_run = true,
             "--quiet" => cfg.quiet = true,
+            "--compile-missing" => cfg.compile_missing = true,
             "--oneshot" => cfg.oneshot = true,
             "--delta-ledger" => {
                 cfg.delta_ledger =
@@ -659,6 +745,8 @@ fn print_run_usage(program: &str) {
          --status S       re-run existing backend rows with status S\n\
          --bucket TEXT    re-run existing backend rows whose failure bucket contains TEXT\n\
          --contains TEXT  re-run existing backend rows whose label/error/status/hash contains TEXT\n\
+         --compile-missing translate+spirv-val Vulkan/MoltenVK rows that cannot compare to Metal;\n\
+                         successful rows are recorded as smoke with the skip reason in error\n\
          --skip N         skip N eligible rows after filters and stable sorting, before --limit\n\
          --limit N        run at most N eligible rows after filters and stable sorting\n\
          --air-list FILE  run AIR SHA-256 hashes listed one per line, after other filters\n\
@@ -831,9 +919,8 @@ pub fn load_tech_rows(path: &Path) -> HashMap<String, TechRowInfo> {
 pub fn execution_status_is_success(backend: RunBackend, status: &str) -> bool {
     match backend {
         RunBackend::Metal => status == "ok",
-        RunBackend::Vulkan | RunBackend::MoltenVk => {
-            status == "ok" || status == "tolerance" || status == "smoke"
-        }
+        RunBackend::Vulkan => status == "ok" || status == "tolerance" || status == "smoke",
+        RunBackend::MoltenVk => status == "ok",
     }
 }
 
@@ -899,6 +986,23 @@ pub fn load_metal_rows(path: &Path) -> HashMap<String, MetalRow> {
             continue;
         }
         if let Ok(row) = serde_json::from_str::<MetalRow>(t) {
+            map.insert(row.air_sha256.to_ascii_lowercase(), row);
+        }
+    }
+    map
+}
+
+pub fn load_candidate_rows(path: &Path) -> HashMap<String, CandidateRow> {
+    let mut map = HashMap::new();
+    let Ok(file) = File::open(path) else {
+        return map;
+    };
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if let Ok(row) = serde_json::from_str::<CandidateRow>(t) {
             map.insert(row.air_sha256.to_ascii_lowercase(), row);
         }
     }
@@ -1028,32 +1132,40 @@ fn rewrite_jsonl_ledger(
     Ok(())
 }
 
+struct MetalStatusFields<'a> {
+    status: &'a str,
+    compare: &'a str,
+    plan: HarnessPlan,
+    stage: Option<Stage>,
+    entry: Option<&'a str>,
+    error: Option<String>,
+}
+
 fn metal_status_row(
     tr: &TranslateRow,
     src: &SourceFile,
-    status: &str,
-    compare: &str,
-    error: Option<String>,
+    fields: MetalStatusFields<'_>,
 ) -> MetalRow {
     MetalRow {
         air_sha256: tr.air_sha256.clone(),
         shard: src.shard.clone(),
         label: src.label.clone(),
-        status: status.into(),
+        status: fields.status.into(),
         backend: RunBackend::Metal.as_str().into(),
         seed_profile: SEED_PROFILE.into(),
         plan_version: PLAN_VERSION,
-        plan: infer_plan(""),
+        plan: fields.plan,
         input_sha256: None,
         output_sha256: None,
         output_b64: None,
         spv_sha256: tr.spv_sha256.clone(),
-        compare: compare.into(),
+        compare: fields.compare.into(),
         fc_specialization: None,
         fc_values: None,
-        stage: None,
-        entry: None,
-        error,
+        input_specialization: None,
+        stage: fields.stage.map(|stage| format!("{stage:?}")),
+        entry: fields.entry.map(str::to_string),
+        error: fields.error,
     }
 }
 
@@ -1092,7 +1204,18 @@ fn append_status_row(
 ) {
     match cfg.backend {
         RunBackend::Metal => {
-            let row = metal_status_row(tr, src, status, metal_compare, Some(error));
+            let row = metal_status_row(
+                tr,
+                src,
+                MetalStatusFields {
+                    status,
+                    compare: metal_compare,
+                    plan: infer_plan(""),
+                    stage: None,
+                    entry: None,
+                    error: Some(error),
+                },
+            );
             let _ = append_result_row(cfg, &row);
         }
         RunBackend::Vulkan | RunBackend::MoltenVk => {
@@ -1119,7 +1242,7 @@ pub fn infer_plan(ll_or_meta_text: &str) -> HarnessPlan {
         });
     }
     let stage = stage_from_ll(ll_or_meta_text);
-    let output = if stage == Stage::Fragment {
+    let mut output = if stage == Stage::Fragment {
         let format = fragment_render_target_format(ll_or_meta_text).unwrap_or("Rgba32Float");
         PlanOutput {
             kind: "render_target".into(),
@@ -1172,6 +1295,15 @@ pub fn infer_plan(ll_or_meta_text: &str) -> HarnessPlan {
     };
 
     let (dispatch_grid, dispatch_tg) = dispatch_plan_for_output(ll_or_meta_text, &output);
+    resize_thread_indexed_input_buffers(ll_or_meta_text, dispatch_grid[0], &mut buffers);
+    if stage == Stage::Kernel && output.kind == "buffer" {
+        apply_output_stride_seed_values(ll_or_meta_text, output.index, &mut buffers);
+    }
+    if output.kind == "buffer" {
+        if let Some(buffer) = buffers.iter().find(|b| b.index == output.index) {
+            output.len = Some(buffer.len);
+        }
+    }
 
     HarnessPlan {
         buffers,
@@ -1179,6 +1311,70 @@ pub fn infer_plan(ll_or_meta_text: &str) -> HarnessPlan {
         output,
         dispatch_grid,
         dispatch_tg,
+    }
+}
+
+fn resize_thread_indexed_input_buffers(ll: &str, grid_x: u32, buffers: &mut [PlanBuffer]) {
+    let grid_x = u64::from(grid_x.max(1));
+    for buffer in buffers {
+        if buffer.role != "Input" {
+            continue;
+        }
+        let Some(type_name) = buffer_type_name_for_location(ll, buffer.index) else {
+            continue;
+        };
+        let Some(required_len) = thread_indexed_input_required_len(ll, &type_name, grid_x) else {
+            continue;
+        };
+        buffer.len = buffer.len.max(required_len);
+    }
+}
+
+fn thread_indexed_input_required_len(ll: &str, type_name: &str, grid_x: u64) -> Option<usize> {
+    let (llvm_ty, elem_bytes) = llvm_thread_indexed_input_type_and_size(type_name)?;
+    if !module_has_dynamic_device_gep(ll, llvm_ty) {
+        return None;
+    }
+    let required_elems =
+        dynamic_device_gep_required_elements(ll, llvm_ty, grid_x).unwrap_or(grid_x);
+    let required_bytes = required_elems.saturating_mul(elem_bytes as u64);
+    usize::try_from(required_bytes).ok()
+}
+
+fn apply_output_stride_seed_values(ll: &str, output_index: u32, buffers: &mut [PlanBuffer]) {
+    let mut required_by_buffer: HashMap<u32, u64> = HashMap::new();
+    for req in output_stride_control_requirements(ll, output_index, buffers) {
+        required_by_buffer
+            .entry(req.buffer)
+            .and_modify(|current| *current = (*current).max(req.min_row_bytes))
+            .or_insert(req.min_row_bytes);
+    }
+    if required_by_buffer.is_empty() {
+        return;
+    }
+
+    for buffer in buffers
+        .iter_mut()
+        .filter(|b| b.seed_mode == SEED_MODE_BOUNDED_CONTROL)
+    {
+        let Some(&required) = required_by_buffer.get(&buffer.index) else {
+            continue;
+        };
+        for field in &mut buffer.seed_layout {
+            if !bounded_control_seed_field_is_within_buffer(buffer.len, field) {
+                continue;
+            }
+            let Some(max_value) = control_seed_field_max_value(field.size) else {
+                continue;
+            };
+            if required > max_value {
+                continue;
+            }
+            let current = field.value.unwrap_or(u64::from(BOUNDED_CONTROL_DIM));
+            if current < required {
+                field.value = Some(required);
+            }
+        }
     }
 }
 
@@ -1223,7 +1419,10 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
     let stride_control_bufs = stride_control_buffer_locations(ll, &loop_bound_bufs);
     let atomic_i32_load_bufs = buffers_with_atomic_i32_loads(ll);
     let fdiv_denominator_control_bufs = buffers_with_float_loads_used_as_fdiv_denominators(ll);
+    let local_array_index_control_bufs = buffers_with_loads_used_as_local_array_indices(ll);
     let bounded_control_module = module_uses_bounded_control_buffers(ll, &loop_bound_bufs);
+    let readonly_buffers = readonly_entry_buffer_locations(ll);
+    let writeonly_buffers = writeonly_entry_buffer_locations(ll);
     let locations = stage_resource_locations(ll);
     let mut out = Vec::new();
     for line in ll.lines() {
@@ -1240,21 +1439,32 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
             continue;
         }
         let fixed_size = extract_i32_after(line, "air.buffer_size");
-        let size = fixed_size.unwrap_or(DEFAULT_BUFFER_LEN as i32);
+        let control_param = is_control_param_buffer_meta(line, fixed_size);
+        let size = if control_param {
+            fixed_size
+                .or_else(|| extract_i32_after(line, "air.arg_type_size"))
+                .unwrap_or(DEFAULT_BUFFER_LEN as i32)
+        } else {
+            fixed_size.unwrap_or(DEFAULT_BUFFER_LEN as i32)
+        };
         let loc = metadata_param_index(line)
             .and_then(|idx| locations.buffers.get(&idx).copied())
             .or_else(|| extract_i32_after(line, "air.location_index").map(|loc| loc as u32))
             .unwrap_or(0);
-        let role = if line.contains("air.read_write") {
+        let loc_u = loc;
+        let role = if writeonly_buffers.contains(&loc_u) {
+            "Output"
+        } else if line.contains("air.read_write") {
             "InOut"
         } else if line.contains("!\"air.write\"") || line.contains("\"air.write\"") {
             "Output"
         } else {
             "Input"
         };
-        let loc_u = loc;
         let type_name = quoted_metadata_string_after(line, "air.arg_type_name");
-        let seed_mode = if is_control_param_buffer_meta(line, fixed_size)
+        let atomic_counter_buffer = is_atomic_counter_air_type(type_name.as_deref());
+        let seed_mode = if control_param
+            || atomic_counter_buffer
             || loop_bound_bufs.contains(&loc_u)
             || stride_control_bufs.contains(&loc_u)
             || (role == "Input" && atomic_i32_load_bufs.contains(&loc_u))
@@ -1266,12 +1476,17 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
             SEED_MODE_DETERMINISTIC
         };
         let mut len = (size as usize).max(4);
-        if fixed_size.is_none() && role == "Input" && bounded_control_module {
+        if fixed_size.is_none()
+            && bounded_control_module
+            && (role == "Input" || readonly_buffers.contains(&loc_u))
+            && !writeonly_buffers.contains(&loc_u)
+        {
             if let Some(payload_len) = bounded_control_float_payload_len(type_name.as_deref()) {
                 len = len.max(payload_len);
             }
         }
-        let finite_struct_seed = finite_struct_float_seed_layout(ll, line, len);
+        let finite_struct_seed =
+            finite_struct_float_seed_layout(ll, line, len, bounded_control_module);
         let seed_mode = if seed_mode == SEED_MODE_DETERMINISTIC
             && role != "Output"
             && finite_struct_seed.is_some()
@@ -1281,13 +1496,18 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
             seed_mode
         };
         let seed_layout = if seed_mode == SEED_MODE_BOUNDED_CONTROL {
-            bounded_control_seed_layout(
-                ll,
-                line,
-                len,
-                &stride_control_bufs,
-                &fdiv_denominator_control_bufs,
-            )
+            if atomic_counter_buffer {
+                zero_u32_seed_layout(len)
+            } else {
+                bounded_control_seed_layout(
+                    ll,
+                    line,
+                    len,
+                    &stride_control_bufs,
+                    &fdiv_denominator_control_bufs,
+                    &local_array_index_control_bufs,
+                )
+            }
         } else if seed_mode == SEED_MODE_FINITE_STRUCT_FLOAT {
             finite_struct_seed
                 .as_ref()
@@ -1348,13 +1568,21 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
 }
 
 fn writeonly_entry_buffer_locations(ll: &str) -> HashSet<u32> {
+    entry_buffer_locations_with_arg_attr(ll, "writeonly")
+}
+
+fn readonly_entry_buffer_locations(ll: &str) -> HashSet<u32> {
+    entry_buffer_locations_with_arg_attr(ll, "readonly")
+}
+
+fn entry_buffer_locations_with_arg_attr(ll: &str, attr: &str) -> HashSet<u32> {
     let Some(args) = primary_entry_function_args(ll) else {
         return HashSet::new();
     };
     let arg_to_buf = arg_index_to_buffer_location(ll);
     args.split(',')
         .enumerate()
-        .filter(|(_, arg)| arg.contains("writeonly"))
+        .filter(|(_, arg)| arg.split_whitespace().any(|token| token == attr))
         .filter_map(|(ord, _)| arg_to_buf.get(&ord).copied())
         .collect()
 }
@@ -1377,7 +1605,7 @@ fn stride_control_buffer_locations(ll: &str, loop_bound_bufs: &HashSet<u32>) -> 
     let arg_to_buf = arg_index_to_buffer_location(ll);
     let arg_name_to_buf = arg_name_to_buffer_location(ll, &arg_to_buf);
     let mut ptr_buf: HashMap<&str, u32> = HashMap::new();
-    for arg in entry_function_args(ll)
+    for arg in primary_entry_function_args(ll)
         .into_iter()
         .flat_map(|args| args.split(',').enumerate())
     {
@@ -1599,14 +1827,18 @@ fn finite_float_texture_seed_mode(format: &str) -> Option<&'static str> {
 
 fn texture_plan_depth(ll: &str, type_name: Option<&str>) -> u32 {
     match type_name {
-        Some(name) if name.starts_with("texturecube<") => 6,
+        Some(name) if name.starts_with("texturecube<") || name.starts_with("depthcube<") => 6,
         Some(name) if name.starts_with("texture2d_array<") => {
             max_literal_sample_texture_array_layer(ll)
                 .and_then(|layer| layer.checked_add(1))
                 .unwrap_or(DEFAULT_TEXTURE_EXTENT.depth)
                 .max(DEFAULT_TEXTURE_EXTENT.depth)
         }
-        Some(name) if name.starts_with("texturecube_array<") => 1,
+        Some(name)
+            if name.starts_with("texturecube_array<") || name.starts_with("depthcube_array<") =>
+        {
+            1
+        }
         _ => DEFAULT_TEXTURE_EXTENT.depth,
     }
 }
@@ -1837,6 +2069,12 @@ fn finite_float_buffer_seed_mode(type_name: Option<&str>) -> Option<&'static str
     }
 }
 
+fn is_atomic_counter_air_type(type_name: Option<&str>) -> bool {
+    type_name
+        .map(|name| name.trim().trim_end_matches('*').trim() == "metal::_atomic")
+        .unwrap_or(false)
+}
+
 fn matrix_buffer_output_format_from_air_type(name: &str) -> Option<&'static str> {
     let scalar = float_scalar_kind_from_air_type(name)?;
     let columns = matrix_or_vector_column_count(name)?;
@@ -1875,6 +2113,7 @@ fn finite_struct_float_seed_layout(
     ll: &str,
     buffer_meta_line: &str,
     len: usize,
+    seed_control_int_fields: bool,
 ) -> Option<(usize, Vec<ControlSeedField>)> {
     let stride = extract_i32_after(buffer_meta_line, "air.arg_type_size")? as usize;
     if stride == 0 || stride > len.max(1) {
@@ -1882,7 +2121,15 @@ fn finite_struct_float_seed_layout(
     }
     let node = metadata_ref_after(buffer_meta_line, "air.struct_type_info")?;
     let mut fields = Vec::new();
-    finite_struct_float_seed_fields(ll, node, 0, stride, &mut fields, &mut Vec::new());
+    finite_struct_float_seed_fields(
+        ll,
+        node,
+        0,
+        stride,
+        seed_control_int_fields,
+        &mut fields,
+        &mut Vec::new(),
+    );
     (!fields.is_empty()).then_some((stride, fields))
 }
 
@@ -1891,6 +2138,7 @@ fn finite_struct_float_seed_fields(
     node: u32,
     base_offset: usize,
     stride: usize,
+    seed_control_int_fields: bool,
     fields: &mut Vec<ControlSeedField>,
     stack: &mut Vec<u32>,
 ) {
@@ -1946,6 +2194,32 @@ fn finite_struct_float_seed_fields(
                     }
                 }
             }
+        } else if seed_control_int_fields {
+            if let Some((size, value)) = finite_struct_control_int_field_seed(type_name, byte_size)
+            {
+                for element in 0..repeat_count {
+                    let field_offset = offset + element * field_byte_size;
+                    if field_offset.saturating_add(size) <= stride {
+                        fields.push(ControlSeedField {
+                            offset: field_offset,
+                            size,
+                            value: Some(value),
+                        });
+                    }
+                }
+            } else if let Some(nested_node) = pending_nested_node.take() {
+                for element in 0..repeat_count {
+                    finite_struct_float_seed_fields(
+                        ll,
+                        nested_node,
+                        offset + element * field_byte_size,
+                        stride,
+                        seed_control_int_fields,
+                        fields,
+                        stack,
+                    );
+                }
+            }
         } else if let Some(nested_node) = pending_nested_node.take() {
             for element in 0..repeat_count {
                 finite_struct_float_seed_fields(
@@ -1953,6 +2227,7 @@ fn finite_struct_float_seed_fields(
                     nested_node,
                     offset + element * field_byte_size,
                     stride,
+                    seed_control_int_fields,
                     fields,
                     stack,
                 );
@@ -1961,6 +2236,19 @@ fn finite_struct_float_seed_fields(
         i += 5;
     }
     stack.pop();
+}
+
+fn finite_struct_control_int_field_seed(type_name: &str, byte_size: i32) -> Option<(usize, u64)> {
+    let name = type_name.trim().trim_end_matches('*').trim();
+    let (size, value) = match name {
+        "bool" => (1, 0),
+        "uchar" | "char" => (1, u64::from(BOUNDED_CONTROL_DIM)),
+        "ushort" | "short" => (2, u64::from(BOUNDED_CONTROL_DIM)),
+        "uint" | "int" => (4, u64::from(BOUNDED_CONTROL_DIM)),
+        "ulong" | "long" => (8, u64::from(BOUNDED_CONTROL_DIM)),
+        _ => return None,
+    };
+    (byte_size as usize == size).then_some((size, value))
 }
 
 fn finite_float_field_shape(type_name: &str, byte_size: i32) -> Option<(usize, usize)> {
@@ -1999,12 +2287,6 @@ fn bounded_control_float_payload_len(type_name: Option<&str>) -> Option<usize> {
 /// These commonly carry M/N/K / radius / iteration counts. Seeding them with
 /// [`Seed::Deterministic`] produces multi-billion trip counts (GPU hang).
 fn is_control_param_buffer_meta(line: &str, fixed_size: Option<i32>) -> bool {
-    let Some(sz) = fixed_size else {
-        return false;
-    };
-    if sz <= 0 || sz as usize > BOUNDED_CONTROL_MAX_BYTES {
-        return false;
-    }
     // Writable blobs are treated as payload even when small.
     if line.contains("air.read_write") {
         return false;
@@ -2015,7 +2297,20 @@ fn is_control_param_buffer_meta(line: &str, fixed_size: Option<i32>) -> bool {
     let aspace = extract_i32_after(line, "air.address_space");
     let constant_as = aspace == Some(2);
     let has_struct = line.contains("air.struct_type_info");
-    constant_as || has_struct
+    if !constant_as && !has_struct {
+        return false;
+    }
+    let Some(sz) = fixed_size.or_else(|| {
+        constant_as
+            .then(|| extract_i32_after(line, "air.arg_type_size"))
+            .flatten()
+    }) else {
+        return false;
+    };
+    if sz <= 0 || sz as usize > BOUNDED_CONTROL_MAX_BYTES {
+        return false;
+    }
+    true
 }
 
 /// Lightweight IR scan: buffer locations whose scalar integer loads appear in an `icmp` that
@@ -2025,7 +2320,7 @@ fn is_control_param_buffer_meta(line: &str, fixed_size: Option<i32>) -> bool {
 /// Not a full relooper — false positives only force small integer seeds on that buffer,
 /// which is safe for execution harnesses (goldens re-derived under the new seed profile).
 fn buffers_with_loads_used_as_loop_bounds(ll: &str) -> HashSet<u32> {
-    let Some(body) = entry_function_body(ll) else {
+    let Some(body) = primary_entry_function_body(ll) else {
         return HashSet::new();
     };
     let cyclic_blocks = cyclic_cfg_blocks(body);
@@ -2074,6 +2369,18 @@ fn buffers_with_loads_used_as_loop_bounds(ll: &str) -> HashSet<u32> {
                 }
                 continue;
             }
+            // Loop bounds are often loaded in a preheader and carried through loop phis
+            // (or simple integer combinators) before the cyclic branch compares them.
+            if rhs.starts_with("phi ")
+                || rhs.starts_with("select ")
+                || rhs.starts_with("add ")
+                || rhs.starts_with("sub ")
+            {
+                if let Some(buf) = first_int_buf_operand(rhs, &int_from_buf) {
+                    int_from_buf.insert(reg, buf);
+                }
+                continue;
+            }
             if let Some(rest) = rhs.strip_prefix("icmp ") {
                 let mut hit = None;
                 for tok in rest.split([',', ' ']) {
@@ -2105,6 +2412,24 @@ fn buffers_with_loads_used_as_loop_bounds(ll: &str) -> HashSet<u32> {
         }
     }
     branched
+}
+
+fn first_int_buf_operand(rhs: &str, int_from_buf: &HashMap<&str, u32>) -> Option<u32> {
+    for tok in rhs.split([',', ' ', '[', ']']) {
+        let t = tok.trim();
+        if let Some(name) = t.strip_prefix('%') {
+            if let Some(&buf) = int_from_buf.get(name) {
+                return Some(buf);
+            }
+        }
+    }
+    None
+}
+
+fn first_local_ptr_operand<'a>(rhs: &'a str, local_ptrs: &HashSet<&str>) -> Option<&'a str> {
+    percent_operands(rhs)
+        .into_iter()
+        .find(|operand| local_ptrs.contains(operand))
 }
 
 fn is_scalar_integer_load_rhs(rhs: &str) -> bool {
@@ -2159,12 +2484,18 @@ fn cyclic_cfg_blocks(body: &str) -> HashSet<&str> {
 }
 
 fn block_label(line: &str) -> Option<&str> {
-    let label = line.strip_suffix(':')?;
+    let (label, _) = line.split_once(':')?;
     (!label.is_empty() && !label.starts_with(';') && !label.contains(' ') && !label.contains('\t'))
         .then_some(label)
 }
 
 fn branch_labels(line: &str) -> Vec<&str> {
+    if let Some(label) = line.trim().strip_prefix("br label %") {
+        return vec![label
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .next()
+            .unwrap_or(label)];
+    }
     line.split(',')
         .filter_map(|part| {
             let part = part.trim();
@@ -2186,7 +2517,7 @@ fn branch_labels(line: &str) -> Vec<&str> {
 /// backend-specific; bounded-control seeding keeps the validation input in the same small-counter
 /// family as constant params.
 fn buffers_with_atomic_i32_loads(ll: &str) -> HashSet<u32> {
-    let Some(body) = entry_function_body(ll) else {
+    let Some(body) = primary_entry_function_body(ll) else {
         return HashSet::new();
     };
     let arg_to_buf = arg_index_to_buffer_location(ll);
@@ -2224,7 +2555,7 @@ fn buffers_with_atomic_i32_loads(ll: &str) -> HashSet<u32> {
 /// expressions can turn into `0/0` before a later clamp. Marking the whole control buffer keeps this a
 /// structural dataflow rule rather than relying on field names.
 fn buffers_with_float_loads_used_as_fdiv_denominators(ll: &str) -> HashSet<u32> {
-    let Some(body) = entry_function_body(ll) else {
+    let Some(body) = primary_entry_function_body(ll) else {
         return HashSet::new();
     };
     let arg_to_buf = arg_index_to_buffer_location(ll);
@@ -2280,6 +2611,77 @@ fn buffers_with_float_loads_used_as_fdiv_denominators(ll: &str) -> HashSet<u32> 
     out
 }
 
+/// Buffer locations whose integer loads feed a dynamic inbounds GEP into a local alloca-backed
+/// array. The default bounded-control integer value is 16; that is a useful small loop/count bound,
+/// but it is out of range for local arrays with fewer elements.
+fn buffers_with_loads_used_as_local_array_indices(ll: &str) -> HashSet<u32> {
+    if !local_array_capacity_is_less_than_bounded_control_dim(ll) {
+        return HashSet::new();
+    }
+    let Some(body) = primary_entry_function_body(ll) else {
+        return HashSet::new();
+    };
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_name_to_buf = arg_name_to_buffer_location(ll, &arg_to_buf);
+    if arg_to_buf.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut ptr_buf: HashMap<&str, u32> = HashMap::new();
+    let mut local_ptrs: HashSet<&str> = HashSet::new();
+    let mut int_from_buf: HashMap<&str, u32> = HashMap::new();
+    let mut out = HashSet::new();
+    for line in body.lines() {
+        let line = line.trim();
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("alloca ") {
+            local_ptrs.insert(reg);
+            continue;
+        }
+        if rhs.starts_with("getelementptr") || rhs.starts_with("bitcast") {
+            let local_ptr = first_local_ptr_operand(rhs, &local_ptrs).is_some();
+            if rhs.starts_with("getelementptr") && rhs.contains("inbounds") && local_ptr {
+                if let Some(buf) = first_int_buf_operand(rhs, &int_from_buf) {
+                    out.insert(buf);
+                }
+            }
+            if local_ptr {
+                local_ptrs.insert(reg);
+            }
+            if let Some(buf) = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf) {
+                ptr_buf.insert(reg, buf);
+            }
+            continue;
+        }
+        if is_scalar_integer_load_rhs(rhs) {
+            if let Some(buf) = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf) {
+                int_from_buf.insert(reg, buf);
+            }
+            continue;
+        }
+        if rhs.starts_with("zext ") || rhs.starts_with("sext ") || rhs.starts_with("trunc ") {
+            if let Some(src) = first_percent_reg(rhs) {
+                if let Some(&buf) = int_from_buf.get(src) {
+                    int_from_buf.insert(reg, buf);
+                }
+            }
+            continue;
+        }
+        if rhs.starts_with("phi ")
+            || rhs.starts_with("select ")
+            || rhs.starts_with("add ")
+            || rhs.starts_with("sub ")
+        {
+            if let Some(buf) = first_int_buf_operand(rhs, &int_from_buf) {
+                int_from_buf.insert(reg, buf);
+            }
+        }
+    }
+    out
+}
+
 fn is_float_load_rhs(rhs: &str) -> bool {
     let Some(rest) = rhs.strip_prefix("load ") else {
         return false;
@@ -2315,6 +2717,11 @@ fn entry_function_args(ll: &str) -> Option<&str> {
 
 /// Map kernel argument ordinal → `air.location_index` for buffer args only.
 fn arg_index_to_buffer_location(ll: &str) -> HashMap<usize, u32> {
+    let reflected = reflected_entry_buffer_locations(ll);
+    if !reflected.is_empty() {
+        return reflected;
+    }
+
     let mut map = HashMap::new();
     // Walk metadata lines that declare buffers; argument order is the first i32 in the node
     // (`!{i32 ARGORD, !"air.buffer", ...}`).
@@ -2330,13 +2737,51 @@ fn arg_index_to_buffer_location(ll: &str) -> HashMap<usize, u32> {
             continue;
         };
         let loc = extract_i32_after(line, "air.location_index").unwrap_or(ord) as u32;
-        map.insert(ord as usize, loc);
+        map.entry(ord as usize).or_insert(loc);
     }
     map
 }
 
+fn reflected_entry_buffer_locations(ll: &str) -> HashMap<usize, u32> {
+    match stage_from_ll(ll) {
+        Stage::Kernel => metal2vulkan::meta::parse_air_kernel_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        KernRole::Buffer(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Stage::Vertex => metal2vulkan::meta::parse_air_vertex_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        VertRole::Buffer(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Stage::Fragment => metal2vulkan::meta::parse_air_fragment_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        FragRole::Buffer(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
 fn arg_name_to_buffer_location(ll: &str, arg_to_buf: &HashMap<usize, u32>) -> HashMap<String, u32> {
-    let Some(args) = entry_function_args(ll) else {
+    let Some(args) = primary_entry_function_args(ll) else {
         return HashMap::new();
     };
     let mut map = HashMap::new();
@@ -2475,12 +2920,25 @@ fn bounded_control_buffer_bytes_with_layout(
     out
 }
 
+fn zero_u32_seed_layout(len: usize) -> Vec<ControlSeedField> {
+    (0..len)
+        .step_by(4)
+        .take_while(|offset| offset.saturating_add(4) <= len)
+        .map(|offset| ControlSeedField {
+            offset,
+            size: 4,
+            value: Some(0),
+        })
+        .collect()
+}
+
 fn bounded_control_seed_layout(
     ll: &str,
     buffer_meta_line: &str,
     len: usize,
     stride_control_bufs: &HashSet<u32>,
     fdiv_denominator_control_bufs: &HashSet<u32>,
+    local_array_index_control_bufs: &HashSet<u32>,
 ) -> Vec<ControlSeedField> {
     let Some(node) = metadata_ref_after(buffer_meta_line, "air.struct_type_info") else {
         return scalar_bounded_control_seed_layout(
@@ -2488,20 +2946,57 @@ fn bounded_control_seed_layout(
             len,
             stride_control_bufs,
             fdiv_denominator_control_bufs,
+            local_array_index_control_bufs,
         );
     };
     let loc = extract_i32_after(buffer_meta_line, "air.location_index").map(|v| v as u32);
     let seed_float_one = loc.is_some_and(|loc| fdiv_denominator_control_bufs.contains(&loc));
-    let Some(line) = metadata_node_line(ll, node) else {
-        return Vec::new();
+    let seed_int_zero = loc.is_some_and(|loc| local_array_index_control_bufs.contains(&loc));
+    let mut fields = Vec::new();
+    let ctx = BoundedControlSeedCtx {
+        ll,
+        len,
+        seed_float_one,
+        seed_int_zero,
+    };
+    bounded_control_seed_fields(&ctx, node, 0, None, &mut fields, &mut Vec::new());
+    fields
+}
+
+struct BoundedControlSeedCtx<'a> {
+    ll: &'a str,
+    len: usize,
+    seed_float_one: bool,
+    seed_int_zero: bool,
+}
+
+fn bounded_control_seed_fields(
+    ctx: &BoundedControlSeedCtx<'_>,
+    node: u32,
+    base_offset: usize,
+    scalar_value_override: Option<u64>,
+    fields: &mut Vec<ControlSeedField>,
+    stack: &mut Vec<u32>,
+) {
+    if stack.contains(&node) {
+        return;
+    }
+    let Some(line) = metadata_node_line(ctx.ll, node) else {
+        return;
     };
     let Some(payload) = metadata_payload(line) else {
-        return Vec::new();
+        return;
     };
     let tokens = metadata_tokens(payload);
-    let mut fields = Vec::new();
+    stack.push(node);
     let mut i = 0;
+    let mut pending_nested_node = None;
     while i + 3 < tokens.len() {
+        if metadata_quoted_token(tokens[i]) == Some("air.struct_type_info") {
+            pending_nested_node = tokens.get(i + 1).and_then(|tok| metadata_ref_token(tok));
+            i += 2;
+            continue;
+        }
         let Some(offset) = metadata_i32_token(tokens[i]) else {
             i += 1;
             continue;
@@ -2510,27 +3005,60 @@ fn bounded_control_seed_layout(
             i += 1;
             continue;
         };
-        if metadata_i32_token(tokens[i + 2]).is_none() {
+        let Some(repeat_count) = metadata_i32_token(tokens[i + 2]) else {
             i += 1;
             continue;
-        }
+        };
         let Some(type_name) = metadata_quoted_token(tokens[i + 3]) else {
             i += 1;
             continue;
         };
+        let field_name = tokens.get(i + 4).and_then(|tok| metadata_quoted_token(tok));
+        let offset = base_offset.saturating_add(offset.max(0) as usize);
+        let field_byte_size = byte_size.max(0) as usize;
+        let repeat_count = usize::try_from(repeat_count).unwrap_or(0).max(1);
         if let Some(size) = bounded_control_field_seed_size(type_name, byte_size) {
-            let offset = offset as usize;
-            if offset < len && offset.saturating_add(size) <= len {
-                fields.push(ControlSeedField {
-                    offset,
-                    size,
-                    value: bounded_control_field_seed_value(type_name, seed_float_one),
-                });
+            for element in 0..repeat_count {
+                let field_offset = offset.saturating_add(element.saturating_mul(field_byte_size));
+                if field_offset < ctx.len && field_offset.saturating_add(size) <= ctx.len {
+                    fields.push(ControlSeedField {
+                        offset: field_offset,
+                        size,
+                        value: scalar_value_override.or_else(|| {
+                            bounded_control_field_seed_value(
+                                type_name,
+                                ctx.seed_float_one,
+                                ctx.seed_int_zero,
+                            )
+                        }),
+                    });
+                }
+            }
+        } else if let Some(nested_node) = pending_nested_node.take() {
+            let nested_scalar_value_override =
+                result_dimension_struct_field(type_name, field_name).then_some(0);
+            for element in 0..repeat_count {
+                bounded_control_seed_fields(
+                    ctx,
+                    nested_node,
+                    offset.saturating_add(element.saturating_mul(field_byte_size)),
+                    nested_scalar_value_override,
+                    fields,
+                    stack,
+                );
             }
         }
         i += 5;
     }
-    fields
+    stack.pop();
+}
+
+fn result_dimension_struct_field(type_name: &str, field_name: Option<&str>) -> bool {
+    matches!(field_name, Some("result_dims" | "output_dims"))
+        && type_name
+            .trim()
+            .trim_end_matches('*')
+            .ends_with("TensorDimensions")
 }
 
 fn scalar_bounded_control_seed_layout(
@@ -2538,6 +3066,7 @@ fn scalar_bounded_control_seed_layout(
     len: usize,
     stride_control_bufs: &HashSet<u32>,
     fdiv_denominator_control_bufs: &HashSet<u32>,
+    local_array_index_control_bufs: &HashSet<u32>,
 ) -> Vec<ControlSeedField> {
     let Some(type_name) = quoted_metadata_string_after(buffer_meta_line, "air.arg_type_name")
     else {
@@ -2547,7 +3076,7 @@ fn scalar_bounded_control_seed_layout(
         return Vec::new();
     };
     let Some(size) = bounded_control_field_seed_size(&type_name, byte_size) else {
-        return Vec::new();
+        return bounded_control_vector_seed_layout(&type_name, byte_size, len);
     };
     if size <= len {
         let loc = extract_i32_after(buffer_meta_line, "air.location_index").map(|v| v as u32);
@@ -2557,7 +3086,9 @@ fn scalar_bounded_control_seed_layout(
             .or_else(|| {
                 let seed_float_one =
                     loc.is_some_and(|loc| fdiv_denominator_control_bufs.contains(&loc));
-                bounded_control_field_seed_value(&type_name, seed_float_one)
+                let seed_int_zero =
+                    loc.is_some_and(|loc| local_array_index_control_bufs.contains(&loc));
+                bounded_control_field_seed_value(&type_name, seed_float_one, seed_int_zero)
             });
         vec![ControlSeedField {
             offset: 0,
@@ -2566,6 +3097,57 @@ fn scalar_bounded_control_seed_layout(
         }]
     } else {
         Vec::new()
+    }
+}
+
+fn bounded_control_vector_seed_layout(
+    type_name: &str,
+    byte_size: i32,
+    len: usize,
+) -> Vec<ControlSeedField> {
+    let Some((lanes, scalar, elem_size)) = float_vector_shape(type_name) else {
+        return Vec::new();
+    };
+    if byte_size as usize != lanes.saturating_mul(elem_size) || byte_size as usize > len {
+        return Vec::new();
+    }
+    (0..lanes)
+        .map(|lane| ControlSeedField {
+            offset: lane.saturating_mul(elem_size),
+            size: elem_size,
+            value: bounded_control_float_lane_value(scalar, lane),
+        })
+        .collect()
+}
+
+fn float_vector_shape(type_name: &str) -> Option<(usize, &str, usize)> {
+    let trimmed = type_name.trim().trim_end_matches('*').trim();
+    let lanes = trimmed
+        .chars()
+        .last()
+        .and_then(|ch| ch.to_digit(10))
+        .and_then(|lanes| usize::try_from(lanes).ok())?;
+    if !(2..=4).contains(&lanes) {
+        return None;
+    }
+    let scalar = &trimmed[..trimmed.len() - 1];
+    let elem_size = match scalar {
+        "half" => 2,
+        "float" => 4,
+        "double" => 8,
+        _ => return None,
+    };
+    Some((lanes, scalar, elem_size))
+}
+
+fn bounded_control_float_lane_value(scalar: &str, lane: usize) -> Option<u64> {
+    match scalar {
+        "half" => [0x3c00, 0x4000, 0x4200, 0x4400]
+            .get(lane)
+            .map(|value| *value as u64),
+        "float" => Some(((lane + 1) as f32).to_bits() as u64),
+        "double" => Some(((lane + 1) as f64).to_bits()),
+        _ => None,
     }
 }
 
@@ -2611,8 +3193,20 @@ fn bounded_control_field_seed_size(type_name: &str, byte_size: i32) -> Option<us
     (byte_size as usize == size).then_some(size)
 }
 
-fn bounded_control_field_seed_value(type_name: &str, _seed_float_one: bool) -> Option<u64> {
+fn bounded_control_field_seed_value(
+    type_name: &str,
+    _seed_float_one: bool,
+    seed_int_zero: bool,
+) -> Option<u64> {
     let name = type_name.trim().trim_end_matches('*').trim();
+    if seed_int_zero
+        && matches!(
+            name,
+            "uchar" | "char" | "ushort" | "short" | "uint" | "int" | "ulong" | "long"
+        )
+    {
+        return Some(0);
+    }
     match name {
         "bool" => Some(0),
         "half" => Some(0x3c00),
@@ -2657,7 +3251,15 @@ fn finite_struct_float_buffer_bytes(
         for field in layout {
             let start = base.saturating_add(field.offset);
             let end = start.saturating_add(field.size);
-            if end <= bytes.len() && matches!(field.size, 2 | 4) {
+            if end > bytes.len() {
+                continue;
+            }
+            if let Some(value) = field.value {
+                let value_bytes = value.to_le_bytes();
+                if matches!(field.size, 1 | 2 | 4 | 8) {
+                    bytes[start..end].copy_from_slice(&value_bytes[..field.size]);
+                }
+            } else if matches!(field.size, 2 | 4) {
                 sanitize_float_buffer_finite(&mut bytes[start..end], field.size);
             }
         }
@@ -3067,7 +3669,50 @@ fn incompatible_texture_array_plan_golden(ll: &str, metal: &MetalRow) -> Option<
     ))
 }
 
-fn incompatible_function_constant_definedness_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+fn incompatible_multisample_texture_golden(ll: &str, _metal: &MetalRow) -> Option<String> {
+    if !(ll.contains("texture2d_ms") || ll.contains("read_texture_2d_ms")) {
+        return None;
+    }
+    Some(
+        "metal golden uses AIR multisample texture reads, but the current validation plan records no \
+         texture sample count and the macOS oracle binds seeded textures as single-sample resources; \
+         rebank with a real multisample texture oracle or drop the row"
+            .into(),
+    )
+}
+
+fn incompatible_function_constant_texture_array_ref_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if !matches!(
+        metal.fc_specialization.as_deref(),
+        Some(FC_SPECIALIZATION_ZERO | FC_SPECIALIZATION_VALUES)
+    ) {
+        return None;
+    }
+    let has_fc_texture_metadata = ll.lines().any(|line| {
+        line.contains(r#""air.function_constant""#)
+            && line.contains(r#""air.texture""#)
+            && line.contains("texture")
+    });
+    let mixes_plain_and_array = ll.contains("texture2d<") && ll.contains("texture2d_array<");
+    if !has_fc_texture_metadata || !mixes_plain_and_array {
+        return None;
+    }
+    Some(
+        "metal golden uses function-constant-selected texture metadata mixing texture2d and \
+         texture2d_array image-view families; the Vulkan validation runner cannot bind a single \
+         compatible image view for that reflected descriptor set, so rebank with a concrete texture \
+         family or drop the row"
+            .into(),
+    )
+}
+
+fn incompatible_function_constant_private_pointer_table_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
     if !matches!(
         metal.fc_specialization.as_deref(),
         Some(FC_SPECIALIZATION_ZERO | FC_SPECIALIZATION_VALUES)
@@ -3075,12 +3720,48 @@ fn incompatible_function_constant_definedness_golden(ll: &str, metal: &MetalRow)
     {
         return None;
     }
+    let has_private_constant_array = ll.lines().any(|line| {
+        line.contains(" = internal ")
+            && line.contains("addrspace(2) constant [")
+            && line.contains(" x ")
+    });
+    let has_private_pointer_phi = ll.lines().any(|line| {
+        line.contains(" = phi ptr addrspace(2) ")
+            && line.contains("[ @")
+            && line.contains(" ], [ @")
+    });
+    if !has_private_constant_array || !has_private_pointer_phi {
+        return None;
+    }
     Some(
-        "metal golden explicitly specializes an AIR function constant used by \
-         air.is_function_constant_defined; the current candidate path specializes initializer values \
-         but still lowers definedness to the unspecialized false default, so this is not a \
-         comparable validation oracle yet; rebank after definedness-aware specialization or drop the \
-         row"
+        "metal golden specializes an AIR function constant whose static initializer selects among \
+         private constant-table pointers; the current product path validates before the validation \
+         FC-specialization helper can prune that unspecialized pointer phi, so this is not a \
+         comparable Vulkan oracle yet"
+            .into(),
+    )
+}
+
+fn incompatible_function_constant_simdgroup_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || !declares_air_function_constants(ll)
+        || !matches!(
+            metal.fc_specialization.as_deref(),
+            Some(FC_SPECIALIZATION_VALUES | FC_SPECIALIZATION_ZERO)
+        )
+        || !(ll.contains("@air.simd_shuffle")
+            || ll.contains("@air.simd_broadcast")
+            || ll.contains("@air.simdgroup."))
+        || !ll.contains("@air.wg.barrier")
+        || !ll.contains("addrspace(3)")
+    {
+        return None;
+    }
+    Some(
+        "metal golden specializes AIR function constants that enable simdgroup/threadgroup-memory \
+         paths; subgroup topology, barriers, and threadgroup scratch scheduling are not a portable \
+         byte oracle for this validation row, so rebank or drop the row"
             .into(),
     )
 }
@@ -3110,6 +3791,377 @@ fn zero_function_constant_feeds_integer_divisor(ll: &str) -> bool {
         }
     }
     false
+}
+
+fn function_constant_values_for_integer_divisors(ll: &str) -> Vec<(usize, u64)> {
+    if !zero_function_constant_feeds_integer_divisor(ll)
+        || ll.contains("@air.is_function_constant_defined")
+    {
+        return Vec::new();
+    }
+    declared_function_constant_indices(ll)
+        .into_iter()
+        .filter(|(ty, _)| is_integer_function_constant_type(ty))
+        .map(|(_, index)| (index, 1))
+        .collect()
+}
+
+fn function_constant_values_for_oracle_inputs(ll: &str) -> Vec<(usize, u64)> {
+    let mut values = function_constant_values_for_barrier_loop_progress(ll);
+    for value in function_constant_values_for_integer_divisors(ll) {
+        if !values.iter().any(|(index, _)| *index == value.0) {
+            values.push(value);
+        }
+    }
+    values.sort_by_key(|(index, _)| *index);
+    values
+}
+
+fn function_constant_values_for_barrier_loop_progress(ll: &str) -> Vec<(usize, u64)> {
+    if !ll.contains("@air.wg.barrier(") || ll.contains("@air.is_function_constant_defined") {
+        return Vec::new();
+    }
+    let colliding_conditional_buffers = colliding_conditional_buffer_function_constants(ll);
+    let branch_bool_fcs = bool_function_constants_feeding_barrier_branches(ll);
+    declared_function_constant_indices(ll)
+        .into_iter()
+        .filter_map(|(ty, index)| {
+            if is_bool_function_constant_type(&ty)
+                && branch_bool_fcs.contains(&index)
+                && !colliding_conditional_buffers.contains(&index)
+            {
+                Some((index, 1))
+            } else if is_integer_function_constant_type(&ty) {
+                Some((index, 2))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct DeclaredFunctionConstant {
+    ty: String,
+    index: usize,
+    global: String,
+}
+
+fn declared_function_constant_indices(ll: &str) -> Vec<(String, usize)> {
+    declared_function_constants(ll)
+        .into_iter()
+        .map(|fc| (fc.ty, fc.index))
+        .collect()
+}
+
+fn declared_function_constants(ll: &str) -> Vec<DeclaredFunctionConstant> {
+    let node_ids = ll
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("!air.function_constants = !{")?;
+            let rest = rest.strip_suffix('}')?;
+            Some(
+                rest.split(',')
+                    .map(|s| s.trim().trim_start_matches('!'))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for id in node_ids {
+        let prefix = format!("!{id} = !{{");
+        let Some(node) = ll
+            .lines()
+            .find(|line| line.trim_start().starts_with(&prefix))
+        else {
+            continue;
+        };
+        let mut quoted = node.split("!\"").skip(1).map(|s| s.split('"').next());
+        let Some(Some(ty)) = quoted.next() else {
+            continue;
+        };
+        let Some(index) = node.split("i32 ").nth(1).and_then(|s| {
+            s.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse::<usize>()
+                .ok()
+        }) else {
+            continue;
+        };
+        let Some(global) = global_name_after(node, "ptr addrspace(") else {
+            continue;
+        };
+        out.push(DeclaredFunctionConstant {
+            ty: ty.to_string(),
+            index,
+            global,
+        });
+    }
+    out
+}
+
+fn is_integer_function_constant_type(ty: &str) -> bool {
+    matches!(
+        ty,
+        "char"
+            | "uchar"
+            | "short"
+            | "ushort"
+            | "int"
+            | "uint"
+            | "long"
+            | "ulong"
+            | "char2"
+            | "uchar2"
+            | "short2"
+            | "ushort2"
+            | "int2"
+            | "uint2"
+            | "long2"
+            | "ulong2"
+            | "char3"
+            | "uchar3"
+            | "short3"
+            | "ushort3"
+            | "int3"
+            | "uint3"
+            | "long3"
+            | "ulong3"
+            | "char4"
+            | "uchar4"
+            | "short4"
+            | "ushort4"
+            | "int4"
+            | "uint4"
+            | "long4"
+            | "ulong4"
+    )
+}
+
+fn is_bool_function_constant_type(ty: &str) -> bool {
+    matches!(ty, "bool" | "bool2" | "bool3" | "bool4")
+}
+
+fn bool_function_constants_feeding_barrier_branches(ll: &str) -> HashSet<usize> {
+    let global_sources = bool_function_constant_global_sources(ll);
+    if global_sources.is_empty() {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    let mut body = Vec::new();
+    let mut in_func = false;
+    for line in ll.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("define ") {
+            in_func = true;
+            body.clear();
+        }
+        if in_func {
+            body.push(line);
+            if trimmed == "}" {
+                collect_barrier_branch_bool_sources(&body, &global_sources, &mut out);
+                in_func = false;
+            }
+        }
+    }
+    out
+}
+
+fn collect_barrier_branch_bool_sources(
+    body: &[&str],
+    global_sources: &HashMap<String, usize>,
+    out: &mut HashSet<usize>,
+) {
+    if !body.iter().any(|line| line.contains("@air.wg.barrier(")) {
+        return;
+    }
+    let mut reg_sources: HashMap<String, HashSet<usize>> = HashMap::new();
+    for line in body {
+        let Some((reg, rhs)) = split_assign(line) else {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("br i1") {
+                if let Some(cond) = first_percent_reg(trimmed) {
+                    if let Some(sources) = reg_sources.get(cond) {
+                        out.extend(sources.iter().copied());
+                    }
+                }
+            }
+            continue;
+        };
+        let mut sources = HashSet::new();
+        if rhs.starts_with("load ") {
+            if let Some(global) = global_name_after(rhs, "ptr addrspace(") {
+                if let Some(index) = global_sources.get(&global) {
+                    sources.insert(*index);
+                }
+            }
+        }
+        for operand in percent_operands(rhs) {
+            if operand == reg {
+                continue;
+            }
+            if let Some(prev) = reg_sources.get(operand) {
+                sources.extend(prev.iter().copied());
+            }
+        }
+        if !sources.is_empty() {
+            reg_sources.insert(reg.to_string(), sources);
+        }
+    }
+}
+
+fn bool_function_constant_global_sources(ll: &str) -> HashMap<String, usize> {
+    let fc_global_to_index: HashMap<String, usize> = declared_function_constants(ll)
+        .into_iter()
+        .filter(|fc| is_bool_function_constant_type(&fc.ty))
+        .map(|fc| (fc.global, fc.index))
+        .collect();
+    let mut value_sources: HashMap<String, usize> = HashMap::new();
+    let mut global_sources = fc_global_to_index.clone();
+    for line in ll.lines() {
+        if let Some((result, global)) = load_result_and_global(line) {
+            if let Some(index) = global_sources.get(&global) {
+                value_sources.insert(ssa_key(&result).to_string(), *index);
+            }
+            continue;
+        }
+        if let Some((reg, rhs)) = split_assign(line) {
+            let mut sources = HashSet::new();
+            for operand in percent_operands(rhs) {
+                if operand == reg {
+                    continue;
+                }
+                if let Some(index) = value_sources.get(operand) {
+                    sources.insert(*index);
+                }
+            }
+            if sources.len() == 1 {
+                value_sources.insert(reg.to_string(), *sources.iter().next().unwrap());
+            }
+            continue;
+        }
+        let Some((stored_value, dest_global)) = store_value_and_dest_global(line) else {
+            continue;
+        };
+        if let Some(index) = value_sources.get(ssa_key(&stored_value)) {
+            global_sources.insert(dest_global, *index);
+        }
+    }
+    global_sources
+}
+
+fn colliding_conditional_buffer_function_constants(ll: &str) -> HashSet<usize> {
+    let pred_to_fc = predicate_global_to_fc_initializer_global(ll);
+    if pred_to_fc.is_empty() {
+        return HashSet::new();
+    }
+    let fc_to_index: HashMap<String, usize> = declared_function_constants(ll)
+        .into_iter()
+        .map(|fc| (fc.global, fc.index))
+        .collect();
+    colliding_conditional_buffer_predicates(ll)
+        .into_iter()
+        .filter_map(|pred| {
+            let fc_global = pred_to_fc.get(&pred)?;
+            fc_to_index.get(fc_global).copied()
+        })
+        .collect()
+}
+
+fn colliding_conditional_buffer_predicates(ll: &str) -> HashSet<String> {
+    let mut unconditional_locations = HashSet::new();
+    let mut conditional = Vec::new();
+    for line in ll.lines() {
+        if !line.contains("air.buffer") || !line.contains("air.location_index") {
+            continue;
+        }
+        if line.contains("air.texture") || line.contains("air.sampler") {
+            continue;
+        }
+        if extract_i32_after(line, "air.address_space") == Some(3) {
+            continue;
+        }
+        let Some(range) = metadata_location_range(line) else {
+            continue;
+        };
+        if let Some(pred) = conditional_resource_predicate_global(ll, line) {
+            conditional.push((pred, range));
+        } else {
+            unconditional_locations.extend(range);
+        }
+    }
+    conditional
+        .into_iter()
+        .filter(|(_, range)| {
+            range
+                .clone()
+                .any(|loc| unconditional_locations.contains(&loc))
+        })
+        .map(|(pred, _)| pred)
+        .collect()
+}
+
+fn metadata_location_range(line: &str) -> Option<std::ops::Range<u32>> {
+    let start =
+        extract_i32_after(line, "air.location_index").and_then(|loc| u32::try_from(loc).ok())?;
+    let count = literal_location_index_count(line).unwrap_or(1).max(1);
+    Some(start..start.saturating_add(count))
+}
+
+fn conditional_resource_predicate_global(ll: &str, line: &str) -> Option<String> {
+    let node = conditional_resource_predicate_node(line)?;
+    let pred_line = metadata_node_line(ll, node)?;
+    global_name_after(pred_line, "ptr addrspace(")
+}
+
+fn conditional_resource_predicate_node(line: &str) -> Option<u32> {
+    let payload = metadata_payload(line)?;
+    let tokens = metadata_tokens(payload);
+    tokens.windows(2).find_map(|window| {
+        (metadata_quoted_token(window[0]) == Some("air.function_constant"))
+            .then(|| metadata_ref_token(window[1]))
+            .flatten()
+    })
+}
+
+fn predicate_global_to_fc_initializer_global(ll: &str) -> HashMap<String, String> {
+    let mut value_sources: HashMap<String, String> = HashMap::new();
+    let mut out = HashMap::new();
+    for line in ll.lines() {
+        if let Some((result, global)) = load_result_and_global(line) {
+            if global.contains(".MTL_FC_INIT_") {
+                value_sources.insert(ssa_key(&result).to_string(), global);
+            }
+            continue;
+        }
+        if line.contains("@air.normalize_function_constant_predicate") {
+            if let Some(result) = instruction_result_name(line) {
+                let result_key = ssa_key(&result);
+                if let Some(source) = percent_operands(line)
+                    .into_iter()
+                    .find(|operand| *operand != result_key)
+                    .and_then(|operand| value_sources.get(operand))
+                    .cloned()
+                {
+                    value_sources.insert(result_key.to_string(), source);
+                }
+            }
+            continue;
+        }
+        let Some((stored_value, dest_global)) = store_value_and_dest_global(line) else {
+            continue;
+        };
+        if let Some(source) = value_sources.get(ssa_key(&stored_value)) {
+            out.insert(dest_global, source.clone());
+        }
+    }
+    out
+}
+
+fn ssa_key(value: &str) -> &str {
+    value.trim().trim_start_matches('%')
 }
 
 fn zero_function_constant_working_globals(ll: &str) -> std::collections::HashSet<String> {
@@ -3231,11 +4283,55 @@ fn incompatible_output_plan_golden(ll: &str, metal: &MetalRow) -> Option<String>
             current_plan.dispatch_tg,
         ));
     }
+    if current.kind == "buffer" {
+        let current_buffer = current_plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == current.index);
+        let banked_buffer = metal
+            .plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == banked.index);
+        if let (Some(current_buffer), Some(banked_buffer)) = (current_buffer, banked_buffer) {
+            if output_buffer_plan_differs(current_buffer, banked_buffer) {
+                return Some(format!(
+                    "metal golden output buffer plan {} differs from current AIR output buffer \
+                     plan {}; rebank Metal row",
+                    plan_buffer_summary(banked_buffer),
+                    plan_buffer_summary(current_buffer),
+                ));
+            }
+        }
+    }
     None
 }
 
+fn output_buffer_plan_differs(current: &PlanBuffer, banked: &PlanBuffer) -> bool {
+    current.len != banked.len
+        || current.role != banked.role
+        || current.seed_mode != banked.seed_mode
+        || current.seed_layout != banked.seed_layout
+        || current.seed_stride != banked.seed_stride
+}
+
+fn plan_buffer_summary(buffer: &PlanBuffer) -> String {
+    format!(
+        "buffer {} role={} len={} seed={} stride={:?} layout_fields={}",
+        buffer.index,
+        buffer.role,
+        buffer.len,
+        buffer.seed_mode,
+        buffer.seed_stride,
+        buffer.seed_layout.len()
+    )
+}
+
 fn incompatible_static_resource_plan_golden(ll: &str, metal: &MetalRow) -> Option<String> {
-    if metal.fc_specialization.as_deref() != Some(FC_SPECIALIZATION_ZERO) {
+    if !matches!(
+        metal.fc_specialization.as_deref(),
+        Some(FC_SPECIALIZATION_ZERO | FC_SPECIALIZATION_VALUES)
+    ) {
         return None;
     }
     if !ll.lines().any(|line| {
@@ -3319,6 +4415,791 @@ fn incompatible_undefined_fragment_color_output_golden(
     )
 }
 
+#[derive(Default)]
+struct OwnedLoopInputFacts {
+    fc_values: Vec<(usize, u64)>,
+    arg_values: Vec<(String, i128)>,
+    arg_float_values: Vec<(String, f64)>,
+    arg_field_values: Vec<(String, Vec<i32>, i128)>,
+    arg_upper_bounds: Vec<(String, i128)>,
+    arg_vector_values: Vec<(String, usize, i128)>,
+    arg_vector_upper_bounds: Vec<(String, usize, i128)>,
+    texture_extents: Vec<(String, [i128; 3])>,
+    imageblock_extent: Option<[i128; 2]>,
+}
+
+impl OwnedLoopInputFacts {
+    fn as_loop_input_facts(&self) -> crate::loop_budget::LoopInputFacts<'_> {
+        crate::loop_budget::LoopInputFacts {
+            fc_values: &self.fc_values,
+            arg_values: &self.arg_values,
+            arg_float_values: &self.arg_float_values,
+            arg_field_values: &self.arg_field_values,
+            arg_upper_bounds: &self.arg_upper_bounds,
+            arg_vector_values: &self.arg_vector_values,
+            arg_vector_upper_bounds: &self.arg_vector_upper_bounds,
+            texture_extents: &self.texture_extents,
+            imageblock_extent: self.imageblock_extent,
+        }
+    }
+}
+
+fn loop_input_facts_for_metal_plan(ll: &str, entry: &str, metal: &MetalRow) -> OwnedLoopInputFacts {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return OwnedLoopInputFacts::default();
+    }
+    let owned_inputs = plan_to_owned_inputs(&metal.plan).ok();
+    let fc_values = metal
+        .fc_values
+        .as_deref()
+        .filter(|values| !values.is_empty())
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| (value.index as usize, value.value))
+                .collect()
+        })
+        .unwrap_or_else(|| function_constant_values_for_oracle_inputs(ll));
+    let mut facts = OwnedLoopInputFacts {
+        fc_values,
+        arg_values: exact_launch_scalar_arg_values(ll, &arg_names, &metal.plan),
+        arg_float_values: Vec::new(),
+        arg_field_values: Vec::new(),
+        arg_upper_bounds: launch_scalar_arg_upper_bounds(ll, &arg_names, &metal.plan),
+        arg_vector_values: exact_launch_vector_arg_values(ll, &arg_names, &metal.plan),
+        arg_vector_upper_bounds: launch_vector_arg_upper_bounds(ll, &arg_names, &metal.plan),
+        texture_extents: exact_texture_extent_values(ll, &arg_names, &metal.plan),
+        imageblock_extent: exact_imageblock_extent_value(ll, &metal.plan),
+    };
+    if let Some(owned_inputs) = &owned_inputs {
+        facts.arg_values.extend(exact_scalar_buffer_arg_values(
+            ll,
+            &arg_names,
+            &owned_inputs.inputs,
+        ));
+        facts.arg_float_values.extend(exact_float_buffer_arg_values(
+            ll,
+            &arg_names,
+            &owned_inputs.inputs,
+        ));
+        facts
+            .arg_field_values
+            .extend(exact_struct_buffer_arg_field_values(
+                ll,
+                &arg_names,
+                &owned_inputs.inputs,
+            ));
+        facts
+            .arg_vector_values
+            .extend(exact_vector_buffer_arg_values(
+                ll,
+                &arg_names,
+                &owned_inputs.inputs,
+            ));
+    }
+    facts
+}
+
+fn exact_launch_scalar_arg_values(
+    ll: &str,
+    arg_names: &[String],
+    plan: &HarnessPlan,
+) -> Vec<(String, i128)> {
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        if !is_scalar_integer_air_type(&type_name) {
+            continue;
+        }
+        let degenerate_position = (line.contains(r#""air.thread_position_in_threadgroup""#)
+            && plan.dispatch_tg[0] <= 1)
+            || (line.contains(r#""air.thread_position_in_grid""#) && plan.dispatch_grid[0] <= 1)
+            || (line.contains(r#""air.threadgroup_position_in_grid""#)
+                && div_ceil_nonzero(plan.dispatch_grid[0], plan.dispatch_tg[0]) <= 1);
+        let value = if line.contains(r#""air.threads_per_threadgroup""#) {
+            Some(plan.dispatch_tg[0])
+        } else if line.contains(r#""air.threads_per_grid""#) {
+            Some(plan.dispatch_grid[0])
+        } else if line.contains(r#""air.threadgroups_per_grid""#) {
+            Some(div_ceil_nonzero(plan.dispatch_grid[0], plan.dispatch_tg[0]))
+        } else if line.contains(r#""air.threads_per_simdgroup""#) {
+            Some(32)
+        } else if line.contains(r#""air.simdgroups_per_threadgroup""#) {
+            Some(div_ceil_nonzero(plan.dispatch_tg[0], 32))
+        } else if degenerate_position {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            out.push((arg_name.clone(), i128::from(value)));
+        }
+    }
+    out
+}
+
+fn launch_scalar_arg_upper_bounds(
+    ll: &str,
+    arg_names: &[String],
+    plan: &HarnessPlan,
+) -> Vec<(String, i128)> {
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        if !is_scalar_integer_air_type(&type_name) {
+            continue;
+        }
+        let value = if line.contains(r#""air.thread_position_in_threadgroup""#) {
+            Some(plan.dispatch_tg[0].saturating_sub(1))
+        } else if line.contains(r#""air.thread_position_in_grid""#) {
+            Some(plan.dispatch_grid[0].saturating_sub(1))
+        } else if line.contains(r#""air.threadgroup_position_in_grid""#) {
+            Some(div_ceil_nonzero(plan.dispatch_grid[0], plan.dispatch_tg[0]).saturating_sub(1))
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            out.push((arg_name.clone(), i128::from(value)));
+        }
+    }
+    out
+}
+
+fn exact_launch_vector_arg_values(
+    ll: &str,
+    arg_names: &[String],
+    plan: &HarnessPlan,
+) -> Vec<(String, usize, i128)> {
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(lanes) = integer_vector_lane_count(&type_name) else {
+            continue;
+        };
+        for lane in 0..lanes {
+            let value = if line.contains(r#""air.threads_per_threadgroup""#) {
+                dispatch_lane(plan.dispatch_tg, lane)
+            } else if line.contains(r#""air.threads_per_grid""#) {
+                dispatch_lane(plan.dispatch_grid, lane)
+            } else if line.contains(r#""air.threadgroups_per_grid""#) {
+                Some(threadgroups_per_grid_lane(plan, lane))
+            } else if line.contains(r#""air.thread_position_in_threadgroup""#) {
+                dispatch_lane(plan.dispatch_tg, lane)
+                    .filter(|value| *value <= 1)
+                    .map(|_| 0)
+            } else if line.contains(r#""air.thread_position_in_grid""#) {
+                dispatch_lane(plan.dispatch_grid, lane)
+                    .filter(|value| *value <= 1)
+                    .map(|_| 0)
+            } else if line.contains(r#""air.threadgroup_position_in_grid""#) {
+                (threadgroups_per_grid_lane(plan, lane) <= 1).then_some(0)
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                out.push((arg_name.clone(), lane, i128::from(value)));
+            }
+        }
+    }
+    out
+}
+
+fn exact_vector_buffer_arg_values(
+    ll: &str,
+    arg_names: &[String],
+    inputs: &Inputs,
+) -> Vec<(String, usize, i128)> {
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+    let locations = stage_resource_locations(ll);
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let readable = line.contains(r#""air.read""#) || line.contains(r#""air.read_write""#);
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !readable
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = extract_i32_after(line, "air.location_index").map(|v| v as u32) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some((lanes, scalar_type, elem_size)) = integer_vector_shape(&type_name) else {
+            continue;
+        };
+        let Some(bytes) = locations
+            .buffers
+            .get(&(arg_ord as u32))
+            .and_then(|loc| input_bytes.get(loc))
+            .or_else(|| input_bytes.get(&raw_loc))
+        else {
+            continue;
+        };
+        for lane in 0..lanes {
+            let offset = lane.saturating_mul(elem_size);
+            if let Some(value) =
+                scalar_int_from_bytes(bytes.get(offset..).unwrap_or(&[]), scalar_type)
+            {
+                out.push((arg_name.clone(), lane, value));
+            }
+        }
+    }
+    out
+}
+
+fn launch_vector_arg_upper_bounds(
+    ll: &str,
+    arg_names: &[String],
+    plan: &HarnessPlan,
+) -> Vec<(String, usize, i128)> {
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(lanes) = integer_vector_lane_count(&type_name) else {
+            continue;
+        };
+        for lane in 0..lanes {
+            let value = if line.contains(r#""air.thread_position_in_threadgroup""#) {
+                dispatch_lane(plan.dispatch_tg, lane).map(|value| value.saturating_sub(1))
+            } else if line.contains(r#""air.thread_position_in_grid""#) {
+                dispatch_lane(plan.dispatch_grid, lane).map(|value| value.saturating_sub(1))
+            } else if line.contains(r#""air.threadgroup_position_in_grid""#) {
+                Some(threadgroups_per_grid_lane(plan, lane).saturating_sub(1))
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                out.push((arg_name.clone(), lane, i128::from(value)));
+            }
+        }
+    }
+    out
+}
+
+fn exact_scalar_buffer_arg_values(
+    ll: &str,
+    arg_names: &[String],
+    inputs: &Inputs,
+) -> Vec<(String, i128)> {
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+    let locations = stage_resource_locations(ll);
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let readable = line.contains(r#""air.read""#) || line.contains(r#""air.read_write""#);
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !readable
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = extract_i32_after(line, "air.location_index").map(|v| v as u32) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(bytes) = locations
+            .buffers
+            .get(&(arg_ord as u32))
+            .and_then(|loc| input_bytes.get(loc))
+            .or_else(|| input_bytes.get(&raw_loc))
+        else {
+            continue;
+        };
+        let Some(value) = scalar_int_from_bytes(bytes, &type_name) else {
+            continue;
+        };
+        out.push((arg_name.clone(), value));
+    }
+    out
+}
+
+fn exact_float_buffer_arg_values(
+    ll: &str,
+    arg_names: &[String],
+    inputs: &Inputs,
+) -> Vec<(String, f64)> {
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+    let locations = stage_resource_locations(ll);
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !line.contains(r#""air.address_space", i32 2"#)
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = extract_i32_after(line, "air.location_index").map(|v| v as u32) else {
+            continue;
+        };
+        let Some(type_name) = quoted_metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(bytes) = locations
+            .buffers
+            .get(&(arg_ord as u32))
+            .and_then(|loc| input_bytes.get(loc))
+            .or_else(|| input_bytes.get(&raw_loc))
+        else {
+            continue;
+        };
+        let Some(value) = scalar_float_from_bytes(bytes, &type_name) else {
+            continue;
+        };
+        out.push((arg_name.clone(), value));
+    }
+    out
+}
+
+fn exact_struct_buffer_arg_field_values(
+    ll: &str,
+    arg_names: &[String],
+    inputs: &Inputs,
+) -> Vec<(String, Vec<i32>, i128)> {
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+    let locations = stage_resource_locations(ll);
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !line.contains(r#""air.address_space", i32 2"#)
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(node) = metadata_ref_after(line, "air.struct_type_info") else {
+            continue;
+        };
+        let Some(raw_loc) = extract_i32_after(line, "air.location_index").map(|v| v as u32) else {
+            continue;
+        };
+        let Some(bytes) = locations
+            .buffers
+            .get(&(arg_ord as u32))
+            .and_then(|loc| input_bytes.get(loc))
+            .or_else(|| input_bytes.get(&raw_loc))
+        else {
+            continue;
+        };
+        let mut ctx = StructFieldCollectCtx {
+            ll,
+            bytes,
+            arg_name,
+            out: &mut out,
+        };
+        collect_struct_int_field_values(&mut ctx, node, 0, &[], &mut Vec::new());
+    }
+    out
+}
+
+struct StructFieldCollectCtx<'a, 'b> {
+    ll: &'a str,
+    bytes: &'a [u8],
+    arg_name: &'a str,
+    out: &'b mut Vec<(String, Vec<i32>, i128)>,
+}
+
+fn collect_struct_int_field_values(
+    ctx: &mut StructFieldCollectCtx<'_, '_>,
+    node: u32,
+    base_offset: usize,
+    base_path: &[i32],
+    stack: &mut Vec<u32>,
+) {
+    if stack.contains(&node) {
+        return;
+    }
+    let Some(line) = metadata_node_line(ctx.ll, node) else {
+        return;
+    };
+    let Some(payload) = metadata_payload(line) else {
+        return;
+    };
+    let tokens = metadata_tokens(payload);
+    stack.push(node);
+    let mut i = 0;
+    let mut field_index = 0i32;
+    let mut pending_nested_node = None;
+    while i + 3 < tokens.len() {
+        if metadata_quoted_token(tokens[i]) == Some("air.struct_type_info") {
+            pending_nested_node = tokens.get(i + 1).and_then(|tok| metadata_ref_token(tok));
+            i += 2;
+            continue;
+        }
+        let Some(offset) = metadata_i32_token(tokens[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some(byte_size) = metadata_i32_token(tokens[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        let Some(repeat_count) = metadata_i32_token(tokens[i + 2]) else {
+            i += 1;
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_token(tokens[i + 3]) else {
+            i += 1;
+            continue;
+        };
+        let offset = base_offset.saturating_add(offset.max(0) as usize);
+        let field_byte_size = byte_size.max(0) as usize;
+        let repeat_count = usize::try_from(repeat_count).unwrap_or(0).max(1);
+        let mut field_path = base_path.to_vec();
+        field_path.push(field_index);
+        if is_scalar_integer_air_type(type_name) {
+            for element in 0..repeat_count {
+                let field_offset = offset.saturating_add(element.saturating_mul(field_byte_size));
+                let end = field_offset.saturating_add(field_byte_size);
+                if end > ctx.bytes.len() {
+                    continue;
+                }
+                let mut path = field_path.clone();
+                if repeat_count > 1 {
+                    path.push(element as i32);
+                }
+                if let Some(value) = scalar_int_from_bytes(&ctx.bytes[field_offset..end], type_name)
+                {
+                    ctx.out.push((ctx.arg_name.to_string(), path, value));
+                }
+            }
+        } else if let Some(nested_node) = pending_nested_node.take() {
+            for element in 0..repeat_count {
+                let nested_offset = offset.saturating_add(element.saturating_mul(field_byte_size));
+                let mut nested_path = field_path.clone();
+                if repeat_count > 1 {
+                    nested_path.push(element as i32);
+                }
+                collect_struct_int_field_values(
+                    ctx,
+                    nested_node,
+                    nested_offset,
+                    &nested_path,
+                    stack,
+                );
+            }
+        }
+        field_index += 1;
+        i += 5;
+    }
+    stack.pop();
+}
+
+fn exact_texture_extent_values(
+    ll: &str,
+    arg_names: &[String],
+    plan: &HarnessPlan,
+) -> Vec<(String, [i128; 3])> {
+    let input_extents = plan
+        .textures
+        .iter()
+        .map(|texture| {
+            (
+                texture.index,
+                [
+                    i128::from(texture.w),
+                    i128::from(texture.h),
+                    i128::from(texture.d),
+                ],
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    if input_extents.is_empty() {
+        return Vec::new();
+    }
+    let locations = stage_resource_locations(ll);
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        if !line.contains(r#""air.texture""#) || !line.contains(r#""air.location_index""#) {
+            continue;
+        }
+        let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = extract_i32_after(line, "air.location_index").map(|v| v as u32) else {
+            continue;
+        };
+        let Some(extent) = locations
+            .textures
+            .get(&(arg_ord as u32))
+            .and_then(|loc| input_extents.get(loc))
+            .or_else(|| input_extents.get(&raw_loc))
+        else {
+            continue;
+        };
+        out.push((arg_name.clone(), *extent));
+    }
+    out
+}
+
+fn exact_imageblock_extent_value(ll: &str, plan: &HarnessPlan) -> Option<[i128; 2]> {
+    (ll.contains("@air.get_imageblock_width(") || ll.contains("@air.get_imageblock_height("))
+        .then_some([
+            i128::from(plan.dispatch_tg[0]),
+            i128::from(plan.dispatch_tg[1]),
+        ])
+}
+
+fn entry_arg_names(ll: &str, entry: &str) -> Vec<String> {
+    let Some(line) = ll.lines().find(|line| {
+        line.trim_start().starts_with("define ") && define_line_names_entry(line, entry)
+    }) else {
+        return Vec::new();
+    };
+    let Some(args) = define_args(line) else {
+        return Vec::new();
+    };
+    args.split(',')
+        .filter_map(|arg| {
+            let (_, name) = arg.rsplit_once('%')?;
+            let name = name.trim().trim_end_matches(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+            });
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn define_line_names_entry(line: &str, entry: &str) -> bool {
+    let Some(at) = line.find('@') else {
+        return false;
+    };
+    let rest = &line[at + 1..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted
+            .strip_prefix(entry)
+            .is_some_and(|tail| tail.starts_with('"'));
+    }
+    rest.strip_prefix(entry).is_some_and(|tail| {
+        tail.starts_with('(')
+            || tail
+                .chars()
+                .next()
+                .is_some_and(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+    })
+}
+
+fn define_args(line: &str) -> Option<&str> {
+    let open = line.find('(')?;
+    let close = line.rfind(") ")?;
+    (open < close).then_some(&line[open + 1..close])
+}
+
+fn integer_vector_lane_count(type_name: &str) -> Option<usize> {
+    integer_vector_shape(type_name).map(|(lanes, _, _)| lanes)
+}
+
+fn integer_vector_shape(type_name: &str) -> Option<(usize, &str, usize)> {
+    let trimmed = type_name.trim().trim_end_matches('*').trim();
+    let lanes = trimmed
+        .chars()
+        .last()
+        .and_then(|ch| ch.to_digit(10))
+        .and_then(|lanes| usize::try_from(lanes).ok())?;
+    if !(2..=4).contains(&lanes) {
+        return None;
+    }
+    let scalar = &trimmed[..trimmed.len() - 1];
+    let elem_size = scalar_int_type_byte_size(scalar)?;
+    Some((lanes, scalar, elem_size))
+}
+
+fn scalar_int_type_byte_size(type_name: &str) -> Option<usize> {
+    match type_name.trim().trim_end_matches('*').trim() {
+        "uchar" | "char" | "bool" => Some(1),
+        "ushort" | "short" => Some(2),
+        "uint" | "int" => Some(4),
+        "ulong" | "long" => Some(8),
+        _ => None,
+    }
+}
+
+fn is_scalar_integer_air_type(type_name: &str) -> bool {
+    matches!(
+        type_name.trim().trim_end_matches('*').trim(),
+        "uchar" | "char" | "bool" | "ushort" | "short" | "uint" | "int" | "ulong" | "long"
+    )
+}
+
+fn dispatch_lane(values: [u32; 3], lane: usize) -> Option<u32> {
+    values.get(lane).copied()
+}
+
+fn threadgroups_per_grid_lane(plan: &HarnessPlan, lane: usize) -> u32 {
+    let grid = dispatch_lane(plan.dispatch_grid, lane).unwrap_or(1);
+    let tg = dispatch_lane(plan.dispatch_tg, lane).unwrap_or(1);
+    div_ceil_nonzero(grid, tg)
+}
+
+fn div_ceil_nonzero(n: u32, d: u32) -> u32 {
+    let d = d.max(1);
+    n.max(1).div_ceil(d)
+}
+
+fn scalar_int_from_bytes(bytes: &[u8], type_name: &str) -> Option<i128> {
+    match type_name.trim().trim_end_matches('*').trim() {
+        "bool" | "uchar" => bytes.first().map(|value| i128::from(*value)),
+        "char" => bytes.first().map(|value| i128::from(*value as i8)),
+        "ushort" => {
+            let bytes: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+            Some(i128::from(u16::from_le_bytes(bytes)))
+        }
+        "short" => {
+            let bytes: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+            Some(i128::from(i16::from_le_bytes(bytes)))
+        }
+        "uint" => {
+            let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+            Some(i128::from(u32::from_le_bytes(bytes)))
+        }
+        "int" => {
+            let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+            Some(i128::from(i32::from_le_bytes(bytes)))
+        }
+        "ulong" => {
+            let bytes: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+            Some(i128::from(u64::from_le_bytes(bytes)))
+        }
+        "long" => {
+            let bytes: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+            Some(i128::from(i64::from_le_bytes(bytes)))
+        }
+        _ => None,
+    }
+}
+
+fn scalar_float_from_bytes(bytes: &[u8], type_name: &str) -> Option<f64> {
+    match type_name.trim().trim_end_matches('*').trim() {
+        "half" => {
+            let bytes: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+            Some(f16_bits_to_f64(u16::from_le_bytes(bytes)))
+        }
+        "float" => {
+            let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+            Some(f64::from(f32::from_le_bytes(bytes)))
+        }
+        "double" => {
+            let bytes: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+            Some(f64::from_le_bytes(bytes))
+        }
+        _ => None,
+    }
+}
+
+fn f16_bits_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exp = (bits >> 10) & 0x1f;
+    let frac = bits & 0x03ff;
+    match (exp, frac) {
+        (0, 0) => sign * 0.0,
+        (0, _) => sign * f64::from(frac) * 2f64.powi(-24),
+        (0x1f, 0) => sign * f64::INFINITY,
+        (0x1f, _) => f64::NAN,
+        _ => sign * (1.0 + f64::from(frac) / 1024.0) * 2f64.powi(i32::from(exp) - 15),
+    }
+}
+
 fn incompatible_compare_none_loop_guard_golden(
     ll: &str,
     entry: &str,
@@ -3327,7 +5208,12 @@ fn incompatible_compare_none_loop_guard_golden(
     if metal.compare != "none" {
         return None;
     }
-    match crate::loop_budget::classify_and_instrument(ll, entry) {
+    let loop_facts = loop_input_facts_for_metal_plan(ll, entry, metal);
+    match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
+        ll,
+        entry,
+        loop_facts.as_loop_input_facts(),
+    ) {
         crate::loop_budget::GuardPlan::Quarantine(reason) => Some(format!(
             "metal golden compare=none cannot be reproduced by current loop guard: {reason}; \
              rebank Metal row"
@@ -3335,6 +5221,46 @@ fn incompatible_compare_none_loop_guard_golden(
         crate::loop_budget::GuardPlan::Instrumented(_)
         | crate::loop_budget::GuardPlan::LoopFree => None,
     }
+}
+
+fn incompatible_compare_none_simdgroup_matrix_smoke_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare != "none" || metal.stage.as_deref() != Some("Kernel") {
+        return None;
+    }
+    if !ll.contains("@air.simdgroup_matrix_8x8_multiply_accumulate.")
+        || !ll.contains("@air.wg.barrier")
+        || !ll.contains("addrspace(3)")
+    {
+        return None;
+    }
+    Some(
+        "metal golden compare=none is a smoke-only simdgroup-matrix kernel with workgroup \
+         barriers and threadgroup memory; the Vulkan smoke run is not a bounded semantic oracle on \
+         this runner, so rebank or drop the row"
+            .into(),
+    )
+}
+
+fn incompatible_compare_none_raytracing_smoke_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare != "none" || metal.stage.as_deref() != Some("Kernel") {
+        return None;
+    }
+    if !(ll.contains(r#""air.instance_acceleration_structure""#)
+        || ll.contains("acceleration_structure<"))
+        || !ll.contains(r#""air.visible_function_table""#)
+        || !ll.contains("raytracing")
+    {
+        return None;
+    }
+    Some(
+        "metal golden compare=none is a smoke-only AIR raytracing kernel using acceleration \
+         structure and visible-function-table ABI; this validation runner has no bounded Vulkan \
+         semantic oracle for that row, so rebank or drop it"
+            .into(),
+    )
 }
 
 fn incompatible_nonportable_ptrtoint_golden(ll: &str, metal: &MetalRow) -> Option<String> {
@@ -3389,6 +5315,212 @@ fn incompatible_undefined_threadgroup_memory_golden(ll: &str, metal: &MetalRow) 
          undefined, so rebank or drop the Metal row"
             .into(),
     )
+}
+
+fn incompatible_subgroup_texture_write_race_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.plan.output.kind != "texture"
+        || metal.plan.dispatch_tg.iter().product::<u32>() <= 32
+        || !ll.contains("@air.write_texture")
+        || !(ll.contains("@air.simd_min.")
+            || ll.contains("@air.simd_max.")
+            || ll.contains("@air.simd_sum.")
+            || ll.contains("@air.simd_prefix_"))
+        || !ll.contains(r#""air.thread_index_in_simdgroup""#)
+        || !ll.contains(r#""air.threadgroup_position_in_grid""#)
+    {
+        return None;
+    }
+    if !declares_lane_zero_subgroup_texture_write(ll) {
+        return None;
+    }
+    Some(
+        "metal golden compares a subgroup-reduction texture write gated only by \
+         thread_index_in_simdgroup==0 while the workgroup contains multiple simdgroups; output \
+         coordinates derive from threadgroup_position_in_grid, so multiple simdgroups race on the \
+         same texels and the winner is backend-schedule-dependent"
+            .into(),
+    )
+}
+
+fn incompatible_many_to_one_texture_write_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll.contains(r#""air.thread_position_in_grid""#)
+        || !ll.contains("@air.write_texture_2d")
+    {
+        return None;
+    }
+    let reduced_coords: HashSet<&str> = ll
+        .lines()
+        .filter_map(|line| {
+            let (result, rhs) = line.split_once(" = ")?;
+            let rhs = rhs.trim_start();
+            let is_many_to_one = (rhs.starts_with("lshr <2 x i32> %")
+                || rhs.starts_with("ashr <2 x i32> %")
+                || rhs.starts_with("udiv <2 x i32> %"))
+                && (rhs.contains("splat (i32 1)") || rhs.contains("<i32 1, i32 1>"));
+            is_many_to_one.then_some(result.trim())
+        })
+        .collect();
+    if reduced_coords.is_empty() {
+        if !texture_array_write_omits_grid_lane(ll, &metal.plan) {
+            return None;
+        }
+        return Some(
+            "metal golden writes a texture2d_array output from multiple kernel lanes whose write \
+             coordinates omit a varying grid dimension; multiple lanes race on the same texels and \
+             the winner is backend-schedule-dependent, so rebank with a one-to-one launch/output \
+             plan or drop the row"
+                .into(),
+        );
+    }
+    let uses_reduced_coord = ll.lines().any(|line| {
+        line.contains("@air.write_texture_2d")
+            && reduced_coords
+                .iter()
+                .any(|coord| line.contains(&format!("<2 x i32> {coord}")))
+    });
+    if !uses_reduced_coord {
+        return None;
+    }
+    Some(
+        "metal golden writes a texture from multiple kernel lanes to the same downscaled output \
+         coordinate; the write race is order-dependent across Metal/Vulkan runners, so rebank with \
+         a one-to-one launch/output plan or drop the row"
+            .into(),
+    )
+}
+
+fn texture_array_write_omits_grid_lane(ll: &str, plan: &HarnessPlan) -> bool {
+    if !ll.contains("@air.write_texture_2d_array") {
+        return false;
+    }
+    let mut coord_masks: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut lane_extracts: HashMap<String, usize> = HashMap::new();
+    for line in ll.lines().map(str::trim) {
+        let Some((result, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("shufflevector <3 x i32> %") {
+            if let Some(mask) = parse_i32_vector_literal(rhs).filter(|mask| mask.len() == 2) {
+                coord_masks.insert(result.to_string(), mask);
+            }
+            continue;
+        }
+        if rhs.starts_with("extractelement <3 x i32> %") {
+            if let Some(lane) = extractelement_i32_lane(rhs) {
+                lane_extracts.insert(result.to_string(), lane);
+            }
+        }
+    }
+    if coord_masks.is_empty() {
+        return false;
+    }
+    ll.lines()
+        .filter(|line| line.contains("@air.write_texture_2d_array"))
+        .any(|line| {
+            coord_masks.iter().any(|(coord, mask)| {
+                if !line.contains(&format!("<2 x i32> %{coord}")) {
+                    return false;
+                }
+                (0..3).any(|lane| {
+                    !mask.contains(&lane)
+                        && plan.dispatch_grid.get(lane).copied().unwrap_or(1) > 1
+                        && !lane_extracts.iter().any(|(reg, reg_lane)| {
+                            *reg_lane == lane && line.contains(&format!("%{reg}"))
+                        })
+                })
+            })
+        })
+}
+
+fn parse_i32_vector_literal(rhs: &str) -> Option<Vec<usize>> {
+    let start = rhs.rfind("<i32 ")?;
+    let rest = &rhs[start + 1..];
+    let (literal, _) = rest.split_once('>')?;
+    literal
+        .split(", ")
+        .map(|part| {
+            part.trim()
+                .strip_prefix("i32 ")
+                .and_then(|n| n.parse::<usize>().ok())
+        })
+        .collect()
+}
+
+fn extractelement_i32_lane(rhs: &str) -> Option<usize> {
+    let lane = rhs
+        .rsplit_once(", i64 ")
+        .or_else(|| rhs.rsplit_once(", i32 "))?
+        .1;
+    lane.split(|ch: char| !ch.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn declares_lane_zero_subgroup_texture_write(ll: &str) -> bool {
+    let Some(args) = primary_entry_function_args(ll) else {
+        return false;
+    };
+    let lane_args = arg_names_for_metadata_key(args, ll, "air.thread_index_in_simdgroup")
+        .into_iter()
+        .map(|name| format!("%{name}"))
+        .collect::<Vec<_>>();
+    let tg_pos_args = arg_names_for_metadata_key(args, ll, "air.threadgroup_position_in_grid")
+        .into_iter()
+        .map(|name| format!("%{name}"))
+        .collect::<Vec<_>>();
+    if lane_args.is_empty() || tg_pos_args.is_empty() {
+        return false;
+    }
+    let Some(body) = primary_entry_function_body(ll) else {
+        return false;
+    };
+
+    let mut lane_zero_predicates = HashSet::new();
+    let mut saw_lane_zero_branch = false;
+    let mut tg_position_values = tg_pos_args.into_iter().collect::<HashSet<_>>();
+    let mut texture_write_uses_tg_position = false;
+    for line in body.lines().map(str::trim) {
+        if line.starts_with('%')
+            && line.contains(" = icmp eq ")
+            && line.contains(", 0")
+            && lane_args
+                .iter()
+                .any(|lane| llvm_line_uses_value(line, lane))
+        {
+            if let Some(value) = llvm_assignment_value(line) {
+                lane_zero_predicates.insert(value.to_string());
+            }
+        }
+        if line.starts_with("br i1 ")
+            && lane_zero_predicates
+                .iter()
+                .any(|pred| llvm_line_uses_value(line, pred))
+        {
+            saw_lane_zero_branch = true;
+        }
+        if line.contains("@air.write_texture")
+            && tg_position_values
+                .iter()
+                .any(|value| llvm_line_uses_value(line, value))
+        {
+            texture_write_uses_tg_position = true;
+        }
+        if line.starts_with('%')
+            && tg_position_values
+                .iter()
+                .any(|value| llvm_line_uses_value(line, value))
+        {
+            if let Some(value) = llvm_assignment_value(line) {
+                tg_position_values.insert(value.to_string());
+            }
+        }
+    }
+    saw_lane_zero_branch && texture_write_uses_tg_position
 }
 
 #[derive(Clone, Copy, Default)]
@@ -3843,7 +5975,7 @@ fn plan_output_summary(output: &PlanOutput) -> String {
 }
 
 fn incompatible_bounded_control_seed_golden(ll: &str, metal: &MetalRow) -> Option<String> {
-    let current = infer_buffers(ll);
+    let current = infer_plan(ll).buffers;
     for banked in metal
         .plan
         .buffers
@@ -3886,6 +6018,238 @@ fn incompatible_bounded_control_seed_golden(ll: &str, metal: &MetalRow) -> Optio
     None
 }
 
+fn incompatible_overlapping_output_stride_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+    {
+        return None;
+    }
+    let output_index = metal.plan.output.index;
+    output_stride_control_requirements(ll, output_index, &metal.plan.buffers)
+        .into_iter()
+        .find(|req| {
+            metal
+                .plan
+                .buffers
+                .iter()
+                .find(|buffer| buffer.index == req.buffer)
+                .is_some_and(|buffer| bounded_control_output_stride_too_small(buffer, *req))
+        })
+        .map(|req| {
+            format!(
+                "metal golden seeds output byte-stride/control buffer too small while replay stores \
+                 {} bytes per element to output buffer {output_index}; rebank Metal row \
+                 with non-overlapping output stride",
+                req.store_bytes
+            )
+        })
+}
+
+#[derive(Clone, Copy)]
+struct OutputStrideRequirement {
+    buffer: u32,
+    store_bytes: usize,
+    min_row_bytes: u64,
+}
+
+fn output_stride_control_requirements(
+    ll: &str,
+    output_index: u32,
+    buffers: &[PlanBuffer],
+) -> Vec<OutputStrideRequirement> {
+    let stride_control_buffers: HashMap<u32, &PlanBuffer> = buffers
+        .iter()
+        .filter(|b| b.seed_mode == SEED_MODE_BOUNDED_CONTROL)
+        .filter(|b| !b.seed_layout.is_empty())
+        .map(|b| (b.index, b))
+        .collect();
+    if stride_control_buffers.is_empty() {
+        return Vec::new();
+    }
+
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_name_to_buf = arg_name_to_buffer_location(ll, &arg_to_buf);
+    let mut ptr_buf: HashMap<&str, u32> = HashMap::new();
+    let mut pointer_roots: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut pointer_offsets: HashMap<String, HashSet<u32>> = HashMap::new();
+    for arg in entry_function_args(ll)
+        .into_iter()
+        .flat_map(|args| args.split(',').enumerate())
+    {
+        let Some(&buf) = arg_to_buf.get(&arg.0) else {
+            continue;
+        };
+        let Some(name) = arg.1.rsplit_once('%').map(|(_, name)| name.trim()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        ptr_buf.insert(name, buf);
+        pointer_roots.insert(name.to_string(), HashSet::from([buf]));
+        pointer_offsets.insert(name.to_string(), HashSet::new());
+    }
+    if let Some(entry) = entry_name_from_ll(ll) {
+        for (ord, name) in entry_arg_names(ll, &entry).into_iter().enumerate() {
+            let Some(&buf) = arg_to_buf.get(&ord) else {
+                continue;
+            };
+            pointer_roots
+                .entry(name.clone())
+                .or_insert_with(|| HashSet::from([buf]));
+            pointer_offsets.entry(name).or_default();
+        }
+    }
+
+    let mut value_sources: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut requirements = Vec::new();
+    for line in ll.lines() {
+        let trimmed = line.trim_start();
+        if let Some((reg, rhs)) = split_assign(trimmed) {
+            let operands = percent_operands(rhs);
+            let mut sources = HashSet::new();
+            if rhs.starts_with("load ") {
+                if let Some(buf) = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf) {
+                    sources.insert(buf);
+                }
+                for operand in &operands {
+                    if let Some(roots) = pointer_roots.get(*operand) {
+                        sources.extend(roots.iter().copied());
+                    }
+                }
+            }
+            for operand in &operands {
+                if let Some(prev) = value_sources.get(*operand) {
+                    sources.extend(prev.iter().copied());
+                }
+            }
+            if !sources.is_empty() {
+                value_sources.insert(reg.to_string(), sources.clone());
+            }
+
+            let mut roots = HashSet::new();
+            let mut offsets = HashSet::new();
+            for operand in operands {
+                if let Some(prev) = pointer_roots.get(operand) {
+                    roots.extend(prev.iter().copied());
+                }
+                if let Some(prev) = pointer_offsets.get(operand) {
+                    offsets.extend(prev.iter().copied());
+                }
+                if let Some(prev) = value_sources.get(operand) {
+                    offsets.extend(prev.iter().copied());
+                }
+            }
+            if !roots.is_empty()
+                && (rhs.contains("getelementptr")
+                    || rhs.starts_with("bitcast ")
+                    || rhs.starts_with("select "))
+            {
+                pointer_roots.insert(reg.to_string(), roots);
+                pointer_offsets.insert(reg.to_string(), offsets);
+            }
+            continue;
+        }
+
+        let Some(store_bytes) = llvm_store_value_byte_width(trimmed) else {
+            continue;
+        };
+        if store_bytes <= 1 {
+            continue;
+        }
+        let Some(ptr) = store_pointer_operand(trimmed) else {
+            continue;
+        };
+        let roots_hit_output = pointer_roots
+            .get(ptr)
+            .is_some_and(|roots| roots.contains(&output_index));
+        if !roots_hit_output {
+            continue;
+        }
+        if let Some(offsets) = pointer_offsets.get(ptr) {
+            for buf in offsets {
+                if stride_control_buffers.contains_key(buf) {
+                    requirements.push(OutputStrideRequirement {
+                        buffer: *buf,
+                        store_bytes,
+                        min_row_bytes: output_stride_min_row_bytes(store_bytes),
+                    });
+                }
+            }
+        }
+    }
+    requirements
+}
+
+fn output_stride_min_row_bytes(store_bytes: usize) -> u64 {
+    u64::from(BOUNDED_CONTROL_DIM).saturating_mul(store_bytes as u64)
+}
+
+fn bounded_control_output_stride_too_small(
+    buffer: &PlanBuffer,
+    req: OutputStrideRequirement,
+) -> bool {
+    buffer.seed_layout.iter().any(|field| {
+        bounded_control_seed_field_is_within_buffer(buffer.len, field)
+            && field.value.unwrap_or(u64::from(BOUNDED_CONTROL_DIM)) < req.min_row_bytes
+    })
+}
+
+fn bounded_control_seed_field_is_within_buffer(len: usize, field: &ControlSeedField) -> bool {
+    field.size <= 4
+        && field.offset.saturating_add(field.size).min(len)
+            == field.offset.saturating_add(field.size)
+}
+
+fn control_seed_field_max_value(size: usize) -> Option<u64> {
+    match size {
+        1 => Some(u64::from(u8::MAX)),
+        2 => Some(u64::from(u16::MAX)),
+        4 => Some(u64::from(u32::MAX)),
+        _ => None,
+    }
+}
+
+fn llvm_store_value_byte_width(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("store ")?;
+    let value_ty = llvm_store_value_type(rest)?;
+    llvm_type_byte_width(value_ty)
+}
+
+fn llvm_store_value_type(rest: &str) -> Option<&str> {
+    let rest = rest.trim_start();
+    if rest.starts_with('<') {
+        let end = rest.find('>')?;
+        return Some(&rest[..=end]);
+    }
+    rest.split_whitespace().next()
+}
+
+fn llvm_type_byte_width(ty: &str) -> Option<usize> {
+    let ty = ty.trim();
+    if let Some(inner) = ty.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        let (lanes, scalar) = inner.split_once(" x ")?;
+        let lanes = lanes.trim().parse::<usize>().ok()?;
+        return llvm_type_byte_width(scalar).map(|bytes| bytes.saturating_mul(lanes));
+    }
+    match ty {
+        "half" => Some(2),
+        "float" => Some(4),
+        "double" => Some(8),
+        "ptr" => Some(8),
+        _ => ty
+            .strip_prefix('i')
+            .and_then(|bits| bits.parse::<usize>().ok())
+            .map(|bits| bits.div_ceil(8)),
+    }
+}
+
+fn store_pointer_operand(line: &str) -> Option<&str> {
+    let (_, ptr_part) = line.split_once(',')?;
+    first_percent_reg(ptr_part)
+}
+
 fn incompatible_oob_vector_input_golden(ll: &str, metal: &MetalRow) -> Option<String> {
     if metal.compare == "none" || metal.stage.as_deref() != Some("Kernel") {
         return None;
@@ -3917,6 +6281,590 @@ fn incompatible_oob_vector_input_golden(ll: &str, metal: &MetalRow) -> Option<St
         }
     }
     None
+}
+
+fn incompatible_bounded_control_strided_input_oob_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || !ll.contains("load <2 x i32>, ptr addrspace(2)")
+        || !ll.contains("@air.min.u.i32")
+        || !module_has_dynamic_device_gep(ll, "i32")
+    {
+        return None;
+    }
+    let width = metal
+        .plan
+        .buffers
+        .iter()
+        .find(|buffer| {
+            buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL
+                && buffer.len >= 8
+                && buffer_type_name_for_location(ll, buffer.index).as_deref() == Some("uint2")
+        })
+        .and_then(|buffer| bounded_control_u32_at(buffer, 0))
+        .unwrap_or(BOUNDED_CONTROL_DIM);
+    let height = metal
+        .plan
+        .buffers
+        .iter()
+        .find(|buffer| {
+            buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL
+                && buffer.len >= 8
+                && buffer_type_name_for_location(ll, buffer.index).as_deref() == Some("uint2")
+        })
+        .and_then(|buffer| bounded_control_u32_at(buffer, 4))
+        .unwrap_or(BOUNDED_CONTROL_DIM);
+    let max_y = u64::from(
+        metal.plan.dispatch_grid[1]
+            .saturating_sub(1)
+            .min(height.saturating_sub(1)),
+    );
+    let required_elems = max_y
+        .saturating_mul(u64::from(width.max(1)))
+        .saturating_add(u64::from(metal.plan.dispatch_grid[0].max(1)));
+    for buffer in &metal.plan.buffers {
+        if buffer.role == "Output" || buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL {
+            continue;
+        }
+        let Some(type_name) = buffer_type_name_for_location(ll, buffer.index) else {
+            continue;
+        };
+        if !matches!(type_name.as_str(), "int" | "uint") {
+            continue;
+        }
+        if required_elems.saturating_mul(4) <= buffer.len as u64 {
+            continue;
+        }
+        return Some(format!(
+            "metal golden seeds bounded_control width={} height={} for a strided device-buffer \
+             lookup into buffer {} with {} uint elements; dispatch_grid={:?} can read past the \
+             input buffer, so rebank with valid dimensions or a larger input buffer",
+            width,
+            height,
+            buffer.index,
+            buffer.len / 4,
+            metal.plan.dispatch_grid
+        ));
+    }
+    None
+}
+
+fn incompatible_finite_struct_control_index_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none" {
+        return None;
+    }
+    let finite_struct_buffers: HashSet<u32> = metal
+        .plan
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.seed_mode == SEED_MODE_FINITE_STRUCT_FLOAT)
+        .map(|buffer| buffer.index)
+        .collect();
+    if finite_struct_buffers.is_empty() {
+        return None;
+    }
+    let body = primary_entry_function_body(ll)?;
+    let args = primary_entry_function_args(ll)?;
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_name_to_buf = arg_name_to_buffer_location_from_args(args, &arg_to_buf);
+    if arg_to_buf.is_empty() {
+        return None;
+    }
+
+    let mut ptr_buf: HashMap<&str, u32> = HashMap::new();
+    let mut index_value_source: HashMap<&str, u32> = HashMap::new();
+    for line in body.lines().map(str::trim) {
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("getelementptr") || rhs.starts_with("bitcast") {
+            let buf = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf);
+            if let Some(buf) = buf {
+                ptr_buf.insert(reg, buf);
+            }
+            if rhs.starts_with("getelementptr")
+                && buf.is_some_and(|buf| finite_struct_buffers.contains(&buf))
+            {
+                if let Some(source_buf) = trailing_dynamic_gep_index(rhs)
+                    .and_then(normalize_percent_reg)
+                    .and_then(|index| index_value_source.get(index))
+                {
+                    return Some(format!(
+                        "metal golden uses finite_struct_float buffer {source_buf} with an integer \
+                         struct field that feeds a dynamic struct-array index; rebank Metal row \
+                         with bounded control/index fields"
+                    ));
+                }
+            }
+            continue;
+        }
+        if is_integer_load_rhs(rhs) {
+            if let Some(buf) = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf)
+                .filter(|buf| finite_struct_buffers.contains(buf))
+            {
+                index_value_source.insert(reg, buf);
+            }
+            continue;
+        }
+        if let Some(src) = integer_cast_source(rhs).and_then(normalize_percent_reg) {
+            if let Some(&buf) = index_value_source.get(src) {
+                index_value_source.insert(reg, buf);
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+struct ControlIndexSource {
+    buffer: u32,
+    value: u64,
+}
+
+fn incompatible_bounded_control_index_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none" {
+        return None;
+    }
+    let bounded_buffers: HashMap<u32, &PlanBuffer> = metal
+        .plan
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL)
+        .map(|buffer| (buffer.index, buffer))
+        .collect();
+    if bounded_buffers.is_empty() {
+        return None;
+    }
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    if arg_to_buf.is_empty() {
+        return None;
+    }
+
+    let mut arg_name_to_buf = HashMap::new();
+    let mut ptr_buf: HashMap<&str, u32> = HashMap::new();
+    let mut ptr_index_source: HashMap<&str, ControlIndexSource> = HashMap::new();
+    let mut index_value_source: HashMap<&str, ControlIndexSource> = HashMap::new();
+    for line in ll.lines().map(str::trim) {
+        if let Some(args) = define_function_args(line) {
+            arg_name_to_buf = arg_name_to_buffer_location_from_args(args, &arg_to_buf);
+            ptr_buf.clear();
+            ptr_index_source.clear();
+            index_value_source.clear();
+            continue;
+        }
+
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+
+        if rhs.starts_with("getelementptr") {
+            if let Some(bound) = fixed_array_gep_bound(rhs) {
+                if let Some(source) = trailing_dynamic_gep_index(rhs)
+                    .and_then(normalize_percent_reg)
+                    .and_then(|index| index_value_source.get(index))
+                    .copied()
+                {
+                    if source.value >= bound {
+                        return Some(format!(
+                            "metal golden seeds bounded_control buffer {} dynamic array index as \
+                             {}, outside fixed {bound}-element array; rebank Metal row with valid \
+                             control/index fields",
+                            source.buffer, source.value
+                        ));
+                    }
+                }
+            }
+
+            let buf = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf);
+            if let Some(buf) = buf {
+                ptr_buf.insert(reg, buf);
+            }
+            if let Some(buffer) = buf.and_then(|buf| bounded_buffers.get(&buf).copied()) {
+                if let Some(source) = bounded_control_gep_index_source(rhs, buffer) {
+                    ptr_index_source.insert(reg, source);
+                }
+            }
+            continue;
+        }
+
+        if rhs.starts_with("bitcast") {
+            let buf = first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf);
+            if let Some(buf) = buf {
+                ptr_buf.insert(reg, buf);
+            }
+            if let Some(source) = percent_operands(rhs)
+                .into_iter()
+                .find_map(|operand| ptr_index_source.get(operand).copied())
+            {
+                ptr_index_source.insert(reg, source);
+            }
+            continue;
+        }
+
+        if is_integer_load_rhs(rhs) {
+            if let Some(source) = load_pointer_operand(rhs)
+                .and_then(|ptr| ptr_index_source.get(ptr))
+                .copied()
+                .or_else(|| {
+                    first_buf_operand(rhs, &ptr_buf, &arg_to_buf, &arg_name_to_buf)
+                        .and_then(|buf| bounded_buffers.get(&buf).copied())
+                        .map(|buffer| ControlIndexSource {
+                            buffer: buffer.index,
+                            value: u64::from(BOUNDED_CONTROL_DIM),
+                        })
+                })
+            {
+                index_value_source.insert(reg, source);
+            }
+            continue;
+        }
+
+        if let Some(src) = integer_cast_source(rhs).and_then(normalize_percent_reg) {
+            if let Some(&source) = index_value_source.get(src) {
+                index_value_source.insert(reg, source);
+            }
+        }
+    }
+    None
+}
+
+fn incompatible_bounded_control_reflective_oob_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none" || metal.stage.as_deref() != Some("Kernel") {
+        return None;
+    }
+    if metal.plan.output.kind != "buffer" || !ll.contains("@air.abs.s.i32") {
+        return None;
+    }
+    let (finite_input, elem_size, elem_label, llvm_ty) =
+        finite_float_input_for_reflective_oob(&metal.plan)?;
+    if !module_has_dynamic_device_gep(ll, llvm_ty) {
+        return None;
+    }
+    let has_reflective_index = ll.lines().any(|line| {
+        let line = line.trim();
+        line.contains(" sub ") && line.contains(" i32 %")
+    }) && ll
+        .lines()
+        .any(|line| line.trim_start().starts_with("br i1 %"));
+    if !has_reflective_index {
+        return None;
+    }
+
+    let input_elems = finite_input.len / elem_size;
+    if input_elems == 0 {
+        return None;
+    }
+
+    let default_bounded_controls = metal
+        .plan
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL)
+        .filter(|buffer| {
+            [0, 4, 12, 24]
+                .into_iter()
+                .all(|offset| bounded_control_u32_at(buffer, offset) == Some(BOUNDED_CONTROL_DIM))
+        })
+        .count();
+    if default_bounded_controls < 2 {
+        return None;
+    }
+
+    let dim = BOUNDED_CONTROL_DIM as usize;
+    let min_reflected_linear_index = dim.saturating_mul(dim).saturating_add(1);
+    if min_reflected_linear_index <= input_elems {
+        return None;
+    }
+    Some(format!(
+        "metal golden seeds bounded_control reflective-padding fields as {dim}, producing source \
+         index {min_reflected_linear_index} past finite {elem_label} input buffer {} with {input_elems} \
+         elements; rebank Metal row with valid padding/control fields",
+        finite_input.index
+    ))
+}
+
+fn incompatible_bounded_control_local_array_index_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none" {
+        return None;
+    }
+    let index_control_bufs = buffers_with_loads_used_as_local_array_indices(ll);
+    if index_control_bufs.is_empty() {
+        return None;
+    }
+    let has_default_index_control = metal
+        .plan
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL)
+        .filter(|buffer| index_control_bufs.contains(&buffer.index))
+        .any(|buffer| bounded_control_u32_at(buffer, 0) == Some(BOUNDED_CONTROL_DIM));
+    if !has_default_index_control {
+        return None;
+    }
+    Some(format!(
+        "metal golden seeds bounded_control local-array index as {}, but the AIR indexes a smaller \
+         stack array through a dynamic inbounds GEP; the result is undefined/robustness-dependent, \
+         so rebank with an in-range index or drop the row",
+        BOUNDED_CONTROL_DIM
+    ))
+}
+
+fn local_array_capacity_is_less_than_bounded_control_dim(ll: &str) -> bool {
+    ll.lines()
+        .filter(|line| line.contains(" = type ") && line.contains("["))
+        .any(|line| {
+            let Some((_, after_bracket)) = line.split_once('[') else {
+                return false;
+            };
+            let Some((count, _)) = after_bracket.split_once(" x ") else {
+                return false;
+            };
+            count
+                .trim()
+                .parse::<u32>()
+                .is_ok_and(|count| count < BOUNDED_CONTROL_DIM)
+        })
+}
+
+fn incompatible_texture_indexed_float_buffer_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.plan.output.kind != "texture"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.read_texture")
+        || !ll.contains(".u.v4i32")
+        || !ll.contains("getelementptr inbounds float, ptr addrspace(1)")
+    {
+        return None;
+    }
+    let input = metal.plan.buffers.iter().find(|buffer| {
+        buffer.role == "Input" && buffer.seed_mode == SEED_MODE_FINITE_FLOAT32 && buffer.len >= 4
+    })?;
+    let input_elems = input.len / 4;
+    if input_elems >= 256 {
+        return None;
+    }
+    let has_deterministic_uint_texture = metal.plan.textures.iter().any(|texture| {
+        matches!(texture.role.as_str(), "StorageRead" | "StorageReadWrite")
+            && texture.seed_mode == SEED_MODE_DETERMINISTIC
+            && texture.format.ends_with("Uint")
+    });
+    if !has_deterministic_uint_texture || !texture_uint_read_feeds_float_buffer_gep(ll) {
+        return None;
+    }
+    Some(format!(
+        "metal golden uses deterministic unsigned texture data as an unchecked index into finite f32 \
+         input buffer {} with {input_elems} elements under AIR fast/no-nans math; out-of-bounds buffer \
+         reads are undefined/robustness-dependent, so rebank with bounded indices or drop Metal row",
+        input.index
+    ))
+}
+
+fn texture_uint_read_feeds_float_buffer_gep(ll: &str) -> bool {
+    let mut read_results = HashSet::new();
+    let mut vectors = HashSet::new();
+    let mut scalars = HashSet::new();
+    let mut indices = HashSet::new();
+    for line in ll.lines().map(str::trim) {
+        if line.contains("@air.read_texture") && line.contains(".u.v4i32") {
+            if let Some(value) = llvm_assignment_value(line) {
+                read_results.insert(value.to_string());
+            }
+            continue;
+        }
+        if line.contains("extractvalue")
+            && read_results.iter().any(|v| llvm_line_uses_value(line, v))
+        {
+            if let Some(value) = llvm_assignment_value(line) {
+                vectors.insert(value.to_string());
+            }
+            continue;
+        }
+        if line.contains("extractelement <4 x i32>")
+            && vectors.iter().any(|v| llvm_line_uses_value(line, v))
+        {
+            if let Some(value) = llvm_assignment_value(line) {
+                scalars.insert(value.to_string());
+            }
+            continue;
+        }
+        if line.contains(" = zext i32 ")
+            && scalars.iter().any(|v| llvm_line_uses_value(line, v))
+            && line.contains(" to i64")
+        {
+            if let Some(value) = llvm_assignment_value(line) {
+                indices.insert(value.to_string());
+            }
+            continue;
+        }
+        if line.contains("getelementptr inbounds float, ptr addrspace(1)")
+            && indices.iter().any(|v| llvm_line_uses_value(line, v))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn incompatible_fast_coordinate_buffer_lookup_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+        || !ll.contains("@air.convert.u.")
+        || !(ll.contains(" fdiv fast ") || ll.contains(" fdiv fast <"))
+        || !ll.contains("getelementptr inbounds [")
+        || !ll.contains(", ptr addrspace(1)")
+    {
+        return None;
+    }
+    let has_finite_float_input = metal.plan.buffers.iter().any(|buffer| {
+        buffer.role == "Input"
+            && matches!(
+                buffer.seed_mode.as_str(),
+                SEED_MODE_FINITE_FLOAT16 | SEED_MODE_FINITE_FLOAT32
+            )
+    });
+    if !has_finite_float_input {
+        return None;
+    }
+    let has_dynamic_device_array_gep = ll.lines().any(|line| {
+        line.contains("getelementptr inbounds [")
+            && line.contains(", ptr addrspace(1)")
+            && (line.contains(", i64 %") || line.contains(", i32 %"))
+    });
+    if !has_dynamic_device_array_gep {
+        return None;
+    }
+    Some(
+        "metal golden computes a finite float-buffer lookup index through AIR fast floating-point \
+         coordinate scaling before texture output; small Metal/Vulkan rounding differences can select \
+         different buffer elements, so this seed is not a portable validation oracle; rebank or drop \
+         Metal row"
+            .into(),
+    )
+}
+
+fn finite_float_input_for_reflective_oob(
+    plan: &HarnessPlan,
+) -> Option<(&PlanBuffer, usize, &'static str, &'static str)> {
+    plan.buffers.iter().find_map(|buffer| {
+        if buffer.role != "Input" {
+            return None;
+        }
+        match buffer.seed_mode.as_str() {
+            SEED_MODE_FINITE_FLOAT16 if buffer.len >= 2 => Some((buffer, 2, "f16", "half")),
+            SEED_MODE_FINITE_FLOAT32 if buffer.len >= 4 => Some((buffer, 4, "f32", "float")),
+            _ => None,
+        }
+    })
+}
+
+fn bounded_control_u32_at(buffer: &PlanBuffer, offset: usize) -> Option<u32> {
+    if offset + 4 > buffer.len {
+        return None;
+    }
+    match buffer
+        .seed_layout
+        .iter()
+        .find(|field| field.offset == offset && field.size <= 4)
+    {
+        Some(field) => field
+            .value
+            .unwrap_or(u64::from(BOUNDED_CONTROL_DIM))
+            .try_into()
+            .ok(),
+        None => Some(BOUNDED_CONTROL_DIM),
+    }
+}
+
+fn define_function_args(line: &str) -> Option<&str> {
+    let line = line.strip_prefix("define ")?;
+    let header = line.split_once('{')?.0;
+    let open = header.find('(')?;
+    let close = header.rfind(')')?;
+    (open < close).then_some(&header[open + 1..close])
+}
+
+fn fixed_array_gep_bound(rhs: &str) -> Option<u64> {
+    let rhs = rhs.strip_prefix("getelementptr")?;
+    let start = rhs.find('[')?;
+    let rest = &rhs[start + 1..];
+    let (bound, _) = rest.split_once(" x ")?;
+    bound.trim().parse().ok()
+}
+
+fn bounded_control_gep_index_source(rhs: &str, buffer: &PlanBuffer) -> Option<ControlIndexSource> {
+    let Some(field_index) = trailing_const_i32_gep_index(rhs) else {
+        return Some(ControlIndexSource {
+            buffer: buffer.index,
+            value: u64::from(BOUNDED_CONTROL_DIM),
+        });
+    };
+    let offset = usize::try_from(field_index).ok()?.checked_mul(4)?;
+    let field = buffer
+        .seed_layout
+        .iter()
+        .find(|field| field.offset == offset && field.size <= 8)?;
+    Some(ControlIndexSource {
+        buffer: buffer.index,
+        value: field.value.unwrap_or(u64::from(BOUNDED_CONTROL_DIM)),
+    })
+}
+
+fn trailing_const_i32_gep_index(rhs: &str) -> Option<u64> {
+    let idx = rhs.rfind(", i32 ")?;
+    let rest = &rhs[idx + ", i32 ".len()..];
+    rest.split(|ch: char| !ch.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn load_pointer_operand(rhs: &str) -> Option<&str> {
+    let (_, ptr_part) = rhs.split_once(',')?;
+    first_percent_reg(ptr_part)
+}
+
+fn is_integer_load_rhs(rhs: &str) -> bool {
+    let Some(rest) = rhs.strip_prefix("load ") else {
+        return false;
+    };
+    let Some((ty, _)) = rest.split_once(',') else {
+        return false;
+    };
+    is_scalar_integer_type(ty.trim())
+}
+
+fn integer_cast_source(rhs: &str) -> Option<&str> {
+    let rest = rhs
+        .strip_prefix("sext ")
+        .or_else(|| rhs.strip_prefix("zext "))
+        .or_else(|| rhs.strip_prefix("trunc "))?;
+    let (from_ty, rest) = rest.split_once(' ')?;
+    if !is_scalar_integer_type(from_ty.trim()) {
+        return None;
+    }
+    let (src, to_ty) = rest.split_once(" to ")?;
+    is_scalar_integer_type(to_ty.trim()).then_some(src.trim())
+}
+
+fn normalize_percent_reg(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let name = value.strip_prefix('%')?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn is_scalar_integer_type(ty: &str) -> bool {
+    ty.strip_prefix('i')
+        .is_some_and(|bits| !bits.is_empty() && bits.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn buffer_type_name_for_location(ll: &str, location: u32) -> Option<String> {
@@ -4066,7 +7014,7 @@ fn incompatible_float_seed_golden(ll: &str, metal: &MetalRow) -> Option<String> 
     if !ll_has_fast_no_nans_float_semantics(ll) {
         return None;
     }
-    let current_buffers = infer_buffers(ll);
+    let current_buffers = infer_plan(ll).buffers;
     for current in current_buffers {
         if current.role == "Output" {
             continue;
@@ -4134,6 +7082,15 @@ fn incompatible_float_seed_golden(ll: &str, metal: &MetalRow) -> Option<String> 
         let Some(banked) = metal.plan.buffers.iter().find(|b| b.index == current.index) else {
             continue;
         };
+        if banked.seed_mode == current.seed_mode && banked.len != current.len {
+            return Some(format!(
+                "metal golden uses legacy {} buffer {} length {} now sized {}; rebank Metal row",
+                finite_seed_label(&current.seed_mode),
+                current.index,
+                banked.len,
+                current.len
+            ));
+        }
         if banked.seed_mode != SEED_MODE_DETERMINISTIC {
             continue;
         }
@@ -4191,10 +7148,776 @@ fn incompatible_float_output_golden(ll: &str, metal: &MetalRow) -> Option<String
     ))
 }
 
+fn incompatible_finite_struct_half_fragment_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+        || !(ll.contains(" fdiv fast half ") || ll.contains(" fdiv fast <"))
+    {
+        return None;
+    }
+    let has_finite_struct_input = infer_buffers(ll)
+        .into_iter()
+        .any(|buffer| buffer.role != "Output" && buffer.seed_mode == SEED_MODE_FINITE_STRUCT_FLOAT);
+    if !has_finite_struct_input {
+        return None;
+    }
+    Some(
+        "metal golden feeds finite_struct_float synthetic data through AIR fast half division before \
+         float render-target output; Metal/Vulkan half division and rounding are not a portable \
+         byte oracle for this seed, so rebank or drop the row"
+            .into(),
+    )
+}
+
+fn incompatible_barycentric_derivative_fragment_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll.contains(r#""air.barycentric_coord""#)
+        || !ll.contains("@air.fwidth.")
+    {
+        return None;
+    }
+    Some(
+        "metal golden compares a fragment render target derived from AIR barycentric coordinates \
+         and derivative/fwidth math; the current Vulkan harness does not reproduce Metal's exact \
+         rasterization/interpolation derivative oracle for this synthetic draw, so rebank or drop \
+         the row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_vertex_clip_distance_half_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Vertex")
+        || !ll.contains(r#""air.clip_distance""#)
+        || !sampled_finite_half_texture(ll)
+    {
+        return None;
+    }
+    Some(
+        "metal golden is a vertex shader that samples synthetic finite f16 texture data while \
+         writing AIR clip_distance; MoltenVK rejects the validation runner's vertex-only \
+         ClipDistance pipeline for this shape, so this row is not a portable MoltenVK byte oracle; \
+         rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_sampled_half_render_target_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !(ll.contains("@air.sample_texture") || ll.contains("@air.gather_texture"))
+        || !sampled_finite_half_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f16 texture data before a float fragment \
+         render-target output under AIR fast/no-nans math; MoltenVK exact byte comparison is not a \
+         portable oracle for half texture filtering and render-target rounding in this seed; \
+         rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_half_texture_output_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.write_texture")
+        || !(ll.contains("@air.sample_texture")
+            || ll.contains("@air.gather_texture")
+            || ll.contains("@air.read_texture"))
+        || !(sampled_finite_half_texture(ll) || storage_read_finite_half_texture(ll))
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples or reads synthetic finite f16 texture data before a float texture \
+         output under AIR fast/no-nans math; MoltenVK exact byte comparison is not a portable \
+         oracle for half texture filtering, image reads, and texture write rounding in this seed; \
+         rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_storage_f32_texture_output_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.read_texture")
+        || !writes_f32_texture_output(ll)
+        || !storage_read_finite_f32_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden reads synthetic finite f32 storage texture data through AIR fast/no-nans \
+         math before float texture output; MoltenVK exact byte comparison is not a portable oracle \
+         for texture read/write rounding, denorm flushing, and approximate math in this seed; \
+         rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_sampled_f32_cube_buffer_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.sample_texture_cube.v4f32")
+        || !(ll.contains("@air.fast_sqrt.") || ll.contains("@air.fast_rsqrt."))
+        || !sampled_finite_f32_texture(ll)
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !format.is_float_like() {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 cube texture data through AIR fast sqrt/rsqrt \
+         before float buffer output; Metal/Vulkan cube filtering and approximate math are not a \
+         portable byte oracle for this seed, so rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_fast_f32_input_buffer_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !metal.plan.textures.is_empty()
+        || !ll.lines().any(|line| line.contains("store float "))
+        || !ll_uses_approximate_fast_f32_math(ll)
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !format.is_float_like() {
+        return None;
+    }
+    let finite_f32_inputs = metal
+        .plan
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.role == "Input" && buffer.seed_mode == SEED_MODE_FINITE_FLOAT32)
+        .count();
+    if finite_f32_inputs < 2 {
+        return None;
+    }
+    Some(
+        "metal golden feeds finite f32 buffer inputs through AIR fast/no-nans approximate math \
+         before float buffer output; MoltenVK exact byte comparison is not a portable oracle for \
+         denorm flushing, signed-zero handling, and reassociation in this seed; rebank or drop \
+         Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_fast_half_buffer_output_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !(ll.contains("store half ") || ll.contains("store <3 x half>"))
+        || !(ll.contains("@air.fast_sqrt.") || ll.contains("@air.fast_rsqrt."))
+        || !metal
+            .plan
+            .buffers
+            .iter()
+            .any(|buffer| buffer.role == "Input" && buffer.seed_mode == SEED_MODE_FINITE_FLOAT16)
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !matches!(
+        format,
+        DataFormat::R16Float | DataFormat::Rg16Float | DataFormat::Rgba16Float
+    ) {
+        return None;
+    }
+    Some(
+        "metal golden writes finite f16 buffer output through AIR fast/no-nans approximate math; \
+         MoltenVK exact byte comparison is not a portable oracle for half conversion, denorm \
+         flushing, and reassociation in this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_sampled_f32_render_target_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.sample_texture")
+        || !sampled_finite_f32_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 texture data before a float fragment \
+         render-target output under AIR fast/no-nans math; MoltenVK exact byte comparison is not a \
+         portable oracle for texture filtering, denorm flushing, and render-target rounding in \
+         this seed; rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_fast_f32_buffer_output_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !metal.plan.textures.is_empty()
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !format.is_float_like() {
+        return None;
+    }
+    let has_finite_f32_output = metal.plan.buffers.iter().any(|buffer| {
+        matches!(buffer.role.as_str(), "InOut" | "Output")
+            && buffer.seed_mode == SEED_MODE_FINITE_FLOAT32
+    });
+    let has_control_input = metal.plan.buffers.iter().any(|buffer| {
+        buffer.role != "Output"
+            && matches!(
+                buffer.seed_mode.as_str(),
+                SEED_MODE_BOUNDED_CONTROL | SEED_MODE_DETERMINISTIC
+            )
+    });
+    if !(has_finite_f32_output && has_control_input) {
+        return None;
+    }
+    Some(
+        "metal golden writes finite f32 buffer output under AIR fast/no-nans math; MoltenVK exact \
+         byte comparison is not a portable oracle for denorm flushing, signed-zero handling, and \
+         reassociation in this seed; rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+        || metal.plan.output.format != "RawBytes"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !raw_buffer_writes_float_derived_bytes(ll)
+    {
+        return None;
+    }
+    Some(
+        "metal golden compares raw buffer bytes written from AIR fast/no-nans float values; \
+         MoltenVK exact byte comparison is not a portable oracle for float denorm flushing, \
+         signed-zero handling, and raw padding bytes in this seed; rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_fast_half_render_target_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.fast_sqrt.")
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !matches!(format, DataFormat::Rgba16Float | DataFormat::Rgba32Float) {
+        return None;
+    }
+    Some(
+        "metal golden writes a float fragment render target through AIR fast_sqrt under \
+         fast/no-nans math; MoltenVK exact byte comparison is not a portable oracle for \
+         approximate sqrt and render-target rounding in this seed; rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_integer_texture_fast_render_target_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !(ll.contains("@air.fast_pow.") || ll.contains("@air.fast_powr."))
+        || !integer_input_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden reads deterministic integer texture data through AIR fast/no-nans pow before \
+         float render-target output; MoltenVK exact byte comparison is not a portable oracle for \
+         integer texture conversion, approximate pow, and half render-target rounding in this seed; \
+         rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_moltenvk_scaled_integer_half_texture_output_exact_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.write_texture_")
+        || !ll.contains("v4f16")
+        || !(ll.contains("@air.convert.f.v4f16.u.") || ll.contains("@air.convert.f.v4f16.s."))
+        || !ll.contains("fmul fast <4 x half>")
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden scales integer buffer data into f16 texture output under AIR fast/no-nans \
+         math; Metal/MoltenVK half conversion and texture write rounding are not an exact byte \
+         oracle for this seed, so rebank or drop the Metal row"
+            .into(),
+    )
+}
+
+fn sampled_finite_half_texture(ll: &str) -> bool {
+    infer_textures(ll).into_iter().any(|texture| {
+        texture.role == "Sampled"
+            && texture.format == "Rgba16Float"
+            && texture.seed_mode == SEED_MODE_FINITE_FLOAT16
+    })
+}
+
+fn sampled_finite_f32_texture(ll: &str) -> bool {
+    infer_textures(ll).into_iter().any(|texture| {
+        texture.role == "Sampled"
+            && texture.format == "Rgba32Float"
+            && texture.seed_mode == SEED_MODE_FINITE_FLOAT32
+    })
+}
+
+fn integer_input_texture(ll: &str) -> bool {
+    infer_textures(ll).into_iter().any(|texture| {
+        !matches!(texture.role.as_str(), "StorageWrite" | "ColorTarget")
+            && parse_format(&texture.format)
+                .ok()
+                .is_some_and(data_format_is_integer_like)
+    })
+}
+
+fn data_format_is_integer_like(format: DataFormat) -> bool {
+    matches!(
+        format,
+        DataFormat::Rgba8Uint
+            | DataFormat::Rgba8Sint
+            | DataFormat::Rgba16Uint
+            | DataFormat::Rgba16Sint
+            | DataFormat::Rgba32Uint
+            | DataFormat::Rgba32Sint
+            | DataFormat::R32Uint
+            | DataFormat::R32Sint
+            | DataFormat::Rg32Uint
+            | DataFormat::Rg32Sint
+            | DataFormat::R16Uint
+            | DataFormat::R16Sint
+            | DataFormat::Rg16Uint
+            | DataFormat::Rg16Sint
+    )
+}
+
+fn storage_read_finite_half_texture(ll: &str) -> bool {
+    infer_textures(ll).into_iter().any(|texture| {
+        matches!(texture.role.as_str(), "StorageRead" | "StorageReadWrite")
+            && texture.format == "Rgba16Float"
+            && texture.seed_mode == SEED_MODE_FINITE_FLOAT16
+    })
+}
+
+fn storage_read_finite_f32_texture(ll: &str) -> bool {
+    infer_textures(ll).into_iter().any(|texture| {
+        matches!(texture.role.as_str(), "StorageRead" | "StorageReadWrite")
+            && matches!(
+                texture.format.as_str(),
+                "R32Float" | "Rg32Float" | "Rgba32Float"
+            )
+            && texture.seed_mode == SEED_MODE_FINITE_FLOAT32
+    })
+}
+
+fn writes_f32_texture_output(ll: &str) -> bool {
+    ll.contains("@air.write_texture_") && ll.contains("f32")
+        || ll.contains("@air.write_imageblock_slice_to_texture_") && ll.contains("f32")
+}
+
+fn raw_buffer_writes_float_derived_bytes(ll: &str) -> bool {
+    ll.contains("store float ")
+        || ll.contains("store <")
+        || ll.lines().any(|line| {
+            line.contains("@air.pack.") && (line.contains("f16") || line.contains("f32"))
+        })
+}
+
+fn ll_uses_approximate_fast_f32_math(ll: &str) -> bool {
+    ll.contains("@air.fast_rsqrt.f32")
+        || ll.contains("@air.fast_sqrt.f32")
+        || ll.contains("@air.fast_sin.f32")
+        || ll.contains("@air.fast_cos.f32")
+        || ll.contains("@air.fast_pow.f32")
+        || ll.contains("@air.fast_powr.f32")
+        || ll.contains("@air.fast_fmod.f32")
+}
+
+fn float_texture_or_render_target_output(ll: &str, metal: &MetalRow) -> bool {
+    if !matches!(metal.plan.output.kind.as_str(), "texture" | "render_target") {
+        return false;
+    }
+    current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())
+        .is_some_and(DataFormat::is_float_like)
+}
+
+fn static_normalized_linear_sampler(ll: &str) -> bool {
+    ll.lines()
+        .filter(|line| line.contains("@__air_sampler_state") && line.contains(" constant "))
+        .filter_map(first_i64_literal)
+        .any(air_sampler_word_is_normalized_linear)
+}
+
+fn air_sampler_word_is_normalized_linear(word: i64) -> bool {
+    let word = word as u64;
+    let min_linear = ((word >> 11) & 0x3) == 1;
+    let mag_linear = ((word >> 9) & 0x3) == 1;
+    let normalized_coordinates = word & 0x8000 == 0;
+    min_linear && mag_linear && normalized_coordinates
+}
+
+fn first_i64_literal(line: &str) -> Option<i64> {
+    let (_, after_i64) = line.split_once("i64 ")?;
+    let token = after_i64
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '-')
+        .collect::<String>();
+    (!token.is_empty()).then(|| token.parse().ok()).flatten()
+}
+
+fn incompatible_sampled_half_domain_sensitive_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll_has_domain_sensitive_float_math(ll)
+        || !ll.contains("@air.sample_texture")
+        || !sampled_finite_half_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f16 texture data through AIR fast/no-nans \
+         domain-sensitive math before float texture output; Metal/Vulkan texture sampling, \
+         approximate math, and half-rounding are not a portable validation oracle for this seed; \
+         rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_fast_procedural_half_texture_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+        || !ll.contains("@air.write_texture_2d.v4f16")
+        || !(ll.contains("@air.fast_sin.") || ll.contains("@air.fast_cos."))
+        || !ll.contains("@air.fast_fract.")
+    {
+        return None;
+    }
+    Some(
+        "metal golden writes procedural f16 texture output from AIR fast trigonometric/fract math; \
+         approximate transcendental results and half rounding are not a portable Metal/Vulkan \
+         validation oracle for this synthetic seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_half_linear_filter_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !(ll.contains("@air.sample_texture_2d.v4f16")
+            || ll.contains("@air.gather_texture_2d.v4f16"))
+        || !sampled_finite_half_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    if ll.contains("@air.gather_texture_2d.v4f16")
+        && ll.contains("@air.imageblock_data")
+        && ll.contains("@air.write_imageblock_slice_to_texture_2d")
+    {
+        return Some(
+            "metal golden gathers finite f16 texture data through an AIR imageblock before \
+             texture output; Metal/Vulkan gather addressing and imageblock rounding are not a \
+             portable validation oracle for this synthetic seed; rebank or drop Metal row"
+                .into(),
+        );
+    }
+    if ll.contains(" fmul fast <2 x float> ")
+        && ll.contains("load float, ptr addrspace(1)")
+        && ll.contains("@air.write_texture_2d.i16.v4f16")
+    {
+        return Some(
+            "metal golden samples finite f16 texture data with buffer-scaled coordinates before \
+             f16 texture output; Metal/Vulkan sampling coordinate handling and half rounding are \
+             not a portable validation oracle for this seed; rebank or drop Metal row"
+                .into(),
+        );
+    }
+    if static_normalized_linear_sampler(ll)
+        && ll.contains("@air.imageblock_data")
+        && ll.contains("@air.write_imageblock_slice_to_texture_2d")
+    {
+        return Some(
+            "metal golden stores normalized-linear sampled/gathered finite f16 texture data through an AIR \
+             imageblock before texture output; Metal/Vulkan f16 interpolation and imageblock \
+             rounding are not a portable validation oracle for this synthetic seed; rebank or drop \
+             Metal row"
+                .into(),
+        );
+    }
+    if ll.contains(r#""air.sampler""#)
+        && ll.contains("ptr addrspace(3)")
+        && ll.contains("@air.wg.barrier")
+    {
+        return Some(
+            "metal golden accumulates finite f16 texture samples selected by a runtime sampler \
+             through threadgroup half storage before float texture output; the validation row does \
+             not bank sampler semantics, and Metal/Vulkan f16 sampling/rounding is not a portable \
+             oracle for this synthetic seed; rebank or drop Metal row"
+                .into(),
+        );
+    }
+    None
+}
+
+fn incompatible_storage_half_imageblock_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll.contains("@air.read_texture_2d.i16.v4f16")
+        || !ll.contains("@air.imageblock_data")
+        || !ll.contains("@air.write_imageblock_slice_to_texture_2d.i16.v4f16")
+        || !ll.contains("@air.wg.barrier")
+        || !storage_read_finite_half_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden copies synthetic finite f16 storage texture data through an AIR imageblock \
+         before texture output; Metal imageblock slice layout/rounding is not a portable \
+         Vulkan byte oracle for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_uninitialized_half_imageblock_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || !ll.contains("@air.imageblock_data")
+        || !ll.contains("@air.write_imageblock_slice_to_texture_2d.i16.f16")
+        || !float_texture_or_render_target_output(ll, metal)
+        || ll
+            .lines()
+            .any(|line| line.contains("store ") && line.contains("ptr addrspace(4)"))
+    {
+        return None;
+    }
+    Some(
+        "metal golden writes uninitialized scalar half AIR imageblock data into f16 texture output; \
+         imageblock contents and scalar slice layout are not a portable Metal/Vulkan byte oracle \
+         for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_f32_imageblock_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll.contains("@air.sample_texture_2d.v4f32")
+        || !ll.contains("@air.imageblock_data")
+        || !ll.contains("@air.write_imageblock_slice_to_texture_2d.v4f32")
+        || !ll.contains("@air.wg.barrier")
+        || !sampled_finite_f32_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden stores synthetic finite f32 sampled texture data through an AIR imageblock \
+         before texture output; Metal imageblock slice layout and sampled-float rounding are not a \
+         portable Vulkan byte oracle for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn integer_texture_output(ll: &str, metal: &MetalRow) -> bool {
+    if metal.plan.output.kind != "texture" {
+        return false;
+    }
+    let Some(format) = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())
+    else {
+        return false;
+    };
+    matches!(
+        format,
+        DataFormat::Rgba8Uint
+            | DataFormat::Rgba8Sint
+            | DataFormat::Rgba16Uint
+            | DataFormat::Rgba16Sint
+            | DataFormat::Rgba32Uint
+            | DataFormat::Rgba32Sint
+            | DataFormat::R32Uint
+            | DataFormat::R32Sint
+            | DataFormat::Rg32Uint
+            | DataFormat::Rg32Sint
+            | DataFormat::R16Uint
+            | DataFormat::R16Sint
+            | DataFormat::Rg16Uint
+            | DataFormat::Rg16Sint
+    )
+}
+
+fn incompatible_integer_gather_imageblock_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll.contains("@air.gather_texture_2d.s.v4i16")
+        || !ll.contains("@air.imageblock_data")
+        || !ll.contains("@air.write_imageblock_slice_to_texture_2d.i16.v4i16")
+        || !ll.contains("@air.wg.barrier")
+        || !ll.contains(r#""texture2d<short, sample>""#)
+        || !ll.contains(r#""texture2d<short, write>""#)
+        || !integer_texture_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden gathers signed integer texture data through an AIR imageblock before \
+         integer texture output; Metal imageblock slice layout and gather edge handling are not a \
+         portable Vulkan byte oracle for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_half_cube_render_target_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || metal.plan.output.kind != "render_target"
+        || !(ll.contains("@air.sample_texture_cube.v4f16")
+            || ll.contains("@air.sample_texture_cube_array.v4f16"))
+        || !ll.contains(r#""air.fragment_input""#)
+        || !sampled_finite_half_texture(ll)
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !matches!(format, DataFormat::Rgba16Float | DataFormat::Rgba32Float) {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f16 cube texture data from generated fragment \
+         coordinates before float render-target output; Metal/Vulkan cube face selection, filtering, \
+         and half rounding are not a portable validation oracle for this synthetic seed; rebank or \
+         drop Metal row"
+            .into(),
+    )
+}
+
 fn incompatible_sampled_fast_pow_texture_golden(ll: &str, metal: &MetalRow) -> Option<String> {
     if !ll_has_fast_no_nans_float_semantics(ll)
         || !ll.contains("@air.sample_texture")
-        || !ll.contains("@air.fast_pow.")
+        || !(ll.contains("@air.fast_pow.") || ll.contains("@air.fast_powr."))
         || metal.plan.output.kind != "render_target"
     {
         return None;
@@ -4208,11 +7931,272 @@ fn incompatible_sampled_fast_pow_texture_golden(ll: &str, metal: &MetalRow) -> O
         return None;
     }
     Some(
-        "metal golden samples signed finite f32 texture data through AIR fast_pow under fast/no-nans \
-         math; Metal/Vulkan linear sampling and sign-sensitive pow behavior are not a portable \
-         validation oracle for this synthetic seed; rebank or drop Metal row"
+        "metal golden samples synthetic finite f32 texture data through AIR fast_pow/fast_powr \
+         under fast/no-nans math; Metal/Vulkan linear sampling and approximate pow rounding are \
+         not a portable validation oracle for this synthetic seed; rebank or drop Metal row"
             .into(),
     )
+}
+
+fn incompatible_sampled_fast_exp_texture_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.sample_texture")
+        || !ll.contains("@air.fast_exp.")
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    let has_sampled_f32_texture = infer_textures(ll).into_iter().any(|texture| {
+        texture.role == "Sampled"
+            && texture.format == "Rgba32Float"
+            && texture.seed_mode == SEED_MODE_FINITE_FLOAT32
+    });
+    if !has_sampled_f32_texture {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 texture data through AIR fast_exp under \
+         fast/no-nans math before float texture output; Metal/Vulkan sampling and approximate exp \
+         rounding are not a portable validation oracle for this seed, so rebank or drop the row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_f32_domain_math_texture_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.sample_texture")
+        || !(ll_has_domain_sensitive_float_math(ll) || ll.contains("@air.log."))
+        || ll.contains("@air.fast_pow.")
+        || ll.contains("@air.fast_powr.")
+        || ll.contains("@air.fast_exp.")
+        || !sampled_finite_f32_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 texture data through AIR fast/no-nans \
+         domain-sensitive math before float output; Metal/Vulkan texture sampling and approximate \
+         math are not a portable validation oracle for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_uint_float_render_target_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll.contains("@air.sample_texture_2d.u.v4i32")
+        || !ll.contains("@air.convert.f.f32.u.i32")
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic uint texture data and converts it to float render-target \
+         output; Metal/Vulkan integer sampling and float conversion are not an exact byte oracle \
+         for this seed, so rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_half_dot_render_target_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll.contains("@air.sample_texture_2d.v4f16")
+        || !ll.contains("@air.dot.v4f16")
+        || !sampled_finite_half_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f16 texture data through AIR half dot math before \
+         float render-target output; Metal/Vulkan half sampling and dot rounding are not a \
+         portable validation oracle for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_f32_dynamic_lod_render_target_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || metal.plan.output.kind != "render_target"
+        || !ll.contains("@air.sample_texture_2d.v4f32")
+        || !ll.contains(r#""air.fragment_input""#)
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !matches!(format, DataFormat::Rgba16Float | DataFormat::Rgba32Float) {
+        return None;
+    }
+    let sampled_f32_count = infer_textures(ll)
+        .into_iter()
+        .filter(|texture| {
+            texture.role == "Sampled"
+                && texture.format == "Rgba32Float"
+                && texture.seed_mode == SEED_MODE_FINITE_FLOAT32
+        })
+        .count();
+    if sampled_f32_count < 2 || !declares_dynamic_lod_sample(ll) {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 texture data from generated fragment coordinates \
+         with dynamic LOD before float render-target output; Metal/Vulkan sampling, LOD selection, \
+         and fast-math rounding are not a portable validation oracle for this synthetic seed; \
+         rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_f32_texture_array_render_targets_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll.contains("@air.sample_texture_2d.v4f32")
+        || !ll.contains("array<texture2d<float, sample>")
+        || !ll.contains("@__air_sampler_state")
+        || !sampled_finite_f32_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    let render_targets = ll
+        .lines()
+        .filter(|line| line.contains(r#""air.render_target""#))
+        .count();
+    if render_targets < 2 {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 texture-array inputs through a static sampler into \
+         multiple float render targets; Metal/Vulkan interpolation and texture-array binding semantics \
+         are not a portable validation oracle for this seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn declares_dynamic_lod_sample(ll: &str) -> bool {
+    ll.lines().any(|line| {
+        line.contains("@air.sample_texture")
+            && line.contains(", i1 true, float %")
+            && line.contains(", float 0.000000e+00, i32 0)")
+    })
+}
+
+fn incompatible_fragment_half_pow_render_target_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || metal.plan.output.kind != "render_target"
+        || !(ll.contains("@air.pow.") || ll.contains("@air.fast_pow."))
+        || !ll.contains(r#""air.fragment_input""#)
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !matches!(format, DataFormat::Rgba16Float | DataFormat::Rgba32Float) {
+        return None;
+    }
+    if bounded_control_fragment_half_pow_inputs(ll, metal) {
+        return Some(
+            "metal golden feeds framebuffer half color through bounded-control gain/offset/gamma \
+             AIR pow under fast/no-nans fragment render-target math; Metal/Vulkan pow and half \
+             rounding are not a portable validation oracle for this synthetic seed; rebank or \
+             drop Metal row"
+                .into(),
+        );
+    }
+    let signed_half_values: Vec<_> = ll
+        .lines()
+        .filter(|line| {
+            line.contains("= fsub fast ") && (line.contains(" half ") || line.contains(" x half>"))
+        })
+        .filter_map(llvm_assignment_value)
+        .collect();
+    if signed_half_values.is_empty() {
+        return None;
+    }
+    if ll.lines().any(|line| {
+        (line.contains("@air.pow.") || line.contains("@air.fast_pow."))
+            && line.contains("f16")
+            && signed_half_values
+                .iter()
+                .any(|value| llvm_line_uses_value(line, value))
+    }) {
+        return Some(
+            "metal golden feeds signed half values into AIR pow under fast/no-nans fragment \
+             render-target math; negative-base pow behavior and half rounding are not a portable \
+             Metal/Vulkan validation oracle for this synthetic seed; rebank or drop Metal row"
+                .into(),
+        );
+    }
+    None
+}
+
+fn incompatible_fragment_fast_pow_rsqrt_render_target_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Fragment")
+        || metal.plan.output.kind != "render_target"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.fast_pow.")
+        || !ll.contains("@air.fast_rsqrt.")
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden writes a float fragment render target through AIR fast_pow and fast_rsqrt \
+         under fast/no-nans math; approximate reciprocal-square-root, pow, and reassociation \
+         differences are not a portable Metal/Vulkan byte oracle for this seed; rebank or drop \
+         the Metal row"
+            .into(),
+    )
+}
+
+fn bounded_control_fragment_half_pow_inputs(ll: &str, metal: &MetalRow) -> bool {
+    if !ll.contains("@air.pow.v3f16")
+        || !ll.contains("load float, ptr addrspace(2)")
+        || !ll.contains("fptrunc float %")
+        || !ll.contains("fmul fast <3 x half>")
+        || !ll.contains("fadd fast <3 x half>")
+        || !ll.contains("fdiv fast float 1.000000e+00")
+    {
+        return false;
+    }
+    metal
+        .plan
+        .buffers
+        .iter()
+        .any(|buffer| buffer.role != "Output" && buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL)
 }
 
 fn incompatible_dependent_sampled_lookup_golden(ll: &str, metal: &MetalRow) -> Option<String> {
@@ -4246,7 +8230,7 @@ fn incompatible_dependent_sampled_lookup_golden(ll: &str, metal: &MetalRow) -> O
 
 fn incompatible_dependent_sampled_half_lookup_golden(ll: &str, metal: &MetalRow) -> Option<String> {
     if !ll_has_fast_no_nans_float_semantics(ll)
-        || metal.plan.output.kind != "render_target"
+        || !matches!(metal.plan.output.kind.as_str(), "render_target" | "texture")
         || !ll.contains("@air.sample_texture")
     {
         return None;
@@ -4272,7 +8256,19 @@ fn incompatible_dependent_sampled_half_lookup_golden(ll: &str, metal: &MetalRow)
                 && texture.format == "Rgba32Float"
                 && texture.seed_mode == SEED_MODE_FINITE_FLOAT32
         });
-    if !(has_half_lookup_quantizer || has_sampled_half_to_3d_lookup) {
+    let has_sampled_half_dynamic_texture_lookup = metal.plan.output.kind == "texture"
+        && float_texture_or_render_target_output(ll, metal)
+        && sampled_half_count >= 2
+        && ll.contains("@air.gather_texture_2d.v4f16")
+        && ll.contains("@air.read_texture_2d")
+        && ll.contains("@air.sample_texture_2d.v4f16")
+        && ll.contains("@air.mix.v2f32")
+        && ll.contains("fcmp fast")
+        && has_dynamic_half_lane_extract(ll);
+    if !(has_half_lookup_quantizer
+        || has_sampled_half_to_3d_lookup
+        || has_sampled_half_dynamic_texture_lookup)
+    {
         return None;
     }
     Some(
@@ -4282,6 +8278,13 @@ fn incompatible_dependent_sampled_half_lookup_golden(ll: &str, metal: &MetalRow)
          oracle; rebank or drop Metal row"
             .into(),
     )
+}
+
+fn has_dynamic_half_lane_extract(ll: &str) -> bool {
+    ll.lines().any(|line| {
+        line.contains("extractelement <4 x half>")
+            && (line.contains(", i16 %") || line.contains(", i32 %") || line.contains(", i64 %"))
+    })
 }
 
 fn incompatible_sampled_half_fast_sqrt_render_target_golden(
@@ -4301,12 +8304,7 @@ fn incompatible_sampled_half_fast_sqrt_render_target_golden(
     if !matches!(format, DataFormat::Rgba16Float | DataFormat::Rgba32Float) {
         return None;
     }
-    let has_sampled_half = infer_textures(ll).into_iter().any(|texture| {
-        texture.role == "Sampled"
-            && texture.format == "Rgba16Float"
-            && texture.seed_mode == SEED_MODE_FINITE_FLOAT16
-    });
-    if !has_sampled_half {
+    if !sampled_finite_half_texture(ll) {
         return None;
     }
     Some(
@@ -4329,12 +8327,7 @@ fn incompatible_sampled_half_exact_control_flow_golden(
     {
         return None;
     }
-    let has_sampled_half = infer_textures(ll).into_iter().any(|texture| {
-        texture.role == "Sampled"
-            && texture.format == "Rgba16Float"
-            && texture.seed_mode == SEED_MODE_FINITE_FLOAT16
-    });
-    if !has_sampled_half {
+    if !sampled_finite_half_texture(ll) {
         return None;
     }
     Some(
@@ -4414,6 +8407,109 @@ fn incompatible_sampled_half_buffer_fast_math_golden(ll: &str, metal: &MetalRow)
          AIR fast_pow/fast_rsqrt before half buffer output; Metal/Vulkan linear sampling and \
          approximate math are not a portable validation oracle for this synthetic seed; rebank or \
          drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_fast_procedural_f32_texture_output_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !(ll.contains("@air.write_texture_") && ll.contains(".v4f32"))
+        || !(ll.contains("@air.fast_fmod.")
+            || ll.contains("@air.fast_fract.")
+            || ll.contains("@air.fast_rsqrt."))
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden writes procedural f32 texture output from AIR fast/no-nans approximate math; \
+         Metal/Vulkan transcendental and normalization rounding are not a portable byte oracle for \
+         this synthetic seed; rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_fast_f32_buffer_output_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "buffer"
+        || !ll_has_fast_no_nans_float_semantics(ll)
+        || !ll.contains("@air.fast_rsqrt.f32")
+        || !ll.contains(" fdiv fast float ")
+        || !ll.contains("@llvm.minnum.f32")
+    {
+        return None;
+    }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if !format.is_float_like() {
+        return None;
+    }
+    let plan = infer_plan(ll);
+    if !plan.textures.is_empty() {
+        return None;
+    }
+    let finite_f32_inputs = plan
+        .buffers
+        .iter()
+        .filter(|buffer| buffer.role == "Input" && buffer.seed_mode == SEED_MODE_FINITE_FLOAT32)
+        .count();
+    if finite_f32_inputs < 2 {
+        return None;
+    }
+    Some(
+        "metal golden feeds finite f32 buffer data through AIR fast/no-nans normalization and \
+         min/max math before float buffer output; Metal/Vulkan approximate reciprocal-square-root, \
+         division, and reassociation are not an exact byte oracle for this seed, so rebank or drop \
+         Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_sampled_f32_texture_output_golden(ll: &str, metal: &MetalRow) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll.contains("@air.sample_texture_2d.v4f32")
+        || !ll.contains("@air.write_texture_2d.v4f32")
+        || !sampled_finite_f32_texture(ll)
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden samples synthetic finite f32 texture data into f32 texture output; \
+         Metal/Vulkan sampling and texture write rounding are not an exact byte oracle for this \
+         seed, so rebank or drop Metal row"
+            .into(),
+    )
+}
+
+fn incompatible_storage_half_exp_texture_output_golden(
+    ll: &str,
+    metal: &MetalRow,
+) -> Option<String> {
+    if metal.compare == "none"
+        || metal.stage.as_deref() != Some("Kernel")
+        || metal.plan.output.kind != "texture"
+        || !ll.contains("@air.read_texture_2d.i16.v4f16")
+        || !ll.contains("@air.write_texture_2d.i16.v4f16")
+        || !ll.contains("@air.exp.f16")
+        || !float_texture_or_render_target_output(ll, metal)
+    {
+        return None;
+    }
+    Some(
+        "metal golden reads synthetic finite f16 texture data through AIR exp before f16 texture \
+         output; Metal/Vulkan half math and texture write rounding are not a portable byte oracle \
+         for this seed; rebank or drop Metal row"
             .into(),
     )
 }
@@ -4643,6 +8739,14 @@ pub fn compare_candidate_to_metal(
                     }
                     return (result.status, result.observed, result.tolerance);
                 }
+                if let Some(result) =
+                    compare_finite_bfloat_raw_bytes(candidate, &golden, metal, format)
+                {
+                    if metal.compare == "none" && result.status != "ok" {
+                        return ("smoke".to_string(), result.observed, result.tolerance);
+                    }
+                    return (result.status, result.observed, result.tolerance);
+                }
                 let policy = tolerance_for_metal_context(format, ll, metal);
                 let mut result = compare_to_golden(candidate, &golden, format, policy.as_ref());
                 if fast_math_nonfinite_domain_mismatch(format, ll, &result) {
@@ -4700,6 +8804,44 @@ fn candidate_compare_error(
     }
 }
 
+fn enforce_backend_compare_policy(
+    backend: RunBackend,
+    status: &mut String,
+    error: &mut Option<String>,
+) {
+    if backend != RunBackend::MoltenVk || status == "ok" {
+        return;
+    }
+    if status == "tolerance" {
+        *status = "failure".into();
+        if error.is_none() {
+            *error = Some("MoltenVK output differs from Metal; exact byte match required".into());
+        }
+    } else if status == "smoke" {
+        *status = "failure".into();
+        if error.is_none() {
+            *error = Some("MoltenVK compare=none smoke row is not an exact Metal match".into());
+        }
+    }
+}
+
+fn compile_missing_compare_smoke_error(
+    status: &str,
+    tolerance: Option<&ToleranceSpecJson>,
+    error: Option<&str>,
+) -> Option<String> {
+    if status == "missing" && tolerance.is_some_and(|t| t.kind == "FastMathNonFiniteDomain") {
+        Some(format!(
+            "compile-only: {}",
+            error.unwrap_or(
+                "metal golden compares a non-finite result from AIR fast/no-nans domain-sensitive math"
+            )
+        ))
+    } else {
+        None
+    }
+}
+
 fn fast_math_nonfinite_domain_mismatch(
     format: DataFormat,
     ll: Option<&str>,
@@ -4733,6 +8875,91 @@ fn ll_has_domain_sensitive_float_math(ll: &str) -> bool {
         || ll
             .lines()
             .any(|line| line.trim_start().starts_with("%") && line.contains(" fdiv fast "))
+}
+
+fn compare_finite_bfloat_raw_bytes(
+    candidate: &[u8],
+    golden: &[u8],
+    metal: &MetalRow,
+    format: DataFormat,
+) -> Option<CompareResult> {
+    if format != DataFormat::RawBytes {
+        return None;
+    }
+    let output = metal.plan.buffers.iter().find(|buffer| {
+        buffer.index == metal.plan.output.index
+            && buffer.seed_mode == SEED_MODE_FINITE_BFLOAT16
+            && matches!(
+                buffer.role.as_str(),
+                "InOut" | "Output" | "ReadWrite" | "Write"
+            )
+    })?;
+    if output.len == 0 || !candidate.len().is_multiple_of(2) || !golden.len().is_multiple_of(2) {
+        return None;
+    }
+    let policy = ToleranceSpecJson {
+        kind: "BFloat16AbsOrUlp".into(),
+        max_abs: Some(0.003_906_25),
+        max_ulp: Some(32),
+    };
+    Some(compare_bfloat_raw_bytes(candidate, golden, &policy))
+}
+
+fn compare_bfloat_raw_bytes(
+    candidate: &[u8],
+    golden: &[u8],
+    policy: &ToleranceSpecJson,
+) -> CompareResult {
+    if candidate == golden {
+        return CompareResult {
+            status: "ok".into(),
+            observed: None,
+            tolerance: None,
+        };
+    }
+    if candidate.len() != golden.len() {
+        return CompareResult {
+            status: "failure".into(),
+            observed: None,
+            tolerance: Some(policy.clone()),
+        };
+    }
+
+    let mut max_abs = 0.0f32;
+    let mut max_ulp = 0u32;
+    let mut within = true;
+    for (c, g) in candidate.chunks_exact(2).zip(golden.chunks_exact(2)) {
+        let cu = u16::from_le_bytes([c[0], c[1]]);
+        let gu = u16::from_le_bytes([g[0], g[1]]);
+        let cf = bfloat_bits_to_f32(cu);
+        let gf = bfloat_bits_to_f32(gu);
+        if cf.is_nan() && gf.is_nan() {
+            continue;
+        }
+        if cf.is_nan() || gf.is_nan() {
+            max_abs = f32::INFINITY;
+            max_ulp = u32::MAX;
+            within = false;
+            continue;
+        }
+        let abs = (cf - gf).abs();
+        let ulp = ordered_bfloat_ulp_key(cu).abs_diff(ordered_bfloat_ulp_key(gu));
+        max_abs = max_abs.max(abs);
+        max_ulp = max_ulp.max(ulp);
+        within &= tolerance_policy_accepts(policy, abs, ulp);
+    }
+    CompareResult {
+        status: if within {
+            "tolerance".into()
+        } else {
+            "failure".into()
+        },
+        observed: Some(ObservedMargins {
+            max_abs: Some(max_abs),
+            max_ulp: Some(max_ulp),
+        }),
+        tolerance: Some(policy.clone()),
+    }
 }
 
 fn compare_finite_struct_float_raw_bytes(
@@ -4985,9 +9212,15 @@ fn tolerance_policy_accepts(policy: &ToleranceSpecJson, abs: f32, ulp: u32) -> b
         "Abs" => abs <= policy.max_abs.unwrap_or(0.0),
         "Ulp" => ulp <= policy.max_ulp.unwrap_or(0),
         "AbsAndUlp" => abs <= policy.max_abs.unwrap_or(0.0) && ulp <= policy.max_ulp.unwrap_or(0),
-        "AbsOrUlp" => abs <= policy.max_abs.unwrap_or(0.0) || ulp <= policy.max_ulp.unwrap_or(0),
+        "AbsOrUlp" | "BFloat16AbsOrUlp" => {
+            abs <= policy.max_abs.unwrap_or(0.0) || ulp <= policy.max_ulp.unwrap_or(0)
+        }
         _ => false,
     }
+}
+
+fn ordered_bfloat_ulp_key(bits: u16) -> u32 {
+    ordered_float_bits(bits as u32, 0x8000)
 }
 
 fn ordered_half_ulp_key(bits: u16) -> u32 {
@@ -5031,6 +9264,10 @@ fn half_bits_to_f32(bits: u16) -> f32 {
     }
 }
 
+fn bfloat_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
 // --- run one case --------------------------------------------------------------------------------
 
 /// Run the driver. Returns process exit code (0 = ok / nothing; 1 = failures; oneshot: 0/1/2).
@@ -5058,6 +9295,9 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
     if cfg.dry_run {
         eprintln!("# dry-run");
     }
+    if cfg.compile_missing {
+        eprintln!("# compile-missing");
+    }
 
     let translate = load_translate_rows(&cfg.translate_ledger, cfg.backend);
     let only_air_set = cfg
@@ -5080,6 +9320,11 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
         load_tech_keys(&cfg.tech_ledger)
     };
     let metal_rows = load_metal_rows(&cfg.metal_ledger);
+    let moltenvk_rows = if cfg.backend == RunBackend::Vulkan {
+        load_candidate_rows(&cfg.corpus_dir.join(RunBackend::MoltenVk.ledger_file_name()))
+    } else {
+        HashMap::new()
+    };
 
     let mut todo: Vec<TranslateRow> = translate
         .into_iter()
@@ -5163,7 +9408,7 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
     // Oneshot worker: run in-process (parent applies the wall timeout around this process).
     if cfg.oneshot {
         let row = &todo[0];
-        let outcome = process_one(cfg, row, &metal_rows);
+        let outcome = process_one(cfg, row, &metal_rows, &moltenvk_rows);
         eprintln!(
             "# oneshot {:?} {} {}",
             outcome,
@@ -5319,6 +9564,10 @@ fn tech_row_selected(cfg: &RunConfig, row: &TechRowInfo) -> bool {
     true
 }
 
+fn should_skip_existing_metal_compare_none(cfg: &RunConfig, row: &MetalRow) -> bool {
+    !cfg.force && row.status == "ok" && row.compare == "none"
+}
+
 /// Spawn this binary in `--oneshot` mode for one hash; kill after `timeout_secs`.
 fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
     use std::process::{Command, Stdio};
@@ -5344,11 +9593,14 @@ fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
     // Explicit so workers keep panics useful even if the parent env is scrubbed.
     let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".into());
     cmd.env("RUST_BACKTRACE", backtrace);
-    if cfg.force {
+    if cfg.reruns_existing_backend_rows() {
         cmd.arg("--force");
     }
     if cfg.quiet {
         cmd.arg("--quiet");
+    }
+    if cfg.compile_missing {
+        cmd.arg("--compile-missing");
     }
     // New process group so a timeout / Ctrl-C can kill metal-as / helper descendants.
     #[cfg(unix)]
@@ -5634,7 +9886,7 @@ fn write_timeout_or_error_row(cfg: &RunConfig, tr: &TranslateRow, err: &str, sta
     append_status_row(cfg, tr, &kind_label_src, status, "full", None, err.into());
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum ProcessOutcome {
     Ok,
     Fail,
@@ -5642,10 +9894,237 @@ enum ProcessOutcome {
     Timeout,
 }
 
+fn candidate_metal_status_precheck(
+    backend: RunBackend,
+    metal: &MetalRow,
+) -> Option<(&'static str, String, ProcessOutcome)> {
+    if metal.status == "quarantine" {
+        return Some((
+            "quarantine",
+            "metal status=quarantine".into(),
+            ProcessOutcome::Skip,
+        ));
+    }
+    if metal.status != "ok" || metal.output_sha256.is_none() {
+        return Some((
+            "missing",
+            format!("metal status={}", metal.status),
+            ProcessOutcome::Skip,
+        ));
+    }
+    if backend == RunBackend::MoltenVk && metal.compare == "none" {
+        return Some((
+            "missing",
+            "metal golden compare=none is not a full semantic golden; rebank Metal row".into(),
+            ProcessOutcome::Skip,
+        ));
+    }
+    None
+}
+
+fn compile_missing_candidate_smoke(
+    cfg: &RunConfig,
+    tr: &TranslateRow,
+    src: &SourceFile,
+    ll: &str,
+    stage: Stage,
+    golden_output_sha256: Option<String>,
+    reason: String,
+) -> ProcessOutcome {
+    let tmp = crate::scratch_dir_for(&format!("corpus-smoke-{}", &tr.air_sha256[..12]));
+    let plan = infer_plan(ll);
+    let spv = match translate_candidate_spv_for_plan(ll, stage, &plan, &tmp) {
+        Ok(spv) if !spv.is_empty() => spv,
+        Ok(_) => {
+            let _ = fs::remove_dir_all(&tmp);
+            write_failure_row(
+                cfg,
+                tr,
+                src,
+                &format!("compile-missing smoke translate produced empty SPIR-V; skipped compare: {reason}"),
+            );
+            return ProcessOutcome::Fail;
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&tmp);
+            if compile_missing_unsupported_translate_error(&error) {
+                let row = candidate_status_row(
+                    cfg,
+                    tr,
+                    src,
+                    "quarantine",
+                    golden_output_sha256,
+                    Some(format!(
+                        "compile-missing smoke unsupported: {error}; skipped compare: {reason}"
+                    )),
+                );
+                let _ = append_result_row(cfg, &row);
+                return ProcessOutcome::Skip;
+            }
+            write_failure_row(
+                cfg,
+                tr,
+                src,
+                &format!("compile-missing smoke translate: {error}; skipped compare: {reason}"),
+            );
+            return ProcessOutcome::Fail;
+        }
+    };
+    if let Err(error) = metal2vulkan::tools::spirv_val_bytes(&spv, &tmp) {
+        let _ = fs::remove_dir_all(&tmp);
+        if compile_missing_unsupported_validation_error(ll, &error) {
+            let row = candidate_status_row(
+                cfg,
+                tr,
+                src,
+                "quarantine",
+                golden_output_sha256,
+                Some(format!(
+                    "compile-missing smoke unsupported: {error}; skipped compare: {reason}"
+                )),
+            );
+            let _ = append_result_row(cfg, &row);
+            return ProcessOutcome::Skip;
+        }
+        if compile_missing_invalid_smoke_is_validation_quarantine(&reason) {
+            let row = candidate_status_row(
+                cfg,
+                tr,
+                src,
+                "quarantine",
+                golden_output_sha256,
+                Some(format!(
+                    "compile-missing smoke validation quarantine: {error}; skipped compare: {reason}"
+                )),
+            );
+            let _ = append_result_row(cfg, &row);
+            return ProcessOutcome::Skip;
+        }
+        write_failure_row(
+            cfg,
+            tr,
+            src,
+            &format!(
+                "compile-missing smoke produced invalid SPIR-V: {error}; skipped compare: {reason}"
+            ),
+        );
+        return ProcessOutcome::Fail;
+    }
+    let _ = fs::remove_dir_all(&tmp);
+    let row = CandidateRow {
+        air_sha256: tr.air_sha256.clone(),
+        shard: src.shard.clone(),
+        label: src.label.clone(),
+        status: "smoke".into(),
+        backend: cfg.backend.as_str().into(),
+        output_sha256: None,
+        output_b64: None,
+        golden_output_sha256,
+        spv_sha256: Some(sha256_hex(&spv)),
+        tolerance: None,
+        observed: None,
+        error: Some(format!("compile-only: {reason}")),
+    };
+    if let Err(error) = append_result_row(cfg, &row) {
+        eprintln!("    write ledger: {error}");
+        return ProcessOutcome::Fail;
+    }
+    ProcessOutcome::Ok
+}
+
+fn compile_missing_unsupported_translate_error(error: &str) -> bool {
+    error.contains("unsupported Metal visible function reference")
+        || error.contains("unsupported Metal patch control point function")
+}
+
+fn compile_missing_unsupported_validation_error(ll: &str, error: &str) -> bool {
+    let validation_class = metal2vulkan::native::classify_validation_error(error);
+    ((error.contains("OpFunctionCall Argument") && error.contains("llvm_memcpy"))
+        || validation_class == metal2vulkan::native::ValidationClass::CfgStructurization)
+        && unsupported_byval_texture_array_memcpy(ll)
+}
+
+fn compile_missing_invalid_smoke_is_validation_quarantine(reason: &str) -> bool {
+    reason.contains("rebank Metal row")
+        || reason.contains("not a comparable Vulkan oracle yet")
+        || reason.contains("compare=none")
+}
+
+fn unsupported_byval_texture_array_memcpy(ll: &str) -> bool {
+    ll.contains("llvm.memcpy.")
+        && ll.contains(" byval([")
+        && ll.contains(" x ptr addrspace(1)])")
+        && ll.contains(r#""air.texture""#)
+        && ll.contains(r#""air.arg_type_name""#)
+        && ll.contains("!\"array<texture")
+}
+
+fn moltenvk_ok_reference<'a>(
+    cfg: &RunConfig,
+    moltenvk_rows: &'a HashMap<String, CandidateRow>,
+    air_sha256: &str,
+    metal: &MetalRow,
+) -> Option<&'a CandidateRow> {
+    if cfg.backend != RunBackend::Vulkan {
+        return None;
+    }
+    let metal_output = metal.output_sha256.as_deref()?;
+    let row = moltenvk_rows.get(air_sha256)?;
+    (row.status == "ok"
+        && row.output_sha256.as_deref() == Some(metal_output)
+        && row.golden_output_sha256.as_deref() == Some(metal_output)
+        && row.output_b64.is_some())
+    .then_some(row)
+}
+
+struct CandidateCompareReference<'a> {
+    backend: &'static str,
+    row: &'a CandidateRow,
+    skipped_metal_reason: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_run_vulkan_for_skipped_metal_compare(
+    cfg: &RunConfig,
+    tr: &TranslateRow,
+    src: &SourceFile,
+    ll: &str,
+    stage: Stage,
+    entry: &str,
+    metal: &MetalRow,
+    moltenvk_rows: &HashMap<String, CandidateRow>,
+    skipped_metal_reason: &str,
+) -> Option<ProcessOutcome> {
+    if cfg.backend != RunBackend::Vulkan {
+        return None;
+    }
+    let compare_reference =
+        moltenvk_ok_reference(cfg, moltenvk_rows, &tr.air_sha256, metal).map(|reference| {
+            CandidateCompareReference {
+                backend: RunBackend::MoltenVk.as_str(),
+                row: reference,
+                skipped_metal_reason,
+            }
+        });
+    Some(run_candidate(
+        cfg,
+        tr,
+        src,
+        ll,
+        stage,
+        entry,
+        &metal.plan,
+        metal,
+        compare_reference,
+        Some(skipped_metal_reason),
+    ))
+}
+
 fn process_one(
     cfg: &RunConfig,
     tr: &TranslateRow,
     metal_rows: &HashMap<String, MetalRow>,
+    moltenvk_rows: &HashMap<String, CandidateRow>,
 ) -> ProcessOutcome {
     let Some(src) = resolve_source(
         &tr.air_sha256,
@@ -5675,121 +10154,350 @@ fn process_one(
     // the new metal row is still the one used for this run (and for candidate input matching).
     if cfg.backend == RunBackend::Metal {
         if let Some(m) = metal_rows.get(&tr.air_sha256) {
-            if m.status == "ok" && m.compare == "none" {
+            if should_skip_existing_metal_compare_none(cfg, m) {
                 eprintln!("    skip: metal compare=none");
                 return ProcessOutcome::Skip;
             }
         }
-        let plan = infer_plan(&ll);
-        return run_metal(cfg, tr, &src, &ll, stage, &entry, &plan);
+        let (plan, fc_values) = metal_oracle_inputs(&ll, metal_rows.get(&tr.air_sha256));
+        return run_metal(cfg, tr, &src, &ll, stage, &entry, &plan, &fc_values);
     }
 
     // Vulkan / MoltenVK candidates: inputs must match the metal golden's banked plan. A stale
     // Metal golden is not a candidate regression; keep the diagnostic row but account it as a
     // skipped/not-comparable case in the parent runner.
     macro_rules! write_missing_candidate_and_skip {
-        ($golden:expr, $reason:expr) => {{
+        ($metal:expr, $golden:expr, $reason:expr) => {{
+            if let Some(outcome) = try_run_vulkan_for_skipped_metal_compare(
+                cfg,
+                tr,
+                &src,
+                &ll,
+                stage,
+                &entry,
+                $metal,
+                moltenvk_rows,
+                &$reason,
+            ) {
+                return outcome;
+            }
+            if cfg.compile_missing {
+                return compile_missing_candidate_smoke(
+                    cfg, tr, &src, &ll, stage, $golden, $reason,
+                );
+            }
             let row = candidate_status_row(cfg, tr, &src, "missing", $golden, Some($reason));
             let _ = append_result_row(cfg, &row);
             return ProcessOutcome::Skip;
         }};
     }
     let Some(metal) = metal_rows.get(&tr.air_sha256) else {
-        write_missing_candidate_and_skip!(None, "no metal golden row".into());
+        let reason = "no metal golden row".to_string();
+        if cfg.compile_missing {
+            return compile_missing_candidate_smoke(cfg, tr, &src, &ll, stage, None, reason);
+        }
+        let row = candidate_status_row(cfg, tr, &src, "missing", None, Some(reason));
+        let _ = append_result_row(cfg, &row);
+        return ProcessOutcome::Skip;
     };
-    if metal.status == "quarantine" {
+    if let Some((status, reason, outcome)) = candidate_metal_status_precheck(cfg.backend, metal) {
+        if cfg.compile_missing && status == "missing" {
+            return compile_missing_candidate_smoke(
+                cfg,
+                tr,
+                &src,
+                &ll,
+                stage,
+                metal.output_sha256.clone(),
+                reason,
+            );
+        }
         let row = candidate_status_row(
             cfg,
             tr,
             &src,
-            "quarantine",
+            status,
             metal.output_sha256.clone(),
-            Some("metal status=quarantine".into()),
+            Some(reason),
         );
         let _ = append_result_row(cfg, &row);
-        return ProcessOutcome::Fail;
-    }
-    if metal.status != "ok" || metal.output_sha256.is_none() {
-        write_missing_candidate_and_skip!(
-            metal.output_sha256.clone(),
-            format!("metal status={}", metal.status)
-        );
+        return outcome;
     }
     if let Some(reason) = incompatible_function_constant_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
-    if let Some(reason) = incompatible_function_constant_definedness_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+    if let Some(reason) = incompatible_function_constant_texture_array_ref_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_function_constant_private_pointer_table_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_function_constant_simdgroup_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_zero_function_constant_divisor_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_output_plan_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_texture_array_plan_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_multisample_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_static_resource_plan_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_point_coord_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_undefined_texture_write_lanes_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_bounded_control_seed_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_overlapping_output_stride_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_oob_vector_input_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_bounded_control_strided_input_oob_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_bounded_control_index_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_bounded_control_reflective_oob_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_bounded_control_local_array_index_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_texture_indexed_float_buffer_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_fast_coordinate_buffer_lookup_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_finite_struct_control_index_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_float_seed_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_float_output_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_finite_struct_half_fragment_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_barycentric_derivative_fragment_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if cfg.backend == RunBackend::MoltenVk {
+        if let Some(reason) =
+            incompatible_moltenvk_vertex_clip_distance_half_texture_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) =
+            incompatible_moltenvk_sampled_half_render_target_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) = incompatible_moltenvk_half_texture_output_exact_golden(&ll, metal) {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) =
+            incompatible_moltenvk_storage_f32_texture_output_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) =
+            incompatible_moltenvk_sampled_f32_render_target_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) = incompatible_moltenvk_fast_f32_buffer_output_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) =
+            incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) = incompatible_moltenvk_sampled_f32_cube_buffer_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) = incompatible_moltenvk_fast_f32_input_buffer_exact_golden(&ll, metal) {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) = incompatible_moltenvk_fast_half_buffer_output_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) = incompatible_moltenvk_fast_half_render_target_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) =
+            incompatible_moltenvk_integer_texture_fast_render_target_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+        if let Some(reason) =
+            incompatible_moltenvk_scaled_integer_half_texture_output_exact_golden(&ll, metal)
+        {
+            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+        }
+    }
+    if let Some(reason) = incompatible_sampled_half_linear_filter_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_storage_half_imageblock_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_uninitialized_half_imageblock_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_f32_imageblock_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_integer_gather_imageblock_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_half_cube_render_target_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_half_domain_sensitive_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_fast_procedural_half_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_fast_pow_texture_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_fast_exp_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_f32_domain_math_texture_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_uint_float_render_target_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_half_dot_render_target_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_f32_dynamic_lod_render_target_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_f32_texture_array_render_targets_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_fragment_half_pow_render_target_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_fragment_fast_pow_rsqrt_render_target_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_dependent_sampled_lookup_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_dependent_sampled_half_lookup_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_fast_sqrt_render_target_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_exact_control_flow_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_cube_fast_math_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_sampled_half_buffer_fast_math_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_fast_procedural_f32_texture_output_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_fast_f32_buffer_output_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_sampled_f32_texture_output_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_storage_half_exp_texture_output_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_compare_none_simdgroup_matrix_smoke_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_compare_none_raytracing_smoke_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_compare_none_loop_guard_golden(&ll, &entry, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_nonportable_ptrtoint_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_parallel_dynamic_buffer_scatter_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_subgroup_texture_write_race_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    }
+    if let Some(reason) = incompatible_many_to_one_texture_write_golden(&ll, metal) {
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_undefined_threadgroup_memory_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal.output_sha256.clone(), reason);
+        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     let plan = metal.plan.clone();
-    run_candidate(cfg, tr, &src, &ll, stage, &entry, &plan, metal)
+    run_candidate(cfg, tr, &src, &ll, stage, &entry, &plan, metal, None, None)
 }
 
 fn write_failure_row(cfg: &RunConfig, tr: &TranslateRow, src: &SourceFile, err: &str) {
     append_status_row(cfg, tr, src, "fallback", "full", None, err.into());
+}
+
+fn metal_oracle_inputs(ll: &str, metal: Option<&MetalRow>) -> (HarnessPlan, Vec<(usize, u64)>) {
+    let current_plan = infer_plan(ll);
+    let plan = metal
+        .and_then(banked_explicit_input_plan)
+        .unwrap_or(current_plan);
+    let fc_values = metal
+        .and_then(banked_function_constant_values)
+        .unwrap_or_else(|| function_constant_values_for_oracle_inputs(ll));
+    (plan, fc_values)
+}
+
+fn banked_function_constant_values(metal: &MetalRow) -> Option<Vec<(usize, u64)>> {
+    if let Some(fc_values) = metal.fc_values.as_deref() {
+        if !fc_values.is_empty() {
+            return Some(
+                fc_values
+                    .iter()
+                    .map(|value| (value.index as usize, value.value))
+                    .collect(),
+            );
+        }
+    }
+    None
+}
+
+fn banked_explicit_input_plan(metal: &MetalRow) -> Option<HarnessPlan> {
+    (metal.input_specialization.as_deref() == Some(INPUT_SPECIALIZATION_EXPLICIT))
+        .then(|| metal.plan.clone())
 }
 
 /// Record a case the oracle refused to submit because it could not prove the GPU work bounded
@@ -5797,16 +10505,28 @@ fn write_failure_row(cfg: &RunConfig, tr: &TranslateRow, src: &SourceFile, err: 
 /// outcome with a quarantine status. A committed Metal kernel cannot be cancelled, so quarantining
 /// is the only safe outcome — the case is recorded for visibility, not dispatched.
 #[cfg(target_os = "macos")]
-fn write_quarantine_row(cfg: &RunConfig, tr: &TranslateRow, src: &SourceFile, reason: &str) {
-    append_status_row(
-        cfg,
+fn write_quarantine_row(
+    cfg: &RunConfig,
+    tr: &TranslateRow,
+    src: &SourceFile,
+    plan: &HarnessPlan,
+    stage: Stage,
+    entry: &str,
+    reason: &str,
+) {
+    let row = metal_status_row(
         tr,
         src,
-        "quarantine",
-        "none",
-        None,
-        format!("quarantined: {reason}"),
+        MetalStatusFields {
+            status: "quarantine",
+            compare: "none",
+            plan: plan.clone(),
+            stage: Some(stage),
+            entry: Some(entry),
+            error: Some(format!("quarantined: {reason}")),
+        },
     );
+    let _ = append_result_row(cfg, &row);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5818,6 +10538,7 @@ fn run_metal(
     stage: Stage,
     entry: &str,
     plan: &HarnessPlan,
+    fc_values: &[(usize, u64)],
 ) -> ProcessOutcome {
     if stage == Stage::Fragment {
         if let Some(reason) = unsupported_fragment_color_output_arity(ll) {
@@ -5828,7 +10549,7 @@ fn run_metal(
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (cfg, tr, src, ll, stage, entry, plan);
+        let _ = (cfg, tr, src, ll, stage, entry, plan, fc_values);
         eprintln!("    fallback: corpus-run-metal requires macOS");
         ProcessOutcome::Fail
     }
@@ -5857,6 +10578,7 @@ fn run_metal(
         };
         let source_metallib = source_metallib_for_air(src);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&air);
+        crate::oracle_macos::set_fc_values(fc_values.to_vec());
         let result = catch_oracle_unwind(|| {
             crate::oracle_macos::execute_metallib_blob(
                 &b64,
@@ -5874,7 +10596,7 @@ fn run_metal(
                 // kernel cannot be cancelled). Record it as quarantined; it is a failure status,
                 // but not a dispatched GPU failure.
                 if let Some(reason) = e.strip_prefix("m2v-quarantine:") {
-                    write_quarantine_row(cfg, tr, src, reason.trim());
+                    write_quarantine_row(cfg, tr, src, plan, stage, entry, reason.trim());
                     return ProcessOutcome::Fail;
                 }
                 write_failure_row(cfg, tr, src, &classify_metal_oracle_panic(&e));
@@ -5904,6 +10626,7 @@ fn run_metal(
             compare: compare.into(),
             fc_specialization,
             fc_values,
+            input_specialization: None,
             stage: Some(format!("{stage:?}")),
             entry: Some(entry.into()),
             error: None,
@@ -6022,7 +10745,12 @@ fn candidate_ll_for_metal_compare<'a>(
         return Ok(Cow::Borrowed(ll));
     }
 
-    match crate::loop_budget::classify_and_instrument(ll, entry) {
+    let loop_facts = loop_input_facts_for_metal_plan(ll, entry, metal);
+    match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
+        ll,
+        entry,
+        loop_facts.as_loop_input_facts(),
+    ) {
         crate::loop_budget::GuardPlan::Instrumented(text) => Ok(Cow::Owned(text)),
         crate::loop_budget::GuardPlan::LoopFree => Ok(Cow::Borrowed(ll)),
         crate::loop_budget::GuardPlan::Quarantine(reason) => Err(reason),
@@ -6051,6 +10779,7 @@ fn candidate_execution_error_status(error: &str) -> &'static str {
     if error.contains("Vulkan validation runner skipped NVIDIA")
         || error.contains("pipeline probe timed out after")
         || error.contains("the logical or physical device has been lost")
+        || error.contains("Vulkan device does not support SPIR-V")
     {
         "quarantine"
     } else {
@@ -6064,7 +10793,7 @@ fn write_candidate_execution_error_row(
     src: &SourceFile,
     metal: &MetalRow,
     error: &str,
-) {
+) -> &'static str {
     let status = candidate_execution_error_status(error);
     let golden_output_sha256 = (status == "quarantine")
         .then(|| metal.output_sha256.clone())
@@ -6078,6 +10807,15 @@ fn write_candidate_execution_error_row(
         Some(format!("vulkan execute: {error}")),
     );
     let _ = append_result_row(cfg, &row);
+    status
+}
+
+fn speculative_quarantine_outcome(skipped_metal_reason: Option<&str>) -> ProcessOutcome {
+    if skipped_metal_reason.is_some() {
+        ProcessOutcome::Skip
+    } else {
+        ProcessOutcome::Fail
+    }
 }
 
 fn translate_candidate_spv_for_plan(
@@ -6109,10 +10847,23 @@ fn run_candidate(
     entry: &str,
     plan: &HarnessPlan,
     metal: &MetalRow,
+    compare_reference: Option<CandidateCompareReference<'_>>,
+    skipped_metal_reason: Option<&str>,
 ) -> ProcessOutcome {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (cfg, tr, src, ll, stage, entry, plan, metal);
+        let _ = (
+            cfg,
+            tr,
+            src,
+            ll,
+            stage,
+            entry,
+            plan,
+            metal,
+            compare_reference,
+            skipped_metal_reason,
+        );
         write_failure_row(cfg, tr, src, "vulkan runner unsupported on this OS");
         return ProcessOutcome::Fail;
     }
@@ -6150,7 +10901,7 @@ fn run_candidate(
                     metal,
                     &format!("candidate loop guard: {reason}"),
                 );
-                return ProcessOutcome::Fail;
+                return speculative_quarantine_outcome(skipped_metal_reason);
             }
         };
         let candidate_ll = candidate_ll.as_ref();
@@ -6204,6 +10955,27 @@ fn run_candidate(
             incompatible_undefined_fragment_color_output_golden(candidate_ll, plan, &spv)
         {
             let _ = fs::remove_dir_all(&tmp);
+            if cfg.compile_missing {
+                let row = CandidateRow {
+                    air_sha256: tr.air_sha256.clone(),
+                    shard: src.shard.clone(),
+                    label: src.label.clone(),
+                    status: "smoke".into(),
+                    backend: cfg.backend.as_str().into(),
+                    output_sha256: None,
+                    output_b64: None,
+                    golden_output_sha256: metal.output_sha256.clone(),
+                    spv_sha256: Some(sha256_hex(&spv)),
+                    tolerance: None,
+                    observed: None,
+                    error: Some(format!("compile-only: {reason}")),
+                };
+                if let Err(e) = append_result_row(cfg, &row) {
+                    eprintln!("    write ledger: {e}");
+                    return ProcessOutcome::Fail;
+                }
+                return ProcessOutcome::Ok;
+            }
             let row = candidate_status_row(
                 cfg,
                 tr,
@@ -6222,8 +10994,12 @@ fn run_candidate(
         let candidate = match result {
             Ok(Ok(b)) => b,
             Ok(Err(error)) => {
-                write_candidate_execution_error_row(cfg, tr, src, metal, &error);
-                return ProcessOutcome::Fail;
+                let status = write_candidate_execution_error_row(cfg, tr, src, metal, &error);
+                return if status == "quarantine" {
+                    speculative_quarantine_outcome(skipped_metal_reason)
+                } else {
+                    ProcessOutcome::Fail
+                };
             }
             Err(payload) => {
                 let detail = panic_payload_message(payload);
@@ -6231,18 +11007,53 @@ fn run_candidate(
                 return ProcessOutcome::Fail;
             }
         };
-        let golden_hash = metal.output_sha256.clone().unwrap_or_default();
+        let reference_metal;
+        let compare_metal = if let Some(reference) = compare_reference.as_ref() {
+            reference_metal = MetalRow {
+                output_sha256: reference.row.output_sha256.clone(),
+                output_b64: reference.row.output_b64.clone(),
+                compare: "full".into(),
+                ..metal.clone()
+            };
+            &reference_metal
+        } else {
+            metal
+        };
+        let golden_hash = compare_metal.output_sha256.clone().unwrap_or_default();
         let out_hash = sha256_hex(&candidate);
-        let format = candidate_compare_format(candidate_ll, plan, metal);
-        let (status, observed, tolerance) = compare_candidate_to_metal(
+        let format = candidate_compare_format(candidate_ll, plan, compare_metal);
+        let (mut status, observed, tolerance) = compare_candidate_to_metal(
             &candidate,
-            metal,
+            compare_metal,
             &out_hash,
             &golden_hash,
             format,
             Some(candidate_ll),
         );
-        let error = candidate_compare_error(&status, metal, tolerance.as_ref());
+        let mut error = candidate_compare_error(&status, compare_metal, tolerance.as_ref());
+        if let Some(reference) = compare_reference.as_ref() {
+            if !matches!(status.as_str(), "ok" | "tolerance") && error.is_none() {
+                error = Some(format!(
+                    "Vulkan output differs from {} ok reference; skipped Metal compare reason: {}",
+                    reference.backend, reference.skipped_metal_reason
+                ));
+            }
+        }
+        if let Some(reason) = skipped_metal_reason {
+            if !matches!(status.as_str(), "ok" | "tolerance") {
+                status = "missing".into();
+                error = Some(reason.to_string());
+            }
+        }
+        if cfg.compile_missing {
+            if let Some(smoke_error) =
+                compile_missing_compare_smoke_error(&status, tolerance.as_ref(), error.as_deref())
+            {
+                status = "smoke".into();
+                error = Some(smoke_error);
+            }
+        }
+        enforce_backend_compare_policy(cfg.backend, &mut status, &mut error);
         let row = CandidateRow {
             air_sha256: tr.air_sha256.clone(),
             shard: src.shard.clone(),
@@ -6292,10 +11103,105 @@ mod tests {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: stage.map(str::to_string),
             entry: None,
             error: None,
         }
+    }
+
+    fn candidate_row_for_compare(status: &str, output: Option<&[u8]>) -> CandidateRow {
+        let output_sha256 = output.map(sha256_hex);
+        CandidateRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: status.into(),
+            backend: "moltenvk".into(),
+            output_sha256: output_sha256.clone(),
+            output_b64: output.map(encode_output_b64),
+            golden_output_sha256: output_sha256,
+            spv_sha256: None,
+            tolerance: None,
+            observed: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn vulkan_uses_only_complete_moltenvk_ok_reference_rows() {
+        let mut cfg = RunConfig::from_manifest(RunBackend::Vulkan);
+        let metal = metal_row_for_compare(&[1, 2, 3], infer_plan(""), Some("Kernel"));
+        let mut rows = HashMap::new();
+
+        rows.insert(
+            "x".into(),
+            candidate_row_for_compare("missing", Some(&[1, 2, 3])),
+        );
+        assert!(moltenvk_ok_reference(&cfg, &rows, "x", &metal).is_none());
+
+        rows.insert("x".into(), candidate_row_for_compare("ok", None));
+        assert!(moltenvk_ok_reference(&cfg, &rows, "x", &metal).is_none());
+
+        rows.insert(
+            "x".into(),
+            candidate_row_for_compare("ok", Some(&[9, 9, 9])),
+        );
+        assert!(moltenvk_ok_reference(&cfg, &rows, "x", &metal).is_none());
+
+        rows.insert(
+            "x".into(),
+            candidate_row_for_compare("ok", Some(&[1, 2, 3])),
+        );
+        assert!(moltenvk_ok_reference(&cfg, &rows, "x", &metal).is_some());
+
+        cfg.backend = RunBackend::MoltenVk;
+        assert!(moltenvk_ok_reference(&cfg, &rows, "x", &metal).is_none());
+    }
+
+    #[test]
+    fn candidate_metal_quarantine_precheck_is_skip_not_failure() {
+        let plan = infer_plan("");
+        let mut metal = metal_row_for_compare(&[], plan, Some("Kernel"));
+        assert!(candidate_metal_status_precheck(RunBackend::Vulkan, &metal).is_none());
+
+        metal.status = "quarantine".into();
+        let (status, reason, outcome) =
+            candidate_metal_status_precheck(RunBackend::MoltenVk, &metal)
+                .expect("quarantine precheck");
+        assert_eq!(status, "quarantine");
+        assert_eq!(reason, "metal status=quarantine");
+        assert_eq!(outcome, ProcessOutcome::Skip);
+
+        metal.status = "fallback".into();
+        let (status, reason, outcome) =
+            candidate_metal_status_precheck(RunBackend::MoltenVk, &metal)
+                .expect("fallback precheck");
+        assert_eq!(status, "missing");
+        assert_eq!(reason, "metal status=fallback");
+        assert_eq!(outcome, ProcessOutcome::Skip);
+
+        metal.status = "ok".into();
+        metal.output_sha256 = None;
+        let (status, reason, outcome) =
+            candidate_metal_status_precheck(RunBackend::MoltenVk, &metal)
+                .expect("hashless ok precheck");
+        assert_eq!(status, "missing");
+        assert_eq!(reason, "metal status=ok");
+        assert_eq!(outcome, ProcessOutcome::Skip);
+
+        metal.output_sha256 = Some(sha256_hex(&[]));
+        metal.compare = "none".into();
+        assert!(candidate_metal_status_precheck(RunBackend::Vulkan, &metal).is_none());
+        let (status, reason, outcome) =
+            candidate_metal_status_precheck(RunBackend::MoltenVk, &metal)
+                .expect("MoltenVK compare=none precheck");
+        assert_eq!(status, "missing");
+        assert_eq!(
+            reason,
+            "metal golden compare=none is not a full semantic golden; rebank Metal row"
+        );
+        assert_eq!(outcome, ProcessOutcome::Skip);
     }
 
     /// Minimal AIR-shaped snippet of an MPS-style GEMM: constant-space params struct +
@@ -6333,6 +11239,70 @@ define void @f16MatrixMultiplyNN_aligned(ptr addrspace(1) %0, ptr addrspace(1) %
 !22 = !{i32 4, !"air.buffer", !"air.buffer_size", i32 36, !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !23, !"air.arg_type_size", i32 36, !"air.arg_type_name", !"MPSMatrixMulParameters", !"air.arg_name", !"p"}
 !23 = !{i32 0, i32 4, i32 0, !"uint", !"M"}
 !24 = !{i32 5, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+"#;
+
+    const BOUNDED_CONTROL_FLOAT_PAYLOAD_LL: &str = r#"
+%struct.Params = type { i32, [2 x i32], float, i32, i32 }
+
+define void @k(ptr addrspace(1) readonly %input, ptr addrspace(1) writeonly %output, ptr addrspace(2) %params, i32 %group_id, i16 %lid, i16 %lsize) {
+entry:
+  %batch_size_ptr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 4
+  %batch_size = load i32, ptr addrspace(2) %batch_size_ptr, align 4
+  %stride0_ptr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 1, i64 0
+  %stride0 = load i32, ptr addrspace(2) %stride0_ptr, align 4
+  %stride1_ptr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 1, i64 1
+  %stride1 = load i32, ptr addrspace(2) %stride1_ptr, align 4
+  %channels_ptr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 3
+  %channels = load i32, ptr addrspace(2) %channels_ptr, align 4
+  %gid_base = mul nsw i32 %stride0, %group_id
+  %lid32 = zext i16 %lid to i32
+  %lsize32 = zext i16 %lsize to i32
+  br label %batch_loop
+
+batch_loop:
+  %sum = phi float [ 0.000000e+00, %entry ], [ %sum_next, %batch_latch ]
+  %batch = phi i32 [ 0, %entry ], [ %batch_next, %batch_latch ]
+  %batch_base = mul nsw i32 %batch, %stride1
+  %base = add nsw i32 %batch_base, %gid_base
+  %active = icmp sgt i32 %channels, %lid32
+  br i1 %active, label %lane_loop, label %batch_latch
+
+lane_loop:
+  %lane = phi i32 [ %lid32, %batch_loop ], [ %lane_next, %lane_loop ]
+  %lane_sum = phi float [ %sum, %batch_loop ], [ %lane_sum_next, %lane_loop ]
+  %idx = add nsw i32 %base, %lane
+  %idx64 = sext i32 %idx to i64
+  %ptr = getelementptr inbounds float, ptr addrspace(1) %input, i64 %idx64
+  %value = load float, ptr addrspace(1) %ptr, align 4
+  %lane_sum_next = fadd fast float %lane_sum, %value
+  %lane_next = add nuw nsw i32 %lane, %lsize32
+  %keep_lane = icmp slt i32 %lane_next, %channels
+  br i1 %keep_lane, label %lane_loop, label %batch_latch
+
+batch_latch:
+  %sum_next = phi float [ %sum, %batch_loop ], [ %lane_sum_next, %lane_loop ]
+  %batch_next = add nuw nsw i32 %batch, 1
+  %keep_batch = icmp eq i32 %batch_next, %batch_size
+  br i1 %keep_batch, label %done, label %batch_loop
+
+done:
+  %out_idx = sext i32 %group_id to i64
+  %out = getelementptr inbounds float, ptr addrspace(1) %output, i64 %out_idx
+  store float %sum_next, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !7, !8, !9}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"input"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"output"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 24, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !6, !"air.arg_type_size", i32 24, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!6 = !{i32 0, i32 4, i32 0, !"int", !"flags", i32 4, i32 4, i32 2, !"int", !"strides", i32 12, i32 4, i32 0, !"float", !"scale", i32 16, i32 4, i32 0, !"int", !"channels", i32 20, i32 4, i32 0, !"int", !"batch_size"}
+!7 = !{i32 3, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"group_id"}
+!8 = !{i32 4, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lid"}
+!9 = !{i32 5, !"air.threads_per_threadgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lsize"}
 "#;
 
     /// Raw device payload whose i32 counter is read through an AIR atomic load. Even though the
@@ -6417,6 +11387,35 @@ entry:
 !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
 "#;
 
+    const FLOAT2_DEPTH_DIVIDE_CONTROL_LL: &str = r#"
+define float @depth_divide(ptr addrspace(2) %near_far, ptr addrspace(2) %bias, ptr addrspace(1) %tex, <2 x float> %uv) #0 {
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  %disp = extractelement <4 x float> %color, i64 0
+  %nf = load <2 x float>, ptr addrspace(2) %near_far, align 8
+  %near = extractelement <2 x float> %nf, i64 0
+  %far = extractelement <2 x float> %nf, i64 1
+  %b = load float, ptr addrspace(2) %bias, align 4
+  %den = fsub fast float %near, %far
+  %num = fsub fast float %disp, %b
+  %out = fdiv fast float %num, %den
+  ret float %out
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @depth_divide, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6, !7}
+!3 = !{!"air.depth", !"air.depth_qualifier", !"air.any", !"air.arg_type_name", !"float", !"air.arg_name", !"z"}
+!4 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"float2", !"air.arg_name", !"near_far"}
+!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"bias"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!7 = !{i32 3, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+"#;
+
     const VECTOR_CONTROL_STRUCT_LL: &str = r#"
 define <4 x float> @fragment(ptr addrspace(2) %uniforms) {
 entry:
@@ -6474,7 +11473,7 @@ loop:
   %f = load float, ptr addrspace(1) %field, align 4
   store float %f, ptr addrspace(1) %out, align 4
   %next = add i32 %i, 1
-  %done = icmp eq i32 %next, 1
+  %done = icmp eq i32 %next, 257
   br i1 %done, label %exit, label %loop, !llvm.loop !5
 
 exit:
@@ -6509,6 +11508,54 @@ declare ptr addrspace(1) @air.get_data_pointer_instance_acceleration_structure(p
             assert_eq!(
                 b.seed_mode, SEED_MODE_FINITE_FLOAT16,
                 "buffer {idx} should use finite f16 seeds"
+            );
+        }
+    }
+
+    #[test]
+    fn arg_type_sized_constant_struct_with_float_field_stays_bounded_control() {
+        let plan = infer_plan(
+            r#"
+define void @steel_like(ptr addrspace(2) %params, ptr addrspace(1) %out) {
+entry:
+  %nq_ptr = getelementptr inbounds %Params, ptr addrspace(2) %params, i64 0, i32 7
+  %nq = load i32, ptr addrspace(2) %nq_ptr, align 4
+  %scale_ptr = getelementptr inbounds %Params, ptr addrspace(2) %params, i64 0, i32 6
+  %scale = load float, ptr addrspace(2) %scale_ptr, align 4
+  %keep = icmp sgt i32 %nq, 0
+  br i1 %keep, label %write, label %exit
+write:
+  store float %scale, ptr addrspace(1) %out, align 4
+  br label %exit
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @steel_like, !1, !2}
+!1 = !{}
+!2 = !{!3, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 152, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!4 = !{i32 0, i32 4, i32 0, !"int", !"B", i32 4, i32 4, i32 0, !"int", !"H", i32 8, i32 4, i32 0, !"int", !"D", i32 12, i32 4, i32 0, !"int", !"qL", i32 16, i32 4, i32 0, !"int", !"kL", i32 20, i32 4, i32 0, !"int", !"gqa_factor", i32 24, i32 4, i32 0, !"float", !"scale", i32 28, i32 4, i32 0, !"int", !"NQ", i32 32, i32 4, i32 0, !"int", !"NK", i32 36, i32 4, i32 0, !"int", !"NQ_aligned", i32 40, i32 4, i32 0, !"int", !"NK_aligned", i32 44, i32 4, i32 0, !"int", !"qL_rem", i32 48, i32 4, i32 0, !"int", !"kL_rem", i32 52, i32 4, i32 0, !"int", !"qL_off", i32 56, i32 8, i32 3, !"long", !"Q_strides", i32 80, i32 8, i32 3, !"long", !"K_strides", i32 104, i32 8, i32 3, !"long", !"V_strides", i32 128, i32 8, i32 3, !"long", !"O_strides"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#,
+        );
+        let params = plan.buffers.iter().find(|b| b.index == 4).unwrap();
+        assert_eq!(params.len, 152);
+        assert_eq!(params.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        for (offset, size, value) in [
+            (0usize, 4usize, None),
+            (24, 4, Some(0x3f80_0000)),
+            (28, 4, None),
+            (56, 8, None),
+            (128, 8, None),
+        ] {
+            assert!(
+                params.seed_layout.iter().any(|field| {
+                    field.offset == offset && field.size == size && field.value == value
+                }),
+                "missing bounded field ({offset}, {size}, {value:?}) in {:?}",
+                params.seed_layout
             );
         }
     }
@@ -6626,6 +11673,59 @@ define void @kernel(ptr addrspace(1) %in, ptr addrspace(1) %out) {
     }
 
     #[test]
+    fn bounded_control_module_seeds_mixed_struct_integer_fields() {
+        let mut plan = infer_plan(
+            r#"
+%struct.Payload = type { float, i32, i8, <2 x float> }
+
+define void @kernel(ptr addrspace(2) %params, ptr addrspace(1) %queue) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !5}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"params"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 20, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload", !"air.arg_name", !"queue"}
+!6 = !{i32 0, i32 4, i32 0, !"float", !"cost", i32 4, i32 4, i32 0, !"uint", !"count", i32 8, i32 1, i32 0, !"bool", !"enabled", i32 12, i32 8, i32 0, !"float2", !"bounds"}
+"#,
+        );
+        let queue = plan.buffers.iter_mut().find(|b| b.index == 7).unwrap();
+        queue.len = 64;
+        assert_eq!(queue.seed_mode, SEED_MODE_FINITE_STRUCT_FLOAT);
+        assert_eq!(queue.seed_stride, Some(20));
+        assert!(
+            queue.seed_layout.iter().any(|field| {
+                field.offset == 4
+                    && field.size == 4
+                    && field.value == Some(u64::from(BOUNDED_CONTROL_DIM))
+            }),
+            "missing bounded integer field: {:?}",
+            queue.seed_layout
+        );
+        assert!(
+            queue
+                .seed_layout
+                .iter()
+                .any(|field| { field.offset == 8 && field.size == 1 && field.value == Some(0) }),
+            "missing bounded bool field: {:?}",
+            queue.seed_layout
+        );
+
+        let owned = plan_to_owned_inputs(&plan).unwrap();
+        let bytes =
+            seeded_buffer_bytes(owned.inputs.buffers.iter().find(|b| b.index == 7).unwrap());
+        for base in (0..60).step_by(20) {
+            assert_eq!(
+                u32::from_le_bytes(bytes[base + 4..base + 8].try_into().unwrap()),
+                BOUNDED_CONTROL_DIM
+            );
+            assert_eq!(bytes[base + 8], 0);
+        }
+    }
+
+    #[test]
     fn finite_struct_float_input_buffer_covers_default_dispatch() {
         let ll = r#"
 %struct.Payload = type { float, i32, <2 x float> }
@@ -6681,6 +11781,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -6690,6 +11791,437 @@ attributes #0 = { "no-nans-fp-math"="true" }
             reason.contains("legacy finite_struct_float seed for buffer 7"),
             "{reason}"
         );
+    }
+
+    #[test]
+    fn finite_struct_integer_field_dynamic_index_requires_rebank() {
+        let ll = r#"
+%struct.Payload = type { [4 x i16], [4 x float] }
+
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %tid) {
+  %tid64 = zext i32 %tid to i64
+  %idx_ptr = getelementptr inbounds %struct.Payload, ptr addrspace(1) %src, i64 0, i32 0, i64 %tid64
+  %raw = load i16, ptr addrspace(1) %idx_ptr, align 2
+  %idx = sext i16 %raw to i64
+  %out = getelementptr inbounds %struct.Payload, ptr addrspace(1) %dst, i64 0, i32 1, i64 %idx
+  store float 1.000000e+00, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !5, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 24, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload", !"air.arg_name", !"src"}
+!4 = !{i32 0, i32 8, i32 4, !"short", !"idx", i32 8, i32 16, i32 4, !"float", !"values"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 24, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Payload", !"air.arg_name", !"dst"}
+!6 = !{i32 0, i32 8, i32 4, !"short", !"idx", i32 8, i32 16, i32 4, !"float", !"values"}
+!7 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let plan = infer_plan(ll);
+        assert_eq!(
+            plan.buffers
+                .iter()
+                .find(|buffer| buffer.index == 0)
+                .unwrap()
+                .seed_mode,
+            SEED_MODE_FINITE_STRUCT_FLOAT
+        );
+        assert_eq!(
+            plan.buffers
+                .iter()
+                .find(|buffer| buffer.index == 1)
+                .unwrap()
+                .seed_mode,
+            SEED_MODE_FINITE_STRUCT_FLOAT
+        );
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&[])),
+            output_b64: Some(encode_output_b64(&[])),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: Some("kernel".into()),
+            error: None,
+        };
+
+        let reason = incompatible_finite_struct_control_index_golden(ll, &metal).unwrap();
+        assert!(
+            reason.contains("finite_struct_float buffer 0")
+                && reason.contains("dynamic struct-array index"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn bounded_control_dynamic_fixed_array_index_requires_rebank() {
+        let ll = r#"
+%struct.Params = type { i32, i32 }
+
+define void @kernel(ptr addrspace(2) %params, ptr addrspace(1) %out) {
+  tail call fastcc void @impl(ptr addrspace(2) %params, ptr addrspace(1) %out)
+  ret void
+}
+
+define internal fastcc void @impl(ptr addrspace(2) %params, ptr addrspace(1) %out) {
+  %tmp = alloca [5 x i32], align 4
+  %slot0 = getelementptr inbounds [5 x i32], ptr %tmp, i64 0, i64 0
+  store i32 7, ptr %slot0, align 4
+  %axis_ptr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 0
+  %axis = load i32, ptr addrspace(2) %axis_ptr, align 4
+  %axis64 = sext i32 %axis to i64
+  %slot = getelementptr inbounds [5 x i32], ptr %tmp, i64 0, i64 %axis64
+  %value = load i32, ptr %slot, align 4
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !5}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!4 = !{i32 0, i32 4, i32 0, !"int", !"axis", i32 4, i32 4, i32 0, !"int", !"limit"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"out"}
+"#;
+        let plan = infer_plan(ll);
+        let params = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .unwrap();
+        assert_eq!(params.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert!(
+            params
+                .seed_layout
+                .iter()
+                .any(|field| field.offset == 0 && field.size == 4 && field.value.is_none()),
+            "{:?}",
+            params.seed_layout
+        );
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&[])),
+            output_b64: Some(encode_output_b64(&[])),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: Some("kernel".into()),
+            error: None,
+        };
+
+        let reason = incompatible_bounded_control_index_golden(ll, &metal).unwrap();
+        assert!(
+            reason.contains("bounded_control buffer 0")
+                && reason.contains("outside fixed 5-element array"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn bounded_control_reflective_padding_oob_requires_rebank() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %dst, ptr addrspace(2) %src_ctl, ptr addrspace(2) %dst_ctl, <3 x i32> %gid) {
+  %x = extractelement <3 x i32> %gid, i64 0
+  %padded = sub i32 %x, 16
+  %neg = icmp slt i32 %padded, 0
+  br i1 %neg, label %reflect, label %direct
+
+reflect:
+  %abs = tail call i32 @air.abs.s.i32(i32 %padded)
+  br label %join
+
+direct:
+  br label %join
+
+join:
+  %idx = phi i32 [ %abs, %reflect ], [ 257, %direct ]
+  %idx64 = sext i32 %idx to i64
+  %src_ptr = getelementptr inbounds half, ptr addrspace(1) %src, i64 %idx64
+  %value = load half, ptr addrspace(1) %src_ptr, align 2
+  store half %value, ptr addrspace(1) %dst, align 2
+  ret void
+}
+
+declare i32 @air.abs.s.i32(i32)
+"#;
+        let control_layout = (0..14)
+            .map(|field| ControlSeedField {
+                offset: field * 4,
+                size: 4,
+                value: None,
+            })
+            .collect::<Vec<_>>();
+        let plan = HarnessPlan {
+            buffers: vec![
+                PlanBuffer {
+                    index: 0,
+                    len: 512,
+                    role: "Input".into(),
+                    seed_tag: 1,
+                    seed_mode: SEED_MODE_FINITE_FLOAT16.into(),
+                    seed_layout: Vec::new(),
+                    seed_stride: None,
+                },
+                PlanBuffer {
+                    index: 1,
+                    len: 256,
+                    role: "InOut".into(),
+                    seed_tag: 2,
+                    seed_mode: SEED_MODE_FINITE_FLOAT16.into(),
+                    seed_layout: Vec::new(),
+                    seed_stride: None,
+                },
+                PlanBuffer {
+                    index: 2,
+                    len: 56,
+                    role: "Input".into(),
+                    seed_tag: 3,
+                    seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                    seed_layout: control_layout.clone(),
+                    seed_stride: None,
+                },
+                PlanBuffer {
+                    index: 3,
+                    len: 56,
+                    role: "Input".into(),
+                    seed_tag: 4,
+                    seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                    seed_layout: control_layout,
+                    seed_stride: None,
+                },
+            ],
+            textures: Vec::new(),
+            output: PlanOutput {
+                kind: "buffer".into(),
+                index: 1,
+                format: "R16Float".into(),
+                len: Some(256),
+                w: None,
+                h: None,
+                d: None,
+            },
+            dispatch_grid: [64, 1, 1],
+            dispatch_tg: [64, 1, 1],
+        };
+        let metal = metal_row_for_compare(&[], plan, Some("Kernel"));
+
+        let reason = incompatible_bounded_control_reflective_oob_golden(ll, &metal)
+            .expect("reflective padding OOB");
+        assert!(reason.contains("reflective-padding"), "{reason}");
+        assert!(
+            reason.contains("past finite f16 input buffer 0"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn bounded_control_reflective_padding_oob_covers_f32_inputs() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %dst, ptr addrspace(2) %src_ctl, ptr addrspace(2) %dst_ctl, <3 x i32> %gid) {
+  %x = extractelement <3 x i32> %gid, i64 0
+  %padded = sub i32 %x, 16
+  %neg = icmp slt i32 %padded, 0
+  br i1 %neg, label %reflect, label %direct
+
+reflect:
+  %abs = tail call i32 @air.abs.s.i32(i32 %padded)
+  br label %join
+
+direct:
+  br label %join
+
+join:
+  %idx = phi i32 [ %abs, %reflect ], [ 257, %direct ]
+  %idx64 = sext i32 %idx to i64
+  %src_ptr = getelementptr inbounds float, ptr addrspace(1) %src, i64 %idx64
+  %value = load float, ptr addrspace(1) %src_ptr, align 4
+  store float %value, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+declare i32 @air.abs.s.i32(i32)
+"#;
+        let control_layout = (0..14)
+            .map(|field| ControlSeedField {
+                offset: field * 4,
+                size: 4,
+                value: None,
+            })
+            .collect::<Vec<_>>();
+        let plan = HarnessPlan {
+            buffers: vec![
+                PlanBuffer {
+                    index: 0,
+                    len: 1024,
+                    role: "Input".into(),
+                    seed_tag: 1,
+                    seed_mode: SEED_MODE_FINITE_FLOAT32.into(),
+                    seed_layout: Vec::new(),
+                    seed_stride: None,
+                },
+                PlanBuffer {
+                    index: 1,
+                    len: 256,
+                    role: "InOut".into(),
+                    seed_tag: 2,
+                    seed_mode: SEED_MODE_FINITE_FLOAT32.into(),
+                    seed_layout: Vec::new(),
+                    seed_stride: None,
+                },
+                PlanBuffer {
+                    index: 2,
+                    len: 56,
+                    role: "Input".into(),
+                    seed_tag: 3,
+                    seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                    seed_layout: control_layout.clone(),
+                    seed_stride: None,
+                },
+                PlanBuffer {
+                    index: 3,
+                    len: 56,
+                    role: "Input".into(),
+                    seed_tag: 4,
+                    seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                    seed_layout: control_layout,
+                    seed_stride: None,
+                },
+            ],
+            textures: Vec::new(),
+            output: PlanOutput {
+                kind: "buffer".into(),
+                index: 1,
+                format: "F32".into(),
+                len: Some(256),
+                w: None,
+                h: None,
+                d: None,
+            },
+            dispatch_grid: [64, 1, 1],
+            dispatch_tg: [64, 1, 1],
+        };
+        let metal = metal_row_for_compare(&[], plan, Some("Kernel"));
+
+        let reason = incompatible_bounded_control_reflective_oob_golden(ll, &metal)
+            .expect("reflective padding OOB");
+        assert!(
+            reason.contains("past finite f32 input buffer 0"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn texture_indexed_float_buffer_oob_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %hash, ptr addrspace(1) %input, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %sam = tail call ptr addrspace(2) @air.get_read_sampler()
+  %read = tail call { <4 x i32>, i8 } @air.read_texture_2d.i16.u.v4i32(ptr addrspace(1) %hash, ptr addrspace(2) %sam, <2 x i16> %gid, <2 x i16> zeroinitializer, i16 0, i32 1)
+  %vec = extractvalue { <4 x i32>, i8 } %read, 0
+  %lane = extractelement <4 x i32> %vec, i64 0
+  %idx = zext i32 %lane to i64
+  %ptr = getelementptr inbounds float, ptr addrspace(1) %input, i64 %idx
+  %v = load float, ptr addrspace(1) %ptr, align 4
+  %splat0 = insertelement <4 x float> poison, float %v, i64 0
+  %splat = shufflevector <4 x float> %splat0, <4 x float> poison, <4 x i32> zeroinitializer
+  tail call void @air.write_texture_2d.i16.v4f32(ptr addrspace(1) %out, <2 x i16> %gid, <4 x float> %splat, i16 0, i32 2)
+  ret void
+}
+
+declare ptr addrspace(2) @air.get_read_sampler()
+declare { <4 x i32>, i8 } @air.read_texture_2d.i16.u.v4i32(ptr addrspace(1), ptr addrspace(2), <2 x i16>, <2 x i16>, i16, i32)
+declare void @air.write_texture_2d.i16.v4f32(ptr addrspace(1), <2 x i16>, <4 x float>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.compile_options = !{!8}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<uint, read>", !"air.arg_name", !"hash"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 256, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"input"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!8 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_texture_indexed_float_buffer_golden(ll, &metal)
+            .expect("texture-indexed finite f32 buffer OOB golden");
+        assert!(reason.contains("unchecked index"), "{reason}");
+        assert!(reason.contains("finite f32 input buffer 0"), "{reason}");
+    }
+
+    #[test]
+    fn fast_coordinate_buffer_lookup_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %input, ptr addrspace(1) %out, ptr addrspace(2) %size, <2 x i32> %gid) #0 {
+  %dims = load <2 x i32>, ptr addrspace(2) %size, align 8
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %gid)
+  %dims_f = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %dims)
+  %scaled = fdiv fast <2 x float> %coord, %dims_f
+  %idx2 = tail call <2 x i32> @air.convert.u.v2i32.f.v2f32(<2 x float> %scaled)
+  %y = extractelement <2 x i32> %idx2, i64 1
+  %w = extractelement <2 x i32> %dims, i64 0
+  %row = mul i32 %y, %w
+  %x = extractelement <2 x i32> %idx2, i64 0
+  %idx = add i32 %row, %x
+  %idx64 = zext i32 %idx to i64
+  %p0 = getelementptr inbounds [3 x half], ptr addrspace(1) %input, i64 %idx64, i64 0
+  %h = load half, ptr addrspace(1) %p0, align 2
+  %f = tail call fast float @air.convert.f.f32.f.f16(half %h)
+  %v0 = insertelement <4 x float> poison, float %f, i64 0
+  %v = shufflevector <4 x float> %v0, <4 x float> poison, <4 x i32> zeroinitializer
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %out, <2 x i32> %gid, <4 x float> %v, i32 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32>)
+declare <2 x i32> @air.convert.u.v2i32.f.v2f32(<2 x float>)
+declare float @air.convert.f.f32.f.f16(half)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.compile_options = !{!7}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 6, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"packed_half3", !"air.arg_name", !"input"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 8, !"air.arg_type_name", !"uint2", !"air.arg_name", !"size"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+!7 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_fast_coordinate_buffer_lookup_golden(ll, &metal)
+            .expect("fast coordinate buffer lookup golden");
+        assert!(reason.contains("finite float-buffer lookup"), "{reason}");
+        assert!(reason.contains("rounding differences"), "{reason}");
     }
 
     #[test]
@@ -6997,6 +12529,34 @@ define float @fragment(ptr addrspace(2) %params) {
     }
 
     #[test]
+    fn bounded_control_float_vector_divisor_fields_seed_to_distinct_values() {
+        let plan = infer_plan(FLOAT2_DEPTH_DIVIDE_CONTROL_LL);
+        let near_far = plan.buffers.iter().find(|b| b.index == 0).unwrap();
+        assert_eq!(near_far.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert_eq!(
+            near_far.seed_layout,
+            vec![
+                ControlSeedField {
+                    offset: 0,
+                    size: 4,
+                    value: Some(0x3f80_0000),
+                },
+                ControlSeedField {
+                    offset: 4,
+                    size: 4,
+                    value: Some(0x4000_0000),
+                },
+            ]
+        );
+
+        let owned = plan_to_owned_inputs(&plan).unwrap();
+        let bytes =
+            seeded_buffer_bytes(owned.inputs.buffers.iter().find(|b| b.index == 0).unwrap());
+        assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 1.0);
+        assert_eq!(f32::from_le_bytes(bytes[4..8].try_into().unwrap()), 2.0);
+    }
+
+    #[test]
     fn bounded_control_float_fields_seed_to_normal_one() {
         let plan = infer_plan(
             r#"
@@ -7047,6 +12607,82 @@ define <4 x float> @fragment(ptr addrspace(2) %params) {
     }
 
     #[test]
+    fn bounded_control_seed_recurses_into_nested_struct_fields() {
+        let plan = infer_plan(
+            r#"
+define void @mps_like(ptr addrspace(1) %params) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @mps_like, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 64, !"air.location_index", i32 24, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 64, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"MPSNDArrayQuantizedGatherMultiplyParams", !"air.arg_name", !"params"}
+!4 = !{!"air.struct_type_info", !5, i32 0, i32 48, i32 0, !"MPSNDArrayQuantizedMultiplyGenericParams", !"quantParams", i32 48, i32 4, i32 0, !"uint", !"vecPlaceholderIdx", i32 52, i32 4, i32 0, !"uint", !"w_experts_stride", i32 56, i32 4, i32 0, !"uint", !"scales_experts_stride", i32 60, i32 4, i32 0, !"uint", !"biases_experts_stride"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"x_ld", i32 4, i32 4, i32 0, !"uint", !"w_ld", i32 8, i32 4, i32 0, !"uint", !"scales_ld", i32 12, i32 4, i32 0, !"uint", !"biases_ld", i32 16, i32 4, i32 0, !"uint", !"x_batch_stride", i32 20, i32 4, i32 0, !"uint", !"w_batch_stride", i32 24, i32 4, i32 0, !"uint", !"scales_batch_stride", i32 28, i32 4, i32 0, !"uint", !"biases_batch_stride", i32 32, i32 4, i32 0, !"uint", !"B", i32 36, i32 4, i32 0, !"uint", !"M", i32 40, i32 4, i32 0, !"uint", !"N", i32 44, i32 4, i32 0, !"uint", !"K"}
+"#,
+        );
+        let params = plan.buffers.iter().find(|b| b.index == 24).unwrap();
+        assert_eq!(params.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        for offset in [0usize, 44, 48, 60] {
+            assert!(
+                params.seed_layout.iter().any(|field| field.offset == offset
+                    && field.size == 4
+                    && field.value.is_none()),
+                "missing bounded-control field at offset {offset}: {:?}",
+                params.seed_layout
+            );
+        }
+
+        let owned = plan_to_owned_inputs(&plan).unwrap();
+        let bytes =
+            seeded_buffer_bytes(owned.inputs.buffers.iter().find(|b| b.index == 24).unwrap());
+        for offset in [0usize, 44, 48, 60] {
+            let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            assert_eq!(value, BOUNDED_CONTROL_DIM, "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn bounded_control_result_dimensions_seed_to_zero() {
+        let plan = infer_plan(
+            r#"
+define void @pool_like(ptr addrspace(2) %params) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @pool_like, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 112, !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 112, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"PoolingParams", !"air.arg_name", !"params"}
+!4 = !{i32 0, i32 4, i32 0, !"int", !"kernel_width", !"air.struct_type_info", !5, i32 80, i32 16, i32 0, !"TensorDimensions", !"result_dims", !"air.struct_type_info", !5, i32 96, i32 16, i32 0, !"TensorDimensions", !"result_strides"}
+!5 = !{i32 0, i32 4, i32 0, !"int", !"n", i32 4, i32 4, i32 0, !"int", !"c", i32 8, i32 4, i32 0, !"int", !"h", i32 12, i32 4, i32 0, !"int", !"w"}
+"#,
+        );
+        let params = plan.buffers.iter().find(|b| b.index == 4).unwrap();
+        for offset in [80usize, 84, 88, 92] {
+            assert!(
+                params.seed_layout.iter().any(|field| field.offset == offset
+                    && field.size == 4
+                    && field.value == Some(0)),
+                "missing zero result_dims field at offset {offset}: {:?}",
+                params.seed_layout
+            );
+        }
+        for offset in [96usize, 100, 104, 108] {
+            assert!(
+                params.seed_layout.iter().any(|field| field.offset == offset
+                    && field.size == 4
+                    && field.value.is_none()),
+                "result_strides should keep bounded-control dim at offset {offset}: {:?}",
+                params.seed_layout
+            );
+        }
+    }
+
+    #[test]
     fn finite_float_texture_seed_has_no_nan_or_inf() {
         let plan = infer_plan(
             r#"
@@ -7076,6 +12712,93 @@ declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr ad
         let input = owned.inputs.textures.iter().find(|t| t.index == 2).unwrap();
         let bytes = seeded_texture_bytes(input);
         assert!(!contains_nonfinite_float_lane(&bytes, 2));
+    }
+
+    #[test]
+    fn depth_cube_texture_plan_has_six_layers() {
+        let plan = infer_plan(
+            r#"
+define <4 x half> @fragment(ptr addrspace(1) %depth, <3 x float> %coord) {
+  %s = call { float, i8 } @air.sample_depth_cube.f32(ptr addrspace(1) %depth, ptr addrspace(2) null, i32 1, <3 x float> %coord, i1 true, float 0.0, float 0.0, i32 0)
+  %d = extractvalue { float, i8 } %s, 0
+  %c = insertelement <4 x half> zeroinitializer, half 0xH3C00, i64 0
+  ret <4 x half> %c
+}
+
+declare { float, i8 } @air.sample_depth_cube.f32(ptr addrspace(1), ptr addrspace(2), i32, <3 x float>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @fragment, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depthcube<float, sample>", !"air.arg_name", !"depth"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"float3", !"air.arg_name", !"coord"}
+"#,
+        );
+        let texture = plan.textures.iter().find(|t| t.index == 0).unwrap();
+        assert_eq!(texture.format, "R32Float");
+        assert_eq!(texture.d, 6);
+        assert_eq!(texture.seed_mode, SEED_MODE_FINITE_FLOAT32);
+    }
+
+    #[test]
+    fn bounded_control_float_payload_sizes_readwrite_input() {
+        let plan = infer_plan(BOUNDED_CONTROL_FLOAT_PAYLOAD_LL);
+        let input = plan.buffers.iter().find(|b| b.index == 0).unwrap();
+        let output = plan.buffers.iter().find(|b| b.index == 1).unwrap();
+        let params = plan.buffers.iter().find(|b| b.index == 3).unwrap();
+
+        assert_eq!(input.role, "InOut");
+        assert_eq!(input.seed_mode, SEED_MODE_FINITE_FLOAT32);
+        assert_eq!(
+            input.len,
+            BOUNDED_CONTROL_DIM as usize * BOUNDED_CONTROL_DIM as usize * 4
+        );
+        assert_eq!(output.len, DEFAULT_BUFFER_LEN);
+        assert_eq!(plan.output.index, 1);
+        assert_eq!(plan.output.len, Some(DEFAULT_BUFFER_LEN));
+        assert_eq!(params.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+    }
+
+    #[test]
+    fn stale_bounded_control_float_payload_len_golden_is_missing() {
+        let mut old_plan = infer_plan(BOUNDED_CONTROL_FLOAT_PAYLOAD_LL);
+        old_plan
+            .buffers
+            .iter_mut()
+            .find(|b| b.index == 0)
+            .unwrap()
+            .len = DEFAULT_BUFFER_LEN;
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan: old_plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&0.0f32.to_le_bytes())),
+            output_b64: Some(encode_output_b64(&0.0f32.to_le_bytes())),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: Some("k".into()),
+            error: None,
+        };
+
+        let reason = incompatible_float_seed_golden(BOUNDED_CONTROL_FLOAT_PAYLOAD_LL, &metal)
+            .expect("stale finite-float payload length");
+        assert!(
+            reason.contains("buffer 0 length 256 now sized 1024"),
+            "{reason}"
+        );
+        assert!(reason.contains("rebank Metal row"), "{reason}");
     }
 
     #[test]
@@ -7208,6 +12931,133 @@ done:
     }
 
     #[test]
+    fn loop_bound_scan_sees_gep_load_from_readwrite_counter() {
+        let ll = r#"
+define void @bvh_like(i32 %tid, i32 %lid, ptr addrspace(1) %counters) {
+entry:
+  %count_ptr = getelementptr inbounds %struct.Counter, ptr addrspace(1) %counters, i64 0, i32 0
+  %count = load i32, ptr addrspace(1) %count_ptr, align 4
+  br label %loop
+loop:
+  %i = phi i32 [ 1, %entry ], [ %next, %loop ]
+  %next = shl i32 %i, 1
+  %keep = icmp ult i32 %next, %count
+  br i1 %keep, label %loop, label %done
+done:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @bvh_like, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"lid"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 6, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 256, !"air.arg_type_name", !"Counter", !"air.arg_name", !"counters"}
+!6 = !{i32 0, i32 4, i32 0, !"uint", !"count"}
+"#;
+        let hit = buffers_with_loads_used_as_loop_bounds(ll);
+        assert!(
+            hit.contains(&6),
+            "expected buffer 6 (counter load -> icmp -> loop br), got {hit:?}"
+        );
+        let plan = infer_plan(ll);
+        let counters = plan.buffers.iter().find(|b| b.index == 6).unwrap();
+        assert_eq!(counters.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+    }
+
+    #[test]
+    fn loop_bound_scan_uses_air_entry_after_static_initializer() {
+        let ll = r#"
+@fc = internal unnamed_addr addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+@g = internal unnamed_addr addrspace(2) global i32 undef, align 4
+
+define internal void @_GLOBAL__sub_I_test() section "air.static_init" {
+  %v = load i32, ptr addrspace(2) @fc, align 4
+  store i32 %v, ptr addrspace(2) @g, align 4
+  ret void
+}
+
+define void @k(i32 %tgid, ptr addrspace(1) %queue) {
+entry:
+  %idx = zext i32 %tgid to i64
+  %count_ptr = getelementptr inbounds %struct.Queue, ptr addrspace(1) %queue, i64 %idx, i32 1
+  %count = load i32, ptr addrspace(1) %count_ptr, align 4
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %step = load i32, ptr addrspace(2) @g, align 4
+  %next = add i32 %step, %i
+  %keep = icmp ult i32 %next, %count
+  br i1 %keep, label %loop, label %done
+done:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tgid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 14, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !5, !"air.arg_type_size", i32 8, !"air.arg_type_name", !"Queue", !"air.arg_name", !"queue"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"base", i32 4, i32 4, i32 0, !"uint", !"count"}
+"#;
+        let hit = buffers_with_loads_used_as_loop_bounds(ll);
+        assert!(
+            hit.contains(&14),
+            "expected buffer 14 from the AIR entry body, got {hit:?}"
+        );
+        let plan = infer_plan(ll);
+        let queue = plan.buffers.iter().find(|b| b.index == 14).unwrap();
+        assert_eq!(queue.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+    }
+
+    #[test]
+    fn loop_bound_scan_tracks_preheader_load_through_loop_phi() {
+        let ll = r#"
+define void @k(i32 %tid, ptr addrspace(1) %queue) {
+entry:
+  %idx = zext i32 %tid to i64
+  %limit_ptr = getelementptr inbounds %struct.Queue, ptr addrspace(1) %queue, i64 %idx, i32 3
+  %limit0 = load i32, ptr addrspace(1) %limit_ptr, align 4
+  br label %loop
+loop:
+  %limit = phi i32 [ %limit0, %entry ], [ %limit1, %latch ]
+  %i = phi i32 [ 0, %entry ], [ %next, %latch ]
+  %next = add i32 %i, 16
+  %keep = icmp ult i32 %next, %limit
+  br i1 %keep, label %latch, label %done
+latch:
+  %limit1 = load i32, ptr addrspace(1) %limit_ptr, align 4
+  br label %loop
+done:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 16, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !5, !"air.arg_type_size", i32 16, !"air.arg_type_name", !"Queue", !"air.arg_name", !"queue"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"a", i32 4, i32 4, i32 0, !"uint", !"b", i32 8, i32 4, i32 0, !"uint", !"c", i32 12, i32 4, i32 0, !"uint", !"limit"}
+!6 = !{i32 1, !"air.indirect_constant", !"air.location_index", i32 99, i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"nested"}
+"#;
+        let hit = buffers_with_loads_used_as_loop_bounds(ll);
+        assert!(
+            hit.contains(&16),
+            "expected buffer 16 from preheader load carried through a loop phi, got {hit:?}"
+        );
+        assert!(
+            !hit.contains(&99),
+            "nested metadata must not override the entry buffer binding, got {hit:?}"
+        );
+        let plan = infer_plan(ll);
+        let queue = plan.buffers.iter().find(|b| b.index == 16).unwrap();
+        assert_eq!(queue.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+    }
+
+    #[test]
     fn texture_bounds_guard_does_not_make_coordinate_buffer_bounded_control() {
         let ll = r#"
 define void @asvMetalTraversalKernel(i32 %tid, ptr addrspace(1) %tex, ptr addrspace(1) %rayBuckets, ptr addrspace(1) %rayData, ptr addrspace(2) %targetRayCount) {
@@ -7273,6 +13123,7 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
             plan: old_plan,
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             error: None,
         };
         let reason = incompatible_bounded_control_seed_golden(ll, &metal)
@@ -7305,6 +13156,46 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
     }
 
     #[test]
+    fn atomic_counter_buffer_seeds_every_counter_lane_zero() {
+        let ll = r#"
+define void @scan(ptr addrspace(1) %counter, ptr addrspace(1) %scratch) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @scan, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"metal::_atomic", !"air.arg_name", !"counter"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"scratch"}
+"#;
+        let plan = infer_plan(ll);
+        let counter = plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 2)
+            .expect("atomic counter buffer");
+        let scratch = plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 3)
+            .expect("plain int scratch buffer");
+
+        assert_eq!(counter.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert_eq!(counter.seed_layout.len(), counter.len / 4);
+        assert!(counter
+            .seed_layout
+            .iter()
+            .all(|field| field.size == 4 && field.value == Some(0)));
+        assert!(
+            bounded_control_buffer_bytes_with_layout(counter.len, &counter.seed_layout)
+                .chunks_exact(4)
+                .all(|lane| lane == [0, 0, 0, 0])
+        );
+        assert_eq!(scratch.seed_mode, SEED_MODE_DETERMINISTIC);
+    }
+
+    #[test]
     fn stale_bounded_control_seed_golden_is_missing() {
         let mut old_plan = infer_plan(ATOMIC_COUNTER_SOURCE_LL);
         let data = old_plan
@@ -7329,6 +13220,7 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
             compare: "none".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -7437,6 +13329,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: Some("Kernel".into()),
             entry: Some("flags".into()),
             error: None,
@@ -7447,6 +13340,223 @@ entry:
         assert!(reason.contains("buffer 1"), "{reason}");
         assert!(reason.contains("typed AIR control metadata"), "{reason}");
         assert!(reason.contains("rebank Metal row"), "{reason}");
+    }
+
+    #[test]
+    fn loop_input_facts_include_bounded_control_struct_fields() {
+        let ll = r#"
+define void @kernel(ptr addrspace(2) %params) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!4 = !{i32 0, i32 4, i32 0, !"uint", !"width", i32 4, i32 2, i32 0, !"ushort", !"height"}
+"#;
+        let arg_names = entry_arg_names(ll, "kernel");
+        let plan = HarnessPlan {
+            buffers: vec![PlanBuffer {
+                index: 7,
+                len: 8,
+                role: "Input".into(),
+                seed_tag: 1,
+                seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                seed_layout: vec![
+                    ControlSeedField {
+                        offset: 0,
+                        size: 4,
+                        value: Some(3),
+                    },
+                    ControlSeedField {
+                        offset: 4,
+                        size: 2,
+                        value: Some(5),
+                    },
+                ],
+                seed_stride: None,
+            }],
+            textures: Vec::new(),
+            output: PlanOutput {
+                kind: "buffer".into(),
+                index: 7,
+                format: "RawBytes".into(),
+                len: Some(8),
+                w: None,
+                h: None,
+                d: None,
+            },
+            dispatch_grid: [1, 1, 1],
+            dispatch_tg: [1, 1, 1],
+        };
+        let inputs = plan_to_owned_inputs(&plan).unwrap();
+        let mut fields = exact_struct_buffer_arg_field_values(ll, &arg_names, &inputs.inputs);
+        fields.sort();
+        assert_eq!(
+            fields,
+            vec![
+                ("params".to_string(), vec![0], 3),
+                ("params".to_string(), vec![1], 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_input_facts_include_bounded_control_device_scalar() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %counter) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"counter"}
+"#;
+        let arg_names = entry_arg_names(ll, "kernel");
+        let plan = HarnessPlan {
+            buffers: vec![PlanBuffer {
+                index: 7,
+                len: 4,
+                role: "InOut".into(),
+                seed_tag: 1,
+                seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                seed_layout: vec![ControlSeedField {
+                    offset: 0,
+                    size: 4,
+                    value: Some(0),
+                }],
+                seed_stride: None,
+            }],
+            textures: Vec::new(),
+            output: PlanOutput {
+                kind: "buffer".into(),
+                index: 1,
+                format: "RawBytes".into(),
+                len: Some(4),
+                w: None,
+                h: None,
+                d: None,
+            },
+            dispatch_grid: [1, 1, 1],
+            dispatch_tg: [1, 1, 1],
+        };
+        let inputs = plan_to_owned_inputs(&plan).unwrap();
+        assert_eq!(
+            exact_scalar_buffer_arg_values(ll, &arg_names, &inputs.inputs),
+            vec![("counter".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn loop_input_facts_include_bounded_control_vector_buffer_lanes() {
+        let ll = r#"
+define void @kernel(ptr addrspace(2) %tile_locations) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tile_locations"}
+"#;
+        let arg_names = entry_arg_names(ll, "kernel");
+        let plan = HarnessPlan {
+            buffers: vec![PlanBuffer {
+                index: 7,
+                len: 4,
+                role: "Input".into(),
+                seed_tag: 1,
+                seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                seed_layout: vec![
+                    ControlSeedField {
+                        offset: 0,
+                        size: 2,
+                        value: Some(16),
+                    },
+                    ControlSeedField {
+                        offset: 2,
+                        size: 2,
+                        value: Some(2),
+                    },
+                ],
+                seed_stride: None,
+            }],
+            textures: Vec::new(),
+            output: PlanOutput {
+                kind: "buffer".into(),
+                index: 7,
+                format: "RawBytes".into(),
+                len: Some(4),
+                w: None,
+                h: None,
+                d: None,
+            },
+            dispatch_grid: [1, 1, 1],
+            dispatch_tg: [1, 1, 1],
+        };
+        let inputs = plan_to_owned_inputs(&plan).unwrap();
+        let mut lanes = exact_vector_buffer_arg_values(ll, &arg_names, &inputs.inputs);
+        lanes.sort();
+        assert_eq!(
+            lanes,
+            vec![
+                ("tile_locations".to_string(), 0, 16),
+                ("tile_locations".to_string(), 1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn loop_input_facts_include_bounded_control_float_buffer_value() {
+        let ll = r#"
+define void @kernel(ptr addrspace(2) %rank_mode) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"rank_mode"}
+"#;
+        let arg_names = entry_arg_names(ll, "kernel");
+        let plan = HarnessPlan {
+            buffers: vec![PlanBuffer {
+                index: 0,
+                len: 4,
+                role: "Input".into(),
+                seed_tag: 1,
+                seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+                seed_layout: vec![ControlSeedField {
+                    offset: 0,
+                    size: 4,
+                    value: Some(0),
+                }],
+                seed_stride: None,
+            }],
+            textures: Vec::new(),
+            output: PlanOutput {
+                kind: "buffer".into(),
+                index: 0,
+                format: "RawBytes".into(),
+                len: Some(4),
+                w: None,
+                h: None,
+                d: None,
+            },
+            dispatch_grid: [1, 1, 1],
+            dispatch_tg: [1, 1, 1],
+        };
+        let inputs = plan_to_owned_inputs(&plan).unwrap();
+        assert_eq!(
+            exact_float_buffer_arg_values(ll, &arg_names, &inputs.inputs),
+            vec![("rank_mode".to_string(), 0.0)]
+        );
     }
 
     #[test]
@@ -7508,6 +13618,7 @@ declare <4 x i8> @air.convert.u.v4i8.u.v4i16(<4 x i16>)
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: Some("Kernel".into()),
             entry: Some("byte_stride".into()),
             error: None,
@@ -7590,6 +13701,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: Some("Kernel".into()),
             entry: Some("copy".into()),
             error: None,
@@ -7601,6 +13713,209 @@ entry:
 
         metal.plan.buffers[0].len = 64;
         assert!(incompatible_oob_vector_input_golden(ll, &metal).is_none());
+    }
+
+    #[test]
+    fn thread_indexed_scalar_input_is_sized_to_dispatch_grid() {
+        let ll = r#"
+define void @copy(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %idx
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %q = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %idx
+  store i32 %v, ptr addrspace(1) %q, align 4
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @copy, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"dst"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let plan = infer_plan(ll);
+        let src = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .expect("source buffer");
+
+        assert_eq!(plan.dispatch_grid, [DEFAULT_DISPATCH_GRID_X as u32, 1, 1]);
+        assert_eq!(src.len, DEFAULT_DISPATCH_GRID_X * 4);
+        assert!(incompatible_oob_vector_input_golden(
+            ll,
+            &metal_row_for_compare(&[], plan, Some("Kernel"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn banked_function_constants_do_not_freeze_stale_metal_plan() {
+        let ll = r#"
+define void @copy(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %idx
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %q = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %idx
+  store i32 %v, ptr addrspace(1) %q, align 4
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @copy, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"dst"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let mut banked = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        banked.plan.buffers.iter_mut().for_each(|buffer| {
+            if buffer.index == 0 {
+                buffer.len = 4;
+            }
+        });
+        banked.fc_values = Some(vec![FunctionConstantValueJson {
+            index: 11,
+            value: 2,
+        }]);
+
+        let (plan, fc_values) = metal_oracle_inputs(ll, Some(&banked));
+        let src = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .expect("source buffer");
+
+        assert_eq!(src.len, DEFAULT_DISPATCH_GRID_X * 4);
+        assert_eq!(fc_values, vec![(11, 2)]);
+    }
+
+    #[test]
+    fn output_stride_seed_one_vector_store_is_sized_to_store_width() {
+        let ll = r#"
+define void @byte_output_stride(ptr addrspace(1) %src, ptr addrspace(1) %dst, ptr addrspace(1) %stride, i32 %tid) local_unnamed_addr #0 {
+entry:
+  %s = load i32, ptr addrspace(1) %stride, align 4
+  %base = mul i32 %tid, %s
+  %idx = zext i32 %base to i64
+  %p = getelementptr inbounds i8, ptr addrspace(1) %src, i64 %idx
+  %q = bitcast ptr addrspace(1) %p to ptr addrspace(1)
+  %v = load <4 x i16>, ptr addrspace(1) %q, align 8
+  %dstp = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %idx
+  store <4 x i16> %v, ptr addrspace(1) %dstp, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @byte_output_stride, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"dst"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"stride"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+
+attributes #0 = { nounwind }
+"#;
+        let plan = infer_plan(ll);
+        let stride = plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 2)
+            .expect("stride control");
+        assert_eq!(stride.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert_eq!(
+            stride.seed_layout,
+            vec![ControlSeedField {
+                offset: 0,
+                size: 4,
+                value: Some(128)
+            }]
+        );
+        let metal = metal_row_for_compare(&[], plan, Some("Kernel"));
+        assert!(incompatible_overlapping_output_stride_golden(ll, &metal).is_none());
+
+        let mut old_plan = metal.plan.clone();
+        old_plan
+            .buffers
+            .iter_mut()
+            .find(|b| b.index == 2)
+            .expect("old stride control")
+            .seed_layout[0]
+            .value = Some(1);
+        let metal = metal_row_for_compare(&[], old_plan, Some("Kernel"));
+        let reason = incompatible_overlapping_output_stride_golden(ll, &metal)
+            .expect("overlapping output stride should need rebank");
+        assert!(
+            reason.contains("output byte-stride/control buffer too small"),
+            "{reason}"
+        );
+        assert!(reason.contains("stores 8 bytes"), "{reason}");
+        assert!(reason.contains("rebank Metal row"), "{reason}");
+    }
+
+    #[test]
+    fn output_stride_struct_field_is_sized_to_store_width() {
+        let ll = r#"
+%struct.Params = type { i32, i32, i32 }
+
+define void @byte_output_stride_struct(ptr addrspace(1) %dst, ptr addrspace(2) %params, i32 %tid) local_unnamed_addr #0 {
+entry:
+  %stridep = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 2
+  %stride = load i32, ptr addrspace(2) %stridep, align 4
+  %row = mul i32 %stride, %tid
+  %row64 = zext i32 %row to i64
+  %base = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %row64
+  store float 1.000000e+00, ptr addrspace(1) %base, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @byte_output_stride_struct, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 12, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!5 = !{!"air.struct_type_info", i32 0, i32 4, i32 0, !"uint", !"m", i32 4, i32 4, i32 0, !"uint", !"n", i32 8, i32 4, i32 0, !"uint", !"rowBytes"}
+!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+
+attributes #0 = { nounwind }
+"#;
+        let plan = infer_plan(ll);
+        let params = plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 1)
+            .expect("params control");
+        assert_eq!(params.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert!(params
+            .seed_layout
+            .iter()
+            .any(|field| field.offset == 8 && field.value == Some(64)));
+        let metal = metal_row_for_compare(&[], plan, Some("Kernel"));
+        assert!(incompatible_overlapping_output_stride_golden(ll, &metal).is_none());
+
+        let mut old_plan = metal.plan.clone();
+        for field in &mut old_plan
+            .buffers
+            .iter_mut()
+            .find(|b| b.index == 1)
+            .expect("old params control")
+            .seed_layout
+        {
+            field.value = None;
+        }
+        let metal = metal_row_for_compare(&[], old_plan, Some("Kernel"));
+        let reason = incompatible_overlapping_output_stride_golden(ll, &metal)
+            .expect("default bounded-control stride should need rebank");
+        assert!(
+            reason.contains("output byte-stride/control buffer too small"),
+            "{reason}"
+        );
+        assert!(reason.contains("stores 4 bytes"), "{reason}");
     }
 
     #[test]
@@ -7656,6 +13971,59 @@ declare float @air.fast_sqrt.f32(float)
     }
 
     #[test]
+    fn bounded_control_strided_input_oob_golden_is_missing() {
+        let ll = r#"
+define void @mask(ptr addrspace(1) readonly %input, ptr addrspace(1) %out, ptr addrspace(2) readonly %size, <2 x i16> %gid) #0 {
+  %y16 = extractelement <2 x i16> %gid, i64 1
+  %y = zext i16 %y16 to i32
+  %dims = load <2 x i32>, ptr addrspace(2) %size, align 8
+  %h = extractelement <2 x i32> %dims, i64 1
+  %h_last = add i32 %h, -1
+  %row = tail call i32 @air.min.u.i32(i32 %y, i32 %h_last)
+  %x16 = extractelement <2 x i16> %gid, i64 0
+  %x = zext i16 %x16 to i32
+  %w = extractelement <2 x i32> %dims, i64 0
+  %base = mul i32 %row, %w
+  %idx = add i32 %base, %x
+  %idx64 = zext i32 %idx to i64
+  %p = getelementptr inbounds i32, ptr addrspace(1) %input, i64 %idx64
+  %v = load i32, ptr addrspace(1) %p, align 4
+  %zero = icmp eq i32 %v, 0
+  br i1 %zero, label %one, label %none
+
+one:
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %out, <2 x i16> %gid, <4 x half> splat (half 0xH3C00), i16 0, i32 2)
+  br label %done
+
+none:
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %out, <2 x i16> %gid, <4 x half> zeroinitializer, i16 0, i32 2)
+  br label %done
+
+done:
+  ret void
+}
+
+declare i32 @air.min.u.i32(i32, i32)
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @mask, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"input"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"uint2", !"air.arg_name", !"size"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_bounded_control_strided_input_oob_golden(ll, &metal)
+            .expect("bounded-control strided input OOB");
+        assert!(reason.contains("width=16 height=16"), "{reason}");
+        assert!(reason.contains("read past the input buffer"), "{reason}");
+    }
+
+    #[test]
     fn stale_typed_bounded_control_layout_golden_is_missing() {
         let mut old_plan = infer_plan(COPY_ARGS_U64_LL);
         let args = old_plan
@@ -7680,6 +14048,7 @@ declare float @air.fast_sqrt.f32(float)
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -7726,6 +14095,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -7776,6 +14146,7 @@ declare ptr addrspace(1) @air.get_primitive_acceleration_structure_instance_acce
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -7836,6 +14207,7 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1) captures(none), i32, i
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -7895,6 +14267,7 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1) captures(none), i32, i
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -7931,6 +14304,181 @@ entry:
         let plan = infer_plan(ll);
         assert_eq!(plan.output.kind, "buffer");
         assert_eq!(plan.output.index, 1);
+        assert_eq!(
+            plan.buffers
+                .iter()
+                .find(|buffer| buffer.index == 0)
+                .map(|buffer| buffer.role.as_str()),
+            Some("InOut")
+        );
+        assert_eq!(
+            plan.buffers
+                .iter()
+                .find(|buffer| buffer.index == 1)
+                .map(|buffer| buffer.role.as_str()),
+            Some("Output")
+        );
+    }
+
+    #[test]
+    fn output_writeonly_buffer_plan_role_drift_requires_rebank() {
+        let ll = r#"
+define void @copy(ptr addrspace(1) noundef writeonly "air-buffer-no-alias" %out, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %dst = getelementptr i32, ptr addrspace(1) %out, i64 %idx
+  store i32 %tid, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @copy, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 256, !"air.location_index", i32 4, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let current = infer_plan(ll);
+        assert_eq!(
+            current
+                .buffers
+                .iter()
+                .find(|buffer| buffer.index == 4)
+                .map(|buffer| buffer.role.as_str()),
+            Some("Output")
+        );
+
+        let mut banked = current.clone();
+        banked
+            .buffers
+            .iter_mut()
+            .find(|buffer| buffer.index == 4)
+            .expect("output buffer")
+            .role = "InOut".into();
+        let metal = metal_row_for_compare(&[], banked, Some("Kernel"));
+        let reason = incompatible_output_plan_golden(ll, &metal)
+            .expect("stale output writeonly buffer plan");
+        assert!(reason.contains("output buffer plan"), "{reason}");
+        assert!(reason.contains("role=InOut"), "{reason}");
+        assert!(reason.contains("role=Output"), "{reason}");
+    }
+
+    #[test]
+    fn subgroup_lane_zero_texture_write_race_requires_rebank() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] zeroinitializer, align 8
+
+define void @reduce(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i16> %tgid, i16 %lane) #0 {
+entry:
+  %coord_f = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %tgid)
+  %sample = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord_f, i1 true, <2 x i32> zeroinitializer, i32 0, i32 0)
+  %vec = extractvalue { <4 x float>, i8 } %sample, 0
+  %x = extractelement <4 x float> %vec, i64 0
+  %min = tail call fast float @air.simd_min.f32(float %x)
+  %is_lane0 = icmp eq i16 %lane, 0
+  br i1 %is_lane0, label %write, label %done
+
+write:
+  %coord = shl <2 x i16> %tgid, splat (i16 1)
+  %value = insertelement <4 x float> zeroinitializer, float %min, i64 0
+  tail call void @air.write_texture_2d.i16.v4f32(ptr addrspace(1) %out, <2 x i16> %coord, <4 x float> %value, i16 0, i32 2)
+  br label %done
+
+done:
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
+declare float @air.simd_min.f32(float)
+declare void @air.write_texture_2d.i16.v4f32(ptr addrspace(1), <2 x i16>, <4 x float>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @reduce, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tgid"}
+!6 = !{i32 3, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lane"}
+"#;
+        let mut plan = infer_plan(ll);
+        plan.output.kind = "texture".into();
+        plan.output.index = 1;
+        plan.output.format = "R32Float".into();
+        plan.dispatch_tg = [8, 8, 1];
+        let metal = metal_row_for_compare(&[], plan, Some("Kernel"));
+
+        let reason = incompatible_subgroup_texture_write_race_golden(ll, &metal)
+            .expect("lane-zero subgroup texture write race");
+        assert!(reason.contains("thread_index_in_simdgroup==0"), "{reason}");
+        assert!(reason.contains("backend-schedule-dependent"), "{reason}");
+    }
+
+    #[test]
+    fn downscaled_texture_write_race_requires_rebank() {
+        let ll = r#"
+define void @downscale(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i32> %gid) #0 {
+  %s = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %sat = tail call fast <4 x float> @air.fast_saturate.v4f32(<4 x float> %v)
+  %dst = lshr <2 x i32> %gid, splat (i32 1)
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %out, <2 x i32> %dst, <4 x float> %sat, i32 0, i32 2)
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
+declare <4 x float> @air.fast_saturate.v4f32(<4 x float>)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @downscale, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+"#;
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_many_to_one_texture_write_golden(ll, &metal)
+            .expect("downscaled texture write race");
+        assert!(reason.contains("downscaled output coordinate"), "{reason}");
+        assert!(reason.contains("order-dependent"), "{reason}");
+    }
+
+    #[test]
+    fn texture_array_write_omitting_grid_lane_requires_rebank() {
+        let ll = r#"
+define void @array_write(ptr addrspace(1) %out, ptr addrspace(1) readonly %src, <3 x i32> %gid) #0 {
+  %z = extractelement <3 x i32> %gid, i64 2
+  %x = extractelement <3 x i32> %gid, i64 0
+  %idx = zext i32 %x to i64
+  %p = getelementptr inbounds float, ptr addrspace(1) %src, i64 %idx
+  %v0 = load float, ptr addrspace(1) %p, align 4
+  %v = insertelement <4 x float> zeroinitializer, float %v0, i64 0
+  %coord = shufflevector <3 x i32> %gid, <3 x i32> poison, <2 x i32> <i32 0, i32 2>
+  tail call void @air.write_texture_2d_array.v4f32(ptr addrspace(1) %out, <2 x i32> %coord, i32 %z, <4 x float> %v, i32 0, i32 2)
+  ret void
+}
+
+declare void @air.write_texture_2d_array.v4f32(ptr addrspace(1), <2 x i32>, i32, <4 x float>, i32, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @array_write, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d_array<float, write>", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+"#;
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_many_to_one_texture_write_golden(ll, &metal)
+            .expect("texture2d_array omitted grid lane race");
+        assert!(reason.contains("texture2d_array"), "{reason}");
+        assert!(reason.contains("omit a varying grid dimension"), "{reason}");
     }
 
     #[test]
@@ -7977,6 +14525,7 @@ declare void @air.wg.barrier(i32, i32)
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8031,6 +14580,7 @@ declare void @air.wg.barrier(i32, i32)
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8067,6 +14617,7 @@ declare void @air.wg.barrier(i32, i32)
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8075,6 +14626,45 @@ declare void @air.wg.barrier(i32, i32)
         let reason = incompatible_bounded_control_seed_golden(SCALAR_ULONG_CONTROL_LL, &metal)
             .expect("stale scalar bounded-control layout");
         assert!(reason.contains("buffer 7"), "{reason}");
+        assert!(reason.contains("typed AIR control metadata"), "{reason}");
+        assert!(reason.contains("rebank Metal row"), "{reason}");
+    }
+
+    #[test]
+    fn stale_vector_float_bounded_control_layout_golden_is_missing() {
+        let mut old_plan = infer_plan(FLOAT2_DEPTH_DIVIDE_CONTROL_LL);
+        let near_far = old_plan
+            .buffers
+            .iter_mut()
+            .find(|b| b.index == 0)
+            .expect("near/far buffer");
+        near_far.seed_layout.clear();
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: "deterministic_v2_bounded_control".into(),
+            plan_version: PLAN_VERSION,
+            plan: old_plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&[0u8; 4])),
+            output_b64: Some(encode_output_b64(&[0u8; 4])),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: None,
+            entry: None,
+            error: None,
+        };
+
+        let reason =
+            incompatible_bounded_control_seed_golden(FLOAT2_DEPTH_DIVIDE_CONTROL_LL, &metal)
+                .expect("stale vector float bounded-control layout");
+        assert!(reason.contains("buffer 0"), "{reason}");
         assert!(reason.contains("typed AIR control metadata"), "{reason}");
         assert!(reason.contains("rebank Metal row"), "{reason}");
     }
@@ -8120,6 +14710,7 @@ declare void @air.wg.barrier(i32, i32)
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8275,6 +14866,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8294,6 +14886,52 @@ entry:
         assert_eq!(
             tolerance.as_ref().map(|t| t.kind.as_str()),
             Some("AbsOrUlp")
+        );
+    }
+
+    #[test]
+    fn compare_bfloat_raw_output_uses_bfloat_tolerance() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %out) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat", !"air.arg_name", !"out"}
+"#;
+        let plan = infer_plan(ll);
+        assert_eq!(plan.output.kind, "buffer");
+        assert_eq!(plan.output.format, "RawBytes");
+        assert_eq!(
+            plan.buffers
+                .iter()
+                .find(|buffer| buffer.index == 1)
+                .map(|buffer| buffer.seed_mode.as_str()),
+            Some(SEED_MODE_FINITE_BFLOAT16)
+        );
+
+        let golden = 0xb81fu16.to_le_bytes();
+        let candidate = 0xb81eu16.to_le_bytes();
+        let metal = metal_row_for_compare(&golden, plan, Some("Kernel"));
+        let out_hash = sha256_hex(&candidate);
+        let golden_hash = metal.output_sha256.clone().unwrap();
+        let (status, observed, tolerance) = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &out_hash,
+            &golden_hash,
+            DataFormat::RawBytes,
+            Some(ll),
+        );
+
+        assert_eq!(status, "tolerance");
+        assert_eq!(observed.and_then(|m| m.max_ulp), Some(1));
+        assert_eq!(
+            tolerance.as_ref().map(|t| t.kind.as_str()),
+            Some("BFloat16AbsOrUlp")
         );
     }
 
@@ -8326,6 +14964,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8346,6 +14985,24 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
         );
         assert_eq!(observed.and_then(|m| m.max_ulp), Some(u32::MAX));
         let error = candidate_compare_error(&status, &metal, tolerance.as_ref()).unwrap();
+        assert!(error.contains("undefined fast-math domains"), "{error}");
+    }
+
+    #[test]
+    fn compile_missing_fast_math_nonfinite_domain_is_smoke() {
+        let tolerance = ToleranceSpecJson {
+            kind: "FastMathNonFiniteDomain".into(),
+            max_abs: None,
+            max_ulp: None,
+        };
+        let error = compile_missing_compare_smoke_error(
+            "missing",
+            Some(&tolerance),
+            Some("metal golden compares a non-finite result from AIR fast/no-nans domain-sensitive math; rebank validation inputs away from undefined fast-math domains"),
+        )
+        .expect("smoke error");
+
+        assert!(error.starts_with("compile-only: "), "{error}");
         assert!(error.contains("undefined fast-math domains"), "{error}");
     }
 
@@ -8435,6 +15092,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8505,6 +15163,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8630,6 +15289,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8671,6 +15331,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8744,6 +15405,143 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
+    fn compare_sampled_f32_storage_texture_uses_texture_tolerance() {
+        let golden = 0.0f32.to_le_bytes();
+        let candidate = 0.0015f32.to_le_bytes();
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out) {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+"#;
+        let plan = infer_plan(ll);
+        assert_eq!(plan.output.kind, "texture");
+        assert_eq!(plan.output.format, "R32Float");
+        let metal = metal_row_for_compare(&golden, plan, Some("Kernel"));
+
+        let ordinary = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &sha256_hex(&candidate),
+            metal.output_sha256.as_deref().unwrap(),
+            DataFormat::R32Float,
+            None,
+        );
+        assert_eq!(ordinary.0, "failure");
+
+        let (status, observed, tolerance) = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &sha256_hex(&candidate),
+            metal.output_sha256.as_deref().unwrap(),
+            DataFormat::R32Float,
+            Some(ll),
+        );
+        assert_eq!(status, "tolerance");
+        assert_eq!(observed.and_then(|m| m.max_abs), Some(0.0015));
+        assert_eq!(tolerance.and_then(|t| t.max_abs), Some(0.001_953_125));
+    }
+
+    #[test]
+    fn compare_sampled_f32_half_imageblock_storage_texture_uses_half_step_tolerance() {
+        let golden = 0.0f32.to_le_bytes();
+        let candidate = 0.0029f32.to_le_bytes();
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i16> %tid) {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %h = tail call fast <4 x half> @air.convert.f.v4f16.f.v4f32(<4 x float> %v)
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
+  store <4 x half> %h, ptr addrspace(4) %slot
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %tid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare <4 x half> @air.convert.f.v4f16.f.v4f32(<4 x float>)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
+"#;
+        let metal = metal_row_for_compare(&golden, infer_plan(ll), Some("Kernel"));
+
+        let (status, observed, tolerance) = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &sha256_hex(&candidate),
+            metal.output_sha256.as_deref().unwrap(),
+            DataFormat::R32Float,
+            Some(ll),
+        );
+
+        assert_eq!(status, "tolerance");
+        assert_eq!(observed.and_then(|m| m.max_abs), Some(0.0029));
+        assert_eq!(tolerance.and_then(|t| t.max_abs), Some(0.003_906_25));
+    }
+
+    #[test]
+    fn compare_sampled_f32_half_coordinate_texture_uses_half_step_tolerance() {
+        let golden = 0.0f32.to_le_bytes();
+        let candidate = 0.0038f32.to_le_bytes();
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %warp, ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i32> %gid) {
+  %r = tail call { <4 x half>, i8 } @air.read_texture_2d.v4f16(ptr addrspace(1) %warp, ptr addrspace(2) null, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)
+  %rv = extractvalue { <4 x half>, i8 } %r, 0
+  %xy_h = shufflevector <4 x half> %rv, <4 x half> poison, <2 x i32> <i32 0, i32 1>
+  %xy = tail call fast <2 x float> @air.convert.f.v2f32.f.v2f16(<2 x half> %xy_h)
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x float> %xy, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %out, <2 x i32> %gid, <4 x float> %v, i32 0, i32 2)
+  ret void
+}
+
+declare { <4 x half>, i8 } @air.read_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
+declare <2 x float> @air.convert.f.v2f32.f.v2f16(<2 x half>)
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<half, read>", !"air.arg_name", !"warp"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 4, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+"#;
+        let metal = metal_row_for_compare(&golden, infer_plan(ll), Some("Kernel"));
+
+        let (status, observed, tolerance) = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &sha256_hex(&candidate),
+            metal.output_sha256.as_deref().unwrap(),
+            DataFormat::R32Float,
+            Some(ll),
+        );
+
+        assert_eq!(status, "tolerance");
+        assert_eq!(observed.and_then(|m| m.max_abs), Some(0.0038));
+        assert_eq!(tolerance.and_then(|t| t.max_abs), Some(0.003_906_25));
+    }
+
+    #[test]
     fn compare_sampled_fast_half_render_target_counts_trig_coordinate_math() {
         let golden = 0x2c17u16.to_le_bytes(); // approximately 0.0639
         let candidate = 0x2b47u16.to_le_bytes(); // approximately 0.0569
@@ -8813,6 +15611,45 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
             .and_then(|m| m.max_abs)
             .is_some_and(|abs| abs > 0.003_906_25));
         assert_eq!(tolerance.and_then(|t| t.max_abs), Some(0.007_812_5));
+    }
+
+    #[test]
+    fn compare_sampled_fast_half_palette_allows_dot_mix_amplified_drift() {
+        let golden = 0x3bb0u16.to_le_bytes(); // 0.9609375
+        let candidate = 0x3bdeu16.to_le_bytes(); // 0.9833984375
+        let mut plan = infer_plan("");
+        plan.output.kind = "render_target".into();
+        plan.output.format = "Rgba16Float".into();
+        let metal = metal_row_for_compare(&golden, plan, Some("Fragment"));
+        let ll = r#"
+define <4 x half> @frag(ptr addrspace(1) %tex) #0 {
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  %rgb = shufflevector <4 x half> %v, <4 x half> poison, <3 x i32> <i32 0, i32 1, i32 2>
+  %l = tail call fast half @air.dot.v3f16(<3 x half> %rgb, <3 x half> splat (half 0xH3C00))
+  %t = insertelement <3 x half> poison, half %l, i64 0
+  %tt = shufflevector <3 x half> %t, <3 x half> poison, <3 x i32> zeroinitializer
+  %m = tail call fast <3 x half> @air.mix.v3f16(<3 x half> zeroinitializer, <3 x half> splat (half 0xH3C00), <3 x half> %tt)
+  %out = shufflevector <3 x half> %m, <3 x half> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
+  ret <4 x half> %out
+}
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare half @air.dot.v3f16(<3 x half>, <3 x half>)
+declare <3 x half> @air.mix.v3f16(<3 x half>, <3 x half>, <3 x half>)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+"#;
+        let (status, observed, tolerance) = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &sha256_hex(&candidate),
+            metal.output_sha256.as_deref().unwrap(),
+            DataFormat::Rgba16Float,
+            Some(ll),
+        );
+
+        assert_eq!(status, "tolerance");
+        assert_eq!(observed.and_then(|m| m.max_abs), Some(0.022_460_938));
+        assert_eq!(tolerance.and_then(|t| t.max_abs), Some(0.023_437_5));
     }
 
     #[test]
@@ -8906,6 +15743,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "none".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8943,6 +15781,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -8985,6 +15824,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "none".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9042,6 +15882,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9104,6 +15945,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9156,6 +15998,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9203,6 +16046,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9257,6 +16101,7 @@ define void @kernel(ptr addrspace(1) %out) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9311,6 +16156,7 @@ entry:
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9355,6 +16201,7 @@ define void @kernel() {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9379,6 +16226,145 @@ define void @kernel() {
             .contains("without fc_values"));
         metal.fc_values = Some(vec![FunctionConstantValueJson { index: 1, value: 1 }]);
         assert!(incompatible_function_constant_golden(ll, &metal).is_none());
+    }
+
+    #[test]
+    fn function_constant_texture_array_ref_view_family_requires_rebank() {
+        let ll = r#"
+@_ZL33_tex_loc = internal addrspace(2) global i32 1, align 4
+@_ZL33_arr_loc = internal addrspace(2) global i32 33, align 4
+@fc0 = internal addrspace(2) global i8 1, align 1
+@fc1 = internal addrspace(2) global i8 1, align 1
+
+define void @kernel(ptr addrspace(1) %a, ptr addrspace(1) %b) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !5}
+!3 = !{i32 0, !"air.function_constant", !4, !"air.texture", !"air.location_index", ptr addrspace(2) @_ZL33_tex_loc, i32 1, !"air.sample", !"air.arg_type_name", !"array_ref<texture2d<float, sample>>", !"air.arg_name", !"plain"}
+!4 = !{ptr addrspace(2) @fc0, !"bool", !"usePlain", i32 1, i1 true}
+!5 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", ptr addrspace(2) @_ZL33_arr_loc, i32 1, !"air.sample", !"air.arg_type_name", !"array_ref<texture2d_array<float, sample>>", !"air.arg_name", !"arrayed"}
+!6 = !{ptr addrspace(2) @fc1, !"bool", !"useArray", i32 2, i1 true}
+"#;
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.fc_specialization = Some(FC_SPECIALIZATION_VALUES.into());
+        metal.fc_values = Some(vec![
+            FunctionConstantValueJson { index: 1, value: 1 },
+            FunctionConstantValueJson { index: 2, value: 1 },
+        ]);
+
+        let reason = incompatible_function_constant_texture_array_ref_golden(ll, &metal)
+            .expect("mixed FC texture array_ref view family");
+        assert!(reason.contains("texture metadata"), "{reason}");
+        assert!(reason.contains("image-view"), "{reason}");
+
+        metal.compare = "none".into();
+        let reason = incompatible_function_constant_texture_array_ref_golden(ll, &metal)
+            .expect("mixed FC texture array_ref smoke view family");
+        assert!(reason.contains("image-view"), "{reason}");
+
+        let read_ll = r#"
+@fc0 = internal addrspace(2) global i8 1, align 1
+@fc1 = internal addrspace(2) global i8 1, align 1
+
+define void @kernel(ptr addrspace(1) %arrayed, ptr addrspace(1) %plain, ptr addrspace(1) %out) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !5, !7}
+!3 = !{i32 0, !"air.function_constant", !4, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_array<half, read>", !"air.arg_name", !"arrayed"}
+!4 = !{ptr addrspace(2) @fc0, !"bool", !"useArrayed", i32 1, i1 true}
+!5 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<half, read>", !"air.arg_name", !"plain"}
+!6 = !{ptr addrspace(2) @fc1, !"bool", !"usePlain", i32 2, i1 true}
+!7 = !{i32 2, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+"#;
+        let reason = incompatible_function_constant_texture_array_ref_golden(read_ll, &metal)
+            .expect("mixed FC read texture view family");
+        assert!(reason.contains("texture2d_array"), "{reason}");
+    }
+
+    #[test]
+    fn function_constant_private_pointer_table_golden_is_missing() {
+        let ll = r#"
+@_Z7quality.MTL_FC_INIT_0_i = internal addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+@small = internal unnamed_addr addrspace(2) constant [4 x <3 x half>] zeroinitializer, align 8
+@large = internal unnamed_addr addrspace(2) constant [8 x <3 x half>] zeroinitializer, align 8
+
+define internal void @init() section "air.static_init" {
+  %q = load i32, ptr addrspace(2) @_Z7quality.MTL_FC_INIT_0_i, align 4
+  %defined = tail call i1 @air.is_function_constant_defined(ptr addrspace(2) @_Z7quality.MTL_FC_INIT_0_i)
+  %v = select i1 %defined, i32 %q, i32 0
+  ret void
+}
+
+define void @frag(i32 %quality) {
+  switch i32 %quality, label %small [
+    i32 1, label %large
+  ]
+small:
+  br label %merge
+large:
+  br label %merge
+merge:
+  %table = phi ptr addrspace(2) [ @small, %small ], [ @large, %large ]
+  ret void
+}
+
+declare i1 @air.is_function_constant_defined(ptr addrspace(2))
+!air.function_constants = !{!0}
+!0 = !{ptr addrspace(2) @_Z7quality.MTL_FC_INIT_0_i, !"int", !"quality", i32 0, i1 false}
+"#;
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        metal.fc_specialization = Some(FC_SPECIALIZATION_ZERO.into());
+
+        let reason = incompatible_function_constant_private_pointer_table_golden(ll, &metal)
+            .expect("FC private pointer table golden");
+        assert!(
+            reason.contains("private constant-table pointers"),
+            "{reason}"
+        );
+
+        metal.fc_specialization = None;
+        assert!(incompatible_function_constant_private_pointer_table_golden(ll, &metal).is_none());
+    }
+
+    #[test]
+    fn multisample_texture_golden_requires_rebank() {
+        let ll = r#"
+define <{ <4 x i32> }> @frag(ptr addrspace(1) %tex, i32 %sampleId) {
+entry:
+  %coord = insertelement <2 x i32> undef, i32 0, i64 0
+  %read = call { <4 x i32>, i8 } @air.read_texture_2d_ms.s.v4i32(ptr addrspace(1) %tex, i32 0, <2 x i32> %coord, i32 %sampleId, i32 1)
+  %v = extractvalue { <4 x i32>, i8 } %read, 0
+  %out = insertvalue <{ <4 x i32> }> undef, <4 x i32> %v, 0
+  ret <{ <4 x i32> }> %out
+}
+
+declare { <4 x i32>, i8 } @air.read_texture_2d_ms.s.v4i32(ptr addrspace(1), i32, <2 x i32>, i32, i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"int4"}
+!3 = !{!4, !5}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_ms<int, read>", !"air.arg_name", !"tex"}
+!5 = !{i32 1, !"air.sample_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"sampleId"}
+"#;
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_multisample_texture_golden(ll, &metal)
+            .expect("multisample texture golden should require rebank");
+        assert!(reason.contains("single-sample"), "{reason}");
+        assert!(reason.contains("rebank"), "{reason}");
+        assert!(
+            incompatible_multisample_texture_golden("define void @f() { ret void }", &metal)
+                .is_none()
+        );
     }
 
     #[test]
@@ -9416,6 +16402,7 @@ define void @k(i32 %gid) {
             compare: "full".into(),
             fc_specialization: Some(FC_SPECIALIZATION_ZERO.into()),
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9431,32 +16418,221 @@ define void @k(i32 %gid) {
     }
 
     #[test]
-    fn specialized_function_constant_definedness_golden_is_missing() {
+    fn integer_divisor_function_constants_request_nonzero_values() {
         let ll = r#"
-@_Z2fc.MTL_FC_INIT_16_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@_ZL2fc = internal unnamed_addr addrspace(2) global i16 zeroinitializer, align 2
+@_Z2fc.MTL_FC_INIT_4_t = internal unnamed_addr addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
+@_Z2flt.MTL_FC_INIT_5_f = internal unnamed_addr addrspace(2) externally_initialized constant float undef, section "air.fc_initializer", align 4
 
-define void @kernel() {
-  %defined = tail call i1 @air.is_function_constant_defined(ptr addrspace(2) @_Z2fc.MTL_FC_INIT_16_b)
+define internal void @_GLOBAL__sub_I_k() section "air.static_init" {
+  %1 = load i16, ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t, align 2
+  store i16 %1, ptr addrspace(2) @_ZL2fc, align 2
+  ret void
+}
+
+define void @k(i32 %gid) {
+  %2 = load i16, ptr addrspace(2) @_ZL2fc, align 2
+  %3 = zext i16 %2 to i32
+  %4 = sdiv i32 %gid, %3
+  ret void
+}
+
+!air.function_constants = !{!0, !1}
+!0 = !{ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t, !"ushort", !"fc", i32 4, i1 true}
+!1 = !{ptr addrspace(2) @_Z2flt.MTL_FC_INIT_5_f, !"float", !"flt", i32 5, i1 true}
+"#;
+        assert_eq!(
+            function_constant_values_for_integer_divisors(ll),
+            vec![(4, 1)]
+        );
+    }
+
+    #[test]
+    fn barrier_loop_function_constants_request_nonzero_values() {
+        let ll = r#"
+define void @k() {
+  br label %loop
+loop:
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br label %loop
+}
+
+declare void @air.wg.barrier(i32, i32)
+!air.function_constants = !{!0, !1, !2, !3}
+!0 = !{ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t, !"ushort", !"fc", i32 4, i1 true}
+!1 = !{ptr addrspace(2) @_Z2flt.MTL_FC_INIT_5_f, !"float", !"flt", i32 5, i1 true}
+!2 = !{ptr addrspace(2) @_Z2wide.MTL_FC_INIT_6_j, !"uint", !"wide", i32 6, i1 true}
+!3 = !{ptr addrspace(2) @_Z2flag.MTL_FC_INIT_7_b, !"bool", !"flag", i32 7, i1 true}
+"#;
+        assert_eq!(
+            function_constant_values_for_barrier_loop_progress(ll),
+            vec![(4, 2), (6, 2)]
+        );
+    }
+
+    #[test]
+    fn barrier_loop_function_constants_include_branch_control_bools() {
+        let ll = r#"
+@_Z4flag.MTL_FC_INIT_7_b = internal unnamed_addr addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@_ZL4flag = internal unnamed_addr addrspace(2) global i8 undef, align 1
+
+define internal void @_GLOBAL__sub_I_k() section "air.static_init" {
+  %flag = load i8, ptr addrspace(2) @_Z4flag.MTL_FC_INIT_7_b, align 1
+  store i8 %flag, ptr addrspace(2) @_ZL4flag, align 1
+  ret void
+}
+
+define void @k() {
+  %flag = load i8, ptr addrspace(2) @_ZL4flag, align 1
+  %enabled = icmp ne i8 %flag, 0
+  br i1 %enabled, label %loop, label %exit
+loop:
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br label %exit
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+!air.function_constants = !{!0}
+!0 = !{ptr addrspace(2) @_Z4flag.MTL_FC_INIT_7_b, !"bool", !"flag", i32 7, i1 true}
+"#;
+        assert_eq!(
+            function_constant_values_for_barrier_loop_progress(ll),
+            vec![(7, 1)]
+        );
+    }
+
+    #[test]
+    fn barrier_loop_function_constants_do_not_activate_colliding_conditional_buffers() {
+        let ll = r#"
+@_Z4flag.MTL_FC_INIT_7_b = internal unnamed_addr addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@_Z4wide.MTL_FC_INIT_8_j = internal unnamed_addr addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+@pred = internal addrspace(2) global i8 0, align 1
+
+define internal void @_GLOBAL__sub_I_k() section "air.static_init" {
+  %flag = load i8, ptr addrspace(2) @_Z4flag.MTL_FC_INIT_7_b, align 1
+  %pred = tail call i8 @air.normalize_function_constant_predicate.i8(i8 %flag)
+  store i8 %pred, ptr addrspace(2) @pred, align 1
+  ret void
+}
+
+define void @k() {
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  ret void
+}
+
+declare i8 @air.normalize_function_constant_predicate.i8(i8)
+declare void @air.wg.barrier(i32, i32)
+!air.kernel = !{!0}
+!air.function_constants = !{!5, !6}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"base"}
+!4 = !{i32 1, !"air.function_constant", !7, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"conditional"}
+!5 = !{ptr addrspace(2) @_Z4flag.MTL_FC_INIT_7_b, !"bool", !"flag", i32 7, i1 true}
+!6 = !{ptr addrspace(2) @_Z4wide.MTL_FC_INIT_8_j, !"uint", !"wide", i32 8, i1 true}
+!7 = !{ptr addrspace(2) @pred, !"bool", !"flag"}
+"#;
+        assert_eq!(
+            function_constant_values_for_barrier_loop_progress(ll),
+            vec![(8, 2)]
+        );
+    }
+
+    #[test]
+    fn metal_oracle_inputs_only_bank_explicit_input_plans() {
+        let mut plan = infer_plan("");
+        plan.dispatch_grid = [1, 1, 1];
+        plan.dispatch_tg = [1, 1, 1];
+        let mut metal = metal_row_for_compare(&[], plan.clone(), Some("Kernel"));
+        assert!(banked_explicit_input_plan(&metal).is_none());
+        assert!(banked_function_constant_values(&metal).is_none());
+
+        metal.input_specialization = Some(INPUT_SPECIALIZATION_EXPLICIT.into());
+        let banked_plan =
+            banked_explicit_input_plan(&metal).expect("explicit input row should bank inputs");
+        assert_eq!(banked_plan.dispatch_grid, [1, 1, 1]);
+        assert_eq!(banked_plan.dispatch_tg, [1, 1, 1]);
+
+        metal.input_specialization = None;
+        metal.fc_values = Some(vec![FunctionConstantValueJson {
+            index: 18,
+            value: 1,
+        }]);
+        assert!(banked_explicit_input_plan(&metal).is_none());
+        let fc_values =
+            banked_function_constant_values(&metal).expect("FC row should bank FC values");
+        assert_eq!(fc_values, vec![(18, 1)]);
+
+        let (current_plan, fc_values) = metal_oracle_inputs("", Some(&metal));
+        assert_eq!(
+            current_plan.dispatch_grid,
+            [DEFAULT_DISPATCH_GRID_X as u32, 1, 1]
+        );
+        assert_eq!(fc_values, vec![(18, 1)]);
+    }
+
+    #[test]
+    fn barrier_loop_function_constants_override_divisor_defaults() {
+        let ll = r#"
+@_ZL2fc = internal unnamed_addr addrspace(2) global i32 zeroinitializer, align 4
+@_Z2fc.MTL_FC_INIT_4_j = internal unnamed_addr addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+
+define internal void @_GLOBAL__sub_I_k() section "air.static_init" {
+  %1 = load i32, ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_j, align 4
+  store i32 %1, ptr addrspace(2) @_ZL2fc, align 4
+  ret void
+}
+
+define void @k(i32 %gid) {
+  %step = load i32, ptr addrspace(2) @_ZL2fc, align 4
+  %q = sdiv i32 %gid, %step
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %0 ], [ %next, %loop ]
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %next = add i32 %i, %step
+  %more = icmp ult i32 %next, 8
+  br i1 %more, label %loop, label %exit
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+!air.function_constants = !{!0}
+!0 = !{ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_j, !"uint", !"fc", i32 4, i1 true}
+"#;
+        assert_eq!(function_constant_values_for_oracle_inputs(ll), vec![(4, 2)]);
+    }
+
+    #[test]
+    fn definedness_function_constants_do_not_request_nonzero_values() {
+        let ll = r#"
+@_ZL2fc = internal unnamed_addr addrspace(2) global i16 zeroinitializer, align 2
+@_Z2fc.MTL_FC_INIT_4_t = internal unnamed_addr addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
+
+define internal void @_GLOBAL__sub_I_k() section "air.static_init" {
+  %1 = load i16, ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t, align 2
+  store i16 %1, ptr addrspace(2) @_ZL2fc, align 2
+  ret void
+}
+
+define void @k(i32 %gid) {
+  %defined = tail call i1 @air.is_function_constant_defined(ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t)
+  %2 = load i16, ptr addrspace(2) @_ZL2fc, align 2
+  %3 = zext i16 %2 to i32
+  %4 = sdiv i32 %gid, %3
   ret void
 }
 
 declare i1 @air.is_function_constant_defined(ptr addrspace(2))
-
 !air.function_constants = !{!0}
-!0 = !{ptr addrspace(2) @_Z2fc.MTL_FC_INIT_16_b, !"bool", !"fc", i32 16, i1 false}
+!0 = !{ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t, !"ushort", !"fc", i32 4, i1 true}
 "#;
-        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        metal.fc_specialization = Some(FC_SPECIALIZATION_ZERO.into());
-
-        let reason = incompatible_function_constant_definedness_golden(ll, &metal)
-            .expect("definedness specialization golden");
-        assert!(
-            reason.contains("air.is_function_constant_defined"),
-            "{reason}"
-        );
-
-        metal.fc_specialization = None;
-        assert!(incompatible_function_constant_definedness_golden(ll, &metal).is_none());
+        assert!(function_constant_values_for_integer_divisors(ll).is_empty());
+        assert!(function_constant_values_for_barrier_loop_progress(ll).is_empty());
     }
 
     #[test]
@@ -9507,6 +16683,7 @@ declare i1 @air.is_function_constant_defined(ptr addrspace(2))
             compare: "full".into(),
             fc_specialization: Some(FC_SPECIALIZATION_ZERO.into()),
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9564,6 +16741,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9610,6 +16788,7 @@ declare void @air.write_texture_2d.u.v4i16(ptr addrspace(1), <2 x i32>, <4 x i16
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9652,6 +16831,7 @@ define <4 x float> @fragment(<2 x float> %coord) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9718,6 +16898,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9732,6 +16913,64 @@ attributes #0 = { "no-nans-fp-math"="true" }
             &metal,
         )
         .is_none());
+    }
+
+    #[test]
+    fn finite_float_seed_checker_uses_full_inferred_plan() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %tid) #0 {
+  %idx = zext i32 %tid to i64
+  %p = getelementptr inbounds <3 x float>, ptr addrspace(1) %src, i64 %idx
+  %v = load <3 x float>, ptr addrspace(1) %p, align 16
+  %x = extractelement <3 x float> %v, i64 0
+  %scaled = fmul fast float %x, 2.000000e+00
+  %q = getelementptr inbounds float, ptr addrspace(1) %dst, i64 %idx
+  store float %scaled, ptr addrspace(1) %q, align 4
+  ret void
+}
+
+attributes #0 = { "no-nans-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float3", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let current_plan = infer_plan(ll);
+        let src = current_plan
+            .buffers
+            .iter()
+            .find(|b| b.index == 0)
+            .expect("source buffer");
+        assert_eq!(src.seed_mode, SEED_MODE_FINITE_FLOAT32);
+        assert_eq!(src.len, 12 * DEFAULT_DISPATCH_GRID_X);
+
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan: current_plan,
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&0.0f32.to_le_bytes())),
+            output_b64: Some(encode_output_b64(&0.0f32.to_le_bytes())),
+            spv_sha256: None,
+            compare: "full".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: None,
+            entry: None,
+            error: None,
+        };
+
+        assert!(incompatible_float_seed_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -9784,6 +17023,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9847,6 +17087,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9893,6 +17134,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -9948,6 +17190,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -10035,6 +17278,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -10076,6 +17320,1630 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
         let reason = incompatible_sampled_fast_pow_texture_golden(ll, &metal)
             .expect("sampled fast pow texture golden");
         assert!(reason.contains("fast_pow"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_f32_domain_math_texture_golden_is_missing() {
+        let ll = r#"
+define float @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %x = extractelement <4 x float> %v, i64 0
+  %biased = fadd fast float %x, 1.000000e+00
+  %out = tail call fast float @air.log.f32(float %biased)
+  ret float %out
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare float @air.log.f32(float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!air.compile_options = !{!5}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!5 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_f32_domain_math_texture_golden(ll, &metal)
+            .expect("sampled f32 domain math texture golden");
+        assert!(reason.contains("finite f32 texture"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_uint_float_render_target_golden_is_missing() {
+        let ll = r#"
+define <4 x float> @frag(ptr addrspace(1) %tex, <2 x float> %uv) {
+  %s = tail call { <4 x i32>, i8 } @air.sample_texture_2d.u.v4i32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x i32>, i8 } %s, 0
+  %x = extractelement <4 x i32> %v, i64 0
+  %f = tail call float @air.convert.f.f32.u.i32(i32 %x)
+  %scaled = fdiv float %f, 2.550000e+02
+  %rgba = insertelement <4 x float> zeroinitializer, float %scaled, i64 0
+  ret <4 x float> %rgba
+}
+
+declare { <4 x i32>, i8 } @air.sample_texture_2d.u.v4i32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare float @air.convert.f.f32.u.i32(i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<uint, sample>", !"air.arg_name", !"tex"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_uint_float_render_target_golden(ll, &metal)
+            .expect("sampled uint float render-target golden");
+        assert!(reason.contains("synthetic uint texture"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_dot_render_target_golden_is_missing() {
+        let ll = r#"
+define <4 x float> @frag(ptr addrspace(1) %tex, <2 x float> %uv) {
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  %d = tail call half @air.dot.v4f16(<4 x half> %v, <4 x half> splat (half 0xH3C00))
+  %f = tail call float @air.convert.f.f32.f.f16(half %d)
+  %rgba = insertelement <4 x float> zeroinitializer, float %f, i64 0
+  ret <4 x float> %rgba
+}
+
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare half @air.dot.v4f16(<4 x half>, <4 x half>)
+declare float @air.convert.f.f32.f.f16(half)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"tex"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_half_dot_render_target_golden(ll, &metal)
+            .expect("sampled half dot render-target golden");
+        assert!(reason.contains("half dot"), "{reason}");
+    }
+
+    #[test]
+    fn fast_procedural_f32_texture_output_golden_is_missing() {
+        let ll = r#"
+define void @k(<2 x i16> %gid, ptr addrspace(1) %tex) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %x = extractelement <2 x float> %coord, i64 0
+  %m = tail call fast float @air.fast_fmod.f32(float %x, float 1.000000e+01)
+  %r = tail call fast float @air.fast_rsqrt.f32(float %m)
+  %v = insertelement <4 x float> zeroinitializer, float %r, i64 0
+  tail call void @air.write_texture_2d.i16.v4f32(ptr addrspace(1) %tex, <2 x i16> %gid, <4 x float> %v, i16 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare float @air.fast_fmod.f32(float, float)
+declare float @air.fast_rsqrt.f32(float)
+declare void @air.write_texture_2d.i16.v4f32(ptr addrspace(1), <2 x i16>, <4 x float>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.compile_options = !{!4}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"tex"}
+!4 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_fast_procedural_f32_texture_output_golden(ll, &metal)
+            .expect("fast procedural f32 texture output golden");
+        assert!(reason.contains("procedural f32 texture output"), "{reason}");
+    }
+
+    #[test]
+    fn fast_procedural_f32_texture3d_output_golden_is_missing() {
+        let ll = r#"
+define void @k(<3 x i16> %gid, ptr addrspace(1) %tex) #0 {
+  %coord = tail call fast <3 x float> @air.convert.f.v3f32.u.v3i16(<3 x i16> %gid)
+  %x = extractelement <3 x float> %coord, i64 0
+  %m = tail call fast float @air.fast_fmod.f32(float %x, float 1.000000e+01)
+  %r = tail call fast float @air.fast_rsqrt.f32(float %m)
+  %v = insertelement <4 x float> zeroinitializer, float %r, i64 0
+  tail call void @air.write_texture_3d.i16.v4f32(ptr addrspace(1) %tex, <3 x i16> %gid, <4 x float> %v, i16 0, i32 2)
+  ret void
+}
+
+declare <3 x float> @air.convert.f.v3f32.u.v3i16(<3 x i16>)
+declare float @air.fast_fmod.f32(float, float)
+declare float @air.fast_rsqrt.f32(float)
+declare void @air.write_texture_3d.i16.v4f32(ptr addrspace(1), <3 x i16>, <4 x float>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.compile_options = !{!4}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture3d<float, write>", !"air.arg_name", !"tex"}
+!4 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_fast_procedural_f32_texture_output_golden(ll, &metal)
+            .expect("fast procedural f32 texture3d output golden");
+        assert!(reason.contains("procedural f32 texture output"), "{reason}");
+    }
+
+    #[test]
+    fn fast_f32_buffer_output_golden_is_missing() {
+        let ll = r#"
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) #0 {
+  %x = load float, ptr addrspace(1) %a, align 4
+  %y = load float, ptr addrspace(1) %b, align 4
+  %sum = fadd fast float %x, %y
+  %den = tail call fast float @air.fast_rsqrt.f32(float %sum)
+  %q = fdiv fast float %x, %den
+  %m = tail call fast float @llvm.minnum.f32(float %q, float %y)
+  store float %m, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare float @air.fast_rsqrt.f32(float)
+declare float @llvm.minnum.f32(float, float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.compile_options = !{!6}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!6 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_fast_f32_buffer_output_golden(ll, &metal)
+            .expect("fast f32 buffer output golden");
+        assert!(reason.contains("finite f32 buffer data"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_f32_texture_output_golden_is_missing() {
+        let ll = r#"
+define void @k(<2 x i16> %gid, ptr addrspace(1) %src, ptr addrspace(1) %dst, <2 x float> %uv) {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst, <2 x i32> zeroinitializer, <4 x float> %v, i32 2)
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dst"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_f32_texture_output_golden(ll, &metal)
+            .expect("sampled f32 texture output golden");
+        assert!(reason.contains("f32 texture output"), "{reason}");
+    }
+
+    #[test]
+    fn storage_half_exp_texture_output_golden_is_missing() {
+        let ll = r#"
+define void @k(<2 x i16> %gid, ptr addrspace(1) %src, ptr addrspace(1) %dst) {
+  %v = tail call <4 x half> @air.read_texture_2d.i16.v4f16(ptr addrspace(1) %src, <2 x i16> %gid, i32 0)
+  %e = tail call half @air.exp.f16(half 0xH3C00)
+  %out = insertelement <4 x half> %v, half %e, i64 0
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %dst, <2 x i16> %gid, <4 x half> %out, i16 0, i32 2)
+  ret void
+}
+
+declare <4 x half> @air.read_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, i32)
+declare half @air.exp.f16(half)
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<half, read>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_storage_half_exp_texture_output_golden(ll, &metal)
+            .expect("storage half exp texture output golden");
+        assert!(reason.contains("AIR exp"), "{reason}");
+    }
+
+    #[test]
+    fn function_constant_simdgroup_threadgroup_golden_is_missing() {
+        let ll = r#"
+@_Z7enable0.MTL_FC_INIT_0_b = internal unnamed_addr addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+
+define void @k(ptr addrspace(3) %scratch, i16 %lane) {
+  %flag = load i8, ptr addrspace(2) @_Z7enable0.MTL_FC_INIT_0_b, align 1
+  %enabled = icmp ne i8 %flag, 0
+  br i1 %enabled, label %wide, label %done
+wide:
+  %v = tail call i16 @air.simd_shuffle_up.s.i16(i16 %lane, i16 1)
+  %slot = getelementptr inbounds i32, ptr addrspace(3) %scratch, i64 0
+  store i32 1, ptr addrspace(3) %slot, align 4
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  br label %done
+done:
+  ret void
+}
+
+declare i16 @air.simd_shuffle_up.s.i16(i16, i16)
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!air.function_constants = !{!5}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_name", !"int", !"air.arg_name", !"scratch"}
+!4 = !{i32 1, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lane"}
+!5 = !{ptr addrspace(2) @_Z7enable0.MTL_FC_INIT_0_b, !"bool", !"enable0", i32 0, i1 true}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.fc_specialization = Some(FC_SPECIALIZATION_VALUES.into());
+        metal.fc_values = Some(vec![FunctionConstantValueJson { index: 0, value: 1 }]);
+        let reason = incompatible_function_constant_simdgroup_golden(ll, &metal)
+            .expect("function-constant simdgroup golden");
+        assert!(reason.contains("simdgroup/threadgroup-memory"), "{reason}");
+    }
+
+    #[test]
+    fn bounded_control_local_array_index_seeds_in_range() {
+        let ll = r#"
+%"struct.metal::array.4" = type { [4 x <3 x half>] }
+
+define <4 x float> @frag(ptr addrspace(2) %index) {
+  %arr = alloca %"struct.metal::array.4", align 8
+  %idx = load i32, ptr addrspace(2) %index, align 4
+  %wide = sext i32 %idx to i64
+  %slot = getelementptr inbounds %"struct.metal::array.4", ptr %arr, i64 0, i32 0, i64 %wide
+  %v = load <3 x half>, ptr %slot, align 8
+  %out = tail call <3 x float> @air.convert.f.v3f32.f.v3f16(<3 x half> %v)
+  %out4 = shufflevector <3 x float> %out, <3 x float> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
+  %alpha = insertelement <4 x float> %out4, float 1.000000e+00, i64 3
+  ret <4 x float> %alpha
+}
+
+declare <3 x float> @air.convert.f.v3f32.f.v3f16(<3 x half>)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"index"}
+"#;
+
+        let plan = infer_plan(ll);
+        let index = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .expect("index buffer");
+        assert_eq!(index.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert_eq!(bounded_control_u32_at(index, 0), Some(0));
+
+        let metal = metal_row_for_compare(&[], plan, Some("Fragment"));
+        assert!(incompatible_bounded_control_local_array_index_golden(ll, &metal).is_none());
+    }
+
+    #[test]
+    fn bounded_control_local_array_loop_index_golden_is_comparable() {
+        let ll = r#"
+define void @k(ptr addrspace(2) %dims, ptr addrspace(1) %out) {
+entry:
+  %arr = alloca [2 x float], align 4
+  %dim = load i32, ptr addrspace(2) %dims, align 4
+  store float 1.000000e+00, ptr %arr, align 4
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %wide = zext i32 %i to i64
+  %slot = getelementptr inbounds [2 x float], ptr %arr, i64 0, i64 %wide
+  %v = load float, ptr %slot, align 4
+  %dst = getelementptr inbounds float, ptr addrspace(1) %out, i64 %wide
+  store float %v, ptr addrspace(1) %dst, align 4
+  %next = add nuw nsw i32 %i, 1
+  %done = icmp eq i32 %next, 2
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"dims"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        assert!(incompatible_bounded_control_local_array_index_golden(ll, &metal).is_none());
+    }
+
+    #[test]
+    fn finite_struct_half_div_fragment_golden_is_missing() {
+        let ll = r#"
+define <4 x half> @frag(ptr addrspace(1) %coeff, <4 x half> %color) #0 {
+  %p = getelementptr inbounds half, ptr addrspace(1) %coeff, i64 0
+  %den = load half, ptr addrspace(1) %p, align 2
+  %splat0 = insertelement <3 x half> poison, half %den, i64 0
+  %splat = shufflevector <3 x half> %splat0, <3 x half> poison, <3 x i32> zeroinitializer
+  %rgb = shufflevector <4 x half> %color, <4 x half> poison, <3 x i32> <i32 0, i32 1, i32 2>
+  %div = fdiv fast <3 x half> %rgb, %splat
+  %out3 = shufflevector <3 x half> %div, <3 x half> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
+  %out = insertelement <4 x half> %out3, half 0xH3C00, i64 3
+  ret <4 x half> %out
+}
+
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!air.compile_options = !{!7}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 131072, !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"Coeff", !"air.arg_name", !"coeff"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"half4", !"air.arg_name", !"color"}
+!6 = !{i32 0, i32 2, i32 1, !"half"}
+!7 = !{!"air.compile.fast_math_enable"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_finite_struct_half_fragment_golden(ll, &metal)
+            .expect("finite-struct half fragment golden");
+        assert!(reason.contains("fast half division"), "{reason}");
+    }
+
+    #[test]
+    fn barycentric_derivative_fragment_golden_is_missing() {
+        let ll = r#"
+define <4 x half> @frag(<3 x float> %bary) {
+  %w = tail call <3 x float> @air.fwidth.v3f32(<3 x float> %bary)
+  %x = extractelement <3 x float> %w, i64 0
+  %c = insertelement <4 x float> zeroinitializer, float %x, i64 0
+  %out = tail call <4 x half> @air.convert.f.v4f16.f.v4f32(<4 x float> %c)
+  ret <4 x half> %out
+}
+
+declare <3 x float> @air.fwidth.v3f32(<3 x float>)
+declare <4 x half> @air.convert.f.v4f16.f.v4f32(<4 x float>)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.barycentric_coord", !"air.center", !"air.perspective", !"air.arg_type_name", !"float3", !"air.arg_name", !"bary"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_barycentric_derivative_fragment_golden(ll, &metal)
+            .expect("barycentric derivative fragment golden");
+        assert!(reason.contains("barycentric"), "{reason}");
+        assert!(reason.contains("derivative"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_vertex_clip_distance_half_texture_golden_is_missing() {
+        let ll = r#"
+define void @vert(ptr addrspace(1) %tex) {
+  ret void
+}
+
+!air.vertex = !{!0}
+!0 = !{ptr @vert, !1, !2}
+!1 = !{!3, !4}
+!2 = !{!5}
+!3 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!4 = !{!"air.clip_distance", !"air.clip_distance_array_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"clipDistance"}
+!5 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"tex"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Vertex"));
+        let reason = incompatible_moltenvk_vertex_clip_distance_half_texture_golden(ll, &metal)
+            .expect("MoltenVK ClipDistance half-texture vertex golden");
+        assert!(reason.contains("clip_distance"), "{reason}");
+        assert!(reason.contains("MoltenVK"), "{reason}");
+
+        let fragment_metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        assert!(
+            incompatible_moltenvk_vertex_clip_distance_half_texture_golden(ll, &fragment_metal)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn moltenvk_sampled_half_render_target_exact_golden_is_missing() {
+        let ll = r#"
+define <4 x half> @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  %d = tail call fast half @air.dot.v4f16(<4 x half> %v, <4 x half> %v)
+  %out = insertelement <4 x half> %v, half %d, i64 3
+  ret <4 x half> %out
+}
+
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare half @air.dot.v4f16(<4 x half>, <4 x half>)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"tex"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_moltenvk_sampled_half_render_target_exact_golden(ll, &metal)
+            .expect("MoltenVK sampled half render-target exact golden");
+        assert!(reason.contains("finite f16 texture"), "{reason}");
+        assert!(
+            reason.contains("MoltenVK exact byte comparison"),
+            "{reason}"
+        );
+
+        let mut compare_none = metal;
+        compare_none.compare = "none".into();
+        assert!(
+            incompatible_moltenvk_sampled_half_render_target_exact_golden(ll, &compare_none)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn moltenvk_half_texture_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %sam = tail call ptr addrspace(2) @air.get_read_sampler()
+  %read = tail call { <4 x half>, i8 } @air.read_texture_2d.i16.v4f16(ptr addrspace(1) readonly %src, ptr addrspace(2) %sam, <2 x i16> %gid, <2 x i16> zeroinitializer, i16 0, i32 1)
+  %v = extractvalue { <4 x half>, i8 } %read, 0
+  %sum = fadd fast <4 x half> %v, %v
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %out, <2 x i16> %gid, <4 x half> %sum, i16 0, i32 2)
+  ret void
+}
+
+declare ptr addrspace(2) @air.get_read_sampler()
+declare { <4 x half>, i8 } @air.read_texture_2d.i16.v4f16(ptr addrspace(1) readonly, ptr addrspace(2), <2 x i16>, <2 x i16>, i16, i32)
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<half, read>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_moltenvk_half_texture_output_exact_golden(ll, &metal)
+            .expect("MoltenVK half texture-output exact golden");
+        assert!(reason.contains("finite f16 texture data"), "{reason}");
+        assert!(reason.contains("texture write rounding"), "{reason}");
+
+        let fragment_metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        assert!(
+            incompatible_moltenvk_half_texture_output_exact_golden(ll, &fragment_metal).is_none()
+        );
+    }
+
+    #[test]
+    fn moltenvk_storage_f32_texture_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i32> %gid) #0 {
+  %read = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly %src, ptr addrspace(2) null, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)
+  %v = extractvalue { <4 x float>, i8 } %read, 0
+  %x = extractelement <4 x float> %v, i64 0
+  %p = tail call fast float @air.fast_powr.f32(float %x, float 2.000000e+00)
+  %out4 = insertelement <4 x float> zeroinitializer, float %p, i64 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %out, <2 x i32> %gid, <4 x float> %out4, i32 0, i32 2)
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly, ptr addrspace(2), <2 x i32>, <2 x i32>, i32, i32)
+declare float @air.fast_powr.f32(float, float)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_moltenvk_storage_f32_texture_output_exact_golden(ll, &metal)
+            .expect("MoltenVK storage f32 texture-output exact golden");
+        assert!(reason.contains("finite f32 storage texture"), "{reason}");
+        assert!(
+            reason.contains("MoltenVK exact byte comparison"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn moltenvk_storage_r32_imageblock_texture_output_exact_golden_is_missing() {
+        let ll = r#"
+%"struct.metal::_imageblock_base.92" = type { ptr addrspace(4) }
+
+define void @kernel(%"struct.metal::_imageblock_base.92" %ib, ptr addrspace(1) %tex, <2 x i16> %gid, <2 x i16> %tid) #0 {
+  %read = tail call { <4 x float>, i8 } @air.read_texture_2d.i16.v4f32(ptr addrspace(1) readonly %tex, ptr addrspace(2) null, <2 x i16> %gid, <2 x i16> zeroinitializer, i16 0, i32 1)
+  %v = extractvalue { <4 x float>, i8 } %read, 0
+  %x = extractelement <4 x float> %v, i64 0
+  %r = tail call fast float @air.fast_sqrt.f32(float %x)
+  %out = insertelement <4 x float> zeroinitializer, float %r, i64 0
+  %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
+  store <4 x float> %out, ptr addrspace(4) %ptr, align 16
+  tail call void @air.wg.barrier(i32 8, i32 1)
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f32(ptr addrspace(1) %tex, ptr addrspace(4) %ptr, i1 true, <2 x i16> zeroinitializer, <2 x i16> splat (i16 8), <2 x i16> %gid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.read_texture_2d.i16.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x i16>, <2 x i16>, i16, i32)
+declare float @air.fast_sqrt.f32(float)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.wg.barrier(i32, i32)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f32(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 16, !"air.arg_type_name", !"imageblock<ibRGBA, layout_explicit>", !"air.arg_name", !"ib"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d<float, read_write>", !"air.arg_name", !"tex"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!6 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "R32Float".into();
+        let reason = incompatible_moltenvk_storage_f32_texture_output_exact_golden(ll, &metal)
+            .expect("MoltenVK storage R32 imageblock exact golden");
+        assert!(reason.contains("finite f32 storage texture"), "{reason}");
+        assert!(reason.contains("texture read/write rounding"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_sampled_f32_render_target_exact_golden_is_missing() {
+        let ll = r#"
+define <4 x float> @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  ret <4 x float> %v
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_moltenvk_sampled_f32_render_target_exact_golden(ll, &metal)
+            .expect("MoltenVK sampled f32 render-target exact golden");
+        assert!(reason.contains("finite f32 texture"), "{reason}");
+        assert!(reason.contains("render-target rounding"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_sampled_f32_cube_buffer_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %cube, ptr addrspace(1) %out) #0 {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_cube.v4f32(ptr addrspace(1) %cube, ptr addrspace(2) null, <3 x float> splat (float 1.000000e+00), i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %x = extractelement <4 x float> %v, i64 0
+  %r = tail call fast float @air.fast_rsqrt.f32(float %x)
+  store float %r, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_cube.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, i1, float, float, i32)
+declare float @air.fast_rsqrt.f32(float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texturecube<float, sample>", !"air.arg_name", !"cube"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "F32".into();
+        let reason = incompatible_moltenvk_sampled_f32_cube_buffer_exact_golden(ll, &metal)
+            .expect("MoltenVK sampled f32 cube buffer exact golden");
+        assert!(reason.contains("f32 cube texture"), "{reason}");
+        assert!(reason.contains("approximate math"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_fast_f32_buffer_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %out, ptr addrspace(2) %control, i32 %idx) #0 {
+  %c = load i32, ptr addrspace(2) %control, align 4
+  %ok = icmp eq i32 %c, 0
+  %value = select i1 %ok, float 0.000000e+00, float -0.000000e+00
+  %dst = getelementptr float, ptr addrspace(1) %out, i32 %idx
+  store float %value, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+attributes #0 = { "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"uint", !"air.arg_name", !"control"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"idx"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "Rgba32Float".into();
+        metal.plan.buffers[0].seed_mode = SEED_MODE_FINITE_FLOAT32.into();
+        let reason = incompatible_moltenvk_fast_f32_buffer_output_exact_golden(ll, &metal)
+            .expect("MoltenVK fast f32 buffer-output exact golden");
+        assert!(reason.contains("finite f32 buffer output"), "{reason}");
+        assert!(reason.contains("denorm flushing"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_fast_f32_input_buffer_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) #0 {
+  %x = load float, ptr addrspace(1) %a, align 4
+  %y = load float, ptr addrspace(1) %b, align 4
+  %s = fadd fast float %x, %y
+  %r = tail call fast float @air.fast_rsqrt.f32(float %s)
+  store float %r, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare float @air.fast_rsqrt.f32(float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "F32".into();
+        let reason = incompatible_moltenvk_fast_f32_input_buffer_exact_golden(ll, &metal)
+            .expect("MoltenVK finite f32 input buffer exact golden");
+        assert!(reason.contains("finite f32 buffer inputs"), "{reason}");
+        assert!(
+            reason.contains("MoltenVK exact byte comparison"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn moltenvk_fast_half_buffer_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out) #0 {
+  %h = load half, ptr addrspace(1) %src, align 2
+  %f = tail call fast float @air.convert.f.f32.f.f16(half %h)
+  %r = tail call fast float @air.fast_sqrt.f32(float %f)
+  %o = tail call fast half @air.convert.f.f16.f.f32(float %r)
+  store half %o, ptr addrspace(1) %out, align 2
+  ret void
+}
+
+declare float @air.convert.f.f32.f.f16(half)
+declare float @air.fast_sqrt.f32(float)
+declare half @air.convert.f.f16.f.f32(float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"half", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"half", !"air.arg_name", !"out"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "R16Float".into();
+        let reason = incompatible_moltenvk_fast_half_buffer_output_exact_golden(ll, &metal)
+            .expect("MoltenVK fast half buffer-output exact golden");
+        assert!(reason.contains("finite f16 buffer output"), "{reason}");
+        assert!(reason.contains("half conversion"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_fast_half_render_target_exact_golden_is_missing() {
+        let ll = r#"
+define <4 x half> @frag(half %x) #0 {
+  %s = tail call fast half @air.fast_sqrt.f16(half %x)
+  %out = insertelement <4 x half> zeroinitializer, half %s, i64 0
+  ret <4 x half> %out
+}
+
+declare half @air.fast_sqrt.f16(half)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"half", !"air.arg_name", !"x"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_moltenvk_fast_half_render_target_exact_golden(ll, &metal)
+            .expect("MoltenVK fast half render-target exact golden");
+        assert!(reason.contains("fast_sqrt"), "{reason}");
+        assert!(reason.contains("render-target rounding"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_fast_raw_float_buffer_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %out, float %x, i32 %idx) #0 {
+  %dst = getelementptr float, ptr addrspace(1) %out, i32 %idx
+  store float %x, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+attributes #0 = { "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"float", !"air.arg_name", !"x"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"idx"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "RawBytes".into();
+        let reason = incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(ll, &metal)
+            .expect("MoltenVK fast raw float buffer-output exact golden");
+        assert!(reason.contains("raw buffer bytes"), "{reason}");
+        assert!(reason.contains("signed-zero"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_packed_unorm_raw_float_buffer_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out, i32 %idx) #0 {
+  %srcp = getelementptr i32, ptr addrspace(1) %src, i32 %idx
+  %raw = load i32, ptr addrspace(1) %srcp, align 1
+  %unpacked = tail call fast <4 x half> @air.unpack.unorm4x8.v4f16(i32 %raw)
+  %scaled = fmul fast <4 x half> %unpacked, %unpacked
+  %packed = tail call i32 @air.pack.unorm4x8.v4f16(<4 x half> %scaled)
+  %dstp = getelementptr i32, ptr addrspace(1) %out, i32 %idx
+  store i32 %packed, ptr addrspace(1) %dstp, align 1
+  ret void
+}
+
+declare <4 x half> @air.unpack.unorm4x8.v4f16(i32)
+declare i32 @air.pack.unorm4x8.v4f16(<4 x half>)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"idx"}
+"#;
+
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.plan.output.format = "RawBytes".into();
+        let reason = incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(ll, &metal)
+            .expect("MoltenVK packed unorm raw float buffer-output exact golden");
+        assert!(reason.contains("raw buffer bytes"), "{reason}");
+        assert!(reason.contains("float denorm"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_integer_texture_fast_render_target_exact_golden_is_missing() {
+        let ll = r#"
+define <4 x half> @frag(ptr addrspace(1) readonly %tex, <2 x i16> %coord) #0 {
+  %r = tail call { <4 x i16>, i8 } @air.read_texture_2d.u.v4i16(ptr addrspace(1) readonly %tex, ptr addrspace(2) null, <2 x i16> %coord, <2 x i16> zeroinitializer, i16 0, i32 1)
+  %u = extractvalue { <4 x i16>, i8 } %r, 0
+  %f = tail call fast <4 x half> @air.convert.f.v4f16.u.v4i16(<4 x i16> %u)
+  %x = extractelement <4 x half> %f, i64 0
+  %p = tail call fast half @air.fast_pow.f16(half %x, half 2.000000e+00)
+  %out = insertelement <4 x half> zeroinitializer, half %p, i64 0
+  ret <4 x half> %out
+}
+
+declare { <4 x i16>, i8 } @air.read_texture_2d.u.v4i16(ptr addrspace(1) readonly, ptr addrspace(2), <2 x i16>, <2 x i16>, i16, i32)
+declare <4 x half> @air.convert.f.v4f16.u.v4i16(<4 x i16>)
+declare half @air.fast_pow.f16(half, half)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<ushort, sample>", !"air.arg_name", !"tex"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"coord"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason =
+            incompatible_moltenvk_integer_texture_fast_render_target_exact_golden(ll, &metal)
+                .expect("MoltenVK integer texture fast render-target exact golden");
+        assert!(reason.contains("integer texture data"), "{reason}");
+        assert!(reason.contains("approximate pow"), "{reason}");
+    }
+
+    #[test]
+    fn moltenvk_scaled_integer_half_texture_output_exact_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %raw = load <4 x i8>, ptr addrspace(1) %src, align 4
+  %h = tail call fast <4 x half> @air.convert.f.v4f16.u.v4i8(<4 x i8> %raw)
+  %scaled = fmul fast <4 x half> %h, splat (half 0xH1C04)
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %out, <2 x i16> %gid, <4 x half> %scaled, i16 0, i32 2)
+  ret void
+}
+
+declare <4 x half> @air.convert.f.v4f16.u.v4i8(<4 x i8>)
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar4", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason =
+            incompatible_moltenvk_scaled_integer_half_texture_output_exact_golden(ll, &metal)
+                .expect("MoltenVK scaled integer half texture-output exact golden");
+        assert!(reason.contains("integer buffer data"), "{reason}");
+        assert!(reason.contains("half conversion"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_fast_exp_f32_texture_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %table, ptr addrspace(1) %out, <2 x i32> %gid) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %gid)
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %table, ptr addrspace(2) null, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %x = extractelement <4 x float> %v, i64 0
+  %e = tail call fast float @air.fast_exp.f32(float %x)
+  %out4 = insertelement <4 x float> zeroinitializer, float %e, i64 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %out, <2 x i32> %gid, <4 x float> %out4, i32 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32>)
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare float @air.fast_exp.f32(float)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 4, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"table"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_fast_exp_texture_golden(ll, &metal)
+            .expect("sampled fast exp texture golden");
+        assert!(reason.contains("fast_exp"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_fast_powr_integer_render_target_golden_is_missing() {
+        let ll = r#"
+define i32 @frag(<2 x float> %uv, ptr addrspace(1) %tex, ptr addrspace(2) %sampler) #0 {
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %rgb = shufflevector <4 x float> %v, <4 x float> poison, <3 x i32> <i32 0, i32 1, i32 2>
+  %mag = tail call fast <3 x float> @air.fast_fabs.v3f32(<3 x float> %rgb)
+  %pow = tail call fast <3 x float> @air.fast_powr.v3f32(<3 x float> %mag, <3 x float> splat (float 0x3FC4640000000000))
+  %lane = extractelement <3 x float> %pow, i64 0
+  %u = tail call i16 @air.convert.u.i16.f.f32(float %lane)
+  %packed = zext i16 %u to i32
+  ret i32 %packed
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare <3 x float> @air.fast_fabs.v3f32(<3 x float>)
+declare <3 x float> @air.fast_powr.v3f32(<3 x float>, <3 x float>)
+declare i16 @air.convert.u.i16.f.f32(float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"uint"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+!5 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!6 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_fast_pow_texture_golden(ll, &metal)
+            .expect("sampled fast powr texture golden");
+        assert!(reason.contains("fast_pow/fast_powr"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_f32_dynamic_lod_render_target_golden_is_missing() {
+        let ll = r#"
+define <4 x float> @frag(<2 x float> %uv, ptr addrspace(1) %src, ptr addrspace(1) %mask) #0 {
+  %mask_sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %mask, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %mask_v = extractvalue { <4 x float>, i8 } %mask_sample, 0
+  %alpha = extractelement <4 x float> %mask_v, i64 3
+  %scaled = fmul fast float %alpha, 4.000000e+00
+  %lod = tail call fast float @air.fast_log2.f32(float %scaled)
+  %delta0 = insertelement <2 x float> poison, float %lod, i64 0
+  %delta = shufflevector <2 x float> %delta0, <2 x float> poison, <2 x i32> zeroinitializer
+  %coord = fadd fast <2 x float> %uv, %delta
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 true, float %lod, float 0.000000e+00, i32 0)
+  %out = extractvalue { <4 x float>, i8 } %sample, 0
+  ret <4 x float> %out
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare float @air.fast_log2.f32(float)
+attributes #0 = { "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+!5 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"mask"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_f32_dynamic_lod_render_target_golden(ll, &metal)
+            .expect("sampled f32 dynamic LOD render-target golden");
+        assert!(reason.contains("dynamic LOD"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_f32_texture_array_render_targets_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601055744, i64 0], align 8
+
+define <{ <4 x float>, <4 x float> }> @frag(<2 x float> %uv0, <2 x float> %uv1, ptr readonly byval([2 x ptr addrspace(1)]) %textures) #0 {
+  %p0 = getelementptr inbounds [2 x ptr addrspace(1)], ptr %textures, i64 0, i64 0
+  %t0 = load ptr addrspace(1), ptr %p0, align 8
+  %s0 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %t0, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv0, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v0 = extractvalue { <4 x float>, i8 } %s0, 0
+  %p1 = getelementptr inbounds [2 x ptr addrspace(1)], ptr %textures, i64 0, i64 1
+  %t1 = load ptr addrspace(1), ptr %p1, align 8
+  %s1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %t1, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv1, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v1 = extractvalue { <4 x float>, i8 } %s1, 0
+  %o0 = insertvalue <{ <4 x float>, <4 x float> }> undef, <4 x float> %v0, 0
+  %o1 = insertvalue <{ <4 x float>, <4 x float> }> %o0, <4 x float> %v1, 1
+  ret <{ <4 x float>, <4 x float> }> %o1
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!7}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3, !4}
+!2 = !{!5, !6}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"left"}
+!4 = !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"right"}
+!5 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv0"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 2, !"air.sample", !"air.arg_type_name", !"array<texture2d<float, sample>, 2>", !"air.arg_name", !"textures"}
+!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_f32_texture_array_render_targets_golden(ll, &metal)
+            .expect("sampled f32 texture-array render-target golden");
+        assert!(reason.contains("multiple float render targets"), "{reason}");
+        assert!(reason.contains("texture-array"), "{reason}");
+    }
+
+    #[test]
+    fn fragment_half_pow_signed_base_render_target_golden_is_missing() {
+        let ll = r#"
+define <4 x half> @frag(<2 x float> %uv) #0 {
+  %u = extractelement <2 x float> %uv, i64 0
+  %h = fptrunc float %u to half
+  %base0 = insertelement <3 x half> poison, half %h, i64 0
+  %base = shufflevector <3 x half> %base0, <3 x half> poison, <3 x i32> zeroinitializer
+  %signed = fsub fast <3 x half> splat (half 0xH3C9A), %base
+  %pow = tail call fast <3 x half> @air.pow.v3f16(<3 x half> %signed, <3 x half> splat (half 0xH3C00))
+  %out3 = shufflevector <3 x half> %pow, <3 x half> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
+  %out = insertelement <4 x half> %out3, half 0xH3C00, i64 3
+  ret <4 x half> %out
+}
+
+declare <3 x half> @air.pow.v3f16(<3 x half>, <3 x half>)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_fragment_half_pow_render_target_golden(ll, &metal)
+            .expect("fragment half pow render-target golden");
+        assert!(reason.contains("negative-base pow"), "{reason}");
+    }
+
+    #[test]
+    fn fragment_fast_pow_rsqrt_render_target_golden_is_missing() {
+        let ll = r#"
+define <4 x float> @frag(float %x) #0 {
+  %r = tail call fast float @air.fast_rsqrt.f32(float %x)
+  %p = tail call fast float @air.fast_pow.f32(float %r, float 2.000000e+00)
+  %out0 = insertelement <4 x float> zeroinitializer, float %p, i64 0
+  ret <4 x float> %out0
+}
+
+declare float @air.fast_rsqrt.f32(float)
+declare float @air.fast_pow.f32(float, float)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float", !"air.arg_name", !"x"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_fragment_fast_pow_rsqrt_render_target_golden(ll, &metal)
+            .expect("fragment fast pow/rsqrt render-target golden");
+        assert!(reason.contains("fast_pow"), "{reason}");
+        assert!(reason.contains("fast_rsqrt"), "{reason}");
+    }
+
+    #[test]
+    fn fragment_half_pow_bounded_control_render_target_golden_is_missing() {
+        let ll = r#"
+%"struct.Params" = type { float, float, float }
+
+define <4 x half> @frag(<2 x float> %uv, ptr addrspace(2) %params, <4 x half> %color) #0 {
+  %rgb = shufflevector <4 x half> %color, <4 x half> poison, <3 x i32> <i32 0, i32 1, i32 2>
+  %gain_p = getelementptr inbounds %"struct.Params", ptr addrspace(2) %params, i64 0, i32 0
+  %gain_f = load float, ptr addrspace(2) %gain_p, align 4
+  %gain_h = fptrunc float %gain_f to half
+  %gain0 = insertelement <3 x half> poison, half %gain_h, i64 0
+  %gain = shufflevector <3 x half> %gain0, <3 x half> poison, <3 x i32> zeroinitializer
+  %offset_p = getelementptr inbounds %"struct.Params", ptr addrspace(2) %params, i64 0, i32 1
+  %offset_f = load float, ptr addrspace(2) %offset_p, align 4
+  %offset_h = fptrunc float %offset_f to half
+  %offset0 = insertelement <3 x half> poison, half %offset_h, i64 0
+  %offset = shufflevector <3 x half> %offset0, <3 x half> poison, <3 x i32> zeroinitializer
+  %scaled = fmul fast <3 x half> %rgb, %gain
+  %base = fadd fast <3 x half> %scaled, %offset
+  %gamma_p = getelementptr inbounds %"struct.Params", ptr addrspace(2) %params, i64 0, i32 2
+  %gamma_f = load float, ptr addrspace(2) %gamma_p, align 4
+  %inv = fdiv fast float 1.000000e+00, %gamma_f
+  %inv_h = fptrunc float %inv to half
+  %inv0 = insertelement <3 x half> poison, half %inv_h, i64 0
+  %exp = shufflevector <3 x half> %inv0, <3 x half> poison, <3 x i32> zeroinitializer
+  %pow = tail call fast <3 x half> @air.pow.v3f16(<3 x half> %base, <3 x half> %exp)
+  %out3 = shufflevector <3 x half> %pow, <3 x half> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 poison>
+  %alpha = extractelement <4 x half> %color, i64 3
+  %out = insertelement <4 x half> %out3, half %alpha, i64 3
+  ret <4 x half> %out
+}
+
+declare <3 x half> @air.pow.v3f16(<3 x half>, <3 x half>)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 12, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !7, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!6 = !{i32 2, !"air.render_target", i32 0, i32 1, !"air.arg_type_name", !"half4", !"air.arg_name", !"color"}
+!7 = !{i32 0, i32 4, i32 0, !"float", !"gain", i32 4, i32 4, i32 0, !"float", !"offset", i32 8, i32 4, i32 0, !"float", !"gamma"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_fragment_half_pow_render_target_golden(ll, &metal)
+            .expect("bounded-control fragment half pow render-target golden");
+        assert!(reason.contains("bounded-control"), "{reason}");
+        assert!(reason.contains("AIR pow"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_domain_sensitive_texture_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
+
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  %x_h = extractelement <4 x half> %v, i64 0
+  %x = fpext half %x_h to float
+  %log = tail call fast float @air.fast_log.f32(float %x)
+  %root = tail call fast float @air.fast_sqrt.f32(float %log)
+  %wide0 = insertelement <4 x float> poison, float %root, i64 0
+  %wide = shufflevector <4 x float> %wide0, <4 x float> poison, <4 x i32> zeroinitializer
+  tail call void @air.write_texture_2d.i16.v4f32(ptr addrspace(1) %out, <2 x i16> %gid, <4 x float> %wide, i16 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare float @air.fast_log.f32(float)
+declare float @air.fast_sqrt.f32(float)
+declare void @air.write_texture_2d.i16.v4f32(ptr addrspace(1), <2 x i16>, <4 x float>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_half_domain_sensitive_texture_golden(ll, &metal)
+            .expect("sampled half domain-sensitive texture golden");
+        assert!(reason.contains("domain-sensitive math"), "{reason}");
+    }
+
+    #[test]
+    fn fast_procedural_half_texture_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %out, <2 x i32> %gid) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %gid)
+  %x = extractelement <2 x float> %coord, i64 0
+  %s = tail call fast float @air.fast_sin.f32(float %x)
+  %f = tail call fast float @air.fast_fract.f32(float %s)
+  %h = fptrunc float %f to half
+  %v0 = insertelement <4 x half> zeroinitializer, half %h, i64 0
+  tail call void @air.write_texture_2d.v4f16(ptr addrspace(1) %out, <2 x i32> %gid, <4 x half> %v0, i32 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32>)
+declare float @air.fast_sin.f32(float)
+declare float @air.fast_fract.f32(float)
+declare void @air.write_texture_2d.v4f16(ptr addrspace(1), <2 x i32>, <4 x half>, i32, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_fast_procedural_half_texture_golden(ll, &metal)
+            .expect("fast procedural half texture golden");
+        assert!(reason.contains("fast trigonometric/fract"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_linear_imageblock_texture_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020489, i64 0], align 8
+
+define void @kernel(ptr addrspace(4) %imageblock, ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %coord_i = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %coord = fmul fast <2 x float> %coord_i, splat (float 1.250000e-01)
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %gid, i32 0, i16 0)
+  store <4 x half> %v, ptr addrspace(4) %slot
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!7}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.arg_type_name", !"imageblock<half4>", !"air.arg_name", !"imageblock"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
+            .expect("sampled half linear imageblock texture golden");
+        assert!(reason.contains("imageblock"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_linear_scaled_texture_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601055817, i64 0], align 8
+
+define void @upsample(ptr addrspace(1) %src, ptr addrspace(1) %out, ptr addrspace(1) readonly %scale, <2 x i16> %gid) #0 {
+  %coord_i = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %center = fadd fast <2 x float> %coord_i, splat (float 5.000000e-01)
+  %s = load float, ptr addrspace(1) %scale, align 4
+  %lane = insertelement <2 x float> poison, float %s, i64 0
+  %scale2 = shufflevector <2 x float> %lane, <2 x float> poison, <2 x i32> zeroinitializer
+  %uv = fmul fast <2 x float> %scale2, %center
+  %sample = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %rgba = extractvalue { <4 x half>, i8 } %sample, 0
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %out, <2 x i16> %gid, <4 x half> %rgba, i16 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @upsample, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"scale"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!7 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
+            .expect("sampled half scaled linear texture golden");
+        assert!(reason.contains("buffer-scaled coordinates"), "{reason}");
+        assert!(reason.contains("f16 texture output"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_gather_imageblock_texture_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
+
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %g = tail call { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i32 0, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %g, 0
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %gid, i32 0, i16 0)
+  store <4 x half> %v, ptr addrspace(4) %slot
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 true, <2 x i16> zeroinitializer, <2 x i16> %gid, <2 x i16> %gid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
+            .expect("sampled half gather imageblock texture golden");
+        assert!(reason.contains("gathers finite f16"), "{reason}");
+    }
+
+    #[test]
+    fn storage_half_imageblock_texture_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i16> %ib, <2 x i16> %gid) {
+  %sam = tail call ptr addrspace(2) @air.get_read_sampler()
+  %read = tail call { <4 x half>, i8 } @air.read_texture_2d.i16.v4f16(ptr addrspace(1) readonly %src, ptr addrspace(2) %sam, <2 x i16> %gid, <2 x i16> zeroinitializer, i16 0, i32 1)
+  %v = extractvalue { <4 x half>, i8 } %read, 0
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %ib, i32 0, i16 0)
+  store <4 x half> %v, ptr addrspace(4) %slot
+  tail call void @air.wg.barrier(i32 8, i32 1)
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare ptr addrspace(2) @air.get_read_sampler()
+declare { <4 x half>, i8 } @air.read_texture_2d.i16.v4f16(ptr addrspace(1) readonly, ptr addrspace(2), <2 x i16>, <2 x i16>, i16, i32)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.wg.barrier(i32, i32)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<half, read>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"ib"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_storage_half_imageblock_texture_golden(ll, &metal)
+            .expect("storage half imageblock texture golden");
+        assert!(reason.contains("storage texture"), "{reason}");
+        assert!(reason.contains("imageblock"), "{reason}");
+    }
+
+    #[test]
+    fn uninitialized_half_imageblock_texture_golden_is_missing() {
+        let ll = r#"
+%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
+
+define void @kernel(ptr addrspace(1) %out, %"struct.metal::_imageblock_base" %imageblock, <2 x i16> %gid, <2 x i16> %pid) #0 {
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %pid, i32 0, i16 0)
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.f16(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 2, !"air.struct_type_info", !5, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imageblock"}
+!5 = !{i32 0, i32 2, i32 0, !"half", !"depth"}
+!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"pid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_uninitialized_half_imageblock_texture_golden(ll, &metal)
+            .expect("uninitialized half imageblock texture golden");
+        assert!(reason.contains("uninitialized scalar half"), "{reason}");
+        assert!(reason.contains("imageblock"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_f32_imageblock_texture_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601053257, i64 0], align 8
+
+define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i32> %gid, <2 x i16> %ib) {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %gid)
+  %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x float>, i8 } %s, 0
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %ib, i32 0, i16 0)
+  store <4 x float> %v, ptr addrspace(4) %slot
+  tail call void @air.wg.barrier(i32 8, i32 1)
+  tail call void @air.write_imageblock_slice_to_texture_2d.v4f32(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i32> %gid, i32 0, i1 false, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32>)
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) readonly, ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.wg.barrier(i32, i32)
+declare void @air.write_imageblock_slice_to_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i32>, i32, i1, i32)
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_f32_imageblock_texture_golden(ll, &metal)
+            .expect("sampled f32 imageblock texture golden");
+        assert!(reason.contains("finite f32"), "{reason}");
+        assert!(reason.contains("imageblock"), "{reason}");
+    }
+
+    #[test]
+    fn integer_gather_imageblock_texture_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
+
+define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i16> %gid, <2 x i16> %tid) {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %g = tail call { <4 x i16>, i8 } @air.gather_texture_2d.s.v4i16(ptr addrspace(1) readonly %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0, i32 0)
+  %v = extractvalue { <4 x i16>, i8 } %g, 0
+  %slot = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
+  store <4 x i16> %v, ptr addrspace(4) %slot
+  tail call void @air.wg.barrier(i32 8, i32 1)
+  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1) %out, ptr addrspace(4) %slot, i1 true, <2 x i16> zeroinitializer, <2 x i16> %gid, <2 x i16> %gid, i16 0, i1 false, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x i16>, i8 } @air.gather_texture_2d.s.v4i16(ptr addrspace(1) readonly, ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32, i32)
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.wg.barrier(i32, i32)
+declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<short, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<short, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_integer_gather_imageblock_texture_golden(ll, &metal)
+            .expect("integer gather imageblock texture golden");
+        assert!(reason.contains("signed integer"), "{reason}");
+        assert!(reason.contains("imageblock"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_runtime_sampler_threadgroup_texture_golden_is_missing() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out, ptr addrspace(3) %scratch, ptr addrspace(2) %sam, <2 x i16> %gid) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) %sam, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  store <4 x half> %v, ptr addrspace(3) %scratch
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %loaded = load <4 x half>, ptr addrspace(3) %scratch
+  %wide = tail call <4 x float> @air.convert.f.v4f32.f.v4f16(<4 x half> %loaded)
+  tail call void @air.write_texture_2d.i16.v4f32(ptr addrspace(1) %out, <2 x i16> %gid, <4 x float> %wide, i16 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare <4 x float> @air.convert.f.v4f32.f.v4f16(<4 x half>)
+declare void @air.wg.barrier(i32, i32)
+declare void @air.write_texture_2d.i16.v4f32(ptr addrspace(1), <2 x i16>, <4 x float>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 8, !"air.arg_type_name", !"threadgroup half4*", !"air.arg_name", !"scratch"}
+!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sam"}
+!7 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
+            .expect("sampled half runtime sampler threadgroup texture golden");
+        assert!(reason.contains("runtime sampler"), "{reason}");
+    }
+
+    #[test]
+    fn sampled_half_cube_array_render_target_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601036873, i64 0], align 8
+
+define <4 x half> @frag(<3 x float> %normal, i32 %layer, ptr addrspace(1) %cube) #0 {
+  %z = extractelement <3 x float> %normal, i64 2
+  %nz = fneg fast float %z
+  %coord = insertelement <3 x float> %normal, float %nz, i64 2
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_cube_array.v4f16(ptr addrspace(1) %cube, ptr addrspace(2) @__air_sampler_state, <3 x float> %coord, i32 %layer, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %v = extractvalue { <4 x half>, i8 } %s, 0
+  ret <4 x half> %v
+}
+
+declare { <4 x half>, i8 } @air.sample_texture_cube_array.v4f16(ptr addrspace(1), ptr addrspace(2), <3 x float>, i32, i1, float, float, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !7}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.fragment_input", !"air.arg_type_name", !"float3", !"air.arg_name", !"normal"}
+!5 = !{i32 1, !"air.fragment_input", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"layer"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!7 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texturecube_array<half, sample>", !"air.arg_name", !"cube"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
+        let reason = incompatible_sampled_half_cube_render_target_golden(ll, &metal)
+            .expect("sampled half cube-array render-target golden");
+        assert!(reason.contains("cube texture"), "{reason}");
     }
 
     #[test]
@@ -10150,6 +19018,67 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
         let reason = incompatible_dependent_sampled_half_lookup_golden(ll, &metal)
             .expect("dependent sampled half lookup golden");
         assert!(reason.contains("finite f16"), "{reason}");
+    }
+
+    #[test]
+    fn dependent_sampled_half_texture_lookup_golden_is_missing() {
+        let ll = r#"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050624, i64 0], align 8
+
+define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %depth, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
+  %coord = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16> %gid)
+  %g = tail call { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i32 1, i32 0)
+  %gv = extractvalue { <4 x half>, i8 } %g, 0
+  %r = tail call { <4 x half>, i8 } @air.read_texture_2d.i16.v4f16(ptr addrspace(1) %depth, ptr addrspace(2) null, <2 x i16> %gid, <2 x i16> zeroinitializer, i16 0, i32 0)
+  %rv = extractvalue { <4 x half>, i8 } %r, 0
+  %sum = fadd fast <4 x half> %gv, %rv
+  %mins = tail call fast <4 x half> @air.fmin.v4f16(<4 x half> %sum, <4 x half> zeroinitializer)
+  %cmp4 = fcmp fast olt <4 x half> %mins, %sum
+  %idx4 = select <4 x i1> %cmp4, <4 x i16> <i16 2, i16 3, i16 poison, i16 poison>, <4 x i16> <i16 0, i16 1, i16 poison, i16 poison>
+  %a = extractelement <4 x i16> %idx4, i64 0
+  %b = extractelement <4 x i16> %idx4, i64 1
+  %choose_b = fcmp fast ogt half 0xH3C00, 0xH3800
+  %idx = select i1 %choose_b, i16 %a, i16 %b
+  %lane = extractelement <4 x half> %sum, i16 %idx
+  %gate = fcmp fast oge half %lane, 0xH3800
+  %gate_h = tail call fast half @air.convert.f.f16.u.i1(i1 %gate)
+  %gate_f = fpext half %gate_h to float
+  %splat0 = insertelement <2 x float> poison, float %gate_f, i64 0
+  %splat = shufflevector <2 x float> %splat0, <2 x float> poison, <2 x i32> zeroinitializer
+  %offset = fadd fast <2 x float> %coord, splat (float 1.000000e+00)
+  %lookup = tail call fast <2 x float> @air.mix.v2f32(<2 x float> %coord, <2 x float> %offset, <2 x float> %splat)
+  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %src, ptr addrspace(2) @__air_sampler_state, <2 x float> %lookup, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %outv = extractvalue { <4 x half>, i8 } %s, 0
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %out, <2 x i16> %gid, <4 x half> %outv, i16 0, i32 2)
+  ret void
+}
+
+declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
+declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
+declare { <4 x half>, i8 } @air.read_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x i16>, <2 x i16>, i16, i32)
+declare <4 x half> @air.fmin.v4f16(<4 x half>, <4 x half>)
+declare half @air.convert.f.f16.u.i1(i1)
+declare <2 x float> @air.mix.v2f32(<2 x float>, <2 x float>, <2 x float>)
+declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32)
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+
+!air.kernel = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"depth"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!7 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+"#;
+
+        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        let reason = incompatible_dependent_sampled_half_lookup_golden(ll, &metal)
+            .expect("dependent sampled half texture lookup golden");
+        assert!(reason.contains("dependent texture lookup"), "{reason}");
     }
 
     #[test]
@@ -10349,6 +19278,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -10384,6 +19314,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -10410,15 +19341,39 @@ attributes #0 = { "no-nans-fp-math"="true" }
         assert!(execution_status_is_success(RunBackend::Vulkan, "ok"));
         assert!(execution_status_is_success(RunBackend::Vulkan, "tolerance"));
         assert!(execution_status_is_success(RunBackend::Vulkan, "smoke"));
-        assert!(execution_status_is_success(
+        assert!(!execution_status_is_success(
             RunBackend::MoltenVk,
             "tolerance"
         ));
-        assert!(execution_status_is_success(RunBackend::MoltenVk, "smoke"));
+        assert!(!execution_status_is_success(RunBackend::MoltenVk, "smoke"));
         assert!(!execution_status_is_success(
             RunBackend::MoltenVk,
             "failure"
         ));
+    }
+
+    #[test]
+    fn moltenvk_compare_policy_requires_exact_output() {
+        let mut status = "tolerance".to_string();
+        let mut error = None;
+        enforce_backend_compare_policy(RunBackend::MoltenVk, &mut status, &mut error);
+        assert_eq!(status, "failure");
+        assert_eq!(
+            error.as_deref(),
+            Some("MoltenVK output differs from Metal; exact byte match required")
+        );
+
+        let mut status = "tolerance".to_string();
+        let mut error = None;
+        enforce_backend_compare_policy(RunBackend::Vulkan, &mut status, &mut error);
+        assert_eq!(status, "tolerance");
+        assert!(error.is_none());
+
+        let mut status = "smoke".to_string();
+        let mut error = Some("existing smoke reason".to_string());
+        enforce_backend_compare_policy(RunBackend::MoltenVk, &mut status, &mut error);
+        assert_eq!(status, "failure");
+        assert_eq!(error.as_deref(), Some("existing smoke reason"));
     }
 
     #[test]
@@ -10451,6 +19406,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
             "graphics pipeline probe timed out after 15s",
             "wait for compute completion: the logical or physical device has been lost",
             "wait for vertex validation completion: the logical or physical device has been lost",
+            "Vulkan device does not support SPIR-V StencilExportEXT capability",
         ] {
             assert_eq!(candidate_execution_error_status(error), "quarantine");
         }
@@ -10458,6 +19414,15 @@ attributes #0 = { "no-nans-fp-math"="true" }
             candidate_execution_error_status("create descriptor set: unsupported format"),
             "fallback"
         );
+    }
+
+    #[test]
+    fn speculative_candidate_quarantines_are_skips() {
+        assert_eq!(
+            speculative_quarantine_outcome(Some("skipped golden")),
+            ProcessOutcome::Skip
+        );
+        assert_eq!(speculative_quarantine_outcome(None), ProcessOutcome::Fail);
     }
 
     #[test]
@@ -10515,6 +19480,22 @@ attributes #0 = { "no-nans-fp-math"="true" }
     }
 
     #[test]
+    fn forced_metal_rerun_does_not_skip_existing_compare_none() {
+        let mut cfg = RunConfig::from_manifest(RunBackend::Metal);
+        let mut metal = metal_row_for_compare(&[], infer_plan(""), Some("Kernel"));
+        metal.compare = "none".into();
+
+        assert!(should_skip_existing_metal_compare_none(&cfg, &metal));
+
+        cfg.force = true;
+        assert!(!should_skip_existing_metal_compare_none(&cfg, &metal));
+
+        cfg.force = false;
+        cfg.only_status = Some("ok".into());
+        assert!(cfg.reruns_existing_backend_rows());
+    }
+
+    #[test]
     fn candidate_compare_none_uses_guarded_ll() {
         let ll = "\
 define void @spin(ptr addrspace(1) %0) {
@@ -10539,6 +19520,7 @@ define void @spin(ptr addrspace(1) %0) {
             compare: "none".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -10554,6 +19536,196 @@ define void @spin(ptr addrspace(1) %0) {
         match candidate_ll_for_metal_compare(ll, "spin", &metal).unwrap() {
             Cow::Borrowed(text) => assert_eq!(text, ll),
             Cow::Owned(_) => panic!("compare=full should keep original LL"),
+        }
+    }
+
+    #[test]
+    fn compare_none_candidate_loop_guard_uses_recorded_launch_plan_facts() {
+        let ll = r#"
+define void @stats_like(i16 %simd_size, i16 %simdgroups, ptr addrspace(1) %out) {
+entry:
+  %simd_size_wide = zext i16 %simd_size to i32
+  %simdgroups_wide = zext i16 %simdgroups to i32
+  %simd_size_minus_one = add nsw i32 %simd_size_wide, -1
+  %rounded = add nsw i32 %simd_size_minus_one, %simdgroups_wide
+  %groups_wide = sdiv i32 %rounded, %simd_size_wide
+  %groups = trunc i32 %groups_wide to i16
+  %run = icmp ugt i16 %groups, 1
+  br i1 %run, label %loop, label %exit
+loop:
+  %i = phi i16 [ %groups, %entry ], [ %next, %loop ]
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %i_wide = zext i16 %i to i32
+  %rounded_next = add nsw i32 %simd_size_minus_one, %i_wide
+  %next_wide = sdiv i32 %rounded_next, %simd_size_wide
+  %next = trunc i32 %next_wide to i16
+  %more = icmp ugt i16 %next, 1
+  br i1 %more, label %loop, label %exit
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @stats_like, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.threads_per_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"simd_size"}
+!4 = !{i32 1, !"air.simdgroups_per_threadgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"simdgroups"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+        match crate::loop_budget::classify_and_instrument(ll, "stats_like") {
+            crate::loop_budget::GuardPlan::Quarantine(reason) => {
+                assert!(reason.contains("air.wg.barrier"), "{reason}");
+            }
+            other => panic!("expected facts-free loop guard to quarantine, got {other:?}"),
+        }
+
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: "x".into(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan: HarnessPlan {
+                buffers: vec![PlanBuffer {
+                    index: 0,
+                    len: 4,
+                    role: "Output".into(),
+                    seed_tag: 1,
+                    seed_mode: SEED_MODE_DETERMINISTIC.into(),
+                    seed_layout: Vec::new(),
+                    seed_stride: None,
+                }],
+                textures: Vec::new(),
+                output: PlanOutput {
+                    kind: "buffer".into(),
+                    index: 0,
+                    format: "RawBytes".into(),
+                    len: Some(4),
+                    w: None,
+                    h: None,
+                    d: None,
+                },
+                dispatch_grid: [64, 1, 1],
+                dispatch_tg: [64, 1, 1],
+            },
+            input_sha256: None,
+            output_sha256: Some("gold".into()),
+            output_b64: None,
+            spv_sha256: None,
+            compare: "none".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: Some("stats_like".into()),
+            error: None,
+        };
+
+        match candidate_ll_for_metal_compare(ll, "stats_like", &metal).expect("candidate ll") {
+            Cow::Borrowed(_) => {}
+            Cow::Owned(text) => {
+                panic!(
+                    "expected exact launch facts to prove loop-free, got instrumentation:\n{text}"
+                )
+            }
+        }
+        assert!(incompatible_compare_none_loop_guard_golden(ll, "stats_like", &metal).is_none());
+    }
+
+    #[test]
+    fn compare_none_candidate_loop_guard_uses_generated_fc_values() {
+        let ll = r#"
+@_Z21threadsPerThreadgroup.MTL_FC_INIT_11_j = internal unnamed_addr addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+@_ZL21threadsPerThreadgroup = internal unnamed_addr addrspace(2) global i32 undef, align 4
+
+define internal void @_GLOBAL__sub_I_test() section "air.static_init" {
+  %t = load i32, ptr addrspace(2) @_Z21threadsPerThreadgroup.MTL_FC_INIT_11_j, align 4
+  store i32 %t, ptr addrspace(2) @_ZL21threadsPerThreadgroup, align 4
+  ret void
+}
+
+define void @fc_stride_like(i32 %lid) {
+entry:
+  %active = icmp ult i32 %lid, 48
+  br i1 %active, label %preheader, label %exit
+preheader:
+  %stride = load i32, ptr addrspace(2) @_ZL21threadsPerThreadgroup, align 4
+  br label %loop
+loop:
+  %i = phi i32 [ %lid, %preheader ], [ %next, %loop ]
+  tail call void @air.wg.barrier(i32 2, i32 1)
+  %next = add i32 %i, %stride
+  %more = icmp ult i32 %next, 48
+  br i1 %more, label %loop, label %exit
+exit:
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!air.function_constants = !{!5}
+!0 = !{ptr @fc_stride_like, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"lid"}
+!5 = !{ptr addrspace(2) @_Z21threadsPerThreadgroup.MTL_FC_INIT_11_j, !"uint", !"threadsPerThreadgroup", i32 11, i1 true}
+"#;
+        match crate::loop_budget::classify_and_instrument(ll, "fc_stride_like") {
+            crate::loop_budget::GuardPlan::Quarantine(reason) => {
+                assert!(reason.contains("air.wg.barrier"), "{reason}");
+            }
+            other => panic!("expected facts-free loop guard to quarantine, got {other:?}"),
+        }
+
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: "x".into(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan: HarnessPlan {
+                buffers: Vec::new(),
+                textures: Vec::new(),
+                output: PlanOutput {
+                    kind: "buffer".into(),
+                    index: 0,
+                    format: "RawBytes".into(),
+                    len: Some(4),
+                    w: None,
+                    h: None,
+                    d: None,
+                },
+                dispatch_grid: [64, 1, 1],
+                dispatch_tg: [64, 1, 1],
+            },
+            input_sha256: None,
+            output_sha256: Some("gold".into()),
+            output_b64: None,
+            spv_sha256: None,
+            compare: "none".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: Some("fc_stride_like".into()),
+            error: None,
+        };
+
+        match candidate_ll_for_metal_compare(ll, "fc_stride_like", &metal).expect("candidate ll") {
+            Cow::Borrowed(_) => {}
+            Cow::Owned(text) => {
+                panic!(
+                    "expected generated FC facts to prove loop-free, got instrumentation:\n{text}"
+                )
+            }
         }
     }
 
@@ -10585,6 +19757,7 @@ declare void @air.wg.barrier(i32, i32)
             compare: "none".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: None,
             entry: None,
             error: None,
@@ -10594,6 +19767,110 @@ declare void @air.wg.barrier(i32, i32)
             .expect("old compare=none barrier golden should require rebank");
         assert!(reason.contains("compare=none"), "{reason}");
         assert!(reason.contains("air.wg.barrier"), "{reason}");
+    }
+
+    #[test]
+    fn compare_none_simdgroup_matrix_smoke_golden_requires_rebank() {
+        let ll = r#"
+@tile = addrspace(3) global [64 x bfloat] undef, align 2
+
+define void @kernel(<64 x float> %a, <64 x float> %b, <64 x float> %c) {
+entry:
+  call void @air.wg.barrier(i32 2, i32 1)
+  %m = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float> %a, <64 x float> %b, <64 x float> %c)
+  %x = extractelement <64 x float> %m, i64 0
+  %bf = fptrunc float %x to bfloat
+  store bfloat %bf, ptr addrspace(3) @tile, align 2
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+"#;
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.compare = "none".into();
+
+        let reason = incompatible_compare_none_simdgroup_matrix_smoke_golden(ll, &metal)
+            .expect("compare=none bfloat matrix smoke row");
+        assert!(reason.contains("compare=none"), "{reason}");
+        assert!(reason.contains("simdgroup-matrix"), "{reason}");
+    }
+
+    #[test]
+    fn compare_none_half_simdgroup_matrix_smoke_golden_requires_rebank() {
+        let ll = r#"
+@tile = addrspace(3) global [64 x half] undef, align 2
+
+define void @kernel(<64 x float> %a, <64 x float> %b, <64 x float> %c) {
+entry:
+  call void @air.wg.barrier(i32 2, i32 1)
+  %m = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float> %a, <64 x float> %b, <64 x float> %c)
+  %x = extractelement <64 x float> %m, i64 0
+  %h = fptrunc float %x to half
+  store half %h, ptr addrspace(3) @tile, align 2
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+"#;
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.compare = "none".into();
+
+        let reason = incompatible_compare_none_simdgroup_matrix_smoke_golden(ll, &metal)
+            .expect("compare=none half matrix smoke row");
+        assert!(reason.contains("compare=none"), "{reason}");
+        assert!(reason.contains("simdgroup-matrix"), "{reason}");
+    }
+
+    #[test]
+    fn compare_none_float_simdgroup_matrix_smoke_golden_requires_rebank() {
+        let ll = r#"
+@tile = addrspace(3) global [64 x float] undef, align 4
+
+define void @kernel(<64 x float> %a, <64 x float> %b, <64 x float> %c) {
+entry:
+  call void @air.wg.barrier(i32 2, i32 1)
+  %m = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float> %a, <64 x float> %b, <64 x float> %c)
+  store <64 x float> %m, ptr addrspace(3) @tile, align 4
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f32.v64f32(<64 x float>, <64 x float>, <64 x float>)
+"#;
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.compare = "none".into();
+
+        let reason = incompatible_compare_none_simdgroup_matrix_smoke_golden(ll, &metal)
+            .expect("compare=none float matrix smoke row");
+        assert!(reason.contains("compare=none"), "{reason}");
+        assert!(reason.contains("simdgroup-matrix"), "{reason}");
+    }
+
+    #[test]
+    fn compare_none_raytracing_smoke_golden_requires_rebank() {
+        let ll = r#"
+define void @kernel(i32 %tid, ptr addrspace(1) %accel, ptr addrspace(1) %table) {
+entry:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.instance_acceleration_structure", !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<instancing, primitive_motion>", !"air.arg_name", !"raytracing_accel"}
+!5 = !{i32 2, !"air.visible_function_table", !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table", !"air.arg_name", !"raytracing_table"}
+"#;
+        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
+        metal.compare = "none".into();
+
+        let reason = incompatible_compare_none_raytracing_smoke_golden(ll, &metal)
+            .expect("compare=none raytracing smoke row");
+        assert!(reason.contains("compare=none"), "{reason}");
+        assert!(reason.contains("AIR raytracing"), "{reason}");
     }
 
     #[test]
@@ -10627,6 +19904,61 @@ error: unresolved visible function reference: postfixPrimary_f\n  Reason: visibl
             classify_metal_oracle_panic(err),
             "unsupported Metal visible function reference(s): postfixPrimary_f, prefixPrimary_f"
         );
+    }
+
+    #[test]
+    fn compile_missing_patch_control_point_translate_error_is_quarantine() {
+        assert!(compile_missing_unsupported_translate_error(
+            "native emitter: unsupported Metal patch control point function; tessellation patch inputs are not yet lowered"
+        ));
+    }
+
+    #[test]
+    fn compile_missing_memcpy_validation_error_is_quarantine() {
+        let ll = r#"
+define <4 x float> @fragment_main(
+    ptr readonly byval([3 x ptr addrspace(1)]) captures(none) %textures) {
+  %dst = alloca [3 x ptr addrspace(1)], align 8
+  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %textures, i64 24, i1 false)
+  ret <4 x float> zeroinitializer
+}
+
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+
+!air.fragment = !{!1}
+!1 = !{ptr @fragment_main, !2, !3}
+!2 = !{}
+!3 = !{!4}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 5, i32 3, !"air.sample",
+       !"air.arg_type_name", !"array<texture2d<half, sample>, 3>"}
+"#;
+        let memcpy_err = "spirv-val failed:\nerror: line 618: OpFunctionCall Argument <id> \
+'517[%517]'s type does not match Function <id> '3[%_ptr_Private_uchar]'s parameter type.\n\
+  %518 = OpFunctionCall %void %llvm_memcpy_p0_p0_i64 %517 %263 %ulong_24 %false";
+        let cfg_err = "spirv-val failed: error: line 526: Block '1818[%1818]' is already a merge block for another header";
+
+        assert!(compile_missing_unsupported_validation_error(ll, memcpy_err));
+        assert!(compile_missing_unsupported_validation_error(ll, cfg_err));
+        assert!(!compile_missing_unsupported_validation_error(
+            "", memcpy_err
+        ));
+        assert!(!compile_missing_unsupported_validation_error(
+            ll,
+            "spirv-val failed: error: line 1: unsupported binary version"
+        ));
+    }
+
+    #[test]
+    fn compile_missing_invalid_smoke_validation_precheck_is_quarantine() {
+        assert!(compile_missing_invalid_smoke_is_validation_quarantine(
+            "metal golden uses deterministic buffer 4 for AIR control/atomic counter input now seeded bounded_control; rebank Metal row"
+        ));
+        assert!(compile_missing_invalid_smoke_is_validation_quarantine(
+            "metal golden specializes an AIR function constant whose static initializer selects among private constant-table pointers; the current product path validates before the validation FC-specialization helper can prune that unspecialized pointer phi, so this is not a comparable Vulkan oracle yet"
+        ));
+        assert!(!compile_missing_invalid_smoke_is_validation_quarantine(
+            "metal status=fallback"
+        ));
     }
 
     #[test]
@@ -10819,6 +20151,7 @@ define <{ <4 x float>, float }> @frag(<4 x float> %position) {
             compare: "full".into(),
             fc_specialization: None,
             fc_values: None,
+            input_specialization: None,
             stage: Some("Kernel".into()),
             entry: Some("k".into()),
             error: None,
@@ -10964,6 +20297,12 @@ define <4 x float> @frag(ptr addrspace(1) %tex, ptr addrspace(2) %buf) {
         let reason = incompatible_static_resource_plan_golden(ll, &metal)
             .expect("stale static resource plan");
         assert!(reason.contains("input resource plan"), "{reason}");
+
+        metal.fc_specialization = Some(FC_SPECIALIZATION_VALUES.into());
+        metal.fc_values = Some(vec![FunctionConstantValueJson { index: 1, value: 1 }]);
+        let reason = incompatible_static_resource_plan_golden(ll, &metal)
+            .expect("stale static resource plan with FC values");
+        assert!(reason.contains("static-location plan"), "{reason}");
     }
 
     #[test]

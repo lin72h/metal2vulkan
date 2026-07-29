@@ -838,6 +838,11 @@ impl Emitter {
                 return Ok(LlType::Array(Box::new(LlType::Int(8)), size));
             }
         }
+        if global.addrspace != 3 {
+            if let Some(view) = self.flat_scalar_reinterpret_globals.get(&global.name) {
+                return Ok(view.clone());
+            }
+        }
         Ok(ty)
     }
 
@@ -877,6 +882,77 @@ impl Emitter {
         Ok(reinterpreted)
     }
 
+    pub(super) fn scan_flat_scalar_reinterpret_globals(
+        &mut self,
+    ) -> Result<HashMap<String, LlType>, String> {
+        let globals = self.ir.globals.clone();
+        let functions = self.ir.functions.clone();
+        let mut reinterpreted = HashMap::new();
+        let declared: HashMap<&str, &LlType> =
+            globals.iter().map(|g| (g.name.as_str(), &g.ty)).collect();
+        let functions_by_name: HashMap<&str, &LlFunction> =
+            functions.iter().map(|f| (f.name.as_str(), f)).collect();
+        for function in &functions {
+            for block in &function.blocks {
+                let Some(carrier) = &block.typed else {
+                    continue;
+                };
+                for inst in &carrier.insts {
+                    if let Some(gep) = &inst.gep {
+                        let LlValue::Global(base) = &gep.base.value else {
+                            continue;
+                        };
+                        let Some(declared_ty) = declared.get(base.as_str()) else {
+                            continue;
+                        };
+                        let declared_ty = self.resolve_type(declared_ty)?;
+                        let source_ty = self.resolve_type(&gep.source_ty)?;
+                        if source_ty != declared_ty {
+                            if let Some(view) =
+                                flat_scalar_reinterpret_view(&declared_ty, &source_ty)
+                            {
+                                reinterpreted.entry(base.clone()).or_insert(view);
+                            }
+                        }
+                    }
+                    let Some(call_result) = &inst.emit_scan_call else {
+                        continue;
+                    };
+                    let call = call_result.as_ref().map_err(|e| e.clone())?;
+                    let Some(callee) = functions_by_name.get(call.callee.as_str()) else {
+                        continue;
+                    };
+                    for (index, arg) in call.args.iter().enumerate() {
+                        let LlValue::Global(base) = &arg.value else {
+                            continue;
+                        };
+                        let Some(declared_ty) = declared.get(base.as_str()) else {
+                            continue;
+                        };
+                        let Some((param_name, _)) = callee.params.get(index) else {
+                            continue;
+                        };
+                        let Some(expected) =
+                            self.function_param_concrete_pointee(&callee.name, index, param_name)
+                        else {
+                            continue;
+                        };
+                        let declared_ty = self.resolve_type(declared_ty)?;
+                        let expected = self.resolve_type(&expected)?;
+                        if expected != declared_ty {
+                            if let Some(view) =
+                                flat_scalar_reinterpret_view(&declared_ty, &expected)
+                            {
+                                reinterpreted.entry(base.clone()).or_insert(view);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(reinterpreted)
+    }
+
     pub(super) fn emit_global(&mut self, global: &LlGlobal) -> Result<(), String> {
         let ty = self.global_declared_pointee(global)?;
         let storage = if global.addrspace == 3 {
@@ -890,47 +966,82 @@ impl Emitter {
                 Some(initializer) => {
                     let initializer_ty = self.resolve_type(&initializer.ty)?;
                     if initializer_ty != ty {
-                        // The byte-view remodel declared this global as a flat `[N x i8]`
-                        // (`global_declared_pointee`); flatten the all-i8-leaf initializer to the
-                        // same byte image.
+                        // Reinterpret remodels declare this global as a flat scalar array; flatten the
+                        // initializer to the same byte/scalar image.
                         let LlType::Array(elem, len) = &ty else {
                             return Err(format!(
                                 "native emitter: global {} initializer type {:?} does not match {:?}",
                                 global.name, initializer_ty, ty
                             ));
                         };
-                        if elem.as_ref() != &LlType::Int(8)
-                            || !self.byte_view_reinterpret_globals.contains(&global.name)
+                        if elem.as_ref() == &LlType::Int(8)
+                            && self.byte_view_reinterpret_globals.contains(&global.name)
                         {
+                            let mut bytes = Vec::new();
+                            self.append_i8_initializer_bytes(
+                                &initializer.value,
+                                &initializer_ty,
+                                &mut bytes,
+                            )?;
+                            if bytes.len() != *len as usize {
+                                return Err(format!(
+                                    "native emitter: global {} byte-flattened initializer is {} bytes, declared {}",
+                                    global.name,
+                                    bytes.len(),
+                                    len
+                                ));
+                            }
+                            let flat = LlValue::Array(
+                                bytes
+                                    .into_iter()
+                                    .map(|byte| TypedValue {
+                                        ty: LlType::Int(8),
+                                        value: LlValue::Int(u64::from(byte)),
+                                    })
+                                    .collect(),
+                            );
+                            self.const_initializer_id(&flat, &ty)?
+                        } else if let Some(view_ty) = self
+                            .flat_scalar_reinterpret_globals
+                            .get(&global.name)
+                            .cloned()
+                        {
+                            let Some((leaf, count)) = flat_scalar_leaf_count(&initializer_ty)
+                            else {
+                                return Err(format!(
+                                    "native emitter: global {} initializer type {:?} does not match {:?}",
+                                    global.name, initializer_ty, ty
+                                ));
+                            };
+                            let Some((view_leaf, view_count)) = flat_scalar_leaf_count(&view_ty)
+                            else {
+                                return Err(format!(
+                                    "native emitter: global {} initializer type {:?} does not match {:?}",
+                                    global.name, initializer_ty, ty
+                                ));
+                            };
+                            if !types_compatible(&view_leaf, &leaf) || view_count != count {
+                                return Err(format!(
+                                    "native emitter: global {} initializer type {:?} does not match {:?}",
+                                    global.name, initializer_ty, ty
+                                ));
+                            }
+                            let mut values = Vec::new();
+                            self.append_flat_scalar_initializer(
+                                &initializer.value,
+                                &initializer_ty,
+                                &leaf,
+                                &mut values,
+                            )?;
+                            let mut values = values.into_iter();
+                            let flat = self.scalar_initializer_from_flat(&view_ty, &mut values)?;
+                            self.const_initializer_id(&flat, &view_ty)?
+                        } else {
                             return Err(format!(
                                 "native emitter: global {} initializer type {:?} does not match {:?}",
                                 global.name, initializer_ty, ty
                             ));
                         }
-                        let mut bytes = Vec::new();
-                        self.append_i8_initializer_bytes(
-                            &initializer.value,
-                            &initializer_ty,
-                            &mut bytes,
-                        )?;
-                        if bytes.len() != *len as usize {
-                            return Err(format!(
-                                "native emitter: global {} byte-flattened initializer is {} bytes, declared {}",
-                                global.name,
-                                bytes.len(),
-                                len
-                            ));
-                        }
-                        let flat = LlValue::Array(
-                            bytes
-                                .into_iter()
-                                .map(|byte| TypedValue {
-                                    ty: LlType::Int(8),
-                                    value: LlValue::Int(u64::from(byte)),
-                                })
-                                .collect(),
-                        );
-                        self.const_initializer_id(&flat, &ty)?
                     } else {
                         self.const_initializer_id(&initializer.value, &initializer.ty)?
                     }
@@ -1003,6 +1114,99 @@ impl Emitter {
             other => Err(format!(
                 "native emitter: cannot byte-flatten initializer {other:?} of {ty:?}"
             )),
+        }
+    }
+
+    fn append_flat_scalar_initializer(
+        &mut self,
+        value: &LlValue,
+        ty: &LlType,
+        leaf: &LlType,
+        out: &mut Vec<TypedValue>,
+    ) -> Result<(), String> {
+        let ty = self.resolve_type(ty)?;
+        match value {
+            LlValue::Zero | LlValue::Undef => {
+                let (actual_leaf, count) = flat_scalar_leaf_count(&ty).ok_or_else(|| {
+                    format!("native emitter: cannot scalar-flatten zero of {ty:?}")
+                })?;
+                if !types_compatible(&actual_leaf, leaf) {
+                    return Err(format!(
+                        "native emitter: cannot scalar-flatten {ty:?} as {leaf:?}"
+                    ));
+                }
+                out.extend(std::iter::repeat_n(
+                    TypedValue {
+                        ty: leaf.clone(),
+                        value: LlValue::Zero,
+                    },
+                    count as usize,
+                ));
+                Ok(())
+            }
+            LlValue::Array(elems) | LlValue::Struct(elems) => {
+                for elem in elems {
+                    self.append_flat_scalar_initializer(&elem.value, &elem.ty, leaf, out)?;
+                }
+                Ok(())
+            }
+            scalar if types_compatible(&ty, leaf) => {
+                out.push(TypedValue {
+                    ty,
+                    value: scalar.clone(),
+                });
+                Ok(())
+            }
+            other => Err(format!(
+                "native emitter: cannot scalar-flatten initializer {other:?} of {ty:?} as {leaf:?}"
+            )),
+        }
+    }
+
+    fn scalar_initializer_from_flat<I>(
+        &mut self,
+        ty: &LlType,
+        values: &mut I,
+    ) -> Result<LlValue, String>
+    where
+        I: Iterator<Item = TypedValue>,
+    {
+        let ty = self.resolve_type(ty)?;
+        match ty {
+            LlType::Array(elem, len) => {
+                let elem = self.resolve_type(&elem)?;
+                let mut elems = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    elems.push(TypedValue {
+                        ty: elem.clone(),
+                        value: self.scalar_initializer_from_flat(&elem, values)?,
+                    });
+                }
+                Ok(LlValue::Array(elems))
+            }
+            LlType::Struct(fields) => {
+                let mut elems = Vec::with_capacity(fields.len());
+                for field in fields {
+                    let field = self.resolve_type(&field)?;
+                    elems.push(TypedValue {
+                        ty: field.clone(),
+                        value: self.scalar_initializer_from_flat(&field, values)?,
+                    });
+                }
+                Ok(LlValue::Struct(elems))
+            }
+            scalar => {
+                let value = values
+                    .next()
+                    .ok_or_else(|| format!("native emitter: missing scalar for {scalar:?}"))?;
+                if !types_compatible(&value.ty, &scalar) {
+                    return Err(format!(
+                        "native emitter: scalar initializer {:?} does not match {scalar:?}",
+                        value.ty
+                    ));
+                }
+                Ok(value.value)
+            }
         }
     }
 
@@ -1157,6 +1361,23 @@ impl Emitter {
         ));
         self.interner.function_types.insert(key, id);
         id
+    }
+}
+
+fn flat_scalar_reinterpret_view(declared: &LlType, source: &LlType) -> Option<LlType> {
+    let (declared_leaf, declared_count) = flat_scalar_leaf_count(declared)?;
+    let (source_leaf, source_count) = flat_scalar_leaf_count(source)?;
+    if source_count == 0
+        || !types_compatible(&declared_leaf, &source_leaf)
+        || declared_count % source_count != 0
+    {
+        return None;
+    }
+    let len = declared_count / source_count;
+    if len == 1 {
+        Some(source.clone())
+    } else {
+        Some(LlType::Array(Box::new(source.clone()), len))
     }
 }
 

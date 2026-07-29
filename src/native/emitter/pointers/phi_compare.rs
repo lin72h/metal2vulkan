@@ -232,6 +232,9 @@ impl Emitter {
                 return Ok(());
             }
         }
+        if self.emit_raw_pointer_icmp(pred, &name, &lhs.value, &rhs.value, instructions)? {
+            return Ok(());
+        }
         if self.emit_provenance_pointer_icmp(pred, &name, &lhs.value, &rhs.value, instructions)? {
             return Ok(());
         }
@@ -342,6 +345,65 @@ impl Emitter {
         Ok(())
     }
 
+    pub(in crate::native::emitter) fn emit_raw_pointer_icmp(
+        &mut self,
+        pred: Op,
+        name: &str,
+        lhs: &LlValue,
+        rhs: &LlValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !matches!(pred, Op::IEqual | Op::INotEqual) {
+            return Ok(false);
+        }
+        let (LlValue::Local(lhs_name), LlValue::Local(rhs_name)) = (lhs, rhs) else {
+            return Ok(false);
+        };
+        let (Some(lhs_raw), Some(rhs_raw)) = (
+            self.raw_offsets.get(lhs_name).cloned(),
+            self.raw_offsets.get(rhs_name).cloned(),
+        ) else {
+            return Ok(false);
+        };
+        if lhs_raw.root != rhs_raw.root
+            || lhs_raw.addrspace != rhs_raw.addrspace
+            || lhs_raw.device_addr_base != rhs_raw.device_addr_base
+            || lhs_raw.unmodelable
+            || rhs_raw.unmodelable
+        {
+            return Ok(false);
+        }
+
+        let result_ty = LlType::Bool;
+        let result_type = self.type_id(&result_ty)?;
+        let equal = self.fresh();
+        let lhs_index = self.emit_raw_byte_index(&lhs_raw, 0, instructions)?;
+        let rhs_index = self.emit_raw_byte_index(&rhs_raw, 0, instructions)?;
+        instructions.push(Self::inst(
+            Op::IEqual,
+            Some(result_type),
+            Some(equal),
+            vec![Operand::IdRef(lhs_index), Operand::IdRef(rhs_index)],
+        ));
+        let result = self.result_id(name, &result_ty)?;
+        match pred {
+            Op::IEqual => instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(equal)],
+            )),
+            Op::INotEqual => instructions.push(Self::inst(
+                Op::LogicalNot,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(equal)],
+            )),
+            _ => unreachable!(),
+        }
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_provenance_pointer_icmp(
         &mut self,
         pred: Op,
@@ -442,6 +504,7 @@ impl Emitter {
             addrspace: root_provenance.addrspace,
             source_ty: root_provenance.source_ty,
             indices,
+            root_indices: None,
             root_is_indexed_container: root_provenance.root_is_indexed_container,
         })
     }

@@ -544,7 +544,9 @@ impl ShaderReflection {
                 },
                 FragRole::Position
                 | FragRole::PointCoord
+                | FragRole::FrontFacing
                 | FragRole::PrimitiveId
+                | FragRole::SampleId
                 | FragRole::ViewportArrayIndex
                 | FragRole::Varying(_)
                 | FragRole::Other => {

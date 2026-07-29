@@ -128,7 +128,8 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     let mut retyped_load_ptr: HashMap<Word, (Word, Word)> = HashMap::new(); // handle -> (image_ty, p)
     let mut dead_roots: Vec<Word> = Vec::new();
     for (&handle, &(arrayvar, idx)) in &handles {
-        let &(elem_image_ty, dim, comp) = ctx.image_array_vars.get(&arrayvar).unwrap();
+        let &(elem_image_ty, dim, comp, multisampled) =
+            ctx.image_array_vars.get(&arrayvar).unwrap();
         let ptr_image = ctx.ty_ptr(StorageClass::UniformConstant, elem_image_ty);
         let p = ctx.module.fresh_id();
         new_access_chains.insert(
@@ -143,6 +144,9 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         retyped_load_ptr.insert(handle, (elem_image_ty, p));
         ctx.image_dims.insert(handle, dim);
         ctx.image_comp.insert(handle, comp);
+        if multisampled {
+            ctx.image_multisampled.insert(handle);
+        }
         if image_type_is_storage(ctx, elem_image_ty) {
             ctx.image_storage.insert(handle);
         }

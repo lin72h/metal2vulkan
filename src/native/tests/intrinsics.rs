@@ -428,6 +428,39 @@ declare void @postfixPrimary_f.MTL_VISIBLE_FN_REF(ptr addrspace(2)) section "air
 }
 
 #[test]
+fn native_patch_control_point_reference_fails_before_emit() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <{ <4 x float> }> @main(ptr %patch) {
+entry:
+  %cp = tail call { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32 0, ptr %patch)
+  %pos = insertvalue <{ <4 x float> }> undef, <4 x float> zeroinitializer, 0
+  ret <{ <4 x float> }> %pos
+}
+
+declare { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32, ptr) section "air.externally_defined"
+!air.vertex = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.patch_control_point_input", !5}
+!5 = !{!"air.patch_control_point_function", ptr @control.MTL_CONTROL_POINT_FN}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_patch_control_point_ref_{}",
+        std::process::id()
+    ));
+    let err = crate::translate_sanitized_native(ll, Stage::Vertex, &tmp)
+        .expect_err("patch control point functions are unsupported");
+    assert!(
+        err.contains("unsupported Metal patch control point function"),
+        "{err}"
+    );
+    assert!(err.contains("Vulkan tessellation interface"), "{err}");
+}
+
+#[test]
 fn native_reverse_bits_intrinsic_lowers() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

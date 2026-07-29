@@ -41,7 +41,7 @@ use vulkano::pipeline::graphics::color_blend::{
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
 use vulkano::pipeline::graphics::multisample::MultisampleState;
-use vulkano::pipeline::graphics::rasterization::RasterizationState;
+use vulkano::pipeline::graphics::rasterization::{FrontFace, RasterizationState};
 use vulkano::pipeline::graphics::subpass::PipelineRenderingCreateInfo;
 use vulkano::pipeline::graphics::vertex_input::{
     VertexInputAttributeDescription, VertexInputBindingDescription, VertexInputState,
@@ -122,6 +122,11 @@ fn preflight_shader_device_support(stage: Stage, spv: &[u8]) -> Result<(), Strin
             32 if !features.shader_clip_distance => {
                 return Err("Vulkan device does not support SPIR-V ClipDistance capability".into());
             }
+            35 if !features.sample_rate_shading => {
+                return Err(
+                    "Vulkan device does not support SPIR-V SampleRateShading capability".into(),
+                );
+            }
             5013 if !extensions.ext_shader_stencil_export => {
                 return Err(
                     "Vulkan device does not support SPIR-V StencilExportEXT capability".into(),
@@ -188,6 +193,10 @@ fn preflight_texture_binding_view_conflicts(spv: &[u8]) -> Result<(), String> {
 }
 
 pub(crate) fn fragment_writes_color_location(spv: &[u8], location: u32) -> bool {
+    fragment_color_output_locations(spv).contains(&location)
+}
+
+fn fragment_color_output_locations(spv: &[u8]) -> Vec<u32> {
     const OP_TYPE_POINTER: u32 = 32;
     const OP_VARIABLE: u32 = 59;
     const OP_DECORATE: u32 = 71;
@@ -196,7 +205,7 @@ pub(crate) fn fragment_writes_color_location(spv: &[u8], location: u32) -> bool 
     const STORAGE_CLASS_OUTPUT: u32 = 3;
 
     let Ok(words) = bytes_to_words(spv) else {
-        return true;
+        return Vec::new();
     };
     let mut variable_locations = HashMap::new();
     let mut member_locations: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -208,7 +217,7 @@ pub(crate) fn fragment_writes_color_location(spv: &[u8], location: u32) -> bool 
         let word_count = (word >> 16) as usize;
         let opcode = word & 0xffff;
         if word_count == 0 || index + word_count > words.len() {
-            return true;
+            return Vec::new();
         }
         match opcode {
             OP_TYPE_POINTER if word_count >= 4 => {
@@ -231,19 +240,113 @@ pub(crate) fn fragment_writes_color_location(spv: &[u8], location: u32) -> bool 
         index += word_count;
     }
 
-    output_variables
+    let mut out = output_variables
         .into_iter()
-        .any(|(variable_id, pointer_type_id)| {
-            variable_locations.get(&variable_id) == Some(&location)
-                || pointer_pointees
-                    .get(&pointer_type_id)
-                    .and_then(|pointee_id| member_locations.get(pointee_id))
-                    .is_some_and(|locations| locations.contains(&location))
+        .flat_map(|(variable_id, pointer_type_id)| {
+            let direct = variable_locations.get(&variable_id).copied().into_iter();
+            let members = pointer_pointees
+                .get(&pointer_type_id)
+                .and_then(|pointee_id| member_locations.get(pointee_id))
+                .into_iter()
+                .flatten()
+                .copied();
+            direct.chain(members).collect::<Vec<_>>()
         })
+        .collect::<Vec<_>>();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn render_target_writes_color0(format: DataFormat, fragment_spv: &[u8]) -> bool {
     !is_depth_format(format) && fragment_writes_color_location(fragment_spv, 0)
+}
+
+fn fragment_render_target_attachment_formats(
+    sanitized_ll: &str,
+    output_format: DataFormat,
+    fragment_spv: &[u8],
+) -> Vec<Option<DataFormat>> {
+    let mut declared_formats = HashMap::new();
+    for line in sanitized_ll
+        .lines()
+        .filter(|line| line.contains(r#""air.render_target""#))
+    {
+        let Some(index) = metadata_i32_after(line, "air.render_target") else {
+            continue;
+        };
+        let Some(type_name) = metadata_string_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(format) = fragment_color_format_from_air_type(&type_name) else {
+            continue;
+        };
+        declared_formats.entry(index).or_insert(format);
+    }
+
+    let written_locations = fragment_color_output_locations(fragment_spv);
+    let mut formats = HashMap::new();
+    for location in written_locations {
+        let format = declared_formats
+            .get(&location)
+            .copied()
+            .unwrap_or(output_format);
+        formats.insert(location, format);
+    }
+
+    if formats.is_empty() && render_target_writes_color0(output_format, fragment_spv) {
+        formats.insert(0, output_format);
+    }
+
+    if formats.is_empty() {
+        return Vec::new();
+    }
+
+    let max_location = formats.keys().copied().max().unwrap_or(0);
+    let mut out = vec![None; max_location as usize + 1];
+    for (location, format) in formats {
+        let format = if location == 0 { output_format } else { format };
+        out[location as usize] = Some(format);
+    }
+    out
+}
+
+fn make_render_color_attachment_views(
+    memory_allocator: Arc<StandardMemoryAllocator>,
+    formats: &[Option<DataFormat>],
+    output_format: DataFormat,
+    extent: Extent3d,
+    color0_view: Arc<ImageView>,
+) -> Vec<Option<Arc<ImageView>>> {
+    formats
+        .iter()
+        .enumerate()
+        .map(|(index, format)| {
+            let format = (*format)?;
+            if index == 0 && format == output_format {
+                return Some(color0_view.clone());
+            }
+            let image = Image::new(
+                memory_allocator.clone(),
+                ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: vulkan_format(format),
+                    extent: [extent.width, extent.height, 1],
+                    usage: render_target_usage(format),
+                    ..Default::default()
+                },
+                AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("create extra render target image {index}: {e}"));
+            Some(
+                ImageView::new_default(image)
+                    .unwrap_or_else(|e| panic!("create extra render target view {index}: {e}")),
+            )
+        })
+        .collect()
 }
 
 fn fragment_has_flat_integer_input(spv: &[u8]) -> bool {
@@ -393,7 +496,7 @@ fn execute_compute(
     );
     let (device, queue) = device_and_queue(QueueFlags::COMPUTE, false);
     preflight_nvidia_compute_pipeline(&device, spv, tmp)?;
-    let pipeline = compute_pipeline(device.clone(), spv);
+    let pipeline = compute_pipeline(device.clone(), spv)?;
     let texture_reqs = required_texture_bindings(device.clone(), spv);
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
     let mut buffers = make_buffers(memory_allocator.clone(), inputs);
@@ -559,18 +662,22 @@ fn execute_render_fragment(
 
     let (device, queue) = device_and_queue(QueueFlags::GRAPHICS, true);
     let depth_output = is_depth_format(format);
-    let writes_color0 = render_target_writes_color0(format, fragment_spv);
+    let color_attachment_formats = if depth_output {
+        Vec::new()
+    } else {
+        fragment_render_target_attachment_formats(sanitized_ll, format, fragment_spv)
+    };
     let target = RenderPipelineTarget {
         format,
         extent,
-        writes_color0,
+        color_attachment_formats,
         depth_output,
     };
     preflight_nvidia_fragment_graphics_pipeline(
         &device,
         &vertex_spv,
         fragment_spv,
-        target,
+        target.clone(),
         inputs.render.blend,
         tmp,
     )?;
@@ -578,7 +685,7 @@ fn execute_render_fragment(
         device.clone(),
         &vertex_spv,
         fragment_spv,
-        target,
+        target.clone(),
         inputs.render.blend,
     );
     let texture_reqs = required_texture_bindings(device.clone(), fragment_spv);
@@ -632,6 +739,13 @@ fn execute_render_fragment(
     )
     .expect("create render target image");
     let view = ImageView::new_default(image.clone()).expect("create render target view");
+    let color_attachment_views = make_render_color_attachment_views(
+        memory_allocator.clone(),
+        &target.color_attachment_formats,
+        format,
+        extent,
+        view.clone(),
+    );
     let target_staging = Buffer::from_iter(
         memory_allocator.clone(),
         BufferCreateInfo {
@@ -695,15 +809,23 @@ fn execute_render_fragment(
             .unwrap_or_else(|e| panic!("upload color input {}: {e}", color_input.index));
     }
 
-    let color_attachments = if writes_color0 {
-        vec![Some(RenderingAttachmentInfo {
-            load_op: AttachmentLoadOp::Load,
-            store_op: AttachmentStoreOp::Store,
-            ..RenderingAttachmentInfo::image_view(view.clone())
-        })]
-    } else {
-        Vec::new()
-    };
+    let color_attachments = color_attachment_views
+        .iter()
+        .enumerate()
+        .map(|(index, attachment_view)| {
+            attachment_view
+                .as_ref()
+                .map(|attachment_view| RenderingAttachmentInfo {
+                    load_op: if index == 0 {
+                        AttachmentLoadOp::Load
+                    } else {
+                        AttachmentLoadOp::DontCare
+                    },
+                    store_op: AttachmentStoreOp::Store,
+                    ..RenderingAttachmentInfo::image_view(attachment_view.clone())
+                })
+        })
+        .collect();
     let depth_attachment = if depth_output {
         Some(RenderingAttachmentInfo {
             load_op: AttachmentLoadOp::Load,
@@ -774,7 +896,7 @@ fn execute_vertex(
     let (device, queue) = device_and_queue(QueueFlags::GRAPHICS, true);
     let vertex_inputs = vertex_inputs(sanitized_ll);
     preflight_nvidia_vertex_validation_graphics_pipeline(&device, vertex_spv, sanitized_ll, tmp)?;
-    let pipeline = vertex_pipeline(device.clone(), vertex_spv, &vertex_inputs);
+    let pipeline = vertex_pipeline(device.clone(), vertex_spv, &vertex_inputs)?;
     let texture_reqs = required_texture_bindings(device.clone(), vertex_spv);
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
     let buffers = make_buffers(memory_allocator.clone(), inputs);
@@ -1105,6 +1227,9 @@ pub fn device_and_queue_result(
     if physical_device.supported_features().image_cube_array {
         enabled_features.image_cube_array = true;
     }
+    if physical_device.supported_features().sample_rate_shading {
+        enabled_features.sample_rate_shading = true;
+    }
     let enabled_extensions = DeviceExtensions {
         ext_shader_atomic_float: true,
         ext_shader_stencil_export: physical_device
@@ -1135,32 +1260,34 @@ pub fn device_and_queue_result(
     Ok((device, queue))
 }
 
-fn compute_pipeline(device: Arc<Device>, spv: &[u8]) -> Arc<ComputePipeline> {
+fn compute_pipeline(device: Arc<Device>, spv: &[u8]) -> Result<Arc<ComputePipeline>, String> {
     let words = bytes_to_words(spv).expect("SPIR-V bytes must decode to words");
     let module = unsafe { ShaderModule::new(device.clone(), ShaderModuleCreateInfo::new(&words)) }
-        .expect("create shader module");
-    let entry = module.entry_point("main").expect("SPIR-V entry point main");
+        .map_err(|error| format!("create shader module: {error}"))?;
+    let entry = module
+        .entry_point("main")
+        .ok_or_else(|| "SPIR-V entry point main not found".to_string())?;
     let stage = PipelineShaderStageCreateInfo::new(entry);
     let layout = PipelineLayout::new(
         device.clone(),
         PipelineDescriptorSetLayoutCreateInfo::from_stages([&stage])
             .into_pipeline_layout_create_info(device.clone())
-            .expect("reflect compute pipeline layout"),
+            .map_err(|error| format!("reflect compute pipeline layout: {error}"))?,
     )
-    .expect("create compute pipeline layout");
+    .map_err(|error| format!("create compute pipeline layout: {error}"))?;
     ComputePipeline::new(
         device,
         None,
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
-    .expect("create compute pipeline")
+    .map_err(|error| format!("create compute pipeline: {error}"))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct RenderPipelineTarget {
     format: DataFormat,
     extent: Extent3d,
-    writes_color0: bool,
+    color_attachment_formats: Vec<Option<DataFormat>>,
     depth_output: bool,
 }
 
@@ -1191,7 +1318,10 @@ fn graphics_pipeline(
         depth_range: 0.0..=1.0,
     };
     create_info.viewport_state = Some(viewport_state);
-    create_info.rasterization_state = Some(RasterizationState::default());
+    create_info.rasterization_state = Some(RasterizationState {
+        front_face: FrontFace::Clockwise,
+        ..RasterizationState::default()
+    });
     create_info.multisample_state = Some(MultisampleState::default());
     create_info.depth_stencil_state = target.depth_output.then(|| DepthStencilState {
         depth: Some(DepthState {
@@ -1200,19 +1330,19 @@ fn graphics_pipeline(
         }),
         ..Default::default()
     });
-    create_info.color_blend_state = if target.writes_color0 {
+    create_info.color_blend_state = if target.color_attachment_formats.is_empty() {
+        None
+    } else {
         Some(ColorBlendState::with_attachment_states(
-            1,
+            target.color_attachment_formats.len() as u32,
             color_blend_attachment(blend),
         ))
-    } else {
-        None
     };
-    let color_attachment_formats = if target.writes_color0 {
-        vec![Some(vulkan_format(target.format))]
-    } else {
-        Vec::new()
-    };
+    let color_attachment_formats = target
+        .color_attachment_formats
+        .iter()
+        .map(|format| format.map(vulkan_format))
+        .collect();
     let depth_attachment_format = target.depth_output.then(|| vulkan_format(target.format));
     create_info.subpass = Some(
         PipelineRenderingCreateInfo {
@@ -1271,7 +1401,9 @@ fn run_graphics_pipeline_probe_child(
         .arg(format!("{:?}", target.format))
         .arg(target.extent.width.to_string())
         .arg(target.extent.height.to_string())
-        .arg(if target.writes_color0 { "1" } else { "0" })
+        .arg(probe_color_attachment_formats_arg(
+            &target.color_attachment_formats,
+        ))
         .arg(if target.depth_output { "1" } else { "0" })
         .arg(format!("{:?}", blend))
         .env("RUST_BACKTRACE", "0")
@@ -1537,7 +1669,7 @@ where
     if args.len() != 8 {
         eprintln!(
             "usage: --graphics-pipeline-probe <vertex.spv> <fragment.spv> <format> \
-             <width> <height> <writes-color0:0|1> <depth-output:0|1> <blend>"
+             <width> <height> <color-attachments> <depth-output:0|1> <blend>"
         );
         return 2;
     }
@@ -1554,7 +1686,8 @@ where
             .ok_or_else(|| "unknown graphics probe format".to_string())?;
         let width = parse_probe_u32(&args[3], "width")?;
         let height = parse_probe_u32(&args[4], "height")?;
-        let writes_color0 = parse_probe_bool(&args[5], "writes-color0")?;
+        let color_attachment_formats =
+            parse_probe_color_attachment_formats(&args[5], "color-attachments")?;
         let depth_output = parse_probe_bool(&args[6], "depth-output")?;
         let blend = args[7]
             .to_str()
@@ -1564,7 +1697,7 @@ where
         let target = RenderPipelineTarget {
             format,
             extent: Extent3d::new(width, height, 1),
-            writes_color0,
+            color_attachment_formats,
             depth_output,
         };
         let result = catch_probe_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1602,9 +1735,9 @@ where
         let (device, _) = device_and_queue_result(QueueFlags::GRAPHICS, true)?;
         let vertex_inputs = vertex_inputs(&sanitized_ll);
         let result = catch_probe_unwind(std::panic::AssertUnwindSafe(|| {
-            let _pipeline = vertex_pipeline(device, &vertex_spv, &vertex_inputs);
+            vertex_pipeline(device, &vertex_spv, &vertex_inputs).map(|_| ())
         }));
-        result.map_err(crate::corpus_run::panic_payload_message)?;
+        result.map_err(crate::corpus_run::panic_payload_message)??;
         Ok(())
     };
 
@@ -1632,9 +1765,9 @@ where
             .map_err(|error| format!("read {}: {error}", compute_path.display()))?;
         let (device, _) = device_and_queue_result(QueueFlags::COMPUTE, false)?;
         let result = catch_probe_unwind(std::panic::AssertUnwindSafe(|| {
-            let _pipeline = compute_pipeline(device, &compute_spv);
+            compute_pipeline(device, &compute_spv).map(|_| ())
         }));
-        result.map_err(crate::corpus_run::panic_payload_message)?;
+        result.map_err(crate::corpus_run::panic_payload_message)??;
         Ok(())
     };
 
@@ -1688,6 +1821,45 @@ fn parse_probe_blend(value: &str) -> Option<BlendMode> {
     }
 }
 
+fn probe_color_attachment_formats_arg(formats: &[Option<DataFormat>]) -> String {
+    if formats.is_empty() {
+        return "-".to_string();
+    }
+    formats
+        .iter()
+        .map(|format| {
+            format
+                .map(|format| format!("{format:?}"))
+                .unwrap_or_else(|| "none".to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_probe_color_attachment_formats(
+    value: &std::ffi::OsStr,
+    label: &str,
+) -> Result<Vec<Option<DataFormat>>, String> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| format!("{label} is not UTF-8"))?;
+    if value == "-" {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(|part| {
+            if part == "none" {
+                Ok(None)
+            } else {
+                parse_probe_format(part)
+                    .map(Some)
+                    .ok_or_else(|| format!("{label}: unknown format {part}"))
+            }
+        })
+        .collect()
+}
+
 fn parse_probe_bool(value: &std::ffi::OsStr, label: &str) -> Result<bool, String> {
     match value.to_str() {
         Some("0") => Ok(false),
@@ -1708,34 +1880,47 @@ fn vertex_pipeline(
     device: Arc<Device>,
     vertex_spv: &[u8],
     vertex_inputs: &[VertexInput],
-) -> Arc<GraphicsPipeline> {
+) -> Result<Arc<GraphicsPipeline>, String> {
     let vertex_stage = shader_stage(device.clone(), vertex_spv);
-    let layout = PipelineLayout::new(
-        device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages([&vertex_stage])
-            .into_pipeline_layout_create_info(device.clone())
-            .expect("reflect vertex validation pipeline layout"),
-    )
-    .expect("create vertex validation pipeline layout");
+    let layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages([&vertex_stage])
+        .into_pipeline_layout_create_info(device.clone())
+        .map_err(|error| format!("reflect vertex validation pipeline layout: {error}"))?;
+    let layout = PipelineLayout::new(device.clone(), layout_info)
+        .map_err(|error| format!("create vertex validation pipeline layout: {error}"))?;
+    let create_info = vertex_validation_pipeline_create_info(layout, vertex_stage, vertex_inputs);
+    if spirv_capabilities(vertex_spv).is_ok_and(|caps| caps.contains(&32)) {
+        // Vulkano 0.35's shader-stage validation unwraps ClipDistance decorations as if the
+        // decoration target were the array type rather than the output variable. The SPIR-V has
+        // already passed spirv-val and Vulkan still validates pipeline creation below.
+        unsafe { GraphicsPipeline::new_unchecked(device, None, create_info) }
+            .map_err(|error| format!("create vertex validation pipeline: {error:?}"))
+    } else {
+        GraphicsPipeline::new(device, None, create_info)
+            .map_err(|error| format!("create vertex validation pipeline: {error:?}"))
+    }
+}
+
+fn vertex_validation_pipeline_create_info(
+    layout: Arc<PipelineLayout>,
+    vertex_stage: PipelineShaderStageCreateInfo,
+    vertex_inputs: &[VertexInput],
+) -> GraphicsPipelineCreateInfo {
     let mut create_info = GraphicsPipelineCreateInfo::layout(layout);
     create_info.stages = [vertex_stage].into_iter().collect();
     create_info.vertex_input_state = Some(vertex_input_state(vertex_inputs));
     create_info.input_assembly_state = Some(InputAssemblyState::default());
+    create_info.viewport_state = vertex_validation_viewport_state();
     create_info.rasterization_state = Some(RasterizationState {
         rasterizer_discard_enable: true,
         ..RasterizationState::default()
     });
     create_info.depth_stencil_state = Some(DepthStencilState::default());
     create_info.subpass = Some(PipelineRenderingCreateInfo::default().into());
-    if spirv_capabilities(vertex_spv).is_ok_and(|caps| caps.contains(&32)) {
-        // Vulkano 0.35's shader-stage validation unwraps ClipDistance decorations as if the
-        // decoration target were the array type rather than the output variable. The SPIR-V has
-        // already passed spirv-val and Vulkan still validates pipeline creation below.
-        unsafe { GraphicsPipeline::new_unchecked(device, None, create_info) }
-            .expect("create vertex validation pipeline")
-    } else {
-        GraphicsPipeline::new(device, None, create_info).expect("create vertex validation pipeline")
-    }
+    create_info
+}
+
+fn vertex_validation_viewport_state() -> Option<ViewportState> {
+    None
 }
 
 fn color_blend_attachment(blend: BlendMode) -> ColorBlendAttachmentState {
@@ -3239,7 +3424,10 @@ fn make_texture_readback(
             extent,
         } => {
             let kind = texture_kind(Some(sanitized_ll), index);
-            let readback_format = reflected_texture_format(format, texture_reqs.get(&index));
+            let readback_format = reflected_texture_format(
+                format,
+                texture_binding_req_for_index(texture_reqs, index),
+            );
             let len = texture_byte_len(readback_format, texture_output_extent(extent, kind));
             Some(
                 Buffer::from_iter(
@@ -3684,7 +3872,7 @@ fn descriptor_set(
                         textures,
                         texture_index,
                         info.descriptor_count,
-                        texture_reqs.get(&texture_index),
+                        texture_binding_req_for_index(texture_reqs, texture_index),
                     ),
                 )
             }
@@ -3702,7 +3890,7 @@ fn descriptor_set(
                         textures,
                         texture_index,
                         info.descriptor_count,
-                        texture_reqs.get(&texture_index),
+                        texture_binding_req_for_index(texture_reqs, texture_index),
                     ),
                 )
             }
@@ -4007,6 +4195,68 @@ mod tests {
 
     fn spirv_bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn fragment_render_target_attachment_formats_include_all_mrt_locations() {
+        let ll = r#"
+!air.fragment = !{!15}
+!15 = !{ptr @frag, !16, !25}
+!16 = !{!17, !18, !19, !20, !21, !22, !23, !24}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"int4"}
+!18 = !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"int4"}
+!19 = !{!"air.render_target", i32 2, i32 0, !"air.arg_type_name", !"int4"}
+!20 = !{!"air.render_target", i32 3, i32 0, !"air.arg_type_name", !"int4"}
+!21 = !{!"air.render_target", i32 4, i32 0, !"air.arg_type_name", !"int4"}
+!22 = !{!"air.render_target", i32 5, i32 0, !"air.arg_type_name", !"int4"}
+!23 = !{!"air.render_target", i32 6, i32 0, !"air.arg_type_name", !"int4"}
+!24 = !{!"air.render_target", i32 7, i32 0, !"air.arg_type_name", !"int4"}
+"#;
+        let mut words = vec![0x0723_0203, 0x0001_0300, 0, 32, 0];
+        words.extend(spirv_inst(21, &[1, 32, 1])); // sint
+        words.extend(spirv_inst(23, &[2, 1, 4])); // v4sint
+        words.extend(spirv_inst(32, &[3, 3, 2])); // Output pointer to v4sint
+        for location in 0..8 {
+            let var = 10 + location;
+            words.extend(spirv_inst(59, &[3, var, 3])); // Output variable
+            words.extend(spirv_inst(71, &[var, 30, location])); // Location
+        }
+
+        let formats = fragment_render_target_attachment_formats(
+            ll,
+            DataFormat::Rgba32Sint,
+            &spirv_bytes(&words),
+        );
+
+        assert_eq!(formats.len(), 8);
+        assert!(formats
+            .iter()
+            .all(|format| *format == Some(DataFormat::Rgba32Sint)));
+    }
+
+    #[test]
+    fn fragment_render_target_attachment_formats_ignore_unwritten_metadata_locations() {
+        let ll = r#"
+!air.fragment = !{!15}
+!15 = !{ptr @frag, !16, !25}
+!16 = !{!17, !18}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!18 = !{!"air.render_target", i32 4, i32 0, !"air.arg_type_name", !"int4"}
+"#;
+        let mut words = vec![0x0723_0203, 0x0001_0300, 0, 16, 0];
+        words.extend(spirv_inst(22, &[1, 32])); // float
+        words.extend(spirv_inst(23, &[2, 1, 4])); // v4float
+        words.extend(spirv_inst(32, &[3, 3, 2])); // Output pointer to v4float
+        words.extend(spirv_inst(59, &[3, 10, 3])); // Output variable
+        words.extend(spirv_inst(71, &[10, 30, 0])); // Location 0
+
+        let formats = fragment_render_target_attachment_formats(
+            ll,
+            DataFormat::Rgba32Float,
+            &spirv_bytes(&words),
+        );
+
+        assert_eq!(formats, vec![Some(DataFormat::Rgba32Float)]);
     }
 
     #[test]
@@ -4400,6 +4650,11 @@ mod tests {
             .expect("static sampler should use first unoccupied sampler-band binding");
         assert_eq!(state.filter, Filter::Linear);
         assert_eq!(state.address_mode, [SamplerAddressMode::ClampToEdge; 3]);
+    }
+
+    #[test]
+    fn vertex_validation_pipeline_omits_viewport_state_under_discard() {
+        assert!(vertex_validation_viewport_state().is_none());
     }
 
     #[test]

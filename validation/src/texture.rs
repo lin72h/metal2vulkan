@@ -123,8 +123,14 @@ pub(crate) fn texture_kind_from_type_name(name: Option<&str>) -> TextureKind {
         Some(name) if name.starts_with("texture2d_array") || name.starts_with("depth2d_array") => {
             TextureKind::Dim2dArray
         }
-        Some(name) if name.starts_with("texturecube_array<") => TextureKind::CubeArray,
-        Some(name) if name.starts_with("texturecube<") => TextureKind::Cube,
+        Some(name)
+            if name.starts_with("texturecube_array<") || name.starts_with("depthcube_array<") =>
+        {
+            TextureKind::CubeArray
+        }
+        Some(name) if name.starts_with("texturecube<") || name.starts_with("depthcube<") => {
+            TextureKind::Cube
+        }
         _ => TextureKind::Plain,
     }
 }
@@ -161,7 +167,15 @@ mod tests {
             TextureKind::Cube
         );
         assert_eq!(
+            texture_kind_from_type_name(Some("depthcube<float, sample>")),
+            TextureKind::Cube
+        );
+        assert_eq!(
             texture_kind_from_type_name(Some("texturecube_array<float, sample>")),
+            TextureKind::CubeArray
+        );
+        assert_eq!(
+            texture_kind_from_type_name(Some("depthcube_array<float, sample>")),
             TextureKind::CubeArray
         );
         assert_eq!(

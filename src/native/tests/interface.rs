@@ -427,6 +427,52 @@ attributes #0 = { nounwind }
 }
 
 #[test]
+fn native_fragment_front_facing_maps_to_frontfacing_builtin() {
+    let ll = r#"
+source_filename = "synth_front_facing"
+target datalayout = "e-p:64:64:64"
+target triple = "air64-apple-macosx14.0.0"
+
+define <4 x float> @frag(i1 %front) local_unnamed_addr #0 {
+entry:
+  br i1 %front, label %yes, label %no
+
+yes:
+  ret <4 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>
+
+no:
+  ret <4 x float> <float 0.000000e+00, float 0.000000e+00, float 1.000000e+00, float 1.000000e+00>
+}
+
+attributes #0 = { nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.front_facing", !"air.arg_type_name", !"bool", !"air.arg_name", !"front"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_front_facing_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("BuiltIn FrontFacing"), "{asm}");
+    assert!(asm.contains("OpEntryPoint Fragment"), "{asm}");
+    assert!(asm.contains("OpLoad"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_fragment_primitive_id_maps_to_primitiveid_builtin() {
     let ll = r#"
 source_filename = "synth_primitive_id"
@@ -461,6 +507,53 @@ attributes #0 = { nounwind }
     let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("BuiltIn PrimitiveId"), "{asm}");
+    assert!(asm.contains("OpEntryPoint Fragment"), "{asm}");
+    assert!(asm.contains("OpLoad"), "{asm}");
+    assert!(
+        !asm.lines()
+            .any(|line| line.contains("OpUndef") && line.contains("%1")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_fragment_sample_id_maps_to_sampleid_builtin() {
+    let ll = r#"
+source_filename = "synth_sample_id"
+target datalayout = "e-p:64:64:64"
+target triple = "air64-apple-macosx14.0.0"
+
+define i32 @frag(i32 %sampleId) local_unnamed_addr #0 {
+entry:
+  %next = add i32 %sampleId, 1
+  ret i32 %next
+}
+
+attributes #0 = { nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"uint"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.sample_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"sampleId"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_sample_id_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("BuiltIn SampleId"), "{asm}");
+    assert!(asm.contains("OpCapability SampleRateShading"), "{asm}");
     assert!(asm.contains("OpEntryPoint Fragment"), "{asm}");
     assert!(asm.contains("OpLoad"), "{asm}");
     assert!(

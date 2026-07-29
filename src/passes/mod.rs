@@ -90,6 +90,14 @@ pub(in crate::passes) enum SingletonType {
     Int16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::passes) struct ImageShape {
+    pub(in crate::passes) dim: Dim,
+    pub(in crate::passes) arrayed: bool,
+    pub(in crate::passes) comp: ImageComp,
+    pub(in crate::passes) multisampled: bool,
+}
+
 /// Typed cache key for the synthesized array type + numeric constants the lowering passes memoize
 /// (cleanup-plan C3): replaces the former prefix-namespaced string keys (`arr_…`, `ci_…`, `cf_…`,
 /// `ch_…`) with a structural enum. Each builder keeps its exact scan / no-scan behavior — this only
@@ -150,14 +158,17 @@ struct Ctx {
     /// loaded-image id -> sampled component type (default Float), so integer textures fetch/sample
     /// into a matching int vector.
     image_comp: HashMap<Word, ImageComp>,
+    /// loaded-image ids whose AIR texture type is multisampled (`texture*_ms`), so reads use an MS
+    /// image type and pass a Sample image operand instead of treating the sample id as a mip LOD.
+    image_multisampled: HashSet<Word>,
     /// loaded-image ids that are STORAGE images (`OpTypeImage Sampled=2` with an explicit ImageFormat),
     /// the write-texture binding. `air.write_texture_*` lowers to `OpImageWrite` only on these.
     image_storage: HashSet<Word>,
-    /// texture-array descriptor variable id -> (element `OpTypeImage` id, (Dim, arrayed), comp). Set
+    /// texture-array descriptor variable id -> (element `OpTypeImage` id, (Dim, arrayed), comp, MS). Set
     /// by the interface `ParamBinding::ImageArray` binding for runtime-indexed texture-handle arrays.
     /// `materialize_texture_array_loads` reads it to turn each `OpLoad` of a handle from a
     /// dynamically-indexed array element into `OpAccessChain %arrayvar %idx` + `OpLoad %image`.
-    image_array_vars: HashMap<Word, (Word, (Dim, bool), ImageComp)>,
+    image_array_vars: HashMap<Word, (Word, (Dim, bool), ImageComp, bool)>,
     /// loaded-image ids synthesized by `air.get_null_texture_*()`.
     null_image_values: HashSet<Word>,
     /// composite type ids already given explicit Offset/ArrayStride layout (dedup; a type decorated
@@ -220,6 +231,7 @@ impl Ctx {
             struct_cache: HashMap::new(),
             image_dims: HashMap::new(),
             image_comp: HashMap::new(),
+            image_multisampled: HashSet::new(),
             image_storage: HashSet::new(),
             image_array_vars: HashMap::new(),
             null_image_values: HashSet::new(),
@@ -527,6 +539,16 @@ impl Ctx {
 
     /// Get or create OpTypeImage with the given sampled component type, 2D/1D, sampled.
     fn ty_image(&mut self, dim: Dim, arrayed: bool, comp: ImageComp) -> Word {
+        self.ty_image_ms(dim, arrayed, comp, false)
+    }
+
+    fn ty_image_ms(
+        &mut self,
+        dim: Dim,
+        arrayed: bool,
+        comp: ImageComp,
+        multisampled: bool,
+    ) -> Word {
         let f = match comp {
             ImageComp::Float => self.ty_float(),
             ImageComp::Uint => self.ty_uint(),
@@ -540,7 +562,7 @@ impl Ctx {
                 Operand::Dim(dim),
                 Operand::LiteralBit32(0), // Depth: not a depth image
                 Operand::LiteralBit32(arrayed as u32), // Arrayed
-                Operand::LiteralBit32(0), // MS
+                Operand::LiteralBit32(multisampled as u32), // MS
                 Operand::LiteralBit32(1), // Sampled: 1 = used with sampler
                 Operand::ImageFormat(ImageFormat::Unknown),
             ],
@@ -841,8 +863,10 @@ use access::{
     remodel_workgroup_single_field_struct_array, repair_scalar_load_through_vector_ptr,
     repair_vector_load_through_scalar_stride, reroot_demoted_array_element_overindex,
     retype_demoted_copymemory_placeholder, rewrite_byte_buffer_chained_reinterpret,
-    rewrite_chained_element_reinterpret, rewrite_dynamic_struct_index_reinterpret,
-    rewrite_dynamic_struct_index_vector_reinterpret, rewrite_raw_byte_pointer_wide_loads,
+    rewrite_chained_element_reinterpret, rewrite_dynamic_homogeneous_struct_index_load,
+    rewrite_dynamic_struct_index_reinterpret, rewrite_dynamic_struct_index_subword_reinterpret,
+    rewrite_dynamic_struct_index_vector_reinterpret,
+    rewrite_dynamic_struct_index_wide_word_reinterpret, rewrite_raw_byte_pointer_wide_loads,
     rewrite_reinterpret_scalar_loads, rewrite_scalar_pointer_arithmetic_access_chains,
     rewrite_scalar_slot_array_overindex, rewrite_strided_descent_access_chains,
 };
@@ -952,6 +976,30 @@ pub(crate) fn inline_all_emitted_helpers(
     }
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     Ok((ctx.module, ctx.emit_sidecar))
+}
+
+pub(crate) fn repair_relooped_access_chains(
+    module: &mut Module,
+    entry_name: Option<&str>,
+) -> Result<(), String> {
+    let input = std::mem::take(module);
+    let mut ctx = Ctx::with_options_and_sidecar(
+        input,
+        crate::emit_sidecar::EmitSidecar::default(),
+        Stage::Kernel,
+        TransformOptions::default(),
+    );
+    let entry_idx = find_entry_index(&ctx.module, entry_name).ok_or_else(|| {
+        "no entry function with a body found for relooped access repair".to_string()
+    })?;
+    rewrite_dynamic_struct_index_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_struct_index_wide_word_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_struct_index_vector_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_homogeneous_struct_index_load(&mut ctx, entry_idx)?;
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    *module = ctx.module;
+    Ok(())
 }
 
 pub(crate) fn lower_scalar_i64_arithmetic_module(module: &mut Module) {
@@ -1487,7 +1535,10 @@ pub(crate) fn transform_with_options_and_sidecar(
     drop_dead_invalid_access_chains(&mut ctx, entry_idx);
     rewrite_strided_descent_access_chains(&mut ctx, entry_idx);
     rewrite_dynamic_struct_index_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_struct_index_wide_word_reinterpret(&mut ctx, entry_idx)?;
     rewrite_dynamic_struct_index_vector_reinterpret(&mut ctx, entry_idx)?;
+    rewrite_dynamic_homogeneous_struct_index_load(&mut ctx, entry_idx)?;
     rewrite_chained_element_reinterpret(&mut ctx, entry_idx)?;
     rewrite_byte_buffer_chained_reinterpret(&mut ctx, entry_idx)?;
     // The raw-byte replay introduces PtrAccessChain byte pointers.  Decorate their common uchar

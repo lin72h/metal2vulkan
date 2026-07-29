@@ -8,7 +8,7 @@ pub(in crate::passes) fn texture_type_hints(
     frag: Option<&FragMeta>,
     vert: Option<&VertMeta>,
     kern: Option<&KernMeta>,
-) -> HashMap<Word, (Dim, bool, ImageComp)> {
+) -> HashMap<Word, ImageShape> {
     params
         .iter()
         .enumerate()
@@ -19,8 +19,8 @@ pub(in crate::passes) fn texture_type_hints(
                 Stage::Vertex => vert.and_then(|m| m.texture_type_name(idx)),
                 Stage::Kernel => kern.and_then(|m| m.texture_type_name(idx)),
             }?;
-            let (dim, arrayed) = texture_arg_dim(name);
-            Some((*pid, (dim, arrayed, texture_arg_comp(name))))
+            let shape = texture_arg_shape(name);
+            Some((*pid, shape))
         })
         .collect()
 }

@@ -752,16 +752,32 @@ impl<'a> RetryCtx<'a> {
         // The collapsed+raw module can be right in every way EXCEPT its control flow (the
         // scatter_forward class: the raw model dissolves the atomic pointer reinterpret the inlining
         // exposed, and only the CFG wall remains). The relooper structures it byte-neutrally.
-        let relooped = native::rewrite_to_relooper_module(&mut finished_module)
-            .map(|()| module_bytes(&finished_module));
+        let relooped = native::rewrite_to_relooper_module_capped(
+            &mut finished_module,
+            native::CFG_EMIT_RELOOPER_MAX_BLOCKS,
+        )
+        .and_then(|()| {
+            passes::repair_relooped_access_chains(&mut finished_module, self.entry_name)?;
+            Ok(())
+        });
         if self.retry_debug_on {
             if let Err(e) = &relooped {
                 eprintln!("[retry-debug] inline_sroa_raw relooper rewrite failed: {e}");
             }
         }
-        relooped
-            .ok()
-            .filter(|b| self.validates_dbg("inline_sroa_raw_relooped", b))
+        relooped.ok()?;
+        let relooped_bytes = module_bytes(&finished_module);
+        if self.validates_dbg("inline_sroa_raw_relooped", &relooped_bytes) {
+            return Some(relooped_bytes);
+        }
+        if !self.psb_retry_enabled {
+            return None;
+        }
+        self.psb_then_wg_remodel_module(
+            finished_module,
+            "inline_sroa_raw_relooped+psb",
+            "inline_sroa_raw_relooped+psb+wg",
+        )
     }
 
     // Combined inline+SROA → raw → cross-arm-restructure → PSB retry — the straddle-loop-merge +

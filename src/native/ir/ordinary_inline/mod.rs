@@ -435,6 +435,10 @@ impl LlModule {
                                     .params
                                     .iter()
                                     .any(|(_, ty)| matches!(ty, LlType::Ptr(_)))
+                                && !call
+                                    .args
+                                    .iter()
+                                    .any(|arg| matches!(arg.value, LlValue::Gep(_)))
                             {
                                 return None;
                             }
@@ -457,6 +461,7 @@ impl LlModule {
                                 .map(|((parameter, expected_type), argument)| {
                                     if &argument.ty == expected_type
                                         && (matches!(argument.value, LlValue::Local(_))
+                                            || matches!(argument.value, LlValue::Gep(_))
                                             || is_literal(&argument.value))
                                     {
                                         if let (LlType::Ptr(_), LlValue::Local(argument_name)) =

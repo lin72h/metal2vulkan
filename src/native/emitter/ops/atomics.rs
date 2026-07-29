@@ -3,6 +3,51 @@
 use super::*;
 
 impl Emitter {
+    pub(in crate::native::emitter) fn atomic_i32_scope_for_arg(
+        &self,
+        ptr_arg: &TypedValue,
+    ) -> Result<Scope, String> {
+        let storage = if let LlValue::Local(name) = &ptr_arg.value {
+            if self.unmodeled_pointers.contains(name) {
+                StorageClass::Workgroup
+            } else if let Some(raw) = self.raw_offsets.get(name) {
+                self.raw_access_storage(raw)?
+            } else {
+                let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
+                    return Err(format!(
+                        "native emitter: atomic i32 pointer argument has type {:?}",
+                        ptr_arg.ty
+                    ));
+                };
+                self.pointer_storage_for(&ptr_arg.value, addrspace)?
+            }
+        } else {
+            let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
+                return Err(format!(
+                    "native emitter: atomic i32 pointer argument has type {:?}",
+                    ptr_arg.ty
+                ));
+            };
+            self.pointer_storage_for(&ptr_arg.value, addrspace)?
+        };
+        Ok(if storage == StorageClass::Workgroup {
+            Scope::Workgroup
+        } else {
+            Scope::Device
+        })
+    }
+
+    pub(in crate::native::emitter) fn atomic_i32_memory_semantics(
+        scope: Scope,
+        workgroup_semantics: MemorySemantics,
+    ) -> MemorySemantics {
+        if scope == Scope::Workgroup {
+            workgroup_semantics | MemorySemantics::WORKGROUP_MEMORY
+        } else {
+            MemorySemantics::RELAXED
+        }
+    }
+
     pub(in crate::native::emitter) fn atomic_i32_pointer_id(
         &mut self,
         ptr_arg: &TypedValue,

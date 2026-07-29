@@ -34,6 +34,7 @@ impl Emitter {
                     ty: index_ty.clone(),
                     value: LlValue::Int(0),
                 }],
+                root_indices: None,
                 root_is_indexed_container: template.root_is_indexed_container,
             }
         } else {
@@ -53,6 +54,7 @@ impl Emitter {
                     ty: index_ty.clone(),
                     value: LlValue::Int(0),
                 }],
+                root_indices: None,
                 root_is_indexed_container: template.root_is_indexed_container,
             }
         } else {
@@ -96,6 +98,7 @@ impl Emitter {
                 ty: index_ty,
                 value: LlValue::Local(index_name),
             }],
+            root_indices: None,
             root_is_indexed_container: template.root_is_indexed_container,
         }))
     }
@@ -169,7 +172,7 @@ impl Emitter {
             .collect::<Vec<_>>();
         let root = root_candidates
             .iter()
-            .find_map(|value| self.value_id(value, &gep.base.ty).ok());
+            .find_map(|value| self.forward_phi_root_id(value, &gep.base.ty).ok().flatten());
         let Some(root) = root else {
             return Ok(None);
         };
@@ -181,8 +184,34 @@ impl Emitter {
                 ty: gep.indices[0].ty.clone(),
                 value: LlValue::Int(0),
             }],
+            root_indices: None,
             root_is_indexed_container: self.is_indexed_container_root(root, None),
         }))
+    }
+
+    fn forward_phi_root_id(
+        &mut self,
+        value: &LlValue,
+        ty: &LlType,
+    ) -> Result<Option<Word>, String> {
+        if let Ok(id) = self.value_id(value, ty) {
+            return Ok(Some(id));
+        }
+        let LlValue::Local(name) = value else {
+            return Ok(None);
+        };
+        if self.values.contains_key(name) {
+            return Ok(None);
+        }
+        let Some(have_ty) = self.tir_result_types.get(name).cloned() else {
+            return Ok(None);
+        };
+        let want = self.resolve_type(ty)?;
+        let have = self.resolve_type(&have_ty)?;
+        if !types_compatible(&have, &want) {
+            return Ok(None);
+        }
+        Ok(Some(self.result_id(name, &have_ty)?))
     }
 
     pub(in crate::native::emitter) fn provenance_for_pointer_value(
@@ -222,6 +251,7 @@ impl Emitter {
                             ty: index_ty.clone(),
                             value: LlValue::Int(0),
                         }],
+                        root_indices: None,
                         root_is_indexed_container: template.root_is_indexed_container,
                     };
                     if !had_existing_provenance {
@@ -252,6 +282,7 @@ impl Emitter {
                         ty: index_ty.clone(),
                         value: LlValue::Local(index_name),
                     }],
+                    root_indices: None,
                     root_is_indexed_container: template.root_is_indexed_container,
                 };
                 self.gep_provenance.insert(name.clone(), provenance.clone());
@@ -294,6 +325,7 @@ impl Emitter {
                 ty: index_ty.clone(),
                 value: LlValue::Local(index_name),
             }],
+            root_indices: None,
             root_is_indexed_container: template.root_is_indexed_container,
         };
         self.gep_provenance
@@ -355,6 +387,7 @@ impl Emitter {
                     ty: index_ty,
                     value: LlValue::Local(index_name),
                 }],
+                root_indices: None,
                 root_is_indexed_container: template.root_is_indexed_container,
             },
         );

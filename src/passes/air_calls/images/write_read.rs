@@ -246,7 +246,9 @@ fn texel_lane_is_statically_undef(
 
 /// Lower `air.read_texture_<dim>.<ret>`: a sampler-less texel read by integer coordinate (Metal's
 /// `texture.read(uint2 coord, lod)`). AIR args: a0=texture(loaded image), a1=integer coord, a2=lod,
-/// (a3=access flag, ignored). Sampled images use `OpImageFetch` with the integer coord + Lod;
+/// (a3=access flag, ignored). Sampled images use `OpImageFetch` with the integer coord + Lod when
+/// the SPIR-V image dimension permits it; texel-buffer fetches (`Dim Buffer`) have no mip levels and
+/// must omit Lod.
 /// read-write storage images use `OpImageRead` and ignore the LOD because storage images are not
 /// mipmapped in the current harness. The read produces the image component vector, then converts to
 /// the AIR result shape when needed.
@@ -353,9 +355,16 @@ pub(in crate::passes) fn lower_read(
         let op = if image_is_storage(ctx, img) {
             Op::ImageRead
         } else {
-            if let Some(lod) = lod32 {
-                ops.push(Operand::ImageOperands(spirv::ImageOperands::LOD));
-                ops.push(Operand::IdRef(lod));
+            if image_value_is_multisampled(ctx, img) {
+                if let Some(sample) = lod32 {
+                    ops.push(Operand::ImageOperands(spirv::ImageOperands::SAMPLE));
+                    ops.push(Operand::IdRef(sample));
+                }
+            } else if dim != Dim::DimBuffer {
+                if let Some(lod) = lod32 {
+                    ops.push(Operand::ImageOperands(spirv::ImageOperands::LOD));
+                    ops.push(Operand::IdRef(lod));
+                }
             }
             Op::ImageFetch
         };
@@ -477,7 +486,7 @@ pub(in crate::passes) fn lower_read_depth(
     //   * with-sampler/no-offset: (texture, sampler, sample_index, coord, lod, access) -> coord=a3, lod=a4
     //     array/no-offset: (texture, sampler, sample_index, coord, layer, lod, access)
     //       -> coord=a3, layer=a4, lod=a5
-    let (coord, layer, lod) = if value_is_int_or_intvec(ctx, args[1]) {
+    let (coord, layer, lod, sample_index) = if value_is_int_or_intvec(ctx, args[1]) {
         // No-sampler: a1 is the coord, unless a1 is a scalar sample-index before a vector coord.
         let coord_idx = if vector_shape(ctx, args[1]).is_none()
             && args
@@ -488,30 +497,35 @@ pub(in crate::passes) fn lower_read_depth(
         } else {
             1
         };
+        let sample_index = (coord_idx == 2).then_some(args[1]);
         let coord = *args.get(coord_idx).ok_or("air.read_depth missing coord")?;
         if arrayed {
             (
                 coord,
                 args.get(coord_idx + 1).copied(),
                 args.get(coord_idx + 2).copied(),
+                sample_index,
             )
         } else {
-            (coord, None, args.get(coord_idx + 1).copied())
+            (coord, None, args.get(coord_idx + 1).copied(), sample_index)
         }
     } else {
         let coord = *args.get(3).ok_or("air.read_depth missing coord")?;
+        let sample_index = args.get(2).copied();
         if arrayed {
             // layer at a4; an optional offset sits between layer and lod (8 args ⇒ offset present).
             (
                 coord,
                 args.get(4).copied(),
                 args.get(if args.len() >= 8 { 6 } else { 5 }).copied(),
+                sample_index,
             )
         } else {
             (
                 coord,
                 None,
                 args.get(if args.len() >= 7 { 5 } else { 4 }).copied(),
+                sample_index,
             )
         }
     };
@@ -528,7 +542,14 @@ pub(in crate::passes) fn lower_read_depth(
     };
     let color = ctx.module.fresh_id();
     let mut ops = vec![Operand::IdRef(img), Operand::IdRef(coord32)];
-    if let Some(lod) = lod32 {
+    if image_value_is_multisampled(ctx, img) {
+        let sample = sample_index
+            .or(lod)
+            .ok_or("air.read_depth multisample read missing sample index")?;
+        let sample32 = coerce_image_coord32(ctx, sample, &mut out, "air.read_depth sample")?;
+        ops.push(Operand::ImageOperands(spirv::ImageOperands::SAMPLE));
+        ops.push(Operand::IdRef(sample32));
+    } else if let Some(lod) = lod32 {
         ops.push(Operand::ImageOperands(spirv::ImageOperands::LOD));
         ops.push(Operand::IdRef(lod));
     }

@@ -10,6 +10,7 @@
 pub fn is_pointer_typing_validation_error(err: &str) -> bool {
     err.contains("does not match Pointer")
         || err.contains("does not match Object")
+        || err.contains("does not match the type that results from indexing into the Composite")
         || err.contains("reached non-composite")
         || err.contains("OpInBoundsAccessChain cannot find index")
         // Anchored: the real spirv-val message is "... does not match the type used to index ..."

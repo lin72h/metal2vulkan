@@ -1,5 +1,5 @@
 use super::location_index;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub(super) fn location_index_with_static(
     body: &str,
@@ -47,7 +47,7 @@ enum StaticValue {
 /// location index rather than guessing.
 pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
     let mut globals = parse_integer_global_initializers(ll);
-    let mut stores = HashMap::new();
+    let mut unknown_stores = HashSet::new();
     let mut env: HashMap<String, StaticValue> = HashMap::new();
     let mut in_static_init = false;
 
@@ -77,8 +77,11 @@ pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
             };
             if let Some(value) = eval_int_operand(value, &env, &globals) {
                 let value = value as u32;
-                globals.insert(global.clone(), value);
-                stores.insert(global, value);
+                unknown_stores.remove(&global);
+                globals.insert(global, value);
+            } else {
+                globals.remove(&global);
+                unknown_stores.insert(global);
             }
             continue;
         }
@@ -94,7 +97,10 @@ pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
         }
     }
 
-    stores
+    globals
+        .into_iter()
+        .filter(|(global, _)| !unknown_stores.contains(global))
+        .collect()
 }
 
 fn parse_integer_global_initializers(ll: &str) -> HashMap<String, u32> {
@@ -124,11 +130,11 @@ fn integer_initializer(rest: &str) -> Option<u32> {
     let ty_pos = tokens
         .iter()
         .position(|tok| matches!(*tok, "i8" | "i16" | "i32"))?;
-    tokens
-        .get(ty_pos + 1)?
-        .trim_end_matches(',')
-        .parse::<u32>()
-        .ok()
+    let value = tokens.get(ty_pos + 1)?.trim_end_matches(',');
+    if value == "undef" && rest.contains("air.fc_initializer") {
+        return Some(0);
+    }
+    value.parse::<u32>().ok()
 }
 
 fn eval_static_rhs(

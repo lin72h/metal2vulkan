@@ -192,6 +192,7 @@ pub(super) fn drop_unused_int64_capability(ctx: &mut Ctx) {
 
 pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) {
     crate::spirv_variable_ptr::lower_zero_base_storage_buffer_ptr_access_chains(&mut ctx.module);
+    crate::spirv_variable_ptr::rewrite_storage_buffer_atomic_scopes(&mut ctx.module);
     let (needs_storage_buffer, needs_other) = needed_variable_pointer_capabilities(ctx);
     ctx.module
         .capabilities
@@ -299,6 +300,14 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
     });
     if has_primitive_id {
         want.push(Capability::Geometry);
+    }
+    let has_sample_id = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::SampleId))
+    });
+    if has_sample_id {
+        want.push(Capability::SampleRateShading);
     }
     let has_stencil_export = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate

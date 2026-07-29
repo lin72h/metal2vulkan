@@ -100,12 +100,21 @@ fn lower_async_copy_if_enabled(san_ll: &str) -> String {
     native::lower_simdgroup_async_copy(san_ll)
 }
 
-fn reject_visible_function_references(san_ll: &str) -> Result<(), String> {
+fn reject_unsupported_metal_linked_functions(san_ll: &str) -> Result<(), String> {
     if san_ll.contains(".MTL_VISIBLE_FN_REF") || san_ll.contains("!air.visible_function_references")
     {
         return Err(
             "native emitter: unsupported Metal visible function reference; dynamic linked \
              functions are not expressible in Logical SPIR-V"
+                .into(),
+        );
+    }
+    if san_ll.contains(".MTL_CONTROL_POINT_FN")
+        || san_ll.contains("\"air.patch_control_point_function\"")
+    {
+        return Err(
+            "native emitter: unsupported Metal patch control point function; tessellation patch \
+             inputs are not yet lowered to the Vulkan tessellation interface"
                 .into(),
         );
     }
@@ -220,7 +229,7 @@ pub fn translate_pre_psb_probe(
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
-    reject_visible_function_references(san_ll)?;
+    reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, passes::TransformOptions::default());
     translate_sanitized_with_meta(
@@ -253,7 +262,7 @@ pub fn translate_sanitized_native_with_options(
     // the emitter outright today. See `native::async_copy` + journal AIR2VK-ASYNC-COPY-CLEAR.
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
-    reject_visible_function_references(san_ll)?;
+    reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, options);
     translate_sanitized_with_meta(
@@ -306,7 +315,7 @@ pub fn translate_sanitized_native_reflected(
 ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
-    reject_visible_function_references(san_ll)?;
+    reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, options);
     let mut reflection = build_reflection(
@@ -352,7 +361,7 @@ pub fn translate_native_no_retry(san_ll: &str, stage: passes::Stage) -> Result<V
     // Mirror the pre-spirv-val prologue of `translate_sanitized_native_with_options` exactly so BC
     // measures the bytes production would actually validate: async-copy lowering, then stage meta.
     let lowered = lower_async_copy_if_enabled(san_ll);
-    reject_visible_function_references(&lowered)?;
+    reject_unsupported_metal_linked_functions(&lowered)?;
     let stage_meta = parse_stage_meta(&lowered, stage);
     translate_native_no_retry_with_meta(
         &lowered,
@@ -402,7 +411,7 @@ pub fn translate_native_primary_validated(
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
-    reject_visible_function_references(san_ll)?;
+    reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let finished = emit_finish_primary_module(
         san_ll,
@@ -606,6 +615,11 @@ fn finish_module(
     // block), by register-demoting the offending value to a function-scope OpVariable. Floor-safe by
     // construction — a validating module has every def dominating its uses, so this never fires on one.
     native::demote_nondominating_values_module(&mut out);
+    // Workgroup struct-padding clears emitted as byte-addressed `uchar*` stores are not legal
+    // Logical SPIR-V when rooted at a struct pointer. Drop the provably-padding zero stores before
+    // validation so the normal retry cascade only sees semantic failures.
+    native::drop_workgroup_struct_padding_byte_zero_stores_module(&mut out);
+    native::drop_dangling_debug_targets_module(&mut out);
     // M4/Keystone-2: node-split a multi-entry loop whose header is entered from two different
     // selections' arms (the irreducible shape `structured_plan` over-admits — the mlx-steel
     // `steel_attention` family), so the PRIMARY structured emit validates instead of shipping only via
@@ -647,7 +661,7 @@ pub fn translate_raw_tiers_probe(
 ) -> Vec<Result<Vec<u8>, String>> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
-    if let Err(error) = reject_visible_function_references(san_ll) {
+    if let Err(error) = reject_unsupported_metal_linked_functions(san_ll) {
         return vec![Err(error.clone()), Err(error)];
     }
     let stage_meta = parse_stage_meta(san_ll, stage);
@@ -708,7 +722,7 @@ pub fn translate_bda_probe(
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
-    reject_visible_function_references(san_ll)?;
+    reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
     tools::llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
@@ -951,6 +965,16 @@ fn translate_sanitized_with_meta(
                                     rc.inline_sroa_chain(
                                         "val-ptr:inline_sroa",
                                         "val-ptr:inline_sroa_raw",
+                                    )
+                                })
+                                // The TopK multi-destination shape can need BOTH pieces: inline+SROA+raw
+                                // dissolves pointer-valued local aggregate fields, then the expanded helper
+                                // exposes a merge-block overlap that needs the existing cross-arm restructure
+                                // tier before validation can adopt it.
+                                .or_else(|| {
+                                    rc.census(
+                                        "val-ptr:inline_sroa_raw_cfg_restructure",
+                                        rc.inline_sroa_raw_cfg_restructure_retry(),
                                     )
                                 })
                                 // The FC-multiplexed cross-binding merge whose live buffers were Private-demoted to

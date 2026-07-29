@@ -62,6 +62,10 @@ pub(super) struct Emitter {
     /// (a byte-table reinterpret view); when all-i8-leaf, declared as a flat `[N x i8]` so every
     /// view lowers through the byte-array raw paths. Populated before globals emit.
     byte_view_reinterpret_globals: HashSet<String>,
+    /// Constant globals accessed through a GEP source type that differs from the declared type
+    /// whose declared layout is a padding-free scalar image. These are declared as `[N x scalar]`
+    /// and AIR aggregate GEP views linearize to scalar indices from that flat root.
+    flat_scalar_reinterpret_globals: HashMap<String, LlType>,
     gep_provenance: HashMap<String, GepProvenance>,
     selected_pointers: HashMap<String, SelectedPointer>,
     selected_load_pointers: HashMap<String, SelectedLoadPointer>,
@@ -236,6 +240,7 @@ struct GepProvenance {
     addrspace: u32,
     source_ty: LlType,
     indices: Vec<TypedValue>,
+    root_indices: Option<Vec<TypedValue>>,
     root_is_indexed_container: bool,
 }
 
@@ -410,6 +415,7 @@ impl Emitter {
             global_values: HashMap::new(),
             int_atomic_reinterpret_globals: HashSet::new(),
             byte_view_reinterpret_globals: HashSet::new(),
+            flat_scalar_reinterpret_globals: HashMap::new(),
             gep_provenance: HashMap::new(),
             selected_pointers: HashMap::new(),
             selected_load_pointers: HashMap::new(),
@@ -879,6 +885,7 @@ impl Emitter {
         self.int_atomic_reinterpret_globals =
             Self::scan_int_atomic_reinterpret_globals(&globals, &functions);
         self.byte_view_reinterpret_globals = self.scan_byte_view_reinterpret_globals()?;
+        self.flat_scalar_reinterpret_globals = self.scan_flat_scalar_reinterpret_globals()?;
         for global in &globals {
             self.emit_global(global)?;
         }
@@ -931,6 +938,8 @@ impl Emitter {
             emit_sidecar,
             self.ir.entry_name.as_deref(),
         )?;
+        self.rewrite_private_scalar_offset_access_chains();
+        self.repair_truncated_access_chain_indices();
         Ok(())
     }
 
@@ -1056,6 +1065,319 @@ impl Emitter {
         }
     }
 
+    fn rewrite_private_scalar_offset_access_chains(&mut self) {
+        let mut defs = HashMap::new();
+        for inst in &self.module.types_global_values {
+            if let Some(id) = inst.result_id {
+                defs.insert(id, inst.clone());
+            }
+        }
+        for function in &self.module.functions {
+            for param in &function.parameters {
+                if let Some(id) = param.result_id {
+                    defs.insert(id, param.clone());
+                }
+            }
+            for block in &function.blocks {
+                if let Some(label) = &block.label {
+                    if let Some(id) = label.result_id {
+                        defs.insert(id, label.clone());
+                    }
+                }
+                for inst in &block.instructions {
+                    if let Some(id) = inst.result_id {
+                        defs.insert(id, inst.clone());
+                    }
+                }
+            }
+        }
+
+        let mut pointer_info = HashMap::new();
+        for inst in &self.module.types_global_values {
+            if inst.class.opcode == Op::TypePointer {
+                let (
+                    Some(ptr),
+                    Some(Operand::StorageClass(storage)),
+                    Some(Operand::IdRef(pointee)),
+                ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
+                else {
+                    continue;
+                };
+                pointer_info.insert(ptr, (*storage, *pointee));
+            }
+        }
+
+        let mut insertions = Vec::new();
+        let mut next_defs = defs.clone();
+        for fi in 0..self.module.functions.len() {
+            for bi in 0..self.module.functions[fi].blocks.len() {
+                let mut ii = 0usize;
+                while ii < self.module.functions[fi].blocks[bi].instructions.len() {
+                    let inst = self.module.functions[fi].blocks[bi].instructions[ii].clone();
+                    if inst.class.opcode != Op::InBoundsAccessChain || inst.operands.len() != 2 {
+                        ii += 1;
+                        continue;
+                    }
+                    let Some(result_type) = inst.result_type else {
+                        ii += 1;
+                        continue;
+                    };
+                    let Some((StorageClass::Private, pointee_ty)) =
+                        pointer_info.get(&result_type).copied()
+                    else {
+                        ii += 1;
+                        continue;
+                    };
+                    if !spirv_type_is_scalar(&defs, pointee_ty) {
+                        ii += 1;
+                        continue;
+                    }
+                    let Some(Operand::IdRef(base)) = inst.operands.first() else {
+                        ii += 1;
+                        continue;
+                    };
+                    let Some(base_def) = next_defs.get(base).cloned() else {
+                        ii += 1;
+                        continue;
+                    };
+                    if !matches!(
+                        base_def.class.opcode,
+                        Op::AccessChain | Op::InBoundsAccessChain
+                    ) || base_def.result_type != Some(result_type)
+                        || base_def.operands.len() < 2
+                    {
+                        ii += 1;
+                        continue;
+                    }
+                    let Some(Operand::IdRef(root)) = base_def.operands.first() else {
+                        ii += 1;
+                        continue;
+                    };
+                    let Some(root_ptr_ty) = result_type_of_id(&defs, *root) else {
+                        ii += 1;
+                        continue;
+                    };
+                    let Some((StorageClass::Private, mut cur_ty)) =
+                        pointer_info.get(&root_ptr_ty).copied()
+                    else {
+                        ii += 1;
+                        continue;
+                    };
+                    for index in &base_def.operands[1..base_def.operands.len() - 1] {
+                        let Some(next) = access_chain_step_type(&defs, cur_ty, index) else {
+                            cur_ty = 0;
+                            break;
+                        };
+                        cur_ty = next;
+                    }
+                    if cur_ty == 0
+                        || access_chain_step_type(&defs, cur_ty, base_def.operands.last().unwrap())
+                            != Some(pointee_ty)
+                    {
+                        ii += 1;
+                        continue;
+                    }
+                    let Some(Operand::IdRef(offset)) = inst.operands.get(1) else {
+                        ii += 1;
+                        continue;
+                    };
+                    let Some(Operand::IdRef(base_last)) = base_def.operands.last() else {
+                        ii += 1;
+                        continue;
+                    };
+                    let Some(merged) =
+                        self.merge_access_indices(*base_last, *offset, &defs, &mut insertions)
+                    else {
+                        ii += 1;
+                        continue;
+                    };
+                    let mut operands = base_def.operands.clone();
+                    *operands
+                        .last_mut()
+                        .expect("base access-chain operand length checked") =
+                        Operand::IdRef(merged);
+                    self.module.functions[fi].blocks[bi].instructions[ii].operands = operands;
+                    if let Some(id) = inst.result_id {
+                        let mut updated = inst;
+                        updated.operands = self.module.functions[fi].blocks[bi].instructions[ii]
+                            .operands
+                            .clone();
+                        next_defs.insert(id, updated);
+                    }
+                    if !insertions.is_empty() {
+                        let pending = std::mem::take(&mut insertions);
+                        self.module.functions[fi].blocks[bi]
+                            .instructions
+                            .splice(ii..ii, pending);
+                        ii += 1;
+                    }
+                    ii += 1;
+                }
+            }
+        }
+    }
+
+    fn repair_truncated_access_chain_indices(&mut self) {
+        let mut defs = HashMap::new();
+        for inst in &self.module.types_global_values {
+            if let Some(id) = inst.result_id {
+                defs.insert(id, inst.clone());
+            }
+        }
+        for function in &self.module.functions {
+            for param in &function.parameters {
+                if let Some(id) = param.result_id {
+                    defs.insert(id, param.clone());
+                }
+            }
+            for block in &function.blocks {
+                if let Some(label) = &block.label {
+                    if let Some(id) = label.result_id {
+                        defs.insert(id, label.clone());
+                    }
+                }
+                for inst in &block.instructions {
+                    if let Some(id) = inst.result_id {
+                        defs.insert(id, inst.clone());
+                    }
+                }
+            }
+        }
+
+        let mut pointer_info = HashMap::new();
+        for inst in &self.module.types_global_values {
+            if inst.class.opcode == Op::TypePointer {
+                let (
+                    Some(ptr),
+                    Some(Operand::StorageClass(storage)),
+                    Some(Operand::IdRef(pointee)),
+                ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
+                else {
+                    continue;
+                };
+                pointer_info.insert(ptr, (*storage, *pointee));
+            }
+        }
+
+        for fi in 0..self.module.functions.len() {
+            for bi in 0..self.module.functions[fi].blocks.len() {
+                for ii in 0..self.module.functions[fi].blocks[bi].instructions.len() {
+                    let inst = self.module.functions[fi].blocks[bi].instructions[ii].clone();
+                    if !matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                        || inst.operands.len() < 2
+                    {
+                        continue;
+                    }
+                    let Some(result_type) = inst.result_type else {
+                        continue;
+                    };
+                    let Some((_, pointee_ty)) = pointer_info.get(&result_type).copied() else {
+                        continue;
+                    };
+                    let Some(Operand::IdRef(base)) = inst.operands.first() else {
+                        continue;
+                    };
+                    let Some(base_ty) = result_type_of_id(&defs, *base) else {
+                        continue;
+                    };
+                    let Some((_, mut cur_ty)) = pointer_info.get(&base_ty).copied() else {
+                        continue;
+                    };
+                    let mut valid = true;
+                    for index in &inst.operands[1..] {
+                        let Some(next) = access_chain_step_type(&defs, cur_ty, index) else {
+                            valid = false;
+                            break;
+                        };
+                        cur_ty = next;
+                    }
+                    if !valid || cur_ty == pointee_ty {
+                        continue;
+                    }
+                    let Some(extra_count) = zero_tail_indices_to_pointee(&defs, cur_ty, pointee_ty)
+                    else {
+                        continue;
+                    };
+                    if extra_count == 0 {
+                        continue;
+                    }
+                    let Some(index_ty) = inst.operands[1..].iter().rev().find_map(|operand| {
+                        let Operand::IdRef(id) = operand else {
+                            return None;
+                        };
+                        result_type_of_id(&defs, *id)
+                    }) else {
+                        continue;
+                    };
+                    let zero = self.get_or_create_index_const(index_ty, 0);
+                    let mut operands = inst.operands;
+                    operands.extend(std::iter::repeat_n(Operand::IdRef(zero), extra_count));
+                    self.module.functions[fi].blocks[bi].instructions[ii].operands = operands;
+                }
+            }
+        }
+    }
+
+    fn merge_access_indices(
+        &mut self,
+        lhs: Word,
+        rhs: Word,
+        defs: &HashMap<Word, Instruction>,
+        insertions: &mut Vec<Instruction>,
+    ) -> Option<Word> {
+        match (const_int_value(defs, lhs), const_int_value(defs, rhs)) {
+            (Some(a), Some(b)) => {
+                let ty = result_type_of_id(defs, lhs).or_else(|| result_type_of_id(defs, rhs))?;
+                return Some(self.get_or_create_index_const(ty, a.checked_add(b)?));
+            }
+            (Some(0), _) => return Some(rhs),
+            (_, Some(0)) => return Some(lhs),
+            _ => {}
+        }
+        let lhs_ty = result_type_of_id(defs, lhs);
+        let rhs_ty = result_type_of_id(defs, rhs);
+        let (ty, lhs_id, rhs_id) = match (
+            lhs_ty,
+            rhs_ty,
+            const_int_value(defs, lhs),
+            const_int_value(defs, rhs),
+        ) {
+            (Some(a), Some(b), _, _) if a == b => (a, lhs, rhs),
+            (_, Some(ty), Some(value), _) => (ty, self.get_or_create_index_const(ty, value), rhs),
+            (Some(ty), _, _, Some(value)) => (ty, lhs, self.get_or_create_index_const(ty, value)),
+            _ => return None,
+        };
+        let id = self.fresh();
+        insertions.push(Self::inst(
+            Op::IAdd,
+            Some(ty),
+            Some(id),
+            vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
+        ));
+        Some(id)
+    }
+
+    fn get_or_create_index_const(&mut self, ty: Word, value: u64) -> Word {
+        let operands = index_const_operands(&self.module.types_global_values, ty, value)
+            .unwrap_or_else(|| vec![Operand::LiteralBit32(value as u32)]);
+        for inst in &self.module.types_global_values {
+            if inst.class.opcode == Op::Constant
+                && inst.result_type == Some(ty)
+                && inst.operands == operands
+            {
+                return inst.result_id.expect("constant has result id");
+            }
+        }
+        let id = self.fresh();
+        self.module.types_global_values.push(Self::inst(
+            Op::Constant,
+            Some(ty),
+            Some(id),
+            operands,
+        ));
+        id
+    }
+
     pub(super) fn fresh(&mut self) -> Word {
         self.module.fresh_id()
     }
@@ -1075,4 +1397,97 @@ fn ptr_access_chain_allowed_storage(storage: StorageClass) -> bool {
         storage,
         StorageClass::Workgroup | StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer
     )
+}
+
+fn result_type_of_id(defs: &HashMap<Word, Instruction>, id: Word) -> Option<Word> {
+    defs.get(&id).and_then(|inst| inst.result_type)
+}
+
+fn const_int_value(defs: &HashMap<Word, Instruction>, id: Word) -> Option<u64> {
+    let inst = defs.get(&id)?;
+    if inst.class.opcode != Op::Constant {
+        return None;
+    }
+    match inst.operands.as_slice() {
+        [Operand::LiteralBit32(value)] => Some(u64::from(*value)),
+        [Operand::LiteralBit32(lo), Operand::LiteralBit32(hi)] => {
+            Some(u64::from(*lo) | (u64::from(*hi) << 32))
+        }
+        _ => None,
+    }
+}
+
+fn index_const_operands(types: &[Instruction], ty: Word, value: u64) -> Option<Vec<Operand>> {
+    let ty = types
+        .iter()
+        .find(|inst| inst.result_id == Some(ty) && inst.class.opcode == Op::TypeInt)?;
+    let bits = match ty.operands.first()? {
+        Operand::LiteralBit32(bits) => *bits,
+        _ => return None,
+    };
+    match bits {
+        64 => Some(vec![
+            Operand::LiteralBit32(value as u32),
+            Operand::LiteralBit32((value >> 32) as u32),
+        ]),
+        _ => Some(vec![Operand::LiteralBit32(value as u32)]),
+    }
+}
+
+fn spirv_type_is_scalar(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
+    defs.get(&ty).is_some_and(|inst| {
+        matches!(
+            inst.class.opcode,
+            Op::TypeBool | Op::TypeFloat | Op::TypeInt
+        )
+    })
+}
+
+fn zero_tail_indices_to_pointee(
+    defs: &HashMap<Word, Instruction>,
+    mut cur_ty: Word,
+    pointee_ty: Word,
+) -> Option<usize> {
+    let mut count = 0usize;
+    while cur_ty != pointee_ty {
+        let def = defs.get(&cur_ty)?;
+        cur_ty = match def.class.opcode {
+            Op::TypeArray | Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
+                let Operand::IdRef(elem) = def.operands.first()? else {
+                    return None;
+                };
+                *elem
+            }
+            _ => return None,
+        };
+        count += 1;
+    }
+    Some(count)
+}
+
+fn access_chain_step_type(
+    defs: &HashMap<Word, Instruction>,
+    composite_ty: Word,
+    index: &Operand,
+) -> Option<Word> {
+    let def = defs.get(&composite_ty)?;
+    match def.class.opcode {
+        Op::TypeStruct => {
+            let Operand::IdRef(index) = index else {
+                return None;
+            };
+            let member = const_int_value(defs, *index)? as usize;
+            match def.operands.get(member)? {
+                Operand::IdRef(member_ty) => Some(*member_ty),
+                _ => None,
+            }
+        }
+        Op::TypeArray | Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
+            match def.operands.first()? {
+                Operand::IdRef(elem) => Some(*elem),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }

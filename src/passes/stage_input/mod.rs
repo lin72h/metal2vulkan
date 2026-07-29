@@ -96,6 +96,7 @@ pub(in crate::passes) enum ParamBinding {
         image_ty: Word,
         dim: (Dim, bool),
         comp: ImageComp,
+        multisampled: bool,
     },
     /// A runtime-indexed texture ARRAY (`array_ref<texture>`): a descriptor array of sampled or storage
     /// images. Declared as `OpTypeArray %image N` in UniformConstant. Unlike `Image`, the param is NOT
@@ -108,6 +109,7 @@ pub(in crate::passes) enum ParamBinding {
         elem_image_ty: Word,
         dim: (Dim, bool),
         comp: ImageComp,
+        multisampled: bool,
     },
     /// A write-only storage-image variable (`OpTypeImage Sampled=2` + ImageFormat): param uses are the
     /// `air.write_texture_*` texture operand; replace the param id with an OpLoad of the storage image.
@@ -231,7 +233,9 @@ pub(super) fn build_stage_input(
                                                         // interface variables decorated with the same builtin. Create FragCoord once and share it.
     let mut fragcoord_var: Option<Word> = None;
     let mut pointcoord_var: Option<Word> = None;
+    let mut front_facing_var: Option<Word> = None;
     let mut primitive_id_var: Option<Word> = None;
+    let mut sample_id_var: Option<Word> = None;
     let mut local_invocation_index_var: Option<Word> = None;
     let mut num_workgroups_var: Option<Word> = None;
     let mut global_invocation_id_var: Option<Word> = None;
@@ -243,7 +247,9 @@ pub(super) fn build_stage_input(
             Stage::Fragment => match frag.and_then(|m| m.role_of(idx)) {
                 Some(FragRole::Position) => s == "position",
                 Some(FragRole::PointCoord) => s == "point_coord",
+                Some(FragRole::FrontFacing) => s == "front_facing",
                 Some(FragRole::PrimitiveId) => s == "primitive_id",
+                Some(FragRole::SampleId) => s == "sample_id",
                 Some(FragRole::ViewportArrayIndex) => s == "viewport_array_index",
                 Some(FragRole::Varying(_)) => s == "varying",
                 Some(FragRole::Texture(_)) => s == "texture",
@@ -377,21 +383,33 @@ pub(super) fn build_stage_input(
             ));
             buffer_structs.push((var, block_ty));
         } else if role_is("texture") && is_array_texture {
-            let (elem_image_ty, dim, arrayed, comp) =
+            let (elem_image_ty, dim, arrayed, comp, multisampled) =
                 if let Some((dim, arrayed, fmt, comp)) = wtex_dims.get(pid).copied() {
                     (
                         ctx.ty_storage_image(dim, arrayed, fmt, comp),
                         dim,
                         arrayed,
                         comp,
+                        false,
                     )
                 } else {
-                    let (dim, arrayed, comp) = tex_dims
+                    let shape = tex_dims
                         .get(pid)
                         .copied()
                         .or_else(|| texture_type_hints.get(pid).copied())
-                        .unwrap_or((Dim::Dim2D, false, ImageComp::Float));
-                    (ctx.ty_image(dim, arrayed, comp), dim, arrayed, comp)
+                        .unwrap_or(ImageShape {
+                            dim: Dim::Dim2D,
+                            arrayed: false,
+                            comp: ImageComp::Float,
+                            multisampled: false,
+                        });
+                    (
+                        ctx.ty_image_ms(shape.dim, shape.arrayed, shape.comp, shape.multisampled),
+                        shape.dim,
+                        shape.arrayed,
+                        shape.comp,
+                        shape.multisampled,
+                    )
                 };
             // The array length is a runtime function constant (`nImagesFC`), not a compile-time value,
             // so over-declare to `air.max_textures` (128). Vulkan lets an argument-buffer texture array
@@ -417,6 +435,7 @@ pub(super) fn build_stage_input(
                     elem_image_ty,
                     dim: (dim, arrayed),
                     comp,
+                    multisampled,
                 },
             ));
         } else if role_is("texture") && wtex_dims.contains_key(pid) {
@@ -447,12 +466,18 @@ pub(super) fn build_stage_input(
                 },
             ));
         } else if role_is("texture") {
-            let (dim, arrayed, comp) = tex_dims
+            let shape = tex_dims
                 .get(pid)
                 .copied()
                 .or_else(|| texture_type_hints.get(pid).copied())
-                .unwrap_or((Dim::Dim2D, false, ImageComp::Float));
-            let image_ty = ctx.ty_image(dim, arrayed, comp);
+                .unwrap_or(ImageShape {
+                    dim: Dim::Dim2D,
+                    arrayed: false,
+                    comp: ImageComp::Float,
+                    multisampled: false,
+                });
+            let image_ty =
+                ctx.ty_image_ms(shape.dim, shape.arrayed, shape.comp, shape.multisampled);
             let pptr = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
             let var = ctx.module.fresh_id();
             ctx.new_globals.push(Instruction::new(
@@ -469,8 +494,9 @@ pub(super) fn build_stage_input(
                 ParamBinding::Image {
                     var,
                     image_ty,
-                    dim: (dim, arrayed),
-                    comp,
+                    dim: (shape.dim, shape.arrayed),
+                    comp: shape.comp,
+                    multisampled: shape.multisampled,
                 },
             ));
         } else if let Some(color_index) = color_input_index(stage, frag, idx) {
@@ -1104,10 +1130,50 @@ pub(super) fn build_stage_input(
                 let z = ctx.const_zero(*pty, &defs);
                 bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
             }
+        } else if role_is("front_facing") {
+            let bool_ty = ctx.ty_bool();
+            if *pty == bool_ty {
+                let var = if let Some(v) = front_facing_var {
+                    v
+                } else {
+                    let pptr = ctx.ty_ptr(StorageClass::Input, bool_ty);
+                    let var = ctx.module.fresh_id();
+                    ctx.new_globals.push(Instruction::new(
+                        Op::Variable,
+                        Some(pptr),
+                        Some(var),
+                        vec![Operand::StorageClass(StorageClass::Input)],
+                    ));
+                    decorate_builtin(&mut ctx.module, var, BuiltIn::FrontFacing);
+                    ctx.interface.push(var);
+                    front_facing_var = Some(var);
+                    var
+                };
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: bool_ty }));
+            } else {
+                let z = ctx.const_zero(*pty, &defs);
+                bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
+            }
         } else if role_is("primitive_id") {
             let uint_ty = ctx.ty_uint();
             let var =
                 bind_kernel_uint_builtin_once(ctx, &mut primitive_id_var, BuiltIn::PrimitiveId);
+            decorate_flat(&mut ctx.module, var);
+            if *pty == uint_ty {
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
+            } else {
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadVarConverted {
+                        var,
+                        load_ty: uint_ty,
+                        param_ty: *pty,
+                    },
+                ));
+            }
+        } else if role_is("sample_id") {
+            let uint_ty = ctx.ty_uint();
+            let var = bind_kernel_uint_builtin_once(ctx, &mut sample_id_var, BuiltIn::SampleId);
             decorate_flat(&mut ctx.module, var);
             if *pty == uint_ty {
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));

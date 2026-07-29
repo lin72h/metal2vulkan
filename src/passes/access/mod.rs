@@ -364,6 +364,346 @@ mod byte_reinterpret_tests {
     }
 
     #[test]
+    fn dynamic_struct_index_subword_reinterpret_extracts_half_from_word_lane() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let half = ctx.ty_half();
+        let rt = ctx.ty_runtime_array(uint);
+        let struct_id = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(struct_id),
+            vec![Operand::IdRef(rt)],
+        ));
+        let ptr_struct = ctx.ty_ptr(StorageClass::StorageBuffer, struct_id);
+        let ptr_half = ctx.ty_ptr(StorageClass::StorageBuffer, half);
+        let base = storage_buffer_var(&mut ctx, ptr_struct);
+        let dyn_idx = ctx.module.fresh_id();
+        let chain_id = ctx.module.fresh_id();
+        let val_id = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(uint), Some(dyn_idx), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_half),
+                    Some(chain_id),
+                    vec![Operand::IdRef(base), Operand::IdRef(dyn_idx)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(half),
+                    Some(val_id),
+                    vec![Operand::IdRef(chain_id)],
+                ),
+            ],
+        );
+
+        rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, 0).unwrap();
+
+        let insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(chain_id)),
+            "the invalid half pointer should be eliminated"
+        );
+        let word_chain = insts
+            .iter()
+            .find(|inst| {
+                matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                    && inst.operands.first() == Some(&Operand::IdRef(base))
+            })
+            .expect("replacement chain into the backing word array");
+        assert_eq!(word_chain.operands.len(), 3);
+        let Some(Operand::IdRef(word_pointee)) = type_def_of(&ctx, word_chain.result_type.unwrap())
+            .and_then(|d| d.operands.get(1).cloned())
+        else {
+            panic!("replacement chain result is not a pointer");
+        };
+        assert_eq!(word_pointee, uint, "replacement chain reads uint words");
+        let cast = find_inst(&ctx, val_id);
+        assert_eq!(cast.class.opcode, Op::Bitcast);
+        assert_eq!(cast.result_type, Some(half));
+        assert!(
+            insts.iter().any(|inst| inst.class.opcode == Op::UDiv),
+            "half element index is divided by two to address the backing word"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ShiftRightLogical),
+            "selected half lane is shifted down before truncation"
+        );
+    }
+
+    #[test]
+    fn dynamic_struct_index_subword_reinterpret_extracts_uchar_from_word_lane() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let uchar = ctx.ty_int8();
+        let rt = ctx.ty_runtime_array(uint);
+        let struct_id = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(struct_id),
+            vec![Operand::IdRef(rt)],
+        ));
+        let ptr_struct = ctx.ty_ptr(StorageClass::StorageBuffer, struct_id);
+        let ptr_uchar = ctx.ty_ptr(StorageClass::StorageBuffer, uchar);
+        let base = storage_buffer_var(&mut ctx, ptr_struct);
+        let dyn_idx = ctx.module.fresh_id();
+        let chain_id = ctx.module.fresh_id();
+        let val_id = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(uint), Some(dyn_idx), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_uchar),
+                    Some(chain_id),
+                    vec![Operand::IdRef(base), Operand::IdRef(dyn_idx)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(uchar),
+                    Some(val_id),
+                    vec![Operand::IdRef(chain_id)],
+                ),
+            ],
+        );
+
+        rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, 0).unwrap();
+
+        let insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(chain_id)),
+            "the invalid uchar pointer should be eliminated"
+        );
+        let div = insts
+            .iter()
+            .find(|inst| inst.class.opcode == Op::UDiv)
+            .expect("byte element index is divided by four to address the backing word");
+        let Operand::IdRef(divisor) = div.operands[1] else {
+            panic!("divisor is not an id")
+        };
+        assert_eq!(const_u32(&ctx, divisor), Some(4));
+        let lane = insts
+            .iter()
+            .find(|inst| inst.class.opcode == Op::BitwiseAnd && inst.result_type == Some(uint))
+            .expect("byte lane is masked out of the dynamic index");
+        let Operand::IdRef(mask) = lane.operands[1] else {
+            panic!("lane mask is not an id")
+        };
+        assert_eq!(const_u32(&ctx, mask), Some(3));
+        assert_eq!(find_inst(&ctx, val_id).result_type, Some(uchar));
+    }
+
+    #[test]
+    fn dynamic_struct_index_subword_reinterpret_packs_ushort_store_into_word_lane() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let ushort = ctx.ty_int16();
+        let rt = ctx.ty_runtime_array(uint);
+        let struct_id = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(struct_id),
+            vec![Operand::IdRef(rt)],
+        ));
+        let ptr_struct = ctx.ty_ptr(StorageClass::StorageBuffer, struct_id);
+        let ptr_ushort = ctx.ty_ptr(StorageClass::StorageBuffer, ushort);
+        let base = storage_buffer_var(&mut ctx, ptr_struct);
+        let dyn_idx = ctx.module.fresh_id();
+        let object = ctx.module.fresh_id();
+        let chain_id = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(uint), Some(dyn_idx), vec![]),
+                Instruction::new(Op::Undef, Some(ushort), Some(object), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_ushort),
+                    Some(chain_id),
+                    vec![Operand::IdRef(base), Operand::IdRef(dyn_idx)],
+                ),
+                Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(chain_id), Operand::IdRef(object)],
+                ),
+            ],
+        );
+
+        rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, 0).unwrap();
+
+        let insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(chain_id)),
+            "the invalid ushort pointer should be eliminated"
+        );
+        assert!(
+            insts.iter().any(|inst| inst.class.opcode == Op::Not),
+            "store clears the selected 16-bit lane before OR-ing in new bits"
+        );
+        assert!(
+            insts.iter().any(|inst| inst.class.opcode == Op::BitwiseOr),
+            "store merges preserved word bits with shifted object bits"
+        );
+        let stores: Vec<&Instruction> = insts
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Store)
+            .collect();
+        assert_eq!(
+            stores.len(),
+            1,
+            "the original halfword store becomes one word store"
+        );
+        let Operand::IdRef(stored) = stores[0].operands[1] else {
+            panic!("store object is not an id");
+        };
+        assert_eq!(value_result_type(&ctx, stored), Some(uint));
+    }
+
+    #[test]
+    fn dynamic_struct_index_wide_word_reinterpret_assembles_ulong_from_two_words() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let ulong = ctx.ty_ulong();
+        let rt = ctx.ty_runtime_array(uint);
+        let struct_id = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(struct_id),
+            vec![Operand::IdRef(rt)],
+        ));
+        let ptr_struct = ctx.ty_ptr(StorageClass::StorageBuffer, struct_id);
+        let ptr_ulong = ctx.ty_ptr(StorageClass::StorageBuffer, ulong);
+        let base = storage_buffer_var(&mut ctx, ptr_struct);
+        let dyn_idx = ctx.module.fresh_id();
+        let chain_id = ctx.module.fresh_id();
+        let val_id = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(uint), Some(dyn_idx), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_ulong),
+                    Some(chain_id),
+                    vec![Operand::IdRef(base), Operand::IdRef(dyn_idx)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(ulong),
+                    Some(val_id),
+                    vec![Operand::IdRef(chain_id)],
+                ),
+            ],
+        );
+
+        rewrite_dynamic_struct_index_wide_word_reinterpret(&mut ctx, 0).unwrap();
+
+        let insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(chain_id)),
+            "the invalid ulong pointer should be eliminated"
+        );
+        let chains: Vec<&Instruction> = insts
+            .iter()
+            .filter(|inst| {
+                matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                    && inst.operands.first() == Some(&Operand::IdRef(base))
+            })
+            .collect();
+        assert_eq!(chains.len(), 2, "one word pointer per half of the u64");
+        assert!(
+            insts
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::Load && inst.result_type == Some(uint))
+                .count()
+                == 2,
+            "wide load reads two uint words"
+        );
+        assert_eq!(find_inst(&ctx, val_id).result_type, Some(ulong));
+        assert!(
+            insts.iter().any(|inst| inst.class.opcode == Op::BitwiseOr),
+            "low and high words are OR-assembled"
+        );
+    }
+
+    #[test]
+    fn dynamic_struct_index_wide_word_reinterpret_splits_ulong_store_into_two_words() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let ulong = ctx.ty_ulong();
+        let rt = ctx.ty_runtime_array(uint);
+        let struct_id = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(struct_id),
+            vec![Operand::IdRef(rt)],
+        ));
+        let ptr_struct = ctx.ty_ptr(StorageClass::StorageBuffer, struct_id);
+        let ptr_ulong = ctx.ty_ptr(StorageClass::StorageBuffer, ulong);
+        let base = storage_buffer_var(&mut ctx, ptr_struct);
+        let dyn_idx = ctx.module.fresh_id();
+        let object = ctx.module.fresh_id();
+        let chain_id = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(uint), Some(dyn_idx), vec![]),
+                Instruction::new(Op::Undef, Some(ulong), Some(object), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_ulong),
+                    Some(chain_id),
+                    vec![Operand::IdRef(base), Operand::IdRef(dyn_idx)],
+                ),
+                Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(chain_id), Operand::IdRef(object)],
+                ),
+            ],
+        );
+
+        rewrite_dynamic_struct_index_wide_word_reinterpret(&mut ctx, 0).unwrap();
+
+        let insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(chain_id)),
+            "the invalid ulong pointer should be eliminated"
+        );
+        let stores: Vec<&Instruction> = insts
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Store)
+            .collect();
+        assert_eq!(stores.len(), 2, "wide store writes two uint words");
+        for store in stores {
+            let Operand::IdRef(stored) = store.operands[1] else {
+                panic!("store object is not an id");
+            };
+            assert_eq!(value_result_type(&ctx, stored), Some(uint));
+        }
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ShiftRightLogical),
+            "high word is extracted by shifting the 64-bit object down"
+        );
+    }
+
+    #[test]
     fn dynamic_struct_index_vector_reinterpret_replays_scalar_lanes() {
         let mut ctx = Ctx::new(Module::new());
         let uint = ctx.ty_uint();
@@ -435,6 +775,114 @@ mod byte_reinterpret_tests {
         assert_eq!(rebuilt.class.opcode, Op::CompositeConstruct);
         assert_eq!(rebuilt.result_type, Some(v2uint));
         assert_eq!(rebuilt.operands.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_homogeneous_function_struct_index_load_becomes_select() {
+        let mut ctx = Ctx::new(Module::new());
+        let v3u16 = ctx.ty_vec_u16(3);
+        let inner_struct = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(inner_struct),
+            vec![
+                Operand::IdRef(v3u16),
+                Operand::IdRef(v3u16),
+                Operand::IdRef(v3u16),
+            ],
+        ));
+        let struct_id = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(struct_id),
+            vec![Operand::IdRef(inner_struct)],
+        ));
+        let ptr_struct = ctx.ty_ptr(StorageClass::Function, struct_id);
+        let ptr_v3u16 = ctx.ty_ptr(StorageClass::Function, v3u16);
+        let uint = ctx.ty_uint();
+        let zero = ctx.const_uint(0);
+        let dyn_idx = ctx.module.fresh_id();
+        let base = ctx.module.fresh_id();
+        let chain = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(
+                    Op::Variable,
+                    Some(ptr_struct),
+                    Some(base),
+                    vec![Operand::StorageClass(StorageClass::Function)],
+                ),
+                Instruction::new(
+                    Op::Bitcast,
+                    Some(uint),
+                    Some(dyn_idx),
+                    vec![Operand::IdRef(zero)],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_v3u16),
+                    Some(chain),
+                    vec![Operand::IdRef(base), Operand::IdRef(dyn_idx)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(v3u16),
+                    Some(loaded),
+                    vec![Operand::IdRef(chain)],
+                ),
+            ],
+        );
+
+        rewrite_dynamic_homogeneous_struct_index_load(&mut ctx, 0).unwrap();
+
+        let insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(
+            !insts.iter().any(|inst| inst.result_id == Some(chain)),
+            "invalid dynamic pointer should be deleted"
+        );
+        assert!(
+            insts
+                .iter()
+                .any(|inst| inst.class.opcode == Op::Select && inst.result_id == Some(loaded)),
+            "load result should be produced by the select cascade"
+        );
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|inst| {
+                    matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                        && inst.result_type == Some(ptr_v3u16)
+                })
+                .count(),
+            3,
+            "one constant-member chain per homogeneous field"
+        );
+        for chain in insts.iter().filter(|inst| {
+            matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
+                && inst.result_type == Some(ptr_v3u16)
+        }) {
+            let Operand::IdRef(wrapper_member) = chain.operands.get(1).unwrap() else {
+                panic!("wrapper member is not an id")
+            };
+            assert_eq!(const_u32(&ctx, *wrapper_member), Some(0));
+        }
+        assert!(
+            insts.iter().any(|inst| {
+                inst.class.opcode == Op::CompositeConstruct
+                    && inst.result_type.and_then(|ty| {
+                        type_def_of(&ctx, ty).and_then(|def| match def.operands.get(1) {
+                            Some(Operand::LiteralBit32(lanes)) => Some(*lanes),
+                            _ => None,
+                        })
+                    }) == Some(3)
+            }),
+            "vector selects need a v3bool condition"
+        );
     }
 
     // ---- rewrite_chained_element_reinterpret --------------------------------------------------

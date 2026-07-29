@@ -4,14 +4,156 @@
 
 use crate::spirv_module::load_bytes;
 
+const FC_DEFINED_NAME_PREFIX: &str = "__metal2vulkan.MTL_FC_DEFINED_";
+
 /// Parse the FC index `N` out of an `air.fc_initializer` global's mangled name — the stable
 /// `...MTL_FC_INIT_<N>_<suffix>` shape the AIR/LLVM backend emits for a `[[function_constant(N)]]`.
 /// Returns `None` for any name lacking that ABI marker (working copies, ordinary globals), so this
 /// keys only on the documented Metal function-constant machinery, never on a shader-specific name.
-fn fc_init_index(name: &str) -> Option<u32> {
+pub(crate) fn fc_init_index(name: &str) -> Option<u32> {
     let rest = name.split("MTL_FC_INIT_").nth(1)?;
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     digits.parse::<u32>().ok()
+}
+
+pub(crate) fn fc_defined_name(index: u32) -> String {
+    format!("{FC_DEFINED_NAME_PREFIX}{index}")
+}
+
+fn fc_defined_index(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(FC_DEFINED_NAME_PREFIX)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u32>().ok()
+}
+
+fn fc_defined_marker_indices(
+    module: &crate::spirv_module::Module,
+) -> std::collections::HashMap<u32, u32> {
+    use crate::spirv_module::Operand;
+    use spirv::Op;
+
+    let mut out = std::collections::HashMap::new();
+    for inst in &module.debug_names {
+        if inst.class.opcode != Op::Name {
+            continue;
+        }
+        if let (Some(Operand::IdRef(id)), Some(Operand::LiteralString(name))) =
+            (inst.operands.first(), inst.operands.get(1))
+        {
+            if let Some(index) = fc_defined_index(name) {
+                out.insert(*id, index);
+            }
+        }
+    }
+    out
+}
+
+fn fc_init_indices(module: &crate::spirv_module::Module) -> std::collections::HashSet<u32> {
+    use crate::spirv_module::Operand;
+    use spirv::Op;
+
+    let mut out = std::collections::HashSet::new();
+    for inst in &module.debug_names {
+        if inst.class.opcode != Op::Name {
+            continue;
+        }
+        if let Some(Operand::LiteralString(name)) = inst.operands.get(1) {
+            if let Some(index) = fc_init_index(name) {
+                out.insert(index);
+            }
+        }
+    }
+    out
+}
+
+fn bool_constant_for(
+    module: &mut crate::spirv_module::Module,
+    bool_ty: u32,
+    value: bool,
+    const_for: &mut std::collections::HashMap<(u32, bool), u32>,
+) -> u32 {
+    use crate::spirv_module::Instruction;
+    use spirv::Op;
+
+    if let Some(&id) = const_for.get(&(bool_ty, value)) {
+        return id;
+    }
+    let op = if value {
+        Op::ConstantTrue
+    } else {
+        Op::ConstantFalse
+    };
+    if let Some(id) = module
+        .types_global_values
+        .iter()
+        .find(|inst| inst.class.opcode == op && inst.result_type == Some(bool_ty))
+        .and_then(|inst| inst.result_id)
+    {
+        const_for.insert((bool_ty, value), id);
+        return id;
+    }
+    let id = module.fresh_id();
+    module
+        .types_global_values
+        .push(Instruction::new(op, Some(bool_ty), Some(id), vec![]));
+    const_for.insert((bool_ty, value), id);
+    id
+}
+
+fn specialize_fc_definedness(
+    module: &mut crate::spirv_module::Module,
+    defined_indices: &std::collections::HashSet<u32>,
+) -> bool {
+    use crate::spirv_module::Operand;
+    use spirv::Op;
+
+    let marker_indices = fc_defined_marker_indices(module);
+    if marker_indices.is_empty() {
+        return false;
+    }
+
+    let mut edits = Vec::new();
+    for (function_idx, function) in module.functions.iter().enumerate() {
+        for (block_idx, block) in function.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                if inst.class.opcode != Op::CopyObject {
+                    continue;
+                }
+                let Some(result_id) = inst.result_id else {
+                    continue;
+                };
+                let Some(&fc_index) = marker_indices.get(&result_id) else {
+                    continue;
+                };
+                let Some(bool_ty) = inst.result_type else {
+                    continue;
+                };
+                edits.push((
+                    function_idx,
+                    block_idx,
+                    inst_idx,
+                    bool_ty,
+                    defined_indices.contains(&fc_index),
+                ));
+            }
+        }
+    }
+
+    if edits.is_empty() {
+        return false;
+    }
+
+    let mut const_for = std::collections::HashMap::new();
+    let mut changed = false;
+    for (function_idx, block_idx, inst_idx, bool_ty, value) in edits {
+        let const_id = bool_constant_for(module, bool_ty, value, &mut const_for);
+        let inst = &mut module.functions[function_idx].blocks[block_idx].instructions[inst_idx];
+        if inst.operands.first() != Some(&Operand::IdRef(const_id)) {
+            inst.operands = vec![Operand::IdRef(const_id)];
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn materialize_zero_fc_initializers(module: &mut crate::spirv_module::Module) -> bool {
@@ -183,6 +325,50 @@ fn materialize_zero_fc_initializers(module: &mut crate::spirv_module::Module) ->
     true
 }
 
+fn fc_lanes_from_le_value(value: u64, width: u32, count: u32) -> Vec<u64> {
+    let width_bytes = (width as usize).div_ceil(8).min(8);
+    let bytes = value.to_le_bytes();
+    (0..count)
+        .map(|lane| {
+            let start = lane as usize * width_bytes;
+            if start >= bytes.len() {
+                return 0;
+            }
+            let available = (bytes.len() - start).min(width_bytes);
+            let mut lane = [0u8; 8];
+            lane[..available].copy_from_slice(&bytes[start..start + available]);
+            u64::from_le_bytes(lane)
+        })
+        .collect()
+}
+
+fn int_constant_id(
+    scalar_ty: u32,
+    width: u32,
+    value: u64,
+    next_id: &mut u32,
+    const_for: &mut std::collections::HashMap<(u32, u64), u32>,
+    new_consts: &mut std::collections::HashMap<u32, crate::spirv_module::Instruction>,
+) -> u32 {
+    use crate::spirv_module::{Instruction, Operand};
+    use spirv::Op;
+
+    *const_for.entry((scalar_ty, value)).or_insert_with(|| {
+        let id = *next_id;
+        *next_id += 1;
+        let operand = if width > 32 {
+            Operand::LiteralBit64(value)
+        } else {
+            Operand::LiteralBit32(value as u32)
+        };
+        new_consts.insert(
+            id,
+            Instruction::new(Op::Constant, Some(scalar_ty), Some(id), vec![operand]),
+        );
+        id
+    })
+}
+
 /// Bake every discovered Metal function constant to its zero/default value.
 ///
 /// This is distinct from a no-op: after materializing explicit zero constants, the same structural
@@ -191,7 +377,11 @@ fn materialize_zero_fc_initializers(module: &mut crate::spirv_module::Module) ->
 /// FC-gated resources must collapse to one Vulkan descriptor shape.
 pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String> {
     let mut module = load_bytes(spv).map_err(|e| format!("SPIR-V load: {e:?}"))?;
-    if !materialize_zero_fc_initializers(&mut module) {
+    let mut defined_indices = fc_init_indices(&module);
+    defined_indices.extend(fc_defined_marker_indices(&module).values().copied());
+    let materialized = materialize_zero_fc_initializers(&mut module);
+    let definedness = specialize_fc_definedness(&mut module, &defined_indices);
+    if !materialized && !definedness {
         if prune_static_fc_branches_and_drop_interface(&mut module) {
             return Ok(module
                 .assemble()
@@ -248,9 +438,12 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
         }
     }
 
-    // Type tables: pointer id -> pointee id; int type id -> bit width.
+    // Type tables: pointer id -> pointee id; int type id -> bit width; vector int type ->
+    // (component type, lane count).
     let mut pointee: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     let mut int_width: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut int_vectors: std::collections::HashMap<u32, (u32, u32)> =
+        std::collections::HashMap::new();
     for inst in &module.types_global_values {
         match inst.class.opcode {
             Op::TypePointer => {
@@ -266,18 +459,32 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
                     int_width.insert(rid, *w);
                 }
             }
+            Op::TypeVector => {
+                if let (
+                    Some(rid),
+                    Some(Operand::IdRef(component_ty)),
+                    Some(Operand::LiteralBit32(count)),
+                ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
+                {
+                    int_vectors.insert(rid, (*component_ty, *count));
+                }
+            }
             _ => {}
         }
     }
+    int_vectors.retain(|_, (component_ty, _)| int_width.contains_key(component_ty));
 
     // Synthesize one OpConstant per (scalar-int type, value) and repoint each targeted variable's
     // initializer at it. Allocate fresh ids above the current bound.
     let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(1);
     let mut const_for: std::collections::HashMap<(u32, u64), u32> =
         std::collections::HashMap::new();
-    let mut new_consts: Vec<Instruction> = vec![];
+    let mut composite_for: std::collections::HashMap<(u32, Vec<u64>), u32> =
+        std::collections::HashMap::new();
+    let mut new_consts: std::collections::HashMap<u32, Instruction> =
+        std::collections::HashMap::new();
     // Collect the edits first (immutable borrow of the table), then apply.
-    let mut edits: Vec<(usize, u32)> = vec![]; // (var instruction index, const id)
+    let mut edits: Vec<(usize, Vec<u32>, u32)> = vec![]; // (var instruction index, const ids, initializer id)
     for (vi, inst) in module.types_global_values.iter().enumerate() {
         if inst.class.opcode != Op::Variable {
             continue;
@@ -293,32 +500,60 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
         let scalar_ty = *pointee
             .get(&ptr_ty)
             .ok_or_else(|| format!("FC var %{vid}: pointer type %{ptr_ty} has no pointee"))?;
-        let width = *int_width.get(&scalar_ty).ok_or_else(|| {
-            format!("FC index {idx}: pointee %{scalar_ty} is not a scalar integer type")
-        })?;
-        let cid = *const_for.entry((scalar_ty, val)).or_insert_with(|| {
-            let id = next_id;
-            next_id += 1;
-            let operand = if width > 32 {
-                Operand::LiteralBit64(val)
-            } else {
-                Operand::LiteralBit32(val as u32)
-            };
-            new_consts.push(Instruction::new(
-                Op::Constant,
-                Some(scalar_ty),
-                Some(id),
-                vec![operand],
+        if let Some(&width) = int_width.get(&scalar_ty) {
+            let cid = int_constant_id(
+                scalar_ty,
+                width,
+                val,
+                &mut next_id,
+                &mut const_for,
+                &mut new_consts,
+            );
+            edits.push((vi, vec![cid], cid));
+            continue;
+        }
+        let Some(&(component_ty, count)) = int_vectors.get(&scalar_ty) else {
+            return Err(format!(
+                "FC index {idx}: pointee %{scalar_ty} is not a scalar or vector integer type"
             ));
-            id
-        });
-        edits.push((vi, cid));
+        };
+        let width = int_width[&component_ty];
+        let lanes = fc_lanes_from_le_value(val, width, count);
+        let mut const_ids = Vec::with_capacity(lanes.len() + 1);
+        for lane in &lanes {
+            const_ids.push(int_constant_id(
+                component_ty,
+                width,
+                *lane,
+                &mut next_id,
+                &mut const_for,
+                &mut new_consts,
+            ));
+        }
+        let composite_id = *composite_for
+            .entry((scalar_ty, lanes.clone()))
+            .or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                new_consts.insert(
+                    id,
+                    Instruction::new(
+                        Op::ConstantComposite,
+                        Some(scalar_ty),
+                        Some(id),
+                        const_ids.iter().copied().map(Operand::IdRef).collect(),
+                    ),
+                );
+                id
+            });
+        const_ids.push(composite_id);
+        edits.push((vi, const_ids, composite_id));
     }
 
     let requested: std::collections::HashSet<u32> = want.keys().copied().collect();
     let applied: std::collections::HashSet<u32> = edits
         .iter()
-        .filter_map(|(vi, _)| module.types_global_values[*vi].result_id)
+        .filter_map(|(vi, _, _)| module.types_global_values[*vi].result_id)
         .filter_map(|vid| var_index.get(&vid).copied())
         .collect();
     let missing: Vec<u32> = requested.difference(&applied).copied().collect();
@@ -330,14 +565,14 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
         ));
     }
 
-    // Map: FC variable id -> its constant id, and const id -> the OpConstant instruction.
-    let var_to_const: std::collections::HashMap<u32, u32> = edits
+    // Map: FC variable id -> the constants needed before it and the initializer id.
+    let var_to_consts: std::collections::HashMap<u32, (Vec<u32>, u32)> = edits
         .iter()
-        .filter_map(|(vi, cid)| module.types_global_values[*vi].result_id.map(|v| (v, *cid)))
-        .collect();
-    let mut const_inst: std::collections::HashMap<u32, Instruction> = new_consts
-        .into_iter()
-        .filter_map(|c| c.result_id.map(|id| (id, c)))
+        .filter_map(|(vi, consts, initializer)| {
+            module.types_global_values[*vi]
+                .result_id
+                .map(|v| (v, (consts.clone(), *initializer)))
+        })
         .collect();
 
     // Rebuild the type/global section. An OpConstant must follow its result-type definition but
@@ -351,17 +586,21 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for mut inst in module.types_global_values.drain(..) {
         if inst.class.opcode == Op::Variable {
-            if let Some(&cid) = inst.result_id.as_ref().and_then(|v| var_to_const.get(v)) {
-                if emitted.insert(cid) {
-                    if let Some(c) = const_inst.remove(&cid) {
-                        rebuilt.push(c);
+            if let Some((consts, initializer)) =
+                inst.result_id.as_ref().and_then(|v| var_to_consts.get(v))
+            {
+                for const_id in consts {
+                    if emitted.insert(*const_id) {
+                        if let Some(c) = new_consts.remove(const_id) {
+                            rebuilt.push(c);
+                        }
                     }
                 }
                 // Repoint (or append) the initializer operand.
                 if inst.operands.len() >= 2 {
-                    inst.operands[1] = Operand::IdRef(cid);
+                    inst.operands[1] = Operand::IdRef(*initializer);
                 } else {
-                    inst.operands.push(Operand::IdRef(cid));
+                    inst.operands.push(Operand::IdRef(*initializer));
                 }
             }
         }
@@ -371,6 +610,8 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     if let Some(h) = module.header.as_mut() {
         h.bound = next_id;
     }
+    let defined_indices = requested;
+    specialize_fc_definedness(&mut module, &defined_indices);
 
     // If the baked values make AIR function-constant branches static, prune the dead arms and then
     // rebuild the entry interface from the variables still referenced by function bodies. This keeps
@@ -380,6 +621,7 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     // is structural and already used by native retry tiers; this helper is opt-in because it only runs
     // for explicit harness/user-provided FC values.
     prune_static_fc_branches_and_drop_interface(&mut module);
+    rewrite_thread_local_scalar_byte_subslot_stores(&mut module);
 
     Ok(module
         .assemble()
@@ -399,6 +641,447 @@ fn prune_static_fc_branches_and_drop_interface(module: &mut crate::spirv_module:
     restore_loop_merges_removed_by_fc_prune(&before_prune, module);
     drop_unreferenced_entry_interface_globals(module);
     true
+}
+
+fn rewrite_thread_local_scalar_byte_subslot_stores(
+    module: &mut crate::spirv_module::Module,
+) -> bool {
+    use crate::spirv_module::{Instruction, Operand};
+    use spirv::{Op, StorageClass, Word};
+
+    let mut type_defs: std::collections::HashMap<Word, Instruction> =
+        std::collections::HashMap::new();
+    let mut ptr_info: std::collections::HashMap<Word, (StorageClass, Word)> =
+        std::collections::HashMap::new();
+    let mut result_type: std::collections::HashMap<Word, Word> = std::collections::HashMap::new();
+    for inst in module.all_inst_iter() {
+        if let Some(id) = inst.result_id {
+            if let Some(ty) = inst.result_type {
+                result_type.insert(id, ty);
+            }
+            if matches!(
+                inst.class.opcode,
+                Op::TypeInt | Op::TypeFloat | Op::TypePointer | Op::TypeVector
+            ) {
+                type_defs.insert(id, inst.clone());
+            }
+            if inst.class.opcode == Op::TypePointer {
+                if let (Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                {
+                    ptr_info.insert(id, (*sc, *pointee));
+                }
+            }
+        }
+    }
+
+    let scalar_width = |ty: Word| -> Option<u32> {
+        let def = type_defs.get(&ty)?;
+        match def.class.opcode {
+            Op::TypeInt | Op::TypeFloat => match def.operands.first()? {
+                Operand::LiteralBit32(width) => Some(*width),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let is_unsigned_int = |ty: Word, width: u32| -> bool {
+        matches!(
+            type_defs.get(&ty).map(|i| (i.class.opcode, i.operands.as_slice())),
+            Some((
+                Op::TypeInt,
+                [Operand::LiteralBit32(w), Operand::LiteralBit32(0)]
+            )) if *w == width
+        )
+    };
+    let const_u32 = |id: Word| -> Option<u32> {
+        module.types_global_values.iter().find_map(|inst| {
+            if inst.class.opcode == Op::Constant && inst.result_id == Some(id) {
+                match inst.operands.first()? {
+                    Operand::LiteralBit32(v) => Some(*v),
+                    Operand::LiteralBit64(v) => u32::try_from(*v).ok(),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+    };
+
+    #[derive(Clone, Copy)]
+    struct Plan {
+        chain_fi: usize,
+        chain_bi: usize,
+        chain_ii: usize,
+        store_fi: usize,
+        store_bi: usize,
+        store_ii: usize,
+        base: Word,
+        base_ty: Word,
+        base_bits: u32,
+        object: Word,
+        object_ty: Word,
+        object_bits: u32,
+        offset_bits: u32,
+    }
+
+    let mut chain_base: std::collections::HashMap<
+        Word,
+        (usize, usize, usize, Word, Word, u32, u32),
+    > = std::collections::HashMap::new();
+    for (fi, function) in module.functions.iter().enumerate() {
+        for (bi, block) in function.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if inst.class.opcode != Op::PtrAccessChain || inst.operands.len() != 2 {
+                    continue;
+                }
+                let (Some(chain), Some(result_ptr_ty)) = (inst.result_id, inst.result_type) else {
+                    continue;
+                };
+                let Some(&(sc, result_pointee)) = ptr_info.get(&result_ptr_ty) else {
+                    continue;
+                };
+                if !matches!(sc, StorageClass::Function | StorageClass::Private)
+                    || scalar_width(result_pointee) != Some(8)
+                {
+                    continue;
+                }
+                let (Some(Operand::IdRef(base)), Some(Operand::IdRef(offset))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                else {
+                    continue;
+                };
+                let Some(offset_bytes) = const_u32(*offset) else {
+                    continue;
+                };
+                let Some(base_ptr_ty) = result_type.get(base).copied() else {
+                    continue;
+                };
+                let Some(&(base_sc, base_ty)) = ptr_info.get(&base_ptr_ty) else {
+                    continue;
+                };
+                if base_sc != sc {
+                    continue;
+                }
+                let Some(base_bits) = scalar_width(base_ty) else {
+                    continue;
+                };
+                chain_base.insert(
+                    chain,
+                    (fi, bi, ii, *base, base_ty, base_bits, offset_bytes * 8),
+                );
+            }
+        }
+    }
+    if chain_base.is_empty() {
+        return false;
+    }
+
+    let mut uses: std::collections::HashMap<Word, Vec<(usize, usize, usize)>> =
+        std::collections::HashMap::new();
+    let mut disqualified = std::collections::HashSet::new();
+    for (fi, function) in module.functions.iter().enumerate() {
+        for (bi, block) in function.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                if inst
+                    .result_id
+                    .is_some_and(|id| chain_base.contains_key(&id))
+                    && inst.class.opcode == Op::PtrAccessChain
+                {
+                    continue;
+                }
+                for (oi, op) in inst.operands.iter().enumerate() {
+                    let Operand::IdRef(id) = op else { continue };
+                    if !chain_base.contains_key(id) {
+                        continue;
+                    }
+                    if inst.class.opcode == Op::Store && oi == 0 {
+                        uses.entry(*id).or_default().push((fi, bi, ii));
+                    } else {
+                        disqualified.insert(*id);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut plans = Vec::new();
+    for (chain, (chain_fi, chain_bi, chain_ii, base, base_ty, base_bits, offset_bits)) in chain_base
+    {
+        if disqualified.contains(&chain) {
+            continue;
+        }
+        let Some(sites) = uses.get(&chain) else {
+            continue;
+        };
+        for &(store_fi, store_bi, store_ii) in sites {
+            let store = &module.functions[store_fi].blocks[store_bi].instructions[store_ii];
+            let Some(Operand::IdRef(object)) = store.operands.get(1) else {
+                continue;
+            };
+            let Some(object_ty) = result_type.get(object).copied() else {
+                continue;
+            };
+            let Some(object_bits) = scalar_width(object_ty) else {
+                continue;
+            };
+            if offset_bits + object_bits > base_bits {
+                continue;
+            }
+            plans.push(Plan {
+                chain_fi,
+                chain_bi,
+                chain_ii,
+                store_fi,
+                store_bi,
+                store_ii,
+                base,
+                base_ty,
+                base_bits,
+                object: *object,
+                object_ty,
+                object_bits,
+                offset_bits,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return false;
+    }
+
+    let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(1);
+    let mut unsigned_int_for_width: std::collections::HashMap<u32, Word> = type_defs
+        .iter()
+        .filter_map(|(&id, inst)| {
+            if inst.class.opcode == Op::TypeInt {
+                if let (Some(Operand::LiteralBit32(width)), Some(Operand::LiteralBit32(0))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                {
+                    return Some((*width, id));
+                }
+            }
+            None
+        })
+        .collect();
+    let mut const_for: std::collections::HashMap<(Word, u64), Word> =
+        std::collections::HashMap::new();
+    for inst in &module.types_global_values {
+        if inst.class.opcode != Op::Constant {
+            continue;
+        }
+        let (Some(ty), Some(id)) = (inst.result_type, inst.result_id) else {
+            continue;
+        };
+        let value = match inst.operands.first() {
+            Some(Operand::LiteralBit32(v)) => u64::from(*v),
+            Some(Operand::LiteralBit64(v)) => *v,
+            _ => continue,
+        };
+        const_for.insert((ty, value), id);
+    }
+    let mut new_defs = std::collections::HashMap::new();
+
+    for plan in &plans {
+        for width in [plan.base_bits, plan.object_bits] {
+            unsigned_int_for_width.entry(width).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                module.types_global_values.push(Instruction::new(
+                    Op::TypeInt,
+                    None,
+                    Some(id),
+                    vec![Operand::LiteralBit32(width), Operand::LiteralBit32(0)],
+                ));
+                id
+            });
+        }
+    }
+
+    let mut chain_sites: std::collections::HashSet<(usize, usize, usize)> =
+        std::collections::HashSet::new();
+    let mut store_plan: std::collections::HashMap<(usize, usize, usize), Plan> =
+        std::collections::HashMap::new();
+    for plan in plans {
+        chain_sites.insert((plan.chain_fi, plan.chain_bi, plan.chain_ii));
+        store_plan.insert((plan.store_fi, plan.store_bi, plan.store_ii), plan);
+    }
+
+    let mut changed = false;
+    for (fi, function) in module.functions.iter_mut().enumerate() {
+        for (bi, block) in function.blocks.iter_mut().enumerate() {
+            let old = std::mem::take(&mut block.instructions);
+            let mut out = Vec::with_capacity(old.len() + 16);
+            for (ii, inst) in old.into_iter().enumerate() {
+                if chain_sites.contains(&(fi, bi, ii)) {
+                    changed = true;
+                    continue;
+                }
+                let Some(plan) = store_plan.get(&(fi, bi, ii)).copied() else {
+                    out.push(inst);
+                    continue;
+                };
+                let base_uint_ty = unsigned_int_for_width[&plan.base_bits];
+                let object_uint_ty = unsigned_int_for_width[&plan.object_bits];
+                let whole = next_id;
+                next_id += 1;
+                out.push(Instruction::new(
+                    Op::Load,
+                    Some(plan.base_ty),
+                    Some(whole),
+                    vec![Operand::IdRef(plan.base)],
+                ));
+                let whole_u = if is_unsigned_int(plan.base_ty, plan.base_bits) {
+                    whole
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    out.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(base_uint_ty),
+                        Some(id),
+                        vec![Operand::IdRef(whole)],
+                    ));
+                    id
+                };
+                let low_mask = if plan.object_bits == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << plan.object_bits) - 1
+                };
+                let low_mask = int_constant_id(
+                    base_uint_ty,
+                    plan.base_bits,
+                    low_mask,
+                    &mut next_id,
+                    &mut const_for,
+                    &mut new_defs,
+                );
+                let mask = if plan.offset_bits == 0 {
+                    low_mask
+                } else {
+                    let shift = int_constant_id(
+                        base_uint_ty,
+                        plan.base_bits,
+                        u64::from(plan.offset_bits),
+                        &mut next_id,
+                        &mut const_for,
+                        &mut new_defs,
+                    );
+                    let id = next_id;
+                    next_id += 1;
+                    out.push(Instruction::new(
+                        Op::ShiftLeftLogical,
+                        Some(base_uint_ty),
+                        Some(id),
+                        vec![Operand::IdRef(low_mask), Operand::IdRef(shift)],
+                    ));
+                    id
+                };
+                let not_mask = next_id;
+                next_id += 1;
+                out.push(Instruction::new(
+                    Op::Not,
+                    Some(base_uint_ty),
+                    Some(not_mask),
+                    vec![Operand::IdRef(mask)],
+                ));
+                let keep = next_id;
+                next_id += 1;
+                out.push(Instruction::new(
+                    Op::BitwiseAnd,
+                    Some(base_uint_ty),
+                    Some(keep),
+                    vec![Operand::IdRef(whole_u), Operand::IdRef(not_mask)],
+                ));
+                let object_u = if is_unsigned_int(plan.object_ty, plan.object_bits) {
+                    plan.object
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    out.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(object_uint_ty),
+                        Some(id),
+                        vec![Operand::IdRef(plan.object)],
+                    ));
+                    id
+                };
+                let object_wide = if plan.object_bits == plan.base_bits {
+                    object_u
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    out.push(Instruction::new(
+                        Op::UConvert,
+                        Some(base_uint_ty),
+                        Some(id),
+                        vec![Operand::IdRef(object_u)],
+                    ));
+                    id
+                };
+                let object_shifted = if plan.offset_bits == 0 {
+                    object_wide
+                } else {
+                    let shift = int_constant_id(
+                        base_uint_ty,
+                        plan.base_bits,
+                        u64::from(plan.offset_bits),
+                        &mut next_id,
+                        &mut const_for,
+                        &mut new_defs,
+                    );
+                    let id = next_id;
+                    next_id += 1;
+                    out.push(Instruction::new(
+                        Op::ShiftLeftLogical,
+                        Some(base_uint_ty),
+                        Some(id),
+                        vec![Operand::IdRef(object_wide), Operand::IdRef(shift)],
+                    ));
+                    id
+                };
+                let combined = next_id;
+                next_id += 1;
+                out.push(Instruction::new(
+                    Op::BitwiseOr,
+                    Some(base_uint_ty),
+                    Some(combined),
+                    vec![Operand::IdRef(keep), Operand::IdRef(object_shifted)],
+                ));
+                let stored = if is_unsigned_int(plan.base_ty, plan.base_bits) {
+                    combined
+                } else {
+                    let id = next_id;
+                    next_id += 1;
+                    out.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(plan.base_ty),
+                        Some(id),
+                        vec![Operand::IdRef(combined)],
+                    ));
+                    id
+                };
+                let mut operands = vec![Operand::IdRef(plan.base), Operand::IdRef(stored)];
+                operands.extend(inst.operands.iter().skip(2).cloned());
+                out.push(Instruction::new(Op::Store, None, None, operands));
+                changed = true;
+            }
+            block.instructions = out;
+        }
+    }
+    if !new_defs.is_empty() {
+        let mut ids = new_defs.keys().copied().collect::<Vec<_>>();
+        ids.sort_unstable();
+        for id in ids {
+            if let Some(inst) = new_defs.remove(&id) {
+                module.types_global_values.push(inst);
+            }
+        }
+    }
+    if let Some(header) = module.header.as_mut() {
+        header.bound = next_id;
+    }
+    changed
 }
 
 fn restore_loop_merges_removed_by_fc_prune(
@@ -650,6 +1333,113 @@ mod tests {
             label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
             instructions,
         }
+    }
+
+    fn definedness_fixture_bytes() -> Vec<u8> {
+        let mut module = Module::new();
+        let mut header = ModuleHeader::new(21);
+        header.set_version(1, 4);
+        module.header = Some(header);
+        module.capabilities.push(Instruction::new(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(Capability::Shader)],
+        ));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeBool, None, Some(1), vec![]),
+            Instruction::new(Op::ConstantFalse, Some(1), Some(2), vec![]),
+            Instruction::new(Op::TypeVoid, None, Some(3), vec![]),
+            Instruction::new(Op::TypeFunction, None, Some(4), vec![Operand::IdRef(3)]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(5),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(5),
+                ],
+            ),
+            Instruction::new(Op::ConstantNull, Some(5), Some(7), vec![]),
+            Instruction::new(
+                Op::Variable,
+                Some(6),
+                Some(8),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(7),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(6),
+                Some(9),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(7),
+                ],
+            ),
+        ];
+        module.debug_names = vec![
+            name(8, "_Z1x.MTL_FC_INIT_3_b"),
+            name(9, "_Z1y.MTL_FC_INIT_5_b"),
+            name(11, &fc_defined_name(3)),
+            name(12, &fc_defined_name(5)),
+        ];
+
+        let mut function = Function::new();
+        function.def = Some(Instruction::new(
+            Op::Function,
+            Some(3),
+            Some(10),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(4),
+            ],
+        ));
+        function.blocks = vec![block(
+            20,
+            vec![
+                Instruction::new(Op::CopyObject, Some(1), Some(11), vec![Operand::IdRef(2)]),
+                Instruction::new(Op::CopyObject, Some(1), Some(12), vec![Operand::IdRef(2)]),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        )];
+        function.end = Some(Instruction::new(Op::FunctionEnd, None, None, vec![]));
+        module.functions.push(function);
+
+        module
+            .assemble()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect()
+    }
+
+    fn copy_object_operand_const_opcode(module: &Module, result_id: u32) -> Op {
+        let const_id = module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .find(|inst| inst.class.opcode == Op::CopyObject && inst.result_id == Some(result_id))
+            .and_then(|inst| inst.operands.first())
+            .and_then(|op| match op {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .expect("copy object constant operand");
+        module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.result_id == Some(const_id))
+            .map(|inst| inst.class.opcode)
+            .expect("constant definition")
     }
 
     #[test]
@@ -1024,6 +1814,254 @@ mod tests {
     }
 
     #[test]
+    fn value_specialization_materializes_vector_int_fc_initializer() {
+        let bytes = fixture_bytes(
+            7,
+            vec![
+                Instruction::new(
+                    Op::TypeInt,
+                    None,
+                    Some(1),
+                    vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+                ),
+                Instruction::new(
+                    Op::TypeVector,
+                    None,
+                    Some(2),
+                    vec![Operand::IdRef(1), Operand::LiteralBit32(4)],
+                ),
+                Instruction::new(
+                    Op::TypePointer,
+                    None,
+                    Some(3),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(2),
+                    ],
+                ),
+                Instruction::new(Op::ConstantNull, Some(2), Some(4), vec![]),
+                Instruction::new(
+                    Op::Variable,
+                    Some(3),
+                    Some(5),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(4),
+                    ],
+                ),
+            ],
+            vec![name(5, "_ZN3app12shader_stateE.MTL_FC_INIT_0_Dv4_j")],
+        );
+
+        let out = specialize_function_constants(&bytes, &[(0, 1)]).expect("specialize");
+        let m = load_bytes(&out).expect("reload");
+        let vector_init = m
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(5))
+            .and_then(|inst| inst.operands.get(1))
+            .and_then(|op| match op {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .expect("vector initializer");
+        let vector_const = m
+            .types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == Op::ConstantComposite && inst.result_id == Some(vector_init)
+            })
+            .expect("vector value composite");
+        assert_eq!(vector_const.result_type, Some(2));
+
+        let constants = m
+            .types_global_values
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Constant)
+            .filter_map(|inst| {
+                let id = inst.result_id?;
+                let Some(Operand::LiteralBit32(value)) = inst.operands.first() else {
+                    return None;
+                };
+                Some((id, *value))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let lane_values = vector_const
+            .operands
+            .iter()
+            .map(|op| match op {
+                Operand::IdRef(id) => constants[id],
+                other => panic!("unexpected composite operand: {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lane_values, vec![1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn value_specialization_rewrites_thread_local_byte_subslot_store() {
+        let mut module = Module::new();
+        let mut header = ModuleHeader::new(40);
+        header.set_version(1, 4);
+        module.header = Some(header);
+        module.capabilities.push(Instruction::new(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(Capability::Shader)],
+        ));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
+            Instruction::new(Op::TypeFunction, None, Some(2), vec![Operand::IdRef(1)]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(3),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(4),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(5),
+                vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(6),
+                vec![Operand::LiteralBit32(16)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(7),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(8),
+                vec![Operand::IdRef(3), Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(9),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(8),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(10),
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(7),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(11),
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(4),
+                ],
+            ),
+            Instruction::new(Op::ConstantNull, Some(8), Some(12), vec![]),
+            Instruction::new(
+                Op::Variable,
+                Some(9),
+                Some(13),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(12),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(3),
+                Some(14),
+                vec![Operand::LiteralBit32(2)],
+            ),
+        ];
+        module.debug_names = vec![name(13, "_ZN3app12shader_stateE.MTL_FC_INIT_0_Dv4_j")];
+        let function = Function {
+            def: Some(Instruction::new(
+                Op::Function,
+                Some(1),
+                Some(20),
+                vec![
+                    Operand::FunctionControl(FunctionControl::NONE),
+                    Operand::IdRef(2),
+                ],
+            )),
+            blocks: vec![block(
+                21,
+                vec![
+                    Instruction::new(
+                        Op::Variable,
+                        Some(10),
+                        Some(15),
+                        vec![Operand::StorageClass(StorageClass::Function)],
+                    ),
+                    Instruction::new(Op::Undef, Some(6), Some(16), vec![]),
+                    Instruction::new(
+                        Op::PtrAccessChain,
+                        Some(11),
+                        Some(17),
+                        vec![Operand::IdRef(15), Operand::IdRef(14)],
+                    ),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(17), Operand::IdRef(16)],
+                    ),
+                    Instruction::new(Op::Return, None, None, vec![]),
+                ],
+            )],
+            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+            ..Default::default()
+        };
+        module.functions.push(function);
+
+        let bytes = module
+            .assemble()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let out = specialize_function_constants(&bytes, &[(0, 1)]).expect("specialize");
+        let m = load_bytes(&out).expect("reload");
+        let insts = &m.functions[0].blocks[0].instructions;
+
+        assert!(
+            !insts
+                .iter()
+                .any(|inst| inst.class.opcode == Op::PtrAccessChain),
+            "byte subslot PtrAccessChain should be removed"
+        );
+        assert!(
+            insts.iter().any(|inst| inst.class.opcode == Op::BitwiseOr),
+            "store should become a read-modify-write pack"
+        );
+        assert!(
+            insts.iter().any(|inst| {
+                inst.class.opcode == Op::Store
+                    && matches!(inst.operands.first(), Some(Operand::IdRef(15)))
+            }),
+            "rewritten store should target the original scalar slot"
+        );
+    }
+
+    #[test]
     fn zero_specialization_discovers_fc_initializers() {
         let bytes = fixture_bytes(
             5,
@@ -1186,6 +2224,38 @@ mod tests {
                 Operand::IdRef(scalar_init),
             ],
             "vector FC initializer should be an explicit zero composite"
+        );
+    }
+
+    #[test]
+    fn zero_specialization_marks_all_fc_definedness_predicates_true() {
+        let out =
+            specialize_function_constants_zero(&definedness_fixture_bytes()).expect("specialize");
+        let module = load_bytes(&out).expect("reload");
+
+        assert_eq!(
+            copy_object_operand_const_opcode(&module, 11),
+            Op::ConstantTrue
+        );
+        assert_eq!(
+            copy_object_operand_const_opcode(&module, 12),
+            Op::ConstantTrue
+        );
+    }
+
+    #[test]
+    fn value_specialization_marks_only_listed_fc_definedness_predicates_true() {
+        let out = specialize_function_constants(&definedness_fixture_bytes(), &[(3, 1)])
+            .expect("specialize");
+        let module = load_bytes(&out).expect("reload");
+
+        assert_eq!(
+            copy_object_operand_const_opcode(&module, 11),
+            Op::ConstantTrue
+        );
+        assert_eq!(
+            copy_object_operand_const_opcode(&module, 12),
+            Op::ConstantFalse
         );
     }
 

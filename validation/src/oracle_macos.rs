@@ -6,12 +6,13 @@ use crate::texture::{
 };
 use crate::{
     scratch_dir_for, seeded_buffer_bytes, seeded_render_target_bytes, BlendMode, DataFormat,
-    Extent3d, Inputs, Output, Stage, TextureRole,
+    Extent3d, Inputs, Output, Seed, Stage, TextureRole,
 };
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use core::ffi::c_void;
 use core::ptr::NonNull;
+use metal2vulkan::meta::{FragRole, KernRole, VertRole};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSArray, NSString, NSURL};
@@ -101,6 +102,9 @@ pub fn execute_metallib_blob(
         set_oracle_compare(OracleCompare::Full);
         set_oracle_function_constants(OracleFunctionConstants::None);
         let mut load_source_metallib = false;
+        let requested_fc_values = fc_values_requested();
+        let loop_guard_fc_values =
+            loop_guard_function_constant_values(sanitized_ll, &requested_fc_values);
 
         // Structural infinite-loop guard. A committed Metal command buffer CANNOT be cancelled —
         // an unbounded compute loop pins the GPU until the machine is rebooted (killing the CPU
@@ -116,6 +120,8 @@ pub fn execute_metallib_blob(
         // refinement metal2vulkan's Workgroup zero-init pass applies on the candidate side.
         let module_text = disassembled_module_text(&air_path)
             .unwrap_or_else(|e| panic!("m2v-quarantine: metal-objdump failed: {e}"));
+        let missing_visible_refs =
+            missing_visible_function_reference_names(sanitized_ll, &module_text);
         let zero_init = if sanitized_ll.contains("addrspace(3)") {
             insert_threadgroup_zero_init(&module_text, function_name)
         } else {
@@ -123,16 +129,88 @@ pub fn execute_metallib_blob(
         };
         let analysis_text = zero_init.as_deref().unwrap_or(&module_text);
 
-        match crate::loop_budget::classify_and_instrument(analysis_text, function_name) {
+        let arg_values = exact_scalar_arg_values(analysis_text, function_name, inputs);
+        let arg_float_values = exact_float_arg_values(analysis_text, function_name, inputs);
+        let arg_upper_bounds = launch_scalar_arg_upper_bounds(analysis_text, function_name, inputs);
+        let arg_field_values = exact_struct_arg_values(analysis_text, function_name, inputs);
+        let arg_vector_values =
+            exact_launch_vector_arg_values(analysis_text, function_name, inputs);
+        let buffer_arg_vector_values =
+            exact_vector_arg_values(analysis_text, function_name, inputs);
+        let arg_vector_upper_bounds =
+            launch_vector_arg_upper_bounds(analysis_text, function_name, inputs);
+        let texture_extents = exact_texture_extent_values(analysis_text, function_name, inputs);
+        let imageblock_extent = exact_imageblock_extent_value(analysis_text, inputs)
+            .or_else(|| exact_imageblock_extent_value(sanitized_ll, inputs));
+        let mut arg_values = arg_values;
+        let mut arg_float_values = arg_float_values;
+        let mut arg_upper_bounds = arg_upper_bounds;
+        let mut arg_field_values = arg_field_values;
+        let mut arg_vector_values = arg_vector_values;
+        arg_vector_values.extend(buffer_arg_vector_values);
+        let mut arg_vector_upper_bounds = arg_vector_upper_bounds;
+        let mut texture_extents = texture_extents;
+        arg_values.extend(exact_scalar_arg_values(sanitized_ll, function_name, inputs));
+        arg_float_values.extend(exact_float_arg_values(sanitized_ll, function_name, inputs));
+        arg_upper_bounds.extend(launch_scalar_arg_upper_bounds(
+            sanitized_ll,
+            function_name,
+            inputs,
+        ));
+        arg_field_values.extend(exact_struct_arg_values(sanitized_ll, function_name, inputs));
+        arg_vector_values.extend(exact_launch_vector_arg_values(
+            sanitized_ll,
+            function_name,
+            inputs,
+        ));
+        arg_vector_values.extend(exact_vector_arg_values(sanitized_ll, function_name, inputs));
+        arg_vector_upper_bounds.extend(launch_vector_arg_upper_bounds(
+            sanitized_ll,
+            function_name,
+            inputs,
+        ));
+        texture_extents.extend(exact_texture_extent_values(
+            sanitized_ll,
+            function_name,
+            inputs,
+        ));
+        match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
+            analysis_text,
+            function_name,
+            crate::loop_budget::LoopInputFacts {
+                fc_values: &loop_guard_fc_values,
+                arg_values: &arg_values,
+                arg_float_values: &arg_float_values,
+                arg_upper_bounds: &arg_upper_bounds,
+                arg_field_values: &arg_field_values,
+                arg_vector_values: &arg_vector_values,
+                arg_vector_upper_bounds: &arg_vector_upper_bounds,
+                texture_extents: &texture_extents,
+                imageblock_extent,
+            },
+        ) {
             crate::loop_budget::GuardPlan::Quarantine(reason) => {
+                if !missing_visible_refs.is_empty() {
+                    panic!(
+                        "{}",
+                        unresolved_visible_function_references_message(&missing_visible_refs)
+                    );
+                }
                 // Never submit work we cannot prove bounded. Surfaced to the driver via the
                 // `m2v-quarantine:` panic sentinel (caught by `catch_oracle_unwind`).
                 panic!("m2v-quarantine: {reason}");
             }
             crate::loop_budget::GuardPlan::Instrumented(text) => {
+                if !missing_visible_refs.is_empty() {
+                    panic!(
+                        "{}",
+                        unresolved_visible_function_references_message(&missing_visible_refs)
+                    );
+                }
                 // Candidate runners use compare=none to apply the same loop-budget transform before
                 // translating their SPIR-V, so the golden and candidate both cover bounded work.
                 set_oracle_compare(OracleCompare::MetalOnly);
+                let text = substitute_imageblock_air_calls(&text, imageblock_extent);
                 match link_module_text_with_rename_retry(
                     &text,
                     &air_path,
@@ -148,6 +226,10 @@ pub fn execute_metallib_blob(
             }
             crate::loop_budget::GuardPlan::LoopFree => {
                 if let Some(text) = zero_init {
+                    if text.contains("@air.load.implicit_imageblock.") {
+                        set_oracle_compare(OracleCompare::MetalOnly);
+                    }
+                    let text = substitute_imageblock_air_calls(&text, imageblock_extent);
                     match link_module_text_with_rename_retry(
                         &text,
                         &air_path,
@@ -200,12 +282,41 @@ pub fn execute_metallib_blob(
 
         let device =
             MTLCreateSystemDefaultDevice().expect("MTLCreateSystemDefaultDevice returned nil");
-        let library_path = if load_source_metallib {
-            source_metallib.expect("source metallib flag set without source path")
+        let library = if load_source_metallib {
+            let source_path =
+                source_metallib.expect("source metallib flag set without source path");
+            match load_library_from_url(&device, source_path) {
+                Ok(library) => library,
+                Err(source_error) => {
+                    command_stdout(
+                        "xcrun",
+                        &[
+                            "metallib",
+                            air_path.to_str().expect("AIR scratch path is not UTF-8"),
+                            "-o",
+                            metallib_path
+                                .to_str()
+                                .expect("metallib scratch path is not UTF-8"),
+                        ],
+                    )
+                    .unwrap_or_else(|link_error| {
+                        panic!(
+                            "newLibraryWithURL failed for source metallib {}: {source_error}; fallback xcrun failed: {link_error}",
+                            source_path.display()
+                        )
+                    });
+                    load_library_from_url(&device, &metallib_path).unwrap_or_else(|fallback_error| {
+                        panic!(
+                            "newLibraryWithURL failed for source metallib {}: {source_error}; fallback AIR metallib load failed: {fallback_error}",
+                            source_path.display()
+                        )
+                    })
+                }
+            }
         } else {
-            &metallib_path
+            load_library_from_url(&device, &metallib_path)
+                .unwrap_or_else(|e| panic!("newLibraryWithURL failed: {e}"))
         };
-        let library = load_library_from_url(&device, library_path);
         match stage {
             Stage::Kernel => execute_compute_library(
                 &device,
@@ -230,6 +341,99 @@ pub fn execute_metallib_blob(
             ),
         }
     })
+}
+
+fn substitute_imageblock_air_calls(text: &str, extent: Option<[i128; 2]>) -> String {
+    text.lines()
+        .map(|line| {
+            substitute_imageblock_extent_call(line, extent)
+                .or_else(|| substitute_implicit_imageblock_load(line))
+                .unwrap_or_else(|| line.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn substitute_imageblock_extent_call(line: &str, extent: Option<[i128; 2]>) -> Option<String> {
+    let extent = extent?;
+    let (result, component) = imageblock_extent_call_result_component(line)?;
+    let ty = imageblock_extent_call_type(line)?;
+    let indent = line_indent(line);
+    Some(format!(
+        "{indent}%{result} = add {ty} 0, {}",
+        extent[component]
+    ))
+}
+
+fn substitute_implicit_imageblock_load(line: &str) -> Option<String> {
+    if !line.contains("@air.load.implicit_imageblock.") {
+        return None;
+    }
+    let result = ssa_result_name(line)?;
+    let ty = call_result_type_before(line, "@air.load.implicit_imageblock.")?;
+    let zero = zero_constant_for_type(ty)?;
+    let indent = line_indent(line);
+    Some(format!(
+        "{indent}%{result} = select i1 true, {ty} {zero}, {ty} {zero}"
+    ))
+}
+
+fn imageblock_extent_call_result_component(line: &str) -> Option<(String, usize)> {
+    let result = ssa_result_name(line)?;
+    let component = if line.contains("@air.get_imageblock_width(") {
+        0
+    } else if line.contains("@air.get_imageblock_height(") {
+        1
+    } else {
+        return None;
+    };
+    Some((result, component))
+}
+
+fn imageblock_extent_call_type(line: &str) -> Option<&str> {
+    let ty = call_result_type_before(line, "@air.get_imageblock_width(")
+        .or_else(|| call_result_type_before(line, "@air.get_imageblock_height("))?;
+    matches!(ty, "i8" | "i16" | "i32" | "i64").then_some(ty)
+}
+
+fn call_result_type_before<'a>(line: &'a str, callee_marker: &str) -> Option<&'a str> {
+    let before_call = line.split_once(callee_marker)?.0.trim_end();
+    if before_call.ends_with('>') {
+        let start = before_call.rfind('<')?;
+        return Some(&before_call[start..]);
+    }
+    before_call.split_whitespace().last()
+}
+
+fn zero_constant_for_type(ty: &str) -> Option<&'static str> {
+    if ty.starts_with('<') {
+        return Some("zeroinitializer");
+    }
+    if matches!(ty, "half") {
+        return Some("0xH0000");
+    }
+    if matches!(ty, "float") {
+        return Some("0.000000e+00");
+    }
+    if matches!(ty, "double") {
+        return Some("0.000000e+00");
+    }
+    ty.strip_prefix('i')
+        .and_then(|width| width.parse::<u32>().ok())
+        .is_some()
+        .then_some("0")
+}
+
+fn line_indent(line: &str) -> &str {
+    &line[..line.len() - line.trim_start().len()]
+}
+
+fn ssa_result_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('%')?;
+    let (name, _) = rest.split_once(" = ")?;
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// Parse the colliding symbol out of a Metal linker "LLVM ERROR: multiple symbols ('<sym>')!"
@@ -587,6 +791,940 @@ fn command_stdout(cmd: &str, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+fn exact_scalar_arg_values(ll: &str, entry: &str, inputs: &Inputs) -> Vec<(String, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = exact_launch_scalar_arg_values(ll, &arg_names, inputs);
+    let reflected_buffer_locations = reflected_buffer_locations(ll);
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return out;
+    }
+
+    for line in ll.lines() {
+        let readable = line.contains(r#""air.read""#) || line.contains(r#""air.read_write""#);
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !readable
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = exact_metadata_i32_after(line, "air.location_index").map(|v| v as u32)
+        else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(bytes) =
+            input_bytes_for_arg(&input_bytes, &reflected_buffer_locations, arg_ord, raw_loc)
+        else {
+            continue;
+        };
+        let Some(value) = scalar_int_from_bytes(bytes, type_name) else {
+            continue;
+        };
+        out.push((arg_name.clone(), value));
+    }
+    out
+}
+
+fn exact_float_arg_values(ll: &str, entry: &str, inputs: &Inputs) -> Vec<(String, f64)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let reflected_buffer_locations = reflected_buffer_locations(ll);
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !line.contains(r#""air.address_space", i32 2"#)
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = exact_metadata_i32_after(line, "air.location_index").map(|v| v as u32)
+        else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(bytes) =
+            input_bytes_for_arg(&input_bytes, &reflected_buffer_locations, arg_ord, raw_loc)
+        else {
+            continue;
+        };
+        let Some(value) = scalar_float_from_bytes(bytes, type_name) else {
+            continue;
+        };
+        out.push((arg_name.clone(), value));
+    }
+    out
+}
+
+fn exact_launch_scalar_arg_values(
+    ll: &str,
+    arg_names: &[String],
+    inputs: &Inputs,
+) -> Vec<(String, i128)> {
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        if !is_scalar_integer_air_type(type_name) {
+            continue;
+        }
+        let degenerate_position = (line.contains(r#""air.thread_position_in_threadgroup""#)
+            && inputs.dispatch.threads_per_threadgroup[0] <= 1)
+            || (line.contains(r#""air.thread_position_in_grid""#)
+                && inputs.dispatch.threads_per_grid[0] <= 1)
+            || (line.contains(r#""air.threadgroup_position_in_grid""#)
+                && div_ceil_nonzero(
+                    inputs.dispatch.threads_per_grid[0],
+                    inputs.dispatch.threads_per_threadgroup[0],
+                ) <= 1);
+        let value = if line.contains(r#""air.threads_per_threadgroup""#) {
+            Some(inputs.dispatch.threads_per_threadgroup[0])
+        } else if line.contains(r#""air.threads_per_grid""#) {
+            Some(inputs.dispatch.threads_per_grid[0])
+        } else if line.contains(r#""air.threadgroups_per_grid""#) {
+            Some(div_ceil_nonzero(
+                inputs.dispatch.threads_per_grid[0],
+                inputs.dispatch.threads_per_threadgroup[0],
+            ))
+        } else if line.contains(r#""air.threads_per_simdgroup""#) {
+            Some(32)
+        } else if line.contains(r#""air.simdgroups_per_threadgroup""#) {
+            Some(div_ceil_nonzero(
+                inputs.dispatch.threads_per_threadgroup[0],
+                32,
+            ))
+        } else if degenerate_position {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            out.push((arg_name.clone(), i128::from(value)));
+        }
+    }
+    out
+}
+
+fn launch_scalar_arg_upper_bounds(ll: &str, entry: &str, inputs: &Inputs) -> Vec<(String, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        if !is_scalar_integer_air_type(type_name) {
+            continue;
+        }
+        let value = if line.contains(r#""air.thread_position_in_threadgroup""#) {
+            Some(inputs.dispatch.threads_per_threadgroup[0].saturating_sub(1))
+        } else if line.contains(r#""air.thread_position_in_grid""#) {
+            Some(inputs.dispatch.threads_per_grid[0].saturating_sub(1))
+        } else if line.contains(r#""air.threadgroup_position_in_grid""#) {
+            Some(
+                div_ceil_nonzero(
+                    inputs.dispatch.threads_per_grid[0],
+                    inputs.dispatch.threads_per_threadgroup[0],
+                )
+                .saturating_sub(1),
+            )
+        } else {
+            None
+        };
+        if let Some(value) = value {
+            out.push((arg_name.clone(), i128::from(value)));
+        }
+    }
+    out
+}
+
+fn exact_launch_vector_arg_values(
+    ll: &str,
+    entry: &str,
+    inputs: &Inputs,
+) -> Vec<(String, usize, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(lanes) = integer_vector_lane_count(type_name) else {
+            continue;
+        };
+        for lane in 0..lanes {
+            let value = if line.contains(r#""air.threads_per_threadgroup""#) {
+                dispatch_lane(inputs.dispatch.threads_per_threadgroup, lane)
+            } else if line.contains(r#""air.threads_per_grid""#) {
+                dispatch_lane(inputs.dispatch.threads_per_grid, lane)
+            } else if line.contains(r#""air.threadgroups_per_grid""#) {
+                Some(threadgroups_per_grid_lane(inputs, lane))
+            } else if line.contains(r#""air.thread_position_in_threadgroup""#) {
+                dispatch_lane(inputs.dispatch.threads_per_threadgroup, lane)
+                    .filter(|value| *value <= 1)
+                    .map(|_| 0)
+            } else if line.contains(r#""air.thread_position_in_grid""#) {
+                dispatch_lane(inputs.dispatch.threads_per_grid, lane)
+                    .filter(|value| *value <= 1)
+                    .map(|_| 0)
+            } else if line.contains(r#""air.threadgroup_position_in_grid""#) {
+                (threadgroups_per_grid_lane(inputs, lane) <= 1).then_some(0)
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                out.push((arg_name.clone(), lane, i128::from(value)));
+            }
+        }
+    }
+    out
+}
+
+fn exact_vector_arg_values(ll: &str, entry: &str, inputs: &Inputs) -> Vec<(String, usize, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+    let reflected_buffer_locations = reflected_buffer_locations(ll);
+
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !line.contains(r#""air.address_space", i32 2"#)
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = exact_metadata_i32_after(line, "air.location_index").map(|v| v as u32)
+        else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some((lanes, scalar_type, elem_size)) = integer_vector_shape(type_name) else {
+            continue;
+        };
+        let Some(bytes) =
+            input_bytes_for_arg(&input_bytes, &reflected_buffer_locations, arg_ord, raw_loc)
+        else {
+            continue;
+        };
+        for lane in 0..lanes {
+            let offset = lane.saturating_mul(elem_size);
+            if let Some(value) =
+                scalar_int_from_bytes(bytes.get(offset..).unwrap_or(&[]), scalar_type)
+            {
+                out.push((arg_name.clone(), lane, value));
+            }
+        }
+    }
+    out
+}
+
+fn launch_vector_arg_upper_bounds(
+    ll: &str,
+    entry: &str,
+    inputs: &Inputs,
+) -> Vec<(String, usize, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_after(line, "air.arg_type_name") else {
+            continue;
+        };
+        let Some(lanes) = integer_vector_lane_count(type_name) else {
+            continue;
+        };
+        for lane in 0..lanes {
+            let value = if line.contains(r#""air.thread_position_in_threadgroup""#) {
+                dispatch_lane(inputs.dispatch.threads_per_threadgroup, lane)
+                    .map(|value| value.saturating_sub(1))
+            } else if line.contains(r#""air.thread_position_in_grid""#) {
+                dispatch_lane(inputs.dispatch.threads_per_grid, lane)
+                    .map(|value| value.saturating_sub(1))
+            } else if line.contains(r#""air.threadgroup_position_in_grid""#) {
+                Some(threadgroups_per_grid_lane(inputs, lane).saturating_sub(1))
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                out.push((arg_name.clone(), lane, i128::from(value)));
+            }
+        }
+    }
+    out
+}
+
+fn integer_vector_lane_count(type_name: &str) -> Option<usize> {
+    integer_vector_shape(type_name).map(|(lanes, _, _)| lanes)
+}
+
+fn integer_vector_shape(type_name: &str) -> Option<(usize, &str, usize)> {
+    let trimmed = type_name.trim().trim_end_matches('*').trim();
+    let lanes = trimmed
+        .chars()
+        .last()
+        .and_then(|ch| ch.to_digit(10))
+        .and_then(|lanes| usize::try_from(lanes).ok())?;
+    if !(2..=4).contains(&lanes) {
+        return None;
+    }
+    let scalar = &trimmed[..trimmed.len() - 1];
+    let elem_size = scalar_int_type_byte_size(scalar)?;
+    Some((lanes, scalar, elem_size))
+}
+
+fn scalar_int_type_byte_size(type_name: &str) -> Option<usize> {
+    match type_name.trim().trim_end_matches('*').trim() {
+        "uchar" | "char" | "bool" => Some(1),
+        "ushort" | "short" => Some(2),
+        "uint" | "int" => Some(4),
+        "ulong" | "long" => Some(8),
+        _ => None,
+    }
+}
+
+fn dispatch_lane(values: [u32; 3], lane: usize) -> Option<u32> {
+    values.get(lane).copied()
+}
+
+fn threadgroups_per_grid_lane(inputs: &Inputs, lane: usize) -> u32 {
+    let grid = dispatch_lane(inputs.dispatch.threads_per_grid, lane).unwrap_or(1);
+    let tg = dispatch_lane(inputs.dispatch.threads_per_threadgroup, lane).unwrap_or(1);
+    div_ceil_nonzero(grid, tg)
+}
+
+fn is_scalar_integer_air_type(type_name: &str) -> bool {
+    matches!(
+        type_name.trim().trim_end_matches('*').trim(),
+        "uchar" | "char" | "bool" | "ushort" | "short" | "uint" | "int" | "ulong" | "long"
+    )
+}
+
+fn div_ceil_nonzero(n: u32, d: u32) -> u32 {
+    let d = d.max(1);
+    n.max(1).div_ceil(d)
+}
+
+fn reflected_buffer_locations(ll: &str) -> std::collections::HashMap<usize, u32> {
+    match crate::air::stage_from_ll(ll) {
+        Stage::Kernel => metal2vulkan::meta::parse_air_kernel_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        KernRole::Buffer(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Stage::Vertex => metal2vulkan::meta::parse_air_vertex_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        VertRole::Buffer(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Stage::Fragment => metal2vulkan::meta::parse_air_fragment_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        FragRole::Buffer(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn reflected_texture_locations(ll: &str) -> std::collections::HashMap<usize, u32> {
+    match crate::air::stage_from_ll(ll) {
+        Stage::Kernel => metal2vulkan::meta::parse_air_kernel_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        KernRole::Texture(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Stage::Vertex => metal2vulkan::meta::parse_air_vertex_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        VertRole::Texture(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Stage::Fragment => metal2vulkan::meta::parse_air_fragment_meta(ll)
+            .map(|meta| {
+                meta.roles
+                    .into_iter()
+                    .filter_map(|(arg, role)| match role {
+                        FragRole::Texture(loc) => Some((arg as usize, loc)),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+fn exact_texture_extent_values(ll: &str, entry: &str, inputs: &Inputs) -> Vec<(String, [i128; 3])> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let input_extents = inputs
+        .textures
+        .iter()
+        .map(|texture| (texture.index, texture.extent))
+        .collect::<std::collections::HashMap<_, _>>();
+    if input_extents.is_empty() {
+        return Vec::new();
+    }
+    let reflected_texture_locations = reflected_texture_locations(ll);
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        if !line.contains(r#""air.texture""#) || !line.contains(r#""air.location_index""#) {
+            continue;
+        }
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = exact_metadata_i32_after(line, "air.location_index").map(|v| v as u32)
+        else {
+            continue;
+        };
+        let Some(extent) = reflected_texture_locations
+            .get(&arg_ord)
+            .and_then(|loc| input_extents.get(loc))
+            .or_else(|| input_extents.get(&raw_loc))
+        else {
+            continue;
+        };
+        out.push((
+            arg_name.clone(),
+            [
+                i128::from(extent.width),
+                i128::from(extent.height),
+                i128::from(extent.depth),
+            ],
+        ));
+    }
+    out
+}
+
+fn exact_imageblock_extent_value(ll: &str, inputs: &Inputs) -> Option<[i128; 2]> {
+    (ll.contains("@air.get_imageblock_width(") || ll.contains("@air.get_imageblock_height("))
+        .then_some([
+            i128::from(inputs.dispatch.threads_per_threadgroup[0]),
+            i128::from(inputs.dispatch.threads_per_threadgroup[1]),
+        ])
+}
+
+fn input_bytes_for_arg<'a>(
+    input_bytes: &std::collections::HashMap<u32, &'a [u8]>,
+    reflected_buffer_locations: &std::collections::HashMap<usize, u32>,
+    arg_ord: usize,
+    raw_loc: u32,
+) -> Option<&'a [u8]> {
+    reflected_buffer_locations
+        .get(&arg_ord)
+        .and_then(|loc| input_bytes.get(loc))
+        .or_else(|| input_bytes.get(&raw_loc))
+        .or_else(|| {
+            u32::try_from(arg_ord)
+                .ok()
+                .and_then(|ord| input_bytes.get(&ord))
+        })
+        .copied()
+}
+
+fn exact_struct_arg_values(
+    ll: &str,
+    entry: &str,
+    inputs: &Inputs,
+) -> Vec<(String, Vec<i32>, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return Vec::new();
+    }
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    if input_bytes.is_empty() {
+        return Vec::new();
+    }
+    let reflected_buffer_locations = reflected_buffer_locations(ll);
+
+    let mut out = Vec::new();
+    for line in ll.lines() {
+        let readable = line.contains(r#""air.read""#) || line.contains(r#""air.read_write""#);
+        if !line.contains(r#""air.buffer""#)
+            || !line.contains(r#""air.location_index""#)
+            || !line.contains(r#""air.struct_type_info""#)
+            || !readable
+            || line.contains(r#""air.write""#)
+        {
+            continue;
+        }
+        let Some(arg_ord) = metadata_first_i32(line).and_then(|v| usize::try_from(v).ok()) else {
+            continue;
+        };
+        let Some(arg_name) = arg_names.get(arg_ord) else {
+            continue;
+        };
+        let Some(raw_loc) = exact_metadata_i32_after(line, "air.location_index").map(|v| v as u32)
+        else {
+            continue;
+        };
+        let Some(bytes) =
+            input_bytes_for_arg(&input_bytes, &reflected_buffer_locations, arg_ord, raw_loc)
+        else {
+            continue;
+        };
+        let Some(node) = metadata_ref_after(line, "air.struct_type_info") else {
+            continue;
+        };
+        collect_struct_int_fields(ll, node, bytes, arg_name, &mut Vec::new(), 0, &mut out);
+    }
+    out
+}
+
+fn collect_struct_int_fields(
+    ll: &str,
+    node: u32,
+    bytes: &[u8],
+    arg_name: &str,
+    path: &mut Vec<i32>,
+    base_offset: usize,
+    out: &mut Vec<(String, Vec<i32>, i128)>,
+) {
+    let Some(line) = metadata_node_line(ll, node) else {
+        return;
+    };
+    let Some(payload) = metadata_payload(line) else {
+        return;
+    };
+    let tokens = metadata_tokens(payload);
+    let mut pending_child = None;
+    let mut field_index = 0_i32;
+    let mut i = 0;
+    while i + 3 < tokens.len() {
+        if metadata_quoted_token(tokens[i]) == Some("air.struct_type_info") {
+            pending_child = tokens
+                .get(i + 1)
+                .and_then(|token| metadata_ref_token(token));
+            i += 2;
+            continue;
+        }
+        let Some(offset) = metadata_i32_token(tokens[i]) else {
+            i += 1;
+            continue;
+        };
+        let Some(byte_size) = metadata_i32_token(tokens[i + 1]) else {
+            i += 1;
+            continue;
+        };
+        let Some(repeat_count) = metadata_i32_token(tokens[i + 2]) else {
+            i += 1;
+            continue;
+        };
+        let Some(type_name) = metadata_quoted_token(tokens[i + 3]) else {
+            i += 1;
+            continue;
+        };
+        let offset = base_offset.saturating_add(offset.max(0) as usize);
+        path.push(field_index);
+        if let Some(child) = pending_child.take() {
+            collect_struct_int_fields(ll, child, bytes, arg_name, path, offset, out);
+        } else if let Some(size) = scalar_int_byte_size(type_name, byte_size) {
+            let count = repeat_count.max(0) as usize;
+            if count > 0 {
+                for element in 0..count {
+                    path.push(element as i32);
+                    let element_offset = offset.saturating_add(element.saturating_mul(size));
+                    if let Some(value) =
+                        scalar_int_from_bytes(bytes.get(element_offset..).unwrap_or(&[]), type_name)
+                    {
+                        out.push((arg_name.to_string(), path.clone(), value));
+                    }
+                    path.pop();
+                }
+            } else if let Some(value) =
+                scalar_int_from_bytes(bytes.get(offset..).unwrap_or(&[]), type_name)
+            {
+                out.push((arg_name.to_string(), path.clone(), value));
+            }
+        } else if let Some((lanes, elem_size)) = vector_int_shape(type_name, byte_size) {
+            let count = repeat_count.max(0) as usize;
+            for element in 0..count.max(1) {
+                let vector_offset =
+                    offset.saturating_add(element.saturating_mul(byte_size as usize));
+                if count > 0 {
+                    path.push(element as i32);
+                }
+                for lane in 0..lanes {
+                    path.push(lane as i32);
+                    let lane_offset = vector_offset.saturating_add(lane.saturating_mul(elem_size));
+                    if let Some(value) =
+                        scalar_int_from_bytes(bytes.get(lane_offset..).unwrap_or(&[]), type_name)
+                    {
+                        out.push((arg_name.to_string(), path.clone(), value));
+                    }
+                    path.pop();
+                }
+                if count > 0 {
+                    path.pop();
+                }
+            }
+        }
+        path.pop();
+        field_index += 1;
+        i += 5;
+    }
+}
+
+fn entry_arg_names(ll: &str, entry: &str) -> Vec<String> {
+    let Some(line) = ll.lines().find(|line| {
+        line.trim_start().starts_with("define ") && define_line_names_entry(line, entry)
+    }) else {
+        return Vec::new();
+    };
+    let Some(args) = define_args(line) else {
+        return Vec::new();
+    };
+    args.split(',')
+        .filter_map(|arg| {
+            let (_, name) = arg.rsplit_once('%')?;
+            let name = name.trim().trim_end_matches(|ch: char| {
+                !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+            });
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
+fn define_line_names_entry(line: &str, entry: &str) -> bool {
+    let Some(at) = line.find('@') else {
+        return false;
+    };
+    let rest = &line[at + 1..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        return quoted
+            .strip_prefix(entry)
+            .is_some_and(|tail| tail.starts_with('"'));
+    }
+    rest.strip_prefix(entry).is_some_and(|tail| {
+        tail.starts_with('(')
+            || tail
+                .chars()
+                .next()
+                .is_some_and(|ch| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '.'))
+    })
+}
+
+fn define_args(line: &str) -> Option<&str> {
+    let open = line.find('(')?;
+    let close = line.rfind(") ")?;
+    (open < close).then_some(&line[open + 1..close])
+}
+
+fn metadata_first_i32(line: &str) -> Option<i32> {
+    let idx = line.find("!{i32 ")?;
+    let rest = &line[idx + "!{i32 ".len()..];
+    let num = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+        .collect::<String>();
+    num.parse().ok()
+}
+
+fn exact_metadata_i32_after(line: &str, key: &str) -> Option<i32> {
+    let idx = line.find(key)?;
+    let mut found_i32 = false;
+    for tok in line[idx + key.len()..].split([',', ' ', '}']) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if t == "i32" {
+            found_i32 = true;
+            continue;
+        }
+        if found_i32 {
+            if let Ok(n) = t.parse::<i32>() {
+                return Some(n);
+            }
+            found_i32 = false;
+        }
+    }
+    None
+}
+
+fn metadata_quoted_after<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let idx = line.find(key)?;
+    let rest = &line[idx + key.len()..];
+    let start = rest.find("!\"")? + 2;
+    let rest = &rest[start..];
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn metadata_ref_after(line: &str, key: &str) -> Option<u32> {
+    let idx = line.find(key)?;
+    let rest = &line[idx + key.len()..];
+    let bang = rest.find('!')?;
+    let rest = &rest[bang + 1..];
+    let digits = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    (!digits.is_empty()).then(|| digits.parse().ok()).flatten()
+}
+
+fn metadata_node_line(ll: &str, node: u32) -> Option<&str> {
+    let prefix = format!("!{node} = ");
+    ll.lines()
+        .find(|line| line.trim_start().starts_with(&prefix))
+}
+
+fn metadata_payload(line: &str) -> Option<&str> {
+    let start = line.find("!{")? + 2;
+    let end = line.rfind('}')?;
+    (start <= end).then_some(&line[start..end])
+}
+
+fn metadata_tokens(payload: &str) -> Vec<&str> {
+    payload
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn metadata_i32_token(token: &str) -> Option<i32> {
+    token.trim().strip_prefix("i32 ")?.trim().parse().ok()
+}
+
+fn metadata_ref_token(token: &str) -> Option<u32> {
+    token.trim().strip_prefix('!')?.parse().ok()
+}
+
+fn metadata_quoted_token(token: &str) -> Option<&str> {
+    let token = token.trim();
+    let rest = token.strip_prefix("!\"")?;
+    let end = rest.find('"')?;
+    Some(&rest[..end])
+}
+
+fn scalar_int_byte_size(type_name: &str, byte_size: i32) -> Option<usize> {
+    let name = type_name.trim().trim_end_matches('*').trim();
+    let size = match name {
+        "uchar" | "char" | "bool" => 1,
+        "ushort" | "short" => 2,
+        "uint" | "int" => 4,
+        "ulong" | "long" => 8,
+        _ => return None,
+    };
+    (byte_size as usize == size).then_some(size)
+}
+
+fn vector_int_shape(type_name: &str, byte_size: i32) -> Option<(usize, usize)> {
+    let name = type_name.trim().trim_end_matches('*').trim();
+    let lanes = name
+        .chars()
+        .last()
+        .and_then(|ch| ch.to_digit(10))
+        .and_then(|lanes| usize::try_from(lanes).ok())?;
+    if !(2..=4).contains(&lanes) {
+        return None;
+    }
+    let scalar = name.trim_end_matches(|ch: char| ch.is_ascii_digit());
+    let elem_size = scalar_int_byte_size(scalar, byte_size / lanes as i32)?;
+    (byte_size as usize == lanes * elem_size).then_some((lanes, elem_size))
+}
+
+fn scalar_int_from_bytes(bytes: &[u8], type_name: &str) -> Option<i128> {
+    let name = type_name
+        .trim()
+        .trim_end_matches('*')
+        .trim()
+        .trim_end_matches(|ch: char| ch.is_ascii_digit());
+    match name {
+        "char" => bytes.first().map(|v| i128::from(*v as i8)),
+        "uchar" | "bool" => bytes.first().map(|v| i128::from(*v)),
+        "short" => bytes
+            .get(..2)
+            .map(|b| i128::from(i16::from_le_bytes([b[0], b[1]]))),
+        "ushort" => bytes
+            .get(..2)
+            .map(|b| i128::from(u16::from_le_bytes([b[0], b[1]]))),
+        "int" => bytes
+            .get(..4)
+            .map(|b| i128::from(i32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        "uint" => bytes
+            .get(..4)
+            .map(|b| i128::from(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        "long" => bytes.get(..8).map(|b| {
+            i128::from(i64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]))
+        }),
+        "ulong" => bytes.get(..8).map(|b| {
+            i128::from(u64::from_le_bytes([
+                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+            ]))
+        }),
+        _ => None,
+    }
+}
+
+fn scalar_float_from_bytes(bytes: &[u8], type_name: &str) -> Option<f64> {
+    let name = type_name
+        .trim()
+        .trim_end_matches('*')
+        .trim()
+        .trim_end_matches(|ch: char| ch.is_ascii_digit());
+    match name {
+        "half" => bytes
+            .get(..2)
+            .map(|b| f16_bits_to_f64(u16::from_le_bytes([b[0], b[1]]))),
+        "float" => bytes
+            .get(..4)
+            .map(|b| f64::from(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+        "double" => bytes
+            .get(..8)
+            .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])),
+        _ => None,
+    }
+}
+
+fn f16_bits_to_f64(bits: u16) -> f64 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exp = (bits >> 10) & 0x1f;
+    let frac = bits & 0x03ff;
+    match (exp, frac) {
+        (0, 0) => sign * 0.0,
+        (0, _) => sign * f64::from(frac) * 2f64.powi(-24),
+        (0x1f, 0) => sign * f64::INFINITY,
+        (0x1f, _) => f64::NAN,
+        _ => sign * (1.0 + f64::from(frac) / 1024.0) * 2f64.powi(i32::from(exp) - 15),
+    }
+}
+
 thread_local! {
     /// Legacy per-case zero-FC request. The oracle now zero-specializes every declared FC by
     /// default to match the translator's disabled-default model; this setter is retained for old
@@ -639,6 +1777,12 @@ fn new_specialized_function(
             new_fc_specialized_function(library, entry, sanitized_ll, &explicit_fc)
         {
             set_oracle_function_constants(OracleFunctionConstants::Values(explicit_fc));
+            return function;
+        }
+    }
+    if let Some(values) = dynamic_resource_location_fc_values(sanitized_ll) {
+        if let Some(function) = new_fc_specialized_function(library, entry, sanitized_ll, &values) {
+            set_oracle_function_constants(OracleFunctionConstants::Values(values));
             return function;
         }
     }
@@ -787,6 +1931,27 @@ fn dynamic_resource_location_fc_values(sanitized_ll: Option<&str>) -> Option<Vec
         .map(|(_, index)| (index, 1))
         .collect();
     (!values.is_empty()).then_some(values)
+}
+
+fn loop_guard_function_constant_values(
+    sanitized_ll: &str,
+    requested_values: &[(usize, u64)],
+) -> Vec<(usize, u64)> {
+    if !requested_values.is_empty() {
+        return requested_values.to_vec();
+    }
+    if let Some(values) = dynamic_resource_location_fc_values(Some(sanitized_ll)) {
+        return values;
+    }
+    declared_function_constants(sanitized_ll)
+        .into_iter()
+        .filter(|(ty, _)| is_loop_guard_fc_type(ty))
+        .map(|(_, index)| (index, 0))
+        .collect()
+}
+
+fn is_loop_guard_fc_type(ty: &str) -> bool {
+    matches!(ty, "bool" | "bool2" | "bool3" | "bool4") || is_integer_fc_type(ty)
 }
 
 fn is_integer_fc_type(ty: &str) -> bool {
@@ -1176,6 +2341,69 @@ fn visible_function_reference_names(sanitized_ll: &str) -> Vec<String> {
         }
     }
     out
+}
+
+fn missing_visible_function_reference_names(sanitized_ll: &str, module_text: &str) -> Vec<String> {
+    let refs = visible_function_reference_names(sanitized_ll);
+    if refs.is_empty() {
+        return Vec::new();
+    }
+    let defined = defined_function_names(module_text);
+    refs.into_iter()
+        .filter(|name| !defined.iter().any(|defined| defined == name))
+        .collect()
+}
+
+fn unresolved_visible_function_references_message(names: &[String]) -> String {
+    let mut out = String::new();
+    for name in names {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("error: unresolved visible function reference: ");
+        out.push_str(name);
+        out.push_str("\n  Reason: visible function not loaded");
+    }
+    out
+}
+
+fn defined_function_names(module_text: &str) -> Vec<String> {
+    module_text
+        .lines()
+        .filter_map(defined_function_name)
+        .collect()
+}
+
+fn defined_function_name(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("define ")?;
+    let at = rest.find('@')?;
+    symbol_after_at(&rest[at..])
+}
+
+fn symbol_after_at(s: &str) -> Option<String> {
+    let rest = s.strip_prefix('@')?;
+    if let Some(rest) = rest.strip_prefix('"') {
+        let mut out = String::new();
+        let mut escaped = false;
+        for ch in rest.chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => break,
+                _ => out.push(ch),
+            }
+        }
+        return (!out.is_empty()).then_some(out);
+    }
+    let name: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '$')
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 fn metadata_list_node_ids<'a>(sanitized_ll: &'a str, name: &str) -> Option<Vec<&'a str>> {
@@ -2354,7 +3582,7 @@ fn compile_library(
 fn load_library_from_url(
     device: &ProtocolObject<dyn MTLDevice>,
     path: &Path,
-) -> Retained<ProtocolObject<dyn MTLLibrary>> {
+) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
     let path = NSString::from_str(
         path.to_str()
             .unwrap_or_else(|| panic!("metallib path is not UTF-8: {}", path.display())),
@@ -2362,7 +3590,7 @@ fn load_library_from_url(
     let url = NSURL::fileURLWithPath(&path);
     device
         .newLibraryWithURL_error(&url)
-        .unwrap_or_else(|e| panic!("newLibraryWithURL failed: {e}"))
+        .map_err(|e| e.to_string())
 }
 
 fn make_default_sampler(device: &ProtocolObject<dyn MTLDevice>) -> MetalSampler {
@@ -2754,6 +3982,475 @@ mod tests {
     }
 
     #[test]
+    fn imageblock_air_call_substitution_uses_extent_and_zero_input() {
+        let ll = "\
+define void @k() {
+entry:
+  %w = tail call i16 @air.get_imageblock_width()
+  %h = tail call i16 @air.get_imageblock_height()
+  %d = tail call fast half @air.load.implicit_imageblock.f16(i32 1, <2 x i16> zeroinitializer, i32 0, i16 0)
+  ret void
+}
+";
+
+        let out = substitute_imageblock_air_calls(ll, Some([8, 4]));
+        assert!(out.contains("%w = add i16 0, 8"));
+        assert!(out.contains("%h = add i16 0, 4"));
+        assert!(out.contains("%d = select i1 true, half 0xH0000, half 0xH0000"));
+        assert!(!out.contains("@air.get_imageblock_"));
+        assert!(!out.contains("@air.load.implicit_imageblock."));
+    }
+
+    #[test]
+    fn exact_scalar_arg_values_follow_constant_buffer_metadata() {
+        static VALUE: [u8; 4] = 16_u32.to_le_bytes();
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 4,
+            len: 4,
+            role: crate::BufferRole::Input,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(ptr addrspace(1) %data, ptr addrspace(2) %n, i32 %tid) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"half"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"uint"}
+!5 = !{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint"}
+"#;
+
+        assert_eq!(
+            exact_scalar_arg_values(ll, "k", &inputs),
+            vec![("n".into(), 16)]
+        );
+    }
+
+    #[test]
+    fn exact_scalar_arg_values_follow_device_buffer_metadata() {
+        static VALUE: [u8; 4] = 0_u32.to_le_bytes();
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 7,
+            len: 4,
+            role: crate::BufferRole::InOut,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(ptr addrspace(1) %counter) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint"}
+"#;
+
+        assert_eq!(
+            exact_scalar_arg_values(ll, "k", &inputs),
+            vec![("counter".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn exact_scalar_arg_values_include_launch_threadgroup_and_simd_sizes() {
+        let inputs = Inputs::new(
+            &[],
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch {
+                threads_per_grid: [128, 1, 1],
+                threads_per_threadgroup: [64, 1, 1],
+            },
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(i32 %gid, i32 %local_id, i32 %group_size, i32 %simd_size, i32 %simdgroups) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+!4 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"local_id"}
+!5 = !{i32 2, !"air.threads_per_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"group_size"}
+!6 = !{i32 3, !"air.threads_per_simdgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"simd_size"}
+!7 = !{i32 4, !"air.simdgroups_per_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"simdgroups"}
+"#;
+
+        assert_eq!(
+            exact_scalar_arg_values(ll, "k", &inputs),
+            vec![
+                ("group_size".into(), 64),
+                ("simd_size".into(), 32),
+                ("simdgroups".into(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_scalar_arg_upper_bounds_include_thread_positions() {
+        let inputs = Inputs::new(
+            &[],
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch {
+                threads_per_grid: [130, 1, 1],
+                threads_per_threadgroup: [64, 1, 1],
+            },
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(i32 %gid, i32 %local_id, i32 %tgid, i32 %group_size) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+!4 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"local_id"}
+!5 = !{i32 2, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tgid"}
+!6 = !{i32 3, !"air.threads_per_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"group_size"}
+"#;
+
+        assert_eq!(
+            launch_scalar_arg_upper_bounds(ll, "k", &inputs),
+            vec![
+                ("gid".into(), 129),
+                ("local_id".into(), 63),
+                ("tgid".into(), 2),
+            ]
+        );
+        assert_eq!(
+            exact_scalar_arg_values(ll, "k", &inputs),
+            vec![("group_size".into(), 64)]
+        );
+    }
+
+    #[test]
+    fn exact_scalar_arg_values_include_degenerate_launch_positions() {
+        let inputs = Inputs::new(
+            &[],
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch {
+                threads_per_grid: [64, 1, 1],
+                threads_per_threadgroup: [64, 1, 1],
+            },
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(i32 %gid, i32 %local_id, i32 %tgid) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+!4 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"local_id"}
+!5 = !{i32 2, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tgid"}
+"#;
+
+        assert_eq!(
+            exact_scalar_arg_values(ll, "k", &inputs),
+            vec![("tgid".into(), 0)]
+        );
+    }
+
+    #[test]
+    fn exact_struct_arg_values_follow_nested_air_metadata() {
+        static VALUE: [u8; 16] = [
+            1, 0, 0, 0, // outer.a
+            2, 0, 0, 0, // inner.x
+            16, 0, 0, 0, // inner.y
+            4, 0, 0, 0, // outer.tail
+        ];
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 7,
+            len: 16,
+            role: crate::BufferRole::Input,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(ptr addrspace(1) %params, ptr addrspace(1) %rw) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !6}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_name", !"Outer"}
+!4 = !{i32 0, i32 4, i32 0, !"uint", !"a", !"air.struct_type_info", !5, i32 4, i32 8, i32 0, !"Inner", !"inner", i32 12, i32 4, i32 0, !"uint", !"tail"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"x", i32 4, i32 4, i32 0, !"uint", !"y"}
+!6 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 7, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_name", !"Outer"}
+"#;
+
+        assert_eq!(
+            exact_struct_arg_values(ll, "k", &inputs),
+            vec![
+                ("params".into(), vec![0], 1),
+                ("params".into(), vec![1, 0], 2),
+                ("params".into(), vec![1, 1], 16),
+                ("params".into(), vec![2], 4),
+                ("rw".into(), vec![0], 1),
+                ("rw".into(), vec![1, 0], 2),
+                ("rw".into(), vec![1, 1], 16),
+                ("rw".into(), vec![2], 4),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_struct_arg_values_follow_vector_integer_lanes() {
+        static VALUE: [u8; 8] = [
+            16, 0, // dims.x
+            2, 0, // dims.y
+            7, 0, 0, 0, // count
+        ];
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 3,
+            len: 8,
+            role: crate::BufferRole::Input,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(ptr addrspace(1) %params) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_name", !"Params"}
+!4 = !{i32 0, i32 4, i32 0, !"ushort2", !"dims", i32 4, i32 4, i32 0, !"uint", !"count"}
+"#;
+
+        assert_eq!(
+            exact_struct_arg_values(ll, "k", &inputs),
+            vec![
+                ("params".into(), vec![0, 0], 16),
+                ("params".into(), vec![0, 1], 2),
+                ("params".into(), vec![1], 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_vector_arg_values_follow_buffer_metadata() {
+        static VALUE: [u8; 4] = [
+            16, 0, // tile.x
+            2, 0, // tile.y
+        ];
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 7,
+            len: 4,
+            role: crate::BufferRole::Input,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(ptr addrspace(2) %tile_locations) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tile_locations"}
+"#;
+
+        assert_eq!(
+            exact_vector_arg_values(ll, "k", &inputs),
+            vec![
+                ("tile_locations".into(), 0, 16),
+                ("tile_locations".into(), 1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_float_arg_values_follow_buffer_metadata() {
+        static VALUE: [u8; 4] = [0, 0, 0, 0];
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 0,
+            len: 4,
+            role: crate::BufferRole::Input,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 0,
+                format: DataFormat::RawBytes,
+                len: 0,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(ptr addrspace(2) %rank_mode) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"rank_mode"}
+"#;
+
+        assert_eq!(
+            exact_float_arg_values(ll, "k", &inputs),
+            vec![("rank_mode".into(), 0.0)]
+        );
+    }
+
+    #[test]
+    fn exact_struct_arg_values_can_use_arg_ordinal_binding() {
+        static VALUE: [u8; 8] = [
+            1, 0, 0, 0, // base
+            16, 0, 0, 0, // count
+        ];
+        static BUFFERS: [crate::BufferInput; 1] = [crate::BufferInput {
+            index: 1,
+            len: 8,
+            role: crate::BufferRole::InOut,
+            seed: crate::Seed::ExactBytes {
+                bytes: &VALUE,
+                reason: "test",
+            },
+        }];
+        let inputs = Inputs::new(
+            &BUFFERS,
+            &[],
+            Output::Buffer {
+                index: 1,
+                format: DataFormat::RawBytes,
+                len: 8,
+            },
+            crate::Dispatch::default_1d(1),
+            crate::Render::fullscreen_triangle(1, 1),
+        );
+        let ll = r#"
+define void @k(i32 %tgid, ptr addrspace(1) %queue) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.threadgroup_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tgid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 14, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !5, !"air.arg_type_size", i32 8, !"air.arg_type_name", !"Queue", !"air.arg_name", !"queue"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"base", i32 4, i32 4, i32 0, !"uint", !"count"}
+"#;
+
+        assert_eq!(
+            exact_struct_arg_values(ll, "k", &inputs),
+            vec![("queue".into(), vec![0], 1), ("queue".into(), vec![1], 16)]
+        );
+    }
+
+    #[test]
     fn fragment_render_target_attachments_use_air_metadata() {
         let ll = r#"
 !16 = !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"half4", !"air.arg_name", !"maskOut"}
@@ -2781,6 +4478,37 @@ mod tests {
             dynamic_resource_location_fc_values(Some(ll)),
             Some(vec![(125, 1)])
         );
+    }
+
+    #[test]
+    fn loop_guard_fcs_match_oracle_default_zero_specialization() {
+        let ll = r#"
+!air.function_constants = !{!47, !48, !49}
+!47 = !{ptr addrspace(2) @fc_u, !"uint", !"Count", i32 125, i1 true}
+!48 = !{ptr addrspace(2) @fc_b, !"bool", !"Enabled", i32 126, i1 true}
+!49 = !{ptr addrspace(2) @fc_f, !"float", !"Scale", i32 127, i1 true}
+"#;
+
+        assert_eq!(
+            loop_guard_function_constant_values(ll, &[]),
+            vec![(125, 0), (126, 0)]
+        );
+        assert_eq!(
+            loop_guard_function_constant_values(ll, &[(125, 7)]),
+            vec![(125, 7)]
+        );
+    }
+
+    #[test]
+    fn loop_guard_fcs_preserve_dynamic_resource_location_override() {
+        let ll = r#"
+!air.function_constants = !{!47, !48}
+!18 = !{i32 0, !"air.function_constant", !19, !"air.texture", !"air.location_index", ptr addrspace(2) @loc, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dest"}
+!47 = !{ptr addrspace(2) @fc_u, !"uint", !"Count", i32 125, i1 true}
+!48 = !{ptr addrspace(2) @fc_b, !"bool", !"Enabled", i32 126, i1 true}
+"#;
+
+        assert_eq!(loop_guard_function_constant_values(ll, &[]), vec![(125, 1)]);
     }
 
     #[test]
@@ -3016,6 +4744,36 @@ declare <4 x half> @custom_fn.MTL_VISIBLE_FN_REF(<2 x float>) local_unnamed_addr
         assert_eq!(
             visible_function_reference_names(ll),
             vec!["custom_fn".to_string()]
+        );
+    }
+
+    #[test]
+    fn missing_visible_function_reference_names_require_defined_bodies() {
+        let metadata = r#"
+!air.visible_function_references = !{!4, !5, !6}
+!4 = !{!"air.visible_function_reference", ptr @custom_fn.MTL_VISIBLE_FN_REF, !"custom_fn"}
+!5 = !{!"air.visible_function_reference", ptr @"quoted.fn".MTL_VISIBLE_FN_REF, !"quoted.fn"}
+!6 = !{!"air.visible_function_reference", ptr @missing_fn.MTL_VISIBLE_FN_REF, !"missing_fn"}
+"#;
+        let module_text = r#"
+define <4 x half> @custom_fn(<2 x float> %coord) {
+entry:
+  ret <4 x half> zeroinitializer
+}
+
+define <4 x half> @"quoted.fn"(<2 x float> %coord) {
+entry:
+  ret <4 x half> zeroinitializer
+}
+"#;
+
+        assert_eq!(
+            missing_visible_function_reference_names(metadata, module_text),
+            vec!["missing_fn".to_string()]
+        );
+        assert_eq!(
+            unresolved_visible_function_references_message(&["missing_fn".to_string()]),
+            "error: unresolved visible function reference: missing_fn\n  Reason: visible function not loaded"
         );
     }
 

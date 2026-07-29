@@ -408,9 +408,8 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     // OpVariable instructions (Function storage) to hoist into the synthetic entry, with their ids.
     let mut variables: Vec<Instruction> = Vec::new();
     let mut variable_ids: HashSet<Word> = HashSet::new();
-    // pointer-result id -> its defining instruction (for per-case rematerialization of demoted
-    // pointers, which cannot spill to memory). Holds the two rematerializable shapes: access chains
-    // and pointer `OpSelect`s (a select over two access chains arises from a `cond ? &a[i] : &b[j]`).
+    // Result id -> defining instruction for per-case rematerialization of demoted values that cannot
+    // spill to memory. Holds pointer chains/selects/copies and pure opaque resource loads.
     let mut ptr_def: HashMap<Word, Instruction> = HashMap::new();
 
     for (bi, block) in function.blocks.iter().enumerate() {
@@ -420,14 +419,24 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                     value_type.insert(rid, rty);
                 }
                 def_block.insert(rid, bi);
-                if matches!(
+                let rematerializable_shape = matches!(
                     inst.class.opcode,
                     Op::AccessChain
                         | Op::InBoundsAccessChain
                         | Op::PtrAccessChain
                         | Op::Select
                         | Op::CopyObject
-                ) {
+                ) || (inst.class.opcode == Op::Load
+                    && matches!(
+                        inst.result_type.and_then(|ty| tc.type_opcode(ty)),
+                        Some(
+                            Op::TypeImage
+                                | Op::TypeSampler
+                                | Op::TypeSampledImage
+                                | Op::TypeAccelerationStructureKHR
+                        )
+                    ));
+                if rematerializable_shape {
                     ptr_def.insert(rid, inst.clone());
                 }
             }
@@ -558,7 +567,17 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
             let Some(&ty) = value_type.get(&v) else {
                 continue;
             };
-            if tc.type_opcode(ty) != Some(Op::TypePointer) {
+            let ty_op = tc.type_opcode(ty);
+            if !matches!(
+                ty_op,
+                Some(
+                    Op::TypePointer
+                        | Op::TypeImage
+                        | Op::TypeSampler
+                        | Op::TypeSampledImage
+                        | Op::TypeAccelerationStructureKHR
+                )
+            ) {
                 continue;
             }
             // All operands must be id refs (a literal-bearing op is not rematerializable here).
@@ -580,6 +599,20 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                 }
                 Op::Select if ids.len() == 3 => (&ids[1..3], &ids[..1]), // two arm pointers, condition
                 Op::CopyObject if ids.len() == 1 => (&ids[..1], &ids[..0]), // pure pointer alias
+                Op::Load
+                    if ids.len() == 1
+                        && matches!(
+                            ty_op,
+                            Some(
+                                Op::TypeImage
+                                    | Op::TypeSampler
+                                    | Op::TypeSampledImage
+                                    | Op::TypeAccelerationStructureKHR
+                            )
+                        ) =>
+                {
+                    (&ids[..1], &ids[..0])
+                }
                 _ => continue,
             };
             // Every pointer operand must dominate every case or already be rematerializable.
@@ -707,6 +740,20 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
             | Some(Op::TypeAccelerationStructureKHR)
             | Some(Op::TypeRuntimeArray)
             | None => {
+                if crate::env_vars::reloop_why() {
+                    let def_op = def_block.get(v).and_then(|&bi| {
+                        function.blocks[bi]
+                            .instructions
+                            .iter()
+                            .find(|inst| inst.result_id == Some(*v))
+                            .map(|inst| inst.class.opcode)
+                    });
+                    eprintln!(
+                        "RELOOP-BAIL-VALUE id=%{v} type=%{ty} type_op={:?} def_op={:?}",
+                        tc.type_opcode(ty),
+                        def_op
+                    );
+                }
                 return bail("non-spillable-demote");
             }
             _ => {}
@@ -1829,6 +1876,48 @@ mod tests {
         assert!(
             validates(&out),
             "relooper output must validate (rematerialized pointer)"
+        );
+    }
+
+    #[test]
+    fn relooper_rematerializes_nonentry_image_load() {
+        // An opaque image handle loaded in one non-entry block and used in a later block dominates in
+        // the original CFG, but not after the relooper turns both blocks into sibling switch cases.
+        // Opaque handles cannot be spilled, so rematerialize the pure descriptor load at the use.
+        let spvasm = r#"
+                       OpCapability Shader
+                       OpCapability ImageQuery
+                       OpMemoryModel Logical GLSL450
+                       OpEntryPoint GLCompute %main "main" %img_var
+                       OpExecutionMode %main LocalSize 1 1 1
+                       OpDecorate %img_var DescriptorSet 0
+                       OpDecorate %img_var Binding 0
+               %void = OpTypeVoid
+                 %fn = OpTypeFunction %void
+              %float = OpTypeFloat 32
+               %uint = OpTypeInt 32 0
+             %v2uint = OpTypeVector %uint 2
+                 %u0 = OpConstant %uint 0
+              %image = OpTypeImage %float 2D 0 0 0 1 Unknown
+            %ptr_img = OpTypePointer UniformConstant %image
+             %img_var = OpVariable %ptr_img UniformConstant
+               %main = OpFunction %void None %fn
+              %entry = OpLabel
+                       OpBranch %body
+               %body = OpLabel
+                %img = OpLoad %image %img_var
+                       OpBranch %use
+                %use = OpLabel
+               %size = OpImageQuerySizeLod %v2uint %img %u0
+                       OpReturn
+                       OpFunctionEnd
+        "#;
+        let Some(spv) = assemble(spvasm) else { return };
+        assert!(validates(&spv), "input must validate");
+        let out = relooper_bytes(&spv);
+        assert!(
+            validates(&out),
+            "relooper output must validate (rematerialized image load)"
         );
     }
 

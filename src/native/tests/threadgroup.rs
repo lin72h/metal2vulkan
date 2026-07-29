@@ -1220,6 +1220,47 @@ entry:
 }
 
 #[test]
+fn native_wg_barrier_device_flag_orders_storage_buffer_memory() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(ptr addrspace(1) %out) {
+entry:
+  store i32 1, ptr addrspace(1) %out, align 4
+  tail call void @air.wg.barrier(i32 1, i32 1)
+  %v = load i32, ptr addrspace(1) %out, align 4
+  store i32 %v, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_wg_barrier_device_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpControlBarrier"), "{asm}");
+    // 584 = AcquireRelease | UniformMemory | CrossWorkgroupMemory.
+    assert!(asm.contains(" 584"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_threadgroup_atomic_i32_lowers_to_workgroup_spirv() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

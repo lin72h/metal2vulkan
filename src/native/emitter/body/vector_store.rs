@@ -703,7 +703,8 @@ impl Emitter {
                 ))
             }
         };
-        if storage != StorageClass::Workgroup
+        if storage != StorageClass::Function
+            && storage != StorageClass::Workgroup
             && !(storage == StorageClass::Private && self.is_imageblock_scratch_pointer(&ptr.value))
         {
             return Ok(false);

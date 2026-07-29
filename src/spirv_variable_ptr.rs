@@ -38,7 +38,9 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
     let defs = collect_defs(module);
     let zero_constants = zero_integer_constants(&defs);
     let access_chains = collect_access_chain_defs(module, &defs, &zero_constants);
-    if access_chains.is_empty() {
+    let direct_demotions =
+        collect_zero_stride_ptr_access_chain_demotions(module, &defs, &zero_constants);
+    if access_chains.is_empty() && direct_demotions.is_empty() {
         return 0;
     }
 
@@ -126,10 +128,6 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
         rewrites.insert(result_id, Rewrite { operands, add });
     }
 
-    if rewrites.is_empty() {
-        return 0;
-    }
-
     let mut changed = 0;
     for block in module
         .functions
@@ -142,25 +140,29 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
                 pos += 1;
                 continue;
             };
-            let Some(rewrite) = rewrites.remove(&result_id) else {
+            if let Some(rewrite) = rewrites.remove(&result_id) {
+                if let Some((sum, ty, lhs, rhs)) = rewrite.add {
+                    block.instructions.insert(
+                        pos,
+                        Instruction::new(
+                            Op::IAdd,
+                            Some(ty),
+                            Some(sum),
+                            vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
+                        ),
+                    );
+                    pos += 1;
+                }
+                block.instructions[pos].class.opcode = Op::AccessChain;
+                block.instructions[pos].operands = rewrite.operands;
+                changed += 1;
                 pos += 1;
                 continue;
-            };
-            if let Some((sum, ty, lhs, rhs)) = rewrite.add {
-                block.instructions.insert(
-                    pos,
-                    Instruction::new(
-                        Op::IAdd,
-                        Some(ty),
-                        Some(sum),
-                        vec![Operand::IdRef(lhs), Operand::IdRef(rhs)],
-                    ),
-                );
-                pos += 1;
             }
-            block.instructions[pos].class.opcode = Op::AccessChain;
-            block.instructions[pos].operands = rewrite.operands;
-            changed += 1;
+            if direct_demotions.contains(&result_id) {
+                block.instructions[pos].class.opcode = Op::AccessChain;
+                changed += 1;
+            }
             pos += 1;
         }
     }
@@ -171,6 +173,187 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
         }
     }
     changed
+}
+
+pub(crate) fn rewrite_storage_buffer_atomic_scopes(module: &mut Module) -> usize {
+    let mut defs = collect_defs(module);
+    let mut rewrites = Vec::new();
+    for (fi, function) in module.functions.iter().enumerate() {
+        for (bi, block) in function.blocks.iter().enumerate() {
+            for (ii, inst) in block.instructions.iter().enumerate() {
+                let Some((scope_idx, semantics_indices)) = atomic_scope_semantics_indices(inst)
+                else {
+                    continue;
+                };
+                let Some(Operand::IdRef(ptr)) = inst.operands.first() else {
+                    continue;
+                };
+                let Some((StorageClass::StorageBuffer, _)) = value_pointer_info(&defs, *ptr) else {
+                    continue;
+                };
+                let Some(scope_operand) = inst.operands.get(scope_idx) else {
+                    continue;
+                };
+                let Some(scope_id) = operand_id(scope_operand) else {
+                    continue;
+                };
+                if constant_u32(&defs, scope_id) != Some(spirv::Scope::Workgroup as u32) {
+                    continue;
+                }
+                let Some(scope_ty) = integer_value_type(&defs, scope_id) else {
+                    continue;
+                };
+                let mut semantics_tys = Vec::new();
+                for &semantics_idx in semantics_indices {
+                    let Some(semantics_operand) = inst.operands.get(semantics_idx) else {
+                        semantics_tys.clear();
+                        break;
+                    };
+                    let Some(semantics_id) = operand_id(semantics_operand) else {
+                        semantics_tys.clear();
+                        break;
+                    };
+                    let Some(semantics_ty) = integer_value_type(&defs, semantics_id) else {
+                        semantics_tys.clear();
+                        break;
+                    };
+                    semantics_tys.push((semantics_idx, semantics_ty));
+                }
+                if semantics_tys.len() != semantics_indices.len() {
+                    continue;
+                }
+                rewrites.push((fi, bi, ii, scope_idx, scope_ty, semantics_tys));
+            }
+        }
+    }
+    if rewrites.is_empty() {
+        return 0;
+    }
+
+    let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(0);
+    let mut constants = HashMap::new();
+    for (_, _, _, _, scope_ty, semantics_tys) in &rewrites {
+        let device = get_or_create_integer_constant(module, &mut defs, &mut next_id, *scope_ty, 1);
+        constants.insert((*scope_ty, 1), device);
+        for (_, semantics_ty) in semantics_tys {
+            let relaxed =
+                get_or_create_integer_constant(module, &mut defs, &mut next_id, *semantics_ty, 0);
+            constants.insert((*semantics_ty, 0), relaxed);
+        }
+    }
+
+    for (fi, bi, ii, scope_idx, scope_ty, semantics_tys) in rewrites {
+        let inst = &mut module.functions[fi].blocks[bi].instructions[ii];
+        let device = constants[&(scope_ty, 1)];
+        inst.operands[scope_idx] = Operand::IdScope(device);
+        for (semantics_idx, semantics_ty) in semantics_tys {
+            let relaxed = constants[&(semantics_ty, 0)];
+            inst.operands[semantics_idx] = Operand::IdMemorySemantics(relaxed);
+        }
+    }
+
+    if let Some(header) = module.header.as_mut() {
+        header.bound = next_id;
+    }
+    constants.len()
+}
+
+fn collect_zero_stride_ptr_access_chain_demotions(
+    module: &Module,
+    defs: &HashMap<Word, Instruction>,
+    zero_constants: &HashSet<Word>,
+) -> HashSet<Word> {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| {
+            if !matches!(
+                inst.class.opcode,
+                Op::PtrAccessChain | Op::InBoundsPtrAccessChain
+            ) {
+                return None;
+            }
+            let result_id = inst.result_id?;
+            let result_type = inst.result_type?;
+            let Some((StorageClass::StorageBuffer, result_pointee)) = ptr_info(defs, result_type)
+            else {
+                return None;
+            };
+            let Some(Operand::IdRef(base)) = inst.operands.first() else {
+                return None;
+            };
+            let (StorageClass::StorageBuffer, base_pointee) = value_pointer_info(defs, *base)?
+            else {
+                return None;
+            };
+            let ptr_indices = id_ref_operands(&inst.operands[1..])?;
+            let first = ptr_indices.first()?;
+            if !zero_constants.contains(first) {
+                return None;
+            }
+            (walk_access_chain_pointee(defs, base_pointee, &ptr_indices) == Some(result_pointee))
+                .then_some(result_id)
+        })
+        .collect()
+}
+
+fn atomic_scope_semantics_indices(inst: &Instruction) -> Option<(usize, &'static [usize])> {
+    match inst.class.opcode {
+        Op::AtomicLoad => Some((1, &[2])),
+        Op::AtomicStore => Some((1, &[2])),
+        Op::AtomicExchange
+        | Op::AtomicIIncrement
+        | Op::AtomicIDecrement
+        | Op::AtomicIAdd
+        | Op::AtomicISub
+        | Op::AtomicSMin
+        | Op::AtomicUMin
+        | Op::AtomicSMax
+        | Op::AtomicUMax
+        | Op::AtomicAnd
+        | Op::AtomicOr
+        | Op::AtomicXor
+        | Op::AtomicFAddEXT => Some((1, &[2])),
+        Op::AtomicCompareExchange | Op::AtomicCompareExchangeWeak => Some((1, &[2, 3])),
+        _ => None,
+    }
+}
+
+fn operand_id(operand: &Operand) -> Option<Word> {
+    match operand {
+        Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) => Some(*id),
+        _ => None,
+    }
+}
+
+fn get_or_create_integer_constant(
+    module: &mut Module,
+    defs: &mut HashMap<Word, Instruction>,
+    next_id: &mut Word,
+    ty: Word,
+    value: u32,
+) -> Word {
+    if let Some(id) = defs.iter().find_map(|(&id, inst)| {
+        (inst.class.opcode == Op::Constant
+            && inst.result_type == Some(ty)
+            && constant_u32(defs, id) == Some(value))
+        .then_some(id)
+    }) {
+        return id;
+    }
+    let id = *next_id;
+    *next_id += 1;
+    let inst = Instruction::new(
+        Op::Constant,
+        Some(ty),
+        Some(id),
+        vec![Operand::LiteralBit32(value)],
+    );
+    module.types_global_values.push(inst.clone());
+    defs.insert(id, inst);
+    id
 }
 
 pub(crate) fn variable_pointer_requirement(module: &Module) -> (bool, bool) {
@@ -385,5 +568,164 @@ fn walk_member(
             }
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function, ModuleHeader};
+
+    fn inst(
+        op: Op,
+        result_type: Option<Word>,
+        result_id: Option<Word>,
+        operands: Vec<Operand>,
+    ) -> Instruction {
+        Instruction::new(op, result_type, result_id, operands)
+    }
+
+    #[test]
+    fn zero_stride_storage_buffer_ptr_access_chain_demotes_to_access_chain() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20));
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(2),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(3),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(Op::TypeRuntimeArray, None, Some(4), vec![Operand::IdRef(1)]),
+            inst(Op::TypeStruct, None, Some(5), vec![Operand::IdRef(4)]),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(5),
+                ],
+            ),
+            inst(
+                Op::Variable,
+                Some(6),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(8),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(1),
+                ],
+            ),
+        ];
+        let mut function = Function::new();
+        let mut block = Block::new();
+        block.instructions.push(inst(
+            Op::PtrAccessChain,
+            Some(8),
+            Some(9),
+            vec![Operand::IdRef(7), Operand::IdRef(2), Operand::IdRef(3)],
+        ));
+        function.blocks.push(block);
+        module.functions.push(function);
+
+        assert_eq!(
+            lower_zero_base_storage_buffer_ptr_access_chains(&mut module),
+            1
+        );
+        assert_eq!(
+            module.functions[0].blocks[0].instructions[0].class.opcode,
+            Op::AccessChain
+        );
+    }
+
+    #[test]
+    fn storage_buffer_atomic_workgroup_scope_rewrites_to_device_relaxed() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20));
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(2),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(3),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(4),
+                vec![Operand::LiteralBit32(2)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(5),
+                vec![Operand::LiteralBit32(264)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(1),
+                ],
+            ),
+            inst(
+                Op::Variable,
+                Some(6),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+        ];
+        let mut function = Function::new();
+        let mut block = Block::new();
+        block.instructions.push(inst(
+            Op::AtomicOr,
+            Some(1),
+            Some(8),
+            vec![
+                Operand::IdRef(7),
+                Operand::IdScope(4),
+                Operand::IdMemorySemantics(5),
+                Operand::IdRef(3),
+            ],
+        ));
+        function.blocks.push(block);
+        module.functions.push(function);
+
+        assert_eq!(rewrite_storage_buffer_atomic_scopes(&mut module), 2);
+        let operands = &module.functions[0].blocks[0].instructions[0].operands;
+        assert_eq!(operands[1], Operand::IdScope(3));
+        assert_eq!(operands[2], Operand::IdMemorySemantics(2));
     }
 }

@@ -6,12 +6,13 @@ const FRAG_LL: &str = r#"
 !15 = !{ptr @F, !16, !18}
 !16 = !{!17}
 !17 = !{!"air.render_target", i32 0, i32 0}
-!18 = !{!19, !20, !21, !22, !23}
+!18 = !{!19, !20, !21, !22, !23, !24}
 !19 = !{i32 0, !"air.position", !"air.center"}
 !20 = !{i32 1, !"air.fragment_input", !"generated", !"air.arg_type_name", !"float2", !"air.arg_name", !"texCoord"}
 !21 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"texture2d<float, sample>"}
 !22 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 5, i32 1}
 !23 = !{i32 4, !"air.point_coord", !"air.arg_type_name", !"float2", !"air.arg_name", !"pointCoord"}
+!24 = !{i32 5, !"air.front_facing", !"air.arg_type_name", !"bool", !"air.arg_name", !"front"}
 "#;
 
 #[test]
@@ -24,6 +25,7 @@ fn fragment_roles() {
     assert_eq!(m.role_of(2), Some(&FragRole::Texture(0)));
     assert_eq!(m.role_of(3), Some(&FragRole::Buffer(5)));
     assert_eq!(m.role_of(4), Some(&FragRole::PointCoord));
+    assert_eq!(m.role_of(5), Some(&FragRole::FrontFacing));
     assert_eq!(m.texture_type_name(2), Some("texture2d<float, sample>"));
     assert_eq!(m.varying_type(0), Some("float2"));
     assert_eq!(m.varying_name(0), Some("texCoord"));
@@ -71,8 +73,26 @@ entry:
 }
 
 #[test]
-fn fragment_function_constant_render_target_is_recognized() {
+fn fragment_function_constant_render_target_disabled_by_default() {
     let ll = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!3 = !{i32 7, !"air.function_constant", !5, !"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"half2"}
+!4 = !{}
+!5 = !{ptr addrspace(2) @__metal_implicit_fc_pred_1, !"bool", !"uses_coverage"}
+"#;
+    let m = parse_air_fragment_meta(ll).unwrap();
+    assert_eq!(m.n_render_targets, 1);
+    assert_eq!(m.render_target_members, vec![(0, 0)]);
+    assert_eq!(m.render_target_type_name(1), None);
+}
+
+#[test]
+fn fragment_function_constant_render_target_static_true_is_recognized() {
+    let ll = r#"
+@__metal_implicit_fc_pred_1 = internal unnamed_addr addrspace(2) global i8 1, align 1
 !air.fragment = !{!0}
 !0 = !{ptr @F, !1, !4}
 !1 = !{!2, !3}
@@ -123,9 +143,8 @@ entry:
 !0 = !{ptr @F, !1, !4}
 !1 = !{!2, !3}
 !2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
-!3 = !{i32 9, !"air.function_constant", !5, !"air.render_target", ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_5, !"air.arg_type_name", !"half4"}
+!3 = !{!"air.render_target", ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_5, !"air.arg_type_name", !"half4"}
 !4 = !{}
-!5 = !{ptr addrspace(2) @__metal_implicit_fc_pred_1, !"bool", !"uses_dest"}
 "#;
     let m = parse_air_fragment_meta(ll).unwrap();
     assert_eq!(m.render_target_members, vec![(0, 0), (1, 4)]);

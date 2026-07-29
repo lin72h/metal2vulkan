@@ -200,9 +200,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tolerance_is_candidate_success() {
+    fn tolerance_success_depends_on_candidate_backend() {
         let row = TriageRow {
-            kind: LedgerKind::MoltenVk,
+            kind: LedgerKind::Vulkan,
             air_sha256: "a".repeat(64),
             status: "tolerance".into(),
             label: String::new(),
@@ -215,6 +215,12 @@ mod tests {
             signature: "within candidate tolerance".into(),
         };
         assert!(row.is_success());
+
+        let moltenvk = TriageRow {
+            kind: LedgerKind::MoltenVk,
+            ..row
+        };
+        assert!(!moltenvk.is_success());
     }
 
     #[test]

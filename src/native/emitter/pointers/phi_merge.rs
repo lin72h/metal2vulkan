@@ -450,6 +450,7 @@ impl Emitter {
             LlValue::Local(name) => {
                 self.unmodeled_pointers.contains(name)
                     || (self.pointer_phi_values.contains(name) && !self.values.contains_key(name))
+                    || self.forward_gep_base_is_unmodeled(name)
             }
             _ => false,
         });
@@ -459,6 +460,44 @@ impl Emitter {
         self.emit_pointer_nullness_phi(name, incoming, result_ty, instructions)?;
         self.define_unmodeled_pointer_value(name, *addrspace, &LlType::Int(8))?;
         Ok(true)
+    }
+
+    pub(in crate::native::emitter) fn forward_gep_base_is_unmodeled(&self, name: &str) -> bool {
+        let Some(gep) = self.forward_geps.get(name) else {
+            return false;
+        };
+        let LlValue::Local(base) = &gep.base.value else {
+            return false;
+        };
+        self.unmodeled_pointers.contains(base)
+    }
+
+    pub(in crate::native::emitter) fn pointer_value_actual_storage(
+        &self,
+        value: &LlValue,
+        instructions: &[Instruction],
+    ) -> Option<StorageClass> {
+        let id = match value {
+            LlValue::Local(name) => self.values.get(name).map(|(id, _)| *id),
+            LlValue::Global(name) => self.global_values.get(name).map(|(id, _)| *id),
+            _ => None,
+        }?;
+        let result_type = self
+            .module
+            .types_global_values
+            .iter()
+            .chain(instructions.iter())
+            .find(|inst| inst.result_id == Some(id))?
+            .result_type?;
+        self.module.types_global_values.iter().find_map(|inst| {
+            if inst.class.opcode != Op::TypePointer || inst.result_id != Some(result_type) {
+                return None;
+            }
+            match inst.operands.first() {
+                Some(Operand::StorageClass(storage)) => Some(*storage),
+                _ => None,
+            }
+        })
     }
 
     pub(in crate::native::emitter) fn emit_pointer_phi_provenance(
@@ -513,6 +552,7 @@ impl Emitter {
                 ty: index_ty,
                 value: LlValue::Local(index_name),
             }],
+            root_indices: None,
             root_is_indexed_container: template.root_is_indexed_container,
         }))
     }

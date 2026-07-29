@@ -16,16 +16,16 @@ impl Emitter {
                     );
                 }
                 let scope = self.const_uint(Scope::Subgroup as u32)?;
-                let semantics = self.const_uint(
-                    (MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY).bits(),
-                )?;
+                let memory_scope =
+                    self.const_uint(air_barrier_memory_scope(call, Scope::Subgroup) as u32)?;
+                let semantics = self.const_uint(air_barrier_memory_semantics(call).bits())?;
                 instructions.push(Self::inst(
                     Op::ControlBarrier,
                     None,
                     None,
                     vec![
                         Operand::IdScope(scope),
-                        Operand::IdScope(scope),
+                        Operand::IdScope(memory_scope),
                         Operand::IdMemorySemantics(semantics),
                     ],
                 ));
@@ -36,16 +36,16 @@ impl Emitter {
                     return Err("native emitter: air.wg.barrier expects 2 operands".to_string());
                 }
                 let scope = self.const_uint(Scope::Workgroup as u32)?;
-                let semantics = self.const_uint(
-                    (MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY).bits(),
-                )?;
+                let memory_scope =
+                    self.const_uint(air_barrier_memory_scope(call, Scope::Workgroup) as u32)?;
+                let semantics = self.const_uint(air_barrier_memory_semantics(call).bits())?;
                 instructions.push(Self::inst(
                     Op::ControlBarrier,
                     None,
                     None,
                     vec![
                         Operand::IdScope(scope),
-                        Operand::IdScope(scope),
+                        Operand::IdScope(memory_scope),
                         Operand::IdMemorySemantics(semantics),
                     ],
                 ));
@@ -136,17 +136,10 @@ impl Emitter {
                 let ptr = self.atomic_i32_pointer_id(&call.args[0], instructions)?;
                 let value =
                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
-                let scope_kind = if call.callee == "air.atomic.global.store.i32" {
-                    Scope::Device
-                } else {
-                    Scope::Workgroup
-                };
+                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics_kind = if scope_kind == Scope::Workgroup {
-                    MemorySemantics::RELEASE | MemorySemantics::WORKGROUP_MEMORY
-                } else {
-                    MemorySemantics::RELAXED
-                };
+                let semantics_kind =
+                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::RELEASE);
                 let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicStore,
@@ -304,6 +297,7 @@ impl Emitter {
                         }
                     }
                 }
+
                 Ok(false)
             }
             callee if is_coherent_air_load(callee) => {
@@ -563,17 +557,10 @@ impl Emitter {
                 let result_type = self.type_id(&result_ty)?;
                 let result = self.result_id(name, &result_ty)?;
                 let ptr = self.atomic_i32_pointer_id(&call.args[0], instructions)?;
-                let scope_kind = if call.callee == "air.atomic.global.load.i32" {
-                    Scope::Device
-                } else {
-                    Scope::Workgroup
-                };
+                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics_kind = if scope_kind == Scope::Workgroup {
-                    MemorySemantics::ACQUIRE | MemorySemantics::WORKGROUP_MEMORY
-                } else {
-                    MemorySemantics::RELAXED
-                };
+                let semantics_kind =
+                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE);
                 let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::AtomicLoad,
@@ -703,22 +690,12 @@ impl Emitter {
                 ));
                 let value =
                     self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
-                let scope_kind = if call.callee == "air.atomic.global.cmpxchg.weak.i32" {
-                    Scope::Device
-                } else {
-                    Scope::Workgroup
-                };
+                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let success_semantics_kind = if scope_kind == Scope::Workgroup {
-                    MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY
-                } else {
-                    MemorySemantics::RELAXED
-                };
-                let failure_semantics_kind = if scope_kind == Scope::Workgroup {
-                    MemorySemantics::ACQUIRE | MemorySemantics::WORKGROUP_MEMORY
-                } else {
-                    MemorySemantics::RELAXED
-                };
+                let success_semantics_kind =
+                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE);
+                let failure_semantics_kind =
+                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE);
                 let success_semantics = self.const_uint(success_semantics_kind.bits())?;
                 let failure_semantics = self.const_uint(failure_semantics_kind.bits())?;
                 instructions.push(Self::inst(
@@ -779,34 +756,32 @@ impl Emitter {
                 let ptr = self.atomic_i32_pointer_id(&call.args[0], instructions)?;
                 let value =
                     self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
-                let (scope_kind, op) = match call.callee.as_str() {
-                    "air.atomic.local.add.s.i32" => (Scope::Workgroup, Op::AtomicIAdd),
-                    "air.atomic.local.add.u.i32" => (Scope::Workgroup, Op::AtomicIAdd),
-                    "air.atomic.local.max.s.i32" => (Scope::Workgroup, Op::AtomicSMax),
-                    "air.atomic.local.max.u.i32" => (Scope::Workgroup, Op::AtomicUMax),
-                    "air.atomic.local.min.s.i32" => (Scope::Workgroup, Op::AtomicSMin),
-                    "air.atomic.local.min.u.i32" => (Scope::Workgroup, Op::AtomicUMin),
-                    "air.atomic.local.and.u.i32" => (Scope::Workgroup, Op::AtomicAnd),
-                    "air.atomic.global.add.s.i32" => (Scope::Device, Op::AtomicIAdd),
-                    "air.atomic.global.add.u.i32" => (Scope::Device, Op::AtomicIAdd),
-                    "air.atomic.global.and.u.i32" => (Scope::Device, Op::AtomicAnd),
-                    "air.atomic.global.xchg.i32" => (Scope::Device, Op::AtomicExchange),
-                    "air.atomic.global.max.s.i32" => (Scope::Device, Op::AtomicSMax),
-                    "air.atomic.global.max.u.i32" => (Scope::Device, Op::AtomicUMax),
-                    "air.atomic.global.min.s.i32" => (Scope::Device, Op::AtomicSMin),
-                    "air.atomic.global.min.u.i32" => (Scope::Device, Op::AtomicUMin),
-                    "air.atomic.global.or.u.i32" => (Scope::Device, Op::AtomicOr),
-                    "air.atomic.global.sub.u.i32" => (Scope::Device, Op::AtomicISub),
-                    "air.atomic.local.or.u.i32" => (Scope::Workgroup, Op::AtomicOr),
-                    "air.atomic.local.xchg.i32" => (Scope::Workgroup, Op::AtomicExchange),
-                    _ => (Scope::Workgroup, Op::AtomicIAdd),
+                let op = match call.callee.as_str() {
+                    "air.atomic.local.add.s.i32" => Op::AtomicIAdd,
+                    "air.atomic.local.add.u.i32" => Op::AtomicIAdd,
+                    "air.atomic.local.max.s.i32" => Op::AtomicSMax,
+                    "air.atomic.local.max.u.i32" => Op::AtomicUMax,
+                    "air.atomic.local.min.s.i32" => Op::AtomicSMin,
+                    "air.atomic.local.min.u.i32" => Op::AtomicUMin,
+                    "air.atomic.local.and.u.i32" => Op::AtomicAnd,
+                    "air.atomic.global.add.s.i32" => Op::AtomicIAdd,
+                    "air.atomic.global.add.u.i32" => Op::AtomicIAdd,
+                    "air.atomic.global.and.u.i32" => Op::AtomicAnd,
+                    "air.atomic.global.xchg.i32" => Op::AtomicExchange,
+                    "air.atomic.global.max.s.i32" => Op::AtomicSMax,
+                    "air.atomic.global.max.u.i32" => Op::AtomicUMax,
+                    "air.atomic.global.min.s.i32" => Op::AtomicSMin,
+                    "air.atomic.global.min.u.i32" => Op::AtomicUMin,
+                    "air.atomic.global.or.u.i32" => Op::AtomicOr,
+                    "air.atomic.global.sub.u.i32" => Op::AtomicISub,
+                    "air.atomic.local.or.u.i32" => Op::AtomicOr,
+                    "air.atomic.local.xchg.i32" => Op::AtomicExchange,
+                    _ => Op::AtomicIAdd,
                 };
+                let scope_kind = self.atomic_i32_scope_for_arg(&call.args[0])?;
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics_kind = if scope_kind == Scope::Workgroup {
-                    MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY
-                } else {
-                    MemorySemantics::RELAXED
-                };
+                let semantics_kind =
+                    Self::atomic_i32_memory_semantics(scope_kind, MemorySemantics::ACQUIRE_RELEASE);
                 let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     op,
@@ -823,5 +798,40 @@ impl Emitter {
             }
             _ => Ok(false),
         }
+    }
+}
+
+fn air_barrier_memory_semantics(call: &LlCall) -> MemorySemantics {
+    let flags = call
+        .args
+        .first()
+        .and_then(|arg| air_i32_literal(&arg.value))
+        .unwrap_or(0);
+    let mut semantics = MemorySemantics::ACQUIRE_RELEASE;
+    if flags & 1 != 0 {
+        semantics |= MemorySemantics::UNIFORM_MEMORY | MemorySemantics::CROSS_WORKGROUP_MEMORY;
+    }
+    if flags & 2 != 0 {
+        semantics |= MemorySemantics::WORKGROUP_MEMORY;
+    }
+    if flags & 4 != 0 {
+        semantics |= MemorySemantics::IMAGE_MEMORY;
+    }
+    if semantics == MemorySemantics::ACQUIRE_RELEASE {
+        semantics |= MemorySemantics::WORKGROUP_MEMORY;
+    }
+    semantics
+}
+
+fn air_barrier_memory_scope(call: &LlCall, default_scope: Scope) -> Scope {
+    let flags = call
+        .args
+        .first()
+        .and_then(|arg| air_i32_literal(&arg.value))
+        .unwrap_or(0);
+    if flags & (1 | 4) != 0 {
+        Scope::Device
+    } else {
+        default_scope
     }
 }

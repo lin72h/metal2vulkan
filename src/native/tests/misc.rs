@@ -583,6 +583,10 @@ declare i1 @air.is_function_constant_defined(ptr addrspace(2))
         .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(asm.contains("OpConstantFalse"), "{asm}");
+    assert!(
+        asm.contains("__metal2vulkan.MTL_FC_DEFINED_1"),
+        "definedness specialization marker should survive lowering: {asm}"
+    );
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")

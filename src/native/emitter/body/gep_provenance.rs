@@ -121,6 +121,24 @@ impl Emitter {
         } else {
             None
         };
+        let composed_root_indices = if let Some((prev, _)) = &composed {
+            if let Some(root_indices) = prev.root_indices.clone() {
+                let mut combined = root_indices;
+                if let Some(first) = gep.indices.first() {
+                    if let Some(last) = combined.last_mut() {
+                        *last = self.combine_gep_indices(last, first, instructions)?;
+                    } else {
+                        combined.push(first.clone());
+                    }
+                }
+                combined.extend(gep.indices.iter().skip(1).cloned());
+                Some(combined)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let was_composed = composed.is_some();
         let previous_root_is_indexed_container = provenance
             .as_ref()
@@ -334,6 +352,7 @@ impl Emitter {
                         source_ty
                     },
                     indices: logical_indices,
+                    root_indices: None,
                     root_is_indexed_container: previous_root_is_indexed_container
                         || self.is_indexed_container_root(root, None),
                 },
@@ -364,6 +383,18 @@ impl Emitter {
                 let is_null = self.const_bool(false)?;
                 self.record_pointer_nullness(name.to_string(), is_null);
             }
+            return Ok(Some(result));
+        }
+        if let Some(result) = self.emit_flat_scalar_reinterpret_gep(
+            name,
+            &gep.base.value,
+            base,
+            addrspace,
+            base_storage,
+            &source_ty,
+            &indices,
+            instructions,
+        )? {
             return Ok(Some(result));
         }
         // `getelementptr T, ptr %bytebase, %i` where the base is a `uchar` (Int(8)) byte-view pointer
@@ -456,6 +487,7 @@ impl Emitter {
                         addrspace: provenance_addrspace,
                         source_ty: source_ty.clone(),
                         indices: indices.clone(),
+                        root_indices: None,
                         root_is_indexed_container: previous_root_is_indexed_container
                             || self.is_indexed_container_root(root, None),
                     },
@@ -498,16 +530,21 @@ impl Emitter {
                 .is_some_and(|base_ty| types_compatible(base_ty, &source_ty))
             && indices.len() >= 2;
         let first_index_nonzero = indices.first().and_then(|idx| const_index(Some(idx))) != Some(0);
+        let base_is_pointer_phi = matches!(
+            &gep.base.value,
+            LlValue::Local(base_name) if self.pointer_phi_values.contains(base_name)
+        );
         let use_ptr_access_chain = decide_ptr_access_chain(PtrAccessChainInputs {
             pointee_points_to_aggregate,
-            base_storage,
-            is_indexed_container_root: self.is_indexed_container_root(base, Some(base_storage)),
+            base_storage: access_storage,
+            is_indexed_container_root: self.is_indexed_container_root(base, Some(access_storage)),
             struct_base_stride,
             array_base_stride,
             first_index_nonzero,
             was_composed,
             base_is_param,
             base_points_to_aggregate,
+            base_is_pointer_phi,
         });
         let incompatible_aggregate_base = base_pointee.as_ref().is_some_and(|base_ty| {
             base_points_to_aggregate && !types_compatible(base_ty, &source_ty)
@@ -526,6 +563,21 @@ impl Emitter {
             && base_pointee
                 .as_ref()
                 .is_some_and(|base_ty| aggregate_member0_wraps_source(base_ty, &source_ty));
+        let member0_array_element_root_indices = if incompatible_aggregate_base {
+            base_pointee.as_ref().and_then(|base_ty| {
+                aggregate_member0_array_element_wraps_source(base_ty, &source_ty).then(|| {
+                    let mut prefixed = Vec::with_capacity(indices.len() + 1);
+                    prefixed.push(TypedValue {
+                        ty: LlType::Int(32),
+                        value: LlValue::Int(0),
+                    });
+                    prefixed.extend(indices.iter().cloned());
+                    prefixed
+                })
+            })
+        } else {
+            None
+        };
         // A Workgroup ENTRY-PARAM base is backed post-interface by an OVERSIZED array of its
         // logical pointee (`[WORKGROUP_MEMORY_ELEMENTS x T]`, the threadgroup-buffer wrap), so the
         // LLVM leading stride index IS the element index into that backing array and must be KEPT —
@@ -541,6 +593,10 @@ impl Emitter {
         let access_indices = if use_ptr_access_chain {
             logical_indices.clone()
         } else if let Some(indices) = reinterpreted_workgroup_indices {
+            indices
+        } else if let Some(indices) = composed_root_indices.clone() {
+            indices
+        } else if let Some(indices) = member0_array_element_root_indices.clone() {
             indices
         } else if keep_incompatible_root_index || workgroup_param_array_backing {
             logical_indices.clone()
@@ -591,6 +647,9 @@ impl Emitter {
                     source_ty
                 },
                 indices: entry_metadata_indices.unwrap_or(indices),
+                root_indices: (composed_root_indices.is_some()
+                    || member0_array_element_root_indices.is_some())
+                .then(|| access_indices.clone()),
                 root_is_indexed_container: previous_root_is_indexed_container
                     || self.is_indexed_container_root(root, None),
             },
@@ -878,6 +937,7 @@ impl Emitter {
                     ty: LlType::Int(32),
                     value: LlValue::Int(target_index),
                 }],
+                root_indices: None,
                 root_is_indexed_container: provenance.root_is_indexed_container,
             },
         );
@@ -972,6 +1032,7 @@ impl Emitter {
                 addrspace: provenance.addrspace,
                 source_ty: provenance.source_ty.clone(),
                 indices: member_path,
+                root_indices: None,
                 root_is_indexed_container: provenance.root_is_indexed_container,
             },
         );
@@ -1057,6 +1118,222 @@ impl Emitter {
         }
         self.apply_raw_gep(RawBufferOffset::root(root, addrspace), source_ty, indices)
             .map(Some)
+    }
+
+    pub(in crate::native::emitter) fn emit_flat_scalar_reinterpret_gep(
+        &mut self,
+        name: &str,
+        base_value: &LlValue,
+        base_id: Word,
+        addrspace: u32,
+        base_storage: StorageClass,
+        source_ty: &LlType,
+        indices: &[TypedValue],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Word>, String> {
+        if base_storage != StorageClass::Private
+            || !matches!(source_ty, LlType::Array(_, _) | LlType::Struct(_))
+        {
+            return Ok(None);
+        }
+        let Some((root_name, root_id, view_ty)) =
+            self.flat_scalar_reinterpret_root(base_value, base_id)
+        else {
+            return Ok(None);
+        };
+        let pointee = gep_pointee(source_ty, indices)?;
+        let Some(access_indices) = self.flat_scalar_reinterpret_access_indices(
+            &view_ty,
+            source_ty,
+            indices,
+            &pointee,
+            instructions,
+        )?
+        else {
+            return Err(format!(
+                "native emitter: cannot remap GEP of flat-scalar global {root_name} from {source_ty:?} with indices {indices:?} into {view_ty:?}"
+            ));
+        };
+        let ptr_ty = self.ptr_type_id(StorageClass::Private, &pointee)?;
+        let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+        let mut ops = vec![Operand::IdRef(root_id)];
+        for index in &access_indices {
+            ops.push(Operand::IdRef(self.value_id(&index.value, &index.ty)?));
+        }
+        instructions.push(Self::inst(
+            Op::InBoundsAccessChain,
+            Some(ptr_ty),
+            Some(result),
+            ops,
+        ));
+        self.pointer_storage
+            .insert(name.to_string(), StorageClass::Private);
+        self.pointer_pointees
+            .insert(name.to_string(), pointee.clone());
+        if !self.pointer_phi_values.is_empty() {
+            let is_null = self.const_bool(false)?;
+            self.record_pointer_nullness(name.to_string(), is_null);
+        }
+        if let Some(index) = access_indices.last() {
+            self.materialize_reserved_pointer_index(name, index, instructions)?;
+        }
+        self.gep_provenance.insert(
+            name.to_string(),
+            GepProvenance {
+                root: root_id,
+                addrspace,
+                source_ty: source_ty.clone(),
+                indices: indices.to_vec(),
+                root_indices: Some(access_indices),
+                root_is_indexed_container: true,
+            },
+        );
+        Ok(Some(result))
+    }
+
+    fn flat_scalar_reinterpret_root(
+        &self,
+        base_value: &LlValue,
+        base_id: Word,
+    ) -> Option<(String, Word, LlType)> {
+        let candidate = match base_value {
+            LlValue::Global(name) if self.flat_scalar_reinterpret_globals.contains_key(name) => {
+                self.global_values
+                    .get(name)
+                    .map(|(id, _)| (name.clone(), *id))
+            }
+            _ => None,
+        }
+        .or_else(|| {
+            self.global_values.iter().find_map(|(name, (id, _))| {
+                (*id == base_id && self.flat_scalar_reinterpret_globals.contains_key(name))
+                    .then(|| (name.clone(), *id))
+            })
+        })?;
+        let pointee = self.pointer_pointees.get(&candidate.0)?;
+        Some((candidate.0, candidate.1, pointee.clone()))
+    }
+
+    fn flat_scalar_reinterpret_access_indices(
+        &mut self,
+        view_ty: &LlType,
+        source_ty: &LlType,
+        indices: &[TypedValue],
+        pointee: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Vec<TypedValue>>, String> {
+        if types_compatible(view_ty, source_ty) {
+            return gep_spirv_indices(indices).map(Some);
+        }
+        let Some((scalar, _)) = flat_scalar_leaf_count(view_ty) else {
+            return Ok(None);
+        };
+        let scalar = self.resolve_type(&scalar)?;
+        let Some(offset) = self.constant_gep_offset_in_scalar_units(source_ty, indices, &scalar)?
+        else {
+            return Ok(None);
+        };
+        self.decompose_scalar_offset_indices(view_ty, offset, pointee, instructions)
+    }
+
+    fn constant_gep_offset_in_scalar_units(
+        &self,
+        source_ty: &LlType,
+        indices: &[TypedValue],
+        scalar: &LlType,
+    ) -> Result<Option<u64>, String> {
+        if indices.is_empty() {
+            return Ok(None);
+        }
+        let (scalar_size, _) = self.raw_type_size_align(scalar)?;
+        if scalar_size == 0 {
+            return Ok(None);
+        }
+        let Some(first) = const_index(indices.first()) else {
+            return Ok(None);
+        };
+        let source_ty = self.resolve_type(source_ty)?;
+        let (source_size, _) = self.raw_type_size_align(&source_ty)?;
+        if !source_size.is_multiple_of(scalar_size) {
+            return Ok(None);
+        }
+        let mut offset = u64::from(first) * (source_size / scalar_size);
+        if indices.len() > 1 {
+            let Some((byte_offset, _)) =
+                self.constant_aggregate_gep_offset(&source_ty, &indices[1..])?
+            else {
+                return Ok(None);
+            };
+            if !byte_offset.is_multiple_of(scalar_size) {
+                return Ok(None);
+            }
+            offset += byte_offset / scalar_size;
+        }
+        Ok(Some(offset))
+    }
+
+    fn decompose_scalar_offset_indices(
+        &self,
+        ty: &LlType,
+        offset: u64,
+        pointee: &LlType,
+        _instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Vec<TypedValue>>, String> {
+        let mut offset = offset;
+        let mut ty = self.resolve_type(ty)?;
+        let mut out = Vec::new();
+        loop {
+            if types_compatible(&ty, pointee) {
+                return Ok(Some(out));
+            }
+            match ty {
+                LlType::Array(elem, len) => {
+                    let elem = self.resolve_type(&elem)?;
+                    let Some((_, elem_units)) = flat_scalar_leaf_count(&elem) else {
+                        return Ok(None);
+                    };
+                    if elem_units == 0 {
+                        return Ok(None);
+                    }
+                    let index = offset / u64::from(elem_units);
+                    if index >= u64::from(len) {
+                        return Ok(None);
+                    }
+                    out.push(TypedValue {
+                        ty: LlType::Int(32),
+                        value: LlValue::Int(index),
+                    });
+                    offset %= u64::from(elem_units);
+                    ty = elem;
+                }
+                LlType::Struct(fields) => {
+                    let mut cursor = 0u64;
+                    let mut selected = None;
+                    for (field_index, field) in fields.iter().enumerate() {
+                        let field = self.resolve_type(field)?;
+                        let Some((_, field_units)) = flat_scalar_leaf_count(&field) else {
+                            return Ok(None);
+                        };
+                        let next = cursor + u64::from(field_units);
+                        if offset < next {
+                            selected = Some((field_index, field, cursor));
+                            break;
+                        }
+                        cursor = next;
+                    }
+                    let Some((field_index, field, cursor)) = selected else {
+                        return Ok(None);
+                    };
+                    out.push(TypedValue {
+                        ty: LlType::Int(32),
+                        value: LlValue::Int(field_index as u64),
+                    });
+                    offset -= cursor;
+                    ty = field;
+                }
+                _ => return Ok(None),
+            }
+        }
     }
 
     pub(in crate::native::emitter) fn byte_array_reinterpret_root(
@@ -1214,6 +1491,7 @@ impl Emitter {
                 addrspace,
                 source_ty,
                 indices: indices.to_vec(),
+                root_indices: None,
                 root_is_indexed_container: !base_is_vector_pointer,
             },
         );
@@ -1391,6 +1669,7 @@ impl Emitter {
                 addrspace,
                 source_ty: access_pointee,
                 indices: access_indices,
+                root_indices: None,
                 root_is_indexed_container: self.is_workgroup_indexed_container_root(root),
             },
         );
@@ -1571,6 +1850,7 @@ impl Emitter {
                 addrspace,
                 source_ty: elem.as_ref().clone(),
                 indices: access_indices,
+                root_indices: None,
                 root_is_indexed_container: self.is_workgroup_indexed_container_root(root),
             },
         );

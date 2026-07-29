@@ -147,7 +147,8 @@ impl Emitter {
         pointee: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if *pointee != LlType::Int(64) || !matches!(self.resolve_type(&object.ty)?, LlType::Ptr(_))
+        if !local_pointer_field_pointee(pointee)
+            || !matches!(self.resolve_type(&object.ty)?, LlType::Ptr(_))
         {
             return Ok(false);
         }
@@ -193,7 +194,7 @@ impl Emitter {
         let LlType::Ptr(_addrspace) = result_ty else {
             return Ok(false);
         };
-        if *pointee != LlType::Int(64) {
+        if !local_pointer_field_pointee(pointee) {
             return Ok(false);
         }
         let Some(key) = self.local_pointer_field_key(ptr)? else {
@@ -854,4 +855,8 @@ impl Emitter {
             _ => false,
         }
     }
+}
+
+fn local_pointer_field_pointee(pointee: &LlType) -> bool {
+    matches!(pointee, LlType::Ptr(_) | LlType::Int(64))
 }

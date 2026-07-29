@@ -115,6 +115,9 @@ pub(in crate::passes) fn load_image_if_pointer(
     ));
     ctx.image_dims.insert(loaded, (dim, arrayed));
     ctx.image_comp.insert(loaded, comp);
+    if ctx.image_multisampled.contains(&image) || image_type_is_multisampled(ctx, pointee) {
+        ctx.image_multisampled.insert(loaded);
+    }
     if ctx.image_storage.contains(&image) || image_type_is_storage(ctx, pointee) {
         ctx.image_storage.insert(loaded);
     }
@@ -184,6 +187,18 @@ fn image_type_is_storage(ctx: &Ctx, image_ty: Word) -> bool {
     type_def_of(ctx, image_ty).is_some_and(|def| {
         def.class.opcode == Op::TypeImage
             && matches!(def.operands.get(5), Some(Operand::LiteralBit32(2)))
+    })
+}
+
+pub(in crate::passes) fn image_value_is_multisampled(ctx: &Ctx, image: Word) -> bool {
+    ctx.image_multisampled.contains(&image)
+        || value_result_type(ctx, image).is_some_and(|ty| image_type_is_multisampled(ctx, ty))
+}
+
+fn image_type_is_multisampled(ctx: &Ctx, image_ty: Word) -> bool {
+    type_def_of(ctx, image_ty).is_some_and(|def| {
+        def.class.opcode == Op::TypeImage
+            && matches!(def.operands.get(4), Some(Operand::LiteralBit32(1)))
     })
 }
 

@@ -280,15 +280,15 @@ pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Wor
     None
 }
 
-/// Map each texture PARAMETER id -> (Dim, arrayed, comp) by scanning the entry's sampled/read texture
-/// calls (arg 0 is the texture operand, which at this stage is still the param id). The callee name
-/// encodes the dimension (`sample_texture_2d`, ...) and the sampled component type via its suffix
-/// (`.u.v4i32` = uint, `.s.v4i32` = sint, else float).
+/// Map each texture PARAMETER id -> its sampled image shape by scanning the entry's sampled/read
+/// texture calls (arg 0 is the texture operand, which at this stage is still the param id). The
+/// callee name encodes the dimension (`sample_texture_2d`, ...) and the sampled component type via
+/// its suffix (`.u.v4i32` = uint, `.s.v4i32` = sint, else float).
 pub(in crate::passes) fn texture_dims(
     ctx: &Ctx,
     entry_idx: usize,
-    type_hints: &HashMap<Word, (Dim, bool, ImageComp)>,
-) -> HashMap<Word, (Dim, bool, ImageComp)> {
+    type_hints: &HashMap<Word, ImageShape>,
+) -> HashMap<Word, ImageShape> {
     let names = air_names(&ctx.module);
     let write_textures = write_texture_operands(ctx, entry_idx, &names);
     let mut out = HashMap::new();
@@ -343,18 +343,30 @@ pub(in crate::passes) fn texture_dims(
             }
             let (dim, arrayed) = sample_dim(name);
             let comp = texture_comp(name)
-                .or_else(|| type_hints.get(tex).map(|(_, _, comp)| *comp))
+                .or_else(|| type_hints.get(tex).map(|shape| shape.comp))
                 .unwrap_or(ImageComp::Float);
+            let multisampled = name.contains("_ms")
+                || type_hints
+                    .get(tex)
+                    .map(|shape| shape.multisampled)
+                    .unwrap_or(false);
+            let shape = ImageShape {
+                dim,
+                arrayed,
+                comp,
+                multisampled,
+            };
             // Let a suffix-derived integer use refine a provisional Float classification from an
             // earlier ambiguous query. Valid Metal does not mix float and integer texel views for the
             // same texture argument.
             out.entry(*tex)
-                .and_modify(|e: &mut (Dim, bool, ImageComp)| {
-                    if e.2 == ImageComp::Float {
-                        e.2 = comp;
+                .and_modify(|e: &mut ImageShape| {
+                    if e.comp == ImageComp::Float {
+                        e.comp = comp;
                     }
+                    e.multisampled |= multisampled;
                 })
-                .or_insert((dim, arrayed, comp));
+                .or_insert(shape);
         }
     }
     // Vulkan forbids `OpImageFetch` on a `Dim Cube` image (cube texel fetch does not exist in
@@ -366,8 +378,9 @@ pub(in crate::passes) fn texture_dims(
     // than a silently wrong emit). Cube ARRAYS are left untouched: their reads carry both face and
     // element and need a fused layer computation this re-type alone would silently drop.
     for (tex, entry) in out.iter_mut() {
-        if entry.0 == Dim::DimCube && !entry.1 && !direction_sampled.contains(tex) {
-            *entry = (Dim::Dim2D, true, entry.2);
+        if entry.dim == Dim::DimCube && !entry.arrayed && !direction_sampled.contains(tex) {
+            entry.dim = Dim::Dim2D;
+            entry.arrayed = true;
         }
     }
     out
@@ -508,10 +521,14 @@ fn texture_comp(name: &str) -> Option<ImageComp> {
     }
 }
 
-pub(in crate::passes) fn texture_arg_comp(name: &str) -> ImageComp {
-    crate::meta::texture_shape_from_name(name)
-        .component
-        .to_image_comp()
+pub(in crate::passes) fn texture_arg_shape(name: &str) -> ImageShape {
+    let shape = crate::meta::texture_shape_from_name(name);
+    ImageShape {
+        dim: shape.dimension.to_spirv_dim(),
+        arrayed: shape.arrayed,
+        comp: shape.component.to_image_comp(),
+        multisampled: shape.multisampled,
+    }
 }
 
 fn texture_arg_storage(name: &str) -> Option<(Dim, bool, ImageFormat, ImageComp)> {
@@ -523,11 +540,6 @@ fn texture_arg_storage(name: &str) -> Option<(Dim, bool, ImageFormat, ImageComp)
         fmt,
         shape.component.to_image_comp(),
     ))
-}
-
-pub(in crate::passes) fn texture_arg_dim(name: &str) -> (Dim, bool) {
-    let shape = crate::meta::texture_shape_from_name(name);
-    (shape.dimension.to_spirv_dim(), shape.arrayed)
 }
 
 /// Parse the (Dim, arrayed) a sample callee name implies.
@@ -560,15 +572,15 @@ mod tests {
     #[test]
     fn texture_arg_comp_reads_nested_texture_array_scalar() {
         assert_eq!(
-            texture_arg_comp("array<texture2d<uint, sample>, 2>"),
+            texture_arg_shape("array<texture2d<uint, sample>, 2>").comp,
             ImageComp::Uint
         );
         assert_eq!(
-            texture_arg_comp("array<texture2d<int, sample>, 2>"),
+            texture_arg_shape("array<texture2d<int, sample>, 2>").comp,
             ImageComp::Sint
         );
         assert_eq!(
-            texture_arg_comp("array<texture2d<half, sample>, 2>"),
+            texture_arg_shape("array<texture2d<half, sample>, 2>").comp,
             ImageComp::Float
         );
     }

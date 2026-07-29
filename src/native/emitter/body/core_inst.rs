@@ -477,6 +477,33 @@ impl Emitter {
             if let Some(pointee) = pointee {
                 self.pointer_pointees.insert(name.to_string(), pointee);
             }
+            let argument_provenance = self.values.iter().find_map(|(candidate, (id, _))| {
+                (*id == argument_id)
+                    .then(|| self.gep_provenance.get(candidate).cloned())
+                    .flatten()
+            });
+            if let Some(provenance) = argument_provenance {
+                self.gep_provenance.insert(name.to_string(), provenance);
+            } else if let LlValue::Gep(gep) = &argument.value {
+                let base_id = self.value_id_in(&gep.base.value, &gep.base.ty, instructions)?;
+                let source_ty = self.resolve_type(&gep.source_ty)?;
+                self.gep_provenance.insert(
+                    name.to_string(),
+                    GepProvenance {
+                        root: base_id,
+                        addrspace,
+                        source_ty,
+                        indices: gep.indices.clone(),
+                        root_indices: None,
+                        root_is_indexed_container: self
+                            .is_indexed_container_root(base_id, Some(storage)),
+                    },
+                );
+            } else if let LlValue::Local(source) = &argument.value {
+                if let Some(provenance) = self.gep_provenance.get(source).cloned() {
+                    self.gep_provenance.insert(name.to_string(), provenance);
+                }
+            }
             if let Some(nullness) = nullness {
                 self.record_pointer_nullness(name.to_string(), nullness);
             }
@@ -695,7 +722,7 @@ impl Emitter {
         line: &str,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
-        let LlType::Vector(elem, _) = self.resolve_type(&vector.ty)? else {
+        let LlType::Vector(elem, lanes) = self.resolve_type(&vector.ty)? else {
             if let Some(elem) = self.one_lane_vector_elem(&vector.ty)? {
                 if const_index(Some(&idx)).is_some_and(|idx| idx != 0) {
                     return Err(format!(
@@ -731,12 +758,24 @@ impl Emitter {
             ));
         } else {
             let idx_id = self.vector_index_id(&idx, instructions)?;
-            instructions.push(Self::inst(
-                Op::VectorExtractDynamic,
-                Some(result_type),
-                Some(result),
-                vec![Operand::IdRef(vector_id), Operand::IdRef(idx_id)],
-            ));
+            if lanes <= 4 {
+                instructions.push(Self::inst(
+                    Op::VectorExtractDynamic,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdRef(vector_id), Operand::IdRef(idx_id)],
+                ));
+            } else {
+                self.emit_large_vector_dynamic_extract(
+                    vector_id,
+                    idx_id,
+                    &idx.ty,
+                    lanes,
+                    result_type,
+                    result,
+                    instructions,
+                )?;
+            }
         }
         Ok(())
     }
@@ -785,15 +824,178 @@ impl Emitter {
             ));
         } else {
             let idx_id = self.vector_index_id(&idx, instructions)?;
+            if let LlType::Vector(_, lanes) = &result_ty {
+                if *lanes > 4 {
+                    self.emit_large_vector_dynamic_insert(
+                        vector_id,
+                        object_id,
+                        idx_id,
+                        &idx.ty,
+                        *lanes,
+                        result_type,
+                        result,
+                        instructions,
+                    )?;
+                } else {
+                    instructions.push(Self::inst(
+                        Op::VectorInsertDynamic,
+                        Some(result_type),
+                        Some(result),
+                        vec![
+                            Operand::IdRef(vector_id),
+                            Operand::IdRef(object_id),
+                            Operand::IdRef(idx_id),
+                        ],
+                    ));
+                }
+            } else {
+                instructions.push(Self::inst(
+                    Op::VectorInsertDynamic,
+                    Some(result_type),
+                    Some(result),
+                    vec![
+                        Operand::IdRef(vector_id),
+                        Operand::IdRef(object_id),
+                        Operand::IdRef(idx_id),
+                    ],
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn dynamic_index_const(&mut self, idx_ty: &LlType, value: u32) -> Result<Word, String> {
+        match self.resolve_type(idx_ty)? {
+            LlType::Bool => self.const_uint(value),
+            LlType::Int(bits) => self.const_int(bits, u64::from(value)),
+            other => Err(format!(
+                "native emitter: dynamic vector index has unsupported type {other:?}"
+            )),
+        }
+    }
+
+    fn emit_large_vector_dynamic_extract(
+        &mut self,
+        vector_id: Word,
+        idx_id: Word,
+        idx_ty: &LlType,
+        lanes: u32,
+        result_type: Word,
+        result: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let bool_ty = self.type_id(&LlType::Bool)?;
+        let mut selected = None;
+        for lane in 0..lanes {
+            let extracted = self.fresh();
             instructions.push(Self::inst(
-                Op::VectorInsertDynamic,
+                Op::CompositeExtract,
+                Some(result_type),
+                Some(extracted),
+                vec![Operand::IdRef(vector_id), Operand::LiteralBit32(lane)],
+            ));
+            let Some(prev) = selected else {
+                selected = Some(extracted);
+                continue;
+            };
+            let lane_id = self.dynamic_index_const(idx_ty, lane)?;
+            let cmp = self.fresh();
+            instructions.push(Self::inst(
+                Op::IEqual,
+                Some(bool_ty),
+                Some(cmp),
+                vec![Operand::IdRef(idx_id), Operand::IdRef(lane_id)],
+            ));
+            let select = if lane + 1 == lanes {
+                result
+            } else {
+                self.fresh()
+            };
+            instructions.push(Self::inst(
+                Op::Select,
+                Some(result_type),
+                Some(select),
+                vec![
+                    Operand::IdRef(cmp),
+                    Operand::IdRef(extracted),
+                    Operand::IdRef(prev),
+                ],
+            ));
+            selected = Some(select);
+        }
+        if lanes == 1 {
+            let selected = selected.ok_or("native emitter: empty large vector extract")?;
+            instructions.push(Self::inst(
+                Op::CopyObject,
                 Some(result_type),
                 Some(result),
+                vec![Operand::IdRef(selected)],
+            ));
+        }
+        Ok(())
+    }
+
+    fn emit_large_vector_dynamic_insert(
+        &mut self,
+        vector_id: Word,
+        object_id: Word,
+        idx_id: Word,
+        idx_ty: &LlType,
+        lanes: u32,
+        result_type: Word,
+        result: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let bool_ty = self.type_id(&LlType::Bool)?;
+        let mut selected = None;
+        for lane in 0..lanes {
+            let candidate = self.fresh();
+            instructions.push(Self::inst(
+                Op::CompositeInsert,
+                Some(result_type),
+                Some(candidate),
                 vec![
-                    Operand::IdRef(vector_id),
                     Operand::IdRef(object_id),
-                    Operand::IdRef(idx_id),
+                    Operand::IdRef(vector_id),
+                    Operand::LiteralBit32(lane),
                 ],
+            ));
+            let Some(prev) = selected else {
+                selected = Some(candidate);
+                continue;
+            };
+            let lane_id = self.dynamic_index_const(idx_ty, lane)?;
+            let cmp = self.fresh();
+            instructions.push(Self::inst(
+                Op::IEqual,
+                Some(bool_ty),
+                Some(cmp),
+                vec![Operand::IdRef(idx_id), Operand::IdRef(lane_id)],
+            ));
+            let select = if lane + 1 == lanes {
+                result
+            } else {
+                self.fresh()
+            };
+            instructions.push(Self::inst(
+                Op::Select,
+                Some(result_type),
+                Some(select),
+                vec![
+                    Operand::IdRef(cmp),
+                    Operand::IdRef(candidate),
+                    Operand::IdRef(prev),
+                ],
+            ));
+            selected = Some(select);
+        }
+        if lanes == 1 {
+            let selected = selected.ok_or("native emitter: empty large vector insert")?;
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(selected)],
             ));
         }
         Ok(())
@@ -820,7 +1022,17 @@ impl Emitter {
                 "native emitter: inttoptr destination is not pointer: {dst_ty:?}"
             ));
         };
-        let _ = self.value_id(&src.value, &src.ty)?;
+        let src_id = self.value_id(&src.value, &src.ty)?;
+        if self.bda_device_pointers && addrspace == 1 {
+            self.used_device_address = true;
+            let mut dev = RawBufferOffset::root(format!(".bda_inttoptr_{src_id}"), 1);
+            dev.device_addr_base = Some(src_id);
+            self.raw_offsets.insert(name.clone(), dev);
+            self.pointer_storage
+                .insert(name.clone(), StorageClass::PhysicalStorageBuffer);
+            self.pointer_pointees.insert(name, LlType::Int(8));
+            return Ok(());
+        }
         // Logical SPIR-V cannot materialize an integer as an address. Preserve a valid SSA pointer so
         // function-constant-dead command-buffer paths translate without claiming active GPU-address
         // semantics.
@@ -1214,6 +1426,9 @@ impl Emitter {
         // SSA result `name`; callee + return type stay from text). Done before the special-case
         // emitters so they consume the graph operands too. Byte-identical by tir's operand soundness.
         self.apply_tir_call_args(&name, &mut call);
+        if self.emit_mtl_force_not_checked_load_call(&call, &name, instructions)? {
+            return Ok(());
+        }
         if self.emit_visible_function_table_placeholder_call(&call, &name, instructions)? {
             return Ok(());
         }

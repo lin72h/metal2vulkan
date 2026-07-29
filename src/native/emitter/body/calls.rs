@@ -3,6 +3,65 @@
 use super::*;
 
 impl Emitter {
+    pub(in crate::native::emitter) fn emit_mtl_force_not_checked_load_call(
+        &mut self,
+        call: &LlCall,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if call.callee != "mtl.force_not_checked.load.i64.p1" {
+            return Ok(false);
+        }
+        if call.args.len() != 1 {
+            return Err(format!(
+                "native emitter: {} expected one pointer argument, got {}",
+                call.callee,
+                call.args.len()
+            ));
+        }
+        let result_ty = self.resolve_type(&call.ret)?;
+        if result_ty != LlType::Int(64) {
+            return Err(format!(
+                "native emitter: {} returned unsupported type {:?}",
+                call.callee, result_ty
+            ));
+        }
+        let arg = &call.args[0];
+        let LlType::Ptr(addrspace) = self.resolve_type(&arg.ty)? else {
+            return Err(format!(
+                "native emitter: {} argument is not a pointer: {:?}",
+                call.callee, arg.ty
+            ));
+        };
+        if addrspace != 1 {
+            return Err(format!(
+                "native emitter: {} expected ptr addrspace(1), got addrspace({addrspace})",
+                call.callee
+            ));
+        }
+        let LlValue::Local(arg_name) = &arg.value else {
+            return Err(format!(
+                "native emitter: {} requires a local device-address pointer",
+                call.callee
+            ));
+        };
+        let Some(raw) = self.raw_offsets.get(arg_name).cloned() else {
+            return Err(format!(
+                "native emitter: {} requires BDA device-address lowering",
+                call.callee
+            ));
+        };
+        if raw.device_addr_base.is_none() {
+            return Err(format!(
+                "native emitter: {} pointer is not backed by a device address",
+                call.callee
+            ));
+        }
+        let result = self.result_id(name, &result_ty)?;
+        self.emit_device_addr_load(result, &result_ty, &raw, instructions)?;
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_visible_function_table_placeholder_call(
         &mut self,
         call: &LlCall,
@@ -111,6 +170,7 @@ impl Emitter {
                         ty: LlType::Int(32),
                         value: LlValue::Int(0),
                     }],
+                    root_indices: None,
                     root_is_indexed_container: true,
                 },
             );
@@ -231,6 +291,7 @@ impl Emitter {
                 addrspace,
                 source_ty: pointee,
                 indices: vec![],
+                root_indices: None,
                 root_is_indexed_container: false,
             },
         );
@@ -306,13 +367,10 @@ impl Emitter {
             .iter()
             .find(|function| function.name == call.callee)
             .map(|function| function.params.clone());
-        for arg in &call.args {
-            let _ = self.value_id_in(&arg.value, &arg.ty, instructions)?;
-        }
         if let Some(callee_params) = callee_params {
-            for (index, (arg, (param_name, param_ty))) in
-                call.args.iter().zip(callee_params).enumerate()
-            {
+            let args = self.function_call_args_for_params(call, &callee_params)?;
+            for (index, arg, (param_name, param_ty)) in args {
+                let _ = self.value_id_in(&arg.value, &arg.ty, instructions)?;
                 if !matches!(self.resolve_type(&param_ty)?, LlType::Ptr(_)) {
                     continue;
                 }
@@ -344,6 +402,10 @@ impl Emitter {
                     }
                 }
             }
+        } else {
+            for arg in &call.args {
+                let _ = self.value_id_in(&arg.value, &arg.ty, instructions)?;
+            }
         }
         Ok(())
     }
@@ -360,45 +422,103 @@ impl Emitter {
             .find(|function| function.name == call.callee)
             .map(|function| function.params.clone())
             .unwrap_or_default();
-        let mut ids = Vec::with_capacity(call.args.len());
-        for (index, arg) in call.args.iter().enumerate() {
-            if let Some((param_name, param_ty)) = callee_params.get(index) {
-                if let Some(id) = self.raw_workgroup_call_arg_id(
-                    &call.callee,
-                    index,
-                    param_name,
-                    param_ty,
-                    arg,
-                    instructions,
-                )? {
-                    ids.push(id);
-                    continue;
-                }
-                if let Some(id) = self.decayed_global_call_arg_id(
-                    &call.callee,
-                    index,
-                    param_name,
-                    param_ty,
-                    arg,
-                    instructions,
-                )? {
-                    ids.push(id);
-                    continue;
-                }
-                if let Some(id) = self.raw_device_call_arg_id(
-                    &call.callee,
-                    param_name,
-                    param_ty,
-                    arg,
-                    instructions,
-                )? {
-                    ids.push(id);
-                    continue;
-                }
+        if callee_params.is_empty() {
+            let mut ids = Vec::with_capacity(call.args.len());
+            for arg in &call.args {
+                ids.push(self.value_id_in(&arg.value, &arg.ty, instructions)?);
+            }
+            return Ok(ids);
+        }
+        let args = self.function_call_args_for_params(call, &callee_params)?;
+        let mut ids = Vec::with_capacity(args.len());
+        for (index, arg, (param_name, param_ty)) in args {
+            if let Some(id) = self.raw_workgroup_call_arg_id(
+                &call.callee,
+                index,
+                &param_name,
+                &param_ty,
+                &arg,
+                instructions,
+            )? {
+                ids.push(id);
+                continue;
+            }
+            if let Some(id) = self.decayed_global_call_arg_id(
+                &call.callee,
+                index,
+                &param_name,
+                &param_ty,
+                &arg,
+                instructions,
+            )? {
+                ids.push(id);
+                continue;
+            }
+            if let Some(id) = self.raw_device_call_arg_id(
+                &call.callee,
+                &param_name,
+                &param_ty,
+                &arg,
+                instructions,
+            )? {
+                ids.push(id);
+                continue;
             }
             ids.push(self.value_id_in(&arg.value, &arg.ty, instructions)?);
         }
         Ok(ids)
+    }
+
+    fn function_call_args_for_params(
+        &self,
+        call: &LlCall,
+        callee_params: &[(String, LlType)],
+    ) -> Result<Vec<(usize, TypedValue, (String, LlType))>, String> {
+        if call.args.len() == callee_params.len() {
+            return Ok(call
+                .args
+                .iter()
+                .cloned()
+                .zip(callee_params.iter().cloned())
+                .enumerate()
+                .map(|(index, (arg, param))| (index, arg, param))
+                .collect());
+        }
+        if call.args.len() < callee_params.len() {
+            return Err(format!(
+                "native emitter: call @{} has {} args for {} params",
+                call.callee,
+                call.args.len(),
+                callee_params.len()
+            ));
+        }
+
+        let mut out = Vec::with_capacity(callee_params.len());
+        let mut arg_index = 0usize;
+        for (param_index, param) in callee_params.iter().cloned().enumerate() {
+            let mut matched = None;
+            for (offset, arg) in call.args[arg_index..].iter().enumerate() {
+                if self.call_arg_matches_param(arg, &param.1)? {
+                    matched = Some((arg_index + offset, arg.clone()));
+                    break;
+                }
+            }
+            let Some((matched_index, arg)) = matched else {
+                return Err(format!(
+                    "native emitter: call @{} could not align arg {} to param {} type {:?}",
+                    call.callee, arg_index, param_index, param.1
+                ));
+            };
+            arg_index = matched_index + 1;
+            out.push((param_index, arg, param));
+        }
+        Ok(out)
+    }
+
+    fn call_arg_matches_param(&self, arg: &TypedValue, param_ty: &LlType) -> Result<bool, String> {
+        let arg_ty = self.resolve_type(&arg.ty)?;
+        let param_ty = self.resolve_type(param_ty)?;
+        Ok(types_compatible(&arg_ty, &param_ty))
     }
 
     pub(in crate::native::emitter) fn decayed_global_call_arg_id(
@@ -429,14 +549,29 @@ impl Emitter {
         let Some(global_pointee) = self.pointer_pointees.get(global_name).cloned() else {
             return Ok(None);
         };
-        let LlType::Array(elem, _) = self.resolve_type(&global_pointee)? else {
+        let expected = self.resolve_type(&expected)?;
+        let global_pointee = self.resolve_type(&global_pointee)?;
+        let Some(decay_indices) = decayed_global_call_arg_indices(&global_pointee, &expected)
+        else {
             return Ok(None);
         };
-        let expected = self.resolve_type(&expected)?;
-        if !types_compatible(&elem, &expected) {
-            return Ok(None);
-        }
         let base = self.value_id(&arg.value, &arg.ty)?;
+        if self
+            .flat_scalar_reinterpret_globals
+            .contains_key(global_name)
+            && matches!(&global_pointee, LlType::Array(elem, _) if types_compatible(elem, &expected))
+        {
+            let ptr_ty = self.ptr_type_id(StorageClass::Private, &expected)?;
+            let zero = self.const_int(32, 0)?;
+            let result = self.fresh();
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(ptr_ty),
+                Some(result),
+                vec![Operand::IdRef(base), Operand::IdRef(zero)],
+            ));
+            return Ok(Some(result));
+        }
         let storage = if arg_addrspace == 3 {
             StorageClass::Workgroup
         } else {
@@ -444,12 +579,16 @@ impl Emitter {
         };
         let ptr_ty = self.ptr_type_id(storage, &expected)?;
         let result = self.fresh();
-        let zero = self.const_uint(0)?;
+        let mut ops = Vec::with_capacity(decay_indices.len() + 1);
+        ops.push(Operand::IdRef(base));
+        for index in &decay_indices {
+            ops.push(Operand::IdRef(self.value_id(&index.value, &index.ty)?));
+        }
         instructions.push(Self::inst(
             Op::InBoundsAccessChain,
             Some(ptr_ty),
             Some(result),
-            vec![Operand::IdRef(base), Operand::IdRef(zero)],
+            ops,
         ));
         Ok(Some(result))
     }
@@ -607,5 +746,29 @@ impl Emitter {
             ],
         ));
         Ok(result)
+    }
+}
+
+fn decayed_global_call_arg_indices(
+    global_pointee: &LlType,
+    expected: &LlType,
+) -> Option<Vec<TypedValue>> {
+    let zero = TypedValue {
+        ty: LlType::Int(32),
+        value: LlValue::Int(0),
+    };
+    match global_pointee {
+        LlType::Array(elem, _) if types_compatible(elem, expected) => Some(vec![zero]),
+        LlType::Struct(fields) => {
+            let first = fields.first()?;
+            if types_compatible(first, expected) {
+                Some(vec![zero])
+            } else if matches!(first, LlType::Array(elem, _) if types_compatible(elem, expected)) {
+                Some(vec![zero.clone(), zero])
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }

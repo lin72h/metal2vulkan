@@ -23,6 +23,7 @@ pub(super) struct PtrAccessChainInputs {
     pub was_composed: bool,
     pub base_is_param: bool,
     pub base_points_to_aggregate: bool,
+    pub base_is_pointer_phi: bool,
 }
 
 /// Decide `OpPtrAccessChain` (`true`) vs `OpInBoundsAccessChain` (`false`) for a getelementptr.
@@ -45,7 +46,8 @@ pub(super) fn decide_ptr_access_chain(i: PtrAccessChainInputs) -> bool {
         && ptr_access_chain_allowed_storage(i.base_storage)
         && (!i.is_indexed_container_root || i.struct_base_stride || i.array_base_stride)
         && i.first_index_nonzero;
-    (!i.was_composed || scalar_ptr_access_chain)
+    (!i.base_is_pointer_phi || ptr_access_chain_allowed_storage(i.base_storage))
+        && (!i.was_composed || scalar_ptr_access_chain)
         && (!i.base_is_param || scalar_ptr_access_chain)
         && (!i.base_points_to_aggregate || scalar_ptr_access_chain)
         && i.first_index_nonzero
@@ -200,6 +202,15 @@ fn aggregate_member0_wraps_source(base: &LlType, source: &LlType) -> bool {
         LlType::Struct(fields) => fields
             .first()
             .is_some_and(|field| types_compatible(field, source)),
+        _ => false,
+    }
+}
+
+fn aggregate_member0_array_element_wraps_source(base: &LlType, source: &LlType) -> bool {
+    match base {
+        LlType::Struct(fields) => fields.first().is_some_and(
+            |field| matches!(field, LlType::Array(elem, _) if types_compatible(elem, source)),
+        ),
         _ => false,
     }
 }
@@ -417,6 +428,7 @@ mod ptr_access_chain_tests {
             was_composed: false,
             base_is_param: false,
             base_points_to_aggregate: false,
+            base_is_pointer_phi: false,
         }
     }
 
@@ -473,6 +485,16 @@ mod ptr_access_chain_tests {
         let i = PtrAccessChainInputs {
             base_storage: StorageClass::Private,
             base_is_param: true,
+            ..scalar_ptr_chain()
+        };
+        assert!(!decide_ptr_access_chain(i));
+    }
+
+    #[test]
+    fn pointer_phi_base_needs_ptr_access_chain_storage() {
+        let i = PtrAccessChainInputs {
+            base_storage: StorageClass::Private,
+            base_is_pointer_phi: true,
             ..scalar_ptr_chain()
         };
         assert!(!decide_ptr_access_chain(i));

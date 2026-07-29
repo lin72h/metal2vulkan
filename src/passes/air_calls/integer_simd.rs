@@ -614,7 +614,31 @@ pub(in crate::passes) fn lower_simd_op(
         if args.len() != 1 {
             return Err(format!("{name} expects one function-constant operand"));
         }
+        let fc_index = ctx.module.debug_names.iter().find_map(|inst| {
+            if inst.class.opcode != Op::Name {
+                return None;
+            }
+            match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(Operand::IdRef(id)), Some(Operand::LiteralString(name)))
+                    if *id == args[0] =>
+                {
+                    crate::fc_specialize::fc_init_index(name)
+                }
+                _ => None,
+            }
+        });
         let c = ctx.const_bool_of(rty, false);
+        if let Some(index) = fc_index {
+            ctx.module.debug_names.push(Instruction::new(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(res),
+                    Operand::LiteralString(crate::fc_specialize::fc_defined_name(index)),
+                ],
+            ));
+        }
         return Ok(Some(vec![Instruction::new(
             Op::CopyObject,
             Some(rty),

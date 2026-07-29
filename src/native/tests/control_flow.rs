@@ -3892,6 +3892,56 @@ no:
 }
 
 #[test]
+fn native_internal_call_skips_extra_air_abi_operands_by_formal_type() {
+    let ll = r#"
+define <4 x half> @frag(<4 x float> %pos, <3 x float> %a, <3 x float> %b) {
+entry:
+  %tmp = alloca <4 x float>, align 16
+  %x = extractelement <4 x float> %pos, i64 0
+  %enabled = fcmp fast olt float %x, 0.000000e+00
+  call void @helper(ptr %tmp, <4 x float> %pos, <3 x float> %a, <3 x float> %b, <3 x float> %a, <2 x float> zeroinitializer, <3 x float> %b, i32 7, [12 x i8] undef, <3 x float> %a, <3 x half> zeroinitializer, i1 %enabled)
+  ret <4 x half> zeroinitializer
+}
+
+define internal void @helper(ptr %out, <4 x float> %pos, <3 x float> %a, <3 x float> %b, <3 x float> %c, <2 x float> %uv, <3 x float> %d, <3 x float> %e, <3 x half> %normal, i1 %enabled) {
+entry:
+  br i1 %enabled, label %yes, label %no
+
+yes:
+  ret void
+
+no:
+  ret void
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"float3", !"air.arg_name", !"a"}
+!6 = !{i32 2, !"air.fragment_input", !"air.arg_type_name", !"float3", !"air.arg_name", !"b"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_extra_air_abi_call_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpFOrdLessThan"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_phi_dedupes_identical_incoming_from_same_predecessor() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

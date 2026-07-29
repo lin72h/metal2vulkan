@@ -358,6 +358,7 @@ pub(in crate::passes) fn apply_bindings(
                 image_ty,
                 dim,
                 comp,
+                multisampled,
             } => {
                 let lid = ctx.module.fresh_id();
                 loads.push(Instruction::new(
@@ -368,6 +369,9 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 ctx.image_dims.insert(lid, dim);
                 ctx.image_comp.insert(lid, comp);
+                if multisampled {
+                    ctx.image_multisampled.insert(lid);
+                }
                 resource_values.insert(lid);
                 splices.push((pid, lid));
             }
@@ -376,11 +380,13 @@ pub(in crate::passes) fn apply_bindings(
                 elem_image_ty,
                 dim,
                 comp,
+                multisampled,
             } => {
                 // Splice the param to the array VARIABLE (a pointer to `array<image>`); the per-element
                 // image is materialized at each use by `materialize_texture_array_loads` reading
                 // `image_array_vars`. No function-top load: the array as a whole is never an operand.
-                ctx.image_array_vars.insert(var, (elem_image_ty, dim, comp));
+                ctx.image_array_vars
+                    .insert(var, (elem_image_ty, dim, comp, multisampled));
                 resource_values.insert(var);
                 splices.push((pid, var));
             }

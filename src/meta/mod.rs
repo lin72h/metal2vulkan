@@ -28,8 +28,12 @@ pub enum FragRole {
     Position,
     /// `[[point_coord]]` -> Input BuiltIn PointCoord.
     PointCoord,
+    /// `[[front_facing]]` -> Input BuiltIn FrontFacing.
+    FrontFacing,
     /// `[[primitive_id]]` -> Input BuiltIn PrimitiveId (32-bit uint).
     PrimitiveId,
+    /// `[[sample_id]]` -> Input BuiltIn SampleId (32-bit uint).
+    SampleId,
     /// `[[viewport_array_index]]` -> Input BuiltIn ViewportIndex (32-bit uint).
     ViewportArrayIndex,
     /// `[[stage_in]]` interpolated input -> Input var at Location N (N = order among fragment_inputs).
@@ -767,6 +771,37 @@ fn primary_role(strs: &[String]) -> Option<&str> {
         .find(|s| *s != "function_constant")
 }
 
+fn function_constant_gate_global(body: &str, nodes: &HashMap<u32, String>) -> Option<String> {
+    if role_strings(body).first().map(String::as_str) != Some("function_constant") {
+        return None;
+    }
+    refs_in(body)
+        .into_iter()
+        .filter_map(|r| nodes.get(&r))
+        .find_map(|node| {
+            let at = node.find('@')?;
+            let name = node[at..]
+                .chars()
+                .take_while(|c| !c.is_whitespace() && !matches!(*c, ',' | ')' | '(' | '[' | ']'))
+                .collect::<String>();
+            (name.len() > 1).then_some(name)
+        })
+}
+
+fn output_metadata_enabled_by_default(
+    body: &str,
+    nodes: &HashMap<u32, String>,
+    static_int_globals: &HashMap<String, u32>,
+) -> bool {
+    function_constant_gate_global(body, nodes)
+        .map(|global| {
+            static_int_globals
+                .get(&global)
+                .is_some_and(|value| *value != 0)
+        })
+        .unwrap_or(true)
+}
+
 /// Like `primary_role`, but only looks past the `air.function_constant` wrapper when the wrapped
 /// resource is a TEXTURE, IMAGEBLOCK, or BUFFER (the latter only when `promote_buffers` is set).
 /// An imageblock has no descriptor binding to promote; recognizing its stable ABI marker merely keeps
@@ -845,7 +880,9 @@ fn parse_air_fragment_meta_with_nodes(
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
                     let is_render_target = primary_role(&roles) == Some("render_target");
-                    is_render_target.then(|| {
+                    (is_render_target
+                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then(|| {
                         (
                             i as u32,
                             render_target_location(node, i as u32, &static_int_globals),
@@ -865,7 +902,9 @@ fn parse_air_fragment_meta_with_nodes(
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
                     let is_depth = primary_role(&roles) == Some("depth");
-                    is_depth.then_some(i as u32)
+                    (is_depth
+                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then_some(i as u32)
                 })
                 .collect()
         })
@@ -880,7 +919,9 @@ fn parse_air_fragment_meta_with_nodes(
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
                     let is_stencil = primary_role(&roles) == Some("stencil");
-                    is_stencil.then_some(i as u32)
+                    (is_stencil
+                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then_some(i as u32)
                 })
                 .collect()
         })
@@ -900,7 +941,9 @@ fn parse_air_fragment_meta_with_nodes(
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
                     let is_render_target = primary_role(&roles) == Some("render_target");
-                    if is_render_target {
+                    if is_render_target
+                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals)
+                    {
                         arg_type_name(node).map(|name| (i as u32, name))
                     } else {
                         None
@@ -942,7 +985,9 @@ fn parse_air_fragment_meta_with_nodes(
         let role = match role_str {
             "position" => FragRole::Position,
             "point_coord" => FragRole::PointCoord,
+            "front_facing" => FragRole::FrontFacing,
             "primitive_id" => FragRole::PrimitiveId,
+            "sample_id" => FragRole::SampleId,
             "viewport_array_index" => FragRole::ViewportArrayIndex,
             "fragment_input" => {
                 let l = varying_loc;

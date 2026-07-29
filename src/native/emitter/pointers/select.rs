@@ -43,6 +43,34 @@ impl Emitter {
         let pointer_meta =
             self.pointer_merge_meta(&[&true_value.value, &false_value.value], &result_ty)?;
         if let LlType::Ptr(addrspace) = result_ty {
+            if let Some(meta) = pointer_meta.as_ref() {
+                let arm_storage_mismatch = |emitter: &Self,
+                                            value: &LlValue|
+                 -> Result<bool, String> {
+                    if matches!(value, LlValue::Zero | LlValue::Undef) {
+                        return Ok(false);
+                    }
+                    if let Some(storage) = emitter.pointer_value_actual_storage(value, instructions)
+                    {
+                        return Ok(storage != meta.storage);
+                    }
+                    if let LlValue::Local(name) = value {
+                        if emitter.forward_gep_base_is_unmodeled(name) {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(emitter
+                        .pointer_meta_for_value(value, addrspace)?
+                        .is_some_and(|arm_meta| arm_meta.storage != meta.storage))
+                };
+                if arm_storage_mismatch(self, &true_value.value)?
+                    || arm_storage_mismatch(self, &false_value.value)?
+                {
+                    let pointee = meta.pointee.as_ref().unwrap_or(&LlType::Int(8)).clone();
+                    self.define_unmodeled_pointer_value(&name, addrspace, &pointee)?;
+                    return Ok(());
+                }
+            }
             if self.record_selected_storage_pointer(
                 &name,
                 &result_ty,

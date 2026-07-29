@@ -95,6 +95,39 @@ fn source_file_from_data(source: SourceData) -> SourceFile {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn metal_as_ll_to_air(source: &SourceFile) -> Result<Vec<u8>, String> {
+    let tmp = crate::scratch_dir_for("corpus-run-metal-as");
+    let mut text = source.air_ll.clone();
+    if !text.contains("!air.version") {
+        text.push_str(
+            "\n!air.version = !{!999001}\n!999001 = !{i32 1, i32 8, i32 0}\n!air.language_version = !{!999002}\n!999002 = !{!\"Metal\", i32 2, i32 0, i32 0}\n",
+        );
+    }
+    let in_ll = tmp.join("case.ll");
+    let out_air = tmp.join("case.air");
+    std::fs::write(&in_ll, text).map_err(|e| format!("write temp ll: {e}"))?;
+    let status = std::process::Command::new("xcrun")
+        .args([
+            "metal-as",
+            in_ll.to_str().ok_or("ll path utf8")?,
+            "-o",
+            out_air.to_str().ok_or("air path utf8")?,
+        ])
+        .output()
+        .map_err(|e| format!("spawn metal-as: {e}"))?;
+    if !status.status.success() {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "metal-as failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        ));
+    }
+    let bytes = std::fs::read(&out_air).map_err(|e| format!("read assembled air: {e}"))?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,37 +161,4 @@ mod tests {
         assert!(!ll.contains("target datalayout"), "{ll}");
         assert!(!ll.contains("@llvm.global_ctors"), "{ll}");
     }
-}
-
-#[cfg(target_os = "macos")]
-fn metal_as_ll_to_air(source: &SourceFile) -> Result<Vec<u8>, String> {
-    let tmp = crate::scratch_dir_for("corpus-run-metal-as");
-    let mut text = source.air_ll.clone();
-    if !text.contains("!air.version") {
-        text.push_str(
-            "\n!air.version = !{!999001}\n!999001 = !{i32 1, i32 8, i32 0}\n!air.language_version = !{!999002}\n!999002 = !{!\"Metal\", i32 2, i32 0, i32 0}\n",
-        );
-    }
-    let in_ll = tmp.join("case.ll");
-    let out_air = tmp.join("case.air");
-    std::fs::write(&in_ll, text).map_err(|e| format!("write temp ll: {e}"))?;
-    let status = std::process::Command::new("xcrun")
-        .args([
-            "metal-as",
-            in_ll.to_str().ok_or("ll path utf8")?,
-            "-o",
-            out_air.to_str().ok_or("air path utf8")?,
-        ])
-        .output()
-        .map_err(|e| format!("spawn metal-as: {e}"))?;
-    if !status.status.success() {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(format!(
-            "metal-as failed: {}",
-            String::from_utf8_lossy(&status.stderr)
-        ));
-    }
-    let bytes = std::fs::read(&out_air).map_err(|e| format!("read assembled air: {e}"))?;
-    let _ = std::fs::remove_dir_all(&tmp);
-    Ok(bytes)
 }
