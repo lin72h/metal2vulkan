@@ -997,7 +997,7 @@ fn inline_one(
     // `%10` wall.) No block in `after` retains Bcall as a live predecessor (Bcall's sole live edge now
     // targets the callee entry, which lives in the renamed callee body, not `after`), so relabeling
     // unconditionally cannot mis-route a genuine Bcall edge.
-    let after_relabeled: Vec<String> = after
+    let mut after_relabeled: Vec<String> = after
         .iter()
         .map(|l| relabel_phi_preds(l, bcall_label.as_deref(), &cont_label))
         .collect();
@@ -1019,29 +1019,41 @@ fn inline_one(
     // Continuation block.
     new_body.push(format!("{cont_label}:"));
     if let Some(result) = &call.result {
-        // Value-returning call with a used result: build a phi (general and always SSA-valid).
         let non_void: Vec<&(String, String)> =
             returns.iter().filter(|(v, _)| !v.is_empty()).collect();
         if non_void.is_empty() {
             // The callee returns void but the call had a result — malformed; bail.
             return None;
         }
-        let ret_ty = if !call.ret_ty.is_empty() {
-            call.ret_ty.clone()
+        if non_void.len() == 1 {
+            // A single return edge needs no merge. The returned value dominates the continuation,
+            // so forward it directly into the post-call region. Besides avoiding a redundant phi,
+            // this preserves visible insertvalue/extractvalue def-use chains for the following SROA
+            // pass; wrapping a returned aggregate in a one-arm phi needlessly hid those chains.
+            let mut return_value = HashMap::new();
+            return_value.insert(result.clone(), non_void[0].0.clone());
+            for line in &mut after_relabeled {
+                *line = rename_line(line, &return_value, &HashMap::new());
+            }
         } else {
-            sig.ret_ty.clone()
-        };
-        if ret_ty.is_empty() {
-            return None;
+            // Multiple returns genuinely require a merge phi in the continuation.
+            let ret_ty = if !call.ret_ty.is_empty() {
+                call.ret_ty.clone()
+            } else {
+                sig.ret_ty.clone()
+            };
+            if ret_ty.is_empty() {
+                return None;
+            }
+            let arms: Vec<String> = non_void
+                .iter()
+                .map(|(v, blk)| format!("[ {v}, %{blk} ]"))
+                .collect();
+            new_body.push(format!(
+                "{call_indent}{result} = phi {ret_ty} {}",
+                arms.join(", ")
+            ));
         }
-        let arms: Vec<String> = non_void
-            .iter()
-            .map(|(v, blk)| format!("[ {v}, %{blk} ]"))
-            .collect();
-        new_body.push(format!(
-            "{call_indent}{result} = phi {ret_ty} {}",
-            arms.join(", ")
-        ));
     }
     new_body.extend(after_relabeled);
 
@@ -1135,10 +1147,9 @@ fn collect_callee_locals(body: &[String]) -> Option<(Vec<String>, Vec<String>)> 
     Some((values, labels))
 }
 
-/// The implicit LLVM id of an UNLABELED callee entry block: the next unnamed number after the
-/// (unnamed, contiguous `%0..%k`) parameters. Returns None if the entry block is explicitly labeled
-/// (already in the label set) or the params are not the simple unnamed sequence (a named or gapped
-/// signature — rare for Metal-frontend AIR — where the implicit number cannot be derived safely).
+/// The implicit LLVM id of an UNLABELED callee entry block: the next unnamed number after its
+/// contiguous numeric parameters. Named parameters do not consume numeric slots, so a signature may
+/// freely mix `%0`, `%1`, `%.named`, `%2`, ... and still have a provable implicit entry id.
 fn implicit_entry_block_id(params: &[String], body: &[String]) -> Option<String> {
     // Entry is explicit if the first meaningful callee line is a block label.
     for line in body {
@@ -1151,16 +1162,20 @@ fn implicit_entry_block_id(params: &[String], body: &[String]) -> Option<String>
         }
         break; // first real line is an instruction -> implicit entry
     }
-    // Require params to be exactly the unnamed sequence %0..%(n-1) so the entry id is `params.len()`.
+    // Numeric parameters must form exactly %0..%N. Named parameters are irrelevant to LLVM's
+    // unnamed-number counter and therefore do not make the entry id ambiguous.
     let mut ids: Vec<u32> = Vec::with_capacity(params.len());
     for p in params {
-        ids.push(p.strip_prefix('%')?.parse::<u32>().ok()?);
+        let bare = p.strip_prefix('%')?;
+        if let Ok(id) = bare.parse::<u32>() {
+            ids.push(id);
+        }
     }
     ids.sort_unstable();
     if ids.iter().enumerate().any(|(i, id)| *id != i as u32) {
-        return None; // gapped/named params -> cannot derive the implicit id
+        return None; // gapped numeric params -> cannot derive the implicit id safely
     }
-    Some(params.len().to_string())
+    Some(ids.len().to_string())
 }
 
 /// The `%name` LHS of a `%name = ...` definition line, else None.
@@ -1336,15 +1351,22 @@ define i32 @main(i32 %0) {
             out.contains(".inl0.1 = add i32 %0, 1"),
             "body not inlined:\n{out}"
         );
-        // A continuation phi (or copy) defines %r from the single return value.
-        assert!(out.contains("%r = phi i32"), "no result phi:\n{out}");
+        // The single return value is forwarded directly; a one-arm phi would hide aggregate
+        // def-use chains from the following SROA pass.
+        assert!(
+            !out.contains("%r = phi i32"),
+            "redundant result phi:\n{out}"
+        );
         assert!(out.contains(".inl0.cont:"), "no cont block:\n{out}");
         assert!(
             out.contains("br label %.inl0.entry"),
             "no entry branch:\n{out}"
         );
         // Post-call instruction survives.
-        assert!(out.contains("%2 = mul i32 %r, 2"), "post-call lost:\n{out}");
+        assert!(
+            out.contains("%2 = mul i32 %.inl0.1, 2"),
+            "post-call result not forwarded:\n{out}"
+        );
     }
 
     // 2. Void callee.
@@ -1463,23 +1485,28 @@ define i32 @main(i32 %0) {
         assert!(out.contains("mul i32"), "outer body missing:\n{out}");
     }
 
-    // A callee whose UNLABELED entry block is referenced by its implicit id (`%2`) in a phi, called
-    // with `fast fastcc`. The implicit entry id must be remapped (no dangling `%2` label) and the
-    // calling-convention/fast-math tokens must not leak into the cont-block phi type.
+    // A callee whose UNLABELED entry block is referenced by its implicit id (`%6`) in a phi and whose
+    // signature mixes six numeric parameters with named parameters. Named parameters do not consume
+    // LLVM's unnamed-number slots, so the entry remains `%6`.
     #[test]
     fn implicit_entry_id_and_fast_fastcc_are_handled() {
         let src = "\
-define internal fast fastcc float @sel(float %0, float %1) {
-  %3 = fcmp olt float %0, %1
-  br i1 %3, label %4, label %5
-4:
-  br label %5
-5:
-  %6 = phi float [ %0, %2 ], [ %1, %4 ]
-  ret float %6
+define internal fast fastcc float @sel(float %0, float %1, float %.a, float %.b, float %2, float %3, float %4, float %5) {
+  %7 = fcmp olt float %0, %1
+  br i1 %7, label %8, label %9
+8:
+  br label %9
+9:
+  %10 = phi float [ %0, %6 ], [ %1, %8 ]
+  %11 = fcmp olt float %10, %.a
+  br i1 %11, label %12, label %13
+12:
+  ret float %10
+13:
+  ret float %.b
 }
-define float @main(float %0, float %1) {
-  %r = call fast fastcc float @sel(float %0, float %1)
+define float @main(float %0, float %1, float %2, float %3, float %4, float %5, float %6, float %7) {
+  %r = call fast fastcc float @sel(float %0, float %1, float %2, float %3, float %4, float %5, float %6, float %7)
   ret float %r
 }
 ";
@@ -1488,17 +1515,19 @@ define float @main(float %0, float %1) {
             !out.contains("call fast fastcc"),
             "call not inlined:\n{out}"
         );
-        // The implicit entry id `%2` must have been remapped to the fresh entry label, not survive
-        // as a bare `%2` phi predecessor (which would dangle -> "unknown block label %2").
+        // The implicit entry id `%6` must have been remapped to the fresh entry label, not survive
+        // as a bare `%6` phi predecessor (which would dangle -> "unknown block label %6").
         assert!(
-            !out.contains("[ %0, %2 ]"),
-            "implicit entry id %2 left un-renamed:\n{out}"
+            !out.contains("[ %0, %6 ]"),
+            "implicit entry id %6 left un-renamed:\n{out}"
         );
         assert!(
             out.contains(".inl0.entry"),
             "entry label not minted:\n{out}"
         );
-        // The cont-block phi must carry the bare return type `float`, never `fast fastcc float`.
+        // The two-return cont-block phi must carry the bare return type `float`, never the leading
+        // fast-math/calling-convention tokens from the function header.
+        assert!(out.contains("%r = phi float"), "result phi missing:\n{out}");
         assert!(
             !out.contains("phi fast fastcc"),
             "cc/fast-math leaked into phi type:\n{out}"

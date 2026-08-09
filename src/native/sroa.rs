@@ -193,11 +193,18 @@ fn last_token(s: &str) -> Option<String> {
 fn fold_aggregates_once(mut body: Vec<String>) -> (Vec<String>, bool) {
     // Map agg SSA name -> its defining insertvalue (val, path, parent-agg).
     let mut inserts: HashMap<String, (String, Vec<u32>, String)> = HashMap::new();
+    // Map extracted SSA name -> (source aggregate, path). Chaining these paths lets an extraction
+    // through an intermediate sub-aggregate reach the original insertvalue, e.g. outer[0][0].
+    let mut extracts: HashMap<String, (String, Vec<u32>)> = HashMap::new();
     for line in &body {
         if let Some(def) = parse_def(line) {
             if def.opcode == "insertvalue" {
                 if let Some((agg, val, path)) = parse_insertvalue(&def.rest) {
                     inserts.insert(def.name.clone(), (val, path, agg));
+                }
+            } else if def.opcode == "extractvalue" {
+                if let Some((agg, path)) = parse_extractvalue(&def.rest) {
+                    extracts.insert(def.name.clone(), (agg, path));
                 }
             }
         }
@@ -211,6 +218,7 @@ fn fold_aggregates_once(mut body: Vec<String>) -> (Vec<String>, bool) {
         let Some((agg, path)) = parse_extractvalue(&def.rest) else {
             continue;
         };
+        let (agg, path) = resolve_extract_root(agg, path, &extracts);
         if let Some(val) = resolve_aggregate_path(&agg, &path, &inserts) {
             // Only substitute a concrete value token (a `%name` or literal), never poison/undef.
             if val != "poison" && val != "undef" && val != "zeroinitializer" {
@@ -232,6 +240,27 @@ fn fold_aggregates_once(mut body: Vec<String>) -> (Vec<String>, bool) {
         true
     });
     (body, true)
+}
+
+/// Collapse `%inner = extractvalue ROOT, A; extractvalue %inner, B` into the structural lookup
+/// `ROOT, A+B`. No IR is rewritten here; this only exposes the full constant path to the existing
+/// exact insertvalue resolver. The bounded walk is defensive against malformed cyclic SSA.
+fn resolve_extract_root(
+    mut agg: String,
+    mut path: Vec<u32>,
+    extracts: &HashMap<String, (String, Vec<u32>)>,
+) -> (String, Vec<u32>) {
+    for _ in 0..256 {
+        let Some((parent, prefix)) = extracts.get(&agg) else {
+            break;
+        };
+        let mut combined = Vec::with_capacity(prefix.len() + path.len());
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(&path);
+        agg = parent.clone();
+        path = combined;
+    }
+    (agg, path)
 }
 
 /// Walk the insertvalue chain from `agg` looking for an insert at exactly `path`. Returns the
@@ -1185,6 +1214,34 @@ define void @k(ptr addrspace(1) %0) {
         assert!(
             out.contains("store ptr %0, ptr %0"),
             "use of %b -> %0:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nested_extractvalue_reaches_nested_insertvalue() {
+        // Mirrors an opaque resource wrapper returned by a builder and destructured after its
+        // consumer is inlined: the first extract produces the wrapper, the second its handle.
+        let src = "\
+define void @k(ptr addrspace(1) %texture, ptr addrspace(1) %out) {
+  %bundle = insertvalue { { ptr addrspace(1) }, i32 } poison, ptr addrspace(1) %texture, 0, 0
+  %wrapper = extractvalue { { ptr addrspace(1) }, i32 } %bundle, 0
+  %handle = extractvalue { ptr addrspace(1) } %wrapper, 0
+  store ptr addrspace(1) %handle, ptr addrspace(1) %out, align 8
+  ret void
+}
+";
+        let out = run(src);
+        assert!(
+            !out.contains("insertvalue"),
+            "nested insert remains:\n{out}"
+        );
+        assert!(
+            !out.contains("extractvalue"),
+            "nested extract remains:\n{out}"
+        );
+        assert!(
+            out.contains("store ptr addrspace(1) %texture, ptr addrspace(1) %out"),
+            "handle was not forwarded:\n{out}"
         );
     }
 
