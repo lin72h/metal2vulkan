@@ -50,6 +50,15 @@ pub enum FragRole {
     Other,
 }
 
+/// Declared AIR access on a buffer argument. This is a conservative contract: it may be broader
+/// than the specialized body actually uses, but it never understates reads or writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BufferAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
 /// A fragment shader's decoded parameter roles + render-target count/indices.
 #[derive(Clone, Debug, Default)]
 pub struct FragMeta {
@@ -91,6 +100,14 @@ pub struct FragMeta {
     /// `param_idx -> declared AIR buffer byte size` (`air.arg_type_size` / `air.buffer_size`), when
     /// the AIR node carries it. Mirrors [`KernMeta::buffer_type_sizes`] for the fragment stage.
     pub buffer_type_sizes: HashMap<u32, u32>,
+    /// `param_idx -> air.buffer_size` for reference-like arguments whose metadata bounds the
+    /// reachable object to exactly that many bytes. Kept separate from `buffer_type_sizes`, which
+    /// may only be an unbounded pointer's element/pointee size.
+    pub buffer_object_sizes: HashMap<u32, u32>,
+    /// `param_idx -> AIR buffer argument type name` for every stage.
+    pub buffer_type_names: HashMap<u32, String>,
+    /// `param_idx -> declared AIR read/write qualifier`.
+    pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
     /// Framebuffer-fetch color input Location -> AIR render-target type name, e.g. `float4`.
@@ -200,6 +217,9 @@ pub struct VertMeta {
     /// `param_idx -> declared AIR buffer byte size` for buffer args, when the AIR carries it (see
     /// [`FragMeta::buffer_type_sizes`]).
     pub buffer_type_sizes: HashMap<u32, u32>,
+    pub buffer_object_sizes: HashMap<u32, u32>,
+    pub buffer_type_names: HashMap<u32, String>,
+    pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
 }
@@ -291,8 +311,12 @@ pub struct KernMeta {
     /// `param_idx -> declared AIR buffer argument byte size`, from `air.arg_type_size` or
     /// `air.buffer_size` when present.
     pub buffer_type_sizes: HashMap<u32, u32>,
+    /// `param_idx -> air.buffer_size` when AIR declares one exact reference-object extent.
+    pub buffer_object_sizes: HashMap<u32, u32>,
     /// `param_idx -> AIR buffer argument type name`, e.g. `char`, `void`, or a struct name.
     pub buffer_type_names: HashMap<u32, String>,
+    /// `param_idx -> declared AIR read/write qualifier`.
+    pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
     /// Textures EMBEDDED inside an `air.indirect_buffer` argument buffer (via `air.indirect_argument`
@@ -379,7 +403,9 @@ fn parse_air_kernel_meta_with_nodes(
     let mut imageblock_layouts = HashMap::new();
     let mut buffer_address_spaces = HashMap::new();
     let mut buffer_type_sizes = HashMap::new();
+    let mut buffer_object_sizes = HashMap::new();
     let mut buffer_type_names = HashMap::new();
+    let mut buffer_accesses = HashMap::new();
     let mut texture_type_names = HashMap::new();
     // `air.location_index` of every top-level `air.texture` arg — the basis for the synthetic
     // embedded-texture index K (see `embedded_synthetic_texture_index`).
@@ -421,6 +447,12 @@ fn parse_air_kernel_meta_with_nodes(
                     .or_else(|| i32_after_marker(node, "air.buffer_size"))
                 {
                     buffer_type_sizes.insert(idx, size);
+                }
+                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                    buffer_object_sizes.insert(idx, size);
+                }
+                if let Some(access) = declared_buffer_access(node) {
+                    buffer_accesses.insert(idx, access);
                 }
                 KernRole::Buffer(location_index(node, idx))
             }
@@ -481,7 +513,9 @@ fn parse_air_kernel_meta_with_nodes(
         imageblock_layouts,
         buffer_address_spaces,
         buffer_type_sizes,
+        buffer_object_sizes,
         buffer_type_names,
+        buffer_accesses,
         texture_type_names,
         embedded_textures,
     })
@@ -842,6 +876,18 @@ fn arg_type_name(body: &str) -> Option<String> {
     string_after_marker(body, "air.arg_type_name")
 }
 
+fn declared_buffer_access(body: &str) -> Option<BufferAccess> {
+    if body.contains("air.read_write") {
+        Some(BufferAccess::ReadWrite)
+    } else if body.contains("air.write") {
+        Some(BufferAccess::WriteOnly)
+    } else if body.contains("air.read") {
+        Some(BufferAccess::ReadOnly)
+    } else {
+        None
+    }
+}
+
 fn arg_name(body: &str) -> Option<String> {
     string_after_marker(body, "air.arg_name")
 }
@@ -964,6 +1010,9 @@ fn parse_air_fragment_meta_with_nodes(
     let mut varying_loc = 0u32;
     let mut buffer_address_spaces = HashMap::new();
     let mut buffer_type_sizes = HashMap::new();
+    let mut buffer_object_sizes = HashMap::new();
+    let mut buffer_type_names = HashMap::new();
+    let mut buffer_accesses = HashMap::new();
     // AIR function-param pointer address spaces for the fragment entry, the fallback the kernel
     // parser uses when a buffer arg node omits `air.address_space`.
     let param_address_spaces = entry
@@ -1028,6 +1077,15 @@ fn parse_air_fragment_meta_with_nodes(
                 {
                     buffer_type_sizes.insert(idx, size);
                 }
+                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                    buffer_object_sizes.insert(idx, size);
+                }
+                if let Some(name) = arg_type_name(node) {
+                    buffer_type_names.insert(idx, name);
+                }
+                if let Some(access) = declared_buffer_access(node) {
+                    buffer_accesses.insert(idx, access);
+                }
                 FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
             }
             // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
@@ -1057,6 +1115,9 @@ fn parse_air_fragment_meta_with_nodes(
         buffer_layouts,
         buffer_address_spaces,
         buffer_type_sizes,
+        buffer_object_sizes,
+        buffer_type_names,
+        buffer_accesses,
         texture_type_names,
         color_input_type_names,
     })
@@ -1118,6 +1179,9 @@ fn parse_air_vertex_meta_with_nodes(
     let mut buffer_layouts = HashMap::new();
     let mut buffer_address_spaces = HashMap::new();
     let mut buffer_type_sizes = HashMap::new();
+    let mut buffer_object_sizes = HashMap::new();
+    let mut buffer_type_names = HashMap::new();
+    let mut buffer_accesses = HashMap::new();
     let mut texture_type_names = HashMap::new();
     let param_address_spaces = entry
         .and_then(|name| function_param_pointer_address_spaces(ll, name))
@@ -1158,6 +1222,15 @@ fn parse_air_vertex_meta_with_nodes(
                 {
                     buffer_type_sizes.insert(idx, size);
                 }
+                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                    buffer_object_sizes.insert(idx, size);
+                }
+                if let Some(name) = arg_type_name(node) {
+                    buffer_type_names.insert(idx, name);
+                }
+                if let Some(access) = declared_buffer_access(node) {
+                    buffer_accesses.insert(idx, access);
+                }
                 VertRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
             }
             "texture" => {
@@ -1183,6 +1256,9 @@ fn parse_air_vertex_meta_with_nodes(
         buffer_layouts,
         buffer_address_spaces,
         buffer_type_sizes,
+        buffer_object_sizes,
+        buffer_type_names,
+        buffer_accesses,
         texture_type_names,
     })
 }

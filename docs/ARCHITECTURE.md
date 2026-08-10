@@ -118,13 +118,17 @@ When the primary emit fails validation (or the emitter returns an error), transl
 ladder of retry **tiers**. Mechanisms live in `retry.rs`; routing lives in
 `translate_sanitized_with_meta` as a match on `native::classify_{validation,emit}_error`.
 
-Two invariants:
+Three invariants:
 
 1. **Adopt only if the candidate validates.** A module that already passed spirv-val never enters
    the cascade; a non-validating retry result is discarded.
 2. **Tier order is load-bearing.** Example: value-select before PhysicalStorageBuffer (device-address)
    lowering, because some drivers cannot pipeline BDA modules as compute; inline+SROA before relooper
    where that ordering has been proven safer. Do not reorder tiers casually.
+3. **Validator success is not a driver-cost proof.** The whole-function switch/state-machine
+   relooper has a hard 1,024-block ceiling. Larger flattened modules can validate quickly while
+   taking real drivers many minutes to compile or crashing their compiler, so they return
+   `FALLBACK` until a regional structurizer can preserve most of the CFG and SSA.
 
 Classification of validator/emitter text into `ValidationClass` / `EmitErrorClass` is confined to
 `native` (`classify_validation_error` / `classify_emit_error`). The cascade then routes by class:
@@ -132,7 +136,7 @@ Classification of validator/emitter text into `ValidationClass` / `EmitErrorClas
 | Class | Typical tier order (census labels under `METAL2VULKAN_TIER_CENSUS`) |
 |---|---|
 | PointerTyping | `fc_promote_logical` → raw → prune → subword pack → raw+relooper → `fc_promote_psb` |
-| CfgStructurization | relooper → relooper (huge) → raw+relooper |
+| CfgStructurization | relooper → prune+relooper → raw+relooper |
 | LogicalPointerPhi | phi-index legalization → prune |
 | CrossBindingPointerMerge | value-select → PSB → raw+PSB → prune |
 | Other (validation) | prune → raw+relooper → value-select |

@@ -451,6 +451,28 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let resolved_ty = self.resolve_type(&argument.ty)?;
+        // Preserve a descriptor-backed raw buffer's byte cursor across helper inlining.  A non-zero
+        // GEP of a raw device buffer has a Private placeholder as its ordinary SSA value, while its
+        // real descriptor root and byte offset live in `raw_offsets`.  Binding the helper parameter
+        // to that placeholder silently turns helper writes into Private writes.  Root the inline
+        // substitution at the descriptor instead and carry the cursor onto the parameter; the
+        // callee's existing raw load/store lowering then reapplies the offset structurally.
+        let inline_raw = if self.raw_buffer_params.contains(name) {
+            match &argument.value {
+                LlValue::Local(source) => self.raw_offsets.get(source).cloned().filter(|raw| {
+                    raw.addrspace == 1 && !raw.unmodelable && raw.device_addr_base.is_none()
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let inline_raw_storage = inline_raw.as_ref().map(|raw| {
+            self.pointer_storage
+                .get(&raw.root)
+                .copied()
+                .unwrap_or(StorageClass::StorageBuffer)
+        });
         let pointer_facts = if let LlType::Ptr(addrspace) = resolved_ty {
             let storage = self.pointer_storage_for(&argument.value, addrspace)?;
             let pointee = self.pointer_pointee_for_value(&argument.value)?;
@@ -463,7 +485,15 @@ impl Emitter {
         } else {
             None
         };
-        let argument_id = self.value_id_in(&argument.value, &argument.ty, instructions)?;
+        let argument_id = if let Some(raw) = inline_raw.as_ref() {
+            self.value_id_in(
+                &LlValue::Local(raw.root.clone()),
+                &argument.ty,
+                instructions,
+            )?
+        } else {
+            self.value_id_in(&argument.value, &argument.ty, instructions)?
+        };
         let placeholder_id = self.fresh();
         self.values
             .insert(name.to_string(), (placeholder_id, resolved_ty.clone()));
@@ -508,10 +538,18 @@ impl Emitter {
                 self.record_pointer_nullness(name.to_string(), nullness);
             }
             if self.raw_buffer_params.contains(name) {
-                self.raw_offsets.insert(
-                    name.to_string(),
-                    RawBufferOffset::root(name.to_string(), addrspace),
-                );
+                if let Some(mut raw) = inline_raw {
+                    raw.root = name.to_string();
+                    self.raw_offsets.insert(name.to_string(), raw);
+                    if let Some(storage) = inline_raw_storage {
+                        self.pointer_storage.insert(name.to_string(), storage);
+                    }
+                } else {
+                    self.raw_offsets.insert(
+                        name.to_string(),
+                        RawBufferOffset::root(name.to_string(), addrspace),
+                    );
+                }
             }
         }
         Ok(())

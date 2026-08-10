@@ -329,6 +329,7 @@ pub fn translate_sanitized_native_reflected(
     // Function constants are a cross-stage IR fact (not in the per-stage meta): scan the sanitized
     // IR once so a consumer can discover the module's spec-ids without walking SPIR-V.
     reflection.function_constants = meta::parse_function_constants(san_ll);
+    reflection.refine_buffer_access_from_entry(san_ll);
     // AIR constexpr samplers are module globals rather than entry parameters, so stage metadata
     // does not carry them. Reflect their decoded state and the same first-free sampler-band
     // allocation used by the interface pass before returning the consumer contract.
@@ -1016,12 +1017,6 @@ fn translate_sanitized_with_meta(
                                     "val-cfg:prune_then_relooper",
                                     rc.prune_then_relooper(&out),
                                 )
-                            })
-                            // Last resort for a HUGE (>1024-block) emitted module whose only blocker is the cfg
-                            // nesting violation — lift the relooper cap (see `relooper_retry_huge`). Clears
-                            // 02/07ef16ba (4630 blocks, reducible, no secondary wall).
-                            .or_else(|| {
-                                rc.census("val-cfg:relooper_huge", rc.relooper_retry_huge(&out))
                             })
                             // The relooper structures the CFG but its from-scratch rebuild can EXPOSE a
                             // cross-binding pointer merge (`Variable pointers must point into the same structure`

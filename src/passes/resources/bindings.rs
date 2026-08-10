@@ -73,6 +73,24 @@ pub(in crate::passes) fn allocate_static_sampler_binding(module: &Module) -> Opt
     (SAMPLER_BINDING_BASE..COLOR_INPUT_BINDING_BASE).find(|binding| !occupied.contains(binding))
 }
 
+/// Allocate one translator-owned null-image descriptor inside the texture ABI band. It must never
+/// use a sampler/color-input binding merely because those bands contain the global high-water mark.
+pub(in crate::passes) fn allocate_default_texture_binding(module: &Module) -> Option<u32> {
+    let occupied = module
+        .annotations
+        .iter()
+        .filter(|instruction| {
+            instruction.class.opcode == Op::Decorate
+                && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
+        })
+        .filter_map(|instruction| match instruction.operands.get(2) {
+            Some(Operand::LiteralBit32(binding)) => Some(*binding),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    (TEXTURE_BINDING_BASE..SAMPLER_BINDING_BASE).find(|binding| !occupied.contains(binding))
+}
+
 pub(in crate::passes) fn texture_resource_binding(binding: u32) -> u32 {
     TEXTURE_BINDING_BASE.saturating_add(binding)
 }

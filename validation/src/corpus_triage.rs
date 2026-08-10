@@ -200,7 +200,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tolerance_success_depends_on_candidate_backend() {
+    fn tolerance_is_success_for_both_candidate_backends() {
         let row = TriageRow {
             kind: LedgerKind::Vulkan,
             air_sha256: "a".repeat(64),
@@ -220,7 +220,7 @@ mod tests {
             kind: LedgerKind::MoltenVk,
             ..row
         };
-        assert!(!moltenvk.is_success());
+        assert!(moltenvk.is_success());
     }
 
     #[test]

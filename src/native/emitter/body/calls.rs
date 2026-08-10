@@ -604,11 +604,11 @@ impl Emitter {
     /// live.
     ///
     /// Gated structurally and tightly so it only fires for the genuine case: the arg must be a Local with
-    /// a raw_offsets entry that is an IDENTITY reference to a device buffer root (addrspace 1, zero const
-    /// offset, no dynamic terms, modelable) whose root is a real buffer param value. Any non-identity
-    /// reference (a non-zero or dynamic offset) would lose the offset if rooted — so it is declined and
-    /// resolves normally. This lives ONLY on the call-argument path; the default emit path is unchanged, so
-    /// pointer merges / direct accesses of the bitcast result keep their Private placeholder semantics.
+    /// a modelable descriptor-backed `raw_offsets` entry whose root is a real device-buffer param. A
+    /// constant non-zero cursor is recorded for that callee parameter and reapplied while the helper is
+    /// emitted; conflicting call-site cursors and dynamic offsets fail visibly rather than silently
+    /// discarding an offset. This lives ONLY on the call-argument path; direct accesses and pointer merges
+    /// keep their existing behavior.
     pub(in crate::native::emitter) fn raw_device_call_arg_id(
         &mut self,
         callee: &str,
@@ -633,16 +633,33 @@ impl Emitter {
         let LlValue::Local(arg_name) = &arg.value else {
             return Ok(None);
         };
-        let Some(raw) = self.raw_offsets.get(arg_name) else {
+        let Some(raw) = self.raw_offsets.get(arg_name).cloned() else {
             return Ok(None);
         };
-        if raw.addrspace != 1 || raw.const_off != 0 || !raw.dyn_terms.is_empty() || raw.unmodelable
+        if raw.addrspace != 1
+            || !raw.dyn_terms.is_empty()
+            || raw.unmodelable
+            || raw.device_addr_base.is_some()
         {
             return Ok(None);
         }
         let root = raw.root.clone();
         if !self.param_values.contains(&root) || !self.raw_buffer_params.contains(&root) {
             return Ok(None);
+        }
+        let key = (callee.to_string(), param_name.to_string());
+        if let Some(previous) = self.raw_call_param_offsets.get(&key) {
+            if previous.const_off != raw.const_off || previous.addrspace != raw.addrspace {
+                return Err(format!(
+                    "native emitter: raw helper parameter @{callee} {param_name} is called with \
+                     conflicting constant byte offsets {} and {}",
+                    previous.const_off, raw.const_off
+                ));
+            }
+        } else {
+            let mut parameter_raw = raw;
+            parameter_raw.root = param_name.to_string();
+            self.raw_call_param_offsets.insert(key, parameter_raw);
         }
         let id = self.value_id_in(&LlValue::Local(root), &arg.ty, instructions)?;
         Ok(Some(id))

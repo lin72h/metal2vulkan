@@ -711,6 +711,9 @@ pub(crate) fn rewrite_variable_pointer_phis_module(module: &mut Module) -> Resul
     }
     add_native_module_capabilities(module);
     crate::passes::lower_scalar_i64_arithmetic_module(module);
+    // The i64 lowering can widen a synthesized index-phi backedge after phi-the-index has already
+    // normalized it. Re-run the narrow-incoming legalization on that final shape before validation.
+    phi_index::rewrite_integer_width_phis(module);
     add_native_module_capabilities(module);
     Ok(())
 }
@@ -808,23 +811,17 @@ pub(crate) fn rewrite_to_relooper_module(module: &mut Module) -> Result<(), Stri
     rewrite_to_relooper_module_capped(module, relooper::default_max_relooper_blocks())
 }
 
-/// Higher block budget for the function-constant-dead prune → relooper composition. Pruning can
-/// shrink an otherwise oversized function below this ceiling while it remains above the normal
-/// relooper budget.
-pub const PRUNE_THEN_RELOOPER_MAX_BLOCKS: usize = 2048;
+/// Product-safe block budget for the function-constant-dead prune → relooper composition. Pruning
+/// may shrink an oversized function below this ceiling; it never licenses a larger state machine.
+pub const PRUNE_THEN_RELOOPER_MAX_BLOCKS: usize = 1024;
 
-/// Bounded high cap for the relooper retry over an unrepaired CFG that the structurizer emitted as a
-/// REJECT (complete but spirv-val-invalid bytes). The normal relooper stays capped at 1024 blocks;
-/// this retry-only cap is sufficient for the complete graph a reject function emits, while remaining
-/// below the 8192 diagnostic ceiling for the separately measured huge emitted-module path.
-pub const CFG_EMIT_RELOOPER_MAX_BLOCKS: usize = 2048;
+/// Higher retry budget for an unrepaired CFG that the structurizer emitted as a REJECT. The normal
+/// relooper stays capped at 1024 blocks; the whole-function relooper independently clamps every
+/// caller to its hard downstream-driver safety ceiling.
+pub const CFG_EMIT_RELOOPER_MAX_BLOCKS: usize = 1024;
 
-/// Like [`rewrite_to_relooper_module`] but with an explicit block cap. The prune-then-relooper
-/// retry uses a higher cap than the default 1024: its input is a function whose statically-dead
-/// function-constant arms were already pruned away (byte-correct DCE), so a >1024-block source can
-/// land below the cap after pruning yet still exceed the default. Lifting the cap only for that
-/// already-failing, adopt-if-validates path keeps the normal relooper's perf budget intact while
-/// admitting the pruned huge-function cfg cases.
+/// Like [`rewrite_to_relooper_module`] but with an explicit requested block cap. The native
+/// whole-function relooper always clamps that request to its hard downstream-driver safety limit.
 pub(crate) fn rewrite_to_relooper_module_capped(
     module: &mut Module,
     max_blocks: usize,

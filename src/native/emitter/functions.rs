@@ -157,8 +157,13 @@ impl Emitter {
                     self.pointer_pointees.insert(name.clone(), pointee);
                 }
                 if self.raw_buffer_params.contains(name) && !concrete_workgroup_raw_param {
-                    self.raw_offsets
-                        .insert(name.clone(), RawBufferOffset::root(name.clone(), addrspace));
+                    let mut raw = self
+                        .raw_call_param_offsets
+                        .get(&(f.name.clone(), name.clone()))
+                        .cloned()
+                        .unwrap_or_else(|| RawBufferOffset::root(name.clone(), addrspace));
+                    raw.root = name.clone();
+                    self.raw_offsets.insert(name.clone(), raw);
                 }
             }
             self.direct_param_values.insert(name.clone());

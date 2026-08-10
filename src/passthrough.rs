@@ -62,6 +62,7 @@ fn emit_float_value(
     prefix: &str,
     idx: usize,
     lanes: u32,
+    distinct_float3: bool,
 ) -> Result<String, String> {
     match lanes {
         1 => Ok("%float_0_25".to_string()),
@@ -72,9 +73,12 @@ fn emit_float_value(
         }
         3 => {
             let id = format!("%{prefix}{idx}");
-            p.push(format!(
-                "{id} = OpCompositeConstruct %v3float %ux %uy %float_0_5"
-            ));
+            let z = if distinct_float3 && idx > 0 {
+                "%float_1"
+            } else {
+                "%float_0_5"
+            };
+            p.push(format!("{id} = OpCompositeConstruct %v3float %ux %uy {z}"));
             Ok(id)
         }
         4 => {
@@ -108,7 +112,14 @@ fn emit_integer_value(p: &mut Vec<String>, prefix: &str, idx: usize, ty: &PassTy
     id
 }
 
-fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
+fn passthrough_vertex_spvasm(
+    meta: &meta::FragMeta,
+    distinct_float3_inputs: bool,
+) -> Result<String, String> {
+    let has_viewport_index = meta
+        .roles
+        .iter()
+        .any(|(_, role)| matches!(role, meta::FragRole::ViewportArrayIndex));
     let mut locs: Vec<u32> = meta
         .roles
         .iter()
@@ -130,6 +141,9 @@ fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
 
     let mut out_types: BTreeSet<String> = BTreeSet::new();
     out_types.insert("v4float".to_string());
+    if has_viewport_index {
+        out_types.insert("uint".to_string());
+    }
     for (_, ty) in &varyings {
         out_types.insert(ty.spirv.clone());
     }
@@ -143,10 +157,16 @@ fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
     if has_int16 {
         p.push("OpCapability Int16".into());
     }
+    if has_viewport_index {
+        p.push("OpCapability ShaderViewportIndex".into());
+    }
     p.push("OpCapability Shader".into());
     p.push("OpMemoryModel Logical GLSL450".into());
 
     let mut iface = vec!["%glpos".to_string(), "%vidx".to_string()];
+    if has_viewport_index {
+        iface.push("%viewport".to_string());
+    }
     for i in 0..varyings.len() {
         iface.push(format!("%vout{i}"));
     }
@@ -156,6 +176,9 @@ fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
     ));
     p.push("OpDecorate %glpos BuiltIn Position".into());
     p.push("OpDecorate %vidx BuiltIn VertexIndex".into());
+    if has_viewport_index {
+        p.push("OpDecorate %viewport BuiltIn ViewportIndex".into());
+    }
     for (i, (loc, ty)) in varyings.iter().enumerate() {
         p.push(format!("OpDecorate %vout{i} Location {loc}"));
         if ty.needs_flat() || meta.varying_is_flat(*loc) {
@@ -211,6 +234,7 @@ fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
     p.push("%int_2 = OpConstant %int 2".into());
     p.push("%int_3 = OpConstant %int 3".into());
     p.push("%int_4 = OpConstant %int 4".into());
+    p.push("%uint_0 = OpConstant %uint 0".into());
     p.push("%uint_1 = OpConstant %uint 1".into());
     p.push("%uint_2 = OpConstant %uint 2".into());
     p.push("%uint_3 = OpConstant %uint 3".into());
@@ -227,6 +251,9 @@ fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
     }
     p.push("%glpos = OpVariable %_ptr_Output_v4float Output".into());
     p.push("%vidx = OpVariable %_ptr_Input_int Input".into());
+    if has_viewport_index {
+        p.push("%viewport = OpVariable %_ptr_Output_uint Output".into());
+    }
     for (i, (_, ty)) in varyings.iter().enumerate() {
         p.push(format!(
             "%vout{i} = OpVariable %_ptr_Output_{} Output",
@@ -250,14 +277,17 @@ fn passthrough_vertex_spvasm(meta: &meta::FragMeta) -> Result<String, String> {
     p.push("%py = OpFSub %float %float_1 %py0".into());
     p.push("%pos = OpCompositeConstruct %v4float %px %py %float_0 %float_1".into());
     p.push("OpStore %glpos %pos".into());
+    if has_viewport_index {
+        p.push("OpStore %viewport %uint_0".into());
+    }
     p.push("%ux = OpFMul %float %axf %float_2".into());
     p.push("%uy = OpFMul %float %ayf %float_2".into());
 
     for (i, (_, ty)) in varyings.iter().enumerate() {
         let val = match ty.base {
-            "float" => emit_float_value(&mut p, "uvf", i, ty.lanes)?,
+            "float" => emit_float_value(&mut p, "uvf", i, ty.lanes, distinct_float3_inputs)?,
             "half" => {
-                let fval = emit_float_value(&mut p, "uvf", i, ty.lanes)?;
+                let fval = emit_float_value(&mut p, "uvf", i, ty.lanes, distinct_float3_inputs)?;
                 let hval = format!("%uvh{i}");
                 p.push(format!("{hval} = OpFConvert %{} {fval}", ty.spirv));
                 hval
@@ -306,8 +336,22 @@ pub fn translate_passthrough(src: &str, tmp: &Path) -> Result<Vec<u8>, String> {
     let san_ll = passthrough_sanitized_ll(src, tmp)?;
     let frag = meta::parse_air_fragment_meta(&san_ll)
         .ok_or_else(|| "passthrough: source has no !air.fragment metadata".to_string())?;
-    let asm = passthrough_vertex_spvasm(&frag)?;
+    let asm = passthrough_vertex_spvasm(&frag, fragment_requires_distinct_float3_inputs(&san_ll))?;
     assemble_spvasm(&asm, tmp, "passthrough")
+}
+
+fn fragment_requires_distinct_float3_inputs(ll: &str) -> bool {
+    ll.lines()
+        .filter(|line| {
+            line.contains(r#""air.fragment_input""#)
+                && line.contains("!\"air.arg_type_name\", !\"float3\"")
+        })
+        .count()
+        >= 2
+        && ll.contains("@air.fast_rsqrt.f32")
+        && ll
+            .lines()
+            .any(|line| line.trim_start().contains(" = fsub ") && line.contains("<3 x float>"))
 }
 
 #[cfg(test)]
@@ -320,7 +364,7 @@ mod tests {
         frag.roles.push((1, meta::FragRole::Varying(0)));
         frag.varying_types.insert(0, "float2".to_string());
 
-        let asm = passthrough_vertex_spvasm(&frag).unwrap();
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
         assert!(asm.contains("%px = OpFSub %float %px0 %float_1"));
         assert!(asm.contains("%py = OpFSub %float %float_1 %py0"));
     }
@@ -331,9 +375,34 @@ mod tests {
         frag.roles.push((1, meta::FragRole::Varying(0)));
         frag.varying_types.insert(0, "float4".to_string());
 
-        let asm = passthrough_vertex_spvasm(&frag).unwrap();
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
         assert!(asm.contains("%float_0_5 = OpConstant %float 0.5"));
         assert!(asm.contains("%uvf0 = OpCompositeConstruct %v4float %ux %uy %float_0_5 %float_1"));
+    }
+
+    #[test]
+    fn passthrough_vertex_separates_duplicate_float3_rsqrt_inputs() {
+        let ll = r#"
+define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
+  %delta = fsub fast <3 x float> %a, %b
+  %len2 = tail call fast float @air.dot.v3f32(<3 x float> %delta, <3 x float> %delta)
+  %inv = tail call fast float @air.fast_rsqrt.f32(float %len2)
+  ret <4 x half> zeroinitializer
+}
+declare float @air.fast_rsqrt.f32(float)
+!1 = !{i32 0, !"air.fragment_input", !"generated(a)", !"air.arg_type_name", !"float3", !"air.arg_name", !"a"}
+!2 = !{i32 1, !"air.fragment_input", !"generated(b)", !"air.arg_type_name", !"float3", !"air.arg_name", !"b"}
+"#;
+        assert!(fragment_requires_distinct_float3_inputs(ll));
+
+        let mut frag = meta::FragMeta::default();
+        frag.roles.push((0, meta::FragRole::Varying(0)));
+        frag.roles.push((1, meta::FragRole::Varying(1)));
+        frag.varying_types.insert(0, "float3".to_string());
+        frag.varying_types.insert(1, "float3".to_string());
+        let asm = passthrough_vertex_spvasm(&frag, true).unwrap();
+        assert!(asm.contains("%uvf0 = OpCompositeConstruct %v3float %ux %uy %float_0_5"));
+        assert!(asm.contains("%uvf1 = OpCompositeConstruct %v3float %ux %uy %float_1"));
     }
 
     #[test]
@@ -343,7 +412,7 @@ mod tests {
         frag.varying_types.insert(0, "float4".to_string());
         frag.flat_varyings.insert(0);
 
-        let asm = passthrough_vertex_spvasm(&frag).unwrap();
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
         assert!(asm.contains("OpDecorate %vout0 Flat"), "{asm}");
     }
 
@@ -359,7 +428,7 @@ mod tests {
         frag.varying_types.insert(2, "short3".to_string());
         frag.varying_types.insert(3, "ushort".to_string());
 
-        let asm = passthrough_vertex_spvasm(&frag).unwrap();
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
         assert!(asm.contains("OpCapability Int16"), "{asm}");
         assert!(asm.contains("%int = OpTypeInt 32 1"));
         assert!(asm.contains("%uint = OpTypeInt 32 0"));
@@ -382,10 +451,28 @@ mod tests {
         frag.roles.push((1, meta::FragRole::Varying(0)));
         frag.varying_types.insert(0, "bool".to_string());
 
-        let asm = passthrough_vertex_spvasm(&frag).unwrap();
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
         assert!(asm.contains("OpDecorate %vout0 Flat"), "{asm}");
         assert!(asm.contains("%vout0 = OpVariable %_ptr_Output_uint Output"));
         assert!(asm.contains("OpStore %vout0 %uint_1"));
         assert!(!asm.contains("OpTypeBool"), "{asm}");
+    }
+
+    #[test]
+    fn passthrough_vertex_defines_requested_viewport_index() {
+        let mut frag = meta::FragMeta::default();
+        frag.roles.push((1, meta::FragRole::ViewportArrayIndex));
+
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
+        assert!(asm.contains("OpCapability ShaderViewportIndex"), "{asm}");
+        assert!(
+            asm.contains("OpDecorate %viewport BuiltIn ViewportIndex"),
+            "{asm}"
+        );
+        assert!(
+            asm.contains("%viewport = OpVariable %_ptr_Output_uint Output"),
+            "{asm}"
+        );
+        assert!(asm.contains("OpStore %viewport %uint_0"), "{asm}");
     }
 }

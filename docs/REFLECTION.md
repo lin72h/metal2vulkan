@@ -55,7 +55,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature.
-Bump-aware field: `reflection_version` (`REFLECTION_VERSION`, currently `3`). Invalidate any
+Bump-aware field: `reflection_version` (`REFLECTION_VERSION`, currently `4`). Invalidate any
 on-disk cache when that constant changes.
 
 ## Descriptor ABI (binding map)
@@ -122,17 +122,40 @@ Top-level fields:
 | `metal_index` | Guest Metal slot `n`, or synthetic index for embedded textures |
 | `descriptor` | `{ set, binding }` or `None` if no descriptor (threadgroup / some locals) |
 | `param_index` | SPIR-V `OpFunctionParameter` order, if any |
-| `address_space` / `declared_size` / `type_layout` | Buffer layout and sizing |
+| `address_space` / `declared_size` / `type_layout` | Buffer address space, argument/pointee size, and aggregate layout |
+| `extent` | Buffer reachability: `Object { bytes }`, `Unbounded`, or `Unknown` |
 | `type_name` | AIR type string when metadata carried it |
 | `texture_shape` | Dim / arrayed / MS / component / writable / storage format (decoded) |
 | `embedded_source` | For arg-buffer textures: owning buffer index + field byte offset |
-| `access` | When known: `ReadOnly` / `ReadWrite` / `Sampled` / `Storage` |
+| `access` | When known: `Unused` / `ReadOnly` / `WriteOnly` / `ReadWrite` / `Sampled` / `Storage` |
 | `static_sampler` | Decoded immutable state for `StaticSampler`; `None` for other kinds |
+
+### Buffer extent and access
+
+`extent` is a conservative sizing contract:
+
+- `Object { bytes }` is emitted only when AIR carries `air.buffer_size`, which proves that the
+  argument is one bounded reference-like object. A consumer may narrow staging to `bytes`.
+- `Unbounded` means AIR identifies a pointer/pointee type but does not carry an array length.
+- `Unknown` means the metadata does not distinguish a bounded object from an unbounded pointer.
+
+Treat both `Unbounded` and `Unknown` as “retain the complete caller-provided window.” An incorrect
+narrowing is silent data corruption, so reflection never infers an object extent merely from
+`declared_size`: for pointer arguments that field can be only the pointee size. Device-space
+bindings expose `declared_size` when AIR carries `air.arg_type_size`; a `void *` with no size
+metadata remains `None`.
+
+Buffer `access` begins with AIR's declared `air.read` / `air.write` / `air.read_write` qualifier.
+The reflected translate paths then tighten that declaration using the specialized LLVM entry:
+an unused parameter becomes `Unused`, while sound `readonly` and `writeonly` parameter attributes
+become `ReadOnly` and `WriteOnly`. When neither source proves a narrower result, the broader AIR
+classification is retained.
 
 **Gaps consumers should expect:**
 
-- **Device buffer R/W:** precise read-vs-write often needs SPIR-V dataflow; many buffers have
-  `access: None`. Prefer IR analysis or treat as read-write unless `address_space` is constant.
+- **Device buffer R/W:** ambiguous parameters retain their conservative AIR declaration; malformed
+  or unusually sparse metadata can still leave `access: None`, which consumers must treat as
+  read-write.
 - **Function constants from meta-only builders:** `from_*` constructors leave
   `function_constants` empty; populate via the reflected translate paths (they scan sanitized IR).
 - **Datalayout:** only filled when translating from unsanitized `.air`/`.ll` via

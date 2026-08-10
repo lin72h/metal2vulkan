@@ -40,12 +40,6 @@ fn load_relooper_module(bytes: &[u8]) -> Result<Module, String> {
     Ok(module)
 }
 
-fn load_relooper_module_capped(bytes: &[u8], max_blocks: usize) -> Result<Module, String> {
-    let mut module = load_bytes(bytes).map_err(|error| format!("SPIR-V load: {error:?}"))?;
-    native::rewrite_to_relooper_module_capped(&mut module, max_blocks)?;
-    Ok(module)
-}
-
 /// Shared context for the retry tiers: the sanitized IR, the temp dir spirv-val runs against, the
 /// module metadata `finish` re-applies on every re-emit, and the A/B env gates read once at
 /// construction. Every tier borrows this immutably (`&self`).
@@ -961,25 +955,6 @@ impl<'a> RetryCtx<'a> {
         )
     }
 
-    // High-cap relooper retry for a HUGE emitted-then-cfg-rejected function. The default relooper cap
-    // (1024) is tuned to bound gate time on the large cfg cluster. A function that emitted a
-    // complete module yet fails spirv-val for a cfg-nesting violation (e.g. 02/07ef16ba, 4630 blocks,
-    // "branches to the selection construct, but not to the selection header") is reducible and carries
-    // no secondary wall — the only thing keeping it failing is the default cap bailing its >1024 blocks.
-    // Lifting the cap on THIS arm clears it (the relooper structures the SAME reachable CFG → byte-
-    // neutral) without making the R4-walled cost-budget cluster waste time relooping-then-discarding.
-    // Adopt-if-validates, so floor-safe; the 8192 ceiling still bounds a pathological future input.
-    pub(crate) fn relooper_retry_huge(&self, out: &[u8]) -> Option<Vec<u8>> {
-        let r = load_relooper_module_capped(out, 8192).map(|module| module_bytes(&module));
-        if self.retry_debug_on {
-            if let Err(e) = &r {
-                eprintln!("[retry-debug] relooper_retry_huge rewrite failed: {e}");
-            }
-        }
-        r.ok()
-            .filter(|b| self.validates_dbg("relooper_retry_huge", b))
-    }
-
     // Combined prune-then-relooper retry — a huge (>1024-block) function whose statically-dead
     // function-constant arms inflate its block count past the relooper's block cap. Const-fold the
     // dead arms first (byte-correct DCE — removes only code that never runs at the disabled FC
@@ -991,10 +966,8 @@ impl<'a> RetryCtx<'a> {
     pub(crate) fn prune_then_relooper(&self, out: &[u8]) -> Option<Vec<u8>> {
         let mut pruned_module = load_bytes(out).ok()?;
         native::prune_constant_branches_module(&mut pruned_module).ok()?;
-        // A function-constant-gated huge function (e.g. the MPS dynamic-struct-index family, ~2265
-        // blocks) shrinks to ~1100 blocks once its dead FC arms are pruned — past the default 1024
-        // relooper cap but well under this ceiling. Only this already-failing, adopt-if-validates
-        // path lifts the cap, so the normal relooper's perf budget is unchanged.
+        // Function-constant pruning can shrink an oversized source below the same hard product cap;
+        // a residual graph above that cap remains an honest fallback.
         let r = native::rewrite_to_relooper_module_capped(
             &mut pruned_module,
             native::PRUNE_THEN_RELOOPER_MAX_BLOCKS,

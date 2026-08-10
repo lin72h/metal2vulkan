@@ -14,8 +14,8 @@
 //! data and never re-reads the emitted SPIR-V, so it is byte-neutral on the translator.
 
 use crate::meta::{
-    texture_shape_from_name, AirType, FragMeta, FragRole, FunctionConstant, KernMeta, KernRole,
-    TextureComponent, TextureDimension, TextureShape, VertMeta, VertOutRole, VertRole,
+    texture_shape_from_name, AirType, BufferAccess, FragMeta, FragRole, FunctionConstant, KernMeta,
+    KernRole, TextureComponent, TextureDimension, TextureShape, VertMeta, VertOutRole, VertRole,
 };
 
 /// Schema version of [`ShaderReflection`]. Bump on any breaking change to the serialized shape so a
@@ -28,7 +28,10 @@ use crate::meta::{
 /// the source `datalayout`; plus fragment/vertex buffer `address_space`/`declared_size` population.
 ///
 /// v3 reports AIR-embedded constexpr samplers as `StaticSampler` bindings with their decoded state.
-pub const REFLECTION_VERSION: u32 = 3;
+///
+/// v4 adds conservative buffer extent classes, all-stage buffer type names / declared sizes, and
+/// declared buffer access (including write-only).
+pub const REFLECTION_VERSION: u32 = 4;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
@@ -118,14 +121,36 @@ pub struct DescriptorLocation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResourceAccess {
+    /// The specialized entry does not dereference this buffer. Its descriptor may still be bound,
+    /// but no buffer contents need to be staged for this shader invocation.
+    Unused,
     /// A buffer read but never written by the shader.
     ReadOnly,
-    /// A buffer written by the shader.
+    /// A buffer written but never read by the shader.
+    WriteOnly,
+    /// A buffer both read and written by the shader, or conservatively declared for both.
     ReadWrite,
     /// A sampled texture (`OpTypeImage Sampled=1`), read through a sampler.
     Sampled,
     /// A storage image (`OpTypeImage Sampled=2`), read/written directly.
     Storage,
+}
+
+/// Conservative byte-extent classification for a buffer binding.
+///
+/// Consumers may narrow a staged buffer window only for [`BufferExtent::Object`]. `Unbounded` and
+/// `Unknown` both require retaining the complete caller-provided window. Every classification is an
+/// over-approximation: an uncertain pointer must never be reported as a bounded object, because an
+/// understated extent silently corrupts shader reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BufferExtent {
+    /// AIR declares a reference-like object whose reachable extent is exactly `bytes`.
+    Object { bytes: u32 },
+    /// AIR declares a pointer/array element size but carries no array length.
+    Unbounded,
+    /// The metadata does not distinguish a bounded object from an unbounded pointer.
+    Unknown,
 }
 
 /// Minification or magnification filtering encoded in an AIR constexpr sampler.
@@ -302,11 +327,17 @@ impl StaticSamplerState {
     }
 
     pub(crate) fn uses_pixel_nearest(self) -> bool {
-        self.uses_pixel_coordinates() && !self.uses_linear_filter()
+        self.uses_pixel_coordinates()
+            && self.min_filter == SamplerFilter::Nearest
+            && self.mag_filter == SamplerFilter::Nearest
     }
 
     pub(crate) fn uses_linear_filter(self) -> bool {
         self.min_filter == SamplerFilter::Linear && self.mag_filter == SamplerFilter::Linear
+    }
+
+    pub(crate) fn uses_bicubic_filter(self) -> bool {
+        self.min_filter == SamplerFilter::Bicubic && self.mag_filter == SamplerFilter::Bicubic
     }
 
     pub(crate) fn uses_pixel_coordinates(self) -> bool {
@@ -374,6 +405,9 @@ pub struct ResourceBinding {
     pub address_space: Option<u32>,
     /// For a buffer: the declared AIR argument byte size, when the metadata carries one.
     pub declared_size: Option<u32>,
+    /// For a buffer: whether AIR bounds the binding to one object or leaves its array extent open.
+    /// `None` for non-buffer resources.
+    pub extent: Option<BufferExtent>,
     /// For a buffer with `air.struct_type_info`: the reconstructed AIR aggregate layout.
     pub type_layout: Option<AirType>,
     /// The AIR argument type name (`texture2d<uint, read>`, a struct name, `char`, …), when carried.
@@ -519,11 +553,19 @@ impl ShaderReflection {
                     param_index: Some(idx),
                     address_space: meta.buffer_address_spaces.get(&idx).copied(),
                     declared_size: meta.buffer_type_sizes.get(&idx).copied(),
+                    extent: Some(buffer_extent(
+                        meta.buffer_object_sizes.get(&idx).copied(),
+                        meta.buffer_type_sizes.get(&idx).copied(),
+                        meta.buffer_type_names.get(&idx),
+                    )),
                     type_layout: meta.buffer_layouts.get(&idx).cloned(),
-                    type_name: None,
+                    type_name: meta.buffer_type_names.get(&idx).cloned(),
                     texture_shape: None,
                     embedded_source: None,
-                    access: None,
+                    access: buffer_access(
+                        meta.buffer_accesses.get(&idx).copied(),
+                        meta.buffer_address_spaces.get(&idx).copied(),
+                    ),
                     static_sampler: None,
                 },
                 FragRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
@@ -535,6 +577,7 @@ impl ShaderReflection {
                     param_index: Some(idx),
                     address_space: None,
                     declared_size: None,
+                    extent: None,
                     type_layout: None,
                     type_name: None,
                     texture_shape: None,
@@ -615,11 +658,19 @@ impl ShaderReflection {
                     param_index: Some(idx),
                     address_space: meta.buffer_address_spaces.get(&idx).copied(),
                     declared_size: meta.buffer_type_sizes.get(&idx).copied(),
+                    extent: Some(buffer_extent(
+                        meta.buffer_object_sizes.get(&idx).copied(),
+                        meta.buffer_type_sizes.get(&idx).copied(),
+                        meta.buffer_type_names.get(&idx),
+                    )),
                     type_layout: meta.buffer_layouts.get(&idx).cloned(),
-                    type_name: None,
+                    type_name: meta.buffer_type_names.get(&idx).cloned(),
                     texture_shape: None,
                     embedded_source: None,
-                    access: None,
+                    access: buffer_access(
+                        meta.buffer_accesses.get(&idx).copied(),
+                        meta.buffer_address_spaces.get(&idx).copied(),
+                    ),
                     static_sampler: None,
                 },
                 VertRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
@@ -700,11 +751,19 @@ impl ShaderReflection {
                         param_index: Some(idx),
                         address_space,
                         declared_size: meta.buffer_type_sizes.get(&idx).copied(),
+                        extent: Some(buffer_extent(
+                            meta.buffer_object_sizes.get(&idx).copied(),
+                            meta.buffer_type_sizes.get(&idx).copied(),
+                            meta.buffer_type_names.get(&idx),
+                        )),
                         type_layout: meta.buffer_layouts.get(&idx).cloned(),
                         type_name: meta.buffer_type_names.get(&idx).cloned(),
                         texture_shape: None,
                         embedded_source: None,
-                        access: buffer_access_from_address_space(address_space),
+                        access: buffer_access(
+                            meta.buffer_accesses.get(&idx).copied(),
+                            address_space,
+                        ),
                         static_sampler: None,
                     }
                 }
@@ -717,6 +776,7 @@ impl ShaderReflection {
                     param_index: Some(idx),
                     address_space: None,
                     declared_size: None,
+                    extent: None,
                     type_layout: None,
                     type_name: None,
                     texture_shape: None,
@@ -739,6 +799,7 @@ impl ShaderReflection {
                 param_index: None,
                 address_space: None,
                 declared_size: None,
+                extent: None,
                 type_layout: None,
                 type_name: None,
                 texture_shape: Some(TextureShape {
@@ -794,6 +855,46 @@ impl ShaderReflection {
             .find(|b| b.kind == kind && b.metal_index == metal_index)
     }
 
+    /// Tighten declared buffer access using LLVM parameter attributes on the translated entry.
+    /// `readonly` / `writeonly` apply transitively to calls made by the function and are therefore
+    /// stronger than AIR's sometimes-broad `air.read_write` metadata. A parameter absent from the
+    /// body is classified `Unused`; ambiguous uses retain the conservative declared classification.
+    pub(crate) fn refine_buffer_access_from_entry(&mut self, ll: &str) {
+        let Some(entry) = self.entry_point.as_deref() else {
+            return;
+        };
+        let Some((args, body)) = llvm_entry_args_and_body(ll, entry) else {
+            return;
+        };
+        for binding in &mut self.bindings {
+            if !matches!(
+                binding.kind,
+                ResourceKind::Buffer | ResourceKind::ThreadgroupBuffer
+            ) {
+                continue;
+            }
+            let Some(param_index) = binding
+                .param_index
+                .and_then(|idx| usize::try_from(idx).ok())
+            else {
+                continue;
+            };
+            let Some(arg) = args.get(param_index) else {
+                continue;
+            };
+            let Some(name) = percent_tokens(arg).last().copied() else {
+                continue;
+            };
+            if !ssa_token_occurs(body, name) || llvm_arg_has_attribute(arg, "readnone") {
+                binding.access = Some(ResourceAccess::Unused);
+            } else if llvm_arg_has_attribute(arg, "readonly") {
+                binding.access = Some(ResourceAccess::ReadOnly);
+            } else if llvm_arg_has_attribute(arg, "writeonly") {
+                binding.access = Some(ResourceAccess::WriteOnly);
+            }
+        }
+    }
+
     pub(crate) fn add_static_samplers(&mut self, ll: &str) -> Result<(), String> {
         let constants = parse_static_sampler_constants(ll)?;
         if constants.is_empty() {
@@ -824,6 +925,7 @@ impl ShaderReflection {
                 param_index: None,
                 address_space: None,
                 declared_size: None,
+                extent: None,
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
@@ -834,6 +936,91 @@ impl ShaderReflection {
         }
         Ok(())
     }
+}
+
+fn llvm_entry_args_and_body<'a>(ll: &'a str, entry: &str) -> Option<(Vec<&'a str>, &'a str)> {
+    let plain = format!("@{entry}(");
+    let quoted = format!("@\"{entry}\"(");
+    let start = ll.lines().position(|line| {
+        line.trim_start().starts_with("define ")
+            && (line.contains(&plain) || line.contains(&quoted))
+    })?;
+    let byte_start = ll
+        .lines()
+        .take(start)
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let function = &ll[byte_start..];
+    // Search from the entry symbol, rather than taking the first `{` / `(` in the header: an LLVM
+    // function may return an aggregate such as `<{ i32, i32 }>`, and those delimiters precede its
+    // parameter list.
+    let symbol = function.find(&plain).or_else(|| function.find(&quoted))?;
+    let open = function[symbol..].find('(')? + symbol;
+    let mut depth = 0u32;
+    let mut close = None;
+    for (offset, character) in function[open..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close?;
+    let header_end = function[close + 1..].find('{')? + close + 1;
+    let args = split_top_level_llvm(&function[open + 1..close]);
+    let tail = &function[header_end + 1..];
+    let body_end = tail.find("\n}").unwrap_or(tail.len());
+    Some((args, &tail[..body_end]))
+}
+
+fn split_top_level_llvm(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    for (index, character) in text.char_indices() {
+        match character {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(text[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !text[start..].trim().is_empty() {
+        out.push(text[start..].trim());
+    }
+    out
+}
+
+fn percent_tokens(text: &str) -> Vec<&str> {
+    text.split('%')
+        .skip(1)
+        .filter_map(|tail| {
+            let token = tail
+                .split(|character: char| {
+                    !(character.is_ascii_alphanumeric() || character == '_' || character == '.')
+                })
+                .next()?;
+            (!token.is_empty()).then_some(token)
+        })
+        .collect()
+}
+
+fn ssa_token_occurs(text: &str, name: &str) -> bool {
+    percent_tokens(text).contains(&name)
+}
+
+fn llvm_arg_has_attribute(arg: &str, attribute: &str) -> bool {
+    arg.split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .any(|token| token == attribute)
 }
 
 fn parse_static_sampler_constants(ll: &str) -> Result<Vec<[u64; 2]>, String> {
@@ -947,6 +1134,7 @@ fn texture_binding(
         param_index,
         address_space: None,
         declared_size: None,
+        extent: None,
         type_layout: None,
         type_name,
         texture_shape,
@@ -982,14 +1170,28 @@ fn classify_texture(shape: Option<&TextureShape>) -> (ResourceKind, ResourceAcce
     }
 }
 
-/// Access for a buffer given its raw AIR address space: the CONSTANT space is read-only. A DEVICE
-/// buffer may be written, and proving it is not requires IR dataflow the facade does not carry — so
-/// its access stays `None` (the consumer determines it SPIR-V-side). Only kernel metadata carries
-/// address spaces; fragment/vertex buffers report `None`.
-fn buffer_access_from_address_space(address_space: Option<u32>) -> Option<ResourceAccess> {
-    match address_space {
-        Some(ADDRESS_SPACE_CONSTANT) => Some(ResourceAccess::ReadOnly),
-        _ => None,
+fn buffer_extent(
+    object_size: Option<u32>,
+    declared_size: Option<u32>,
+    type_name: Option<&String>,
+) -> BufferExtent {
+    match (object_size, declared_size, type_name) {
+        (Some(bytes), _, _) => BufferExtent::Object { bytes },
+        (None, Some(_), _) | (None, None, Some(_)) => BufferExtent::Unbounded,
+        (None, None, None) => BufferExtent::Unknown,
+    }
+}
+
+fn buffer_access(
+    declared: Option<BufferAccess>,
+    address_space: Option<u32>,
+) -> Option<ResourceAccess> {
+    match declared {
+        Some(BufferAccess::ReadOnly) => Some(ResourceAccess::ReadOnly),
+        Some(BufferAccess::WriteOnly) => Some(ResourceAccess::WriteOnly),
+        Some(BufferAccess::ReadWrite) => Some(ResourceAccess::ReadWrite),
+        None if address_space == Some(ADDRESS_SPACE_CONSTANT) => Some(ResourceAccess::ReadOnly),
+        None => None,
     }
 }
 
@@ -1001,6 +1203,7 @@ fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {
         param_index,
         address_space: None,
         declared_size: None,
+        extent: None,
         type_layout: None,
         type_name: None,
         texture_shape: None,

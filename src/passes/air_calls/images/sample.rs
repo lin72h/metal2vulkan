@@ -57,10 +57,13 @@ pub(in crate::passes) fn lower_sample(
         let pixel_linear = comp == crate::passes::ImageComp::Float
             && sampler_state.uses_linear_filter()
             && matches!(dim, Dim::Dim2D | Dim::Dim3D);
+        let pixel_bicubic = comp == crate::passes::ImageComp::Float
+            && sampler_state.uses_bicubic_filter()
+            && dim == Dim::Dim2D;
         let pixel_fetch = comp != crate::passes::ImageComp::Float
             || sampler_state.uses_pixel_nearest()
             || arrayed;
-        if pixel_linear || pixel_fetch {
+        if pixel_linear || pixel_bicubic || pixel_fetch {
             let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
                 Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
                 None => ctx.const_uint(0),
@@ -71,6 +74,20 @@ pub(in crate::passes) fn lower_sample(
                     sampler_state,
                     img,
                     dim,
+                    arrayed,
+                    coord,
+                    args,
+                    lod,
+                    sample_v4,
+                    &mut out,
+                )?;
+                return finish_sample_result(ctx, res, rty, color, sample_v4, out);
+            }
+            if pixel_bicubic {
+                let color = lower_pixel_bicubic_sample(
+                    ctx,
+                    sampler_state,
+                    img,
                     arrayed,
                     coord,
                     args,
@@ -110,6 +127,16 @@ pub(in crate::passes) fn lower_sample(
             }
             return finish_sample_result(ctx, res, rty, color, sample_v4, out);
         }
+    }
+    if ctx
+        .sampler_states
+        .get(&samp)
+        .is_some_and(|state| state.uses_bicubic_filter())
+    {
+        return Err(
+            "air.sample_texture bicubic filtering is supported only for pixel-coordinate 2D float textures"
+                .into(),
+        );
     }
     if is_int_tex {
         if let Some(sampler_state) = ctx.sampler_states.get(&samp).copied() {
@@ -215,6 +242,246 @@ pub(in crate::passes) fn lower_sample(
     );
 
     finish_sample_result(ctx, res, rty, color, sample_v4, out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_pixel_bicubic_sample(
+    ctx: &mut Ctx,
+    sampler_state: StaticSamplerState,
+    img: Word,
+    arrayed: bool,
+    coord: Word,
+    args: &[Word],
+    lod: Word,
+    sample_v4: Word,
+    out: &mut Vec<Instruction>,
+) -> Result<Word, String> {
+    let (offset, dynamic_offset) = sample_const_or_dynamic_offset(ctx, arrayed, args, 2)?;
+    let dynamic_offset = dynamic_offset
+        .map(|offset| dynamic_i32_integer_offset_components(ctx, offset, 2, out))
+        .transpose()?;
+    let layer = if arrayed {
+        Some(
+            args.get(3)
+                .copied()
+                .ok_or("air.sample_texture bicubic array texture missing layer")?,
+        )
+    } else {
+        None
+    };
+    let size = query_image_size(ctx, img, 2, arrayed, lod, out);
+    let float_ty = ctx.ty_float();
+    let sint = ctx.ty_sint();
+    let bool_ty = ctx.ty_bool();
+    let glsl = ctx.glsl();
+    let zero_f = ctx.const_float(0.0);
+    let half_f = ctx.const_float(0.5);
+    let mut base = Vec::with_capacity(2);
+    let mut axis_weights = Vec::with_capacity(2);
+    for (axis, component) in sample_coord_components(ctx, coord, 2, out)?
+        .into_iter()
+        .enumerate()
+    {
+        let Operand::IdRef(component) = component else {
+            return Err("air.sample_texture bicubic coord component is not an id".into());
+        };
+        let component =
+            clamp_pixel_coord_component_finite(ctx, component, size, true, axis as u32, out);
+        let biased = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::FSub,
+            Some(float_ty),
+            Some(biased),
+            vec![Operand::IdRef(component), Operand::IdRef(half_f)],
+        ));
+        let floor = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::ExtInst,
+            Some(float_ty),
+            Some(floor),
+            vec![
+                Operand::IdRef(glsl),
+                Operand::LiteralExtInstInteger(8),
+                Operand::IdRef(biased),
+            ],
+        ));
+        let mut base_i = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::ConvertFToS,
+            Some(sint),
+            Some(base_i),
+            vec![Operand::IdRef(floor)],
+        ));
+        if let Some(offset) = &offset {
+            if offset[axis] != 0 {
+                let shifted = ctx.module.fresh_id();
+                let delta = ctx.const_int_of(sint, offset[axis] as i64);
+                out.push(Instruction::new(
+                    Op::IAdd,
+                    Some(sint),
+                    Some(shifted),
+                    vec![Operand::IdRef(base_i), Operand::IdRef(delta)],
+                ));
+                base_i = shifted;
+            }
+        } else if let Some(offset) = &dynamic_offset {
+            let shifted = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::IAdd,
+                Some(sint),
+                Some(shifted),
+                vec![Operand::IdRef(base_i), Operand::IdRef(offset[axis])],
+            ));
+            base_i = shifted;
+        }
+        let frac = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::FSub,
+            Some(float_ty),
+            Some(frac),
+            vec![Operand::IdRef(biased), Operand::IdRef(floor)],
+        ));
+        base.push(base_i);
+        axis_weights.push(catmull_rom_weights(ctx, frac, out));
+    }
+
+    let zero_color = const_null_of(ctx, sample_v4);
+    let mut acc = zero_color;
+    for tap_y in 0..4 {
+        for tap_x in 0..4 {
+            let tap_coord = pixel_linear_tap_coord(
+                ctx,
+                sampler_state,
+                Dim::Dim2D,
+                arrayed,
+                &base,
+                &[tap_x - 1, tap_y - 1],
+                layer,
+                size,
+                out,
+            )?;
+            let fetched = ctx.module.fresh_id();
+            push_image_read_or_fetch(
+                ctx,
+                out,
+                img,
+                tap_coord.coord,
+                Some(lod),
+                sample_v4,
+                fetched,
+            );
+            let color = if let Some(in_bounds) = tap_coord.in_bounds {
+                let guarded = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::Select,
+                    Some(sample_v4),
+                    Some(guarded),
+                    vec![
+                        Operand::IdRef(in_bounds),
+                        Operand::IdRef(fetched),
+                        Operand::IdRef(zero_color),
+                    ],
+                ));
+                guarded
+            } else {
+                fetched
+            };
+            let weight = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::FMul,
+                Some(float_ty),
+                Some(weight),
+                vec![
+                    Operand::IdRef(axis_weights[0][tap_x as usize]),
+                    Operand::IdRef(axis_weights[1][tap_y as usize]),
+                ],
+            ));
+            let weighted = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::VectorTimesScalar,
+                Some(sample_v4),
+                Some(weighted),
+                vec![Operand::IdRef(color), Operand::IdRef(weight)],
+            ));
+            let weight_is_zero = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::FOrdEqual,
+                Some(bool_ty),
+                Some(weight_is_zero),
+                vec![Operand::IdRef(weight), Operand::IdRef(zero_f)],
+            ));
+            let contribution = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::Select,
+                Some(sample_v4),
+                Some(contribution),
+                vec![
+                    Operand::IdRef(weight_is_zero),
+                    Operand::IdRef(zero_color),
+                    Operand::IdRef(weighted),
+                ],
+            ));
+            let sum = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::FAdd,
+                Some(sample_v4),
+                Some(sum),
+                vec![Operand::IdRef(acc), Operand::IdRef(contribution)],
+            ));
+            acc = sum;
+        }
+    }
+    Ok(acc)
+}
+
+fn catmull_rom_weights(ctx: &mut Ctx, t: Word, out: &mut Vec<Instruction>) -> [Word; 4] {
+    let float_ty = ctx.ty_float();
+    let c_half = ctx.const_float(0.5);
+    let c_neg_half = ctx.const_float(-0.5);
+    let c_one = ctx.const_float(1.0);
+    let c_one_half = ctx.const_float(1.5);
+    let c_two = ctx.const_float(2.0);
+    let c_two_half = ctx.const_float(2.5);
+    let mul = |ctx: &mut Ctx, a, b, out: &mut Vec<Instruction>| {
+        let id = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::FMul,
+            Some(float_ty),
+            Some(id),
+            vec![Operand::IdRef(a), Operand::IdRef(b)],
+        ));
+        id
+    };
+    let add = |ctx: &mut Ctx, op, a, b, out: &mut Vec<Instruction>| {
+        let id = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            op,
+            Some(float_ty),
+            Some(id),
+            vec![Operand::IdRef(a), Operand::IdRef(b)],
+        ));
+        id
+    };
+    let t2 = mul(ctx, t, t, out);
+    let t3 = mul(ctx, t2, t, out);
+    let w0a = mul(ctx, c_neg_half, t, out);
+    let w0b = mul(ctx, c_one, t2, out);
+    let w0c = mul(ctx, c_neg_half, t3, out);
+    let w0ab = add(ctx, Op::FAdd, w0a, w0b, out);
+    let w0 = add(ctx, Op::FAdd, w0ab, w0c, out);
+    let w1a = mul(ctx, c_two_half, t2, out);
+    let w1b = mul(ctx, c_one_half, t3, out);
+    let w1a = add(ctx, Op::FSub, c_one, w1a, out);
+    let w1 = add(ctx, Op::FAdd, w1a, w1b, out);
+    let w2a = mul(ctx, c_half, t, out);
+    let w2b = mul(ctx, c_two, t2, out);
+    let w2c = mul(ctx, c_one_half, t3, out);
+    let w2ab = add(ctx, Op::FAdd, w2a, w2b, out);
+    let w2 = add(ctx, Op::FSub, w2ab, w2c, out);
+    let w3a = mul(ctx, c_neg_half, t2, out);
+    let w3b = mul(ctx, c_half, t3, out);
+    let w3 = add(ctx, Op::FAdd, w3a, w3b, out);
+    [w0, w1, w2, w3]
 }
 
 /// Clamp a float pixel-space sample coordinate component to the finite range `[-9.0, size + 9.0]`

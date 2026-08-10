@@ -30,7 +30,11 @@ use std::collections::{HashMap, HashSet};
 /// marks instrumented kernels as `compare=none`; this cap is therefore a validation liveness guard,
 /// not a product semantic contract. Keep it large enough for bounded harness work but small enough
 /// that runaway SIMT reductions do not run into the corpus worker's wall timeout.
-pub const LOOP_BUDGET_BACKEDGES: i32 = 1 << 18;
+pub const LOOP_BUDGET_BACKEDGES: i32 = 1 << 12;
+/// Cap used only when reproducing an already-banked semantic `plan_version < 3` Metal golden.
+/// Historic `compare=none` rows are non-semantic and always use the safer cap above before they are
+/// quarantined; their smoke bytes do not justify replaying the older, much larger budget.
+pub const LEGACY_LOOP_BUDGET_BACKEDGES: i32 = 1 << 18;
 
 /// Result of classifying one module (entry + all defined functions).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +55,8 @@ pub struct LoopInputFacts<'a> {
     pub arg_float_values: &'a [(String, f64)],
     pub arg_upper_bounds: &'a [(String, i128)],
     pub arg_field_values: &'a [(String, Vec<i32>, i128)],
+    /// Exact integer values loaded through constant byte (`getelementptr i8`) offsets.
+    pub arg_byte_values: &'a [(String, usize, i128)],
     pub arg_vector_values: &'a [(String, usize, i128)],
     pub arg_vector_upper_bounds: &'a [(String, usize, i128)],
     pub texture_extents: &'a [(String, [i128; 3])],
@@ -145,6 +151,53 @@ pub fn classify_and_instrument_with_loop_input_facts(
     entry: &str,
     input_facts: LoopInputFacts<'_>,
 ) -> GuardPlan {
+    classify_and_instrument_with_loop_input_facts_and_budget(
+        module_text,
+        entry,
+        input_facts,
+        LOOP_BUDGET_BACKEDGES,
+    )
+}
+
+/// Return whether the entry's reachable static call graph contains any reachable CFG cycle.
+///
+/// Unlike [`classify_and_instrument_with_loop_input_facts`], this does not erase loops whose trip
+/// count appears small under the supplied facts. It is the conservative semantic-oracle gate:
+/// proving termination is not the same as proving an aggregate GPU-time bound, especially for
+/// nested loops and large loop bodies.
+pub fn reachable_module_has_cfg_cycle_with_loop_input_facts(
+    module_text: &str,
+    entry: &str,
+    input_facts: LoopInputFacts<'_>,
+) -> Result<bool, String> {
+    let lines = module_text.lines().collect::<Vec<_>>();
+    let funcs = find_functions(&lines);
+    if funcs.is_empty() {
+        return Ok(false);
+    }
+    let facts = LoopFacts::from_module(&lines, &input_facts);
+    let parsed = funcs
+        .iter()
+        .map(|function| parse_func_preserving_loops(&lines, function, &facts))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reachable = reachable_functions_from_entry(&parsed, entry);
+    Ok(parsed
+        .iter()
+        .filter(|function| reachable.contains(function.name.as_str()))
+        .any(|function| !function.back_edges.is_empty()))
+}
+
+/// Classify and instrument using an explicit back-edge cap. This exists so candidate runners can
+/// reproduce older banked Metal goldens while new oracle executions use the safer current cap.
+pub fn classify_and_instrument_with_loop_input_facts_and_budget(
+    module_text: &str,
+    entry: &str,
+    input_facts: LoopInputFacts<'_>,
+    loop_budget_backedges: i32,
+) -> GuardPlan {
+    if loop_budget_backedges <= 0 {
+        return GuardPlan::Quarantine("loop back-edge budget must be positive".into());
+    }
     let _ = entry;
     let lines: Vec<&str> = module_text.lines().collect();
     let funcs = find_functions(&lines);
@@ -233,7 +286,7 @@ pub fn classify_and_instrument_with_loop_input_facts(
                 out.push(line.to_string());
             }
         } else {
-            match transform_func(&lines, f, pf, opaque_ptr) {
+            match transform_func(&lines, f, pf, opaque_ptr, loop_budget_backedges) {
                 Ok(func_lines) => out.extend(func_lines),
                 Err(reason) => return GuardPlan::Quarantine(reason),
             }
@@ -411,6 +464,7 @@ struct LoopFacts {
     arg_ints: HashMap<String, i128>,
     arg_floats: HashMap<String, f64>,
     arg_field_ints: HashMap<(String, Vec<i32>), i128>,
+    arg_byte_ints: HashMap<(String, usize), i128>,
     arg_upper_bounds: HashMap<String, i128>,
     arg_vector_ints: HashMap<(String, usize), i128>,
     arg_vector_upper_bounds: HashMap<(String, usize), i128>,
@@ -445,6 +499,13 @@ impl LoopFacts {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let arg_byte_ints = input_facts
+            .arg_byte_values
+            .iter()
+            .map(|(name, offset, value)| {
+                ((name.trim_start_matches('%').to_string(), *offset), *value)
+            })
+            .collect::<HashMap<_, _>>();
         let arg_vector_ints = input_facts
             .arg_vector_values
             .iter()
@@ -466,6 +527,7 @@ impl LoopFacts {
                 arg_ints,
                 arg_floats,
                 arg_field_ints,
+                arg_byte_ints,
                 arg_upper_bounds,
                 arg_vector_ints,
                 arg_vector_upper_bounds,
@@ -542,6 +604,7 @@ impl LoopFacts {
             arg_ints,
             arg_floats,
             arg_field_ints,
+            arg_byte_ints,
             arg_upper_bounds,
             arg_vector_ints,
             arg_vector_upper_bounds,
@@ -557,6 +620,7 @@ impl LoopFacts {
             && self.arg_ints.is_empty()
             && self.arg_floats.is_empty()
             && self.arg_field_ints.is_empty()
+            && self.arg_byte_ints.is_empty()
             && self.arg_upper_bounds.is_empty()
             && self.arg_vector_ints.is_empty()
             && self.arg_vector_upper_bounds.is_empty()
@@ -576,6 +640,7 @@ impl LoopFacts {
             arg_ints: self.arg_ints.clone(),
             arg_floats: self.arg_floats.clone(),
             arg_field_ints: self.arg_field_ints.clone(),
+            arg_byte_ints: self.arg_byte_ints.clone(),
             arg_upper_bounds,
             arg_vector_ints: self.arg_vector_ints.clone(),
             arg_vector_upper_bounds: self.arg_vector_upper_bounds.clone(),
@@ -884,6 +949,23 @@ struct CallSite {
 }
 
 fn parse_func(lines: &[&str], f: &FuncSpan, facts: &LoopFacts) -> Result<ParsedFunc, String> {
+    parse_func_with_loop_elision(lines, f, facts, true)
+}
+
+fn parse_func_preserving_loops(
+    lines: &[&str],
+    f: &FuncSpan,
+    facts: &LoopFacts,
+) -> Result<ParsedFunc, String> {
+    parse_func_with_loop_elision(lines, f, facts, false)
+}
+
+fn parse_func_with_loop_elision(
+    lines: &[&str],
+    f: &FuncSpan,
+    facts: &LoopFacts,
+    elide_small_loops: bool,
+) -> Result<ParsedFunc, String> {
     let body = &lines[f.define_idx + 1..f.close_idx];
     let blocks = parse_blocks(body, &f.name)?;
 
@@ -913,7 +995,9 @@ fn parse_func(lines: &[&str], f: &FuncSpan, facts: &LoopFacts) -> Result<ParsedF
     let back_edges = back_edges(&succ_idx)
         .into_iter()
         .filter(|&(src, dst)| reachable[src] && reachable[dst])
-        .filter(|&(src, dst)| !small_fixed_trip_loop(body, &blocks, facts, src, dst))
+        .filter(|&(src, dst)| {
+            !elide_small_loops || !small_fixed_trip_loop(body, &blocks, facts, src, dst)
+        })
         .collect::<Vec<_>>();
     let loop_has_workgroup_barrier = back_edges.iter().any(|&(src, dst)| {
         natural_loop_nodes(&succ_idx, src, dst)
@@ -1553,6 +1637,7 @@ fn transform_func(
     f: &FuncSpan,
     pf: &ParsedFunc,
     opaque_ptr: bool,
+    loop_budget_backedges: i32,
 ) -> Result<Vec<String>, String> {
     let body_src = &lines[f.define_idx + 1..f.close_idx];
     let mut body: Vec<String> = body_src.iter().map(|s| s.to_string()).collect();
@@ -1686,7 +1771,7 @@ fn transform_func(
     };
     let init = vec![
         format!("  {budget} = alloca i32, align 4"),
-        format!("  store i32 {LOOP_BUDGET_BACKEDGES}, {ptr} {budget}, align 4"),
+        format!("  store i32 {loop_budget_backedges}, {ptr} {budget}, align 4"),
     ];
     let mut emitted_body = Vec::with_capacity(
         body.len() + init.len() + guards_after.len() * 6 + budget_before.len() * 5 + 2,
@@ -1741,7 +1826,156 @@ fn small_fixed_trip_loop(
     let const_loop = counted_const_loop(body, blocks, src, dst);
     let symbolic = counted_small_symbolic_loop(body, blocks, facts, src, dst);
     let consteval = counted_consteval_loop(body, blocks, facts, src, dst);
-    bool_toggle || const_loop || symbolic || consteval
+    let min_chunk = bounded_min_chunk_descending_loop(body, blocks, facts, src, dst);
+    bool_toggle || const_loop || symbolic || consteval || min_chunk
+}
+
+/// Recognize `remaining -= min(remaining, positive_chunk)` loops. This is a common AIR memcpy /
+/// tiled-copy shape. With a concrete small initial value and a positive chunk it reaches zero in a
+/// bounded number of iterations without needing validation-only IR instrumentation.
+fn bounded_min_chunk_descending_loop(
+    body: &[&str],
+    blocks: &[Block],
+    facts: &LoopFacts,
+    src: usize,
+    dst: usize,
+) -> bool {
+    let header = &blocks[dst];
+    let latch = &blocks[src];
+    let Some(src_label) = latch.label.as_deref() else {
+        return false;
+    };
+    let Some(dst_label) = header.label.as_deref() else {
+        return false;
+    };
+    let latch_lines = block_lines(body, latch).collect::<Vec<_>>();
+    let Some(branch) = latch_lines
+        .iter()
+        .rev()
+        .copied()
+        .find(|line| line.trim_start().starts_with("br i1 "))
+    else {
+        return false;
+    };
+    let Some(backedge_on_true) = branch_backedge_on_true(branch, dst_label) else {
+        return false;
+    };
+    let Some(condition) = branch_condition(branch) else {
+        return false;
+    };
+    let Some(condition_line) = latch_lines
+        .iter()
+        .copied()
+        .find(|line| result_name(line).as_deref() == Some(condition.as_str()))
+    else {
+        return false;
+    };
+    let Some((predicate, condition_lhs, condition_rhs)) = parse_icmp_value_operands(condition_line)
+    else {
+        return false;
+    };
+    let continues_while_nonzero =
+        (predicate == "ne" && backedge_on_true) || (predicate == "eq" && !backedge_on_true);
+    if !continues_while_nonzero {
+        return false;
+    }
+
+    let lines = body.to_vec();
+    for ty in ["i32", "i64"] {
+        let bit_width = ty.trim_start_matches('i').parse::<u32>().unwrap_or(64);
+        for phi_line in
+            block_lines(body, header).filter(|line| line.contains(&format!(" = phi {ty} ")))
+        {
+            let Some(phi) = parse_integer_phi(phi_line, src_label, ty) else {
+                continue;
+            };
+            let condition_lhs = condition_lhs.trim_start_matches('%');
+            let condition_rhs = condition_rhs.trim_start_matches('%');
+            if !((condition_lhs == phi.recur && condition_rhs == "0")
+                || (condition_rhs == phi.recur && condition_lhs == "0"))
+            {
+                continue;
+            }
+            let Some(recur_line) = lines
+                .iter()
+                .copied()
+                .find(|line| result_name(line).as_deref() == Some(phi.recur.as_str()))
+            else {
+                continue;
+            };
+            let Some((_, sub_rhs)) = recur_line.split_once(" = sub ") else {
+                continue;
+            };
+            let operands = sub_rhs
+                .split([',', ' '])
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>();
+            let Some(type_pos) = operands.iter().position(|token| *token == ty) else {
+                continue;
+            };
+            let Some(base) = operands
+                .get(type_pos + 1)
+                .map(|token| token.trim_start_matches('%'))
+            else {
+                continue;
+            };
+            let Some(chunk) = operands
+                .get(type_pos + 2)
+                .map(|token| token.trim_start_matches('%'))
+            else {
+                continue;
+            };
+            if base != phi.name {
+                continue;
+            }
+            let Some(chunk_line) = lines
+                .iter()
+                .copied()
+                .find(|line| result_name(line).as_deref() == Some(chunk))
+            else {
+                continue;
+            };
+            if !chunk_line.contains("@air.min.") {
+                continue;
+            }
+            let Some(args) = chunk_line
+                .split_once(" = ")
+                .and_then(|(_, rhs)| call_arg_tokens(rhs))
+            else {
+                continue;
+            };
+            if args.len() < 2 {
+                continue;
+            }
+            let lhs = args[0].trim_start_matches('%');
+            let rhs = args[1].trim_start_matches('%');
+            let bound = if lhs == phi.name {
+                rhs
+            } else if rhs == phi.name {
+                lhs
+            } else {
+                continue;
+            };
+            let Some(initial) =
+                small_integer_upper_bound_with_facts(&lines, facts, &phi.init, bit_width)
+            else {
+                continue;
+            };
+            let Some(chunk) =
+                exact_positive_value(&lines, facts, bound, bit_width, &mut Vec::new())
+            else {
+                continue;
+            };
+            if initial < 0 || chunk <= 0 {
+                continue;
+            }
+            let trips = (initial.max(1) + chunk - 1) / chunk;
+            if (1..=256).contains(&trips) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn bool_toggle_loop(body: &[&str], blocks: &[Block], src: usize, dst: usize) -> bool {
@@ -3654,13 +3888,25 @@ fn consteval_int_values(body: &[&str], facts: &LoopFacts) -> HashMap<String, i12
     let mut values = facts.arg_ints.clone();
     let mut pointer_values = HashMap::new();
     let mut pointer_field_paths = HashMap::new();
+    let mut pointer_byte_offsets = HashMap::new();
     let mut pointer_arg_aliases = HashMap::new();
     let mut vector_values = HashMap::new();
     for line in body {
         if let Some(pointer) = store_dest_pointer(line) {
             pointer_values.remove(&pointer);
             pointer_field_paths.remove(&pointer);
+            pointer_byte_offsets.remove(&pointer);
             pointer_arg_aliases.remove(&pointer);
+            continue;
+        }
+        if let Some((result, arg, offset)) = byte_gep_result_arg_offset(line, &values) {
+            pointer_byte_offsets.insert(
+                result.trim_start_matches('%').to_string(),
+                (arg.clone(), offset),
+            );
+            if let Some(&value) = facts.arg_byte_ints.get(&(arg, offset)) {
+                pointer_values.insert(result.trim_start_matches('%').to_string(), value);
+            }
             continue;
         }
         if let Some((result, arg, path)) = gep_result_arg_field_path(line, &values) {
@@ -3670,6 +3916,26 @@ fn consteval_int_values(body: &[&str], facts: &LoopFacts) -> HashMap<String, i12
             );
             if let Some(value) = facts.field_value(&arg, &path) {
                 pointer_values.insert(result.trim_start_matches('%').to_string(), value);
+            }
+            continue;
+        }
+        if line.contains(" = bitcast ") {
+            if let Some(result) = result_name(line) {
+                let rhs = line.split_once('=').map(|(_, rhs)| rhs).unwrap_or("");
+                if let Some(source) = first_percent_name(rhs) {
+                    if let Some(value) = pointer_values.get(&source).copied() {
+                        pointer_values.insert(result.clone(), value);
+                    }
+                    if let Some(field) = pointer_field_paths.get(&source).cloned() {
+                        pointer_field_paths.insert(result.clone(), field);
+                    }
+                    if let Some(byte) = pointer_byte_offsets.get(&source).cloned() {
+                        pointer_byte_offsets.insert(result.clone(), byte);
+                    }
+                    if let Some(alias) = pointer_arg_aliases.get(&source).cloned() {
+                        pointer_arg_aliases.insert(result, alias);
+                    }
+                }
             }
             continue;
         }
@@ -3795,6 +4061,41 @@ fn consteval_int_values(body: &[&str], facts: &LoopFacts) -> HashMap<String, i12
         }
     }
     values
+}
+
+fn byte_gep_result_arg_offset(
+    line: &str,
+    values: &HashMap<String, i128>,
+) -> Option<(String, String, usize)> {
+    if !line.contains(" = getelementptr ") || !line.contains(" i8,") {
+        return None;
+    }
+    let result = result_name(line)?;
+    let (arg, after_arg) = pointer_operand_and_tail_after(line, "ptr addrspace(")
+        .or_else(|| pointer_operand_and_tail_after(line, "addrspace("))?;
+    for raw in after_arg.split(',') {
+        let mut parts = raw.split_whitespace();
+        let Some(ty) = parts.next() else {
+            continue;
+        };
+        let Some(value) = parts.next() else {
+            continue;
+        };
+        if !ty.starts_with('i') || !ty[1..].chars().all(|ch| ch.is_ascii_digit()) {
+            continue;
+        }
+        let offset = operand_const_value(value.trim_end_matches(','), values)?;
+        return Some((result, arg, usize::try_from(offset).ok()?));
+    }
+    None
+}
+
+fn first_percent_name(text: &str) -> Option<String> {
+    let (_, tail) = text.split_once('%')?;
+    let name = tail
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '.' && ch != '_')
+        .next()?;
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn extractelement_result_vector_lane(line: &str) -> Option<(String, String, usize)> {
@@ -5803,6 +6104,14 @@ define void @k(ptr addrspace(1) %0) {
 }
 ";
         assert_eq!(classify_and_instrument(ll, "k"), GuardPlan::LoopFree);
+        assert_eq!(
+            reachable_module_has_cfg_cycle_with_loop_input_facts(
+                ll,
+                "k",
+                LoopInputFacts::default(),
+            ),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -5838,6 +6147,109 @@ define void @spin(ptr addrspace(1) %0) {
         assert!(
             out.contains("br i1 %m2v.0.c, label %m2v.exit, label %1"),
             "guard exit branch missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn explicit_budget_is_embedded_and_must_be_positive() {
+        let ll = "\
+define void @spin(ptr addrspace(1) %0) {
+  br label %1
+1:
+  br label %1
+}
+";
+        let out = match classify_and_instrument_with_loop_input_facts_and_budget(
+            ll,
+            "spin",
+            LoopInputFacts::default(),
+            7,
+        ) {
+            GuardPlan::Instrumented(text) => text,
+            other => panic!("expected Instrumented, got {other:?}"),
+        };
+        assert!(out.contains("store i32 7, ptr %m2v.bd"), "{out}");
+        assert_eq!(
+            classify_and_instrument_with_loop_input_facts_and_budget(
+                ll,
+                "spin",
+                LoopInputFacts::default(),
+                0,
+            ),
+            GuardPlan::Quarantine("loop back-edge budget must be positive".into())
+        );
+    }
+
+    #[test]
+    fn exact_raw_byte_field_proves_one_iteration_loop_bounded() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %source) {
+entry:
+  %count.ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 24
+  %count.cast = bitcast ptr addrspace(1) %count.ptr to ptr addrspace(1)
+  %count = load i32, ptr addrspace(1) %count.cast, align 4
+  br label %loop
+loop:
+  %remaining = phi i32 [ %count, %entry ], [ %next, %loop ]
+  %next = sub i32 %remaining, 1
+  %done = icmp eq i32 %next, 0
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+"#;
+        let byte_values = [("source".to_string(), 24, 1)];
+        let facts_input = LoopInputFacts {
+            arg_byte_values: &byte_values,
+            ..LoopInputFacts::default()
+        };
+        let lines = ll.lines().collect::<Vec<_>>();
+        let facts = LoopFacts::from_module(&lines, &facts_input);
+        let function = find_functions(&lines).remove(0);
+        let values =
+            consteval_int_values(&lines[function.define_idx + 1..function.close_idx], &facts);
+        assert_eq!(values.get("count"), Some(&1), "{values:?}");
+        assert_eq!(
+            classify_and_instrument_with_loop_input_facts(ll, "kernel", facts_input,),
+            GuardPlan::LoopFree
+        );
+    }
+
+    #[test]
+    fn exact_raw_header_proves_min_chunk_descending_loop_bounded() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %source) {
+entry:
+  %count.ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 24
+  %count = load i32, ptr addrspace(1) %count.ptr, align 4
+  %wide = zext i32 %count to i64
+  %bytes = shl i64 %wide, 4
+  br label %loop
+loop:
+  %remaining = phi i64 [ %bytes, %entry ], [ %next, %loop ]
+  %chunk = tail call i64 @air.min.u.i64(i64 %remaining, i64 1024)
+  %next = sub i64 %remaining, %chunk
+  %done = icmp eq i64 %next, 0
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+declare i64 @air.min.u.i64(i64, i64)
+"#;
+        let byte_values = [("source".to_string(), 24, 1)];
+        let facts_input = LoopInputFacts {
+            arg_byte_values: &byte_values,
+            ..LoopInputFacts::default()
+        };
+        let lines = ll.lines().collect::<Vec<_>>();
+        let facts = LoopFacts::from_module(&lines, &facts_input);
+        let function = find_functions(&lines).remove(0);
+        let body = &lines[function.define_idx + 1..function.close_idx];
+        let values = consteval_int_values(body, &facts);
+        assert_eq!(values.get("bytes"), Some(&16), "{values:?}");
+        assert_eq!(
+            classify_and_instrument_with_loop_input_facts(ll, "kernel", facts_input,),
+            GuardPlan::LoopFree
         );
     }
 
@@ -6943,6 +7355,15 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
             GuardPlan::LoopFree => {}
             other => panic!("expected fixed loops to be treated as bounded, got {other:?}"),
         }
+        assert_eq!(
+            reachable_module_has_cfg_cycle_with_loop_input_facts(
+                ll,
+                "fixed",
+                LoopInputFacts::default(),
+            ),
+            Ok(true),
+            "semantic safety gate must retain even proven finite CFG cycles"
+        );
     }
 
     #[test]

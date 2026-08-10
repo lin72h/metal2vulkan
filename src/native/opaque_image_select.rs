@@ -44,6 +44,7 @@ struct TreePlan {
 /// Replace a selected opaque image consumed only by explicit-LOD sampling with a select over the
 /// sampled value. Returns `true` only after the entire use closure has passed the strict gate.
 pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
+    let phi_changed = rewrite_opaque_image_phis(module);
     let type_defs: HashMap<Word, Instruction> = module
         .types_global_values
         .iter()
@@ -168,7 +169,7 @@ pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
     }
 
     if replacements.is_empty() {
-        return false;
+        return phi_changed;
     }
 
     for (function, func) in module.functions.iter_mut().enumerate() {
@@ -207,6 +208,500 @@ pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
         header.bound = next_id;
     }
     true
+}
+
+/// Lower a stale pointer-typed `OpPhi` whose incoming values are all the same image type into a
+/// plain integer tag phi. Every external use must be a pure image query/read with a non-opaque
+/// result; each use is replayed for every image arm and the ordinary results are selected by tag.
+/// This is the control-flow analogue of [`rewrite_opaque_image_selects`].
+fn rewrite_opaque_image_phis(module: &mut Module) -> bool {
+    let type_defs: HashMap<Word, Instruction> = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+        .collect();
+    let value_types: HashMap<Word, Word> = module
+        .all_inst_iter()
+        .filter_map(|inst| match (inst.result_id, inst.result_type) {
+            (Some(id), Some(ty)) => Some((id, ty)),
+            _ => None,
+        })
+        .collect();
+    let global_ids: HashSet<Word> = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    let mut positions = HashMap::new();
+    let mut uses: HashMap<Word, Vec<UseSite>> = HashMap::new();
+    for (function, func) in module.functions.iter().enumerate() {
+        for (block, blk) in func.blocks.iter().enumerate() {
+            for (instruction, inst) in blk.instructions.iter().enumerate() {
+                let site = Site {
+                    function,
+                    block,
+                    instruction,
+                };
+                if let Some(id) = inst.result_id {
+                    positions.insert(id, site);
+                }
+                for (operand, value) in inst.operands.iter().enumerate() {
+                    if let Operand::IdRef(id) = value {
+                        uses.entry(*id).or_default().push(UseSite { site, operand });
+                    }
+                }
+            }
+        }
+    }
+    let dominators = module
+        .functions
+        .iter()
+        .map(block_dominator_indices)
+        .collect::<Vec<_>>();
+    let value_dominates_site = |value: Word, site: Site| {
+        if global_ids.contains(&value) {
+            return true;
+        }
+        let Some(def) = positions.get(&value).copied() else {
+            return false;
+        };
+        if def.function != site.function {
+            return false;
+        }
+        if def.block == site.block {
+            return def.instruction < site.instruction;
+        }
+        dominators
+            .get(site.function)
+            .and_then(|function| function.get(site.block))
+            .is_some_and(|blocks| blocks.contains(&def.block))
+    };
+
+    let uint_ty = type_defs.iter().find_map(|(&id, inst)| {
+        (inst.class.opcode == Op::TypeInt
+            && matches!(
+                inst.operands.as_slice(),
+                [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]
+            ))
+        .then_some(id)
+    });
+    let bool_ty = type_defs
+        .iter()
+        .find_map(|(&id, inst)| (inst.class.opcode == Op::TypeBool).then_some(id));
+    let (Some(uint_ty), Some(bool_ty)) = (uint_ty, bool_ty) else {
+        return false;
+    };
+
+    #[derive(Clone)]
+    enum PhiConsumer {
+        Direct(UseSite),
+        Sampled {
+            sampled_site: Site,
+            sample_uses: Vec<UseSite>,
+        },
+    }
+
+    #[derive(Clone)]
+    struct PhiPlan {
+        site: Site,
+        result: Word,
+        arms: Vec<(Word, Word)>,
+        consumers: Vec<PhiConsumer>,
+    }
+
+    let mut plans = Vec::new();
+    for (function, func) in module.functions.iter().enumerate() {
+        for (block, blk) in func.blocks.iter().enumerate() {
+            for (instruction, inst) in blk.instructions.iter().enumerate() {
+                if inst.class.opcode != Op::Phi
+                    || !inst
+                        .result_type
+                        .is_some_and(|ty| is_pointer_type(&type_defs, ty))
+                {
+                    continue;
+                }
+                let Some(result) = inst.result_id else {
+                    continue;
+                };
+                let mut arms = Vec::new();
+                let mut image_ty = None;
+                let mut valid = inst.operands.len() >= 4 && inst.operands.len().is_multiple_of(2);
+                for pair in inst.operands.chunks_exact(2) {
+                    let (Operand::IdRef(value), Operand::IdRef(label)) = (&pair[0], &pair[1])
+                    else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(&ty) = value_types.get(value) else {
+                        valid = false;
+                        break;
+                    };
+                    if !is_image_type(&type_defs, ty)
+                        || image_ty.is_some_and(|expected| expected != ty)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    image_ty = Some(ty);
+                    arms.push((*value, *label));
+                }
+                if !valid {
+                    continue;
+                }
+                let Some(result_uses) = uses.get(&result) else {
+                    continue;
+                };
+                let mut consumers = Vec::new();
+                let mut consumers_valid = !result_uses.is_empty();
+                for use_site in result_uses {
+                    let Some(consumer) = instruction_at(module, use_site.site) else {
+                        consumers_valid = false;
+                        break;
+                    };
+                    if use_site.operand != 0 {
+                        consumers_valid = false;
+                        break;
+                    }
+                    if matches!(
+                        consumer.class.opcode,
+                        Op::ImageQuerySizeLod | Op::ImageQuerySize | Op::ImageFetch | Op::ImageRead
+                    ) && consumer.result_id.is_some()
+                        && consumer.result_type.is_some()
+                        && !consumer
+                            .result_type
+                            .is_some_and(|ty| is_opaque_type(&type_defs, ty))
+                        && arms
+                            .iter()
+                            .all(|(value, _)| value_dominates_site(*value, use_site.site))
+                    {
+                        consumers.push(PhiConsumer::Direct(*use_site));
+                        continue;
+                    }
+                    if consumer.class.opcode != Op::SampledImage {
+                        consumers_valid = false;
+                        break;
+                    }
+                    let Some(sampled_id) = consumer.result_id else {
+                        consumers_valid = false;
+                        break;
+                    };
+                    let Some(sample_uses) = uses.get(&sampled_id).cloned() else {
+                        consumers_valid = false;
+                        break;
+                    };
+                    let sampler = consumer.operands.get(1).and_then(|operand| match operand {
+                        Operand::IdRef(id) => Some(*id),
+                        _ => None,
+                    });
+                    if sample_uses.is_empty()
+                        || sampler.is_none()
+                        || sample_uses.iter().any(|sample_use| {
+                            sample_use.operand != 0
+                                || instruction_at(module, sample_use.site).is_none_or(|sample| {
+                                    sample.class.opcode != Op::ImageSampleExplicitLod
+                                        || sample.result_id.is_none()
+                                        || sample.result_type.is_none()
+                                        || sample
+                                            .result_type
+                                            .is_some_and(|ty| is_opaque_type(&type_defs, ty))
+                                })
+                                || arms.iter().any(|(value, _)| {
+                                    !value_dominates_site(*value, sample_use.site)
+                                })
+                                || !value_dominates_site(
+                                    sampler.expect("sampled-image sampler was gated"),
+                                    sample_use.site,
+                                )
+                        })
+                    {
+                        consumers_valid = false;
+                        break;
+                    }
+                    consumers.push(PhiConsumer::Sampled {
+                        sampled_site: use_site.site,
+                        sample_uses,
+                    });
+                }
+                if !consumers_valid {
+                    continue;
+                }
+                plans.push(PhiPlan {
+                    site: Site {
+                        function,
+                        block,
+                        instruction,
+                    },
+                    result,
+                    arms,
+                    consumers,
+                });
+            }
+        }
+    }
+    if plans.is_empty() {
+        return false;
+    }
+
+    let mut next_id = module
+        .header
+        .as_ref()
+        .map(|header| header.bound)
+        .unwrap_or(1);
+    let fresh = |next_id: &mut Word| {
+        let id = *next_id;
+        *next_id += 1;
+        id
+    };
+    let mut constants = HashMap::new();
+    for plan in &plans {
+        for ordinal in 0..plan.arms.len() as u32 {
+            constants.entry(ordinal).or_insert_with(|| {
+                module
+                    .types_global_values
+                    .iter()
+                    .find_map(|inst| {
+                        (inst.class.opcode == Op::Constant
+                            && inst.result_type == Some(uint_ty)
+                            && inst.operands.first() == Some(&Operand::LiteralBit32(ordinal)))
+                        .then_some(inst.result_id)
+                        .flatten()
+                    })
+                    .unwrap_or_else(|| fresh(&mut next_id))
+            });
+        }
+    }
+    let existing_ids: HashSet<Word> = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    let first_variable = module
+        .types_global_values
+        .iter()
+        .position(|inst| inst.class.opcode == Op::Variable)
+        .unwrap_or(module.types_global_values.len());
+    let mut new_constants = constants
+        .iter()
+        .filter(|(_, id)| !existing_ids.contains(id))
+        .map(|(&value, &id)| {
+            Instruction::new(
+                Op::Constant,
+                Some(uint_ty),
+                Some(id),
+                vec![Operand::LiteralBit32(value)],
+            )
+        })
+        .collect::<Vec<_>>();
+    new_constants.sort_by_key(|inst| inst.result_id);
+    module
+        .types_global_values
+        .splice(first_variable..first_variable, new_constants);
+
+    let mut replacements = HashMap::<Site, Vec<Instruction>>::new();
+    let mut removed_ids = HashSet::new();
+    for plan in plans {
+        let tag = fresh(&mut next_id);
+        let mut phi_operands = Vec::with_capacity(plan.arms.len() * 2);
+        for (ordinal, (_, label)) in plan.arms.iter().enumerate() {
+            phi_operands.push(Operand::IdRef(constants[&(ordinal as u32)]));
+            phi_operands.push(Operand::IdRef(*label));
+        }
+        replacements.insert(
+            plan.site,
+            vec![Instruction::new(
+                Op::Phi,
+                Some(uint_ty),
+                Some(tag),
+                phi_operands,
+            )],
+        );
+        removed_ids.insert(plan.result);
+
+        for consumer_plan in plan.consumers {
+            let (consumer, use_sites, sampled_template) = match consumer_plan {
+                PhiConsumer::Direct(use_site) => (
+                    instruction_at(module, use_site.site)
+                        .expect("opaque image phi consumer disappeared")
+                        .clone(),
+                    vec![use_site],
+                    None,
+                ),
+                PhiConsumer::Sampled {
+                    sampled_site,
+                    sample_uses,
+                } => {
+                    let sampled = instruction_at(module, sampled_site)
+                        .expect("opaque image phi sampled-image consumer disappeared")
+                        .clone();
+                    replacements.insert(sampled_site, Vec::new());
+                    if let Some(id) = sampled.result_id {
+                        removed_ids.insert(id);
+                    }
+                    (sampled, sample_uses, Some(sampled_site))
+                }
+            };
+            for use_site in use_sites {
+                let value_consumer = if sampled_template.is_some() {
+                    instruction_at(module, use_site.site)
+                        .expect("opaque image phi sample consumer disappeared")
+                        .clone()
+                } else {
+                    consumer.clone()
+                };
+                let result_ty = value_consumer
+                    .result_type
+                    .expect("gated image consumer result type");
+                let final_result = value_consumer
+                    .result_id
+                    .expect("gated image consumer result");
+                let mut out = Vec::new();
+                let mut arm_results = Vec::with_capacity(plan.arms.len());
+                for (image, _) in &plan.arms {
+                    let result = fresh(&mut next_id);
+                    let mut cloned = value_consumer.clone();
+                    cloned.result_id = Some(result);
+                    if sampled_template.is_some() {
+                        let sampled_result = fresh(&mut next_id);
+                        let mut sampled = consumer.clone();
+                        sampled.result_id = Some(sampled_result);
+                        sampled.operands[0] = Operand::IdRef(*image);
+                        out.push(sampled);
+                        cloned.operands[0] = Operand::IdRef(sampled_result);
+                    } else {
+                        cloned.operands[0] = Operand::IdRef(*image);
+                    }
+                    out.push(cloned);
+                    arm_results.push(result);
+                }
+                let mut selected = arm_results[0];
+                for ordinal in 1..arm_results.len() {
+                    let condition = fresh(&mut next_id);
+                    out.push(Instruction::new(
+                        Op::IEqual,
+                        Some(bool_ty),
+                        Some(condition),
+                        vec![
+                            Operand::IdRef(tag),
+                            Operand::IdRef(constants[&(ordinal as u32)]),
+                        ],
+                    ));
+                    let result = if ordinal + 1 == arm_results.len() {
+                        final_result
+                    } else {
+                        fresh(&mut next_id)
+                    };
+                    out.push(Instruction::new(
+                        Op::Select,
+                        Some(result_ty),
+                        Some(result),
+                        vec![
+                            Operand::IdRef(condition),
+                            Operand::IdRef(arm_results[ordinal]),
+                            Operand::IdRef(selected),
+                        ],
+                    ));
+                    selected = result;
+                }
+                replacements.insert(use_site.site, out);
+            }
+        }
+    }
+
+    for (function, func) in module.functions.iter_mut().enumerate() {
+        for (block, blk) in func.blocks.iter_mut().enumerate() {
+            let old = std::mem::take(&mut blk.instructions);
+            let mut rebuilt = Vec::with_capacity(old.len());
+            for (instruction, inst) in old.into_iter().enumerate() {
+                let site = Site {
+                    function,
+                    block,
+                    instruction,
+                };
+                if let Some(replacement) = replacements.remove(&site) {
+                    rebuilt.extend(replacement);
+                } else {
+                    rebuilt.push(inst);
+                }
+            }
+            blk.instructions = rebuilt;
+        }
+    }
+    let targets_removed = |inst: &Instruction| matches!(inst.operands.first(), Some(Operand::IdRef(id)) if removed_ids.contains(id));
+    module.debug_names.retain(|inst| !targets_removed(inst));
+    module.annotations.retain(|inst| !targets_removed(inst));
+    if let Some(header) = module.header.as_mut() {
+        header.bound = next_id;
+    }
+    true
+}
+
+fn block_dominator_indices(function: &crate::spirv_module::Function) -> Vec<HashSet<usize>> {
+    let labels = function
+        .blocks
+        .iter()
+        .map(|block| block.label.as_ref().and_then(|label| label.result_id))
+        .collect::<Vec<_>>();
+    let by_label = labels
+        .iter()
+        .enumerate()
+        .filter_map(|(index, label)| label.map(|label| (label, index)))
+        .collect::<HashMap<_, _>>();
+    let mut predecessors = vec![Vec::new(); function.blocks.len()];
+    for (index, block) in function.blocks.iter().enumerate() {
+        let Some(terminator) = block.instructions.last() else {
+            continue;
+        };
+        let successors = match terminator.class.opcode {
+            Op::Branch => terminator.operands.first().into_iter().collect::<Vec<_>>(),
+            Op::BranchConditional => terminator
+                .operands
+                .get(1..3)
+                .unwrap_or_default()
+                .iter()
+                .collect(),
+            Op::Switch => terminator
+                .operands
+                .iter()
+                .skip(1)
+                .enumerate()
+                .filter_map(|(operand, value)| operand.is_multiple_of(2).then_some(value))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for successor in successors {
+            if let Operand::IdRef(label) = successor {
+                if let Some(&target) = by_label.get(label) {
+                    predecessors[target].push(index);
+                }
+            }
+        }
+    }
+    let all = (0..function.blocks.len()).collect::<HashSet<_>>();
+    let mut dominators = vec![all; function.blocks.len()];
+    if dominators.is_empty() {
+        return dominators;
+    }
+    dominators[0] = HashSet::from([0]);
+    loop {
+        let mut changed = false;
+        for block in 1..function.blocks.len() {
+            if predecessors[block].is_empty() {
+                continue;
+            }
+            let mut next = dominators[predecessors[block][0]].clone();
+            for predecessor in predecessors[block].iter().skip(1) {
+                next.retain(|candidate| dominators[*predecessor].contains(candidate));
+            }
+            next.insert(block);
+            if dominators[block] != next {
+                dominators[block] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            return dominators;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

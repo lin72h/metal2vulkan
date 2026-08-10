@@ -636,7 +636,7 @@ fn reflection_serde_round_trips() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn reflection_serde_covers_every_v3_field() {
+fn reflection_serde_covers_every_v4_field() {
     // R6: the persisted-cache contract. Build a reflection with EVERY field populated to a
     // non-default value — including the translate-path-only fields a stage builder never fills
     // (function_constants, datalayout, imageblock_layouts) and the storage-format / embedded-source
@@ -657,6 +657,7 @@ fn reflection_serde_covers_every_v3_field() {
                 param_index: Some(0),
                 address_space: Some(2),
                 declared_size: Some(64),
+                extent: Some(BufferExtent::Object { bytes: 64 }),
                 type_layout: Some(AirType::Vec {
                     scalar: AirScalar::Float,
                     lanes: 4,
@@ -674,6 +675,7 @@ fn reflection_serde_covers_every_v3_field() {
                 param_index: None,
                 address_space: None,
                 declared_size: None,
+                extent: None,
                 type_layout: None,
                 type_name: Some("texture2d<float, write>".to_string()),
                 texture_shape: Some(storage_tex),
@@ -691,6 +693,7 @@ fn reflection_serde_covers_every_v3_field() {
                 param_index: None,
                 address_space: None,
                 declared_size: None,
+                extent: None,
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
@@ -744,6 +747,50 @@ fn reflection_serde_covers_every_v3_field() {
     let back: ShaderReflection = serde_json::from_str(&json).expect("deserialize reflection");
     assert_eq!(r, back);
     assert_eq!(back.reflection_version, REFLECTION_VERSION);
+}
+
+#[test]
+fn buffer_reflection_exports_extent_type_size_and_refined_access() {
+    let ll = r#"
+define { float } @f(ptr addrspace(2) readonly %object, ptr addrspace(1) readonly %array, ptr addrspace(1) %unused) {
+entry:
+  %a = load float, ptr addrspace(2) %object, align 4
+  %b = load float, ptr addrspace(1) %array, align 4
+  %sum = fadd float %a, %b
+  %result = insertvalue { float } undef, float %sum, 0
+  ret { float } %result
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float"}
+!3 = !{!4, !5, !6}
+!4 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_name", !"Params"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float"}
+!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"void"}
+"#;
+    let meta = parse_air_fragment_meta(ll).expect("fragment metadata");
+    let mut reflection = ShaderReflection::from_fragment(&meta, Some("f"));
+    reflection.refine_buffer_access_from_entry(ll);
+
+    let object = reflection.binding_at(ResourceKind::Buffer, 0).unwrap();
+    assert_eq!(object.declared_size, Some(16));
+    assert_eq!(object.extent, Some(BufferExtent::Object { bytes: 16 }));
+    assert_eq!(object.type_name.as_deref(), Some("Params"));
+    assert_eq!(object.access, Some(ResourceAccess::ReadOnly));
+
+    let array = reflection.binding_at(ResourceKind::Buffer, 1).unwrap();
+    assert_eq!(array.declared_size, Some(4));
+    assert_eq!(array.extent, Some(BufferExtent::Unbounded));
+    assert_eq!(array.type_name.as_deref(), Some("float"));
+    assert_eq!(array.access, Some(ResourceAccess::ReadOnly));
+
+    let unused = reflection.binding_at(ResourceKind::Buffer, 2).unwrap();
+    assert_eq!(unused.declared_size, None);
+    assert_eq!(unused.extent, Some(BufferExtent::Unbounded));
+    assert_eq!(unused.type_name.as_deref(), Some("void"));
+    assert_eq!(unused.access, Some(ResourceAccess::Unused));
 }
 
 #[test]

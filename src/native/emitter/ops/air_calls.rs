@@ -165,25 +165,6 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
         match call.callee.as_str() {
-            // `air.get_null_texture_<dim>()` yields a NULL texture handle. In the MPS NDArray
-            // kernels (TopK/pooling/FFT-chirp) the result is stored into a vestigial `texture2d`
-            // field of an `_MPSKernelInOut`/`MPSNDArrays` wrapper struct and forwarded to an
-            // inlined helper, but NEVER sampled/read (these are pure buffer-compute kernels). Model
-            // it as an unmodeled null pointer so the downstream store/forward validates; byte-safe
-            // by construction because the handle is never dereferenced. Dispatches on a stable
-            // `air.*` ABI symbol, not on a shader name.
-            callee if callee.starts_with("air.get_null_texture") => {
-                let result_ty = self.resolve_type(&call.ret)?;
-                let LlType::Ptr(addrspace) = result_ty else {
-                    return Err(format!(
-                        "native emitter: {} returned non-pointer {result_ty:?}",
-                        call.callee
-                    ));
-                };
-                self.define_unmodeled_byte_pointer_value(name, addrspace)?;
-                self.null_texture_values.insert(name.to_string());
-                Ok(true)
-            }
             // `air.is_null_texture_<dim>(%tex)` asks whether a texture handle is the null texture.
             // We consume it HERE only when `%tex` is a value we ourselves synthesized from
             // `air.get_null_texture_*` (tracked in `null_texture_values`): that value never crosses

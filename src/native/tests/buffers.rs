@@ -1865,6 +1865,58 @@ entry:
 }
 
 #[test]
+fn native_inline_raw_buffer_gep_argument_keeps_descriptor_root_and_offset() {
+    let ll = r#"
+target triple = "air64-apple-macosx14.0.0"
+
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %shifted = getelementptr inbounds i32, ptr addrspace(1) %out, i64 4
+  tail call fastcc void @helper(ptr addrspace(1) %shifted)
+  ret void
+}
+
+define internal fastcc void @helper(ptr addrspace(1) %dst) {
+entry:
+  store i32 7, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_inline_raw_buffer_gep_arg_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("Binding 0").count(), 1, "{asm}");
+    assert!(
+        !asm.lines()
+            .any(|line| line.contains("OpVariable %_ptr_Private_uint Private")),
+        "offset helper store must remain descriptor-backed:\n{asm}"
+    );
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpInBoundsAccessChain")),
+        "descriptor-backed helper store must preserve the four-word offset:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn native_indirect_helper_gep_drops_signed_zero_record_index() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

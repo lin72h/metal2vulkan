@@ -250,11 +250,11 @@ Candidate statuses:
 |---|---|---|
 | `ok` | exact byte match | leave it alone |
 | `tolerance` | float-like output is within recorded tolerance | accepted; leave it alone unless the policy is wrong |
-| `smoke` | candidate executed and captured bytes, but the Metal row is `compare=none` rather than a semantic golden | accepted as an execution smoke; rebank Metal for semantic comparison |
+| `smoke` | legacy candidate row derived from a Metal `compare=none` bounded-smoke row | non-semantic; quarantine it and rebank Metal before candidate execution |
 | `failure` | candidate ran and produced bytes, but they do not match / exceed tolerance | inspect output class; reduce to a synthetic test when possible |
 | `fallback` | translate, bind, pipeline creation, dispatch, readback, or harness panic before comparable bytes | inspect `error`; usually a harness or executor gap |
 | `missing` | no usable Metal golden for this hash | rerun/fix `corpus-run-metal` first |
-| `quarantine` | Metal loop guard refused to dispatch | do not force GPU execution; improve loop-budget proof or accept quarantine |
+| `quarantine` | no safe semantic Metal oracle (including loop-guarded, transformed, or historic `compare=none` work) | do not force GPU execution; improve the proof/harness or accept quarantine |
 | `timeout` | worker process exceeded `METAL2VULKAN_CORPUS_TIMEOUT_SECS` | rerun single-case with `--jobs 1`; treat persistent timeouts as harness/tool hangs |
 
 Use `corpus-triage` to see the current queue:
@@ -270,6 +270,34 @@ cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
 
 On macOS, validation's Metal oracle and MoltenVK-backed runner are machine-specific. On Linux, use
 a native Vulkan ICD. Treat execution as **layer E**, not the daily default.
+
+Only a Metal `status=ok`, `compare=full` row with captured output bytes is a semantic oracle.
+Bounded loop instrumentation and implicit imageblock substitution remain useful compile-only
+preflights, but the Metal runner quarantines them instead of submitting transformed work or banking
+its bytes. Candidate runners propagate that quarantine without GPU submission; they never treat a
+historic `compare=none` row as exact, tolerance, or smoke evidence.
+
+Targeted recovery of historic `compare=none` rows is deliberately two-step:
+
+```sh
+# Compile through Metal PSO creation without creating/submitting a command buffer. The ledger is
+# unchanged; the output list contains only structurally semantic, successfully compiled rows.
+cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- \
+  --air-list selected-hashes.txt --force --preflight-only \
+  --preflight-safe-list preflight-safe.txt
+
+# Only an explicit hash/list may opt historic compare=none rows into semantic reminting.
+cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- \
+  --air-list preflight-safe.txt --force --remint-compare-none
+```
+
+The preflight source gate rejects unsupported standalone ABIs, unsafe synthetic input
+configurations, CFG-analysis refusals, and every reachable CFG cycle before invoking Apple tools.
+It is intentionally stricter than the bounded-loop instrumentation classifier: a finite trip count
+alone does not prove a quantitative aggregate GPU-time bound. For large private corpora, split the
+hash list by its existing corpus shards so each source-analysis process releases parser memory
+before the next shard; do not run several shard-wide Metal preflights concurrently on a
+memory-constrained host.
 
 ### 7. Agent loop over ledger failures
 

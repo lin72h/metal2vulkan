@@ -37,6 +37,7 @@ use vulkano::memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, Standar
 use vulkano::pipeline::compute::ComputePipelineCreateInfo;
 use vulkano::pipeline::graphics::color_blend::{
     AttachmentBlend, BlendFactor, BlendOp, ColorBlendAttachmentState, ColorBlendState,
+    ColorComponents,
 };
 use vulkano::pipeline::graphics::depth_stencil::{CompareOp, DepthState, DepthStencilState};
 use vulkano::pipeline::graphics::input_assembly::InputAssemblyState;
@@ -197,6 +198,16 @@ pub(crate) fn fragment_writes_color_location(spv: &[u8], location: u32) -> bool 
 }
 
 fn fragment_color_output_locations(spv: &[u8]) -> Vec<u32> {
+    fragment_color_output_component_counts(spv)
+        .into_keys()
+        .collect()
+}
+
+fn fragment_color_output_component_counts(spv: &[u8]) -> HashMap<u32, u32> {
+    const OP_TYPE_INT: u32 = 21;
+    const OP_TYPE_FLOAT: u32 = 22;
+    const OP_TYPE_VECTOR: u32 = 23;
+    const OP_TYPE_STRUCT: u32 = 30;
     const OP_TYPE_POINTER: u32 = 32;
     const OP_VARIABLE: u32 = 59;
     const OP_DECORATE: u32 = 71;
@@ -205,10 +216,12 @@ fn fragment_color_output_locations(spv: &[u8]) -> Vec<u32> {
     const STORAGE_CLASS_OUTPUT: u32 = 3;
 
     let Ok(words) = bytes_to_words(spv) else {
-        return Vec::new();
+        return HashMap::new();
     };
     let mut variable_locations = HashMap::new();
-    let mut member_locations: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut member_locations = HashMap::new();
+    let mut type_component_counts = HashMap::new();
+    let mut struct_member_types: HashMap<u32, Vec<u32>> = HashMap::new();
     let mut pointer_pointees = HashMap::new();
     let mut output_variables = Vec::new();
     let mut index = 5usize;
@@ -217,9 +230,21 @@ fn fragment_color_output_locations(spv: &[u8]) -> Vec<u32> {
         let word_count = (word >> 16) as usize;
         let opcode = word & 0xffff;
         if word_count == 0 || index + word_count > words.len() {
-            return Vec::new();
+            return HashMap::new();
         }
         match opcode {
+            OP_TYPE_INT | OP_TYPE_FLOAT if word_count >= 3 => {
+                type_component_counts.insert(words[index + 1], 1);
+            }
+            OP_TYPE_VECTOR if word_count >= 4 => {
+                type_component_counts.insert(words[index + 1], words[index + 3]);
+            }
+            OP_TYPE_STRUCT if word_count >= 2 => {
+                struct_member_types.insert(
+                    words[index + 1],
+                    words[index + 2..index + word_count].to_vec(),
+                );
+            }
             OP_TYPE_POINTER if word_count >= 4 => {
                 pointer_pointees.insert(words[index + 1], words[index + 3]);
             }
@@ -230,31 +255,41 @@ fn fragment_color_output_locations(spv: &[u8]) -> Vec<u32> {
                 variable_locations.insert(words[index + 1], words[index + 3]);
             }
             OP_MEMBER_DECORATE if word_count >= 5 && words[index + 3] == DECORATION_LOCATION => {
-                member_locations
-                    .entry(words[index + 1])
-                    .or_default()
-                    .push(words[index + 4]);
+                member_locations.insert((words[index + 1], words[index + 2]), words[index + 4]);
             }
             _ => {}
         }
         index += word_count;
     }
 
-    let mut out = output_variables
-        .into_iter()
-        .flat_map(|(variable_id, pointer_type_id)| {
-            let direct = variable_locations.get(&variable_id).copied().into_iter();
-            let members = pointer_pointees
-                .get(&pointer_type_id)
-                .and_then(|pointee_id| member_locations.get(pointee_id))
-                .into_iter()
-                .flatten()
-                .copied();
-            direct.chain(members).collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    out.sort_unstable();
-    out.dedup();
+    let mut out = HashMap::new();
+    for (variable_id, pointer_type_id) in output_variables {
+        let Some(&pointee_id) = pointer_pointees.get(&pointer_type_id) else {
+            continue;
+        };
+        if let Some(&location) = variable_locations.get(&variable_id) {
+            if let Some(&count) = type_component_counts.get(&pointee_id) {
+                out.entry(location)
+                    .and_modify(|seen: &mut u32| *seen = (*seen).max(count))
+                    .or_insert(count);
+            }
+            continue;
+        }
+        let Some(member_types) = struct_member_types.get(&pointee_id) else {
+            continue;
+        };
+        for (member, type_id) in member_types.iter().copied().enumerate() {
+            let Some(&location) = member_locations.get(&(pointee_id, member as u32)) else {
+                continue;
+            };
+            let Some(&count) = type_component_counts.get(&type_id) else {
+                continue;
+            };
+            out.entry(location)
+                .and_modify(|seen: &mut u32| *seen = (*seen).max(count))
+                .or_insert(count);
+        }
+    }
     out
 }
 
@@ -1230,8 +1265,12 @@ pub fn device_and_queue_result(
     if physical_device.supported_features().sample_rate_shading {
         enabled_features.sample_rate_shading = true;
     }
+    if physical_device.supported_features().independent_blend {
+        enabled_features.independent_blend = true;
+    }
     let enabled_extensions = DeviceExtensions {
         ext_shader_atomic_float: true,
+        ext_filter_cubic: physical_device.supported_extensions().ext_filter_cubic,
         ext_shader_stencil_export: physical_device
             .supported_extensions()
             .ext_shader_stencil_export,
@@ -1280,7 +1319,7 @@ fn compute_pipeline(device: Arc<Device>, spv: &[u8]) -> Result<Arc<ComputePipeli
         None,
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
-    .map_err(|error| format!("create compute pipeline: {error}"))
+    .map_err(|error| format!("create compute pipeline: {error} ({error:?})"))
 }
 
 #[derive(Clone, Debug)]
@@ -1333,10 +1372,19 @@ fn graphics_pipeline(
     create_info.color_blend_state = if target.color_attachment_formats.is_empty() {
         None
     } else {
-        Some(ColorBlendState::with_attachment_states(
-            target.color_attachment_formats.len() as u32,
-            color_blend_attachment(blend),
-        ))
+        let component_counts = fragment_color_output_component_counts(fragment_spv);
+        let attachments = target
+            .color_attachment_formats
+            .iter()
+            .enumerate()
+            .map(|(location, _)| {
+                color_blend_attachment(blend, component_counts.get(&(location as u32)).copied())
+            })
+            .collect();
+        Some(ColorBlendState {
+            attachments,
+            ..Default::default()
+        })
     };
     let color_attachment_formats = target
         .color_attachment_formats
@@ -1923,8 +1971,17 @@ fn vertex_validation_viewport_state() -> Option<ViewportState> {
     None
 }
 
-fn color_blend_attachment(blend: BlendMode) -> ColorBlendAttachmentState {
-    match blend {
+fn color_blend_attachment(
+    blend: BlendMode,
+    output_component_count: Option<u32>,
+) -> ColorBlendAttachmentState {
+    let color_write_mask = match output_component_count {
+        Some(1) => ColorComponents::R,
+        Some(2) => ColorComponents::R | ColorComponents::G,
+        Some(3) => ColorComponents::R | ColorComponents::G | ColorComponents::B,
+        _ => ColorComponents::all(),
+    };
+    let mut state = match blend {
         BlendMode::Replace => ColorBlendAttachmentState::default(),
         BlendMode::SourceOver => ColorBlendAttachmentState {
             blend: Some(AttachmentBlend {
@@ -1937,7 +1994,9 @@ fn color_blend_attachment(blend: BlendMode) -> ColorBlendAttachmentState {
             }),
             ..ColorBlendAttachmentState::default()
         },
-    }
+    };
+    state.color_write_mask = color_write_mask;
+    state
 }
 
 fn shader_stage(device: Arc<Device>, spv: &[u8]) -> PipelineShaderStageCreateInfo {
@@ -2881,6 +2940,19 @@ fn texture_binding_req_for_index(
     })
 }
 
+fn placeholder_texture_binding_req_for_index(
+    reqs: &HashMap<u32, TextureBindingReq>,
+    index: u32,
+) -> Option<&TextureBindingReq> {
+    reqs.values()
+        .filter(|req| {
+            index >= req.index && index < req.index.saturating_add(req.descriptor_count.max(1))
+        })
+        // An explicit storage-image format is a hard SPIR-V constraint; a sampled-image scalar
+        // class is only a format-family hint. Prefer the former when descriptor arrays overlap.
+        .min_by_key(|req| (req.image_format.is_none(), !req.needs_storage, req.index))
+}
+
 fn texture_binding_mutable_format_flag(
     reqs: &HashMap<u32, TextureBindingReq>,
     index: u32,
@@ -3270,16 +3342,18 @@ fn append_texture_placeholders(
     spv: &[u8],
     textures: &mut Vec<TextureResource>,
 ) {
-    for req in required_texture_bindings(device, spv).into_values() {
-        let view_type = req.image_view_type.unwrap_or(ImageViewType::Dim2d);
-        let (image_type, array_layers, flags) = placeholder_image_shape(view_type);
-        let format = placeholder_format(&req);
-        let extent = [1u32, 1, 1];
-        let usage = ImageUsage::TRANSFER_DST
-            | ImageUsage::TRANSFER_SRC
-            | texture_binding_image_usage(Some(&req));
+    let reqs = required_texture_bindings(device, spv);
+    for req in reqs.values() {
         for offset in 0..req.descriptor_count {
             let index = req.index + offset;
+            let image_req = placeholder_texture_binding_req_for_index(&reqs, index).unwrap_or(req);
+            let view_type = image_req.image_view_type.unwrap_or(ImageViewType::Dim2d);
+            let (image_type, array_layers, flags) = placeholder_image_shape(view_type);
+            let format = placeholder_format(image_req);
+            let extent = [1u32, 1, 1];
+            let usage = ImageUsage::TRANSFER_DST
+                | ImageUsage::TRANSFER_SRC
+                | texture_binding_image_usage_for_index(&reqs, index);
             if textures.iter().any(|texture| texture.index == index) {
                 continue;
             }
@@ -3380,8 +3454,18 @@ fn texture_view_for_req(
         }
         _ => {}
     }
-    ImageView::new(texture.image.clone(), view_info)
-        .unwrap_or_else(|e| panic!("create descriptor texture view {}: {e}", texture.index))
+    let descriptor_format = view_info.format;
+    ImageView::new(texture.image.clone(), view_info).unwrap_or_else(|e| {
+        panic!(
+            "create descriptor texture view {} (image_format={:?}, descriptor_format={:?}, \
+             image_flags={:?}, requirement={:?}): {e:?}",
+            texture.index,
+            texture.image.format(),
+            descriptor_format,
+            texture.image.flags(),
+            req
+        )
+    })
 }
 
 fn descriptor_view_format(parent_format: Format, req: Option<&TextureBindingReq>) -> Format {
@@ -3822,9 +3906,21 @@ fn descriptor_set(
     let static_samplers = static_sampler_binding_states(sanitized_ll)
         .into_iter()
         .map(|(binding, state)| {
-            let sampler = Sampler::new(device.clone(), state.create_info()).unwrap_or_else(|e| {
+            let mut create_info = state.create_info();
+            // The product lowers every supported AIR bicubic sample to explicit Catmull-Rom
+            // fetches, but its now-dead static sampler descriptor can remain in the reflected
+            // layout. MoltenVK does not expose EXT_filter_cubic, so use a legal placeholder for
+            // that unobserved descriptor. Unsupported bicubic shapes fail translation above.
+            if create_info.min_filter == Filter::Cubic
+                && !device.enabled_extensions().ext_filter_cubic
+                && !device.enabled_extensions().img_filter_cubic
+            {
+                create_info.min_filter = Filter::Nearest;
+                create_info.mag_filter = Filter::Nearest;
+            }
+            let sampler = Sampler::new(device.clone(), create_info).unwrap_or_else(|e| {
                 panic!(
-                    "create static sampler for AIR word {:#x} binding {binding}: {e}",
+                    "create static sampler for AIR word {:#x} binding {binding}: {e:?}",
                     state.word
                 )
             });
@@ -3978,10 +4074,10 @@ impl StaticSamplerState {
                 decode_air_sampler_address((word >> 3) & 0x7),
                 decode_air_sampler_address((word >> 6) & 0x7),
             ],
-            filter: if word & 0x0a00 == 0x0a00 {
-                Filter::Linear
-            } else {
-                Filter::Nearest
+            filter: match ((word >> 11) & 0x3, (word >> 9) & 0x3) {
+                (2, 2) => Filter::Cubic,
+                (1, 1) => Filter::Linear,
+                _ => Filter::Nearest,
             },
             unnormalized_coordinates: word & 0x8000 != 0,
         }
@@ -4195,6 +4291,28 @@ mod tests {
 
     fn spirv_bytes(words: &[u32]) -> Vec<u8> {
         words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn fragment_rgb_output_limits_color_write_mask_to_declared_components() {
+        let mut words = vec![0x0723_0203, 0x0001_0300, 0, 8, 0];
+        words.extend(spirv_inst(22, &[1, 16])); // %1 = OpTypeFloat 16
+        words.extend(spirv_inst(23, &[2, 1, 3])); // %2 = OpTypeVector %1 3
+        words.extend(spirv_inst(32, &[3, 3, 2])); // %3 = Output pointer to %2
+        words.extend(spirv_inst(59, &[3, 4, 3])); // %4 = output variable
+        words.extend(spirv_inst(71, &[4, 30, 0])); // Location 0
+        let spv = spirv_bytes(&words);
+
+        assert_eq!(
+            fragment_color_output_component_counts(&spv).get(&0),
+            Some(&3)
+        );
+        let state = color_blend_attachment(BlendMode::Replace, Some(3));
+        assert_eq!(
+            state.color_write_mask,
+            ColorComponents::R | ColorComponents::G | ColorComponents::B
+        );
+        assert!(!state.color_write_mask.intersects(ColorComponents::A));
     }
 
     #[test]
@@ -4516,6 +4634,38 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_texture_array_requirements_combine_image_usage() {
+        let sampled = TextureBindingReq {
+            index: 0,
+            descriptor_count: 128,
+            needs_sampled: true,
+            needs_storage: false,
+            image_format: None,
+            image_scalar_type: Some(NumericType::Float),
+            image_view_type: Some(ImageViewType::Dim2d),
+        };
+        let storage = TextureBindingReq {
+            index: 8,
+            descriptor_count: 128,
+            needs_sampled: false,
+            needs_storage: true,
+            image_format: Some(Format::R32_SFLOAT),
+            image_scalar_type: Some(NumericType::Float),
+            image_view_type: Some(ImageViewType::Dim2d),
+        };
+        let reqs = HashMap::from([(0, sampled), (8, storage)]);
+
+        let usage = texture_binding_image_usage_for_index(&reqs, 16);
+
+        assert!(usage.intersects(ImageUsage::SAMPLED));
+        assert!(usage.intersects(ImageUsage::STORAGE));
+        assert_eq!(
+            placeholder_texture_binding_req_for_index(&reqs, 16).map(|req| req.index),
+            Some(8)
+        );
+    }
+
+    #[test]
     fn reflected_sampled_image_array_requirement_overrides_later_texture_format() {
         let req = TextureBindingReq {
             index: 0,
@@ -4629,6 +4779,18 @@ mod tests {
         assert_eq!(states[0].address_mode, [SamplerAddressMode::ClampToEdge; 3]);
         assert_eq!(states[0].filter, Filter::Linear);
         assert!(!states[0].unnormalized_coordinates);
+    }
+
+    #[test]
+    fn static_sampler_state_decodes_bicubic_filter_bits() {
+        let states = static_sampler_states(
+            r#"@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 562249, i64 0], align 8"#,
+        );
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].address_mode, [SamplerAddressMode::ClampToEdge; 3]);
+        assert_eq!(states[0].filter, Filter::Cubic);
+        assert!(states[0].unnormalized_coordinates);
     }
 
     #[test]

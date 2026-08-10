@@ -70,24 +70,19 @@ impl Ctx {
     /// Lazily create a default (null) 2D float texture resource for `air.get_null_texture_2d()`.
     /// Metal's `[[function_constant]]`-gated optional attachments resolve (with our FCs folded off) to
     /// a "null texture" the shader still threads through phis and may sample (yielding 0). We bind one
-    /// real `OpTypeImage` 2D-float UniformConstant variable (past every assigned binding) and load it;
+    /// real `OpTypeImage` 2D-float UniformConstant variable in a free texture-ABI binding and load it;
     /// sampling it is valid (reads as the unbound-descriptor default). Memoized across all uses so the
     /// phi-merged values share one image id and type.
-    pub(in crate::passes) fn default_null_image_of(&mut self, dim: Dim, arrayed: bool) -> Word {
+    pub(in crate::passes) fn default_null_image_of(
+        &mut self,
+        dim: Dim,
+        arrayed: bool,
+    ) -> Result<Word, String> {
         if let Some(&v) = self.default_null_image_vars.get(&(dim, arrayed)) {
-            return v;
+            return Ok(v);
         }
-        let mut max_binding: i64 = -1;
-        for ann in &self.module.annotations {
-            if ann.class.opcode == Op::Decorate
-                && ann.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
-            {
-                if let Some(Operand::LiteralBit32(b)) = ann.operands.get(2) {
-                    max_binding = max_binding.max(*b as i64);
-                }
-            }
-        }
-        let binding = (max_binding + 1) as u32;
+        let binding = allocate_default_texture_binding(&self.module)
+            .ok_or_else(|| "no free texture binding for synthesized null image".to_string())?;
         let img_ty = self.ty_image(dim, arrayed, ImageComp::Float);
         let pptr = self.ty_ptr(StorageClass::UniformConstant, img_ty);
         let var = self.module.fresh_id();
@@ -100,7 +95,7 @@ impl Ctx {
         decorate_binding(&mut self.module, var, binding);
         self.interface_buffer_var(var);
         self.default_null_image_vars.insert((dim, arrayed), var);
-        var
+        Ok(var)
     }
 
     /// A constant/undef of `ty` for unused params (OpUndef is always legal).

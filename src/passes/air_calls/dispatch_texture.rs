@@ -912,7 +912,7 @@ pub(in crate::passes) fn lower_get_null_texture(
     } else {
         (Dim::Dim2D, false)
     };
-    let var = ctx.default_null_image_of(dim, arrayed);
+    let var = ctx.default_null_image_of(dim, arrayed)?;
     let img_ty = ctx.ty_image(dim, arrayed, crate::passes::ImageComp::Float);
     ctx.image_dims.insert(res, (dim, arrayed));
     ctx.image_comp.insert(res, crate::passes::ImageComp::Float);

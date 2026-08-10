@@ -212,6 +212,13 @@ pub(super) fn rewrite_integer_width_phis(module: &mut Module) -> bool {
         if let Some(header) = module.header.as_mut() {
             header.bound = next_id;
         }
+        // A pointer induction can start from a narrow zero index while its derived back-edge
+        // address has already been widened to the platform index width.  Phi-the-index preserves
+        // those operands, so legalize the synthesized integer phi before the caller validates the
+        // portability candidate.  Without this, the otherwise-useful pointer-phi rewrite is
+        // discarded and SPIRV-Cross later tries to materialize a StorageBuffer pointer phi as an
+        // invalid MSL pointer-from-lvalue initialization.
+        rewrite_integer_width_phis(module);
     }
     any
 }

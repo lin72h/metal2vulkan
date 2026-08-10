@@ -53,7 +53,6 @@ pub(crate) fn primary_wide_raw_store_guard_cfg_chain_if_needed(
                 retry.prune_then_relooper(spv),
             )
         })
-        .or_else(|| retry.census("val-cfg:relooper_huge", retry.relooper_retry_huge(spv)))
         .or_else(|| {
             retry.census(
                 "val-cfg:relooper_then_value_select",
@@ -492,10 +491,11 @@ pub(crate) fn primary_logical_pointer_inline_sroa_raw_if_needed(
         .then_some(primary)
 }
 
-/// Move a stale opaque-image select into its pure explicit-LOD sampling consumers only after the raw
-/// primary reports the broad `Other` select-type diagnostic. The post-emit pass requires an image-only
-/// select tree and rejects every non-sampling opaque use, so it cannot turn a pointer repair into a
-/// resource-policy guess. The result is retained only after independent spirv-val.
+/// Move a stale opaque-image select/phi into its pure sampling/query consumers after the raw primary
+/// reports either the broad `Other` select diagnostic or the exact pointer-result/image-incoming phi
+/// mismatch. The post-emit pass requires a fully image-only merge and rejects every write, sparse,
+/// opaque, or non-dominating use, so it cannot turn a pointer repair into a resource-policy guess.
+/// The result is retained only after independent spirv-val.
 /// `finish_module` has already loaded, transformed, and canonicalized this module; clone that
 /// retained carrier for the speculative rewrite instead of reparsing its just-assembled bytes.
 pub(crate) fn primary_opaque_image_select_module_if_needed(
@@ -504,7 +504,11 @@ pub(crate) fn primary_opaque_image_select_module_if_needed(
     spv: &[u8],
     tmp: &Path,
 ) -> Option<Vec<u8>> {
-    if native::classify_validation_error(validation_error) != native::ValidationClass::Other {
+    let class = native::classify_validation_error(validation_error);
+    let opaque_phi_mismatch = class == native::ValidationClass::PointerTyping
+        && validation_error.contains("OpPhi's result type")
+        && validation_error.contains("does not match incoming value");
+    if class != native::ValidationClass::Other && !opaque_phi_mismatch {
         return None;
     }
     let mut primary_module = module.clone();

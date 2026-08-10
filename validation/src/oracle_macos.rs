@@ -12,7 +12,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use metal2vulkan::meta::{FragRole, KernRole, VertRole};
+use metal2vulkan::meta::{FragRole, KernRole, VertOutRole, VertRole};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSArray, NSString, NSURL};
@@ -52,6 +52,7 @@ using namespace metal;
 struct Metal2VulkanValidationVertexOut {
     float4 position [[position]];
     float2 coord [[user(coord)]];
+    uint viewport [[viewport_array_index]];
 };
 
 vertex Metal2VulkanValidationVertexOut metal2vulkan_validation_fullscreen_vertex(uint vid [[vertex_id]]) {
@@ -68,6 +69,7 @@ vertex Metal2VulkanValidationVertexOut metal2vulkan_validation_fullscreen_vertex
     Metal2VulkanValidationVertexOut out;
     out.position = float4(positions[vid], 0.0, 1.0);
     out.coord = coords[vid];
+    out.viewport = 0;
     return out;
 }
 "#;
@@ -88,6 +90,7 @@ pub fn execute_metallib_blob(
     inputs: &crate::Inputs,
     sanitized_ll: &str,
     source_metallib: Option<&Path>,
+    submit_gpu: bool,
 ) -> Vec<u8> {
     autoreleasepool(|_| {
         let tmp = scratch_dir_for("oracle-metallib");
@@ -122,17 +125,28 @@ pub fn execute_metallib_blob(
             .unwrap_or_else(|e| panic!("m2v-quarantine: metal-objdump failed: {e}"));
         let missing_visible_refs =
             missing_visible_function_reference_names(sanitized_ll, &module_text);
-        let zero_init = if sanitized_ll.contains("addrspace(3)") {
-            insert_threadgroup_zero_init(&module_text, function_name)
+        let rgb_widened = if stage == Stage::Fragment {
+            widen_fragment_rgb_entry(&module_text, function_name, sanitized_ll)
         } else {
             None
         };
-        let analysis_text = zero_init.as_deref().unwrap_or(&module_text);
+        let structural_text = rgb_widened.as_deref().unwrap_or(&module_text);
+        let zero_init = if sanitized_ll.contains("addrspace(3)") {
+            insert_threadgroup_zero_init(structural_text, function_name)
+        } else {
+            None
+        };
+        let analysis_text = zero_init.as_deref().unwrap_or(structural_text);
 
         let arg_values = exact_scalar_arg_values(analysis_text, function_name, inputs);
         let arg_float_values = exact_float_arg_values(analysis_text, function_name, inputs);
         let arg_upper_bounds = launch_scalar_arg_upper_bounds(analysis_text, function_name, inputs);
         let arg_field_values = exact_struct_arg_values(analysis_text, function_name, inputs);
+        let arg_byte_values = crate::corpus_run::exact_raw_integer_buffer_arg_byte_values(
+            analysis_text,
+            function_name,
+            inputs,
+        );
         let arg_vector_values =
             exact_launch_vector_arg_values(analysis_text, function_name, inputs);
         let buffer_arg_vector_values =
@@ -174,20 +188,36 @@ pub fn execute_metallib_blob(
             function_name,
             inputs,
         ));
+        let loop_input_facts = || crate::loop_budget::LoopInputFacts {
+            fc_values: &loop_guard_fc_values,
+            arg_values: &arg_values,
+            arg_float_values: &arg_float_values,
+            arg_upper_bounds: &arg_upper_bounds,
+            arg_field_values: &arg_field_values,
+            arg_byte_values: &arg_byte_values,
+            arg_vector_values: &arg_vector_values,
+            arg_vector_upper_bounds: &arg_vector_upper_bounds,
+            texture_extents: &texture_extents,
+            imageblock_extent,
+        };
+        let has_reachable_cfg_cycle =
+            crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
+                analysis_text,
+                function_name,
+                loop_input_facts(),
+            )
+            .unwrap_or_else(|reason| panic!("m2v-quarantine: {reason}"));
+        if has_reachable_cfg_cycle && submit_gpu {
+            panic!(
+                "m2v-quarantine: reachable CFG cycle lacks a quantitative aggregate GPU-work \
+                 bound; semantic Metal submission refused"
+            );
+        }
+
         match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
             analysis_text,
             function_name,
-            crate::loop_budget::LoopInputFacts {
-                fc_values: &loop_guard_fc_values,
-                arg_values: &arg_values,
-                arg_float_values: &arg_float_values,
-                arg_upper_bounds: &arg_upper_bounds,
-                arg_field_values: &arg_field_values,
-                arg_vector_values: &arg_vector_values,
-                arg_vector_upper_bounds: &arg_vector_upper_bounds,
-                texture_extents: &texture_extents,
-                imageblock_extent,
-            },
+            loop_input_facts(),
         ) {
             crate::loop_budget::GuardPlan::Quarantine(reason) => {
                 if !missing_visible_refs.is_empty() {
@@ -207,8 +237,16 @@ pub fn execute_metallib_blob(
                         unresolved_visible_function_references_message(&missing_visible_refs)
                     );
                 }
-                // Candidate runners use compare=none to apply the same loop-budget transform before
-                // translating their SPIR-V, so the golden and candidate both cover bounded work.
+                if submit_gpu {
+                    // The guard makes submission finite, but reaching its synthetic exit does not
+                    // prove the original kernel terminated or preserve a semantic output oracle.
+                    // Keep the compile-only preflight path below, but never bank bounded-smoke
+                    // bytes as a successful Metal golden.
+                    panic!(
+                        "m2v-quarantine: kernel requires loop-budget instrumentation; bounded smoke \
+                         output is not a semantic Metal oracle"
+                    );
+                }
                 set_oracle_compare(OracleCompare::MetalOnly);
                 let text = substitute_imageblock_air_calls(&text, imageblock_extent);
                 match link_module_text_with_rename_retry(
@@ -225,11 +263,22 @@ pub fn execute_metallib_blob(
                 }
             }
             crate::loop_budget::GuardPlan::LoopFree => {
-                if let Some(text) = zero_init {
+                if has_reachable_cfg_cycle {
+                    // A legacy small-trip proof may leave the module byte-identical, but without
+                    // an aggregate work estimate it is compile-only, not a semantic submission.
+                    set_oracle_compare(OracleCompare::MetalOnly);
+                }
+                if let Some(text) = zero_init.as_deref().or(rgb_widened.as_deref()) {
                     if text.contains("@air.load.implicit_imageblock.") {
+                        if submit_gpu {
+                            panic!(
+                                "m2v-quarantine: implicit imageblock substitution is compile-only; \
+                                 transformed output is not a semantic Metal oracle"
+                            );
+                        }
                         set_oracle_compare(OracleCompare::MetalOnly);
                     }
-                    let text = substitute_imageblock_air_calls(&text, imageblock_extent);
+                    let text = substitute_imageblock_air_calls(text, imageblock_extent);
                     match link_module_text_with_rename_retry(
                         &text,
                         &air_path,
@@ -324,6 +373,7 @@ pub fn execute_metallib_blob(
                 &effective_name,
                 inputs,
                 Some(sanitized_ll),
+                submit_gpu,
             ),
             Stage::Fragment => execute_render_fragment_library(
                 &device,
@@ -331,6 +381,7 @@ pub fn execute_metallib_blob(
                 &effective_name,
                 inputs,
                 Some(sanitized_ll),
+                submit_gpu,
             ),
             Stage::Vertex => execute_vertex_library(
                 &device,
@@ -338,6 +389,7 @@ pub fn execute_metallib_blob(
                 &effective_name,
                 inputs,
                 Some(sanitized_ll),
+                submit_gpu,
             ),
         }
     })
@@ -496,10 +548,9 @@ fn link_module_text_with_rename_retry(
     }
 }
 
-/// How a candidate backend (`corpus-run-vulkan` / `-moltenvk`) should prepare this oracle golden.
-/// Set per-case by [`execute_metallib_blob`]: a kernel that needed loop-budget instrumentation is
-/// [`OracleCompare::MetalOnly`] because candidate runners must translate a guarded LL copy before
-/// dispatching on Vulkan / MoltenVK.
+/// Whether this invocation can produce a semantic oracle. Set per-case by
+/// [`execute_metallib_blob`]: [`OracleCompare::MetalOnly`] identifies a compile-only transformed
+/// module that must not be submitted or banked as candidate comparison evidence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OracleCompare {
     Full,
@@ -2050,6 +2101,7 @@ fn execute_compute_library(
     entry: &str,
     inputs: &Inputs,
     sanitized_ll: Option<&str>,
+    submit_gpu: bool,
 ) -> Vec<u8> {
     let function = new_specialized_function(library, entry, sanitized_ll);
     let stage_inputs = sanitized_ll.map(compute_stage_inputs).unwrap_or_default();
@@ -2096,6 +2148,9 @@ fn execute_compute_library(
             )
         })
     });
+    if !submit_gpu {
+        return Vec::new();
+    }
     let queue = device
         .newCommandQueue()
         .expect("MTLDevice::newCommandQueue returned nil");
@@ -2367,6 +2422,260 @@ fn unresolved_visible_function_references_message(names: &[String]) -> String {
     out
 }
 
+fn fragment_rgb_output_types(sanitized_ll: &str) -> Option<(&'static str, &'static str)> {
+    let meta = metal2vulkan::meta::parse_air_fragment_meta(sanitized_ll)?;
+    let mut location_zero_types = meta
+        .render_target_members
+        .iter()
+        .filter(|(_, location)| *location == 0)
+        .filter_map(|(member, _)| meta.render_target_type_name(*member));
+    let type_name = location_zero_types.next()?;
+    if location_zero_types.any(|other| other != type_name) {
+        return None;
+    }
+    match type_name {
+        "half3" => Some(("half3", "half")),
+        "float3" => Some(("float3", "float")),
+        "ushort3" => Some(("ushort3", "i16")),
+        "short3" => Some(("short3", "i16")),
+        "uint3" => Some(("uint3", "i32")),
+        "int3" => Some(("int3", "i32")),
+        _ => None,
+    }
+}
+
+/// Widen a three-component fragment entry to a four-component Metal attachment interface.
+/// Only the entry ABI and its location-zero render-target metadata change; helper functions keep
+/// their original types. The added lane is zero and is discarded by corpus output
+/// canonicalization, so all shader-defined RGB bytes remain an exact oracle.
+fn widen_fragment_rgb_entry(
+    module_text: &str,
+    function_name: &str,
+    sanitized_ll: &str,
+) -> Option<String> {
+    let (air_type, scalar_type) = fragment_rgb_output_types(sanitized_ll)?;
+    let narrow_type = format!("<3 x {scalar_type}>");
+    let wide_type = format!("<4 x {scalar_type}>");
+    let mut in_entry = false;
+    let mut widened_header = false;
+    let mut widened_returns = 0usize;
+    let mut widened_metadata = 0usize;
+    let mut widened_entry_metadata_refs = 0usize;
+    let mut out = String::with_capacity(module_text.len() + 256);
+
+    for line in module_text.lines() {
+        let mut emitted = false;
+        if !in_entry
+            && defined_function_name(line).as_deref() == Some(function_name)
+            && line
+                .find('@')
+                .is_some_and(|at| line[..at].contains(&narrow_type))
+        {
+            let at = line.find('@').expect("entry definition contains @");
+            let type_pos = line[..at].rfind(&narrow_type)?;
+            out.push_str(&line[..type_pos]);
+            out.push_str(&wide_type);
+            out.push_str(&line[type_pos + narrow_type.len()..]);
+            out.push('\n');
+            in_entry = true;
+            widened_header = true;
+            emitted = true;
+        } else if in_entry {
+            let indent_len = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            let return_prefix = format!("ret {narrow_type} ");
+            if let Some(value_and_metadata) = trimmed.strip_prefix(&return_prefix) {
+                let (value, metadata) = value_and_metadata
+                    .split_once(", !")
+                    .map_or((value_and_metadata, None), |(value, metadata)| {
+                        (value, Some(metadata))
+                    });
+                let value_name = format!("%m2v.rgb.wide.{widened_returns}");
+                let indent = &line[..indent_len];
+                out.push_str(indent);
+                out.push_str(&value_name);
+                out.push_str(" = shufflevector ");
+                out.push_str(&narrow_type);
+                out.push(' ');
+                out.push_str(value.trim());
+                out.push_str(", ");
+                out.push_str(&narrow_type);
+                out.push_str(" zeroinitializer, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n");
+                out.push_str(indent);
+                out.push_str("ret ");
+                out.push_str(&wide_type);
+                out.push(' ');
+                out.push_str(&value_name);
+                if let Some(metadata) = metadata {
+                    out.push_str(", !");
+                    out.push_str(metadata);
+                }
+                out.push('\n');
+                widened_returns += 1;
+                emitted = true;
+            }
+            if trimmed == "}" {
+                in_entry = false;
+            }
+        }
+
+        if emitted {
+            continue;
+        }
+        if line.trim_start().starts_with('!') && symbol_reference_pos(line, function_name).is_some()
+        {
+            let at = symbol_reference_pos(line, function_name)
+                .expect("entry metadata reference was just found");
+            if let Some(type_pos) = line[..at].rfind(&narrow_type) {
+                out.push_str(&line[..type_pos]);
+                out.push_str(&wide_type);
+                out.push_str(&line[type_pos + narrow_type.len()..]);
+                out.push('\n');
+            } else {
+                // Opaque-pointer LLVM metadata spells the entry reference `ptr @entry`; there is
+                // no function type to rewrite, but the reference still proves we found the entry
+                // metadata node whose render-target child is widened below.
+                out.push_str(line);
+                out.push('\n');
+            }
+            widened_entry_metadata_refs += 1;
+        } else if line.contains(r#"!"air.render_target""#)
+            && metadata_i32_after(line, "air.render_target") == Some(0)
+            && line.contains(&format!(r#"!"{air_type}""#))
+        {
+            out.push_str(&line.replacen(
+                &format!(r#"!"{air_type}""#),
+                &format!(r#"!"{}4""#, air_type.trim_end_matches('3')),
+                1,
+            ));
+            out.push('\n');
+            widened_metadata += 1;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    if widened_header
+        && widened_returns != 0
+        && widened_metadata != 0
+        && widened_entry_metadata_refs != 0
+    {
+        return Some(out);
+    }
+    widen_fragment_rgb_aggregate_entry(
+        module_text,
+        function_name,
+        air_type,
+        &narrow_type,
+        &wide_type,
+    )
+}
+
+fn widen_fragment_rgb_aggregate_entry(
+    module_text: &str,
+    function_name: &str,
+    air_type: &str,
+    narrow_type: &str,
+    wide_type: &str,
+) -> Option<String> {
+    let header = module_text.lines().find(|line| {
+        defined_function_name(line).as_deref() == Some(function_name)
+            && line
+                .find('@')
+                .is_some_and(|at| line[..at].contains("<{") && line[..at].contains(narrow_type))
+    })?;
+    let at = header.find('@')?;
+    let aggregate_start = header[..at].rfind("<{")?;
+    let aggregate_end = header[aggregate_start..at].rfind("}>")? + aggregate_start + 2;
+    let narrow_aggregate = &header[aggregate_start..aggregate_end];
+    let wide_aggregate = narrow_aggregate.replacen(narrow_type, wide_type, 1);
+    if wide_aggregate == narrow_aggregate {
+        return None;
+    }
+
+    let mut in_entry = false;
+    let mut widened_insert = 0usize;
+    let mut widened_metadata = 0usize;
+    let mut entry_metadata_refs = 0usize;
+    let mut out = String::with_capacity(module_text.len() + 256);
+    for line in module_text.lines() {
+        if !in_entry && defined_function_name(line).as_deref() == Some(function_name) {
+            out.push_str(&line.replacen(narrow_aggregate, &wide_aggregate, 1));
+            out.push('\n');
+            in_entry = true;
+            continue;
+        }
+        if in_entry {
+            let trimmed = line.trim_start();
+            let insert_marker = format!(", {narrow_type} ");
+            if trimmed.contains(" = insertvalue ")
+                && trimmed.ends_with(", 0")
+                && trimmed.contains(&insert_marker)
+            {
+                let value_start = line.find(&insert_marker)? + insert_marker.len();
+                let value_end = line.rfind(", 0")?;
+                let value = line[value_start..value_end].trim();
+                let indent = &line[..line.len() - trimmed.len()];
+                let wide_value = format!("%m2v.rgb.aggregate.wide.{widened_insert}");
+                out.push_str(indent);
+                out.push_str(&wide_value);
+                out.push_str(" = shufflevector ");
+                out.push_str(narrow_type);
+                out.push(' ');
+                out.push_str(value);
+                out.push_str(", ");
+                out.push_str(narrow_type);
+                out.push_str(" zeroinitializer, <4 x i32> <i32 0, i32 1, i32 2, i32 3>\n");
+                let replaced = line
+                    .replacen(narrow_aggregate, &wide_aggregate, 1)
+                    .replacen(
+                        &format!("{insert_marker}{value}"),
+                        &format!(", {wide_type} {wide_value}"),
+                        1,
+                    );
+                out.push_str(&replaced);
+                out.push('\n');
+                widened_insert += 1;
+                continue;
+            }
+            out.push_str(&line.replace(narrow_aggregate, &wide_aggregate));
+            out.push('\n');
+            if trimmed == "}" {
+                in_entry = false;
+            }
+            continue;
+        }
+        if line.trim_start().starts_with('!') && symbol_reference_pos(line, function_name).is_some()
+        {
+            out.push_str(&line.replace(narrow_aggregate, &wide_aggregate));
+            out.push('\n');
+            entry_metadata_refs += 1;
+        } else if line.contains(r#"!"air.render_target""#)
+            && metadata_i32_after(line, "air.render_target") == Some(0)
+            && line.contains(&format!(r#"!"{air_type}""#))
+        {
+            out.push_str(&line.replacen(
+                &format!(r#"!"{air_type}""#),
+                &format!(r#"!"{}4""#, air_type.trim_end_matches('3')),
+                1,
+            ));
+            out.push('\n');
+            widened_metadata += 1;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    (widened_insert != 0 && widened_metadata != 0 && entry_metadata_refs != 0).then_some(out)
+}
+
+fn symbol_reference_pos(line: &str, symbol: &str) -> Option<usize> {
+    line.match_indices('@').find_map(|(pos, _)| {
+        (symbol_after_at(&line[pos..]).as_deref() == Some(symbol)).then_some(pos)
+    })
+}
+
 fn defined_function_names(module_text: &str) -> Vec<String> {
     module_text
         .lines()
@@ -2483,6 +2792,7 @@ fn execute_render_fragment_library(
     fragment_entry: &str,
     inputs: &Inputs,
     sanitized_ll: Option<&str>,
+    submit_gpu: bool,
 ) -> Vec<u8> {
     let (format, extent) = match inputs.output {
         Output::RenderTarget { format, extent } => (format, extent),
@@ -2541,6 +2851,9 @@ fn execute_render_fragment_library(
     let pipeline = device
         .newRenderPipelineStateWithDescriptor_error(&pipeline_descriptor)
         .unwrap_or_else(|e| panic!("newRenderPipelineStateWithDescriptor({fragment_entry}): {e}"));
+    if !submit_gpu {
+        return Vec::new();
+    }
     let depth_stencil_state = writes_depth.then(|| make_depth_stencil_state(device));
 
     let target = make_render_target(device, format, extent);
@@ -2790,6 +3103,7 @@ struct FragmentInput {
 }
 
 fn validation_vertex_src_for_fragment(sanitized_ll: Option<&str>) -> String {
+    let distinct_float3_inputs = sanitized_ll.is_some_and(fragment_requires_distinct_float3_inputs);
     let inputs = sanitized_ll
         .map(fragment_inputs)
         .unwrap_or_default()
@@ -2815,6 +3129,7 @@ struct Metal2VulkanValidationVertexOut {
 "#,
     );
     src.push_str(&format!("    float4 {position_field} [[position]];\n"));
+    src.push_str("    uint metal2vulkan_viewport [[viewport_array_index]];\n");
     for (index, input) in inputs.iter().enumerate() {
         src.push_str(&format!(
             "    {} {}{};\n",
@@ -2844,8 +3159,11 @@ vertex Metal2VulkanValidationVertexOut metal2vulkan_validation_fullscreen_vertex
     src.push_str(&format!(
         "    out.{position_field} = float4(positions[vid], 0.0, 1.0);\n"
     ));
+    src.push_str("    out.metal2vulkan_viewport = 0;\n");
     for (index, input) in inputs.iter().enumerate() {
-        let value = validation_vertex_value(&input.type_name).expect("input type was filtered");
+        let value =
+            validation_vertex_value_for_input(&input.type_name, index, distinct_float3_inputs)
+                .expect("input type was filtered");
         src.push_str(&format!("    out.{} = {value};\n", field_names[index]));
     }
     src.push_str(
@@ -2967,6 +3285,31 @@ fn validation_vertex_value(type_name: &str) -> Option<&'static str> {
     })
 }
 
+fn validation_vertex_value_for_input(
+    type_name: &str,
+    index: usize,
+    distinct_float3_inputs: bool,
+) -> Option<&'static str> {
+    if type_name == "float3" && distinct_float3_inputs && index > 0 {
+        return Some("float3(coord, 1.0f)");
+    }
+    validation_vertex_value(type_name)
+}
+
+fn fragment_requires_distinct_float3_inputs(ll: &str) -> bool {
+    ll.lines()
+        .filter(|line| {
+            line.contains(r#""air.fragment_input""#)
+                && line.contains("!\"air.arg_type_name\", !\"float3\"")
+        })
+        .count()
+        >= 2
+        && ll.contains("@air.fast_rsqrt.f32")
+        && ll
+            .lines()
+            .any(|line| line.trim_start().contains(" = fsub ") && line.contains("<3 x float>"))
+}
+
 fn metadata_string_after(line: &str, marker: &str) -> Option<String> {
     let marker = format!("!\"{marker}\", !\"");
     let tail = line.get(line.find(&marker)? + marker.len()..)?;
@@ -2989,6 +3332,7 @@ fn execute_vertex_library(
     entry: &str,
     inputs: &Inputs,
     sanitized_ll: Option<&str>,
+    submit_gpu: bool,
 ) -> Vec<u8> {
     let (index, len) = match inputs.output {
         Output::Buffer { index, len, .. } => (index, len),
@@ -3007,6 +3351,7 @@ fn execute_vertex_library(
         .expect("validation empty fragment function not found");
 
     let vertex_inputs = sanitized_ll.map(vertex_inputs).unwrap_or_default();
+    let writes_point_size = sanitized_ll.is_some_and(vertex_writes_point_size);
     let vertex_input_buffer_index = free_attribute_buffer_index(inputs);
     let pipeline_descriptor = MTLRenderPipelineDescriptor::new();
     pipeline_descriptor.setVertexFunction(Some(&function));
@@ -3021,10 +3366,15 @@ fn execute_vertex_library(
     } else {
         pipeline_descriptor.setFragmentFunction(Some(&fragment_function));
     }
-    // Standalone vertex validation also draws a triangle below; declare the topology for layered
-    // vertex outputs such as render_target_array_index.
+    // Metal requires a point topology when the vertex ABI writes [[point_size]]. Other standalone
+    // vertex cases retain the validation harness's triangle draw. Derive this from !air.vertex
+    // output roles so the oracle follows the shader interface rather than an entry-point name.
     unsafe {
-        pipeline_descriptor.setInputPrimitiveTopology(MTLPrimitiveTopologyClass::Triangle);
+        pipeline_descriptor.setInputPrimitiveTopology(if writes_point_size {
+            MTLPrimitiveTopologyClass::Point
+        } else {
+            MTLPrimitiveTopologyClass::Triangle
+        });
     }
     let vertex_descriptor = if vertex_inputs.is_empty() {
         None
@@ -3039,6 +3389,9 @@ fn execute_vertex_library(
     let pipeline = device
         .newRenderPipelineStateWithDescriptor_error(&pipeline_descriptor)
         .unwrap_or_else(|e| panic!("newRenderPipelineStateWithDescriptor({entry}): {e}"));
+    if !submit_gpu {
+        return Vec::new();
+    }
     let _vertex_descriptor = vertex_descriptor;
 
     let target = make_render_target(device, DataFormat::Rgba8Unorm, inputs.render.target);
@@ -3093,7 +3446,11 @@ fn execute_vertex_library(
     unsafe {
         encoder.setVertexSamplerState_atIndex(Some(&*default_sampler), 0);
         encoder.drawPrimitives_vertexStart_vertexCount(
-            MTLPrimitiveType::Triangle,
+            if writes_point_size {
+                MTLPrimitiveType::Point
+            } else {
+                MTLPrimitiveType::Triangle
+            },
             0,
             inputs.render.vertex_count as usize,
         );
@@ -3124,6 +3481,11 @@ fn execute_vertex_library(
         let ptr = buffer.contents().as_ptr().cast::<u8>();
         std::slice::from_raw_parts(ptr, len).to_vec()
     }
+}
+
+fn vertex_writes_point_size(sanitized_ll: &str) -> bool {
+    metal2vulkan::meta::parse_air_vertex_meta(sanitized_ll)
+        .is_some_and(|meta| meta.output_roles.contains(&VertOutRole::PointSize))
 }
 
 fn entry_function_returns_void(sanitized_ll: &str, entry: &str) -> bool {
@@ -4466,6 +4828,84 @@ define void @k(i32 %tgid, ptr addrspace(1) %queue) {
     }
 
     #[test]
+    fn rgb_fragment_entry_is_widened_without_changing_rgb_helpers() {
+        let sanitized_ll = r#"
+define <3 x half> @frag() {
+  ret <3 x half> zeroinitializer
+}
+!air.fragment = !{!15}
+!15 = !{ptr @frag, !16, !18}
+!16 = !{!17}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half3"}
+!18 = !{}
+"#;
+        let module_text = r#"; ModuleID = 'rgb'
+define <3 x half> @frag(i1 %condition) {
+entry:
+  br i1 %condition, label %left, label %right
+left:
+  ret <3 x half> zeroinitializer
+right:
+  ret <3 x half> <half 0xH3C00, half 0xH4000, half 0xH4200>
+}
+define internal <3 x half> @helper() {
+  ret <3 x half> zeroinitializer
+}
+!15 = !{<3 x half> (i1)* @frag, !16, !18}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half3"}
+"#;
+
+        let widened = widen_fragment_rgb_entry(module_text, "frag", sanitized_ll)
+            .expect("RGB fragment entry should widen");
+        assert!(widened.contains("define <4 x half> @frag"));
+        assert_eq!(widened.matches("ret <4 x half> %m2v.rgb.wide.").count(), 2);
+        assert!(widened.contains("<3 x half> zeroinitializer, <4 x i32>"));
+        assert!(widened.contains("define internal <3 x half> @helper()"));
+        assert!(widened.contains("!15 = !{<4 x half> (i1)* @frag"));
+        assert!(widened.contains(r#"!"air.arg_type_name", !"half4""#));
+    }
+
+    #[test]
+    fn rgb_member_of_fragment_return_struct_is_widened() {
+        let ll = r#"
+define <{ <3 x half>, half }> @frag() {
+  %rgb = insertvalue <{ <3 x half>, half }> undef, <3 x half> zeroinitializer, 0
+  %rgba = insertvalue <{ <3 x half>, half }> %rgb, half 0xH3C00, 1
+  ret <{ <3 x half>, half }> %rgba
+}
+!air.fragment = !{!15}
+!15 = !{ptr @frag, !16, !19}
+!16 = !{!17, !18}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half3"}
+!18 = !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"half"}
+!19 = !{}
+"#;
+
+        let widened = widen_fragment_rgb_entry(ll, "frag", ll)
+            .expect("aggregate RGB fragment entry should widen");
+        assert!(widened.contains("define <{ <4 x half>, half }> @frag"));
+        assert!(widened.contains("%m2v.rgb.aggregate.wide.0 = shufflevector <3 x half>"));
+        assert!(widened.contains(
+            "insertvalue <{ <4 x half>, half }> undef, <4 x half> %m2v.rgb.aggregate.wide.0, 0"
+        ));
+        assert!(widened.contains("ret <{ <4 x half>, half }> %rgba"));
+        assert!(widened.contains(r#"!"air.arg_type_name", !"half4""#));
+    }
+
+    #[test]
+    fn rgba_fragment_entry_does_not_need_oracle_widening() {
+        let ll = r#"
+define <4 x half> @frag() { ret <4 x half> zeroinitializer }
+!air.fragment = !{!15}
+!15 = !{ptr @frag, !16, !18}
+!16 = !{!17}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!18 = !{}
+"#;
+        assert!(widen_fragment_rgb_entry(ll, "frag", ll).is_none());
+    }
+
+    #[test]
     fn dynamic_resource_location_fcs_use_minimal_positive_values() {
         let ll = r#"
 !air.function_constants = !{!47, !48}
@@ -4594,6 +5034,24 @@ define void @k(i32 %tgid, ptr addrspace(1) %queue) {
         assert!(src
             .contains("out.metal2vulkan_validation_position = float4(positions[vid], 0.0, 1.0);"));
         assert!(src.contains("out.position = float3(coord, 0.5f);"));
+    }
+
+    #[test]
+    fn validation_vertex_separates_duplicate_float3_rsqrt_inputs() {
+        let ll = r#"
+define void @frag(<3 x float> %a, <3 x float> %b) {
+  %delta = fsub fast <3 x float> %a, %b
+  %len2 = tail call fast float @air.dot.v3f32(<3 x float> %delta, <3 x float> %delta)
+  %inv = tail call fast float @air.fast_rsqrt.f32(float %len2)
+  ret void
+}
+declare float @air.fast_rsqrt.f32(float)
+!20 = !{i32 0, !"air.fragment_input", !"generated(a)", !"air.arg_type_name", !"float3", !"air.arg_name", !"a"}
+!21 = !{i32 1, !"air.fragment_input", !"generated(b)", !"air.arg_type_name", !"float3", !"air.arg_name", !"b"}
+"#;
+        let src = validation_vertex_src_for_fragment(Some(ll));
+        assert!(src.contains("out.a = float3(coord, 0.5f);"));
+        assert!(src.contains("out.b = float3(coord, 1.0f);"));
     }
 
     #[test]
@@ -4797,6 +5255,29 @@ define void @progressTrackVertex(ptr addrspace(1) %out) {
         assert!(entry_function_returns_void(ll, "progressTrackVertex"));
         assert!(!entry_function_returns_void(ll, "layered"));
         assert!(!entry_function_returns_void(ll, "missing"));
+    }
+
+    #[test]
+    fn vertex_point_topology_follows_air_output_role() {
+        let point_ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @vmain, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{!"air.point_size", !"air.arg_type_name", !"float"}
+!4 = !{}
+"#;
+        let triangle_ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @vmain, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{}
+"#;
+
+        assert!(vertex_writes_point_size(point_ll));
+        assert!(!vertex_writes_point_size(triangle_ll));
+        assert!(!vertex_writes_point_size("!air.vertex = !{}"));
     }
 
     /// End-to-end on the real Apple toolchain, but WITHOUT dispatching to the GPU: compile a kernel

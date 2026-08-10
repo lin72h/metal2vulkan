@@ -55,6 +55,7 @@ use std::collections::{HashMap, HashSet};
 /// Rewrite every eligible multi-block function of `module` into relooper form. Returns true if any
 /// function was rewritten.
 pub(super) fn rewrite_to_relooper(module: &mut Module, max_blocks: usize) -> bool {
+    let max_blocks = effective_relooper_block_cap(max_blocks);
     // Snapshot the global type/const tables we read while choosing/creating types and constants.
     let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(1);
     let mut tc = TypeCtx::new(module, &mut next_id);
@@ -295,12 +296,20 @@ fn block_label(block: &Block) -> Option<Word> {
 /// mostly emit-fail anyway (no module reaches the relooper) and would be pathological to lower.
 const MAX_RELOOPER_BLOCKS: usize = 1024;
 
-/// The effective default block cap. Defaults to `MAX_RELOOPER_BLOCKS` but can be raised via
-/// `METAL2VULKAN_RELOOPER_MAX_BLOCKS` for experiments. The prune-then-relooper retry passes its own (higher)
-/// cap explicitly. Behaviour is adopt-if-validates regardless, so a raised cap can only add wins,
-/// never regress the floor.
+/// Hard product safety ceiling for the whole-function switch/state-machine relooper. Above this
+/// size, valid output has thousands of Function variables and memory operations feeding one giant
+/// switch; real drivers have been observed compiling it for tens of minutes or crashing. Returning
+/// FALLBACK is safer than emitting a module that can wedge a consumer's pipeline compiler.
+const MAX_DRIVER_SAFE_RELOOPER_BLOCKS: usize = MAX_RELOOPER_BLOCKS;
+
+fn effective_relooper_block_cap(requested: usize) -> usize {
+    requested.min(MAX_DRIVER_SAFE_RELOOPER_BLOCKS)
+}
+
+/// The effective default block cap. `METAL2VULKAN_RELOOPER_MAX_BLOCKS` may lower the cap for
+/// diagnostics, but the hard driver-safety ceiling prevents raising it above the product default.
 pub(super) fn default_max_relooper_blocks() -> usize {
-    crate::env_vars::relooper_max_blocks(MAX_RELOOPER_BLOCKS)
+    effective_relooper_block_cap(crate::env_vars::relooper_max_blocks(MAX_RELOOPER_BLOCKS))
 }
 
 fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize) -> bool {
@@ -1521,6 +1530,48 @@ mod tests {
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect()
+    }
+
+    #[test]
+    fn whole_function_relooper_clamps_requested_cap_to_driver_safe_limit() {
+        assert_eq!(
+            effective_relooper_block_cap(8192),
+            MAX_DRIVER_SAFE_RELOOPER_BLOCKS
+        );
+        assert_eq!(
+            effective_relooper_block_cap(MAX_RELOOPER_BLOCKS),
+            MAX_RELOOPER_BLOCKS
+        );
+    }
+
+    #[test]
+    fn whole_function_relooper_refuses_1025_block_state_machine() {
+        let mut spvasm = String::from(
+            r#"OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%main = OpFunction %void None %fn
+"#,
+        );
+        for index in 0..MAX_DRIVER_SAFE_RELOOPER_BLOCKS + 1 {
+            spvasm.push_str(&format!("%b{index} = OpLabel\n"));
+            if index == MAX_DRIVER_SAFE_RELOOPER_BLOCKS {
+                spvasm.push_str("OpReturn\n");
+            } else {
+                spvasm.push_str(&format!("OpBranch %b{}\n", index + 1));
+            }
+        }
+        spvasm.push_str("OpFunctionEnd\n");
+
+        let Some(spv) = assemble(&spvasm) else {
+            return;
+        };
+        let mut module = crate::spirv_module::load_bytes(&spv).expect("load");
+
+        assert!(!rewrite_to_relooper(&mut module, 8192));
     }
 
     fn block_id(block: &Block) -> Word {

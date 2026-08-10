@@ -239,10 +239,9 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
 
 #[test]
 fn native_get_null_texture_models_unmodeled_placeholder() {
-    // `air.get_null_texture_2d()` yields a NULL texture handle that the MPS NDArray kernels store
-    // into a vestigial struct field but never sample. The native emitter previously bailed
-    // (`missing pointer storage`) because the result pointer had no storage class. It is now modeled
-    // as an unmodeled placeholder pointer, so the store validates; the kernel emits a valid module.
+    // `air.get_null_texture_2d()` yields a synthesized image in the texture descriptor band. Even a
+    // kernel that only stores the opaque handle must remain valid, and the translator-owned resource
+    // must not escape into sampler/color-input bindings.
     let ll = r#"
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -261,18 +260,24 @@ declare ptr addrspace(1) @air.get_null_texture_2d()
 !2 = !{!3}
 !3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
 "#;
-    let spv = emit_vulkan_spirv(ll).expect("null-texture kernel must emit a module");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_null_texture_store_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("null-texture kernel must translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpFunction"), "{asm}");
+    assert!(asm.contains("Binding 32"), "{asm}");
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
 fn native_is_null_texture_of_get_null_texture_lowers_to_true() {
     // `air.is_null_texture(%t)` where `%t` came from `air.get_null_texture_2d()` must lower to a
-    // constant TRUE. The get_null_texture handle never crosses the emitter->reparse seam as a
-    // recognizable image, so the passes-layer null tracking can't see it; the emitter therefore
-    // consumes is_null_texture directly, keyed on the value it itself synthesized. Branching on the
-    // result keeps it live (a realistic "is this texture bound?" use) and forces it into the module.
+    // constant TRUE. Branching on the result keeps it live (a realistic "is this texture bound?"
+    // use) and forces the null-image tracking through the lowering pipeline.
     let ll = r#"
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -298,13 +303,20 @@ declare i1 @air.is_null_texture_2d(ptr addrspace(1))
 !2 = !{!3}
 !3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
 "#;
-    let spv = emit_vulkan_spirv(ll).expect("is-null-texture kernel must emit a module");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_null_texture_predicate_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("is-null-texture kernel must translate");
     let asm = disassemble(&spv).expect("disassemble");
     // The predicate is the constant TRUE, not FALSE: a synthesized null texture IS null.
     assert!(
         asm.contains("OpConstantTrue"),
         "is_null_texture(get_null_texture()) must lower to constant TRUE; got:\n{asm}"
     );
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]

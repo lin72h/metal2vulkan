@@ -98,6 +98,10 @@ pub(super) struct Emitter {
     param_values: HashSet<String>,
     inline_parameter_substitutions: Vec<(Word, Word)>,
     raw_buffer_params: HashSet<String>,
+    /// Constant descriptor-relative byte cursors passed to raw helper parameters, keyed by
+    /// `(callee, parameter)`. The emitted-helper inliner can then keep a non-zero caller GEP rooted
+    /// in the real StorageBuffer instead of the ordinary Private placeholder value.
+    raw_call_param_offsets: HashMap<(String, String), RawBufferOffset>,
     /// Current function's entry params declared `air.buffer` in kernel metadata (data pointers,
     /// never textures/samplers). Rebuilt per emit_function from `ir.metadata_data_buffer_params`.
     data_buffer_params: HashSet<String>,
@@ -442,6 +446,7 @@ impl Emitter {
             param_values: HashSet::new(),
             inline_parameter_substitutions: Vec::new(),
             raw_buffer_params: HashSet::new(),
+            raw_call_param_offsets: HashMap::new(),
             data_buffer_params: HashSet::new(),
             raw_offsets: HashMap::new(),
             int_alignments: HashMap::new(),

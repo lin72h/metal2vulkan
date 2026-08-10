@@ -266,6 +266,94 @@ pub fn gather_source_refs(public_dir: &Path, corpus_root: &Path) -> Vec<SourceRe
     sources
 }
 
+/// Build lightweight source references only for the requested AIR hashes.
+///
+/// Unlike [`gather_source_refs`], this does not deserialize every multi-megabyte shard row merely
+/// to discover its hash. The corpus runners use it when a ledger filter has already selected the
+/// relevant rows, keeping a full recovery scan's memory proportional to one shard row.
+pub fn gather_source_refs_for_hashes(
+    public_dir: &Path,
+    corpus_root: &Path,
+    wanted: &HashSet<String>,
+) -> Vec<SourceRef> {
+    let wanted_shards = wanted
+        .iter()
+        .map(|hash| shard_name_for_hash(hash))
+        .collect::<HashSet<_>>();
+    let mut out = gather_public_source_refs(public_dir, public_dir, "public", "synthetic")
+        .into_iter()
+        .filter(|source| wanted.contains(&source.air_sha256))
+        .collect::<Vec<_>>();
+    for path in existing_shard_paths(corpus_root) {
+        let shard = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| "shard_unknown.jsonl".into());
+        if !wanted_shards.contains(&shard) {
+            continue;
+        }
+        let Ok(file) = File::open(&path) else {
+            continue;
+        };
+        let mut reader = BufReader::new(file);
+        let mut offset = 0u64;
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let Ok(read) = reader.read_until(b'\n', &mut line) else {
+                break;
+            };
+            if read == 0 {
+                break;
+            }
+            let len = trim_line_ending_len(&line);
+            if let Some(hash) = compact_json_string_field(&line[..len], b"air_sha256") {
+                if wanted.contains(hash) {
+                    out.push(SourceRef {
+                        air_sha256: hash.to_string(),
+                        label: format!("local/{hash}.ll"),
+                        kind: "private".into(),
+                        shard: Some(shard.clone()),
+                        storage: SourceStorage::ShardRow {
+                            shard: shard.clone(),
+                            byte_offset: offset,
+                            byte_len: len,
+                        },
+                    });
+                }
+            }
+            offset += read as u64;
+        }
+    }
+    out
+}
+
+pub(crate) fn compact_json_string_field<'a>(line: &'a [u8], field: &[u8]) -> Option<&'a str> {
+    let field_start = line.windows(field.len() + 2).position(|window| {
+        window.first() == Some(&b'"')
+            && window.get(1..=field.len()) == Some(field)
+            && window.last() == Some(&b'"')
+    })?;
+    let mut cursor = field_start + field.len() + 2;
+    while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if line.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor += 1;
+    while line.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    if line.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    cursor += 1;
+    let end = line[cursor..].iter().position(|byte| *byte == b'"')? + cursor;
+    std::str::from_utf8(&line[cursor..end]).ok()
+}
+
 pub fn gather_shard_source_refs(corpus_root: &Path) -> Vec<SourceRef> {
     let mut out = Vec::new();
     for path in existing_shard_paths(corpus_root) {

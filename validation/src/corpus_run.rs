@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 pub const SEED_PROFILE: &str = "deterministic_v7_thread_indexed_inputs";
 pub const PLAN_VERSION: u32 = 1;
 const POINT_COORD_TOPOLOGY_PLAN_VERSION: u32 = 2;
+const SAFE_LOOP_BUDGET_PLAN_VERSION: u32 = 3;
 pub const DEFAULT_BUFFER_LEN: usize = 256;
 const DEFAULT_DISPATCH_GRID_X: usize = 64;
 pub const DEFAULT_TEXTURE_EXTENT: Extent3d = Extent3d::new(8, 8, 1);
@@ -43,6 +44,11 @@ pub const CASE_TIMEOUT_ENV: &str = "METAL2VULKAN_CORPUS_TIMEOUT_SECS";
 pub const DEFAULT_CASE_TIMEOUT_SECS: u64 = 300;
 /// Log `# SLOW <air_sha256> …` when a case is still running (or finished) past this wall time.
 pub const SLOW_CASE_SECS: u64 = 30;
+/// Compile-only Metal PSO creation must not consume enough memory for macOS to kill the small
+/// supervisor first and leave the compiler worker orphaned. This is deliberately below one eighth
+/// of the 16-GiB validation host; a row that exceeds it is not safe for unattended recovery.
+#[cfg(target_os = "macos")]
+const PREFLIGHT_WORKER_MAX_RESIDENT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const FC_SPECIALIZATION_ZERO: &str = "zero";
 const FC_SPECIALIZATION_VALUES: &str = "values";
 const INPUT_SPECIALIZATION_EXPLICIT: &str = "explicit";
@@ -504,6 +510,13 @@ pub struct RunConfig {
     pub dry_run: bool,
     pub quiet: bool,
     pub compile_missing: bool,
+    /// Metal diagnostic: compile through PSO creation without creating or submitting GPU work.
+    pub preflight_only: bool,
+    /// Parent-only output containing hashes whose compile-only Metal preflight remained semantic.
+    pub preflight_safe_list: Option<PathBuf>,
+    /// Explicitly allow selected historic `compare=none` rows to reach the current Metal oracle.
+    /// Requires `--air-sha256` or `--air-list`; broad filters remain ledger-only quarantine.
+    pub remint_compare_none: bool,
     pub only_air: Option<String>,
     pub only_air_list: Option<PathBuf>,
     pub jobs: usize,
@@ -536,6 +549,9 @@ impl RunConfig {
             dry_run: false,
             quiet: false,
             compile_missing: false,
+            preflight_only: false,
+            preflight_safe_list: None,
+            remint_compare_none: false,
             only_air: None,
             only_air_list: None,
             jobs: default_workers(),
@@ -617,6 +633,14 @@ pub fn parse_run_args(backend: RunBackend) -> Option<RunConfig> {
             "--dry-run" => cfg.dry_run = true,
             "--quiet" => cfg.quiet = true,
             "--compile-missing" => cfg.compile_missing = true,
+            "--preflight-only" => cfg.preflight_only = true,
+            "--preflight-safe-list" => {
+                cfg.preflight_safe_list =
+                    Some(PathBuf::from(args.next().unwrap_or_else(|| {
+                        fatal(program, "--preflight-safe-list requires a path")
+                    })));
+            }
+            "--remint-compare-none" => cfg.remint_compare_none = true,
             "--oneshot" => cfg.oneshot = true,
             "--delta-ledger" => {
                 cfg.delta_ledger =
@@ -711,6 +735,25 @@ pub fn parse_run_args(backend: RunBackend) -> Option<RunConfig> {
     if cfg.oneshot && cfg.delta_ledger.is_none() {
         fatal(program, "--oneshot requires --delta-ledger PATH");
     }
+    if cfg.preflight_only && backend != RunBackend::Metal {
+        fatal(
+            program,
+            "--preflight-only is supported only by corpus-run-metal",
+        );
+    }
+    if cfg.preflight_safe_list.is_some() && !cfg.preflight_only {
+        fatal(program, "--preflight-safe-list requires --preflight-only");
+    }
+    if cfg.remint_compare_none
+        && (backend != RunBackend::Metal
+            || (cfg.only_air.is_none() && cfg.only_air_list.is_none())
+            || !cfg.force)
+    {
+        fatal(
+            program,
+            "--remint-compare-none requires Metal plus --force and --air-sha256/--air-list",
+        );
+    }
     Some(cfg)
 }
 
@@ -747,6 +790,12 @@ fn print_run_usage(program: &str) {
          --contains TEXT  re-run existing backend rows whose label/error/status/hash contains TEXT\n\
          --compile-missing translate+spirv-val Vulkan/MoltenVK rows that cannot compare to Metal;\n\
                          successful rows are recorded as smoke with the skip reason in error\n\
+         --preflight-only  Metal: compile through PSO creation without submitting\n\
+                           GPU work; does not modify the ledger\n\
+         --preflight-safe-list FILE  write hashes whose preflight needs no semantic transform;\n\
+                           requires --preflight-only\n\
+         --remint-compare-none  Metal: with --force and an explicit hash/list, allow historic\n\
+                           compare=none rows through the current guarded oracle\n\
          --skip N         skip N eligible rows after filters and stable sorting, before --limit\n\
          --limit N        run at most N eligible rows after filters and stable sorting\n\
          --air-list FILE  run AIR SHA-256 hashes listed one per line, after other filters\n\
@@ -853,6 +902,7 @@ pub struct TechRowInfo {
     pub status: String,
     pub label: String,
     pub error: Option<String>,
+    pub compare: String,
     pub signature: String,
 }
 
@@ -862,6 +912,9 @@ impl TechRowInfo {
         self.air_sha256.contains(&text)
             || self.status.to_ascii_lowercase().contains(&text)
             || self.label.to_ascii_lowercase().contains(&text)
+            || format!("compare={}", self.compare)
+                .to_ascii_lowercase()
+                .contains(&text)
             || self.signature.to_ascii_lowercase().contains(&text)
             || self
                 .error
@@ -873,6 +926,21 @@ impl TechRowInfo {
 }
 
 pub fn load_tech_rows(path: &Path) -> HashMap<String, TechRowInfo> {
+    #[derive(Deserialize)]
+    struct TechRowProjection {
+        air_sha256: String,
+        #[serde(default)]
+        status: String,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        compare: String,
+        #[serde(default)]
+        tolerance: Option<serde::de::IgnoredAny>,
+    }
+
     let mut rows = HashMap::new();
     let Ok(file) = File::open(path) else {
         return rows;
@@ -882,25 +950,15 @@ pub fn load_tech_rows(path: &Path) -> HashMap<String, TechRowInfo> {
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
+        let Ok(row) = serde_json::from_str::<TechRowProjection>(t) else {
             continue;
         };
-        let Some(h) = v.get("air_sha256").and_then(|x| x.as_str()) else {
-            continue;
-        };
-        let air_sha256 = h.to_ascii_lowercase();
-        let status = v
-            .get("status")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let label = v
-            .get("label")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
-        let error = v.get("error").and_then(|x| x.as_str()).map(str::to_string);
-        let has_tolerance = v.get("tolerance").is_some();
+        let air_sha256 = row.air_sha256.to_ascii_lowercase();
+        let status = row.status;
+        let label = row.label;
+        let error = row.error;
+        let compare = row.compare;
+        let has_tolerance = row.tolerance.is_some();
         let signature = execution_failure_signature(&status, error.as_deref(), has_tolerance);
         rows.insert(
             air_sha256.clone(),
@@ -909,6 +967,7 @@ pub fn load_tech_rows(path: &Path) -> HashMap<String, TechRowInfo> {
                 status,
                 label,
                 error,
+                compare,
                 signature,
             },
         );
@@ -920,7 +979,7 @@ pub fn execution_status_is_success(backend: RunBackend, status: &str) -> bool {
     match backend {
         RunBackend::Metal => status == "ok",
         RunBackend::Vulkan => status == "ok" || status == "tolerance" || status == "smoke",
-        RunBackend::MoltenVk => status == "ok",
+        RunBackend::MoltenVk => status == "ok" || status == "tolerance",
     }
 }
 
@@ -976,6 +1035,13 @@ fn normalize_execution_error_signature(first_line: &str) -> String {
 }
 
 pub fn load_metal_rows(path: &Path) -> HashMap<String, MetalRow> {
+    load_metal_rows_for_hashes(path, None)
+}
+
+fn load_metal_rows_for_hashes(
+    path: &Path,
+    wanted: Option<&HashSet<String>>,
+) -> HashMap<String, MetalRow> {
     let mut map = HashMap::new();
     let Ok(file) = File::open(path) else {
         return map;
@@ -983,6 +1049,12 @@ pub fn load_metal_rows(path: &Path) -> HashMap<String, MetalRow> {
     for line in BufReader::new(file).lines().map_while(Result::ok) {
         let t = line.trim();
         if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        if wanted.is_some_and(|wanted| {
+            crate::corpus_shards::compact_json_string_field(t.as_bytes(), b"air_sha256")
+                .is_none_or(|hash| !wanted.contains(hash))
+        }) {
             continue;
         }
         if let Ok(row) = serde_json::from_str::<MetalRow>(t) {
@@ -1050,7 +1122,7 @@ pub fn merge_delta_into_ledger(ledger: &Path, delta: &Path) -> std::io::Result<u
         fs::create_dir_all(parent)?;
     }
 
-    let mut by_hash = load_jsonl_objects_by_air_sha256(ledger)?;
+    let mut delta_by_hash = HashMap::<String, serde_json::Value>::new();
     let mut n_delta = 0usize;
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -1064,53 +1136,17 @@ pub fn merge_delta_into_ledger(ledger: &Path, delta: &Path) -> std::io::Result<u
         let Some(air) = v.get("air_sha256").and_then(|x| x.as_str()) else {
             continue;
         };
-        by_hash.insert(air.to_ascii_lowercase(), sort_json(v));
+        delta_by_hash.insert(air.to_ascii_lowercase(), sort_json(v));
         n_delta += 1;
     }
-    rewrite_jsonl_ledger(ledger, &by_hash)?;
-    Ok(n_delta)
-}
-
-fn load_jsonl_objects_by_air_sha256(
-    path: &Path,
-) -> std::io::Result<HashMap<String, serde_json::Value>> {
-    let mut by_hash = HashMap::new();
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(by_hash),
-        Err(e) => return Err(e),
-    };
-    for line in BufReader::new(file).lines() {
-        let line = line?;
-        let t = line.trim();
-        if t.is_empty() || t.starts_with('#') {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(t) else {
-            continue;
-        };
-        let Some(air) = v.get("air_sha256").and_then(|x| x.as_str()) else {
-            continue;
-        };
-        by_hash.insert(air.to_ascii_lowercase(), v);
+    if delta_by_hash.is_empty() {
+        return Ok(0);
     }
-    Ok(by_hash)
-}
 
-fn rewrite_jsonl_ledger(
-    path: &Path,
-    by_hash: &HashMap<String, serde_json::Value>,
-) -> std::io::Result<()> {
-    let mut rows: Vec<&serde_json::Value> = by_hash.values().collect();
-    rows.sort_by(|a, b| {
-        let la = a.get("label").and_then(|x| x.as_str()).unwrap_or("");
-        let lb = b.get("label").and_then(|x| x.as_str()).unwrap_or("");
-        let ha = a.get("air_sha256").and_then(|x| x.as_str()).unwrap_or("");
-        let hb = b.get("air_sha256").and_then(|x| x.as_str()).unwrap_or("");
-        la.cmp(lb).then(ha.cmp(hb))
-    });
-
-    let tmp = path.with_extension("jsonl.tmp");
+    // The execution ledgers contain hundreds of megabytes of base64 output. Stream the existing
+    // rows instead of materializing every payload as a JSON tree; only the small per-run delta and
+    // the set of seen hashes need to stay resident. Replacements retain their existing position.
+    let tmp = ledger.with_extension("jsonl.tmp");
     {
         let mut f = File::create(&tmp)?;
         writeln!(
@@ -1121,15 +1157,68 @@ fn rewrite_jsonl_ledger(
             f,
             "# unique by air_sha256 after per-run delta merge; last write wins for a given hash"
         )?;
-        for row in rows {
-            let line =
-                serde_json::to_string(&sort_json(row.clone())).map_err(std::io::Error::other)?;
-            writeln!(f, "{line}")?;
+
+        let mut seen = HashSet::<String>::new();
+        match File::open(ledger) {
+            Ok(base) => {
+                for line in BufReader::new(base).lines() {
+                    let line = line?;
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') {
+                        continue;
+                    }
+                    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                        continue;
+                    };
+                    let Some(air) = value.get("air_sha256").and_then(|value| value.as_str()) else {
+                        continue;
+                    };
+                    let air = air.to_ascii_lowercase();
+                    if !seen.insert(air.clone()) {
+                        continue;
+                    }
+                    if let Some(replacement) = delta_by_hash.remove(&air) {
+                        let replacement =
+                            serde_json::to_string(&replacement).map_err(std::io::Error::other)?;
+                        writeln!(f, "{replacement}")?;
+                    } else {
+                        writeln!(f, "{trimmed}")?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut additions = delta_by_hash.into_values().collect::<Vec<_>>();
+        additions.sort_by(|a, b| {
+            a.get("label")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .cmp(
+                    b.get("label")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(""),
+                )
+                .then_with(|| {
+                    a.get("air_sha256")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("")
+                        .cmp(
+                            b.get("air_sha256")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or(""),
+                        )
+                })
+        });
+        for addition in additions {
+            let addition = serde_json::to_string(&addition).map_err(std::io::Error::other)?;
+            writeln!(f, "{addition}")?;
         }
         f.flush()?;
     }
-    fs::rename(&tmp, path)?;
-    Ok(())
+    fs::rename(&tmp, ledger)?;
+    Ok(n_delta)
 }
 
 struct MetalStatusFields<'a> {
@@ -1342,25 +1431,37 @@ fn thread_indexed_input_required_len(ll: &str, type_name: &str, grid_x: u64) -> 
 }
 
 fn apply_output_stride_seed_values(ll: &str, output_index: u32, buffers: &mut [PlanBuffer]) {
-    let mut required_by_buffer: HashMap<u32, u64> = HashMap::new();
-    for req in output_stride_control_requirements(ll, output_index, buffers) {
-        required_by_buffer
-            .entry(req.buffer)
-            .and_modify(|current| *current = (*current).max(req.min_row_bytes))
-            .or_insert(req.min_row_bytes);
-    }
-    if required_by_buffer.is_empty() {
+    let requirements = output_stride_control_requirements(ll, output_index, buffers);
+    if requirements.is_empty() {
         return;
     }
+    let packed_loop_scatter_fields = packed_loop_scatter_control_fields(ll);
 
     for buffer in buffers
         .iter_mut()
         .filter(|b| b.seed_mode == SEED_MODE_BOUNDED_CONTROL)
     {
-        let Some(&required) = required_by_buffer.get(&buffer.index) else {
-            continue;
-        };
         for field in &mut buffer.seed_layout {
+            if packed_loop_scatter_fields
+                .get(&buffer.index)
+                .into_iter()
+                .flatten()
+                .any(|&(offset, size)| {
+                    field.offset < offset.saturating_add(size)
+                        && field.offset.saturating_add(field.size) > offset
+                })
+            {
+                continue;
+            }
+            let required = requirements
+                .iter()
+                .filter(|req| req.buffer == buffer.index)
+                .filter(|req| req.field_offset.is_none_or(|offset| offset == field.offset))
+                .map(|req| req.min_row_bytes)
+                .max();
+            let Some(required) = required else {
+                continue;
+            };
             if !bounded_control_seed_field_is_within_buffer(buffer.len, field) {
                 continue;
             }
@@ -1421,6 +1522,17 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
     let fdiv_denominator_control_bufs = buffers_with_float_loads_used_as_fdiv_denominators(ll);
     let local_array_index_control_bufs = buffers_with_loads_used_as_local_array_indices(ll);
     let bounded_control_module = module_uses_bounded_control_buffers(ll, &loop_bound_bufs);
+    let direct_scalar_control_bufs = if bounded_control_module {
+        direct_scalar_integer_load_buffer_locations(ll)
+    } else {
+        HashSet::new()
+    };
+    let switch_control_fields = switch_control_struct_field_seed_values(ll);
+    let packed_loop_scatter_fields = packed_loop_scatter_control_fields(ll);
+    let zero_exit_cycle_guard_fields = zero_exit_cycle_guard_struct_fields(ll);
+    let zero_unspecified_bicubic_fragment_controls = ll.contains("!air.fragment")
+        && ll.contains("@air.sample_texture")
+        && static_pixel_bicubic_sampler(ll);
     let readonly_buffers = readonly_entry_buffer_locations(ll);
     let writeonly_buffers = writeonly_entry_buffer_locations(ll);
     let locations = stage_resource_locations(ll);
@@ -1463,10 +1575,14 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
         };
         let type_name = quoted_metadata_string_after(line, "air.arg_type_name");
         let atomic_counter_buffer = is_atomic_counter_air_type(type_name.as_deref());
+        let direct_device_scalar_control = role == "Input"
+            && extract_i32_after(line, "air.address_space") == Some(1)
+            && direct_scalar_control_bufs.contains(&loc_u);
         let seed_mode = if control_param
             || atomic_counter_buffer
             || loop_bound_bufs.contains(&loc_u)
             || stride_control_bufs.contains(&loc_u)
+            || direct_device_scalar_control
             || (role == "Input" && atomic_i32_load_bufs.contains(&loc_u))
         {
             SEED_MODE_BOUNDED_CONTROL
@@ -1476,6 +1592,15 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
             SEED_MODE_DETERMINISTIC
         };
         let mut len = (size as usize).max(4);
+        if fixed_size.is_none()
+            && !packed_loop_scatter_fields.is_empty()
+            && writeonly_buffers.contains(&loc_u)
+        {
+            let element_size = extract_i32_after(line, "air.arg_type_size")
+                .and_then(|size| usize::try_from(size).ok())
+                .unwrap_or(0);
+            len = len.max(element_size.saturating_mul(DEFAULT_DISPATCH_GRID_X));
+        }
         if fixed_size.is_none()
             && bounded_control_module
             && (role == "Input" || readonly_buffers.contains(&loc_u))
@@ -1499,14 +1624,91 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
             if atomic_counter_buffer {
                 zero_u32_seed_layout(len)
             } else {
-                bounded_control_seed_layout(
+                let mut layout = bounded_control_seed_layout(
                     ll,
                     line,
                     len,
                     &stride_control_bufs,
                     &fdiv_denominator_control_bufs,
                     &local_array_index_control_bufs,
-                )
+                );
+                if direct_device_scalar_control {
+                    for field in &mut layout {
+                        if matches!(field.size, 1 | 2 | 4 | 8) && field.value.is_none() {
+                            field.value = Some(1);
+                        }
+                    }
+                }
+                for field in &mut layout {
+                    if let Some(&value) =
+                        switch_control_fields.get(&(loc_u, field.offset, field.size))
+                    {
+                        field.value = Some(value);
+                    }
+                    if zero_exit_cycle_guard_fields.contains(&(loc_u, field.offset, field.size)) {
+                        field.value = Some(0);
+                    }
+                }
+                for &(offset, size) in packed_loop_scatter_fields.get(&loc_u).into_iter().flatten()
+                {
+                    let stride = extract_i32_after(line, "air.arg_type_size")
+                        .and_then(|stride| usize::try_from(stride).ok())
+                        .filter(|&stride| stride >= offset.saturating_add(size))
+                        .unwrap_or(len);
+                    // AIR bitfield metadata describes both halves using their four-byte backing
+                    // storage. The IR is authoritative: `and 65535` is the bounded loop count,
+                    // while `lshr 16` is the output base. Zero selects the kernel's defined early
+                    // exit. Any positive count makes a source CFG cycle reachable, which Metal
+                    // oracle policy deliberately refuses to submit even with loop instrumentation.
+                    // Seed every array element identically so the loop proof stays valid before
+                    // the dynamic element index is reduced using the serial dispatch fact.
+                    let mut element_offset = offset;
+                    while element_offset.saturating_add(size) <= len {
+                        let end = element_offset.saturating_add(size);
+                        layout.retain(|field| {
+                            field.offset.saturating_add(field.size) <= element_offset
+                                || field.offset >= end
+                        });
+                        layout.push(ControlSeedField {
+                            offset: element_offset,
+                            size: 4,
+                            value: Some(0),
+                        });
+                        element_offset = element_offset.saturating_add(stride);
+                    }
+                    layout.sort_by_key(|field| (field.offset, field.size));
+                }
+                if zero_unspecified_bicubic_fragment_controls {
+                    // A pixel-coordinate bicubic footprint spans four texels per axis. The generic
+                    // bounded-control value (16) commonly pushes synthesized fragment coordinates
+                    // outside the small validation texture, where Metal's fixed-function cubic
+                    // edge behavior is not a portable oracle for the explicit-fetch emulation.
+                    // Keep structurally discovered switch values, but zero every unspecified
+                    // scalar control field so the oracle measures an in-range Catmull-Rom sample.
+                    for field in &mut layout {
+                        if field.value.is_none() {
+                            field.value = Some(0);
+                        }
+                    }
+                }
+                let untyped_byte_buffer = type_name.as_deref().is_some_and(|name| {
+                    matches!(name.trim().trim_end_matches('*'), "char" | "uchar" | "void")
+                });
+                if loop_bound_bufs.contains(&loc_u) && untyped_byte_buffer {
+                    // Untyped AIR headers have no struct metadata. Seed only integer fields the
+                    // IR actually loads at constant byte offsets; unrelated payload bytes retain
+                    // the established bounded-control pattern.
+                    layout.extend(raw_integer_load_seed_fields(ll, loc_u, len, 1));
+                    let memcpy_counts = raw_direct_memcpy_loop_count_offsets(ll, loc_u);
+                    for field in &mut layout {
+                        if field.size == 8 && memcpy_counts.contains(&field.offset) {
+                            field.value = Some(u64::from(BOUNDED_CONTROL_DIM));
+                        }
+                    }
+                    layout.sort_by_key(|field| (field.offset, field.size));
+                    layout.dedup_by_key(|field| (field.offset, field.size));
+                }
+                layout
             }
         } else if seed_mode == SEED_MODE_FINITE_STRUCT_FLOAT {
             finite_struct_seed
@@ -1565,6 +1767,714 @@ fn infer_buffers(ll: &str) -> Vec<PlanBuffer> {
     let mut v: Vec<_> = by_idx.into_values().collect();
     v.sort_by_key(|b| b.index);
     v
+}
+
+#[derive(Clone)]
+struct LlFunctionView<'a> {
+    name: String,
+    args: Vec<&'a str>,
+    body: &'a str,
+}
+
+fn ll_function_views(ll: &str) -> Vec<LlFunctionView<'_>> {
+    let mut out = Vec::new();
+    for line in ll
+        .lines()
+        .filter(|line| line.trim_start().starts_with("define "))
+    {
+        let Some(name) = llvm_defined_function_name(line) else {
+            continue;
+        };
+        let (Some(args), Some(body)) = (
+            function_args_for_entry(ll, &name),
+            function_body_for_entry(ll, &name),
+        ) else {
+            continue;
+        };
+        out.push(LlFunctionView {
+            name,
+            args: split_llvm_arguments(args),
+            body,
+        });
+    }
+    out
+}
+
+fn llvm_defined_function_name(line: &str) -> Option<String> {
+    let rest = line.trim_start().strip_prefix("define ")?;
+    let at = rest.find('@')?;
+    let after = &rest[at + 1..];
+    if let Some(quoted) = after.strip_prefix('"') {
+        let end = quoted.find('"')?;
+        return Some(quoted[..end].to_string());
+    }
+    let end = after.find('(')?;
+    Some(after[..end].trim().to_string())
+}
+
+fn split_llvm_arguments(args: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut round = 0i32;
+    let mut square = 0i32;
+    let mut curly = 0i32;
+    let mut angle = 0i32;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in args.char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '(' => round += 1,
+            ')' => round -= 1,
+            '[' => square += 1,
+            ']' => square -= 1,
+            '{' => curly += 1,
+            '}' => curly -= 1,
+            '<' => angle += 1,
+            '>' => angle -= 1,
+            ',' if round == 0 && square == 0 && curly == 0 && angle == 0 => {
+                out.push(args[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < args.len() {
+        out.push(args[start..].trim());
+    }
+    out
+}
+
+fn switch_selector_case_values(body: &str) -> HashMap<String, u64> {
+    let lines = body.lines().collect::<Vec<_>>();
+    let mut out = HashMap::new();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let trimmed = lines[index].trim_start();
+        if !trimmed.starts_with("switch i") {
+            index += 1;
+            continue;
+        }
+        let Some(selector) = first_percent_reg(trimmed) else {
+            index += 1;
+            continue;
+        };
+        let mut cases = Vec::new();
+        let mut cursor = index;
+        loop {
+            cases.extend(nonnegative_switch_case_literals(lines[cursor]));
+            if lines[cursor].contains(']') || cursor + 1 >= lines.len() {
+                break;
+            }
+            cursor += 1;
+        }
+        if let Some(value) = cases.into_iter().min() {
+            out.insert(selector.to_string(), value);
+        }
+        index = cursor + 1;
+    }
+    out
+}
+
+fn nonnegative_switch_case_literals(line: &str) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(pos) = rest.find("i") {
+        rest = &rest[pos + 1..];
+        let width_len = rest.chars().take_while(char::is_ascii_digit).count();
+        if width_len == 0 || !rest[width_len..].starts_with(' ') {
+            continue;
+        }
+        let value_text = rest[width_len + 1..]
+            .trim_start()
+            .chars()
+            .take_while(|ch| ch.is_ascii_digit() || *ch == '-')
+            .collect::<String>();
+        if let Ok(value) = value_text.parse::<i128>() {
+            if let Ok(value) = u64::try_from(value) {
+                out.push(value);
+            }
+        }
+        rest = &rest[width_len + 1..];
+    }
+    out
+}
+
+fn call_arguments_for_callee<'a>(line: &'a str, callee: &str) -> Option<Vec<&'a str>> {
+    let plain = format!("@{callee}(");
+    let quoted = format!("@\"{callee}\"(");
+    let open = line
+        .find(&plain)
+        .map(|pos| pos + plain.len())
+        .or_else(|| line.find(&quoted).map(|pos| pos + quoted.len()))?;
+    let mut depth = 1i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (relative, ch) in line[open..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(split_llvm_arguments(&line[open..open + relative]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn typed_gep_field_path(rhs: &str, pointer_name: &str) -> Option<Vec<usize>> {
+    let operands = rhs.split(',').collect::<Vec<_>>();
+    let pointer_ordinal = operands.iter().position(|operand| {
+        operand.contains("ptr") && percent_operands(operand).last().copied() == Some(pointer_name)
+    })?;
+    let mut indices = Vec::new();
+    for (ordinal, operand) in operands.iter().skip(pointer_ordinal + 1).enumerate() {
+        let operand = operand.trim();
+        let (ty, value) = operand.split_once(' ')?;
+        if !ty.starts_with('i') {
+            return None;
+        }
+        // The first index selects an array element of the root pointee and may be dynamic. It
+        // does not name a struct member, so only subsequent indices must be constants.
+        if ordinal > 0 {
+            indices.push(value.trim().parse::<usize>().ok()?);
+        }
+    }
+    // An array-element GEP has only the discarded root index. Preserve it as an empty struct path
+    // so a following GEP can append the actual member index.
+    Some(indices)
+}
+
+fn struct_metadata_field(
+    ll: &str,
+    node: u32,
+    member: usize,
+) -> Option<(usize, usize, Option<u32>)> {
+    let line = metadata_node_line(ll, node)?;
+    let payload = metadata_payload(line)?;
+    let tokens = metadata_tokens(payload);
+    let mut pending_nested = None;
+    let mut field_index = 0usize;
+    let mut index = 0usize;
+    while index + 3 < tokens.len() {
+        if metadata_quoted_token(tokens[index]) == Some("air.struct_type_info") {
+            pending_nested = tokens
+                .get(index + 1)
+                .and_then(|token| metadata_ref_token(token));
+            index += 2;
+            continue;
+        }
+        let (Some(offset), Some(size), Some(_repeat), Some(_type_name)) = (
+            metadata_i32_token(tokens[index]),
+            metadata_i32_token(tokens[index + 1]),
+            metadata_i32_token(tokens[index + 2]),
+            metadata_quoted_token(tokens[index + 3]),
+        ) else {
+            index += 1;
+            continue;
+        };
+        if field_index == member {
+            return Some((
+                usize::try_from(offset).ok()?,
+                usize::try_from(size).ok()?,
+                pending_nested,
+            ));
+        }
+        pending_nested = None;
+        field_index += 1;
+        index += 5;
+    }
+    None
+}
+
+fn struct_metadata_path_offset_and_size(
+    ll: &str,
+    root: u32,
+    path: &[usize],
+) -> Option<(usize, usize)> {
+    let mut node = root;
+    let mut base = 0usize;
+    for (depth, &member) in path.iter().enumerate() {
+        let (offset, size, nested) = struct_metadata_field(ll, node, member)?;
+        base = base.checked_add(offset)?;
+        if depth + 1 == path.len() {
+            return Some((base, size));
+        }
+        node = nested?;
+    }
+    None
+}
+
+/// Exact seed overrides for integer struct fields whose loaded values select an explicit LLVM
+/// `switch` case, including selectors forwarded as direct call arguments to helper functions.
+fn switch_control_struct_field_seed_values(ll: &str) -> HashMap<(u32, usize, usize), u64> {
+    let Some(entry_name) = entry_name_from_ll(ll) else {
+        return HashMap::new();
+    };
+    let functions = ll_function_views(ll);
+    let Some(entry) = functions
+        .iter()
+        .find(|function| function.name == entry_name)
+    else {
+        return HashMap::new();
+    };
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_names = entry
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, arg)| {
+            let buffer = arg_to_buf.get(&ordinal).copied()?;
+            let name = percent_operands(arg).last()?.to_string();
+            Some((name, buffer))
+        })
+        .collect::<HashMap<_, _>>();
+    let switch_choices = functions
+        .iter()
+        .map(|function| {
+            (
+                function.name.clone(),
+                switch_selector_case_values(function.body),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut pointer_fields = HashMap::<String, (u32, Vec<usize>)>::new();
+    let mut loaded_fields = HashMap::<String, (u32, Vec<usize>)>::new();
+    let mut requested = Vec::<(u32, Vec<usize>, u64)>::new();
+    for line in entry.body.lines().map(str::trim) {
+        if let Some((reg, rhs)) = split_assign(line) {
+            if rhs.starts_with("getelementptr") {
+                for pointer_name in percent_operands(rhs) {
+                    let origin = pointer_fields.get(pointer_name).cloned().or_else(|| {
+                        arg_names
+                            .get(pointer_name)
+                            .map(|&buffer| (buffer, Vec::new()))
+                    });
+                    let Some((buffer, mut path)) = origin else {
+                        continue;
+                    };
+                    let Some(mut suffix) = typed_gep_field_path(rhs, pointer_name) else {
+                        continue;
+                    };
+                    path.append(&mut suffix);
+                    pointer_fields.insert(reg.to_string(), (buffer, path));
+                    break;
+                }
+            } else if rhs.starts_with("bitcast ") {
+                if let Some(origin) = percent_operands(rhs)
+                    .into_iter()
+                    .find_map(|name| pointer_fields.get(name).cloned())
+                {
+                    pointer_fields.insert(reg.to_string(), origin);
+                }
+            } else if is_scalar_integer_load_rhs(rhs) {
+                if let Some(origin) = percent_operands(rhs).into_iter().find_map(|name| {
+                    pointer_fields
+                        .get(name)
+                        .cloned()
+                        .or_else(|| arg_names.get(name).map(|&buffer| (buffer, Vec::new())))
+                }) {
+                    loaded_fields.insert(reg.to_string(), origin);
+                }
+            }
+        }
+
+        if let Some(entry_switches) = switch_choices.get(&entry.name) {
+            if line.starts_with("switch i") {
+                if let Some(selector) = first_percent_reg(line) {
+                    if let (Some(origin), Some(&value)) =
+                        (loaded_fields.get(selector), entry_switches.get(selector))
+                    {
+                        requested.push((origin.0, origin.1.clone(), value));
+                    }
+                }
+            }
+        }
+        for function in &functions {
+            let Some(function_switches) = switch_choices.get(&function.name) else {
+                continue;
+            };
+            if function_switches.is_empty() {
+                continue;
+            }
+            let Some(call_args) = call_arguments_for_callee(line, &function.name) else {
+                continue;
+            };
+            for (ordinal, parameter) in function.args.iter().enumerate() {
+                let Some(parameter_name) = percent_operands(parameter).into_iter().last() else {
+                    continue;
+                };
+                let Some(&value) = function_switches.get(parameter_name) else {
+                    continue;
+                };
+                let Some(actual) = call_args
+                    .get(ordinal)
+                    .and_then(|argument| percent_operands(argument).into_iter().last())
+                else {
+                    continue;
+                };
+                if let Some(origin) = loaded_fields.get(actual) {
+                    requested.push((origin.0, origin.1.clone(), value));
+                }
+            }
+        }
+    }
+
+    let struct_nodes = ll
+        .lines()
+        .filter(|line| line.contains("air.buffer") && line.contains("air.location_index"))
+        .filter_map(|line| {
+            let location = metadata_param_index(line)
+                .and_then(|index| stage_resource_locations(ll).buffers.get(&index).copied())
+                .or_else(|| extract_i32_after(line, "air.location_index").map(|v| v as u32))?;
+            let node = metadata_ref_after(line, "air.struct_type_info")?;
+            Some((location, node))
+        })
+        .collect::<HashMap<_, _>>();
+    requested
+        .into_iter()
+        .filter_map(|(buffer, path, value)| {
+            let root = *struct_nodes.get(&buffer)?;
+            let (offset, size) = struct_metadata_path_offset_and_size(ll, root, &path)?;
+            Some(((buffer, offset, size), value))
+        })
+        .collect()
+}
+
+/// Locate a packed 32-bit input field whose low half bounds a loop and whose high half seeds a
+/// helper-mediated output scatter. Some AIR struct metadata reports each logical 16-bit field as
+/// the full four-byte backing integer, so blindly applying both metadata records creates an
+/// out-of-bounds, cross-thread write oracle.
+fn packed_loop_scatter_control_fields(ll: &str) -> HashMap<u32, Vec<(usize, usize)>> {
+    let Some(entry_name) = entry_name_from_ll(ll) else {
+        return HashMap::new();
+    };
+    let functions = ll_function_views(ll);
+    let Some(entry) = functions
+        .iter()
+        .find(|function| function.name == entry_name)
+    else {
+        return HashMap::new();
+    };
+    let loop_bound_buffers = buffers_with_loads_used_as_loop_bounds(ll);
+    if loop_bound_buffers.is_empty() || !ll.contains(r#""air.thread_position_in_grid""#) {
+        return HashMap::new();
+    }
+
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_names = entry
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, arg)| {
+            let buffer = arg_to_buf.get(&ordinal).copied()?;
+            let name = percent_operands(arg).last()?.to_string();
+            Some((name, buffer))
+        })
+        .collect::<HashMap<_, _>>();
+    let writable_buffers = writeonly_entry_buffer_locations(ll);
+    let writable_args = arg_names
+        .iter()
+        .filter(|(_, buffer)| writable_buffers.contains(buffer))
+        .map(|(name, _)| name.as_str())
+        .collect::<HashSet<_>>();
+    let helper_receives_output = entry.body.lines().any(|line| {
+        line.contains("call ")
+            && percent_operands(line)
+                .iter()
+                .any(|operand| writable_args.contains(operand))
+    });
+    if !helper_receives_output {
+        return HashMap::new();
+    }
+
+    let mut pointer_fields = HashMap::<String, (u32, Vec<usize>)>::new();
+    let mut loaded_fields = HashMap::<String, (u32, Vec<usize>)>::new();
+    let mut low_half_sources = HashSet::<String>::new();
+    let mut high_half_sources = HashSet::<String>::new();
+    for line in entry.body.lines().map(str::trim) {
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("getelementptr") {
+            for pointer_name in percent_operands(rhs) {
+                let origin = pointer_fields.get(pointer_name).cloned().or_else(|| {
+                    arg_names
+                        .get(pointer_name)
+                        .map(|&buffer| (buffer, Vec::new()))
+                });
+                let Some((buffer, mut path)) = origin else {
+                    continue;
+                };
+                let Some(mut suffix) = typed_gep_field_path(rhs, pointer_name) else {
+                    continue;
+                };
+                path.append(&mut suffix);
+                pointer_fields.insert(reg.to_string(), (buffer, path));
+                break;
+            }
+        } else if rhs.starts_with("bitcast ") {
+            if let Some(origin) = percent_operands(rhs)
+                .into_iter()
+                .find_map(|name| pointer_fields.get(name).cloned())
+            {
+                pointer_fields.insert(reg.to_string(), origin);
+            }
+        } else if is_scalar_integer_load_rhs(rhs) {
+            if let Some(origin) = percent_operands(rhs).into_iter().find_map(|name| {
+                pointer_fields
+                    .get(name)
+                    .cloned()
+                    .or_else(|| arg_names.get(name).map(|&buffer| (buffer, Vec::new())))
+            }) {
+                loaded_fields.insert(reg.to_string(), origin);
+            }
+        } else if rhs.starts_with("and i32 ") && rhs.trim_end().ends_with(", 65535") {
+            if let Some(source) = first_percent_reg(rhs) {
+                low_half_sources.insert(source.to_string());
+            }
+        } else if rhs.starts_with("lshr i32 ") && rhs.trim_end().ends_with(", 16") {
+            if let Some(source) = first_percent_reg(rhs) {
+                high_half_sources.insert(source.to_string());
+            }
+        }
+    }
+
+    let struct_nodes = ll
+        .lines()
+        .filter(|line| line.contains("air.buffer") && line.contains("air.location_index"))
+        .filter_map(|line| {
+            let location = metadata_param_index(line)
+                .and_then(|index| stage_resource_locations(ll).buffers.get(&index).copied())
+                .or_else(|| extract_i32_after(line, "air.location_index").map(|v| v as u32))?;
+            let node = metadata_ref_after(line, "air.struct_type_info")?;
+            Some((location, node))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut out = HashMap::<u32, Vec<(usize, usize)>>::new();
+    for source in low_half_sources.intersection(&high_half_sources) {
+        let Some((buffer, path)) = loaded_fields.get(source) else {
+            continue;
+        };
+        if !loop_bound_buffers.contains(buffer) {
+            continue;
+        }
+        let Some(root) = struct_nodes.get(buffer) else {
+            continue;
+        };
+        let Some((offset, size)) = struct_metadata_path_offset_and_size(ll, *root, path) else {
+            continue;
+        };
+        if size == 4 {
+            out.entry(*buffer).or_default().push((offset, size));
+        }
+    }
+    out
+}
+
+/// Find an integer struct field whose zero value makes the entry branch directly to return while
+/// its other arm reaches a source CFG cycle. This is used only for the packed loop/scatter oracle
+/// class: choosing the defined no-op entry path is safer than submitting even a finite source loop
+/// to Metal, and the proof remains structural (entry CFG + rooted load provenance).
+fn zero_exit_cycle_guard_struct_fields(ll: &str) -> HashSet<(u32, usize, usize)> {
+    if packed_loop_scatter_control_fields(ll).is_empty() {
+        return HashSet::new();
+    }
+    let Some(entry_name) = entry_name_from_ll(ll) else {
+        return HashSet::new();
+    };
+    let functions = ll_function_views(ll);
+    let Some(entry) = functions
+        .iter()
+        .find(|function| function.name == entry_name)
+    else {
+        return HashSet::new();
+    };
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_names = entry
+        .args
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, arg)| {
+            let buffer = arg_to_buf.get(&ordinal).copied()?;
+            let name = percent_operands(arg).last()?.to_string();
+            Some((name, buffer))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut pointer_fields = HashMap::<String, (u32, Vec<usize>)>::new();
+    let mut loaded_fields = HashMap::<String, (u32, Vec<usize>)>::new();
+    let mut zero_conditions = HashMap::<String, ((u32, Vec<usize>), bool)>::new();
+    for line in entry.body.lines().map(str::trim) {
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("getelementptr") {
+            for pointer_name in percent_operands(rhs) {
+                let origin = pointer_fields.get(pointer_name).cloned().or_else(|| {
+                    arg_names
+                        .get(pointer_name)
+                        .map(|&buffer| (buffer, Vec::new()))
+                });
+                let Some((buffer, mut path)) = origin else {
+                    continue;
+                };
+                let Some(mut suffix) = typed_gep_field_path(rhs, pointer_name) else {
+                    continue;
+                };
+                path.append(&mut suffix);
+                pointer_fields.insert(reg.to_string(), (buffer, path));
+                break;
+            }
+        } else if rhs.starts_with("bitcast ") {
+            if let Some(origin) = percent_operands(rhs)
+                .into_iter()
+                .find_map(|name| pointer_fields.get(name).cloned())
+            {
+                pointer_fields.insert(reg.to_string(), origin);
+            }
+        } else if is_scalar_integer_load_rhs(rhs) {
+            if let Some(origin) = percent_operands(rhs).into_iter().find_map(|name| {
+                pointer_fields
+                    .get(name)
+                    .cloned()
+                    .or_else(|| arg_names.get(name).map(|&buffer| (buffer, Vec::new())))
+            }) {
+                loaded_fields.insert(reg.to_string(), origin);
+            }
+        } else if let Some(cmp) = rhs.strip_prefix("icmp ") {
+            let predicate = cmp.split_whitespace().next().unwrap_or_default();
+            let operands = percent_operands(cmp);
+            let loaded = operands
+                .iter()
+                .enumerate()
+                .find_map(|(index, name)| loaded_fields.get(*name).cloned().map(|v| (index, v)));
+            let Some((loaded_index, origin)) = loaded else {
+                continue;
+            };
+            let zero_result = match (predicate, loaded_index) {
+                ("ult", 1) | ("ugt", 0) => Some(false),
+                _ => None,
+            };
+            if let Some(zero_result) = zero_result {
+                zero_conditions.insert(reg.to_string(), (origin, zero_result));
+            }
+        }
+    }
+
+    let cyclic = cyclic_cfg_blocks(entry.body);
+    let return_blocks = function_return_blocks(entry.body);
+    let struct_nodes = ll
+        .lines()
+        .filter(|line| line.contains("air.buffer") && line.contains("air.location_index"))
+        .filter_map(|line| {
+            let location = metadata_param_index(line)
+                .and_then(|index| stage_resource_locations(ll).buffers.get(&index).copied())
+                .or_else(|| extract_i32_after(line, "air.location_index").map(|v| v as u32))?;
+            Some((location, metadata_ref_after(line, "air.struct_type_info")?))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut out = HashSet::new();
+    for line in entry.body.lines().map(str::trim) {
+        if !line.starts_with("br i1 ") {
+            continue;
+        }
+        let Some(condition) = first_percent_reg(line) else {
+            continue;
+        };
+        let Some(((buffer, path), zero_result)) = zero_conditions.get(condition) else {
+            continue;
+        };
+        let labels = branch_labels(line);
+        if labels.len() != 2 {
+            continue;
+        }
+        let exit = labels[usize::from(!*zero_result)];
+        let work = labels[usize::from(*zero_result)];
+        if !return_blocks.contains(exit) || !block_reaches_any(entry.body, work, &cyclic) {
+            continue;
+        }
+        let Some(root) = struct_nodes.get(buffer) else {
+            continue;
+        };
+        if let Some((offset, size)) = struct_metadata_path_offset_and_size(ll, *root, path) {
+            out.insert((*buffer, offset, size));
+        }
+    }
+    out
+}
+
+fn function_return_blocks(body: &str) -> HashSet<&str> {
+    let mut current = None;
+    let mut out = HashSet::new();
+    for line in body.lines().map(str::trim) {
+        if let Some(label) = block_label(line) {
+            current = Some(label);
+        } else if line.starts_with("ret ") {
+            if let Some(label) = current {
+                out.insert(label);
+            }
+        }
+    }
+    out
+}
+
+fn block_reaches_any(body: &str, start: &str, targets: &HashSet<&str>) -> bool {
+    let mut current = None;
+    let mut successors = HashMap::<&str, Vec<&str>>::new();
+    for line in body.lines().map(str::trim) {
+        if let Some(label) = block_label(line) {
+            current = Some(label);
+            successors.entry(label).or_default();
+        } else if let Some(block) = current {
+            if line.starts_with("br ")
+                || line.starts_with("switch ")
+                || (line.starts_with('i') && line.contains("label %"))
+            {
+                successors
+                    .entry(block)
+                    .or_default()
+                    .extend(branch_labels(line));
+            }
+        }
+    }
+    let mut pending = vec![start];
+    let mut seen = HashSet::new();
+    while let Some(block) = pending.pop() {
+        if targets.contains(block) {
+            return true;
+        }
+        if seen.insert(block) {
+            pending.extend(successors.get(block).into_iter().flatten().copied());
+        }
+    }
+    false
 }
 
 fn writeonly_entry_buffer_locations(ll: &str) -> HashSet<u32> {
@@ -1794,17 +2704,26 @@ fn texture_format_from_air_type(type_name: Option<&str>) -> &'static str {
     let Some(type_name) = type_name else {
         return "Rgba32Float";
     };
-    if type_name.starts_with("depth") {
+    // Texture arrays wrap the actual texture spelling in `array<...>`. Parse the innermost AIR
+    // texture type so its component/access qualifiers, rather than the outer aggregate, determine
+    // the validation format.
+    let texture_type = [type_name.find("texture"), type_name.find("depth")]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|start| &type_name[start..])
+        .unwrap_or(type_name);
+    if texture_type.starts_with("depth") {
         return "R32Float";
     }
-    let component = type_name
+    let component = texture_type
         .split_once('<')
         .and_then(|(_, rest)| rest.split([',', '>']).next())
         .map(str::trim)
         .unwrap_or("");
     match component {
         "half" => "Rgba16Float",
-        "float" if texture_type_is_writable(type_name) => "R32Float",
+        "float" if texture_type_is_writable(texture_type) => "R32Float",
         "float" => "Rgba32Float",
         "ushort" => "Rgba16Uint",
         "uint" | "uchar" => "Rgba8Uint",
@@ -1906,31 +2825,81 @@ fn fragment_output_format_from_air_type(type_name: &str) -> Option<&'static str>
     })
 }
 
-fn unsupported_fragment_color_output_arity(ll: &str) -> Option<String> {
+fn fragment_rgb_render_target_padding(ll: &str, output_format: &str) -> Option<(usize, usize)> {
     let meta = metal2vulkan::meta::parse_air_fragment_meta(ll)?;
-    let mut render_targets: Vec<_> = meta.render_target_members.iter().collect();
-    render_targets.sort_by_key(|(_, location)| *location);
-
-    for (member, location) in render_targets {
-        let Some(type_name) = meta.render_target_type_name(*member) else {
-            continue;
-        };
-        if fragment_output_type_has_three_components(type_name) {
-            return Some(format!(
-                "unsupported Metal fragment color output attachment arity: render target location \
-                 {location} uses AIR type {type_name:?}, but Metal has no renderable RGB color \
-                 attachment format for a full golden"
-            ));
-        }
+    let mut location_zero_types = meta
+        .render_target_members
+        .iter()
+        .filter(|(_, location)| *location == 0)
+        .filter_map(|(member, _)| meta.render_target_type_name(*member));
+    let type_name = location_zero_types.next()?;
+    if location_zero_types.any(|other| other != type_name) {
+        return None;
     }
-    None
+
+    match (type_name, output_format) {
+        ("half3", "Rgba16Float") | ("ushort3", "Rgba16Uint") | ("short3", "Rgba16Sint") => {
+            Some((6, 8))
+        }
+        ("float3", "Rgba32Float") | ("uint3", "Rgba32Uint") | ("int3", "Rgba32Sint") => {
+            Some((12, 16))
+        }
+        _ => None,
+    }
 }
 
-fn fragment_output_type_has_three_components(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "half3" | "float3" | "ushort3" | "short3" | "uint3" | "int3"
-    )
+/// Metal and Vulkan render three-component fragment outputs into four-component attachments.
+/// The shader defines RGB, but the attachment's fourth lane is API padding rather than part of
+/// the AIR result. Canonicalize that lane after readback so the oracle compares every defined AIR
+/// output byte without depending on backend-specific padding values.
+fn canonicalize_fragment_render_target_padding(ll: &str, plan: &HarnessPlan, bytes: &mut [u8]) {
+    if plan.output.kind != "render_target" {
+        return;
+    }
+    let Some((defined_bytes, attachment_stride)) =
+        fragment_rgb_render_target_padding(ll, &plan.output.format)
+    else {
+        return;
+    };
+    assert!(
+        bytes.len().is_multiple_of(attachment_stride),
+        "RGB render-target readback length {} is not a multiple of attachment stride {}",
+        bytes.len(),
+        attachment_stride
+    );
+    for texel in bytes.chunks_exact_mut(attachment_stride) {
+        texel[defined_bytes..].fill(0);
+    }
+}
+
+fn canonicalize_unordered_atomic_append_output(ll: &str, plan: &HarnessPlan, bytes: &mut [u8]) {
+    if plan.output.kind != "buffer"
+        || plan.output.format != "RawBytes"
+        || !bytes.len().is_multiple_of(4)
+        || !ll.contains("@air.atomic.global.add")
+        || !ll.contains("\"air.thread_position_in_grid\"")
+        || !ll
+            .lines()
+            .any(|line| line.trim_start().contains(" = getelementptr inbounds i32"))
+        || !ll
+            .lines()
+            .any(|line| line.trim_start().starts_with("store i32 "))
+    {
+        return;
+    }
+    let mut words = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte chunk")))
+        .collect::<Vec<_>>();
+    words.sort_unstable();
+    for (word, value) in bytes.chunks_exact_mut(4).zip(words) {
+        word.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn canonicalize_output_bytes(ll: &str, plan: &HarnessPlan, bytes: &mut [u8]) {
+    canonicalize_fragment_render_target_padding(ll, plan, bytes);
+    canonicalize_unordered_atomic_append_output(ll, plan, bytes);
 }
 
 fn buffer_output_format(ll: &str, output_index: u32) -> Option<&'static str> {
@@ -2375,6 +3344,19 @@ fn buffers_with_loads_used_as_loop_bounds(ll: &str) -> HashSet<u32> {
                 || rhs.starts_with("select ")
                 || rhs.starts_with("add ")
                 || rhs.starts_with("sub ")
+                || rhs.starts_with("mul ")
+                || rhs.starts_with("shl ")
+                || rhs.starts_with("lshr ")
+                || rhs.starts_with("ashr ")
+                || rhs.starts_with("and ")
+                || rhs.starts_with("or ")
+                || rhs.starts_with("xor ")
+                || rhs.starts_with("udiv ")
+                || rhs.starts_with("sdiv ")
+                || rhs.starts_with("urem ")
+                || rhs.starts_with("srem ")
+                || rhs.contains("@air.min.")
+                || rhs.contains("@air.max.")
             {
                 if let Some(buf) = first_int_buf_operand(rhs, &int_from_buf) {
                     int_from_buf.insert(reg, buf);
@@ -2412,6 +3394,196 @@ fn buffers_with_loads_used_as_loop_bounds(ll: &str) -> HashSet<u32> {
         }
     }
     branched
+}
+
+fn direct_scalar_integer_load_buffer_locations(ll: &str) -> HashSet<u32> {
+    let Some(body) = primary_entry_function_body(ll) else {
+        return HashSet::new();
+    };
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_name_to_buf = arg_name_to_buffer_location(ll, &arg_to_buf);
+    let pointers = HashMap::new();
+    body.lines()
+        .filter_map(|line| {
+            let (_, rhs) = split_assign(line.trim())?;
+            is_scalar_integer_load_rhs(rhs).then_some(rhs)
+        })
+        .filter_map(|rhs| first_buf_operand(rhs, &pointers, &arg_to_buf, &arg_name_to_buf))
+        .collect()
+}
+
+/// Integer fields read at constant byte offsets from an untyped buffer. AIR metadata sometimes
+/// describes a structured control/header allocation only as `char*`, so there is no
+/// `air.struct_type_info` from which to build a seed layout. Recover the field offsets from the
+/// pointer chain instead; only buffers already proven to feed a cyclic branch use these fields.
+fn raw_integer_load_seed_fields(
+    ll: &str,
+    target_buffer: u32,
+    len: usize,
+    value: u64,
+) -> Vec<ControlSeedField> {
+    let Some(body) = primary_entry_function_body(ll) else {
+        return Vec::new();
+    };
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_name_to_buf = arg_name_to_buffer_location(ll, &arg_to_buf);
+    let mut pointers = HashMap::<&str, (u32, usize)>::new();
+    let mut fields = Vec::new();
+
+    for line in body.lines().map(str::trim) {
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("bitcast ") {
+            if let Some(pointer) =
+                pointer_buffer_and_offset(rhs, &pointers, &arg_to_buf, &arg_name_to_buf)
+            {
+                pointers.insert(reg, pointer);
+            }
+            continue;
+        }
+        if rhs.starts_with("getelementptr") {
+            let Some((buffer, base)) =
+                pointer_buffer_and_offset(rhs, &pointers, &arg_to_buf, &arg_name_to_buf)
+            else {
+                continue;
+            };
+            // Only byte GEPs have a layout-independent constant offset. Typed GEP offsets need
+            // LLVM layout information and are intentionally left unknown here.
+            if rhs.contains(" i8,") {
+                if let Some(delta) = trailing_constant_i64(rhs) {
+                    if let Some(offset) = base.checked_add_signed(delta) {
+                        pointers.insert(reg, (buffer, offset));
+                    }
+                }
+            } else if rhs.contains(", i64 0") {
+                pointers.insert(reg, (buffer, base));
+            }
+            continue;
+        }
+        if !is_scalar_integer_load_rhs(rhs) {
+            continue;
+        }
+        let Some((buffer, offset)) =
+            pointer_buffer_and_offset(rhs, &pointers, &arg_to_buf, &arg_name_to_buf)
+        else {
+            continue;
+        };
+        if buffer != target_buffer {
+            continue;
+        }
+        let Some(size) = scalar_integer_load_size(rhs) else {
+            continue;
+        };
+        if offset.saturating_add(size) <= len {
+            fields.push(ControlSeedField {
+                offset,
+                size,
+                value: Some(value),
+            });
+        }
+    }
+    fields
+}
+
+fn raw_direct_memcpy_loop_count_offsets(ll: &str, target_buffer: u32) -> HashSet<usize> {
+    let Some(body) = primary_entry_function_body(ll) else {
+        return HashSet::new();
+    };
+    if !body.contains("@llvm.memcpy.") {
+        return HashSet::new();
+    }
+    let arg_to_buf = arg_index_to_buffer_location(ll);
+    let arg_name_to_buf = arg_name_to_buffer_location(ll, &arg_to_buf);
+    let mut pointers = HashMap::<&str, (u32, usize)>::new();
+    let mut raw_i64_loads = HashMap::<&str, usize>::new();
+    for line in body.lines().map(str::trim) {
+        let Some((reg, rhs)) = split_assign(line) else {
+            continue;
+        };
+        if rhs.starts_with("bitcast ") {
+            if let Some(pointer) =
+                pointer_buffer_and_offset(rhs, &pointers, &arg_to_buf, &arg_name_to_buf)
+            {
+                pointers.insert(reg, pointer);
+            }
+            continue;
+        }
+        if rhs.starts_with("getelementptr") {
+            let Some((buffer, base)) =
+                pointer_buffer_and_offset(rhs, &pointers, &arg_to_buf, &arg_name_to_buf)
+            else {
+                continue;
+            };
+            if rhs.contains(" i8,") {
+                if let Some(delta) = trailing_constant_i64(rhs) {
+                    if let Some(offset) = base.checked_add_signed(delta) {
+                        pointers.insert(reg, (buffer, offset));
+                    }
+                }
+            }
+            continue;
+        }
+        if scalar_integer_load_size(rhs) == Some(8) {
+            if let Some((buffer, offset)) =
+                pointer_buffer_and_offset(rhs, &pointers, &arg_to_buf, &arg_name_to_buf)
+            {
+                if buffer == target_buffer {
+                    raw_i64_loads.insert(reg, offset);
+                }
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    for line in body.lines().filter(|line| line.contains(" = phi i64 ")) {
+        for (reg, offset) in &raw_i64_loads {
+            if line.contains(&format!("[ %{reg},")) {
+                out.insert(*offset);
+            }
+        }
+    }
+    out
+}
+
+fn pointer_buffer_and_offset<'a>(
+    rhs: &'a str,
+    pointers: &HashMap<&'a str, (u32, usize)>,
+    arg_to_buf: &HashMap<usize, u32>,
+    arg_name_to_buf: &HashMap<String, u32>,
+) -> Option<(u32, usize)> {
+    for name in percent_operands(rhs) {
+        if let Some(&pointer) = pointers.get(name) {
+            return Some(pointer);
+        }
+        if let Some(&buffer) = arg_name_to_buf.get(name) {
+            return Some((buffer, 0));
+        }
+        if let Ok(ordinal) = name.parse::<usize>() {
+            if let Some(&buffer) = arg_to_buf.get(&ordinal) {
+                return Some((buffer, 0));
+            }
+        }
+    }
+    None
+}
+
+fn trailing_constant_i64(rhs: &str) -> Option<isize> {
+    let (_, tail) = rhs.rsplit_once("i64 ")?;
+    tail.split(|ch: char| ch == ',' || ch.is_whitespace())
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn scalar_integer_load_size(rhs: &str) -> Option<usize> {
+    let rest = rhs.strip_prefix("load i")?;
+    let bits = rest
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse::<usize>()
+        .ok()?;
+    matches!(bits, 8 | 16 | 32 | 64).then_some(bits / 8)
 }
 
 fn first_int_buf_operand(rhs: &str, int_from_buf: &HashMap<&str, u32>) -> Option<u32> {
@@ -2458,7 +3630,10 @@ fn cyclic_cfg_blocks(body: &str) -> HashSet<&str> {
         let Some(block) = current else {
             continue;
         };
-        if line.starts_with("br ") {
+        if line.starts_with("br ")
+            || line.starts_with("switch ")
+            || (line.starts_with('i') && line.contains("label %"))
+        {
             succs.entry(block).or_default().extend(branch_labels(line));
         }
     }
@@ -3017,7 +4192,32 @@ fn bounded_control_seed_fields(
         let offset = base_offset.saturating_add(offset.max(0) as usize);
         let field_byte_size = byte_size.max(0) as usize;
         let repeat_count = usize::try_from(repeat_count).unwrap_or(0).max(1);
-        if let Some(size) = bounded_control_field_seed_size(type_name, byte_size) {
+        if let Some((element_size, columns, rows)) =
+            bounded_control_matrix_shape(type_name, byte_size)
+        {
+            for element in 0..repeat_count {
+                let element_offset = offset.saturating_add(element.saturating_mul(field_byte_size));
+                for column in 0..columns {
+                    for row in 0..rows {
+                        let lane = column.saturating_mul(rows).saturating_add(row);
+                        let field_offset =
+                            element_offset.saturating_add(lane.saturating_mul(element_size));
+                        if field_offset.saturating_add(element_size) <= ctx.len {
+                            let one = match element_size {
+                                2 => 0x3c00,
+                                4 => 0x3f80_0000,
+                                _ => unreachable!("validated matrix scalar size"),
+                            };
+                            fields.push(ControlSeedField {
+                                offset: field_offset,
+                                size: element_size,
+                                value: Some(if column == row { one } else { 0 }),
+                            });
+                        }
+                    }
+                }
+            }
+        } else if let Some(size) = bounded_control_field_seed_size(type_name, byte_size) {
             for element in 0..repeat_count {
                 let field_offset = offset.saturating_add(element.saturating_mul(field_byte_size));
                 if field_offset < ctx.len && field_offset.saturating_add(size) <= ctx.len {
@@ -3032,6 +4232,30 @@ fn bounded_control_seed_fields(
                             )
                         }),
                     });
+                }
+            }
+        } else if let Some((lanes, scalar, element_size)) = integer_vector_shape(type_name) {
+            if field_byte_size == lanes.saturating_mul(element_size) {
+                for element in 0..repeat_count {
+                    let element_offset =
+                        offset.saturating_add(element.saturating_mul(field_byte_size));
+                    for lane in 0..lanes {
+                        let field_offset =
+                            element_offset.saturating_add(lane.saturating_mul(element_size));
+                        if field_offset.saturating_add(element_size) <= ctx.len {
+                            fields.push(ControlSeedField {
+                                offset: field_offset,
+                                size: element_size,
+                                value: scalar_value_override.or_else(|| {
+                                    bounded_control_field_seed_value(
+                                        scalar,
+                                        ctx.seed_float_one,
+                                        ctx.seed_int_zero,
+                                    )
+                                }),
+                            });
+                        }
+                    }
                 }
             }
         } else if let Some(nested_node) = pending_nested_node.take() {
@@ -3181,6 +4405,98 @@ fn metadata_ref_token(token: &str) -> Option<u32> {
     token.strip_prefix('!')?.parse().ok()
 }
 
+fn fragment_has_uninitialized_imageblock_input(ll: &str) -> bool {
+    let Some(fragment_line) = ll
+        .lines()
+        .find(|line| line.trim_start().starts_with("!air.fragment ="))
+    else {
+        return false;
+    };
+    let Some(fragment_entry) = metadata_payload(fragment_line)
+        .map(metadata_tokens)
+        .and_then(|tokens| tokens.into_iter().find_map(metadata_ref_token))
+    else {
+        return false;
+    };
+    let Some(entry_line) = metadata_node_line(ll, fragment_entry) else {
+        return false;
+    };
+    let entry_refs = metadata_payload(entry_line)
+        .map(metadata_tokens)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(metadata_ref_token)
+        .collect::<Vec<_>>();
+    let Some(input_list) = entry_refs.first().copied() else {
+        return false;
+    };
+    let Some(input_line) = metadata_node_line(ll, input_list) else {
+        return false;
+    };
+    metadata_payload(input_line)
+        .map(metadata_tokens)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(metadata_ref_token)
+        .filter_map(|node| metadata_node_line(ll, node))
+        .any(|line| line.contains(r#"!"air.imageblock_data""#))
+}
+
+const UNINITIALIZED_FRAGMENT_IMAGEBLOCK_REASON: &str =
+    "fragment reads incoming air.imageblock_data, but the validation render pass has no prior draw \
+     or tile initializer defining that imageblock memory";
+
+const POST_TESSELLATION_VERTEX_ORACLE_REASON: &str =
+    "vertex entry consumes air.patch_control_point_input and therefore requires a complete Metal \
+     tessellation pipeline with a control-point producer; the standalone validation vertex harness \
+     cannot construct a defined oracle for this ABI";
+
+fn invalid_standalone_metal_oracle_reason(ll: &str) -> Option<&'static str> {
+    ll.contains(r#"!"air.patch_control_point_input""#)
+        .then_some(POST_TESSELLATION_VERTEX_ORACLE_REASON)
+}
+
+fn unsafe_metal_submission_reason(ll: &str) -> Option<&'static str> {
+    if fragment_has_uninitialized_imageblock_input(ll) {
+        return Some(UNINITIALIZED_FRAGMENT_IMAGEBLOCK_REASON);
+    }
+
+    let conditional_threadgroup_buffers = ll
+        .lines()
+        .filter(|line| {
+            line.contains(r#"!"air.function_constant""#)
+                && line.contains(r#"!"air.buffer""#)
+                && extract_i32_after(line, "air.address_space") == Some(3)
+        })
+        .count();
+    if conditional_threadgroup_buffers >= 2 && ll.contains(r#"section "air.fc_initializer""#) {
+        return Some(
+            "kernel combines multiple function-constant-selected threadgroup buffers with packed \
+             air.fc_initializer controls; the synthetic scalar specialization cannot prove a \
+             coherent allocation/use configuration or bounded work",
+        );
+    }
+
+    let conditional_textures = ll
+        .lines()
+        .filter(|line| {
+            line.contains(r#"!"air.function_constant""#) && line.contains(r#"!"air.texture""#)
+        })
+        .count();
+    if ll.len() >= 300_000
+        && conditional_textures >= 8
+        && ll.contains("array_ref<texture")
+        && ll.contains(r#"section "air.fc_initializer""#)
+    {
+        return Some(
+            "large kernel combines many function-constant-selected texture alternatives, runtime \
+             texture arrays, and input-dependent control flow; the validation loop guard does not \
+             establish an aggregate GPU-time bound",
+        );
+    }
+    None
+}
+
 fn bounded_control_field_seed_size(type_name: &str, byte_size: i32) -> Option<usize> {
     let name = type_name.trim().trim_end_matches('*').trim();
     let size = match name {
@@ -3191,6 +4507,25 @@ fn bounded_control_field_seed_size(type_name: &str, byte_size: i32) -> Option<us
         _ => return None,
     };
     (byte_size as usize == size).then_some(size)
+}
+
+fn bounded_control_matrix_shape(type_name: &str, byte_size: i32) -> Option<(usize, usize, usize)> {
+    let name = type_name.trim().trim_end_matches('*').trim();
+    let (element_size, dimensions) = if let Some(dimensions) = name.strip_prefix("float") {
+        (4usize, dimensions)
+    } else if let Some(dimensions) = name.strip_prefix("half") {
+        (2usize, dimensions)
+    } else {
+        return None;
+    };
+    let (columns, rows) = dimensions.split_once('x')?;
+    let columns = columns.parse::<usize>().ok()?;
+    let rows = rows.parse::<usize>().ok()?;
+    if !(2..=4).contains(&columns) || !(2..=4).contains(&rows) {
+        return None;
+    }
+    let packed_size = element_size.checked_mul(columns)?.checked_mul(rows)?;
+    (packed_size <= usize::try_from(byte_size).ok()?).then_some((element_size, columns, rows))
 }
 
 fn bounded_control_field_seed_value(
@@ -3681,34 +5016,6 @@ fn incompatible_multisample_texture_golden(ll: &str, _metal: &MetalRow) -> Optio
     )
 }
 
-fn incompatible_function_constant_texture_array_ref_golden(
-    ll: &str,
-    metal: &MetalRow,
-) -> Option<String> {
-    if !matches!(
-        metal.fc_specialization.as_deref(),
-        Some(FC_SPECIALIZATION_ZERO | FC_SPECIALIZATION_VALUES)
-    ) {
-        return None;
-    }
-    let has_fc_texture_metadata = ll.lines().any(|line| {
-        line.contains(r#""air.function_constant""#)
-            && line.contains(r#""air.texture""#)
-            && line.contains("texture")
-    });
-    let mixes_plain_and_array = ll.contains("texture2d<") && ll.contains("texture2d_array<");
-    if !has_fc_texture_metadata || !mixes_plain_and_array {
-        return None;
-    }
-    Some(
-        "metal golden uses function-constant-selected texture metadata mixing texture2d and \
-         texture2d_array image-view families; the Vulkan validation runner cannot bind a single \
-         compatible image view for that reflected descriptor set, so rebank with a concrete texture \
-         family or drop the row"
-            .into(),
-    )
-}
-
 fn incompatible_function_constant_private_pointer_table_golden(
     ll: &str,
     metal: &MetalRow,
@@ -3756,6 +5063,9 @@ fn incompatible_function_constant_simdgroup_golden(ll: &str, metal: &MetalRow) -
         || !ll.contains("@air.wg.barrier")
         || !ll.contains("addrspace(3)")
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -4261,7 +5571,10 @@ fn declares_air_function_constants(ll: &str) -> bool {
 }
 
 fn incompatible_output_plan_golden(ll: &str, metal: &MetalRow) -> Option<String> {
-    let current_plan = infer_plan(ll);
+    // Compare against the current effective oracle plan, including structural launch
+    // specialization. Comparing only raw inference incorrectly rejects deliberately serial plans
+    // that `metal_oracle_inputs` would reproduce before every new Metal execution.
+    let (current_plan, _) = metal_oracle_inputs(ll, None);
     let current = &current_plan.output;
     let banked = &metal.plan.output;
     if !output_plans_match(current, banked) {
@@ -4421,6 +5734,7 @@ struct OwnedLoopInputFacts {
     arg_values: Vec<(String, i128)>,
     arg_float_values: Vec<(String, f64)>,
     arg_field_values: Vec<(String, Vec<i32>, i128)>,
+    arg_byte_values: Vec<(String, usize, i128)>,
     arg_upper_bounds: Vec<(String, i128)>,
     arg_vector_values: Vec<(String, usize, i128)>,
     arg_vector_upper_bounds: Vec<(String, usize, i128)>,
@@ -4435,6 +5749,7 @@ impl OwnedLoopInputFacts {
             arg_values: &self.arg_values,
             arg_float_values: &self.arg_float_values,
             arg_field_values: &self.arg_field_values,
+            arg_byte_values: &self.arg_byte_values,
             arg_upper_bounds: &self.arg_upper_bounds,
             arg_vector_values: &self.arg_vector_values,
             arg_vector_upper_bounds: &self.arg_vector_upper_bounds,
@@ -4445,11 +5760,6 @@ impl OwnedLoopInputFacts {
 }
 
 fn loop_input_facts_for_metal_plan(ll: &str, entry: &str, metal: &MetalRow) -> OwnedLoopInputFacts {
-    let arg_names = entry_arg_names(ll, entry);
-    if arg_names.is_empty() {
-        return OwnedLoopInputFacts::default();
-    }
-    let owned_inputs = plan_to_owned_inputs(&metal.plan).ok();
     let fc_values = metal
         .fc_values
         .as_deref()
@@ -4461,16 +5771,31 @@ fn loop_input_facts_for_metal_plan(ll: &str, entry: &str, metal: &MetalRow) -> O
                 .collect()
         })
         .unwrap_or_else(|| function_constant_values_for_oracle_inputs(ll));
+    loop_input_facts_for_plan(ll, entry, &metal.plan, fc_values)
+}
+
+fn loop_input_facts_for_plan(
+    ll: &str,
+    entry: &str,
+    plan: &HarnessPlan,
+    fc_values: Vec<(usize, u64)>,
+) -> OwnedLoopInputFacts {
+    let arg_names = entry_arg_names(ll, entry);
+    if arg_names.is_empty() {
+        return OwnedLoopInputFacts::default();
+    }
+    let owned_inputs = plan_to_owned_inputs(plan).ok();
     let mut facts = OwnedLoopInputFacts {
         fc_values,
-        arg_values: exact_launch_scalar_arg_values(ll, &arg_names, &metal.plan),
+        arg_values: exact_launch_scalar_arg_values(ll, &arg_names, plan),
         arg_float_values: Vec::new(),
         arg_field_values: Vec::new(),
-        arg_upper_bounds: launch_scalar_arg_upper_bounds(ll, &arg_names, &metal.plan),
-        arg_vector_values: exact_launch_vector_arg_values(ll, &arg_names, &metal.plan),
-        arg_vector_upper_bounds: launch_vector_arg_upper_bounds(ll, &arg_names, &metal.plan),
-        texture_extents: exact_texture_extent_values(ll, &arg_names, &metal.plan),
-        imageblock_extent: exact_imageblock_extent_value(ll, &metal.plan),
+        arg_byte_values: Vec::new(),
+        arg_upper_bounds: launch_scalar_arg_upper_bounds(ll, &arg_names, plan),
+        arg_vector_values: exact_launch_vector_arg_values(ll, &arg_names, plan),
+        arg_vector_upper_bounds: launch_vector_arg_upper_bounds(ll, &arg_names, plan),
+        texture_extents: exact_texture_extent_values(ll, &arg_names, plan),
+        imageblock_extent: exact_imageblock_extent_value(ll, plan),
     };
     if let Some(owned_inputs) = &owned_inputs {
         facts.arg_values.extend(exact_scalar_buffer_arg_values(
@@ -4488,6 +5813,13 @@ fn loop_input_facts_for_metal_plan(ll: &str, entry: &str, metal: &MetalRow) -> O
             .extend(exact_struct_buffer_arg_field_values(
                 ll,
                 &arg_names,
+                &owned_inputs.inputs,
+            ));
+        facts
+            .arg_byte_values
+            .extend(exact_raw_integer_buffer_arg_byte_values(
+                ll,
+                entry,
                 &owned_inputs.inputs,
             ));
         facts
@@ -4839,6 +6171,13 @@ fn exact_struct_buffer_arg_field_values(
     arg_names: &[String],
     inputs: &Inputs,
 ) -> Vec<(String, Vec<i32>, i128)> {
+    let serial_packed_buffers = if inputs.dispatch.threads_per_grid == [1, 1, 1] {
+        packed_loop_scatter_control_fields(ll)
+            .into_keys()
+            .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
+    };
     let input_bytes = inputs
         .buffers
         .iter()
@@ -4853,10 +6192,7 @@ fn exact_struct_buffer_arg_field_values(
     let locations = stage_resource_locations(ll);
     let mut out = Vec::new();
     for line in ll.lines() {
-        if !line.contains(r#""air.buffer""#)
-            || !line.contains(r#""air.location_index""#)
-            || !line.contains(r#""air.address_space", i32 2"#)
-        {
+        if !line.contains(r#""air.buffer""#) || !line.contains(r#""air.location_index""#) {
             continue;
         }
         let Some(arg_ord) = metadata_param_index(line).and_then(|v| usize::try_from(v).ok()) else {
@@ -4871,6 +6207,12 @@ fn exact_struct_buffer_arg_field_values(
         let Some(raw_loc) = extract_i32_after(line, "air.location_index").map(|v| v as u32) else {
             continue;
         };
+        let address_space = extract_i32_after(line, "air.address_space");
+        if address_space != Some(2)
+            && !(address_space == Some(1) && serial_packed_buffers.contains(&raw_loc))
+        {
+            continue;
+        }
         let Some(bytes) = locations
             .buffers
             .get(&(arg_ord as u32))
@@ -4887,6 +6229,48 @@ fn exact_struct_buffer_arg_field_values(
         };
         collect_struct_int_field_values(&mut ctx, node, 0, &[], &mut Vec::new());
     }
+    out
+}
+
+pub(crate) fn exact_raw_integer_buffer_arg_byte_values(
+    ll: &str,
+    entry: &str,
+    inputs: &Inputs,
+) -> Vec<(String, usize, i128)> {
+    let arg_names = entry_arg_names(ll, entry);
+    let arg_to_buffer = arg_index_to_buffer_location(ll);
+    let input_bytes = inputs
+        .buffers
+        .iter()
+        .filter_map(|buffer| match buffer.seed {
+            Seed::ExactBytes { bytes, .. } => Some((buffer.index, bytes)),
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let mut out = Vec::new();
+    for (arg_ordinal, buffer) in arg_to_buffer {
+        let Some(arg_name) = arg_names.get(arg_ordinal) else {
+            continue;
+        };
+        let Some(bytes) = input_bytes.get(&buffer).copied() else {
+            continue;
+        };
+        for field in raw_integer_load_seed_fields(ll, buffer, bytes.len(), 0) {
+            let end = field.offset.saturating_add(field.size);
+            let Some(raw) = bytes.get(field.offset..end) else {
+                continue;
+            };
+            let mut widened = [0u8; 8];
+            widened[..raw.len()].copy_from_slice(raw);
+            out.push((
+                arg_name.clone(),
+                field.offset,
+                i128::from(u64::from_le_bytes(widened)),
+            ));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    out.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
     out
 }
 
@@ -5209,10 +6593,11 @@ fn incompatible_compare_none_loop_guard_golden(
         return None;
     }
     let loop_facts = loop_input_facts_for_metal_plan(ll, entry, metal);
-    match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
+    match crate::loop_budget::classify_and_instrument_with_loop_input_facts_and_budget(
         ll,
         entry,
         loop_facts.as_loop_input_facts(),
+        loop_budget_for_metal_row(metal),
     ) {
         crate::loop_budget::GuardPlan::Quarantine(reason) => Some(format!(
             "metal golden compare=none cannot be reproduced by current loop guard: {reason}; \
@@ -5220,6 +6605,19 @@ fn incompatible_compare_none_loop_guard_golden(
         )),
         crate::loop_budget::GuardPlan::Instrumented(_)
         | crate::loop_budget::GuardPlan::LoopFree => None,
+    }
+}
+
+fn loop_budget_for_metal_row(metal: &MetalRow) -> i32 {
+    // A compare=none row is smoke-only: it has no semantic output whose replay depends on the
+    // historic guard transform. Always use the current safety cap for those rows, including old
+    // plan versions, so a stale smoke row cannot turn a large bounded kernel into a multi-minute
+    // GPU submission. Exact/tolerance rows retain the legacy cap until they are rebanked because
+    // changing their guard can change a banked output when the old cap was reached.
+    if metal.compare == "none" || metal.plan_version >= SAFE_LOOP_BUDGET_PLAN_VERSION {
+        crate::loop_budget::LOOP_BUDGET_BACKEDGES
+    } else {
+        crate::loop_budget::LEGACY_LOOP_BUDGET_BACKEDGES
     }
 }
 
@@ -5279,23 +6677,9 @@ fn incompatible_parallel_dynamic_buffer_scatter_golden(
     metal: &MetalRow,
 ) -> Option<String> {
     if metal.compare == "none"
-        || metal.plan.output.kind != "buffer"
-        || metal.plan.output.format != "RawBytes"
         || !metal.plan.dispatch_grid.iter().any(|&n| n > 1)
-        || !ll.contains("\"air.thread_position_in_grid\"")
-        || !ll.contains("@air.atomic.global.")
+        || !requires_serial_dynamic_buffer_scatter_plan(ll, &metal.plan)
     {
-        return None;
-    }
-    let output = metal
-        .plan
-        .buffers
-        .iter()
-        .find(|buffer| buffer.index == metal.plan.output.index)?;
-    if output.role != "InOut" {
-        return None;
-    }
-    if !declares_data_dependent_non_atomic_store_to_buffer(ll, metal.plan.output.index) {
         return None;
     }
     Some(
@@ -5303,6 +6687,28 @@ fn incompatible_parallel_dynamic_buffer_scatter_golden(
          is backend-schedule-dependent; rebank Metal row with a serial/smoke plan"
             .into(),
     )
+}
+
+fn requires_serial_dynamic_buffer_scatter_plan(ll: &str, plan: &HarnessPlan) -> bool {
+    if plan.output.kind != "buffer"
+        || plan.output.format != "RawBytes"
+        || !ll.contains("\"air.thread_position_in_grid\"")
+    {
+        return false;
+    }
+    let Some(output) = plan
+        .buffers
+        .iter()
+        .find(|buffer| buffer.index == plan.output.index)
+    else {
+        return false;
+    };
+    let atomic_scatter = output.role == "InOut"
+        && ll.contains("@air.atomic.global.")
+        && declares_data_dependent_non_atomic_store_to_buffer(ll, plan.output.index);
+    let packed_loop_scatter = matches!(output.role.as_str(), "Output" | "InOut")
+        && !packed_loop_scatter_control_fields(ll).is_empty();
+    atomic_scatter || packed_loop_scatter
 }
 
 fn incompatible_undefined_threadgroup_memory_golden(ll: &str, metal: &MetalRow) -> Option<String> {
@@ -6037,18 +7443,37 @@ fn incompatible_overlapping_output_stride_golden(ll: &str, metal: &MetalRow) -> 
                 .is_some_and(|buffer| bounded_control_output_stride_too_small(buffer, *req))
         })
         .map(|req| {
+            let field = metal
+                .plan
+                .buffers
+                .iter()
+                .find(|buffer| buffer.index == req.buffer)
+                .and_then(|buffer| output_stride_offending_field(buffer, req));
+            let field_detail = field.map_or_else(
+                || "unresolved field".into(),
+                |field| {
+                    format!(
+                        "field offset {} size {} value {}",
+                        field.offset,
+                        field.size,
+                        field.value.unwrap_or(u64::from(BOUNDED_CONTROL_DIM))
+                    )
+                },
+            );
             format!(
                 "metal golden seeds output byte-stride/control buffer too small while replay stores \
-                 {} bytes per element to output buffer {output_index}; rebank Metal row \
-                 with non-overlapping output stride",
-                req.store_bytes
+                 {} bytes per element to output buffer {output_index}; control buffer {} requires \
+                 at least {} bytes per row ({field_detail}); rebank Metal row with non-overlapping \
+                 output stride",
+                req.store_bytes, req.buffer, req.min_row_bytes,
             )
         })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct OutputStrideRequirement {
     buffer: u32,
+    field_offset: Option<usize>,
     store_bytes: usize,
     min_row_bytes: u64,
 }
@@ -6073,6 +7498,7 @@ fn output_stride_control_requirements(
     let mut ptr_buf: HashMap<&str, u32> = HashMap::new();
     let mut pointer_roots: HashMap<String, HashSet<u32>> = HashMap::new();
     let mut pointer_offsets: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut pointer_control_fields: HashMap<String, HashSet<(u32, usize)>> = HashMap::new();
     for arg in entry_function_args(ll)
         .into_iter()
         .flat_map(|args| args.split(',').enumerate())
@@ -6089,6 +7515,9 @@ fn output_stride_control_requirements(
         ptr_buf.insert(name, buf);
         pointer_roots.insert(name.to_string(), HashSet::from([buf]));
         pointer_offsets.insert(name.to_string(), HashSet::new());
+        if stride_control_buffers.contains_key(&buf) {
+            pointer_control_fields.insert(name.to_string(), HashSet::from([(buf, 0)]));
+        }
     }
     if let Some(entry) = entry_name_from_ll(ll) {
         for (ord, name) in entry_arg_names(ll, &entry).into_iter().enumerate() {
@@ -6098,11 +7527,17 @@ fn output_stride_control_requirements(
             pointer_roots
                 .entry(name.clone())
                 .or_insert_with(|| HashSet::from([buf]));
-            pointer_offsets.entry(name).or_default();
+            pointer_offsets.entry(name.clone()).or_default();
+            if stride_control_buffers.contains_key(&buf) {
+                pointer_control_fields
+                    .entry(name.clone())
+                    .or_insert_with(|| HashSet::from([(buf, 0)]));
+            }
         }
     }
 
     let mut value_sources: HashMap<String, HashSet<u32>> = HashMap::new();
+    let mut value_control_fields: HashMap<String, HashSet<(u32, usize)>> = HashMap::new();
     let mut requirements = Vec::new();
     for line in ll.lines() {
         let trimmed = line.trim_start();
@@ -6127,9 +7562,26 @@ fn output_stride_control_requirements(
             if !sources.is_empty() {
                 value_sources.insert(reg.to_string(), sources.clone());
             }
+            let mut control_fields = HashSet::new();
+            if rhs.starts_with("load ") {
+                if let Some(ptr) = load_pointer_operand(rhs) {
+                    if let Some(fields) = pointer_control_fields.get(ptr) {
+                        control_fields.extend(fields.iter().copied());
+                    }
+                }
+            }
+            for operand in &operands {
+                if let Some(prev) = value_control_fields.get(*operand) {
+                    control_fields.extend(prev.iter().copied());
+                }
+            }
+            if !control_fields.is_empty() {
+                value_control_fields.insert(reg.to_string(), control_fields.clone());
+            }
 
             let mut roots = HashSet::new();
             let mut offsets = HashSet::new();
+            let mut offset_fields = HashSet::new();
             for operand in operands {
                 if let Some(prev) = pointer_roots.get(operand) {
                     roots.extend(prev.iter().copied());
@@ -6140,14 +7592,38 @@ fn output_stride_control_requirements(
                 if let Some(prev) = value_sources.get(operand) {
                     offsets.extend(prev.iter().copied());
                 }
+                if let Some(prev) = pointer_control_fields.get(operand) {
+                    offset_fields.extend(prev.iter().copied());
+                }
+                if let Some(prev) = value_control_fields.get(operand) {
+                    offset_fields.extend(prev.iter().copied());
+                }
             }
             if !roots.is_empty()
                 && (rhs.contains("getelementptr")
                     || rhs.starts_with("bitcast ")
                     || rhs.starts_with("select "))
             {
+                let roots_include_control = roots
+                    .iter()
+                    .any(|buffer| stride_control_buffers.contains_key(buffer));
                 pointer_roots.insert(reg.to_string(), roots);
                 pointer_offsets.insert(reg.to_string(), offsets);
+                if rhs.contains("getelementptr") && roots_include_control {
+                    if let Some(field_index) = trailing_const_i32_gep_index(rhs) {
+                        offset_fields = offset_fields
+                            .into_iter()
+                            .filter_map(|(buffer, _)| {
+                                let plan = stride_control_buffers.get(&buffer)?;
+                                let offset = packed_u32_control_field_offset(plan, field_index)?;
+                                Some((buffer, offset))
+                            })
+                            .collect();
+                    }
+                }
+                if !offset_fields.is_empty() {
+                    pointer_control_fields.insert(reg.to_string(), offset_fields);
+                }
             }
             continue;
         }
@@ -6170,11 +7646,30 @@ fn output_stride_control_requirements(
         if let Some(offsets) = pointer_offsets.get(ptr) {
             for buf in offsets {
                 if stride_control_buffers.contains_key(buf) {
-                    requirements.push(OutputStrideRequirement {
-                        buffer: *buf,
-                        store_bytes,
-                        min_row_bytes: output_stride_min_row_bytes(store_bytes),
-                    });
+                    let exact_fields = pointer_control_fields
+                        .get(ptr)
+                        .into_iter()
+                        .flatten()
+                        .filter(|(field_buffer, _)| field_buffer == buf)
+                        .map(|(_, offset)| *offset)
+                        .collect::<HashSet<_>>();
+                    if exact_fields.is_empty() {
+                        requirements.push(OutputStrideRequirement {
+                            buffer: *buf,
+                            field_offset: None,
+                            store_bytes,
+                            min_row_bytes: output_stride_min_row_bytes(store_bytes),
+                        });
+                        continue;
+                    }
+                    for field_offset in exact_fields {
+                        requirements.push(OutputStrideRequirement {
+                            buffer: *buf,
+                            field_offset: Some(field_offset),
+                            store_bytes,
+                            min_row_bytes: output_stride_min_row_bytes(store_bytes),
+                        });
+                    }
                 }
             }
         }
@@ -6186,12 +7681,42 @@ fn output_stride_min_row_bytes(store_bytes: usize) -> u64 {
     u64::from(BOUNDED_CONTROL_DIM).saturating_mul(store_bytes as u64)
 }
 
+fn packed_u32_control_field_offset(buffer: &PlanBuffer, field_index: u64) -> Option<usize> {
+    let field_index = usize::try_from(field_index).ok()?;
+    let field_offset = field_index.checked_mul(4)?;
+    if !buffer
+        .seed_layout
+        .iter()
+        .any(|field| field.offset == field_offset && field.size == 4)
+    {
+        return None;
+    }
+    if buffer
+        .seed_layout
+        .iter()
+        .any(|field| field.offset < field_offset && field.offset % 4 == 0 && field.size != 4)
+    {
+        return None;
+    }
+    Some(field_offset)
+}
+
 fn bounded_control_output_stride_too_small(
     buffer: &PlanBuffer,
     req: OutputStrideRequirement,
 ) -> bool {
-    buffer.seed_layout.iter().any(|field| {
-        bounded_control_seed_field_is_within_buffer(buffer.len, field)
+    output_stride_offending_field(buffer, req).is_some()
+}
+
+fn output_stride_offending_field(
+    buffer: &PlanBuffer,
+    req: OutputStrideRequirement,
+) -> Option<&ControlSeedField> {
+    buffer.seed_layout.iter().find(|field| {
+        req.field_offset.is_none_or(|offset| field.offset == offset)
+            && bounded_control_seed_field_is_within_buffer(buffer.len, field)
+            && control_seed_field_max_value(field.size)
+                .is_some_and(|max_value| req.min_row_bytes <= max_value)
             && field.value.unwrap_or(u64::from(BOUNDED_CONTROL_DIM)) < req.min_row_bytes
     })
 }
@@ -7148,6 +8673,13 @@ fn incompatible_float_output_golden(ll: &str, metal: &MetalRow) -> Option<String
     ))
 }
 
+fn metal_output_has_numeric_tolerance(ll: &str, metal: &MetalRow) -> bool {
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok());
+    format.is_some_and(|format| tolerance_for_metal_context(format, Some(ll), metal).is_some())
+}
+
 fn incompatible_finite_struct_half_fragment_golden(ll: &str, metal: &MetalRow) -> Option<String> {
     if metal.compare == "none"
         || metal.stage.as_deref() != Some("Fragment")
@@ -7161,6 +8693,9 @@ fn incompatible_finite_struct_half_fragment_golden(ll: &str, metal: &MetalRow) -
         .into_iter()
         .any(|buffer| buffer.role != "Output" && buffer.seed_mode == SEED_MODE_FINITE_STRUCT_FLOAT);
     if !has_finite_struct_input {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -7212,29 +8747,6 @@ fn incompatible_moltenvk_vertex_clip_distance_half_texture_golden(
     )
 }
 
-fn incompatible_moltenvk_sampled_half_render_target_exact_golden(
-    ll: &str,
-    metal: &MetalRow,
-) -> Option<String> {
-    if metal.compare == "none"
-        || metal.stage.as_deref() != Some("Fragment")
-        || metal.plan.output.kind != "render_target"
-        || !ll_has_fast_no_nans_float_semantics(ll)
-        || !(ll.contains("@air.sample_texture") || ll.contains("@air.gather_texture"))
-        || !sampled_finite_half_texture(ll)
-        || !float_texture_or_render_target_output(ll, metal)
-    {
-        return None;
-    }
-    Some(
-        "metal golden samples synthetic finite f16 texture data before a float fragment \
-         render-target output under AIR fast/no-nans math; MoltenVK exact byte comparison is not a \
-         portable oracle for half texture filtering and render-target rounding in this seed; \
-         rebank or drop the Metal row"
-            .into(),
-    )
-}
-
 fn incompatible_moltenvk_half_texture_output_exact_golden(
     ll: &str,
     metal: &MetalRow,
@@ -7250,6 +8762,9 @@ fn incompatible_moltenvk_half_texture_output_exact_golden(
         || !(sampled_finite_half_texture(ll) || storage_read_finite_half_texture(ll))
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -7274,6 +8789,9 @@ fn incompatible_moltenvk_storage_f32_texture_output_exact_golden(
         || !storage_read_finite_f32_texture(ll)
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -7333,6 +8851,9 @@ fn incompatible_moltenvk_fast_f32_input_buffer_exact_golden(
     if !format.is_float_like() {
         return None;
     }
+    if tolerance_for_metal_context(format, Some(ll), metal).is_some() {
+        return None;
+    }
     let finite_f32_inputs = metal
         .plan
         .buffers
@@ -7378,6 +8899,9 @@ fn incompatible_moltenvk_fast_half_buffer_output_exact_golden(
     ) {
         return None;
     }
+    if tolerance_for_metal_context(format, Some(ll), metal).is_some() {
+        return None;
+    }
     Some(
         "metal golden writes finite f16 buffer output through AIR fast/no-nans approximate math; \
          MoltenVK exact byte comparison is not a portable oracle for half conversion, denorm \
@@ -7398,6 +8922,9 @@ fn incompatible_moltenvk_sampled_f32_render_target_exact_golden(
         || !sampled_finite_f32_texture(ll)
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -7427,6 +8954,9 @@ fn incompatible_moltenvk_fast_f32_buffer_output_exact_golden(
     if !format.is_float_like() {
         return None;
     }
+    if tolerance_for_metal_context(format, Some(ll), metal).is_some() {
+        return None;
+    }
     let has_finite_f32_output = metal.plan.buffers.iter().any(|buffer| {
         matches!(buffer.role.as_str(), "InOut" | "Output")
             && buffer.seed_mode == SEED_MODE_FINITE_FLOAT32
@@ -7449,27 +8979,6 @@ fn incompatible_moltenvk_fast_f32_buffer_output_exact_golden(
     )
 }
 
-fn incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(
-    ll: &str,
-    metal: &MetalRow,
-) -> Option<String> {
-    if metal.compare == "none"
-        || metal.stage.as_deref() != Some("Kernel")
-        || metal.plan.output.kind != "buffer"
-        || metal.plan.output.format != "RawBytes"
-        || !ll_has_fast_no_nans_float_semantics(ll)
-        || !raw_buffer_writes_float_derived_bytes(ll)
-    {
-        return None;
-    }
-    Some(
-        "metal golden compares raw buffer bytes written from AIR fast/no-nans float values; \
-         MoltenVK exact byte comparison is not a portable oracle for float denorm flushing, \
-         signed-zero handling, and raw padding bytes in this seed; rebank or drop the Metal row"
-            .into(),
-    )
-}
-
 fn incompatible_moltenvk_fast_half_render_target_exact_golden(
     ll: &str,
     metal: &MetalRow,
@@ -7486,6 +8995,9 @@ fn incompatible_moltenvk_fast_half_render_target_exact_golden(
         .and_then(|format| parse_format(format).ok())
         .or_else(|| parse_format(&metal.plan.output.format).ok())?;
     if !matches!(format, DataFormat::Rgba16Float | DataFormat::Rgba32Float) {
+        return None;
+    }
+    if tolerance_for_metal_context(format, Some(ll), metal).is_some() {
         return None;
     }
     Some(
@@ -7612,9 +9124,22 @@ fn writes_f32_texture_output(ll: &str) -> bool {
         || ll.contains("@air.write_imageblock_slice_to_texture_") && ll.contains("f32")
 }
 
+#[cfg(test)]
 fn raw_buffer_writes_float_derived_bytes(ll: &str) -> bool {
     ll.contains("store float ")
-        || ll.contains("store <")
+        || ll.contains("store half ")
+        || ll.contains("store double ")
+        || ll.lines().any(|line| {
+            let Some(vector) = line.trim_start().strip_prefix("store <") else {
+                return false;
+            };
+            let Some(element_type) = vector.split('>').next() else {
+                return false;
+            };
+            ["half", "float", "double", "bfloat"]
+                .iter()
+                .any(|scalar| element_type.split_whitespace().last() == Some(*scalar))
+        })
         || ll.lines().any(|line| {
             line.contains("@air.pack.") && (line.contains("f16") || line.contains("f32"))
         })
@@ -7647,6 +9172,16 @@ fn static_normalized_linear_sampler(ll: &str) -> bool {
         .any(air_sampler_word_is_normalized_linear)
 }
 
+fn static_pixel_bicubic_sampler(ll: &str) -> bool {
+    ll.lines()
+        .filter(|line| line.contains("@__air_sampler_state") && line.contains(" constant "))
+        .filter_map(first_i64_literal)
+        .any(|word| {
+            let word = word as u64;
+            ((word >> 11) & 0x3) == 2 && ((word >> 9) & 0x3) == 2 && word & 0x8000 != 0
+        })
+}
+
 fn air_sampler_word_is_normalized_linear(word: i64) -> bool {
     let word = word as u64;
     let min_linear = ((word >> 11) & 0x3) == 1;
@@ -7676,6 +9211,9 @@ fn incompatible_sampled_half_domain_sensitive_texture_golden(
         || !sampled_finite_half_texture(ll)
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -7715,6 +9253,9 @@ fn incompatible_sampled_half_linear_filter_texture_golden(
         || !sampled_finite_half_texture(ll)
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     if ll.contains("@air.gather_texture_2d.v4f16")
@@ -7930,6 +9471,9 @@ fn incompatible_sampled_fast_pow_texture_golden(ll: &str, metal: &MetalRow) -> O
     if !has_signed_sampled_f32_texture {
         return None;
     }
+    if metal_output_has_numeric_tolerance(ll, metal) {
+        return None;
+    }
     Some(
         "metal golden samples synthetic finite f32 texture data through AIR fast_pow/fast_powr \
          under fast/no-nans math; Metal/Vulkan linear sampling and approximate pow rounding are \
@@ -7976,6 +9520,9 @@ fn incompatible_sampled_f32_domain_math_texture_golden(
         || !sampled_finite_f32_texture(ll)
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -8056,6 +9603,9 @@ fn incompatible_sampled_f32_dynamic_lod_render_target_golden(
         })
         .count();
     if sampled_f32_count < 2 || !declares_dynamic_lod_sample(ll) {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -8171,6 +9721,9 @@ fn incompatible_fragment_fast_pow_rsqrt_render_target_golden(
         || !ll.contains("@air.fast_rsqrt.")
         || !float_texture_or_render_target_output(ll, metal)
     {
+        return None;
+    }
+    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -8484,6 +10037,12 @@ fn incompatible_sampled_f32_texture_output_golden(ll: &str, metal: &MetalRow) ->
     {
         return None;
     }
+    let format = current_output_format_for_plan(ll, &metal.plan.output)
+        .and_then(|format| parse_format(format).ok())
+        .or_else(|| parse_format(&metal.plan.output.format).ok())?;
+    if tolerance_for_metal_context(format, Some(ll), metal).is_some() {
+        return None;
+    }
     Some(
         "metal golden samples synthetic finite f32 texture data into f32 texture output; \
          Metal/Vulkan sampling and texture write rounding are not an exact byte oracle for this \
@@ -8734,7 +10293,9 @@ pub fn compare_candidate_to_metal(
                 if let Some(result) =
                     compare_finite_struct_float_raw_bytes(candidate, &golden, metal, format, ll)
                 {
-                    if metal.compare == "none" && result.status != "ok" {
+                    if metal.compare == "none"
+                        && !matches!(result.status.as_str(), "ok" | "tolerance")
+                    {
                         return ("smoke".to_string(), result.observed, result.tolerance);
                     }
                     return (result.status, result.observed, result.tolerance);
@@ -8742,7 +10303,9 @@ pub fn compare_candidate_to_metal(
                 if let Some(result) =
                     compare_finite_bfloat_raw_bytes(candidate, &golden, metal, format)
                 {
-                    if metal.compare == "none" && result.status != "ok" {
+                    if metal.compare == "none"
+                        && !matches!(result.status.as_str(), "ok" | "tolerance")
+                    {
                         return ("smoke".to_string(), result.observed, result.tolerance);
                     }
                     return (result.status, result.observed, result.tolerance);
@@ -8757,7 +10320,8 @@ pub fn compare_candidate_to_metal(
                         max_ulp: None,
                     });
                 }
-                if metal.compare == "none" && result.status != "ok" {
+                if metal.compare == "none" && !matches!(result.status.as_str(), "ok" | "tolerance")
+                {
                     return ("smoke".to_string(), result.observed, result.tolerance);
                 }
                 return (result.status, result.observed, result.tolerance);
@@ -8809,19 +10373,12 @@ fn enforce_backend_compare_policy(
     status: &mut String,
     error: &mut Option<String>,
 ) {
-    if backend != RunBackend::MoltenVk || status == "ok" {
+    if backend != RunBackend::MoltenVk || status != "smoke" {
         return;
     }
-    if status == "tolerance" {
-        *status = "failure".into();
-        if error.is_none() {
-            *error = Some("MoltenVK output differs from Metal; exact byte match required".into());
-        }
-    } else if status == "smoke" {
-        *status = "failure".into();
-        if error.is_none() {
-            *error = Some("MoltenVK compare=none smoke row is not an exact Metal match".into());
-        }
+    *status = "failure".into();
+    if error.is_none() {
+        *error = Some("MoltenVK compare=none smoke row has no semantic Metal golden".into());
     }
 }
 
@@ -9298,6 +10855,9 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
     if cfg.compile_missing {
         eprintln!("# compile-missing");
     }
+    if cfg.preflight_only {
+        eprintln!("# preflight-only (no GPU submission; ledger unchanged)");
+    }
 
     let translate = load_translate_rows(&cfg.translate_ledger, cfg.backend);
     let only_air_set = cfg
@@ -9319,7 +10879,23 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
     } else {
         load_tech_keys(&cfg.tech_ledger)
     };
-    let metal_rows = load_metal_rows(&cfg.metal_ledger);
+    let explicitly_requested_metal_rows = cfg
+        .only_air
+        .iter()
+        .cloned()
+        .chain(
+            only_air_set
+                .iter()
+                .flat_map(|hashes| hashes.iter().cloned()),
+        )
+        .collect::<HashSet<_>>();
+    let mut metal_rows = if cfg.backend == RunBackend::Metal {
+        HashMap::new()
+    } else if explicitly_requested_metal_rows.is_empty() {
+        load_metal_rows(&cfg.metal_ledger)
+    } else {
+        load_metal_rows_for_hashes(&cfg.metal_ledger, Some(&explicitly_requested_metal_rows))
+    };
     let moltenvk_rows = if cfg.backend == RunBackend::Vulkan {
         load_candidate_rows(&cfg.corpus_dir.join(RunBackend::MoltenVk.ledger_file_name()))
     } else {
@@ -9339,6 +10915,13 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
         })
         .filter(|r| {
             if tech_row_filters {
+                if cfg.backend != RunBackend::Metal
+                    && cfg.contains.as_deref() == Some("metal status=quarantine")
+                {
+                    return metal_rows
+                        .get(&r.air_sha256)
+                        .is_some_and(|metal| metal.status == "quarantine");
+                }
                 return existing_rows
                     .get(&r.air_sha256)
                     .is_some_and(|row| tech_row_selected(cfg, row));
@@ -9347,6 +10930,73 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
         })
         .collect();
     todo.sort_by(|a, b| a.label.cmp(&b.label));
+    if cfg.backend == RunBackend::Metal {
+        let wanted = todo
+            .iter()
+            .map(|row| row.air_sha256.clone())
+            .collect::<HashSet<_>>();
+        metal_rows = load_metal_rows_for_hashes(&cfg.metal_ledger, Some(&wanted));
+    }
+    if cfg.backend == RunBackend::Metal && cfg.preflight_only && !cfg.oneshot && !todo.is_empty() {
+        let before = todo.len();
+        let wanted = todo
+            .iter()
+            .map(|row| row.air_sha256.clone())
+            .collect::<HashSet<_>>();
+        let source_refs = crate::corpus_shards::gather_source_refs_for_hashes(
+            &cfg.public_dir,
+            &cfg.local_corpus,
+            &wanted,
+        )
+        .into_iter()
+        .map(|source| (source.air_sha256.clone(), source))
+        .collect::<HashMap<_, _>>();
+        let selected = std::sync::Mutex::new(Vec::new());
+        // A single large AIR module can require hundreds of MiB while its full reachable CFG is
+        // parsed. Bound this phase independently from Apple-tool execution so an eight-core scan
+        // cannot multiply that peak past the host's memory limit.
+        let workers = 1;
+        let chunk_size = todo.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for chunk in todo.chunks(chunk_size) {
+                let selected = &selected;
+                let source_refs = &source_refs;
+                let metal_rows = &metal_rows;
+                let local_corpus = &cfg.local_corpus;
+                scope.spawn(move || {
+                    let mut local = Vec::new();
+                    for row in chunk {
+                        if source_may_have_semantic_metal_preflight(
+                            row,
+                            metal_rows,
+                            source_refs,
+                            local_corpus,
+                        ) {
+                            local.push(row.clone());
+                        }
+                    }
+                    selected
+                        .lock()
+                        .expect("preflight source-filter mutex poisoned")
+                        .extend(local);
+                });
+            }
+        });
+        todo = selected
+            .into_inner()
+            .expect("preflight source-filter mutex poisoned");
+        todo.sort_by(|a, b| a.label.cmp(&b.label));
+        // The parent needed historic plans only to derive loop/input facts. Some plans contain
+        // very large seed-layout vectors; retaining every selected quarantine row while Apple PSO
+        // children start can push an otherwise small preflight over the host memory limit. Each
+        // oneshot worker reloads its single row, so release the parent copies before spawning.
+        metal_rows.clear();
+        metal_rows.shrink_to_fit();
+        eprintln!(
+            "# preflight source-cycle filter: {before} → {} Apple-tool candidates",
+            todo.len()
+        );
+    }
     let unbounded_todo_len = todo.len();
     if cfg.skip > 0 {
         if cfg.skip >= todo.len() {
@@ -9407,6 +11057,7 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
 
     // Oneshot worker: run in-process (parent applies the wall timeout around this process).
     if cfg.oneshot {
+        install_oneshot_parent_watchdog();
         let row = &todo[0];
         let outcome = process_one(cfg, row, &metal_rows, &moltenvk_rows);
         eprintln!(
@@ -9420,6 +11071,80 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
             ProcessOutcome::Fail | ProcessOutcome::Timeout => 1,
             ProcessOutcome::Skip => 2,
         };
+    }
+
+    // Bulk reclassification of historic smoke rows is ledger-only. Spawning a worker per row
+    // would repeatedly load the large corpus ledgers and, more importantly, creates an accidental
+    // path back to GPU submission if the worker logic changes. Keep this parent-side and explicit.
+    if should_reclassify_historic_compare_none_without_source(cfg)
+        && todo.iter().all(|row| {
+            metal_rows
+                .get(&row.air_sha256)
+                .is_some_and(|metal| metal.compare == "none")
+        })
+    {
+        let delta_ledger = run_delta_path(cfg);
+        let _ = fs::remove_file(&delta_ledger);
+        for row in &todo {
+            let metal = metal_rows
+                .get(&row.air_sha256)
+                .expect("bulk compare=none classification checked every row");
+            if let Err(error) =
+                append_jsonl_delta_row(&delta_ledger, &historic_compare_none_quarantine_row(metal))
+            {
+                eprintln!("# RESULT: failed to write bulk quarantine delta: {error}");
+                return 1;
+            }
+        }
+        let merged = match merge_delta_into_ledger(&cfg.tech_ledger, &delta_ledger) {
+            Ok(merged) => merged,
+            Err(error) => {
+                eprintln!("# RESULT: failed to merge bulk quarantine delta: {error}");
+                return 1;
+            }
+        };
+        let _ = fs::remove_file(&delta_ledger);
+        eprintln!(
+            "# RESULT: ok=0 fail={} skip=0 timeout=0 merged_delta={merged} → {}",
+            todo.len(),
+            cfg.tech_ledger.display()
+        );
+        return 1;
+    }
+
+    if cfg.backend != RunBackend::Metal
+        && !cfg.compile_missing
+        && todo.iter().all(|row| {
+            metal_rows
+                .get(&row.air_sha256)
+                .is_some_and(|metal| metal.status == "quarantine")
+        })
+    {
+        let delta_ledger = run_delta_path(cfg);
+        let _ = fs::remove_file(&delta_ledger);
+        for row in &todo {
+            if let Err(error) = append_jsonl_delta_row(
+                &delta_ledger,
+                &candidate_metal_quarantine_row(cfg.backend, row),
+            ) {
+                eprintln!("# RESULT: failed to write candidate quarantine delta: {error}");
+                return 1;
+            }
+        }
+        let merged = match merge_delta_into_ledger(&cfg.tech_ledger, &delta_ledger) {
+            Ok(merged) => merged,
+            Err(error) => {
+                eprintln!("# RESULT: failed to merge candidate quarantine delta: {error}");
+                return 1;
+            }
+        };
+        let _ = fs::remove_file(&delta_ledger);
+        eprintln!(
+            "# RESULT: ok=0 fail=0 skip={} timeout=0 merged_delta={merged} → {}",
+            todo.len(),
+            cfg.tech_ledger.display()
+        );
+        return 0;
     }
 
     // Parent owns the worker process groups. Ctrl-C / SIGTERM must SIGKILL them — workers
@@ -9442,6 +11167,7 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
     let n_skip = AtomicUsize::new(0);
     let n_timeout = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
+    let preflight_safe = std::sync::Mutex::new(Vec::<String>::new());
     let chunk_size = n_total.div_ceil(workers);
 
     eprintln!(
@@ -9457,12 +11183,19 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
             let n_skip = &n_skip;
             let n_timeout = &n_timeout;
             let done = &done;
+            let preflight_safe = &preflight_safe;
             scope.spawn(move || {
                 for row in chunk {
                     let outcome = run_case_subprocess(run_cfg, row);
                     match outcome {
                         ProcessOutcome::Ok => {
                             n_ok.fetch_add(1, Ordering::Relaxed);
+                            if cfg.preflight_only {
+                                preflight_safe
+                                    .lock()
+                                    .expect("preflight safe-list mutex poisoned")
+                                    .push(row.air_sha256.clone());
+                            }
                         }
                         ProcessOutcome::Fail => {
                             n_fail.fetch_add(1, Ordering::Relaxed);
@@ -9492,7 +11225,44 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
         }
     });
 
+    if let Some(path) = cfg.preflight_safe_list.as_deref() {
+        let mut hashes = preflight_safe
+            .into_inner()
+            .expect("preflight safe-list mutex poisoned");
+        hashes.sort_unstable();
+        let mut text = hashes.join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        if let Err(error) = fs::write(path, text) {
+            eprintln!(
+                "# RESULT: failed to write preflight safe list {}: {error}",
+                path.display()
+            );
+            return 1;
+        }
+        eprintln!(
+            "# preflight-safe-list {} rows={}",
+            path.display(),
+            hashes.len()
+        );
+    }
+
     let timeouts = n_timeout.load(Ordering::Relaxed);
+    if cfg.preflight_only {
+        let _ = fs::remove_file(&delta_ledger);
+        eprintln!(
+            "# RESULT: ok={} fail={} skip={} timeout={timeouts} merged_delta=0 (preflight; ledger unchanged)",
+            n_ok.load(Ordering::Relaxed),
+            n_fail.load(Ordering::Relaxed),
+            n_skip.load(Ordering::Relaxed),
+        );
+        return if n_fail.load(Ordering::Relaxed) > 0 || timeouts > 0 {
+            1
+        } else {
+            0
+        };
+    }
     let merged = match merge_delta_into_ledger(&cfg.tech_ledger, &delta_ledger) {
         Ok(n) => {
             let _ = fs::remove_file(&delta_ledger);
@@ -9519,6 +11289,39 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
     } else {
         0
     }
+}
+
+fn source_may_have_semantic_metal_preflight(
+    row: &TranslateRow,
+    metal_rows: &HashMap<String, MetalRow>,
+    source_refs: &HashMap<String, crate::corpus_shards::SourceRef>,
+    local_corpus: &Path,
+) -> bool {
+    let Some(source_ref) = source_refs.get(&row.air_sha256) else {
+        return false;
+    };
+    let Ok(source) = source_ref.load(local_corpus) else {
+        return false;
+    };
+    let ll = metal2vulkan::tools::sanitize_ll_text_with_datalayout(&source.air_ll).0;
+    let Some(entry) = entry_name_from_ll(&ll) else {
+        return false;
+    };
+    if invalid_standalone_metal_oracle_reason(&ll).is_some()
+        || unsafe_metal_submission_reason(&ll).is_some()
+    {
+        return false;
+    }
+    let (plan, fc_values) = metal_oracle_inputs(&ll, metal_rows.get(&row.air_sha256));
+    let facts = loop_input_facts_for_plan(&ll, &entry, &plan, fc_values);
+    matches!(
+        crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
+            &ll,
+            &entry,
+            facts.as_loop_input_facts(),
+        ),
+        Ok(false)
+    )
 }
 
 fn run_delta_path(cfg: &RunConfig) -> PathBuf {
@@ -9568,6 +11371,10 @@ fn should_skip_existing_metal_compare_none(cfg: &RunConfig, row: &MetalRow) -> b
     !cfg.force && row.status == "ok" && row.compare == "none"
 }
 
+fn should_reclassify_historic_compare_none_without_source(cfg: &RunConfig) -> bool {
+    cfg.backend == RunBackend::Metal && !cfg.preflight_only && !cfg.remint_compare_none
+}
+
 /// Spawn this binary in `--oneshot` mode for one hash; kill after `timeout_secs`.
 fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
     use std::process::{Command, Stdio};
@@ -9601,6 +11408,12 @@ fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
     }
     if cfg.compile_missing {
         cmd.arg("--compile-missing");
+    }
+    if cfg.preflight_only {
+        cmd.arg("--preflight-only");
+    }
+    if cfg.remint_compare_none {
+        cmd.arg("--remint-compare-none");
     }
     // New process group so a timeout / Ctrl-C can kill metal-as / helper descendants.
     #[cfg(unix)]
@@ -9671,16 +11484,25 @@ fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
                     "# SLOW {} timed out after {}s",
                     row.air_sha256, cfg.timeout_secs
                 );
-                // Honest warning: SIGKILL frees the CPU worker but cannot cancel an in-flight GPU
-                // kernel. The pre-submission loop-budget guard should make this unreachable for a
-                // GPU loop; reaching it means either a CPU-side tool hang or (if the machine is
-                // unresponsive) a wedged GPU that only a reboot recovers.
-                eprintln!(
-                    "# WARN {} exceeded {}s — killing the CPU worker, but a committed Metal kernel \
-                     cannot be cancelled. If the machine is unresponsive, the GPU is wedged and a \
-                     reboot is the only recovery.",
-                    row.air_sha256, cfg.timeout_secs
-                );
+                if cfg.backend == RunBackend::Metal {
+                    // Honest warning: SIGKILL frees the CPU worker but cannot cancel an in-flight
+                    // Metal kernel. The pre-submission loop-budget guard should make this
+                    // unreachable for a GPU loop; reaching it means either a CPU-side tool hang or
+                    // (if the machine is unresponsive) a wedged GPU that only a reboot recovers.
+                    eprintln!(
+                        "# WARN {} exceeded {}s — killing the CPU worker, but a committed Metal \
+                         kernel cannot be cancelled. If the machine is unresponsive, the GPU is \
+                         wedged and a reboot is the only recovery.",
+                        row.air_sha256, cfg.timeout_secs
+                    );
+                } else {
+                    eprintln!(
+                        "# WARN {} exceeded {}s — killing the {} worker process group",
+                        row.air_sha256,
+                        cfg.timeout_secs,
+                        cfg.backend.program_name()
+                    );
+                }
                 kill_worker(&mut child);
                 let _ = child.wait();
                 write_timeout_or_error_row(
@@ -9690,6 +11512,33 @@ fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
                     "timeout",
                 );
                 return ProcessOutcome::Timeout;
+            }
+            #[cfg(target_os = "macos")]
+            Ok(None)
+                if cfg.preflight_only
+                    && macos_process_resident_bytes(child.id())
+                        .is_some_and(|rss| rss > PREFLIGHT_WORKER_MAX_RESIDENT_BYTES) =>
+            {
+                let rss = macos_process_resident_bytes(child.id()).unwrap_or(0);
+                eprintln!(
+                    "# WARN {} Metal PSO preflight exceeded resident-memory ceiling: {} MiB > {} MiB",
+                    row.air_sha256,
+                    rss / (1024 * 1024),
+                    PREFLIGHT_WORKER_MAX_RESIDENT_BYTES / (1024 * 1024),
+                );
+                kill_worker(&mut child);
+                let _ = child.wait();
+                write_timeout_or_error_row(
+                    cfg,
+                    row,
+                    &format!(
+                        "Metal PSO preflight exceeded resident-memory ceiling ({} MiB > {} MiB)",
+                        rss / (1024 * 1024),
+                        PREFLIGHT_WORKER_MAX_RESIDENT_BYTES / (1024 * 1024),
+                    ),
+                    "fallback",
+                );
+                return ProcessOutcome::Fail;
             }
             Ok(None) => {
                 if !logged_slow && start.elapsed() >= slow_after {
@@ -9708,6 +11557,54 @@ fn run_case_subprocess(cfg: &RunConfig, row: &TranslateRow) -> ProcessOutcome {
                 return ProcessOutcome::Fail;
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_resident_bytes(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_taskinfo>();
+    // SAFETY: `info` points to `size` writable bytes and PROC_PIDTASKINFO initializes that exact
+    // structure on success. The queried pid is a live child owned by this process.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size as libc::c_int,
+        )
+    };
+    if written != size as libc::c_int {
+        return None;
+    }
+    // SAFETY: the successful call above initialized the complete structure.
+    Some(unsafe { info.assume_init() }.pti_resident_size)
+}
+
+fn install_oneshot_parent_watchdog() {
+    #[cfg(unix)]
+    {
+        // The parent normally owns timeout and signal cleanup. If macOS kills that small process
+        // under memory pressure, an Apple compiler call can otherwise continue as a multi-GiB
+        // orphan. The worker was spawned as its own process-group leader, so it can safely kill
+        // itself and every helper descendant when it is reparented.
+        let original_parent = unsafe { libc::getppid() };
+        let own_pid = unsafe { libc::getpid() };
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if unsafe { libc::getppid() } == original_parent {
+                continue;
+            }
+            unsafe {
+                if libc::getpgrp() == own_pid {
+                    libc::kill(-own_pid, libc::SIGKILL);
+                } else {
+                    libc::kill(own_pid, libc::SIGKILL);
+                }
+            }
+            break;
+        });
     }
 }
 
@@ -9895,7 +11792,7 @@ enum ProcessOutcome {
 }
 
 fn candidate_metal_status_precheck(
-    backend: RunBackend,
+    _backend: RunBackend,
     metal: &MetalRow,
 ) -> Option<(&'static str, String, ProcessOutcome)> {
     if metal.status == "quarantine" {
@@ -9909,13 +11806,6 @@ fn candidate_metal_status_precheck(
         return Some((
             "missing",
             format!("metal status={}", metal.status),
-            ProcessOutcome::Skip,
-        ));
-    }
-    if backend == RunBackend::MoltenVk && metal.compare == "none" {
-        return Some((
-            "missing",
-            "metal golden compare=none is not a full semantic golden; rebank Metal row".into(),
             ProcessOutcome::Skip,
         ));
     }
@@ -10126,6 +12016,23 @@ fn process_one(
     metal_rows: &HashMap<String, MetalRow>,
     moltenvk_rows: &HashMap<String, CandidateRow>,
 ) -> ProcessOutcome {
+    if should_reclassify_historic_compare_none_without_source(cfg) {
+        if let Some(metal) = metal_rows
+            .get(&tr.air_sha256)
+            .filter(|metal| metal.compare == "none")
+        {
+            // This is a ledger classification, not an oracle execution. Avoid resolving and
+            // re-inferring the source entirely: historic compare=none bytes are non-semantic by
+            // definition, and bulk resubmission has no safe way to promote them. A targeted remint
+            // starts from the source later with an explicitly reviewed plan.
+            let row = historic_compare_none_quarantine_row(metal);
+            if let Err(error) = append_result_row(cfg, &row) {
+                eprintln!("    write ledger: {error}");
+            }
+            return ProcessOutcome::Fail;
+        }
+    }
+
     let Some(src) = resolve_source(
         &tr.air_sha256,
         &tr.label,
@@ -10160,6 +12067,44 @@ fn process_one(
             }
         }
         let (plan, fc_values) = metal_oracle_inputs(&ll, metal_rows.get(&tr.air_sha256));
+        if let Some(reason) = invalid_standalone_metal_oracle_reason(&ll) {
+            if cfg.preflight_only {
+                eprintln!("    preflight refused before Metal PSO creation: {reason}");
+            } else {
+                write_quarantine_row(cfg, tr, &src, &plan, stage, &entry, reason);
+            }
+            return ProcessOutcome::Fail;
+        }
+        if let Some(reason) = unsafe_metal_submission_reason(&ll) {
+            if cfg.preflight_only {
+                eprintln!("    preflight refused before Metal PSO creation: {reason}");
+            } else {
+                write_quarantine_row(cfg, tr, &src, &plan, stage, &entry, reason);
+            }
+            return ProcessOutcome::Fail;
+        }
+        if cfg.preflight_only {
+            let facts = loop_input_facts_for_plan(&ll, &entry, &plan, fc_values.clone());
+            match crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
+                &ll,
+                &entry,
+                facts.as_loop_input_facts(),
+            ) {
+                Ok(true) => {
+                    eprintln!(
+                        "    preflight skipped before Apple tools: source has a reachable CFG cycle"
+                    );
+                    return ProcessOutcome::Skip;
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "    preflight skipped before Apple tools: source CFG analysis refused: {reason}"
+                    );
+                    return ProcessOutcome::Skip;
+                }
+                Ok(false) => {}
+            }
+        }
         return run_metal(cfg, tr, &src, &ll, stage, &entry, &plan, &fc_values);
     }
 
@@ -10168,6 +12113,7 @@ fn process_one(
     // skipped/not-comparable case in the parent runner.
     macro_rules! write_missing_candidate_and_skip {
         ($metal:expr, $golden:expr, $reason:expr) => {{
+            let reason: String = ($reason).into();
             if let Some(outcome) = try_run_vulkan_for_skipped_metal_compare(
                 cfg,
                 tr,
@@ -10177,16 +12123,14 @@ fn process_one(
                 &entry,
                 $metal,
                 moltenvk_rows,
-                &$reason,
+                &reason,
             ) {
                 return outcome;
             }
             if cfg.compile_missing {
-                return compile_missing_candidate_smoke(
-                    cfg, tr, &src, &ll, stage, $golden, $reason,
-                );
+                return compile_missing_candidate_smoke(cfg, tr, &src, &ll, stage, $golden, reason);
             }
-            let row = candidate_status_row(cfg, tr, &src, "missing", $golden, Some($reason));
+            let row = candidate_status_row(cfg, tr, &src, "missing", $golden, Some(reason));
             let _ = append_result_row(cfg, &row);
             return ProcessOutcome::Skip;
         }};
@@ -10223,10 +12167,21 @@ fn process_one(
         let _ = append_result_row(cfg, &row);
         return outcome;
     }
-    if let Some(reason) = incompatible_function_constant_golden(&ll, metal) {
-        write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
+    if let Some(reason) = unsafe_metal_submission_reason(&ll) {
+        write_missing_candidate_and_skip!(
+            metal,
+            metal.output_sha256.clone(),
+            format!("metal golden is not a defined oracle: {reason}")
+        );
     }
-    if let Some(reason) = incompatible_function_constant_texture_array_ref_golden(&ll, metal) {
+    if let Some(reason) = invalid_standalone_metal_oracle_reason(&ll) {
+        write_missing_candidate_and_skip!(
+            metal,
+            metal.output_sha256.clone(),
+            format!("metal golden is not a defined oracle: {reason}")
+        );
+    }
+    if let Some(reason) = incompatible_function_constant_golden(&ll, metal) {
         write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
     if let Some(reason) = incompatible_function_constant_private_pointer_table_golden(&ll, metal) {
@@ -10304,11 +12259,6 @@ fn process_one(
         {
             write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
         }
-        if let Some(reason) =
-            incompatible_moltenvk_sampled_half_render_target_exact_golden(&ll, metal)
-        {
-            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
-        }
         if let Some(reason) = incompatible_moltenvk_half_texture_output_exact_golden(&ll, metal) {
             write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
         }
@@ -10323,11 +12273,6 @@ fn process_one(
             write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
         }
         if let Some(reason) = incompatible_moltenvk_fast_f32_buffer_output_exact_golden(&ll, metal)
-        {
-            write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
-        }
-        if let Some(reason) =
-            incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(&ll, metal)
         {
             write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
         }
@@ -10462,8 +12407,46 @@ fn process_one(
     if let Some(reason) = incompatible_undefined_threadgroup_memory_golden(&ll, metal) {
         write_missing_candidate_and_skip!(metal, metal.output_sha256.clone(), reason);
     }
+    if metal.compare == "none" {
+        write_missing_candidate_and_skip!(
+            metal,
+            metal.output_sha256.clone(),
+            "metal golden compare=none is bounded smoke output, not a semantic oracle; rebank or \
+             quarantine the Metal row"
+        );
+    }
     let plan = metal.plan.clone();
     run_candidate(cfg, tr, &src, &ll, stage, &entry, &plan, metal, None, None)
+}
+
+fn historic_compare_none_quarantine_row(metal: &MetalRow) -> MetalRow {
+    let mut row = metal.clone();
+    row.status = "quarantine".into();
+    row.output_sha256 = None;
+    row.output_b64 = None;
+    row.error = Some(
+        "quarantined: historic compare=none row is bounded smoke, not a semantic Metal oracle; \
+         targeted remint required"
+            .into(),
+    );
+    row
+}
+
+fn candidate_metal_quarantine_row(backend: RunBackend, tr: &TranslateRow) -> CandidateRow {
+    CandidateRow {
+        air_sha256: tr.air_sha256.clone(),
+        shard: tr.shard.clone(),
+        label: tr.label.clone(),
+        status: "quarantine".into(),
+        backend: backend.as_str().into(),
+        output_sha256: None,
+        output_b64: None,
+        golden_output_sha256: None,
+        spv_sha256: tr.spv_sha256.clone(),
+        tolerance: None,
+        observed: None,
+        error: Some("metal status=quarantine".into()),
+    }
 }
 
 fn write_failure_row(cfg: &RunConfig, tr: &TranslateRow, src: &SourceFile, err: &str) {
@@ -10471,7 +12454,13 @@ fn write_failure_row(cfg: &RunConfig, tr: &TranslateRow, src: &SourceFile, err: 
 }
 
 fn metal_oracle_inputs(ll: &str, metal: Option<&MetalRow>) -> (HarnessPlan, Vec<(usize, u64)>) {
-    let current_plan = infer_plan(ll);
+    let mut current_plan = infer_plan(ll);
+    if current_plan.dispatch_grid.iter().any(|&n| n > 1)
+        && requires_serial_dynamic_buffer_scatter_plan(ll, &current_plan)
+    {
+        current_plan.dispatch_grid = [1, 1, 1];
+        current_plan.dispatch_tg = [1, 1, 1];
+    }
     let plan = metal
         .and_then(banked_explicit_input_plan)
         .unwrap_or(current_plan);
@@ -10479,6 +12468,13 @@ fn metal_oracle_inputs(ll: &str, metal: Option<&MetalRow>) -> (HarnessPlan, Vec<
         .and_then(banked_function_constant_values)
         .unwrap_or_else(|| function_constant_values_for_oracle_inputs(ll));
     (plan, fc_values)
+}
+
+fn oracle_input_specialization(ll: &str, plan: &HarnessPlan) -> Option<String> {
+    (requires_serial_dynamic_buffer_scatter_plan(ll, plan)
+        && plan.dispatch_grid == [1, 1, 1]
+        && plan.dispatch_tg == [1, 1, 1])
+    .then(|| INPUT_SPECIALIZATION_EXPLICIT.into())
 }
 
 fn banked_function_constant_values(metal: &MetalRow) -> Option<Vec<(usize, u64)>> {
@@ -10504,7 +12500,6 @@ fn banked_explicit_input_plan(metal: &MetalRow) -> Option<HarnessPlan> {
 /// (unbounded/uninstrumentable loop). `status=quarantine`, `compare=none`; counted as a failure
 /// outcome with a quarantine status. A committed Metal kernel cannot be cancelled, so quarantining
 /// is the only safe outcome — the case is recorded for visibility, not dispatched.
-#[cfg(target_os = "macos")]
 fn write_quarantine_row(
     cfg: &RunConfig,
     tr: &TranslateRow,
@@ -10540,13 +12535,6 @@ fn run_metal(
     plan: &HarnessPlan,
     fc_values: &[(usize, u64)],
 ) -> ProcessOutcome {
-    if stage == Stage::Fragment {
-        if let Some(reason) = unsupported_fragment_color_output_arity(ll) {
-            write_failure_row(cfg, tr, src, &reason);
-            return ProcessOutcome::Fail;
-        }
-    }
-
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (cfg, tr, src, ll, stage, entry, plan, fc_values);
@@ -10587,9 +12575,10 @@ fn run_metal(
                 &owned.inputs,
                 ll,
                 source_metallib.as_deref(),
+                !cfg.preflight_only,
             )
         });
-        let bytes = match result {
+        let mut bytes = match result {
             Ok(b) => b,
             Err(e) => {
                 // The oracle refuses to submit work it cannot prove bounded (a committed Metal
@@ -10603,11 +12592,31 @@ fn run_metal(
                 return ProcessOutcome::Fail;
             }
         };
-        // Instrumented (loopy) kernels are marked compare=none so candidate runners know to
-        // translate and execute the same bounded LL shape instead of the unguarded source text.
-        let compare = match crate::oracle_macos::last_oracle_compare_mode() {
-            crate::oracle_macos::OracleCompare::Full => "full",
-            crate::oracle_macos::OracleCompare::MetalOnly => "none",
+        if cfg.preflight_only {
+            let compare_mode = crate::oracle_macos::last_oracle_compare_mode();
+            eprintln!(
+                "    preflight ok: Metal PSO compiled; semantic={}; guard={compare_mode:?}; grid={:?}; tg={:?}; buffers={:?}; textures={:?}; output={:?}; no command buffer created",
+                compare_mode == crate::oracle_macos::OracleCompare::Full,
+                plan.dispatch_grid,
+                plan.dispatch_tg,
+                plan.buffers,
+                plan.textures,
+                plan.output,
+            );
+            return if compare_mode == crate::oracle_macos::OracleCompare::Full {
+                ProcessOutcome::Ok
+            } else {
+                ProcessOutcome::Skip
+            };
+        }
+        canonicalize_output_bytes(ll, plan, &mut bytes);
+        // GPU-submitted oracle runs must remain Full. MetalOnly is reserved for compile-only
+        // transformed modules, which return above without banking output bytes.
+        let (compare, plan_version) = match crate::oracle_macos::last_oracle_compare_mode() {
+            crate::oracle_macos::OracleCompare::Full => ("full", PLAN_VERSION),
+            crate::oracle_macos::OracleCompare::MetalOnly => {
+                ("none", SAFE_LOOP_BUDGET_PLAN_VERSION)
+            }
         };
         let (fc_specialization, fc_values) = oracle_function_constant_row_fields();
         let row = MetalRow {
@@ -10617,7 +12626,7 @@ fn run_metal(
             status: "ok".into(),
             backend: "metal".into(),
             seed_profile: SEED_PROFILE.into(),
-            plan_version: PLAN_VERSION,
+            plan_version,
             plan: plan.clone(),
             input_sha256: Some(input_sha),
             output_sha256: Some(sha256_hex(&bytes)),
@@ -10626,7 +12635,7 @@ fn run_metal(
             compare: compare.into(),
             fc_specialization,
             fc_values,
-            input_specialization: None,
+            input_specialization: oracle_input_specialization(ll, plan),
             stage: Some(format!("{stage:?}")),
             entry: Some(entry.into()),
             error: None,
@@ -10746,10 +12755,11 @@ fn candidate_ll_for_metal_compare<'a>(
     }
 
     let loop_facts = loop_input_facts_for_metal_plan(ll, entry, metal);
-    match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
+    match crate::loop_budget::classify_and_instrument_with_loop_input_facts_and_budget(
         ll,
         entry,
         loop_facts.as_loop_input_facts(),
+        loop_budget_for_metal_row(metal),
     ) {
         crate::loop_budget::GuardPlan::Instrumented(text) => Ok(Cow::Owned(text)),
         crate::loop_budget::GuardPlan::LoopFree => Ok(Cow::Borrowed(ll)),
@@ -10991,7 +13001,7 @@ fn run_candidate(
             crate::runner_linux::execute_result(stage, candidate_ll, &spv, &owned.inputs, &tmp)
         }));
         let _ = fs::remove_dir_all(&tmp);
-        let candidate = match result {
+        let mut candidate = match result {
             Ok(Ok(b)) => b,
             Ok(Err(error)) => {
                 let status = write_candidate_execution_error_row(cfg, tr, src, metal, &error);
@@ -11007,6 +13017,7 @@ fn run_candidate(
                 return ProcessOutcome::Fail;
             }
         };
+        canonicalize_output_bytes(candidate_ll, plan, &mut candidate);
         let reference_metal;
         let compare_metal = if let Some(reference) = compare_reference.as_ref() {
             reference_metal = MetalRow {
@@ -11085,6 +13096,50 @@ fn run_candidate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_merge_streams_replacements_and_keeps_last_delta_row() {
+        let dir = std::env::temp_dir().join(format!(
+            "metal2vulkan-streaming-ledger-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("ledger.jsonl");
+        let delta = dir.join("delta.jsonl");
+        fs::write(
+            &ledger,
+            "# header\n{\"air_sha256\":\"a\",\"label\":\"a\",\"status\":\"old\"}\n{\"air_sha256\":\"b\",\"label\":\"b\",\"status\":\"keep\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            &delta,
+            "{\"air_sha256\":\"a\",\"label\":\"a\",\"status\":\"first\"}\n{\"air_sha256\":\"a\",\"label\":\"a\",\"status\":\"last\"}\n{\"air_sha256\":\"c\",\"label\":\"c\",\"status\":\"new\"}\n",
+        )
+        .unwrap();
+
+        assert_eq!(merge_delta_into_ledger(&ledger, &delta).unwrap(), 3);
+        let rows = load_jsonl_objects_by_hash_for_test(&ledger);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows["a"]["status"], "last");
+        assert_eq!(rows["b"]["status"], "keep");
+        assert_eq!(rows["c"]["status"], "new");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn load_jsonl_objects_by_hash_for_test(path: &Path) -> HashMap<String, serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|value| {
+                let hash = value.get("air_sha256")?.as_str()?.to_string();
+                Some((hash, value))
+            })
+            .collect()
+    }
 
     fn metal_row_for_compare(golden: &[u8], plan: HarnessPlan, stage: Option<&str>) -> MetalRow {
         MetalRow {
@@ -11193,15 +13248,7 @@ mod tests {
         metal.output_sha256 = Some(sha256_hex(&[]));
         metal.compare = "none".into();
         assert!(candidate_metal_status_precheck(RunBackend::Vulkan, &metal).is_none());
-        let (status, reason, outcome) =
-            candidate_metal_status_precheck(RunBackend::MoltenVk, &metal)
-                .expect("MoltenVK compare=none precheck");
-        assert_eq!(status, "missing");
-        assert_eq!(
-            reason,
-            "metal golden compare=none is not a full semantic golden; rebank Metal row"
-        );
-        assert_eq!(outcome, ProcessOutcome::Skip);
+        assert!(candidate_metal_status_precheck(RunBackend::MoltenVk, &metal).is_none());
     }
 
     /// Minimal AIR-shaped snippet of an MPS-style GEMM: constant-space params struct +
@@ -11723,6 +13770,279 @@ define void @kernel(ptr addrspace(2) %params, ptr addrspace(1) %queue) {
             );
             assert_eq!(bytes[base + 8], 0);
         }
+    }
+
+    #[test]
+    fn bounded_control_float_matrix_fields_seed_as_identity() {
+        let ll = r#"
+!1 = !{i32 0, i32 64, i32 0, !"float4x4", !"transform"}
+"#;
+        let buffer_meta = r#"!0 = !{!"air.buffer", !"air.location_index", i32 3, !"air.struct_type_info", !1, !"air.arg_type_size", i32 64}"#;
+        let fields = bounded_control_seed_layout(
+            ll,
+            buffer_meta,
+            64,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(fields.len(), 16);
+        for column in 0..4 {
+            for row in 0..4 {
+                let offset = (column * 4 + row) * 4;
+                let field = fields
+                    .iter()
+                    .find(|field| field.offset == offset)
+                    .expect("matrix lane");
+                assert_eq!(
+                    field.value,
+                    Some(if column == row { 0x3f80_0000 } else { 0 })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bounded_control_struct_seeds_every_integer_vector_lane() {
+        let plan = infer_plan(
+            r#"
+%struct.Controls = type { [23 x i32], <2 x i16>, i32 }
+
+define void @kernel(ptr addrspace(2) %controls, ptr addrspace(1) %out, i32 %tid) {
+  %field = getelementptr inbounds %struct.Controls, ptr addrspace(2) %controls, i64 0, i32 1
+  %size = load <2 x i16>, ptr addrspace(2) %field, align 4
+  %height16 = extractelement <2 x i16> %size, i64 1
+  %height = zext i16 %height16 to i32
+  %quotient = udiv i32 %tid, %height
+  store i32 %quotient, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 100, !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 100, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Controls", !"air.arg_name", !"controls"}
+!4 = !{i32 0, i32 4, i32 23, !"uint", !"values", i32 92, i32 4, i32 0, !"ushort2", !"size", i32 96, i32 4, i32 0, !"uint", !"count"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#,
+        );
+        let controls = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 7)
+            .unwrap();
+        assert_eq!(controls.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        for offset in [92, 94] {
+            assert!(
+                controls.seed_layout.iter().any(|field| {
+                    field.offset == offset && field.size == 2 && field.value.is_none()
+                }),
+                "missing ushort2 lane at {offset}: {:?}",
+                controls.seed_layout
+            );
+        }
+        let bytes = bounded_control_buffer_bytes_with_layout(controls.len, &controls.seed_layout);
+        assert_eq!(u16::from_le_bytes(bytes[92..94].try_into().unwrap()), 16);
+        assert_eq!(u16::from_le_bytes(bytes[94..96].try_into().unwrap()), 16);
+    }
+
+    #[test]
+    fn switch_control_struct_fields_use_explicit_case_values() {
+        let ll = r#"
+%Params = type { i32, i32, i32, i32 }
+
+define void @frag(ptr addrspace(2) %params) {
+entry:
+  %field0 = getelementptr inbounds %Params, ptr addrspace(2) %params, i64 0, i32 0
+  %kind = load i32, ptr addrspace(2) %field0
+  %field3 = getelementptr inbounds %Params, ptr addrspace(2) %params, i64 0, i32 3
+  %mode = load i32, ptr addrspace(2) %field3
+  %call = call i32 @helper(i32 %kind, i32 %mode)
+  ret void
+}
+
+define internal i32 @helper(i32 %kind, i32 %mode) {
+entry:
+  switch i32 %kind, label %kind_default [
+    i32 0, label %kind_zero
+    i32 1, label %kind_one
+  ]
+kind_zero:
+  ret i32 0
+kind_one:
+  ret i32 1
+kind_default:
+  switch i32 %mode, label %mode_default [
+    i32 1, label %mode_one
+    i32 2, label %mode_two
+  ]
+mode_one:
+  ret i32 1
+mode_two:
+  ret i32 2
+mode_default:
+  ret i32 0
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 16, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!4 = !{i32 0, i32 4, i32 0, !"uint", !"kind", i32 4, i32 4, i32 0, !"uint", !"x", i32 8, i32 4, i32 0, !"uint", !"y", i32 12, i32 4, i32 0, !"uint", !"mode"}
+"#;
+
+        let plan = infer_plan(ll);
+        let params = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 1)
+            .expect("params buffer");
+        assert_eq!(bounded_control_u32_at(params, 0), Some(0));
+        assert_eq!(bounded_control_u32_at(params, 12), Some(1));
+        assert_eq!(bounded_control_u32_at(params, 4), Some(BOUNDED_CONTROL_DIM));
+
+        let bicubic_ll = format!(
+            "@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 562249, i64 0], align 8\n{ll}\ndeclare void @air.sample_texture_2d()\n"
+        );
+        let bicubic_plan = infer_plan(&bicubic_ll);
+        let bicubic_params = bicubic_plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 1)
+            .expect("bicubic params buffer");
+        assert_eq!(bounded_control_u32_at(bicubic_params, 0), Some(0));
+        assert_eq!(bounded_control_u32_at(bicubic_params, 12), Some(1));
+        assert_eq!(bounded_control_u32_at(bicubic_params, 4), Some(0));
+    }
+
+    #[test]
+    fn raw_header_fields_that_bound_a_loop_are_seeded_to_one() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %source, ptr addrspace(1) writeonly %out) {
+entry:
+  %count_ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 24
+  %count = load i32, ptr addrspace(1) %count_ptr, align 4
+  %stride_ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 40
+  %stride = load i32, ptr addrspace(1) %stride_ptr, align 4
+  %base_ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 80
+  %base = load i64, ptr addrspace(1) %base_ptr, align 8
+  %wide_count = zext i32 %count to i64
+  %wide_stride = zext i32 %stride to i64
+  %bytes = mul i64 %wide_count, %wide_stride
+  br label %loop
+loop:
+  %remaining = phi i64 [ %bytes, %entry ], [ %next, %loop ]
+  %next = sub i64 %remaining, 1
+  %done = icmp eq i64 %next, 0
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"source"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"out"}
+"#;
+        let plan = infer_plan(ll);
+        let source = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .unwrap();
+        assert_eq!(source.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        for (offset, size) in [(24, 4), (40, 4), (80, 8)] {
+            assert!(
+                source.seed_layout.iter().any(|field| {
+                    field.offset == offset && field.size == size && field.value == Some(1)
+                }),
+                "missing safe raw field ({offset}, {size}): {:?}",
+                source.seed_layout
+            );
+        }
+    }
+
+    #[test]
+    fn raw_memcpy_byte_count_uses_one_full_vector() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %source, ptr addrspace(1) writeonly %out) {
+entry:
+  %base.ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 160
+  %base = load i64, ptr addrspace(1) %base.ptr, align 8
+  %count.ptr = getelementptr inbounds i8, ptr addrspace(1) %source, i64 168
+  %count = load i64, ptr addrspace(1) %count.ptr, align 8
+  br label %loop
+loop:
+  %remaining = phi i64 [ %count, %entry ], [ %next, %loop ]
+  %chunk = tail call i64 @air.min.u.i64(i64 %remaining, i64 1024)
+  call void @llvm.memcpy.p1.p1.i64(ptr addrspace(1) %out, ptr addrspace(1) %source, i64 %chunk, i1 false)
+  %next = sub i64 %remaining, %chunk
+  %done = icmp eq i64 %next, 0
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+declare i64 @air.min.u.i64(i64, i64)
+declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"source"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"out"}
+"#;
+        let plan = infer_plan(ll);
+        let source = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .unwrap();
+        assert!(source
+            .seed_layout
+            .iter()
+            .any(|field| { field.offset == 160 && field.size == 8 && field.value == Some(1) }));
+        assert!(source.seed_layout.iter().any(|field| {
+            field.offset == 168
+                && field.size == 8
+                && field.value == Some(u64::from(BOUNDED_CONTROL_DIM))
+        }));
+    }
+
+    #[test]
+    fn air_min_preserves_loaded_loop_bound_provenance() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) readonly %count) {
+entry:
+  %loaded = load i32, ptr addrspace(1) %count, align 4
+  %limit = tail call i32 @air.min.s.i32(i32 %loaded, i32 32)
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %next = add i32 %i, 1
+  %keep = icmp slt i32 %next, %limit
+  br i1 %keep, label %loop, label %exit
+exit:
+  ret void
+}
+declare i32 @air.min.s.i32(i32, i32)
+!air.kernel = !{!0}
+!0 = !{ptr @kernel, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"int", !"air.arg_name", !"count"}
+"#;
+        let plan = infer_plan(ll);
+        let count = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .unwrap();
+        assert_eq!(count.seed_mode, SEED_MODE_BOUNDED_CONTROL);
+        assert_eq!(count.seed_layout[0].value, Some(1));
     }
 
     #[test]
@@ -13858,9 +16178,44 @@ attributes #0 = { nounwind }
     }
 
     #[test]
+    fn output_stride_compatibility_ignores_controls_too_narrow_for_required_stride() {
+        let buffer = PlanBuffer {
+            index: 5,
+            len: 8,
+            role: "Input".into(),
+            seed_mode: SEED_MODE_BOUNDED_CONTROL.into(),
+            seed_tag: 6,
+            seed_stride: None,
+            seed_layout: vec![
+                ControlSeedField {
+                    offset: 0,
+                    size: 4,
+                    value: Some(256),
+                },
+                ControlSeedField {
+                    offset: 4,
+                    size: 1,
+                    value: Some(0),
+                },
+            ],
+        };
+        let requirement = OutputStrideRequirement {
+            buffer: 5,
+            field_offset: Some(0),
+            store_bytes: 4,
+            min_row_bytes: 64,
+        };
+
+        assert!(!bounded_control_output_stride_too_small(
+            &buffer,
+            requirement
+        ));
+    }
+
+    #[test]
     fn output_stride_struct_field_is_sized_to_store_width() {
         let ll = r#"
-%struct.Params = type { i32, i32, i32 }
+%struct.Params = type { i32, i32, i32, i8 }
 
 define void @byte_output_stride_struct(ptr addrspace(1) %dst, ptr addrspace(2) %params, i32 %tid) local_unnamed_addr #0 {
 entry:
@@ -13878,12 +16233,31 @@ entry:
 !1 = !{}
 !2 = !{!3, !4, !6}
 !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 12, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
-!5 = !{!"air.struct_type_info", i32 0, i32 4, i32 0, !"uint", !"m", i32 4, i32 4, i32 0, !"uint", !"n", i32 8, i32 4, i32 0, !"uint", !"rowBytes"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 16, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!5 = !{!"air.struct_type_info", i32 0, i32 4, i32 0, !"uint", !"m", i32 4, i32 4, i32 0, !"uint", !"n", i32 8, i32 4, i32 0, !"uint", !"rowBytes", i32 12, i32 1, i32 0, !"bool", !"enabled"}
 !6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
 
 attributes #0 = { nounwind }
 "#;
+        let inferred = infer_plan(ll);
+        let inferred_params = inferred
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 1)
+            .expect("inferred params");
+        assert_eq!(
+            packed_u32_control_field_offset(inferred_params, 2),
+            Some(8),
+            "{:?}",
+            inferred_params.seed_layout
+        );
+        let requirements = output_stride_control_requirements(ll, 0, &inferred.buffers);
+        assert!(
+            requirements
+                .iter()
+                .any(|requirement| requirement.field_offset == Some(8)),
+            "{requirements:?}"
+        );
         let plan = infer_plan(ll);
         let params = plan
             .buffers
@@ -13895,6 +16269,10 @@ attributes #0 = { nounwind }
             .seed_layout
             .iter()
             .any(|field| field.offset == 8 && field.value == Some(64)));
+        assert!(params
+            .seed_layout
+            .iter()
+            .any(|field| field.offset == 12 && field.value != Some(64)));
         let metal = metal_row_for_compare(&[], plan, Some("Kernel"));
         assert!(incompatible_overlapping_output_stride_golden(ll, &metal).is_none());
 
@@ -14217,6 +16595,167 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1) captures(none), i32, i
             .expect("buffer-loaded scatter indices are schedule-dependent");
         assert!(reason.contains("dynamic buffer scatter"), "{reason}");
         assert!(reason.contains("serial/smoke plan"), "{reason}");
+
+        let (serial_plan, _) = metal_oracle_inputs(ll, None);
+        assert_eq!(serial_plan.dispatch_grid, [1, 1, 1]);
+        assert_eq!(serial_plan.dispatch_tg, [1, 1, 1]);
+        assert_eq!(
+            oracle_input_specialization(ll, &serial_plan).as_deref(),
+            Some(INPUT_SPECIALIZATION_EXPLICIT)
+        );
+    }
+
+    #[test]
+    fn packed_loop_count_and_destination_scatter_gets_safe_explicit_plan() {
+        assert_eq!(
+            typed_gep_field_path(
+                "getelementptr inbounds %struct.Control, ptr addrspace(1) %points, i64 %tid64",
+                "points"
+            ),
+            Some(Vec::new())
+        );
+        let ll = r#"
+%struct.Control = type { <2 x float>, float, half, half, i32 }
+%struct.Vertex = type { [2 x float], [2 x float], [2 x float], half, half, half, half, half, half }
+
+define void @scatter(ptr addrspace(1) readonly %points, ptr addrspace(1) writeonly %out, i32 %tid) {
+entry:
+  %tid64 = zext i32 %tid to i64
+  %field = getelementptr inbounds %struct.Control, ptr addrspace(1) %points, i64 %tid64, i32 4
+  %packed = load i32, ptr addrspace(1) %field, align 4
+  %count = and i32 %packed, 65535
+  %base = lshr i32 %packed, 16
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  call fastcc void @write_quad(i32 %base, ptr addrspace(1) %out)
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, %count
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+
+define internal fastcc void @write_quad(i32 %base, ptr addrspace(1) %out) {
+entry:
+  %index = zext i32 %base to i64
+  %dst = getelementptr inbounds %struct.Vertex, ptr addrspace(1) %out, i64 %index, i32 0, i64 0
+  store float 1.000000e+00, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @scatter, !1, !2}
+!1 = !{}
+!2 = !{!3, !5, !7}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 24, !"air.arg_type_name", !"Control"}
+!4 = !{i32 0, i32 8, i32 0, !"float2", !"a", i32 8, i32 4, i32 0, !"float", !"b", i32 12, i32 2, i32 0, !"half", !"c", i32 14, i32 2, i32 0, !"half", !"d", i32 16, i32 4, i32 0, !"uint", !"e", i32 18, i32 4, i32 0, !"uint", !"f"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 36, !"air.arg_type_name", !"Vertex"}
+!6 = !{i32 0, i32 8, i32 0, !"packed_float2", !"a", i32 24, i32 2, i32 0, !"half", !"b"}
+!7 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+
+        let inferred = infer_plan(ll);
+        let controls = inferred
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .unwrap();
+        assert!(
+            controls
+                .seed_layout
+                .iter()
+                .any(|field| { field.offset == 16 && field.size == 4 && field.value == Some(0) }),
+            "fields={:?} packed={:?} loop_bounds={:?}",
+            controls.seed_layout,
+            packed_loop_scatter_control_fields(ll),
+            buffers_with_loads_used_as_loop_bounds(ll)
+        );
+        assert!(!controls.seed_layout.iter().any(|field| field.offset == 18));
+        assert_eq!(inferred.output.len, Some(36 * DEFAULT_DISPATCH_GRID_X));
+
+        let (serial, _) = metal_oracle_inputs(ll, None);
+        assert_eq!(serial.dispatch_grid, [1, 1, 1]);
+        assert_eq!(serial.dispatch_tg, [1, 1, 1]);
+        assert_eq!(
+            oracle_input_specialization(ll, &serial).as_deref(),
+            Some(INPUT_SPECIALIZATION_EXPLICIT)
+        );
+        let metal = metal_row_for_compare(&[], serial, Some("Kernel"));
+        assert!(incompatible_output_plan_golden(ll, &metal).is_none());
+    }
+
+    #[test]
+    fn packed_scatter_zeroes_rooted_entry_guard_before_any_cfg_cycle() {
+        let ll = r#"
+%struct.Uniforms = type { i32, i32 }
+%struct.Control = type { <2 x float>, float, half, half, i32 }
+
+define void @paint(ptr addrspace(2) readonly %uniforms, ptr addrspace(1) readonly %points, ptr addrspace(1) writeonly %out, i32 %tid) {
+entry:
+  %countp = getelementptr inbounds %struct.Uniforms, ptr addrspace(2) %uniforms, i64 0, i32 1
+  %count = load i32, ptr addrspace(2) %countp, align 4
+  %active = icmp ult i32 %tid, %count
+  br i1 %active, label %work, label %exit
+work:
+  %field = getelementptr inbounds %struct.Control, ptr addrspace(1) %points, i64 0, i32 4
+  %packed = load i32, ptr addrspace(1) %field, align 4
+  %iterations = and i32 %packed, 65535
+  %base = lshr i32 %packed, 16
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %work ], [ %next, %loop ]
+  call void @write(i32 %base, ptr addrspace(1) %out)
+  %next = add i32 %i, 1
+  %done = icmp eq i32 %next, %iterations
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+
+define internal void @write(i32 %base, ptr addrspace(1) writeonly %out) {
+entry:
+  %index = zext i32 %base to i64
+  %dst = getelementptr i32, ptr addrspace(1) %out, i64 %index
+  store i32 1, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @paint, !1, !2}
+!1 = !{}
+!2 = !{!3, !5, !7, !8}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_size", i32 8, !"air.arg_type_name", !"Uniforms"}
+!4 = !{i32 0, i32 4, i32 0, !"uint", !"unused", i32 4, i32 4, i32 0, !"uint", !"count"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !6, !"air.arg_type_size", i32 24, !"air.arg_type_name", !"Control"}
+!6 = !{i32 0, i32 8, i32 0, !"float2", !"a", i32 8, i32 4, i32 0, !"float", !"b", i32 12, i32 2, i32 0, !"half", !"c", i32 14, i32 2, i32 0, !"half", !"d", i32 16, i32 4, i32 0, !"uint", !"packed"}
+!7 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint"}
+!8 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+
+        assert_eq!(
+            zero_exit_cycle_guard_struct_fields(ll),
+            HashSet::from([(0, 4, 4)])
+        );
+        let (plan, fc_values) = metal_oracle_inputs(ll, None);
+        let uniforms = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 0)
+            .unwrap();
+        assert!(uniforms
+            .seed_layout
+            .iter()
+            .any(|field| { field.offset == 4 && field.size == 4 && field.value == Some(0) }));
+        let facts = loop_input_facts_for_plan(ll, "paint", &plan, fc_values);
+        assert_eq!(
+            crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
+                ll,
+                "paint",
+                facts.as_loop_input_facts(),
+            ),
+            Ok(false)
+        );
     }
 
     #[test]
@@ -14777,6 +17316,49 @@ declare void @air.wg.barrier(i32, i32)
         metal2vulkan::tools::spirv_val_bytes(&spv, &tmp)
             .expect("loop-guarded BDA AS pointer candidate should validate");
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn legacy_compare_none_row_uses_current_loop_budget() {
+        let mut metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: 1,
+            plan: infer_plan(LOOP_GUARDED_BDA_AS_POINTER_LL),
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&[])),
+            output_b64: Some(encode_output_b64(&[])),
+            spv_sha256: None,
+            compare: "none".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: Some("bda_loop_guard".into()),
+            error: None,
+        };
+
+        assert_eq!(
+            loop_budget_for_metal_row(&metal),
+            crate::loop_budget::LOOP_BUDGET_BACKEDGES
+        );
+        let quarantine = historic_compare_none_quarantine_row(&metal);
+        assert_eq!(quarantine.status, "quarantine");
+        assert!(quarantine.output_sha256.is_none());
+        assert!(quarantine.output_b64.is_none());
+        assert!(quarantine
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("not a semantic Metal oracle")));
+        metal.compare = "full".into();
+        assert_eq!(
+            loop_budget_for_metal_row(&metal),
+            crate::loop_budget::LEGACY_LOOP_BUDGET_BACKEDGES
+        );
     }
 
     #[test]
@@ -15845,6 +18427,49 @@ define void @kernel(ptr addrspace(1) %out) {
     }
 
     #[test]
+    fn compare_none_preserves_a_valid_numeric_tolerance() {
+        let golden = 0x3c00u16.to_le_bytes();
+        let candidate = 0x3c01u16.to_le_bytes();
+        let metal = MetalRow {
+            air_sha256: "x".into(),
+            shard: None,
+            label: String::new(),
+            status: "ok".into(),
+            backend: "metal".into(),
+            seed_profile: SEED_PROFILE.into(),
+            plan_version: PLAN_VERSION,
+            plan: infer_plan(""),
+            input_sha256: None,
+            output_sha256: Some(sha256_hex(&golden)),
+            output_b64: Some(encode_output_b64(&golden)),
+            spv_sha256: None,
+            compare: "none".into(),
+            fc_specialization: None,
+            fc_values: None,
+            input_specialization: None,
+            stage: Some("Kernel".into()),
+            entry: None,
+            error: None,
+        };
+        let ll = r#"
+define half @k(half %x) #0 { ret half %x }
+attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
+"#;
+        let (status, observed, tolerance) = compare_candidate_to_metal(
+            &candidate,
+            &metal,
+            &sha256_hex(&candidate),
+            metal.output_sha256.as_deref().unwrap_or_default(),
+            DataFormat::R16Float,
+            Some(ll),
+        );
+
+        assert_eq!(status, "tolerance");
+        assert_eq!(observed.and_then(|margin| margin.max_ulp), Some(1));
+        assert!(tolerance.is_some());
+    }
+
+    #[test]
     fn fast_float_integer_render_target_allows_byte_quantization_tolerance() {
         let ll = r#"
 define i16 @frag(half %x) #0 {
@@ -15953,6 +18578,18 @@ define void @kernel(ptr addrspace(1) %out) {
 
         let format = candidate_compare_format(ll, &plan, &metal);
         assert_eq!(format, DataFormat::Rgba32Float);
+    }
+
+    #[test]
+    fn array_wrapped_writable_float_texture_uses_r32_format() {
+        assert_eq!(
+            texture_format_from_air_type(Some("array<texture2d<float, write>, 8>")),
+            "R32Float"
+        );
+        assert_eq!(
+            texture_format_from_air_type(Some("array<texture2d<float, sample>, 8>")),
+            "Rgba32Float"
+        );
     }
 
     #[test]
@@ -16226,67 +18863,6 @@ define void @kernel() {
             .contains("without fc_values"));
         metal.fc_values = Some(vec![FunctionConstantValueJson { index: 1, value: 1 }]);
         assert!(incompatible_function_constant_golden(ll, &metal).is_none());
-    }
-
-    #[test]
-    fn function_constant_texture_array_ref_view_family_requires_rebank() {
-        let ll = r#"
-@_ZL33_tex_loc = internal addrspace(2) global i32 1, align 4
-@_ZL33_arr_loc = internal addrspace(2) global i32 33, align 4
-@fc0 = internal addrspace(2) global i8 1, align 1
-@fc1 = internal addrspace(2) global i8 1, align 1
-
-define void @kernel(ptr addrspace(1) %a, ptr addrspace(1) %b) {
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @kernel, !1, !2}
-!1 = !{}
-!2 = !{!3, !5}
-!3 = !{i32 0, !"air.function_constant", !4, !"air.texture", !"air.location_index", ptr addrspace(2) @_ZL33_tex_loc, i32 1, !"air.sample", !"air.arg_type_name", !"array_ref<texture2d<float, sample>>", !"air.arg_name", !"plain"}
-!4 = !{ptr addrspace(2) @fc0, !"bool", !"usePlain", i32 1, i1 true}
-!5 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", ptr addrspace(2) @_ZL33_arr_loc, i32 1, !"air.sample", !"air.arg_type_name", !"array_ref<texture2d_array<float, sample>>", !"air.arg_name", !"arrayed"}
-!6 = !{ptr addrspace(2) @fc1, !"bool", !"useArray", i32 2, i1 true}
-"#;
-        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        metal.fc_specialization = Some(FC_SPECIALIZATION_VALUES.into());
-        metal.fc_values = Some(vec![
-            FunctionConstantValueJson { index: 1, value: 1 },
-            FunctionConstantValueJson { index: 2, value: 1 },
-        ]);
-
-        let reason = incompatible_function_constant_texture_array_ref_golden(ll, &metal)
-            .expect("mixed FC texture array_ref view family");
-        assert!(reason.contains("texture metadata"), "{reason}");
-        assert!(reason.contains("image-view"), "{reason}");
-
-        metal.compare = "none".into();
-        let reason = incompatible_function_constant_texture_array_ref_golden(ll, &metal)
-            .expect("mixed FC texture array_ref smoke view family");
-        assert!(reason.contains("image-view"), "{reason}");
-
-        let read_ll = r#"
-@fc0 = internal addrspace(2) global i8 1, align 1
-@fc1 = internal addrspace(2) global i8 1, align 1
-
-define void @kernel(ptr addrspace(1) %arrayed, ptr addrspace(1) %plain, ptr addrspace(1) %out) {
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @kernel, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !7}
-!3 = !{i32 0, !"air.function_constant", !4, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_array<half, read>", !"air.arg_name", !"arrayed"}
-!4 = !{ptr addrspace(2) @fc0, !"bool", !"useArrayed", i32 1, i1 true}
-!5 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<half, read>", !"air.arg_name", !"plain"}
-!6 = !{ptr addrspace(2) @fc1, !"bool", !"usePlain", i32 2, i1 true}
-!7 = !{i32 2, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"out"}
-"#;
-        let reason = incompatible_function_constant_texture_array_ref_golden(read_ll, &metal)
-            .expect("mixed FC read texture view family");
-        assert!(reason.contains("texture2d_array"), "{reason}");
     }
 
     #[test]
@@ -17290,7 +19866,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
     }
 
     #[test]
-    fn sampled_fast_pow_f32_texture_golden_is_missing() {
+    fn sampled_fast_pow_f32_texture_uses_numeric_tolerance() {
         let ll = r#"
 define <4 x half> @frag(ptr addrspace(1) %tex) #0 {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -17317,13 +19893,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_sampled_fast_pow_texture_golden(ll, &metal)
-            .expect("sampled fast pow texture golden");
-        assert!(reason.contains("fast_pow"), "{reason}");
+        assert!(incompatible_sampled_fast_pow_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn sampled_f32_domain_math_texture_golden_is_missing() {
+    fn sampled_f32_domain_math_texture_uses_numeric_tolerance() {
         let ll = r#"
 define float @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -17349,9 +19923,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_sampled_f32_domain_math_texture_golden(ll, &metal)
-            .expect("sampled f32 domain math texture golden");
-        assert!(reason.contains("finite f32 texture"), "{reason}");
+        assert!(incompatible_sampled_f32_domain_math_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -17518,7 +20090,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn sampled_f32_texture_output_golden_is_missing() {
+    fn sampled_f32_texture_output_uses_numeric_tolerance() {
         let ll = r#"
 define void @k(<2 x i16> %gid, ptr addrspace(1) %src, ptr addrspace(1) %dst, <2 x float> %uv) {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %src, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -17539,9 +20111,7 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_sampled_f32_texture_output_golden(ll, &metal)
-            .expect("sampled f32 texture output golden");
-        assert!(reason.contains("f32 texture output"), "{reason}");
+        assert!(incompatible_sampled_f32_texture_output_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -17691,7 +20261,7 @@ exit:
     }
 
     #[test]
-    fn finite_struct_half_div_fragment_golden_is_missing() {
+    fn finite_struct_half_div_fragment_uses_numeric_tolerance() {
         let ll = r#"
 define <4 x half> @frag(ptr addrspace(1) %coeff, <4 x half> %color) #0 {
   %p = getelementptr inbounds half, ptr addrspace(1) %coeff, i64 0
@@ -17720,9 +20290,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_finite_struct_half_fragment_golden(ll, &metal)
-            .expect("finite-struct half fragment golden");
-        assert!(reason.contains("fast half division"), "{reason}");
+        assert!(incompatible_finite_struct_half_fragment_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -17784,48 +20352,7 @@ define void @vert(ptr addrspace(1) %tex) {
     }
 
     #[test]
-    fn moltenvk_sampled_half_render_target_exact_golden_is_missing() {
-        let ll = r#"
-define <4 x half> @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
-  %s = tail call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %v = extractvalue { <4 x half>, i8 } %s, 0
-  %d = tail call fast half @air.dot.v4f16(<4 x half> %v, <4 x half> %v)
-  %out = insertelement <4 x half> %v, half %d, i64 3
-  ret <4 x half> %out
-}
-
-declare { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-declare half @air.dot.v4f16(<4 x half>, <4 x half>)
-attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
-
-!air.fragment = !{!0}
-!0 = !{ptr @frag, !1, !2}
-!1 = !{!3}
-!2 = !{!4, !5}
-!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
-!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"tex"}
-!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
-"#;
-
-        let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_moltenvk_sampled_half_render_target_exact_golden(ll, &metal)
-            .expect("MoltenVK sampled half render-target exact golden");
-        assert!(reason.contains("finite f16 texture"), "{reason}");
-        assert!(
-            reason.contains("MoltenVK exact byte comparison"),
-            "{reason}"
-        );
-
-        let mut compare_none = metal;
-        compare_none.compare = "none".into();
-        assert!(
-            incompatible_moltenvk_sampled_half_render_target_exact_golden(ll, &compare_none)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn moltenvk_half_texture_output_exact_golden_is_missing() {
+    fn moltenvk_half_texture_output_uses_numeric_tolerance() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i16> %gid) #0 {
   %sam = tail call ptr addrspace(2) @air.get_read_sampler()
@@ -17851,10 +20378,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_moltenvk_half_texture_output_exact_golden(ll, &metal)
-            .expect("MoltenVK half texture-output exact golden");
-        assert!(reason.contains("finite f16 texture data"), "{reason}");
-        assert!(reason.contains("texture write rounding"), "{reason}");
+        assert!(incompatible_moltenvk_half_texture_output_exact_golden(ll, &metal).is_none());
 
         let fragment_metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
         assert!(
@@ -17863,7 +20387,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn moltenvk_storage_f32_texture_output_exact_golden_is_missing() {
+    fn moltenvk_storage_f32_texture_output_uses_numeric_tolerance() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) readonly %src, ptr addrspace(1) %out, <2 x i32> %gid) #0 {
   %read = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) readonly %src, ptr addrspace(2) null, <2 x i32> %gid, <2 x i32> zeroinitializer, i32 0, i32 1)
@@ -17890,17 +20414,13 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_moltenvk_storage_f32_texture_output_exact_golden(ll, &metal)
-            .expect("MoltenVK storage f32 texture-output exact golden");
-        assert!(reason.contains("finite f32 storage texture"), "{reason}");
         assert!(
-            reason.contains("MoltenVK exact byte comparison"),
-            "{reason}"
+            incompatible_moltenvk_storage_f32_texture_output_exact_golden(ll, &metal).is_none()
         );
     }
 
     #[test]
-    fn moltenvk_storage_r32_imageblock_texture_output_exact_golden_is_missing() {
+    fn moltenvk_storage_r32_imageblock_texture_output_uses_numeric_tolerance() {
         let ll = r#"
 %"struct.metal::_imageblock_base.92" = type { ptr addrspace(4) }
 
@@ -17936,14 +20456,13 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 
         let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
         metal.plan.output.format = "R32Float".into();
-        let reason = incompatible_moltenvk_storage_f32_texture_output_exact_golden(ll, &metal)
-            .expect("MoltenVK storage R32 imageblock exact golden");
-        assert!(reason.contains("finite f32 storage texture"), "{reason}");
-        assert!(reason.contains("texture read/write rounding"), "{reason}");
+        assert!(
+            incompatible_moltenvk_storage_f32_texture_output_exact_golden(ll, &metal).is_none()
+        );
     }
 
     #[test]
-    fn moltenvk_sampled_f32_render_target_exact_golden_is_missing() {
+    fn moltenvk_sampled_f32_render_target_uses_numeric_tolerance() {
         let ll = r#"
 define <4 x float> @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -17964,10 +20483,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_moltenvk_sampled_f32_render_target_exact_golden(ll, &metal)
-            .expect("MoltenVK sampled f32 render-target exact golden");
-        assert!(reason.contains("finite f32 texture"), "{reason}");
-        assert!(reason.contains("render-target rounding"), "{reason}");
+        assert!(incompatible_moltenvk_sampled_f32_render_target_exact_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -18003,7 +20519,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn moltenvk_fast_f32_buffer_output_exact_golden_is_missing() {
+    fn moltenvk_fast_f32_buffer_output_uses_numeric_tolerance() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) %out, ptr addrspace(2) %control, i32 %idx) #0 {
   %c = load i32, ptr addrspace(2) %control, align 4
@@ -18028,14 +20544,11 @@ attributes #0 = { "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "uns
         let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
         metal.plan.output.format = "Rgba32Float".into();
         metal.plan.buffers[0].seed_mode = SEED_MODE_FINITE_FLOAT32.into();
-        let reason = incompatible_moltenvk_fast_f32_buffer_output_exact_golden(ll, &metal)
-            .expect("MoltenVK fast f32 buffer-output exact golden");
-        assert!(reason.contains("finite f32 buffer output"), "{reason}");
-        assert!(reason.contains("denorm flushing"), "{reason}");
+        assert!(incompatible_moltenvk_fast_f32_buffer_output_exact_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn moltenvk_fast_f32_input_buffer_exact_golden_is_missing() {
+    fn moltenvk_fast_f32_input_buffer_uses_numeric_tolerance() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) #0 {
   %x = load float, ptr addrspace(1) %a, align 4
@@ -18060,17 +20573,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 
         let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
         metal.plan.output.format = "F32".into();
-        let reason = incompatible_moltenvk_fast_f32_input_buffer_exact_golden(ll, &metal)
-            .expect("MoltenVK finite f32 input buffer exact golden");
-        assert!(reason.contains("finite f32 buffer inputs"), "{reason}");
-        assert!(
-            reason.contains("MoltenVK exact byte comparison"),
-            "{reason}"
-        );
+        assert!(incompatible_moltenvk_fast_f32_input_buffer_exact_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn moltenvk_fast_half_buffer_output_exact_golden_is_missing() {
+    fn moltenvk_fast_half_buffer_output_uses_numeric_tolerance() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out) #0 {
   %h = load half, ptr addrspace(1) %src, align 2
@@ -18096,14 +20603,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 
         let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
         metal.plan.output.format = "R16Float".into();
-        let reason = incompatible_moltenvk_fast_half_buffer_output_exact_golden(ll, &metal)
-            .expect("MoltenVK fast half buffer-output exact golden");
-        assert!(reason.contains("finite f16 buffer output"), "{reason}");
-        assert!(reason.contains("half conversion"), "{reason}");
+        assert!(incompatible_moltenvk_fast_half_buffer_output_exact_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn moltenvk_fast_half_render_target_exact_golden_is_missing() {
+    fn moltenvk_fast_half_render_target_uses_numeric_tolerance() {
         let ll = r#"
 define <4 x half> @frag(half %x) #0 {
   %s = tail call fast half @air.fast_sqrt.f16(half %x)
@@ -18123,14 +20627,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_moltenvk_fast_half_render_target_exact_golden(ll, &metal)
-            .expect("MoltenVK fast half render-target exact golden");
-        assert!(reason.contains("fast_sqrt"), "{reason}");
-        assert!(reason.contains("render-target rounding"), "{reason}");
+        assert!(incompatible_moltenvk_fast_half_render_target_exact_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn moltenvk_fast_raw_float_buffer_output_exact_golden_is_missing() {
+    fn fast_raw_float_buffer_output_executes_with_exact_default() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) %out, float %x, i32 %idx) #0 {
   %dst = getelementptr float, ptr addrspace(1) %out, i32 %idx
@@ -18149,16 +20650,24 @@ attributes #0 = { "no-nans-fp-math"="true" "no-signed-zeros-fp-math"="true" "uns
 !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"idx"}
 "#;
 
-        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        metal.plan.output.format = "RawBytes".into();
-        let reason = incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(ll, &metal)
-            .expect("MoltenVK fast raw float buffer-output exact golden");
-        assert!(reason.contains("raw buffer bytes"), "{reason}");
-        assert!(reason.contains("signed-zero"), "{reason}");
+        assert!(raw_buffer_writes_float_derived_bytes(ll));
+        assert!(tolerance_for_context(DataFormat::RawBytes, Some(ll)).is_none());
     }
 
     #[test]
-    fn moltenvk_packed_unorm_raw_float_buffer_output_exact_golden_is_missing() {
+    fn integer_vector_store_is_not_classified_as_float_derived_raw_bytes() {
+        let ll = r#"
+define void @kernel(ptr addrspace(1) %out, <4 x i32> %value) #0 {
+  store <4 x i32> %value, ptr addrspace(1) %out, align 16
+  ret void
+}
+attributes #0 = { "no-nans-fp-math"="true" }
+"#;
+        assert!(!raw_buffer_writes_float_derived_bytes(ll));
+    }
+
+    #[test]
+    fn packed_unorm_raw_float_buffer_output_uses_byte_tolerance() {
         let ll = r#"
 define void @kernel(ptr addrspace(1) %src, ptr addrspace(1) %out, i32 %idx) #0 {
   %srcp = getelementptr i32, ptr addrspace(1) %src, i32 %idx
@@ -18184,12 +20693,13 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"idx"}
 "#;
 
-        let mut metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        metal.plan.output.format = "RawBytes".into();
-        let reason = incompatible_moltenvk_fast_raw_float_buffer_output_exact_golden(ll, &metal)
-            .expect("MoltenVK packed unorm raw float buffer-output exact golden");
-        assert!(reason.contains("raw buffer bytes"), "{reason}");
-        assert!(reason.contains("float denorm"), "{reason}");
+        assert!(raw_buffer_writes_float_derived_bytes(ll));
+        assert_eq!(
+            tolerance_for_context(DataFormat::RawBytes, Some(ll))
+                .as_ref()
+                .and_then(|tolerance| tolerance.max_abs),
+            Some(1.0)
+        );
     }
 
     #[test]
@@ -18295,7 +20805,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn sampled_fast_powr_integer_render_target_golden_is_missing() {
+    fn sampled_fast_powr_integer_render_target_uses_numeric_tolerance() {
         let ll = r#"
 define i32 @frag(<2 x float> %uv, ptr addrspace(1) %tex, ptr addrspace(2) %sampler) #0 {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -18326,13 +20836,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_sampled_fast_pow_texture_golden(ll, &metal)
-            .expect("sampled fast powr texture golden");
-        assert!(reason.contains("fast_pow/fast_powr"), "{reason}");
+        assert!(incompatible_sampled_fast_pow_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn sampled_f32_dynamic_lod_render_target_golden_is_missing() {
+    fn sampled_f32_dynamic_lod_render_target_uses_numeric_tolerance() {
         let ll = r#"
 define <4 x float> @frag(<2 x float> %uv, ptr addrspace(1) %src, ptr addrspace(1) %mask) #0 {
   %mask_sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %mask, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -18363,9 +20871,15 @@ attributes #0 = { "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_sampled_f32_dynamic_lod_render_target_golden(ll, &metal)
-            .expect("sampled f32 dynamic LOD render-target golden");
-        assert!(reason.contains("dynamic LOD"), "{reason}");
+        assert!(incompatible_sampled_f32_dynamic_lod_render_target_golden(ll, &metal).is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_process_resident_bytes_reports_current_process() {
+        assert!(
+            macos_process_resident_bytes(std::process::id()).is_some_and(|resident| resident > 0)
+        );
     }
 
     #[test]
@@ -18442,7 +20956,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn fragment_fast_pow_rsqrt_render_target_golden_is_missing() {
+    fn fragment_fast_pow_rsqrt_render_target_uses_numeric_tolerance() {
         let ll = r#"
 define <4 x float> @frag(float %x) #0 {
   %r = tail call fast float @air.fast_rsqrt.f32(float %x)
@@ -18464,10 +20978,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        let reason = incompatible_fragment_fast_pow_rsqrt_render_target_golden(ll, &metal)
-            .expect("fragment fast pow/rsqrt render-target golden");
-        assert!(reason.contains("fast_pow"), "{reason}");
-        assert!(reason.contains("fast_rsqrt"), "{reason}");
+        assert!(incompatible_fragment_fast_pow_rsqrt_render_target_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -18524,7 +21035,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn sampled_half_domain_sensitive_texture_golden_is_missing() {
+    fn sampled_half_domain_sensitive_texture_uses_numeric_tolerance() {
         let ll = r#"
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -18561,9 +21072,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_sampled_half_domain_sensitive_texture_golden(ll, &metal)
-            .expect("sampled half domain-sensitive texture golden");
-        assert!(reason.contains("domain-sensitive math"), "{reason}");
+        assert!(incompatible_sampled_half_domain_sensitive_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -18635,13 +21144,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
-            .expect("sampled half linear imageblock texture golden");
-        assert!(reason.contains("imageblock"), "{reason}");
+        assert!(incompatible_sampled_half_linear_filter_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn sampled_half_linear_scaled_texture_golden_is_missing() {
+    fn sampled_half_linear_scaled_texture_uses_numeric_tolerance() {
         let ll = r#"
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601055817, i64 0], align 8
 
@@ -18676,14 +21183,11 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
-            .expect("sampled half scaled linear texture golden");
-        assert!(reason.contains("buffer-scaled coordinates"), "{reason}");
-        assert!(reason.contains("f16 texture output"), "{reason}");
+        assert!(incompatible_sampled_half_linear_filter_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
-    fn sampled_half_gather_imageblock_texture_golden_is_missing() {
+    fn sampled_half_gather_imageblock_texture_uses_numeric_tolerance() {
         let ll = r#"
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -18715,9 +21219,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
-            .expect("sampled half gather imageblock texture golden");
-        assert!(reason.contains("gathers finite f16"), "{reason}");
+        assert!(incompatible_sampled_half_linear_filter_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -18906,9 +21408,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        let reason = incompatible_sampled_half_linear_filter_texture_golden(ll, &metal)
-            .expect("sampled half runtime sampler threadgroup texture golden");
-        assert!(reason.contains("runtime sampler"), "{reason}");
+        assert!(incompatible_sampled_half_linear_filter_texture_golden(ll, &metal).is_none());
     }
 
     #[test]
@@ -19341,7 +21841,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
         assert!(execution_status_is_success(RunBackend::Vulkan, "ok"));
         assert!(execution_status_is_success(RunBackend::Vulkan, "tolerance"));
         assert!(execution_status_is_success(RunBackend::Vulkan, "smoke"));
-        assert!(!execution_status_is_success(
+        assert!(execution_status_is_success(
             RunBackend::MoltenVk,
             "tolerance"
         ));
@@ -19353,15 +21853,12 @@ attributes #0 = { "no-nans-fp-math"="true" }
     }
 
     #[test]
-    fn moltenvk_compare_policy_requires_exact_output() {
+    fn moltenvk_compare_policy_accepts_tolerance_but_rejects_smoke() {
         let mut status = "tolerance".to_string();
         let mut error = None;
         enforce_backend_compare_policy(RunBackend::MoltenVk, &mut status, &mut error);
-        assert_eq!(status, "failure");
-        assert_eq!(
-            error.as_deref(),
-            Some("MoltenVK output differs from Metal; exact byte match required")
-        );
+        assert_eq!(status, "tolerance");
+        assert!(error.is_none());
 
         let mut status = "tolerance".to_string();
         let mut error = None;
@@ -19374,6 +21871,15 @@ attributes #0 = { "no-nans-fp-math"="true" }
         enforce_backend_compare_policy(RunBackend::MoltenVk, &mut status, &mut error);
         assert_eq!(status, "failure");
         assert_eq!(error.as_deref(), Some("existing smoke reason"));
+
+        let mut status = "smoke".to_string();
+        let mut error = None;
+        enforce_backend_compare_policy(RunBackend::MoltenVk, &mut status, &mut error);
+        assert_eq!(status, "failure");
+        assert_eq!(
+            error.as_deref(),
+            Some("MoltenVK compare=none smoke row has no semantic Metal golden")
+        );
     }
 
     #[test]
@@ -19461,9 +21967,11 @@ attributes #0 = { "no-nans-fp-math"="true" }
             status: "fallback".into(),
             label: "local/foo.ll".into(),
             error: Some("vulkan execute panicked: create compute pipeline".into()),
+            compare: "none".into(),
             signature: "create compute pipeline".into(),
         };
         assert!(tech_row_selected(&cfg, &row));
+        assert!(row.matches_text("compare=none"));
 
         let mut success = row.clone();
         success.status = "tolerance".into();
@@ -19493,6 +22001,17 @@ attributes #0 = { "no-nans-fp-math"="true" }
         cfg.force = false;
         cfg.only_status = Some("ok".into());
         assert!(cfg.reruns_existing_backend_rows());
+
+        assert!(should_reclassify_historic_compare_none_without_source(&cfg));
+        cfg.remint_compare_none = true;
+        assert!(!should_reclassify_historic_compare_none_without_source(
+            &cfg
+        ));
+        cfg.remint_compare_none = false;
+        cfg.preflight_only = true;
+        assert!(!should_reclassify_historic_compare_none_without_source(
+            &cfg
+        ));
     }
 
     #[test]
@@ -19894,6 +22413,87 @@ define void @"persona::ksDepthDilate"(ptr addrspace(2) %0) {
     }
 
     #[test]
+    fn fragment_imageblock_input_is_distinguished_from_output_only_metadata() {
+        let input = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @fragment_main, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.imageblock_data", !"air.imageblock_data_size", i32 16}
+!3 = !{!"air.depth", !"air.arg_type_name", !"float"}
+!4 = !{!5}
+!5 = !{i32 0, !"air.imageblock_data", !"air.imageblock_data_size", i32 16}
+"#;
+        let output_only = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @fragment_main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.imageblock_data", !"air.imageblock_data_size", i32 16}
+"#;
+
+        assert!(fragment_has_uninitialized_imageblock_input(input));
+        assert!(!fragment_has_uninitialized_imageblock_input(output_only));
+        assert_eq!(
+            unsafe_metal_submission_reason(input),
+            Some(UNINITIALIZED_FRAGMENT_IMAGEBLOCK_REASON)
+        );
+    }
+
+    #[test]
+    fn post_tessellation_vertex_is_refused_before_standalone_metal_preflight() {
+        let post_tessellation_vertex = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @post_vertex, !1, !2, !5}
+!1 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!2 = !{!3}
+!3 = !{i32 0, !"air.patch_control_point_input", !4}
+!4 = !{!"air.patch_control_point_function", ptr @control_point}
+!5 = !{!"air.patch", !"triangle", !"air.patch_control_point", i32 3}
+"#;
+        assert_eq!(
+            invalid_standalone_metal_oracle_reason(post_tessellation_vertex),
+            Some(POST_TESSELLATION_VERTEX_ORACLE_REASON)
+        );
+        assert!(invalid_standalone_metal_oracle_reason(
+            &post_tessellation_vertex.replace("air.patch_control_point_input", "air.attribute")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn unsafe_submission_classification_uses_resource_and_control_structure() {
+        let barrier = r#"
+@packed.MTL_FC_INIT_1_j = externally_initialized constant i32 undef, section "air.fc_initializer"
+define void @k() { call void @air.wg.barrier(i32 2, i32 1) ret void }
+!1 = !{i32 0, !"air.function_constant", !9, !"air.buffer", !"air.address_space", i32 3, !"air.arg_name", !"a"}
+!2 = !{i32 1, !"air.function_constant", !9, !"air.buffer", !"air.address_space", i32 3, !"air.arg_name", !"b"}
+"#;
+        assert!(
+            unsafe_metal_submission_reason(barrier)
+                .is_some_and(|reason| reason.contains("coherent allocation/use")),
+            "{barrier}"
+        );
+        assert!(unsafe_metal_submission_reason(&barrier.replace(
+            "!2 = !{i32 1, !\"air.function_constant\", !9, !\"air.buffer\", !\"air.address_space\", i32 3, !\"air.arg_name\", !\"b\"}",
+            ""
+        ))
+        .is_none());
+
+        let mut resource_union = "x".repeat(300_000);
+        resource_union.push_str(
+            "\n@packed.MTL_FC_INIT_2_j = externally_initialized constant i32 undef, section \"air.fc_initializer\"\n",
+        );
+        for index in 0..8 {
+            resource_union.push_str(&format!(
+                "!{} = !{{i32 {index}, !\"air.function_constant\", !99, !\"air.texture\", !\"air.arg_type_name\", !\"array_ref<texture2d<half, sample>>\"}}\n",
+                index + 10
+            ));
+        }
+        assert!(unsafe_metal_submission_reason(&resource_union)
+            .is_some_and(|reason| reason.contains("aggregate GPU-time bound")),);
+    }
+
+    #[test]
     fn unresolved_visible_refs_are_classified_as_unsupported() {
         let err = "newComputePipelineStateWithFunction(topkv): \
 error: unresolved visible function reference: postfixPrimary_f\n  Reason: visible function not loaded\n\
@@ -19973,7 +22573,39 @@ fragment shader color output does not have enough components for the pixel forma
     }
 
     #[test]
-    fn unsupported_rgb_fragment_color_output_is_preflighted() {
+    fn atomic_append_u32_output_is_canonicalized_as_an_unordered_list() {
+        let ll = r#"
+define void @append(i32 %tid, ptr addrspace(1) %out, ptr addrspace(1) %counter) {
+  %slot = call i32 @air.atomic.global.add.s.i32(ptr addrspace(1) %counter, i32 1, i32 0, i32 2, i1 true)
+  %wide = zext i32 %slot to i64
+  %dst = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %wide
+  store i32 %tid, ptr addrspace(1) %dst, align 4
+  ret void
+}
+declare i32 @air.atomic.global.add.s.i32(ptr addrspace(1), i32, i32, i32, i1)
+!air.kernel = !{!0}
+!0 = !{ptr @append, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"atomic_uint", !"air.arg_name", !"counter"}
+"#;
+        let plan = infer_plan(ll);
+        let mut bytes = [3u32, 1, 2, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        canonicalize_unordered_atomic_append_output(ll, &plan, &mut bytes);
+        let words = bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(words, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn rgb_fragment_color_output_canonicalizes_only_attachment_padding() {
         let ll = r#"
 define <3 x half> @inputStreamColorBlitFragment() {
   ret <3 x half> zeroinitializer
@@ -19986,15 +22618,19 @@ define <3 x half> @inputStreamColorBlitFragment() {
 !18 = !{}
 "#;
 
-        let reason =
-            unsupported_fragment_color_output_arity(ll).expect("half3 color should be unsupported");
-        assert!(reason.contains("render target location 0"), "{reason}");
-        assert!(reason.contains("\"half3\""), "{reason}");
-        assert!(reason.contains("no renderable RGB"), "{reason}");
+        let plan = infer_plan(ll);
+        let mut bytes = vec![
+            1, 2, 3, 4, 5, 6, 0xaa, 0xbb, 7, 8, 9, 10, 11, 12, 0xcc, 0xdd,
+        ];
+        canonicalize_fragment_render_target_padding(ll, &plan, &mut bytes);
+        assert_eq!(
+            bytes,
+            vec![1, 2, 3, 4, 5, 6, 0, 0, 7, 8, 9, 10, 11, 12, 0, 0]
+        );
     }
 
     #[test]
-    fn supported_rgba_fragment_color_output_is_not_preflighted() {
+    fn rgba_fragment_color_output_is_not_canonicalized() {
         let ll = r#"
 define <4 x half> @frag() {
   ret <4 x half> zeroinitializer
@@ -20007,7 +22643,31 @@ define <4 x half> @frag() {
 !18 = !{}
 "#;
 
-        assert!(unsupported_fragment_color_output_arity(ll).is_none());
+        let plan = infer_plan(ll);
+        let mut bytes = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        canonicalize_fragment_render_target_padding(ll, &plan, &mut bytes);
+        assert_eq!(bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn integer_rgb_fragment_output_uses_four_byte_padding_lane() {
+        let ll = r#"
+define <3 x i32> @frag() {
+  ret <3 x i32> zeroinitializer
+}
+
+!air.fragment = !{!15}
+!15 = !{ptr @frag, !16, !18}
+!16 = !{!17}
+!17 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"int3"}
+!18 = !{}
+"#;
+
+        let plan = infer_plan(ll);
+        let mut bytes = (1u8..=16).collect::<Vec<_>>();
+        canonicalize_fragment_render_target_padding(ll, &plan, &mut bytes);
+        assert_eq!(&bytes[..12], &(1u8..=12).collect::<Vec<_>>());
+        assert_eq!(&bytes[12..], &[0, 0, 0, 0]);
     }
 
     #[test]
