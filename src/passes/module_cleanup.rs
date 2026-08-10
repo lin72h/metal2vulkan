@@ -431,6 +431,18 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
         want.push(Capability::GroupNonUniform);
         want.push(Capability::GroupNonUniformBallot);
     }
+    let has_subgroup_invocation_builtin = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.iter().any(|operand| {
+                matches!(
+                    operand,
+                    Operand::BuiltIn(spirv::BuiltIn::SubgroupLocalInvocationId)
+                )
+            })
+    });
+    if has_subgroup_invocation_builtin {
+        want.push(Capability::GroupNonUniform);
+    }
     let has_group_arithmetic = ctx
         .module
         .functions

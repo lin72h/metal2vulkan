@@ -184,13 +184,9 @@ declare float @air.quad_sum.f32(float)
 }
 
 #[test]
-fn native_simd_sum_clusters_reduce_only_under_transform_option() {
-    // air.simd_sum reduces over Metal's 32-lane simdgroup. By default the translator emits a
-    // whole-subgroup GroupNonUniformFAdd Reduce; TransformOptions::simd_cluster32 (F4 promoted it
-    // from the former METAL2VULKAN_SIMD_CLUSTER32 env knob, surfaced as the --simd-cluster32 CLI
-    // flag) turns it into a ClusteredReduce over a 32-lane cluster + the GroupNonUniformClustered
-    // capability so a wider-subgroup driver still reduces over exactly 32 lanes. Default off is
-    // byte-neutral; this locks the option→ctx threading the env read used to carry.
+fn native_simd_sum_uses_metal_32_lane_cluster() {
+    // AIR simd operations structurally select Metal's 32-lane simdgroup semantics. This cannot be
+    // left to a driver's native subgroup width: MoltenVK may expose a 64-lane subgroup.
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 define void @k(float %v, ptr addrspace(1) %out) {
@@ -209,27 +205,9 @@ declare float @air.simd_sum.f32(float)
     let tmp = std::env::temp_dir().join(format!("metal2vulkan_simd_sum_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
 
-    // Default options: whole-subgroup Reduce, no clustering, no clustered capability.
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpGroupNonUniformFAdd"), "{asm}");
-    assert!(
-        !asm.contains("ClusteredReduce"),
-        "default lowering must be a whole-subgroup Reduce, not clustered: {asm}"
-    );
-    assert!(
-        !asm_has_line(&asm, "OpCapability GroupNonUniformClustered"),
-        "{asm}"
-    );
-
-    // Opt-in via TransformOptions: ClusteredReduce over 32 lanes + the clustered capability.
-    let opts = passes::TransformOptions {
-        simd_cluster32: true,
-        ..passes::TransformOptions::default()
-    };
-    let spv = crate::translate_sanitized_native_with_options(ll, Stage::Kernel, &tmp, opts)
-        .expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("ClusteredReduce"), "{asm}");
     assert!(
         asm_has_line(&asm, "OpCapability GroupNonUniformClustered"),
@@ -238,7 +216,7 @@ declare float @air.simd_sum.f32(float)
 }
 
 #[test]
-fn native_air_simd_is_first_lowers_to_subgroup_elect() {
+fn native_air_simd_is_first_selects_each_32_lane_partition() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 define void @k(ptr addrspace(1) %out) {
@@ -264,9 +242,10 @@ declare i1 @air.simd_is_first()
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
-    assert!(asm.contains("OpGroupNonUniformElect"), "{asm}");
+    assert!(asm.contains("BuiltIn SubgroupLocalInvocationId"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpIEqual"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

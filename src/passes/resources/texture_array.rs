@@ -24,6 +24,7 @@
 //! legal (no `ShaderNonUniform`).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::spirv_module::Instruction;
 use crate::spirv_module::Operand;
@@ -190,6 +191,117 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     //    of the array pointer). A pure pointer-derivation with no remaining use is safe to delete; run
     //    to a fixpoint so freeing one frees its sources.
     sweep_dead_pointer_derivations(ctx, entry_idx, &dead_roots);
+}
+
+/// Sink a descriptor-array element pointer and its image load from a loop header to their sole use.
+/// SPIRV-Cross otherwise has to give the loop-carried `UniformConstant` pointer function scope and
+/// emits an illegal address-space-qualified automatic MSL variable. Descriptor bindings are
+/// immutable for a dispatch, so repeating the pure access/load at the nested use is equivalent.
+///
+/// Restrict the rewrite to pairs synthesized by [`materialize_texture_array_loads`]: a direct access
+/// into a recorded image-array variable, immediately consumed by an image load, both in a loop
+/// header, with exactly one downstream use outside that header. Phi uses are excluded because their
+/// value must be defined on a predecessor edge rather than immediately before the phi.
+pub(crate) fn sink_loop_header_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
+    if ctx.image_array_vars.is_empty() {
+        return;
+    }
+
+    let function = &ctx.module.functions[entry_idx];
+    let mut defs: HashMap<Word, (usize, usize, Instruction)> = HashMap::new();
+    let mut uses: HashMap<Word, Vec<(usize, usize)>> = HashMap::new();
+    for (block_idx, block) in function.blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if let Some(id) = inst.result_id {
+                defs.insert(id, (block_idx, inst_idx, inst.clone()));
+            }
+            for operand in &inst.operands {
+                if let Operand::IdRef(id) = operand {
+                    uses.entry(*id).or_default().push((block_idx, inst_idx));
+                }
+            }
+        }
+    }
+
+    let loop_headers: HashSet<usize> = function
+        .blocks
+        .iter()
+        .enumerate()
+        .filter(|(_, block)| {
+            block
+                .instructions
+                .iter()
+                .any(|inst| inst.class.opcode == Op::LoopMerge)
+        })
+        .map(|(block_idx, _)| block_idx)
+        .collect();
+    let mut insertions: HashMap<(usize, usize), Vec<Instruction>> = HashMap::new();
+    let mut removals = HashSet::new();
+
+    for (&load_id, &(load_block, _, ref load)) in &defs {
+        if load.class.opcode != Op::Load || load.operands.len() != 1 {
+            continue;
+        }
+        let Some(Operand::IdRef(pointer_id)) = load.operands.first() else {
+            continue;
+        };
+        let Some(&(chain_block, _, ref chain)) = defs.get(pointer_id) else {
+            continue;
+        };
+        if load_block != chain_block || !loop_headers.contains(&load_block) {
+            continue;
+        }
+        if !matches!(
+            chain.class.opcode,
+            Op::AccessChain | Op::InBoundsAccessChain
+        ) {
+            continue;
+        }
+        let Some(Operand::IdRef(root)) = chain.operands.first() else {
+            continue;
+        };
+        if !ctx.image_array_vars.contains_key(root) {
+            continue;
+        }
+        if uses.get(pointer_id).map(Vec::as_slice) != Some(&[(load_block, defs[&load_id].1)][..]) {
+            continue;
+        }
+        let Some([(use_block, use_inst)]) = uses.get(&load_id).map(Vec::as_slice) else {
+            continue;
+        };
+        if *use_block == load_block
+            || function.blocks[*use_block].instructions[*use_inst]
+                .class
+                .opcode
+                == Op::Phi
+        {
+            continue;
+        }
+        insertions
+            .entry((*use_block, *use_inst))
+            .or_default()
+            .extend([chain.clone(), load.clone()]);
+        removals.insert(*pointer_id);
+        removals.insert(load_id);
+    }
+
+    if removals.is_empty() {
+        return;
+    }
+    let function = &mut ctx.module.functions[entry_idx];
+    for (block_idx, block) in function.blocks.iter_mut().enumerate() {
+        let old = std::mem::take(&mut block.instructions);
+        let mut rebuilt = Vec::with_capacity(old.len());
+        for (inst_idx, inst) in old.into_iter().enumerate() {
+            if let Some(prefix) = insertions.remove(&(block_idx, inst_idx)) {
+                rebuilt.extend(prefix);
+            }
+            if !inst.result_id.is_some_and(|id| removals.contains(&id)) {
+                rebuilt.push(inst);
+            }
+        }
+        block.instructions = rebuilt;
+    }
 }
 
 /// The `air.*` texture intrinsics whose arg 0 is a texture handle (sampled/read/write + size queries).
@@ -375,5 +487,127 @@ fn sweep_dead_pointer_derivations(ctx: &mut Ctx, entry_idx: usize, roots: &[Word
             break;
         }
         candidates.extend(freed_sources);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::passes::ImageComp;
+    use crate::spirv_module::{Block, Function, Module};
+    use spirv::Dim;
+
+    #[test]
+    fn single_use_texture_array_load_sinks_out_of_loop_header() {
+        let mut ctx = Ctx::new(Module::new());
+        let image_ty = ctx.ty_image(Dim::Dim2D, false, ImageComp::Float);
+        let array_ty = ctx.ty_array(image_ty, 4);
+        let ptr_array = ctx.ty_ptr(StorageClass::UniformConstant, array_ty);
+        let ptr_image = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
+        let root = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(ptr_array),
+            Some(root),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        ctx.image_array_vars.insert(
+            root,
+            (image_ty, (Dim::Dim2D, false), ImageComp::Float, false),
+        );
+
+        let index = ctx.const_uint(1);
+        let lod = ctx.const_uint(0);
+        let query_ty = ctx.ty_vec_uint(2);
+        let chain = ctx.module.fresh_id();
+        let image = ctx.module.fresh_id();
+        let query = ctx.module.fresh_id();
+        let header = ctx.module.fresh_id();
+        let body = ctx.module.fresh_id();
+        let continue_label = ctx.module.fresh_id();
+        let merge = ctx.module.fresh_id();
+        let function_id = ctx.module.fresh_id();
+        ctx.module.functions.push(Function {
+            def: Some(Instruction::new(
+                Op::Function,
+                None,
+                Some(function_id),
+                vec![],
+            )),
+            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+            parameters: vec![],
+            blocks: vec![
+                Block {
+                    label: Some(Instruction::new(Op::Label, None, Some(header), vec![])),
+                    instructions: vec![
+                        Instruction::new(
+                            Op::AccessChain,
+                            Some(ptr_image),
+                            Some(chain),
+                            vec![Operand::IdRef(root), Operand::IdRef(index)],
+                        ),
+                        Instruction::new(
+                            Op::Load,
+                            Some(image_ty),
+                            Some(image),
+                            vec![Operand::IdRef(chain)],
+                        ),
+                        Instruction::new(
+                            Op::LoopMerge,
+                            None,
+                            None,
+                            vec![Operand::IdRef(merge), Operand::IdRef(continue_label)],
+                        ),
+                        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(body)]),
+                    ],
+                },
+                Block {
+                    label: Some(Instruction::new(Op::Label, None, Some(body), vec![])),
+                    instructions: vec![
+                        Instruction::new(
+                            Op::ImageQuerySizeLod,
+                            Some(query_ty),
+                            Some(query),
+                            vec![Operand::IdRef(image), Operand::IdRef(lod)],
+                        ),
+                        Instruction::new(
+                            Op::Branch,
+                            None,
+                            None,
+                            vec![Operand::IdRef(continue_label)],
+                        ),
+                    ],
+                },
+                Block {
+                    label: Some(Instruction::new(
+                        Op::Label,
+                        None,
+                        Some(continue_label),
+                        vec![],
+                    )),
+                    instructions: vec![Instruction::new(
+                        Op::Branch,
+                        None,
+                        None,
+                        vec![Operand::IdRef(header)],
+                    )],
+                },
+                Block {
+                    label: Some(Instruction::new(Op::Label, None, Some(merge), vec![])),
+                    instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
+                },
+            ],
+        });
+
+        sink_loop_header_texture_array_loads(&mut ctx, 0);
+
+        let header_insts = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(!header_insts
+            .iter()
+            .any(|inst| matches!(inst.result_id, Some(id) if id == chain || id == image)));
+        let body_insts = &ctx.module.functions[0].blocks[1].instructions;
+        assert_eq!(body_insts[0].result_id, Some(chain));
+        assert_eq!(body_insts[1].result_id, Some(image));
+        assert_eq!(body_insts[2].result_id, Some(query));
     }
 }

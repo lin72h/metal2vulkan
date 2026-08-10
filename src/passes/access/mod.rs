@@ -172,6 +172,157 @@ mod byte_reinterpret_tests {
         );
     }
 
+    #[test]
+    fn workgroup_singleton_array_member_index_is_restored() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let len = ctx.const_uint(256);
+        let array = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeArray,
+            None,
+            Some(array),
+            vec![Operand::IdRef(uint), Operand::IdRef(len)],
+        ));
+        let aggregate = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(aggregate),
+            vec![Operand::IdRef(array)],
+        ));
+        let ptr_array = ctx.ty_ptr(StorageClass::Workgroup, aggregate);
+        let ptr_uint = ctx.ty_ptr(StorageClass::Workgroup, uint);
+        let base = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(ptr_array),
+            Some(base),
+            vec![Operand::StorageClass(StorageClass::Workgroup)],
+        ));
+        let stride_index = ctx.const_uint(3);
+        let member_zero = ctx.const_uint(0);
+        let result = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![Instruction::new(
+                Op::PtrAccessChain,
+                Some(ptr_uint),
+                Some(result),
+                vec![
+                    Operand::IdRef(base),
+                    Operand::IdRef(stride_index),
+                    Operand::IdRef(member_zero),
+                ],
+            )],
+        );
+
+        split_workgroup_ptr_access_chain_descent(&mut ctx, 0);
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].class.opcode, Op::InBoundsAccessChain);
+        assert_eq!(instructions[0].result_type, Some(ptr_uint));
+        assert_eq!(instructions[0].result_id, Some(result));
+        assert_eq!(
+            instructions[0].operands,
+            vec![
+                Operand::IdRef(base),
+                Operand::IdRef(member_zero),
+                Operand::IdRef(stride_index),
+            ]
+        );
+    }
+
+    #[test]
+    fn workgroup_array_stride_and_descent_are_split() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let len = ctx.const_uint(256);
+        let array = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeArray,
+            None,
+            Some(array),
+            vec![Operand::IdRef(uint), Operand::IdRef(len)],
+        ));
+        let ptr_array = ctx.ty_ptr(StorageClass::Workgroup, array);
+        let ptr_uint = ctx.ty_ptr(StorageClass::Workgroup, uint);
+        let base = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(ptr_array),
+            Some(base),
+            vec![Operand::StorageClass(StorageClass::Workgroup)],
+        ));
+        let stride_index = ctx.const_uint(3);
+        let element_index = ctx.const_uint(1);
+        let result = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![Instruction::new(
+                Op::PtrAccessChain,
+                Some(ptr_uint),
+                Some(result),
+                vec![
+                    Operand::IdRef(base),
+                    Operand::IdRef(stride_index),
+                    Operand::IdRef(element_index),
+                ],
+            )],
+        );
+
+        split_workgroup_ptr_access_chain_descent(&mut ctx, 0);
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(instructions[0].class.opcode, Op::PtrAccessChain);
+        assert_eq!(instructions[0].result_type, Some(ptr_array));
+        assert_eq!(instructions[0].operands.len(), 2);
+        let strided = instructions[0]
+            .result_id
+            .expect("strided aggregate pointer");
+        assert_eq!(instructions[1].class.opcode, Op::InBoundsAccessChain);
+        assert_eq!(instructions[1].result_type, Some(ptr_uint));
+        assert_eq!(instructions[1].result_id, Some(result));
+        assert_eq!(
+            instructions[1].operands,
+            vec![Operand::IdRef(strided), Operand::IdRef(element_index)]
+        );
+    }
+
+    #[test]
+    fn storage_buffer_strided_descent_keeps_combined_form() {
+        let mut ctx = Ctx::new(Module::new());
+        let float = ctx.ty_float();
+        let array = ctx.ty_runtime_array(float);
+        let ptr_array = ctx.ty_ptr(StorageClass::StorageBuffer, array);
+        let ptr_float = ctx.ty_ptr(StorageClass::StorageBuffer, float);
+        let base = storage_buffer_var(&mut ctx, ptr_array);
+        let stride_index = ctx.const_uint(2);
+        let element_index = ctx.const_uint(1);
+        let result = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![Instruction::new(
+                Op::PtrAccessChain,
+                Some(ptr_float),
+                Some(result),
+                vec![
+                    Operand::IdRef(base),
+                    Operand::IdRef(stride_index),
+                    Operand::IdRef(element_index),
+                ],
+            )],
+        );
+
+        split_workgroup_ptr_access_chain_descent(&mut ctx, 0);
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(instructions[0].class.opcode, Op::PtrAccessChain);
+        assert_eq!(instructions[0].result_id, Some(result));
+        assert_eq!(instructions[0].operands.len(), 3);
+    }
+
     // ---- rewrite_dynamic_struct_index_reinterpret ---------------------------------------------
 
     /// A single-member Block `{ RuntimeArray<uint> }` accessed by ONE dynamic index that yields a

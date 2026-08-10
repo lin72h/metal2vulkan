@@ -1755,11 +1755,42 @@ mod tests {
         ];
         let mut header_merges = HashMap::from([("%header".to_string(), "%pass".to_string())]);
 
-        repair_construct_tree_passthrough_selection_merges(&blocks, &mut header_merges);
+        repair_construct_tree_passthrough_selection_merges(
+            &blocks,
+            &HashMap::new(),
+            &mut header_merges,
+        );
 
         assert_eq!(
             header_merges.get("%header").map(String::as_str),
             Some("%join")
+        );
+    }
+
+    #[test]
+    fn construct_tree_does_not_promote_private_merge_onto_claimed_outer_merge() {
+        let blocks = vec![
+            bb("%outer", &["br i1 %a, label %inner, label %join"]),
+            bb("%inner", &["br i1 %b, label %pass, label %work"]),
+            bb("%work", &["br label %join"]),
+            bb_role("%pass", BlockRole::LMerge, &["br label %join"]),
+            bb("%join", &["ret void"]),
+        ];
+        let mut header_merges = HashMap::from([
+            ("%outer".to_string(), "%join".to_string()),
+            ("%inner".to_string(), "%pass".to_string()),
+        ]);
+
+        repair_construct_tree_passthrough_selection_merges(
+            &blocks,
+            &HashMap::new(),
+            &mut header_merges,
+        );
+
+        assert_eq!(
+            header_merges.get("%inner").map(String::as_str),
+            Some("%pass"),
+            "the outer selection already owns %join"
         );
     }
 

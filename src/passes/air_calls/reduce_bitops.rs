@@ -110,20 +110,85 @@ pub(in crate::passes) fn lower_simd_sum(
     let Some(elem_def) = type_def_of(ctx, elem_ty) else {
         return Err("simd sum element type is undefined".to_string());
     };
-    let op = match elem_def.class.opcode {
-        Op::TypeFloat => Op::GroupNonUniformFAdd,
-        Op::TypeInt => Op::GroupNonUniformIAdd,
+    let (op, subtract) = match elem_def.class.opcode {
+        Op::TypeFloat => (Op::GroupNonUniformFAdd, Op::FSub),
+        Op::TypeInt => (Op::GroupNonUniformIAdd, Op::ISub),
         _ => return Err("simd sum element type is not numeric".to_string()),
     };
     let scope = ctx.const_uint(Scope::Subgroup as u32);
     let cluster32 = ctx.simd_cluster32;
     let operands = group_reduce_operands(ctx, scope, operation, value, cluster32);
-    Ok(vec![Instruction::new(
+    if !cluster32
+        || !matches!(
+            operation,
+            GroupOperation::ExclusiveScan | GroupOperation::InclusiveScan
+        )
+    {
+        return Ok(vec![Instruction::new(
+            op,
+            Some(result_type),
+            Some(result),
+            operands,
+        )]);
+    }
+
+    // SPIR-V has ClusteredReduce but no clustered scan. Form the native subgroup scan, then
+    // subtract the prefix accumulated before this lane's 32-lane AIR simdgroup. For an inclusive
+    // scan, `scan - value` is the exclusive prefix whose value at the partition base is exactly
+    // the amount to remove from every lane in that partition.
+    let native = ctx.module.fresh_id();
+    let mut insts = vec![Instruction::new(
         op,
         Some(result_type),
-        Some(result),
+        Some(native),
         operands,
-    )])
+    )];
+    let exclusive = if operation == GroupOperation::InclusiveScan {
+        let exclusive = ctx.module.fresh_id();
+        insts.push(Instruction::new(
+            subtract,
+            Some(result_type),
+            Some(exclusive),
+            vec![Operand::IdRef(native), Operand::IdRef(value)],
+        ));
+        exclusive
+    } else {
+        native
+    };
+    let lane = subgroup_lane_index_u32(ctx, &mut insts);
+    let uint = ctx.ty_uint();
+    let local_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(local_lane),
+        vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(31))],
+    ));
+    let base_lane = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::ISub,
+        Some(uint),
+        Some(base_lane),
+        vec![Operand::IdRef(lane), Operand::IdRef(local_lane)],
+    ));
+    let partition_prefix = ctx.module.fresh_id();
+    insts.push(Instruction::new(
+        Op::GroupNonUniformShuffle,
+        Some(result_type),
+        Some(partition_prefix),
+        vec![
+            Operand::IdScope(scope),
+            Operand::IdRef(exclusive),
+            Operand::IdRef(base_lane),
+        ],
+    ));
+    insts.push(Instruction::new(
+        subtract,
+        Some(result_type),
+        Some(result),
+        vec![Operand::IdRef(native), Operand::IdRef(partition_prefix)],
+    ));
+    Ok(insts)
 }
 
 pub(in crate::passes) fn lower_simd_bitwise(

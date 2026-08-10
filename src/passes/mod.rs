@@ -869,6 +869,7 @@ use access::{
     rewrite_dynamic_struct_index_wide_word_reinterpret, rewrite_raw_byte_pointer_wide_loads,
     rewrite_reinterpret_scalar_loads, rewrite_scalar_pointer_arithmetic_access_chains,
     rewrite_scalar_slot_array_overindex, rewrite_strided_descent_access_chains,
+    split_workgroup_ptr_access_chain_descent,
 };
 use air_calls::lower_air_calls;
 use emitted_inline::{
@@ -1000,6 +1001,20 @@ pub(crate) fn repair_relooped_access_chains(
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     *module = ctx.module;
     Ok(())
+}
+
+/// Repair aggregate-stride Workgroup pointer chains after an external module rewrite (notably
+/// function-constant branch pruning) has changed the final pointer graph.
+pub(crate) fn repair_specialized_workgroup_ptr_access_chains(module: &mut Module) {
+    let owned = std::mem::replace(module, Module::new());
+    let mut ctx = Ctx::with_options_and_sidecar(
+        owned,
+        crate::emit_sidecar::EmitSidecar::default(),
+        Stage::Kernel,
+        TransformOptions::default(),
+    );
+    split_workgroup_ptr_access_chain_descent(&mut ctx, 0);
+    *module = ctx.module;
 }
 
 pub(crate) fn lower_scalar_i64_arithmetic_module(module: &mut Module) {
@@ -1580,9 +1595,13 @@ pub(crate) fn transform_with_options_and_sidecar(
     //     throws on them at pipeline creation. See `prune.rs`.
     prune_unreachable_blocks(&mut ctx.module);
 
+    resources::sink_loop_header_texture_array_loads(&mut ctx, entry_idx);
     // 3) finalize: append synthesized globals, drop dead air.* decls, add entry point + exec modes,
     //    bump the bound.
     finalize(&mut ctx, entry_idx, &stage)?;
+    // Run on the complete type graph: retained helper functions can carry a Workgroup aggregate
+    // stride that entry-focused lowering could not see until all synthesized globals were appended.
+    split_workgroup_ptr_access_chain_descent(&mut ctx, entry_idx);
 
     Ok((ctx.module, ctx.emit_sidecar))
 }

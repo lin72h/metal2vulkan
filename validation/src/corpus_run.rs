@@ -514,6 +514,9 @@ pub struct RunConfig {
     pub preflight_only: bool,
     /// Parent-only output containing hashes whose compile-only Metal preflight remained semantic.
     pub preflight_safe_list: Option<PathBuf>,
+    /// Ledger-only: demote Metal rows whose MoltenVK row records a non-comparable oracle or a
+    /// historic timeout. This never resolves sources or creates GPU work.
+    pub quarantine_invalid_oracles: bool,
     /// Explicitly allow selected historic `compare=none` rows to reach the current Metal oracle.
     /// Requires `--air-sha256` or `--air-list`; broad filters remain ledger-only quarantine.
     pub remint_compare_none: bool,
@@ -551,6 +554,7 @@ impl RunConfig {
             compile_missing: false,
             preflight_only: false,
             preflight_safe_list: None,
+            quarantine_invalid_oracles: false,
             remint_compare_none: false,
             only_air: None,
             only_air_list: None,
@@ -634,6 +638,7 @@ pub fn parse_run_args(backend: RunBackend) -> Option<RunConfig> {
             "--quiet" => cfg.quiet = true,
             "--compile-missing" => cfg.compile_missing = true,
             "--preflight-only" => cfg.preflight_only = true,
+            "--quarantine-invalid-oracles" => cfg.quarantine_invalid_oracles = true,
             "--preflight-safe-list" => {
                 cfg.preflight_safe_list =
                     Some(PathBuf::from(args.next().unwrap_or_else(|| {
@@ -744,6 +749,12 @@ pub fn parse_run_args(backend: RunBackend) -> Option<RunConfig> {
     if cfg.preflight_safe_list.is_some() && !cfg.preflight_only {
         fatal(program, "--preflight-safe-list requires --preflight-only");
     }
+    if cfg.quarantine_invalid_oracles && (backend != RunBackend::Metal || !cfg.force) {
+        fatal(
+            program,
+            "--quarantine-invalid-oracles requires corpus-run-metal --force",
+        );
+    }
     if cfg.remint_compare_none
         && (backend != RunBackend::Metal
             || (cfg.only_air.is_none() && cfg.only_air_list.is_none())
@@ -794,6 +805,9 @@ fn print_run_usage(program: &str) {
                            GPU work; does not modify the ledger\n\
          --preflight-safe-list FILE  write hashes whose preflight needs no semantic transform;\n\
                            requires --preflight-only\n\
+         --quarantine-invalid-oracles  Metal: ledger-only demotion where MoltenVK records a\n\
+                           non-comparable golden or historic timeout; requires --force and never\n\
+                           resolves sources or submits GPU work\n\
          --remint-compare-none  Metal: with --force and an explicit hash/list, allow historic\n\
                            compare=none rows through the current guarded oracle\n\
          --skip N         skip N eligible rows after filters and stable sorting, before --limit\n\
@@ -1384,7 +1398,7 @@ pub fn infer_plan(ll_or_meta_text: &str) -> HarnessPlan {
     };
 
     let (dispatch_grid, dispatch_tg) = dispatch_plan_for_output(ll_or_meta_text, &output);
-    resize_thread_indexed_input_buffers(ll_or_meta_text, dispatch_grid[0], &mut buffers);
+    resize_thread_indexed_buffers(ll_or_meta_text, dispatch_grid[0], &mut buffers);
     if stage == Stage::Kernel && output.kind == "buffer" {
         apply_output_stride_seed_values(ll_or_meta_text, output.index, &mut buffers);
     }
@@ -1403,31 +1417,46 @@ pub fn infer_plan(ll_or_meta_text: &str) -> HarnessPlan {
     }
 }
 
-fn resize_thread_indexed_input_buffers(ll: &str, grid_x: u32, buffers: &mut [PlanBuffer]) {
+fn resize_thread_indexed_buffers(ll: &str, grid_x: u32, buffers: &mut [PlanBuffer]) {
     let grid_x = u64::from(grid_x.max(1));
     for buffer in buffers {
-        if buffer.role != "Input" {
-            continue;
-        }
-        let Some(type_name) = buffer_type_name_for_location(ll, buffer.index) else {
-            continue;
-        };
-        let Some(required_len) = thread_indexed_input_required_len(ll, &type_name, grid_x) else {
+        let Some(required_len) = thread_indexed_buffer_required_len(ll, buffer.index, grid_x)
+        else {
             continue;
         };
         buffer.len = buffer.len.max(required_len);
     }
 }
 
-fn thread_indexed_input_required_len(ll: &str, type_name: &str, grid_x: u64) -> Option<usize> {
-    let (llvm_ty, elem_bytes) = llvm_thread_indexed_input_type_and_size(type_name)?;
-    if !module_has_dynamic_device_gep(ll, llvm_ty) {
-        return None;
+fn thread_indexed_buffer_required_len(ll: &str, location: u32, grid_x: u64) -> Option<usize> {
+    let metadata = buffer_metadata_line_for_location(ll, location)?;
+    let type_name = quoted_metadata_string_after(metadata, "air.arg_type_name")?;
+    let metadata_stride = extract_i32_after(metadata, "air.arg_type_size")
+        .and_then(|size| usize::try_from(size).ok());
+    let mut llvm_types = Vec::new();
+    if let Some((llvm_ty, elem_bytes)) = llvm_thread_indexed_input_type_and_size(&type_name) {
+        // Primitive/vector AIR pointer metadata may report the scalar pointee size (for example,
+        // float3 with arg_type_size=4). The stable AIR type spelling is authoritative there.
+        llvm_types.push((llvm_ty.to_string(), Some(elem_bytes)));
     }
-    let required_elems =
-        dynamic_device_gep_required_elements(ll, llvm_ty, grid_x).unwrap_or(grid_x);
-    let required_bytes = required_elems.saturating_mul(elem_bytes as u64);
-    usize::try_from(required_bytes).ok()
+    llvm_types.extend(
+        llvm_named_types_for_air_type(ll, &type_name)
+            .into_iter()
+            .map(|llvm_ty| (llvm_ty, metadata_stride)),
+    );
+
+    let mut required_bytes = None;
+    for (llvm_ty, elem_bytes) in llvm_types {
+        if !module_has_dynamic_device_gep(ll, &llvm_ty) {
+            continue;
+        }
+        let elem_bytes = elem_bytes.or_else(|| llvm_type_byte_width(&llvm_ty))?;
+        let required_elems =
+            dynamic_device_gep_required_elements(ll, &llvm_ty, grid_x).unwrap_or(grid_x);
+        let bytes = required_elems.saturating_mul(elem_bytes as u64);
+        required_bytes = Some(required_bytes.unwrap_or(0).max(bytes));
+    }
+    usize::try_from(required_bytes?).ok()
 }
 
 fn apply_output_stride_seed_values(ll: &str, output_index: u32, buffers: &mut [PlanBuffer]) {
@@ -4451,9 +4480,40 @@ const POST_TESSELLATION_VERTEX_ORACLE_REASON: &str =
      tessellation pipeline with a control-point producer; the standalone validation vertex harness \
      cannot construct a defined oracle for this ABI";
 
+const VISIBLE_FUNCTION_REFERENCE_ORACLE_REASON: &str =
+    "entry consumes AIR visible-function references that require separately loaded function-table \
+     implementations; the standalone validation harness cannot construct a defined oracle";
+
+const IMPLICIT_IMAGEBLOCK_ORACLE_REASON: &str =
+    "entry uses the AIR implicit-imageblock tile ABI, which requires a tile/render pipeline and \
+     defined tile memory; the standalone validation harness cannot construct a semantic oracle";
+
+const RAYTRACING_PIPELINE_ORACLE_REASON: &str =
+    "entry uses AIR acceleration-structure intersection operations that require a populated \
+     raytracing pipeline and intersection-function resources; the standalone validation harness \
+     cannot construct a defined oracle";
+
+const EXTERNAL_METAL_RUNTIME_HELPER_ORACLE_REASON: &str =
+    "entry depends on an externally defined Metal runtime helper that is not present in the \
+     extracted AIR module; the standalone validation harness cannot link a defined oracle";
+
 fn invalid_standalone_metal_oracle_reason(ll: &str) -> Option<&'static str> {
-    ll.contains(r#"!"air.patch_control_point_input""#)
-        .then_some(POST_TESSELLATION_VERTEX_ORACLE_REASON)
+    if ll.contains("air.patch_control_point_input") {
+        Some(POST_TESSELLATION_VERTEX_ORACLE_REASON)
+    } else if ll.contains("air.visible_function_reference") {
+        Some(VISIBLE_FUNCTION_REFERENCE_ORACLE_REASON)
+    } else if ll.contains("air.load.implicit_imageblock")
+        || ll.contains("air.store.implicit_imageblock")
+        || ll.contains("air.get_imageblock_width")
+    {
+        Some(IMPLICIT_IMAGEBLOCK_ORACLE_REASON)
+    } else if ll.contains("@air.intersect.") {
+        Some(RAYTRACING_PIPELINE_ORACLE_REASON)
+    } else if ll.contains("@mtl.force_not_checked.") {
+        Some(EXTERNAL_METAL_RUNTIME_HELPER_ORACLE_REASON)
+    } else {
+        None
+    }
 }
 
 fn unsafe_metal_submission_reason(ll: &str) -> Option<&'static str> {
@@ -5104,22 +5164,42 @@ fn zero_function_constant_feeds_integer_divisor(ll: &str) -> bool {
 }
 
 fn function_constant_values_for_integer_divisors(ll: &str) -> Vec<(usize, u64)> {
-    if !zero_function_constant_feeds_integer_divisor(ll)
-        || ll.contains("@air.is_function_constant_defined")
-    {
+    if !zero_function_constant_feeds_integer_divisor(ll) {
         return Vec::new();
     }
-    declared_function_constant_indices(ll)
+    let required_only = ll.contains("@air.is_function_constant_defined");
+    declared_function_constants(ll)
         .into_iter()
-        .filter(|(ty, _)| is_integer_function_constant_type(ty))
-        .map(|(_, index)| (index, 1))
+        .filter(|fc| is_integer_function_constant_type(&fc.ty))
+        // Defining an optional FC would change `is_function_constant_defined`. Required FCs are
+        // already defined by the oracle contract, so making their divisor value nonzero is safe.
+        .filter(|fc| !required_only || fc.required)
+        .map(|fc| (fc.index, 1))
         .collect()
 }
 
 fn function_constant_values_for_oracle_inputs(ll: &str) -> Vec<(usize, u64)> {
-    let mut values = function_constant_values_for_barrier_loop_progress(ll);
+    // AIR's final function-constant metadata bit marks constants that Metal requires callers to
+    // provide. Define those at the translator's zero value while leaving optional constants
+    // undefined; defining every optional FC can activate mutually-exclusive interface members.
+    let mut values = declared_function_constants(ll)
+        .into_iter()
+        .filter(|fc| fc.required)
+        .map(|fc| (fc.index, 0))
+        .collect::<Vec<_>>();
+    for value in function_constant_values_for_barrier_loop_progress(ll) {
+        if let Some(existing) = values.iter_mut().find(|(index, _)| *index == value.0) {
+            *existing = value;
+        } else {
+            values.push(value);
+        }
+    }
     for value in function_constant_values_for_integer_divisors(ll) {
-        if !values.iter().any(|(index, _)| *index == value.0) {
+        if let Some(existing) = values.iter_mut().find(|(index, _)| *index == value.0) {
+            if existing.1 == 0 {
+                *existing = value;
+            }
+        } else {
             values.push(value);
         }
     }
@@ -5155,6 +5235,7 @@ struct DeclaredFunctionConstant {
     ty: String,
     index: usize,
     global: String,
+    required: bool,
 }
 
 fn declared_function_constant_indices(ll: &str) -> Vec<(String, usize)> {
@@ -5203,10 +5284,14 @@ fn declared_function_constants(ll: &str) -> Vec<DeclaredFunctionConstant> {
         let Some(global) = global_name_after(node, "ptr addrspace(") else {
             continue;
         };
+        let required = node
+            .rsplit_once("i1 ")
+            .is_some_and(|(_, tail)| tail.trim_start().starts_with("true"));
         out.push(DeclaredFunctionConstant {
             ty: ty.to_string(),
             index,
             global,
+            required,
         });
     }
     out
@@ -5757,6 +5842,62 @@ impl OwnedLoopInputFacts {
             imageblock_extent: self.imageblock_extent,
         }
     }
+}
+
+fn semantic_metal_submission_rejection_reason(
+    ll: &str,
+    entry: &str,
+    plan: &HarnessPlan,
+    facts: &OwnedLoopInputFacts,
+) -> Option<String> {
+    match crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
+        ll,
+        entry,
+        facts.as_loop_input_facts(),
+    ) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(reason) => return Some(format!("source CFG analysis refused: {reason}")),
+    }
+
+    let per_invocation =
+        match crate::loop_budget::semantic_oracle_work_upper_bound_with_loop_input_facts(
+            ll,
+            entry,
+            facts.as_loop_input_facts(),
+        ) {
+            Ok(Some(bound)) => bound,
+            Ok(None) => {
+                return Some(
+                    "reachable CFG cycle lacks a quantitative aggregate GPU-work bound; semantic \
+                 Metal submission refused"
+                        .into(),
+                );
+            }
+            Err(reason) => return Some(format!("source CFG work analysis refused: {reason}")),
+        };
+    let invocations = plan
+        .dispatch_grid
+        .iter()
+        .copied()
+        .map(u128::from)
+        .product::<u128>()
+        .max(1);
+    let Some(total) = per_invocation.checked_mul(invocations) else {
+        return Some(
+            "reachable CFG cycle aggregate GPU-work bound overflowed; semantic Metal submission \
+             refused"
+                .into(),
+        );
+    };
+    if total > crate::loop_budget::SEMANTIC_ORACLE_MAX_SOURCE_INSTRUCTION_VISITS {
+        return Some(format!(
+            "reachable CFG cycle aggregate GPU-work bound {total} exceeds semantic-oracle ceiling \
+             {}; semantic Metal submission refused",
+            crate::loop_budget::SEMANTIC_ORACLE_MAX_SOURCE_INSTRUCTION_VISITS
+        ));
+    }
+    None
 }
 
 fn loop_input_facts_for_metal_plan(ll: &str, entry: &str, metal: &MetalRow) -> OwnedLoopInputFacts {
@@ -6703,7 +6844,7 @@ fn requires_serial_dynamic_buffer_scatter_plan(ll: &str, plan: &HarnessPlan) -> 
     else {
         return false;
     };
-    let atomic_scatter = output.role == "InOut"
+    let atomic_scatter = matches!(output.role.as_str(), "Output" | "InOut")
         && ll.contains("@air.atomic.global.")
         && declares_data_dependent_non_atomic_store_to_buffer(ll, plan.output.index);
     let packed_loop_scatter = matches!(output.role.as_str(), "Output" | "InOut")
@@ -7294,7 +7435,11 @@ fn declares_fragment_point_coord(ll: &str) -> bool {
 }
 
 fn incompatible_undefined_texture_write_lanes_golden(ll: &str, metal: &MetalRow) -> Option<String> {
-    if metal.plan.output.kind != "texture" || !metal.plan.output.format.starts_with("Rgba") {
+    undefined_texture_write_lanes_reason(ll, &metal.plan)
+}
+
+fn undefined_texture_write_lanes_reason(ll: &str, plan: &HarnessPlan) -> Option<String> {
+    if plan.output.kind != "texture" || !plan.output.format.starts_with("Rgba") {
         return None;
     }
     let undef_texels = undef_lane_texture_write_values(ll);
@@ -8393,13 +8538,38 @@ fn is_scalar_integer_type(ty: &str) -> bool {
 }
 
 fn buffer_type_name_for_location(ll: &str, location: u32) -> Option<String> {
-    ll.lines().find_map(|line| {
+    buffer_metadata_line_for_location(ll, location)
+        .and_then(|line| quoted_metadata_string_after(line, "air.arg_type_name"))
+}
+
+fn buffer_metadata_line_for_location(ll: &str, location: u32) -> Option<&str> {
+    let locations = stage_resource_locations(ll);
+    ll.lines().find(|line| {
         if !line.contains(r#""air.buffer""#) || !line.contains(r#""air.location_index""#) {
-            return None;
+            return false;
         }
-        let loc = extract_i32_after(line, "air.location_index")?;
-        (loc as u32 == location).then(|| quoted_metadata_string_after(line, "air.arg_type_name"))?
+        let resolved = metadata_param_index(line)
+            .and_then(|index| locations.buffers.get(&index).copied())
+            .or_else(|| extract_i32_after(line, "air.location_index").map(|value| value as u32));
+        resolved == Some(location)
     })
+}
+
+fn llvm_named_types_for_air_type(ll: &str, air_type_name: &str) -> Vec<String> {
+    let air_type_name = air_type_name.trim().trim_end_matches('*').trim();
+    ll.lines()
+        .filter_map(|line| {
+            let (name, rhs) = line.trim().split_once(" = type ")?;
+            if !name.starts_with('%') || rhs.is_empty() {
+                return None;
+            }
+            let bare = name
+                .strip_prefix("%struct.")
+                .or_else(|| name.strip_prefix("%class."))
+                .or_else(|| name.strip_prefix('%'))?;
+            (bare == air_type_name).then(|| name.to_string())
+        })
+        .collect()
 }
 
 fn llvm_thread_indexed_input_type_and_size(type_name: &str) -> Option<(&'static str, usize)> {
@@ -9213,9 +9383,6 @@ fn incompatible_sampled_half_domain_sensitive_texture_golden(
     {
         return None;
     }
-    if metal_output_has_numeric_tolerance(ll, metal) {
-        return None;
-    }
     Some(
         "metal golden samples synthetic finite f16 texture data through AIR fast/no-nans \
          domain-sensitive math before float texture output; Metal/Vulkan texture sampling, \
@@ -9352,6 +9519,51 @@ fn incompatible_uninitialized_half_imageblock_texture_golden(
     )
 }
 
+fn invalid_synthetic_oracle_plan_reason(ll: &str, plan: &HarnessPlan) -> Option<&'static str> {
+    if plan.output.kind == "texture"
+        && sampled_finite_half_texture(ll)
+        && ll.contains("@air.imageblock_data")
+        && ll.contains("store half ")
+        && ll.contains("@air.write_imageblock_slice_to_texture_2d.i16.f16")
+    {
+        return Some(
+            "scalar f16 AIR imageblock slice output is seeded from sampled half data; the current \
+             validation imageblock model does not provide a portable Metal/Vulkan scalar-slice \
+             layout oracle",
+        );
+    }
+    if plan.output.kind == "texture"
+        && sampled_finite_half_texture(ll)
+        && ll_has_fast_no_nans_float_semantics(ll)
+        && ll.contains("@air.gather_texture_2d.v4f16")
+        && ll.contains("@air.dot.v4f16")
+        && ll.contains("@air.pow.f16")
+    {
+        return Some(
+            "synthetic signed f16 texture data can feed a negative gather/dot result into AIR pow \
+             under fast/no-nans math; negative-base pow is not a defined Metal/Vulkan oracle",
+        );
+    }
+    let has_unspecified_bounded_field = plan.buffers.iter().any(|buffer| {
+        buffer.seed_mode == SEED_MODE_BOUNDED_CONTROL
+            && buffer.seed_layout.iter().any(|field| field.value.is_none())
+    });
+    if plan.output.kind == "render_target"
+        && ll.contains("!air.fragment")
+        && ll.contains("switch i")
+        && ll
+            .lines()
+            .any(|line| line.contains(" = phi ") && line.contains("undef"))
+        && has_unspecified_bounded_field
+    {
+        return Some(
+            "bounded-control fragment switch retains an unspecified selector while a default path \
+             feeds undef into a render-target phi; the banked output is not a defined oracle",
+        );
+    }
+    None
+}
+
 fn incompatible_sampled_f32_imageblock_texture_golden(
     ll: &str,
     metal: &MetalRow,
@@ -9471,7 +9683,7 @@ fn incompatible_sampled_fast_pow_texture_golden(ll: &str, metal: &MetalRow) -> O
     if !has_signed_sampled_f32_texture {
         return None;
     }
-    if metal_output_has_numeric_tolerance(ll, metal) {
+    if ll.contains("@air.fast_powr.") && ll.contains("@air.fast_fabs.") {
         return None;
     }
     Some(
@@ -9520,9 +9732,6 @@ fn incompatible_sampled_f32_domain_math_texture_golden(
         || !sampled_finite_f32_texture(ll)
         || !float_texture_or_render_target_output(ll, metal)
     {
-        return None;
-    }
-    if metal_output_has_numeric_tolerance(ll, metal) {
         return None;
     }
     Some(
@@ -11055,6 +11264,52 @@ pub fn run_driver(cfg: &RunConfig) -> i32 {
         return 0;
     }
 
+    // A MoltenVK `missing` or historic `timeout` row means the banked Metal bytes cannot serve as
+    // this project's cross-backend semantic oracle: the plan is stale, behavior is undefined, the
+    // shape is not portable, or candidate execution has already hung. Reconcile that state without
+    // touching Apple tools or a GPU. Targeted preflight/remint can promote a row again later.
+    if cfg.quarantine_invalid_oracles {
+        let candidate_rows =
+            load_candidate_rows(&cfg.corpus_dir.join(RunBackend::MoltenVk.ledger_file_name()));
+        let delta_ledger = run_delta_path(cfg);
+        let _ = fs::remove_file(&delta_ledger);
+        let mut quarantined = 0usize;
+        for row in &todo {
+            let Some(metal) = metal_rows.get(&row.air_sha256) else {
+                continue;
+            };
+            let Some(candidate) = candidate_rows.get(&row.air_sha256) else {
+                continue;
+            };
+            if metal.status != "ok" || !matches!(candidate.status.as_str(), "missing" | "timeout") {
+                continue;
+            }
+            let reason = candidate
+                .error
+                .as_deref()
+                .unwrap_or("MoltenVK row is not comparable to the banked Metal golden");
+            let quarantine = invalid_cross_backend_metal_oracle_row(metal, reason);
+            if let Err(error) = append_jsonl_delta_row(&delta_ledger, &quarantine) {
+                eprintln!("# RESULT: failed to write invalid-oracle quarantine: {error}");
+                return 1;
+            }
+            quarantined += 1;
+        }
+        let merged = match merge_delta_into_ledger(&cfg.tech_ledger, &delta_ledger) {
+            Ok(merged) => merged,
+            Err(error) => {
+                eprintln!("# RESULT: failed to merge invalid-oracle quarantine: {error}");
+                return 1;
+            }
+        };
+        let _ = fs::remove_file(&delta_ledger);
+        eprintln!(
+            "# RESULT: ledger-only quarantined={quarantined} merged_delta={merged} → {}",
+            cfg.tech_ledger.display()
+        );
+        return 0;
+    }
+
     // Oneshot worker: run in-process (parent applies the wall timeout around this process).
     if cfg.oneshot {
         install_oneshot_parent_watchdog();
@@ -11304,6 +11559,9 @@ fn source_may_have_semantic_metal_preflight(
         return false;
     };
     let ll = metal2vulkan::tools::sanitize_ll_text_with_datalayout(&source.air_ll).0;
+    if !crate::loop_budget::semantic_oracle_cfg_is_within_analysis_limit(&ll) {
+        return false;
+    }
     let Some(entry) = entry_name_from_ll(&ll) else {
         return false;
     };
@@ -11313,15 +11571,11 @@ fn source_may_have_semantic_metal_preflight(
         return false;
     }
     let (plan, fc_values) = metal_oracle_inputs(&ll, metal_rows.get(&row.air_sha256));
+    if invalid_synthetic_oracle_plan_reason(&ll, &plan).is_some() {
+        return false;
+    }
     let facts = loop_input_facts_for_plan(&ll, &entry, &plan, fc_values);
-    matches!(
-        crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
-            &ll,
-            &entry,
-            facts.as_loop_input_facts(),
-        ),
-        Ok(false)
-    )
+    semantic_metal_submission_rejection_reason(&ll, &entry, &plan, &facts).is_none()
 }
 
 fn run_delta_path(cfg: &RunConfig) -> PathBuf {
@@ -12066,7 +12320,40 @@ fn process_one(
                 return ProcessOutcome::Skip;
             }
         }
+        if !crate::loop_budget::semantic_oracle_cfg_is_within_analysis_limit(&ll) {
+            let reason = format!(
+                "source CFG exceeds semantic-oracle analysis ceiling of {} branch terminators",
+                crate::loop_budget::SEMANTIC_ORACLE_MAX_CFG_BRANCHES
+            );
+            if cfg.preflight_only {
+                eprintln!("    preflight refused before plan inference: {reason}");
+                return ProcessOutcome::Skip;
+            } else {
+                let plan = metal_rows
+                    .get(&tr.air_sha256)
+                    .map(|row| row.plan.clone())
+                    .unwrap_or_else(|| infer_plan(""));
+                write_quarantine_row(cfg, tr, &src, &plan, stage, &entry, &reason);
+                return ProcessOutcome::Fail;
+            }
+        }
         let (plan, fc_values) = metal_oracle_inputs(&ll, metal_rows.get(&tr.air_sha256));
+        if let Some(reason) = undefined_texture_write_lanes_reason(&ll, &plan) {
+            if cfg.preflight_only {
+                eprintln!("    preflight refused before Metal PSO creation: {reason}");
+                return ProcessOutcome::Skip;
+            }
+            write_quarantine_row(cfg, tr, &src, &plan, stage, &entry, &reason);
+            return ProcessOutcome::Fail;
+        }
+        if let Some(reason) = invalid_synthetic_oracle_plan_reason(&ll, &plan) {
+            if cfg.preflight_only {
+                eprintln!("    preflight refused before Metal PSO creation: {reason}");
+            } else {
+                write_quarantine_row(cfg, tr, &src, &plan, stage, &entry, reason);
+            }
+            return ProcessOutcome::Fail;
+        }
         if let Some(reason) = invalid_standalone_metal_oracle_reason(&ll) {
             if cfg.preflight_only {
                 eprintln!("    preflight refused before Metal PSO creation: {reason}");
@@ -12083,27 +12370,15 @@ fn process_one(
             }
             return ProcessOutcome::Fail;
         }
-        if cfg.preflight_only {
-            let facts = loop_input_facts_for_plan(&ll, &entry, &plan, fc_values.clone());
-            match crate::loop_budget::reachable_module_has_cfg_cycle_with_loop_input_facts(
-                &ll,
-                &entry,
-                facts.as_loop_input_facts(),
-            ) {
-                Ok(true) => {
-                    eprintln!(
-                        "    preflight skipped before Apple tools: source has a reachable CFG cycle"
-                    );
-                    return ProcessOutcome::Skip;
-                }
-                Err(reason) => {
-                    eprintln!(
-                        "    preflight skipped before Apple tools: source CFG analysis refused: {reason}"
-                    );
-                    return ProcessOutcome::Skip;
-                }
-                Ok(false) => {}
+        let facts = loop_input_facts_for_plan(&ll, &entry, &plan, fc_values.clone());
+        if let Some(reason) = semantic_metal_submission_rejection_reason(&ll, &entry, &plan, &facts)
+        {
+            if cfg.preflight_only {
+                eprintln!("    preflight skipped before Apple tools: {reason}");
+                return ProcessOutcome::Skip;
             }
+            write_quarantine_row(cfg, tr, &src, &plan, stage, &entry, &reason);
+            return ProcessOutcome::Fail;
         }
         return run_metal(cfg, tr, &src, &ll, stage, &entry, &plan, &fc_values);
     }
@@ -12175,6 +12450,13 @@ fn process_one(
         );
     }
     if let Some(reason) = invalid_standalone_metal_oracle_reason(&ll) {
+        write_missing_candidate_and_skip!(
+            metal,
+            metal.output_sha256.clone(),
+            format!("metal golden is not a defined oracle: {reason}")
+        );
+    }
+    if let Some(reason) = invalid_synthetic_oracle_plan_reason(&ll, &metal.plan) {
         write_missing_candidate_and_skip!(
             metal,
             metal.output_sha256.clone(),
@@ -12429,6 +12711,18 @@ fn historic_compare_none_quarantine_row(metal: &MetalRow) -> MetalRow {
          targeted remint required"
             .into(),
     );
+    row
+}
+
+fn invalid_cross_backend_metal_oracle_row(metal: &MetalRow, reason: &str) -> MetalRow {
+    let mut row = metal.clone();
+    row.status = "quarantine".into();
+    row.compare = "none".into();
+    row.output_sha256 = None;
+    row.output_b64 = None;
+    row.error = Some(format!(
+        "quarantined: banked Metal output is not a valid Metal/MoltenVK semantic oracle: {reason}"
+    ));
     row
 }
 
@@ -16072,6 +16366,41 @@ entry:
     }
 
     #[test]
+    fn thread_indexed_struct_output_is_sized_to_dispatch_grid() {
+        let ll = r#"
+%struct.Result = type { [3 x float], float, [3 x float], float }
+
+define void @write_result(ptr addrspace(1) writeonly %out, i32 %tid) {
+entry:
+  %idx = zext i32 %tid to i64
+  %result = getelementptr inbounds %struct.Result, ptr addrspace(1) %out, i64 %idx
+  %field = getelementptr inbounds %struct.Result, ptr addrspace(1) %result, i64 0, i32 1
+  store float 1.0, ptr addrspace(1) %field, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @write_result, !1, !2}
+!1 = !{}
+!2 = !{!3, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 32, !"air.arg_type_name", !"Result", !"air.arg_name", !"out"}
+!4 = !{i32 0, i32 12, i32 0, !"float3", !"a", i32 12, i32 4, i32 0, !"float", !"b", i32 16, i32 12, i32 0, !"float3", !"c", i32 28, i32 4, i32 0, !"float", !"d"}
+!5 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+        let plan = infer_plan(ll);
+        let output = plan
+            .buffers
+            .iter()
+            .find(|buffer| buffer.index == 2)
+            .expect("result buffer");
+
+        assert_eq!(plan.dispatch_grid, [DEFAULT_DISPATCH_GRID_X as u32, 1, 1]);
+        assert_eq!(output.role, "Output");
+        assert_eq!(output.len, DEFAULT_DISPATCH_GRID_X * 32);
+        assert_eq!(plan.output.len, Some(DEFAULT_DISPATCH_GRID_X * 32));
+    }
+
+    #[test]
     fn banked_function_constants_do_not_freeze_stale_metal_plan() {
         let ll = r#"
 define void @copy(ptr addrspace(1) %src, ptr addrspace(1) %dst, i32 %tid) {
@@ -16569,6 +16898,11 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1) captures(none), i32, i
         plan.output.format = "RawBytes".into();
         plan.output.len = Some(256);
         plan.dispatch_grid = [64, 1, 1];
+        plan.buffers
+            .iter_mut()
+            .find(|buffer| buffer.index == 0)
+            .expect("scatter output buffer")
+            .role = "Output".into();
         let metal = MetalRow {
             air_sha256: "x".into(),
             shard: None,
@@ -17354,6 +17688,18 @@ declare void @air.wg.barrier(i32, i32)
             .error
             .as_deref()
             .is_some_and(|error| error.contains("not a semantic Metal oracle")));
+        let quarantine = invalid_cross_backend_metal_oracle_row(
+            &metal,
+            "metal golden uses a stale candidate plan; rebank Metal row",
+        );
+        assert_eq!(quarantine.status, "quarantine");
+        assert_eq!(quarantine.compare, "none");
+        assert!(quarantine.output_sha256.is_none());
+        assert!(quarantine.output_b64.is_none());
+        assert!(quarantine
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("stale candidate plan")));
         metal.compare = "full".into();
         assert_eq!(
             loop_budget_for_metal_row(&metal),
@@ -19184,7 +19530,21 @@ declare void @air.wg.barrier(i32, i32)
     }
 
     #[test]
-    fn definedness_function_constants_do_not_request_nonzero_values() {
+    fn oracle_inputs_define_required_function_constants_only() {
+        let ll = r#"
+@required.MTL_FC_INIT_7_j = internal addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+@optional.MTL_FC_INIT_11_j = internal addrspace(2) externally_initialized constant i32 undef, section "air.fc_initializer", align 4
+
+!air.function_constants = !{!0, !1}
+!0 = !{ptr addrspace(2) @required.MTL_FC_INIT_7_j, !"uint", !"required", i32 7, i1 true}
+!1 = !{ptr addrspace(2) @optional.MTL_FC_INIT_11_j, !"uint", !"optional", i32 11, i1 false}
+"#;
+
+        assert_eq!(function_constant_values_for_oracle_inputs(ll), vec![(7, 0)]);
+    }
+
+    #[test]
+    fn required_definedness_function_constant_divisor_is_nonzero() {
         let ll = r#"
 @_ZL2fc = internal unnamed_addr addrspace(2) global i16 zeroinitializer, align 2
 @_Z2fc.MTL_FC_INIT_4_t = internal unnamed_addr addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
@@ -19207,7 +19567,11 @@ declare i1 @air.is_function_constant_defined(ptr addrspace(2))
 !air.function_constants = !{!0}
 !0 = !{ptr addrspace(2) @_Z2fc.MTL_FC_INIT_4_t, !"ushort", !"fc", i32 4, i1 true}
 "#;
-        assert!(function_constant_values_for_integer_divisors(ll).is_empty());
+        assert_eq!(
+            function_constant_values_for_integer_divisors(ll),
+            vec![(4, 1)]
+        );
+        assert_eq!(function_constant_values_for_oracle_inputs(ll), vec![(4, 1)]);
         assert!(function_constant_values_for_barrier_loop_progress(ll).is_empty());
     }
 
@@ -19866,7 +20230,7 @@ attributes #0 = { "no-nans-fp-math"="true" }
     }
 
     #[test]
-    fn sampled_fast_pow_f32_texture_uses_numeric_tolerance() {
+    fn sampled_fast_pow_f32_texture_with_unbounded_domain_is_missing() {
         let ll = r#"
 define <4 x half> @frag(ptr addrspace(1) %tex) #0 {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -19893,11 +20257,13 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        assert!(incompatible_sampled_fast_pow_texture_golden(ll, &metal).is_none());
+        let reason = incompatible_sampled_fast_pow_texture_golden(ll, &metal)
+            .expect("unbounded signed fast-pow input");
+        assert!(reason.contains("fast_pow"), "{reason}");
     }
 
     #[test]
-    fn sampled_f32_domain_math_texture_uses_numeric_tolerance() {
+    fn sampled_f32_domain_math_texture_with_unbounded_domain_is_missing() {
         let ll = r#"
 define float @frag(ptr addrspace(1) %tex, <2 x float> %uv) #0 {
   %s = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) null, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -19923,7 +20289,9 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Fragment"));
-        assert!(incompatible_sampled_f32_domain_math_texture_golden(ll, &metal).is_none());
+        let reason = incompatible_sampled_f32_domain_math_texture_golden(ll, &metal)
+            .expect("unbounded sampled domain math");
+        assert!(reason.contains("domain-sensitive"), "{reason}");
     }
 
     #[test]
@@ -21035,7 +21403,7 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
     }
 
     #[test]
-    fn sampled_half_domain_sensitive_texture_uses_numeric_tolerance() {
+    fn sampled_half_domain_sensitive_texture_with_unbounded_domain_is_missing() {
         let ll = r#"
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -21072,7 +21440,9 @@ attributes #0 = { "no-nans-fp-math"="true" "unsafe-fp-math"="true" }
 "#;
 
         let metal = metal_row_for_compare(&[], infer_plan(ll), Some("Kernel"));
-        assert!(incompatible_sampled_half_domain_sensitive_texture_golden(ll, &metal).is_none());
+        let reason = incompatible_sampled_half_domain_sensitive_texture_golden(ll, &metal)
+            .expect("unbounded sampled half domain math");
+        assert!(reason.contains("domain-sensitive"), "{reason}");
     }
 
     #[test]
@@ -22461,6 +22831,65 @@ define void @"persona::ksDepthDilate"(ptr addrspace(2) %0) {
     }
 
     #[test]
+    fn visible_function_reference_is_refused_before_standalone_metal_preflight() {
+        let ll = r#"
+declare float @callable.MTL_VISIBLE_FN_REF(float) section "air.externally_defined"
+!0 = !{!"air.visible_function_reference", ptr @callable.MTL_VISIBLE_FN_REF, !"callable"}
+"#;
+        assert_eq!(
+            invalid_standalone_metal_oracle_reason(ll),
+            Some(VISIBLE_FUNCTION_REFERENCE_ORACLE_REASON)
+        );
+    }
+
+    #[test]
+    fn implicit_imageblock_tile_abi_is_refused_before_standalone_metal_preflight() {
+        for symbol in [
+            "air.load.implicit_imageblock.v4f16",
+            "air.store.implicit_imageblock.v4f16",
+            "air.get_imageblock_width",
+        ] {
+            assert_eq!(
+                invalid_standalone_metal_oracle_reason(symbol),
+                Some(IMPLICIT_IMAGEBLOCK_ORACLE_REASON)
+            );
+        }
+    }
+
+    #[test]
+    fn external_raytracing_dependencies_are_refused_before_standalone_metal_preflight() {
+        assert_eq!(
+            invalid_standalone_metal_oracle_reason(
+                "call void @air.intersect.intersection_function_buffer()"
+            ),
+            Some(RAYTRACING_PIPELINE_ORACLE_REASON)
+        );
+        assert_eq!(
+            invalid_standalone_metal_oracle_reason(
+                "declare extern_weak i64 @mtl.force_not_checked.load.i64.p1(ptr)"
+            ),
+            Some(EXTERNAL_METAL_RUNTIME_HELPER_ORACLE_REASON)
+        );
+    }
+
+    #[test]
+    fn unproven_cfg_cycle_is_refused_before_metal_submission() {
+        let ll = "\
+define void @spin(ptr addrspace(1) %0) {
+entry:
+  br label %loop
+loop:
+  br label %loop
+}
+";
+        let plan = infer_plan(ll);
+        let facts = loop_input_facts_for_plan(ll, "spin", &plan, Vec::new());
+        let reason = semantic_metal_submission_rejection_reason(ll, "spin", &plan, &facts)
+            .expect("unproven cycle must be rejected");
+        assert!(reason.contains("lacks a quantitative aggregate GPU-work bound"));
+    }
+
+    #[test]
     fn unsafe_submission_classification_uses_resource_and_control_structure() {
         let barrier = r#"
 @packed.MTL_FC_INIT_1_j = externally_initialized constant i32 undef, section "air.fc_initializer"
@@ -22689,6 +23118,78 @@ define <{ <4 x float> }> @frag() {
         assert_eq!(plan.output.format, "Rgba32Float");
         assert_eq!(plan.output.w, Some(DEFAULT_TEXTURE_EXTENT.width));
         assert_eq!(plan.output.h, Some(DEFAULT_TEXTURE_EXTENT.height));
+    }
+
+    #[test]
+    fn undefined_synthetic_texture_and_fragment_plans_are_rejected_before_gpu_submission() {
+        let scalar_imageblock = r#"
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst) #0 {
+  %sample = call { <4 x half>, i8 } @air.sample_texture_2d.v4f16(ptr addrspace(1) %src)
+  %p = call ptr addrspace(4) @air.imageblock_data()
+  store half 0xH3C00, ptr addrspace(4) %p
+  call void @air.write_imageblock_slice_to_texture_2d.i16.f16(ptr addrspace(1) %dst)
+  ret void
+}
+attributes #0 = { "no-nans-fp-math"="true" }
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>"}
+"#;
+        let plan = infer_plan(scalar_imageblock);
+        assert!(
+            invalid_synthetic_oracle_plan_reason(scalar_imageblock, &plan)
+                .is_some_and(|reason| reason.contains("scalar-slice"))
+        );
+
+        let gather_pow = scalar_imageblock
+            .replace(
+                "@air.sample_texture_2d.v4f16",
+                "@air.gather_texture_2d.v4f16",
+            )
+            .replace("@air.imageblock_data()", "@air.dot.v4f16()")
+            .replace(
+                "store half 0xH3C00, ptr addrspace(4) %p",
+                "%pow = call half @air.pow.f16()",
+            )
+            .replace(
+                "@air.write_imageblock_slice_to_texture_2d.i16.f16",
+                "@air.write_texture_2d.i16.v4f16",
+            );
+        assert!(
+            invalid_synthetic_oracle_plan_reason(&gather_pow, &infer_plan(&gather_pow))
+                .is_some_and(|reason| reason.contains("negative-base pow"))
+        );
+
+        let fragment_switch = r#"
+define <4 x half> @frag(ptr addrspace(2) %params) {
+  switch i32 %selector, label %default [ i32 0, label %valid ]
+valid:
+  br label %merge
+default:
+  br label %merge
+merge:
+  %color = phi <4 x half> [ zeroinitializer, %valid ], [ undef, %default ]
+  ret <4 x half> %color
+}
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"int"}
+"#;
+        let mut plan = infer_plan(fragment_switch);
+        plan.buffers[0].seed_mode = SEED_MODE_BOUNDED_CONTROL.into();
+        plan.buffers[0].seed_layout = vec![ControlSeedField {
+            offset: 0,
+            size: 4,
+            value: None,
+        }];
+        assert!(invalid_synthetic_oracle_plan_reason(fragment_switch, &plan)
+            .is_some_and(|reason| reason.contains("feeds undef")));
     }
 
     #[test]

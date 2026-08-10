@@ -11,6 +11,23 @@ pub(in crate::native) fn plan_self_check_reason(
     header_merge: &HashMap<String, String>,
     loop_merges: &HashMap<String, LoopMergeInfo>,
 ) -> Option<&'static str> {
+    // SPIR-V permits each merge block to belong to exactly one structured header. Keep this as a
+    // final admission invariant in addition to the synthesis-time collision repair: later
+    // construct-tree cleanup (notably pass-through promotion) must never be able to reintroduce a
+    // shared merge and let an invalid module escape merely because dominance still looks valid.
+    let mut merge_owner = HashMap::<&str, &str>::new();
+    for (header, info) in loop_merges {
+        merge_owner.insert(info.merge.as_str(), header.as_str());
+    }
+    for (header, merge_block) in header_merge {
+        if merge_owner
+            .insert(merge_block.as_str(), header.as_str())
+            .is_some_and(|owner| owner != header)
+        {
+            return Some("selection:merge-reused");
+        }
+    }
+
     // Self-check 1: reject straddling loop merges. A loop nested inside an enclosing construct
     // (selection/switch/outer loop with header CH and merge CM) must keep its merge block INSIDE that
     // construct. The loop is strictly inside the construct when CH dominates the loop header but CM does
@@ -1239,6 +1256,33 @@ mod tests {
             role,
             typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new()),
         }
+    }
+
+    #[test]
+    fn plan_self_check_rejects_merge_claimed_by_two_headers() {
+        let blocks = vec![
+            bb(
+                "%outer",
+                BlockRole::Normal,
+                &["br i1 %a, label %inner, label %merge"],
+            ),
+            bb(
+                "%inner",
+                BlockRole::Normal,
+                &["br i1 %b, label %work, label %merge"],
+            ),
+            bb("%work", BlockRole::Normal, &["br label %merge"]),
+            bb("%merge", BlockRole::Normal, &["ret void"]),
+        ];
+        let header_merges = HashMap::from([
+            ("%outer".to_string(), "%merge".to_string()),
+            ("%inner".to_string(), "%merge".to_string()),
+        ]);
+
+        assert_eq!(
+            plan_self_check_reason(&blocks, &header_merges, &HashMap::new()),
+            Some("selection:merge-reused")
+        );
     }
 
     #[test]

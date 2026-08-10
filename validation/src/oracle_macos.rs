@@ -208,10 +208,32 @@ pub fn execute_metallib_blob(
             )
             .unwrap_or_else(|reason| panic!("m2v-quarantine: {reason}"));
         if has_reachable_cfg_cycle && submit_gpu {
-            panic!(
-                "m2v-quarantine: reachable CFG cycle lacks a quantitative aggregate GPU-work \
-                 bound; semantic Metal submission refused"
-            );
+            let invocations = inputs
+                .dispatch
+                .threads_per_grid
+                .iter()
+                .copied()
+                .map(u128::from)
+                .product::<u128>()
+                .max(1);
+            let bounded =
+                crate::loop_budget::semantic_oracle_work_upper_bound_with_loop_input_facts(
+                    analysis_text,
+                    function_name,
+                    loop_input_facts(),
+                )
+                .ok()
+                .flatten()
+                .and_then(|per_invocation| per_invocation.checked_mul(invocations))
+                .is_some_and(|total| {
+                    total <= crate::loop_budget::SEMANTIC_ORACLE_MAX_SOURCE_INSTRUCTION_VISITS
+                });
+            if !bounded {
+                panic!(
+                    "m2v-quarantine: reachable CFG cycle lacks a quantitative aggregate GPU-work \
+                     bound; semantic Metal submission refused"
+                );
+            }
         }
 
         match crate::loop_budget::classify_and_instrument_with_loop_input_facts(
@@ -1825,14 +1847,16 @@ fn new_specialized_function(
         // Explicit values requested: specialize with them (declared FCs not listed default to 0),
         // identical to the values baked into the translated SPIR-V.
         if let Some(function) =
-            new_fc_specialized_function(library, entry, sanitized_ll, &explicit_fc)
+            new_fc_specialized_function(library, entry, sanitized_ll, &explicit_fc, false)
         {
             set_oracle_function_constants(OracleFunctionConstants::Values(explicit_fc));
             return function;
         }
     }
     if let Some(values) = dynamic_resource_location_fc_values(sanitized_ll) {
-        if let Some(function) = new_fc_specialized_function(library, entry, sanitized_ll, &values) {
+        if let Some(function) =
+            new_fc_specialized_function(library, entry, sanitized_ll, &values, false)
+        {
             set_oracle_function_constants(OracleFunctionConstants::Values(values));
             return function;
         }
@@ -1840,7 +1864,7 @@ fn new_specialized_function(
     // Default validation mode: specialize every declared FC to explicit zero so Metal and the
     // translator both execute the disabled-default path. Older banked rows without this mode are
     // treated as needing rebank by candidate runners.
-    if let Some(function) = new_fc_specialized_function(library, entry, sanitized_ll, &[]) {
+    if let Some(function) = new_fc_specialized_function(library, entry, sanitized_ll, &[], true) {
         set_oracle_function_constants(OracleFunctionConstants::Zero);
         return function;
     }
@@ -1850,7 +1874,7 @@ fn new_specialized_function(
         Err(empty_err) => {
             if let Some(values) = dynamic_resource_location_fc_values(sanitized_ll) {
                 if let Some(function) =
-                    new_fc_specialized_function(library, entry, sanitized_ll, &values)
+                    new_fc_specialized_function(library, entry, sanitized_ll, &values, false)
                 {
                     set_oracle_function_constants(OracleFunctionConstants::Values(values));
                     return function;
@@ -1863,7 +1887,7 @@ fn new_specialized_function(
             // to its disabled zero default) and avoids the front-end crash, so retry with zeros
             // before giving up. Only reached when the empty-set specialization already failed, so
             // no currently-passing case changes behavior.
-            let function = new_fc_specialized_function(library, entry, sanitized_ll, &[])
+            let function = new_fc_specialized_function(library, entry, sanitized_ll, &[], true)
                 .unwrap_or_else(|| {
                     panic!("Metal function {entry:?} could not be specialized: {empty_err}")
                 });
@@ -1873,17 +1897,17 @@ fn new_specialized_function(
     }
 }
 
-/// Build the function specializing every declared function constant to an EXPLICIT value: the value
-/// in `values` for that FC index, or 0 if unlisted. All-zero (`values` empty) is semantically
-/// identical to metal2vulkan's folding (every FC → its disabled zero default); non-zero values match
-/// the constants baked into the translated SPIR-V by `metal2vulkan::specialize_function_constants`,
-/// giving otherwise-unrunnable FC kernels (all-zero → udiv/0 / unbounded loop) a byte-comparable
-/// golden. Returns `None` when the module declares no function constants (nothing to specialize).
+/// Build a function with explicit function constants. Listed FCs receive their requested values;
+/// unlisted FCs remain undefined unless `define_unlisted_as_zero` selects the all-zero mode used by
+/// `specialize_function_constants_zero`. Keeping unlisted FCs undefined in value mode matches
+/// `specialize_function_constants`, including AIR interface predicates based on
+/// `air.is_function_constant_defined`. Returns `None` when the module declares no FCs.
 fn new_fc_specialized_function(
     library: &ProtocolObject<dyn MTLLibrary>,
     entry: &str,
     sanitized_ll: Option<&str>,
     values: &[(usize, u64)],
+    define_unlisted_as_zero: bool,
 ) -> Option<Retained<ProtocolObject<dyn MTLFunction>>> {
     let declared = sanitized_ll
         .map(declared_function_constants)
@@ -1895,13 +1919,18 @@ fn new_fc_specialized_function(
     let function_name = NSString::from_str(entry);
     let specialized = MTLFunctionConstantValues::new();
     for (ty, index) in &declared {
+        let value = match value_for.get(index).copied() {
+            Some(value) => value,
+            None if define_unlisted_as_zero => 0,
+            None => continue,
+        };
         let Some(data_type) = mtl_data_type_for_fc(ty) else {
             panic!("Metal function {entry:?}: FC path unsupported for constant type {ty:?}");
         };
         // Little-endian value bytes; `setConstantValue_type_atIndex` reads `data_type`-many bytes
-        // from the front, so the low N bytes are correct for any scalar-int width. Unlisted FCs → 0.
+        // from the front, so the low N bytes are correct for any scalar-int width.
         let mut bytes = [0u8; 32];
-        bytes[..8].copy_from_slice(&value_for.get(index).copied().unwrap_or(0).to_le_bytes());
+        bytes[..8].copy_from_slice(&value.to_le_bytes());
         unsafe {
             specialized.setConstantValue_type_atIndex(
                 std::ptr::NonNull::new(bytes.as_ptr() as *mut _).unwrap(),
@@ -2125,8 +2154,14 @@ fn execute_compute_library(
         // with explicit zeros before giving up.
         let retry_values =
             dynamic_resource_location_fc_values(sanitized_ll).unwrap_or_else(fc_values_requested);
-        let zero_fn = new_fc_specialized_function(library, entry, sanitized_ll, &retry_values)
-            .unwrap_or_else(|| panic!("newComputePipelineStateWithFunction({entry}): {pso_err}"));
+        let zero_fn = new_fc_specialized_function(
+            library,
+            entry,
+            sanitized_ll,
+            &retry_values,
+            retry_values.is_empty(),
+        )
+        .unwrap_or_else(|| panic!("newComputePipelineStateWithFunction({entry}): {pso_err}"));
         if retry_values.is_empty() {
             set_oracle_function_constants(OracleFunctionConstants::Zero);
         } else {

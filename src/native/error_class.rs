@@ -4,6 +4,88 @@
 //! validator-text matching in this one adapter means a SPIRV-Tools message change touches one place.
 //! Unit coverage lives in `error_classifier_tests`.
 
+use crate::spirv_module::{Module, Operand};
+use spirv::{Op, Word};
+use std::collections::HashMap;
+
+/// A systematic shared-merge failure this large is outside the bounded CFG recovery envelope. The
+/// threshold deliberately excludes isolated/local structurizer mistakes, which still receive the
+/// complete retry ladder.
+const SYSTEMATIC_REUSED_MERGE_TARGETS: usize = 8;
+
+pub(crate) fn systematic_reused_merges_beyond_relooper(module: &Module) -> Option<(usize, usize)> {
+    module.functions.iter().find_map(|function| {
+        if function.blocks.len() <= super::CFG_EMIT_RELOOPER_MAX_BLOCKS {
+            return None;
+        }
+        let mut claims = HashMap::<Word, usize>::new();
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            if !matches!(instruction.class.opcode, Op::SelectionMerge | Op::LoopMerge) {
+                continue;
+            }
+            if let Some(Operand::IdRef(merge)) = instruction.operands.first() {
+                *claims.entry(*merge).or_default() += 1;
+            }
+        }
+        let reused = claims.values().filter(|&&count| count > 1).count();
+        (reused >= SYSTEMATIC_REUSED_MERGE_TARGETS).then_some((function.blocks.len(), reused))
+    })
+}
+
+#[cfg(test)]
+mod systematic_merge_tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function, Instruction};
+
+    fn module_with_reused_merges(blocks: usize, reused_targets: usize) -> Module {
+        let mut function = Function::new();
+        function.blocks.resize_with(blocks, Block::new);
+        for target in 0..reused_targets {
+            for claim in 0..2 {
+                function.blocks[target * 2 + claim]
+                    .instructions
+                    .push(Instruction::new(
+                        Op::SelectionMerge,
+                        None,
+                        None,
+                        vec![Operand::IdRef(target as Word + 1)],
+                    ));
+            }
+        }
+        let mut module = Module::new();
+        module.functions.push(function);
+        module
+    }
+
+    #[test]
+    fn systematic_merge_fast_fallback_requires_both_size_and_repetition() {
+        assert!(
+            systematic_reused_merges_beyond_relooper(&module_with_reused_merges(
+                super::super::CFG_EMIT_RELOOPER_MAX_BLOCKS,
+                SYSTEMATIC_REUSED_MERGE_TARGETS,
+            ))
+            .is_none()
+        );
+        assert!(
+            systematic_reused_merges_beyond_relooper(&module_with_reused_merges(
+                super::super::CFG_EMIT_RELOOPER_MAX_BLOCKS + 1,
+                SYSTEMATIC_REUSED_MERGE_TARGETS - 1,
+            ))
+            .is_none()
+        );
+        assert_eq!(
+            systematic_reused_merges_beyond_relooper(&module_with_reused_merges(
+                super::super::CFG_EMIT_RELOOPER_MAX_BLOCKS + 1,
+                SYSTEMATIC_REUSED_MERGE_TARGETS,
+            )),
+            Some((
+                super::super::CFG_EMIT_RELOOPER_MAX_BLOCKS + 1,
+                SYSTEMATIC_REUSED_MERGE_TARGETS,
+            ))
+        );
+    }
+}
+
 /// Whether a spirv-val error message is one of the buffer pointer-typing failures the raw byte-offset
 /// path repairs (the pointer-merge frontier class). Anything else — a CFG/back-edge error, a missing
 /// capability, or a spirv-val spawn failure — returns false so the ground-truth retry is skipped.

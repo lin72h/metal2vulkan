@@ -393,12 +393,73 @@ pub(in crate::passes) fn lower_simd_op(
         if !is_bool_type(ctx, rty) {
             return Err(format!("{name} result type is not bool"));
         }
+        if ctx.simd_cluster32 {
+            let mut insts = Vec::new();
+            let lane = subgroup_lane_index_u32(ctx, &mut insts);
+            let uint = ctx.ty_uint();
+            let local_lane = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::BitwiseAnd,
+                Some(uint),
+                Some(local_lane),
+                vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(31))],
+            ));
+            insts.push(Instruction::new(
+                Op::IEqual,
+                Some(rty),
+                Some(res),
+                vec![
+                    Operand::IdRef(local_lane),
+                    Operand::IdRef(ctx.const_uint(0)),
+                ],
+            ));
+            return Ok(Some(insts));
+        }
         let scope = ctx.const_uint(Scope::Subgroup as u32);
         return Ok(Some(vec![Instruction::new(
             Op::GroupNonUniformElect,
             Some(rty),
             Some(res),
             vec![Operand::IdScope(scope)],
+        )]));
+    }
+    if name.starts_with("air.simd_broadcast_first.") && args.len() == 1 {
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
+        if ctx.simd_cluster32 {
+            let mut insts = Vec::new();
+            let lane = subgroup_lane_index_u32(ctx, &mut insts);
+            let uint = ctx.ty_uint();
+            let local_lane = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::BitwiseAnd,
+                Some(uint),
+                Some(local_lane),
+                vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(31))],
+            ));
+            let base_lane = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::ISub,
+                Some(uint),
+                Some(base_lane),
+                vec![Operand::IdRef(lane), Operand::IdRef(local_lane)],
+            ));
+            insts.push(Instruction::new(
+                Op::GroupNonUniformShuffle,
+                Some(rty),
+                Some(res),
+                vec![
+                    Operand::IdScope(scope),
+                    Operand::IdRef(args[0]),
+                    Operand::IdRef(base_lane),
+                ],
+            ));
+            return Ok(Some(insts));
+        }
+        return Ok(Some(vec![Instruction::new(
+            Op::GroupNonUniformBroadcastFirst,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdScope(scope), Operand::IdRef(args[0])],
         )]));
     }
     if name.starts_with("air.simd_broadcast.") && args.len() == 2 {

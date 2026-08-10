@@ -944,7 +944,7 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
             &mut header_merges,
             &mut counter,
         );
-        repair_construct_tree_passthrough_selection_merges(&out, &mut header_merges);
+        repair_construct_tree_passthrough_selection_merges(&out, loop_merges, &mut header_merges);
     }
 
     // Re-key from final terminators when a later transform can rewrite an already-recorded header. This
@@ -1076,6 +1076,7 @@ pub(in crate::native) fn repair_construct_tree_nondominated_selection_merges(
 
 pub(in crate::native) fn repair_construct_tree_passthrough_selection_merges(
     blocks: &[BodyBlock],
+    loop_merges: &HashMap<String, LoopMergeInfo>,
     header_merges: &mut HashMap<String, String>,
 ) {
     let forest = analyze(blocks);
@@ -1083,6 +1084,13 @@ pub(in crate::native) fn repair_construct_tree_passthrough_selection_merges(
         .iter()
         .map(|block| (block.name.as_str(), block))
         .collect::<HashMap<_, _>>();
+    let loop_roles = loop_role_targets_with_passthroughs(blocks, loop_merges);
+    let mut claims = header_merges
+        .values()
+        .fold(HashMap::new(), |mut claims, merge| {
+            *claims.entry(merge.clone()).or_insert(0usize) += 1;
+            claims
+        });
     for _ in 0..blocks.len() {
         let mut changed = false;
         let assignments = header_merges
@@ -1100,6 +1108,13 @@ pub(in crate::native) fn repair_construct_tree_passthrough_selection_merges(
             let [successor] = successors.as_slice() else {
                 continue;
             };
+            // Promoting a private pass-through back onto a block already owned by another
+            // selection (or by a loop role) recreates the exact collision the private merge was
+            // synthesized to avoid. Reserve targets as promotions happen so two private merges in
+            // the same pass cannot both collapse onto an initially-unclaimed successor either.
+            if loop_roles.contains(successor) || claims.get(successor).copied().unwrap_or(0) != 0 {
+                continue;
+            }
             if !forest.dominates(&header, successor) {
                 continue;
             }
@@ -1112,6 +1127,10 @@ pub(in crate::native) fn repair_construct_tree_passthrough_selection_merges(
             });
             if bypasses_merge {
                 header_merges.insert(header, successor.clone());
+                if let Some(count) = claims.get_mut(&merge) {
+                    *count = count.saturating_sub(1);
+                }
+                *claims.entry(successor.clone()).or_insert(0) += 1;
                 changed = true;
             }
         }

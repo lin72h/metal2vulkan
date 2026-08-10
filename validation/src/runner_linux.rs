@@ -20,7 +20,9 @@ use vulkano::command_buffer::{
     PrimaryAutoCommandBuffer, RenderingAttachmentInfo, RenderingInfo,
 };
 use vulkano::descriptor_set::allocator::StandardDescriptorSetAllocator;
-use vulkano::descriptor_set::layout::DescriptorType;
+use vulkano::descriptor_set::layout::{
+    DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo, DescriptorType,
+};
 use vulkano::descriptor_set::{DescriptorImageViewInfo, DescriptorSet, WriteDescriptorSet};
 use vulkano::device::physical::PhysicalDeviceType;
 use vulkano::device::{
@@ -55,7 +57,7 @@ use vulkano::pipeline::{
 };
 use vulkano::render_pass::{AttachmentLoadOp, AttachmentStoreOp};
 use vulkano::shader::spirv::bytes_to_words;
-use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo};
+use vulkano::shader::{ShaderModule, ShaderModuleCreateInfo, ShaderStages};
 use vulkano::sync::{now, GpuFuture};
 use vulkano::Version;
 use vulkano::VulkanLibrary;
@@ -553,10 +555,13 @@ fn execute_compute(
         device.clone(),
         pipeline_layout.clone(),
         &buffers,
-        &textures,
-        &[],
         sanitized_ll,
-        &texture_reqs,
+        DescriptorImageBindings {
+            textures: &textures,
+            color_inputs: &[],
+            texture_reqs: &texture_reqs,
+            padding_storage_bindings: &[],
+        },
     );
     let texture_readback =
         make_texture_readback(memory_allocator, inputs.output, sanitized_ll, &texture_reqs);
@@ -751,10 +756,13 @@ fn execute_render_fragment(
         device.clone(),
         pipeline_layout.clone(),
         &buffers,
-        &textures,
-        &color_inputs,
         sanitized_ll,
-        &texture_reqs,
+        DescriptorImageBindings {
+            textures: &textures,
+            color_inputs: &color_inputs,
+            texture_reqs: &texture_reqs,
+            padding_storage_bindings: &[],
+        },
     );
     let image = Image::new(
         memory_allocator.clone(),
@@ -931,7 +939,8 @@ fn execute_vertex(
     let (device, queue) = device_and_queue(QueueFlags::GRAPHICS, true);
     let vertex_inputs = vertex_inputs(sanitized_ll);
     preflight_nvidia_vertex_validation_graphics_pipeline(&device, vertex_spv, sanitized_ll, tmp)?;
-    let pipeline = vertex_pipeline(device.clone(), vertex_spv, &vertex_inputs)?;
+    let (pipeline, padding_buffer_bindings) =
+        vertex_pipeline(device.clone(), vertex_spv, &vertex_inputs)?;
     let texture_reqs = required_texture_bindings(device.clone(), vertex_spv);
     let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
     let buffers = make_buffers(memory_allocator.clone(), inputs);
@@ -948,10 +957,13 @@ fn execute_vertex(
         device.clone(),
         pipeline_layout.clone(),
         &buffers,
-        &textures,
-        &[],
         sanitized_ll,
-        &texture_reqs,
+        DescriptorImageBindings {
+            textures: &textures,
+            color_inputs: &[],
+            texture_reqs: &texture_reqs,
+            padding_storage_bindings: &padding_buffer_bindings,
+        },
     );
 
     let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
@@ -1928,24 +1940,54 @@ fn vertex_pipeline(
     device: Arc<Device>,
     vertex_spv: &[u8],
     vertex_inputs: &[VertexInput],
-) -> Result<Arc<GraphicsPipeline>, String> {
+) -> Result<(Arc<GraphicsPipeline>, Vec<u32>), String> {
     let vertex_stage = shader_stage(device.clone(), vertex_spv);
-    let layout_info = PipelineDescriptorSetLayoutCreateInfo::from_stages([&vertex_stage])
+    let mut descriptor_layout = PipelineDescriptorSetLayoutCreateInfo::from_stages([&vertex_stage]);
+    let padding_buffer_bindings = descriptor_layout
+        .set_layouts
+        .get_mut(DESCRIPTOR_SET as usize)
+        .map(pad_sparse_vertex_buffer_bindings)
+        .unwrap_or_default();
+    let layout_info = descriptor_layout
         .into_pipeline_layout_create_info(device.clone())
         .map_err(|error| format!("reflect vertex validation pipeline layout: {error}"))?;
     let layout = PipelineLayout::new(device.clone(), layout_info)
         .map_err(|error| format!("create vertex validation pipeline layout: {error}"))?;
     let create_info = vertex_validation_pipeline_create_info(layout, vertex_stage, vertex_inputs);
-    if spirv_capabilities(vertex_spv).is_ok_and(|caps| caps.contains(&32)) {
+    let pipeline = if spirv_capabilities(vertex_spv).is_ok_and(|caps| caps.contains(&32)) {
         // Vulkano 0.35's shader-stage validation unwraps ClipDistance decorations as if the
         // decoration target were the array type rather than the output variable. The SPIR-V has
         // already passed spirv-val and Vulkan still validates pipeline creation below.
         unsafe { GraphicsPipeline::new_unchecked(device, None, create_info) }
-            .map_err(|error| format!("create vertex validation pipeline: {error:?}"))
+            .map_err(|error| format!("create vertex validation pipeline: {error:?}"))?
     } else {
         GraphicsPipeline::new(device, None, create_info)
-            .map_err(|error| format!("create vertex validation pipeline: {error:?}"))
+            .map_err(|error| format!("create vertex validation pipeline: {error:?}"))?
+    };
+    Ok((pipeline, padding_buffer_bindings))
+}
+
+fn pad_sparse_vertex_buffer_bindings(set: &mut DescriptorSetLayoutCreateInfo) -> Vec<u32> {
+    let Some(max_buffer_binding) = set
+        .bindings
+        .keys()
+        .copied()
+        .filter(|binding| *binding < TEXTURE_BINDING_BASE)
+        .max()
+    else {
+        return Vec::new();
+    };
+    let mut padding = Vec::new();
+    for binding in 0..=max_buffer_binding {
+        set.bindings.entry(binding).or_insert_with(|| {
+            padding.push(binding);
+            let mut gap =
+                DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageBuffer);
+            gap.stages = ShaderStages::VERTEX;
+            gap
+        });
     }
+    padding
 }
 
 fn vertex_validation_pipeline_create_info(
@@ -3820,15 +3862,26 @@ fn vulkan_image_type(extent: Extent3d) -> ImageType {
     }
 }
 
+struct DescriptorImageBindings<'a> {
+    textures: &'a [TextureResource],
+    color_inputs: &'a [ColorInputAttachment],
+    texture_reqs: &'a HashMap<u32, TextureBindingReq>,
+    padding_storage_bindings: &'a [u32],
+}
+
 fn descriptor_set(
     device: Arc<Device>,
     layout: Arc<PipelineLayout>,
     buffers: &[(u32, Subbuffer<[u8]>)],
-    textures: &[TextureResource],
-    color_inputs: &[ColorInputAttachment],
     sanitized_ll: &str,
-    texture_reqs: &HashMap<u32, TextureBindingReq>,
+    images: DescriptorImageBindings<'_>,
 ) -> Option<Arc<DescriptorSet>> {
+    let DescriptorImageBindings {
+        textures,
+        color_inputs,
+        texture_reqs,
+        padding_storage_bindings,
+    } = images;
     let set_layout = layout.set_layouts().first()?.clone();
     if set_layout.bindings().is_empty() {
         return None;
@@ -3844,6 +3897,27 @@ fn descriptor_set(
         &bound_buffers,
         sanitized_ll,
     ));
+    if !padding_storage_bindings.is_empty() {
+        let padding_buffer = Buffer::from_iter(
+            storage_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                ..Default::default()
+            },
+            [0u8; 16],
+        )
+        .expect("create sparse-layout padding buffer");
+        bound_buffers.extend(
+            padding_storage_bindings
+                .iter()
+                .map(|binding| (*binding, padding_buffer.clone())),
+        );
+    }
     // PSB address-table binding. The `native/psb.rs` lowering synthesizes ONE extra StorageBuffer
     // (`{ runtimearray u64 }`) at a fresh binding holding each merged buffer's device address indexed
     // by its OWN descriptor binding. That binding has no corresponding seeded input, so it is exactly
@@ -4817,6 +4891,22 @@ mod tests {
     #[test]
     fn vertex_validation_pipeline_omits_viewport_state_under_discard() {
         assert!(vertex_validation_viewport_state().is_none());
+    }
+
+    #[test]
+    fn vertex_layout_types_sparse_buffer_binding_gaps_for_moltenvk() {
+        let mut used = DescriptorSetLayoutBinding::descriptor_type(DescriptorType::StorageBuffer);
+        used.stages = ShaderStages::VERTEX;
+        let mut set = DescriptorSetLayoutCreateInfo::default();
+        set.bindings.insert(2, used);
+        let padding = pad_sparse_vertex_buffer_bindings(&mut set);
+
+        assert_eq!(padding, vec![0, 1]);
+        assert_eq!(set.bindings.len(), 3);
+        assert!(set.bindings.values().all(|binding| {
+            binding.descriptor_type == DescriptorType::StorageBuffer
+                && binding.stages == ShaderStages::VERTEX
+        }));
     }
 
     #[test]

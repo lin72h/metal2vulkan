@@ -118,6 +118,14 @@ fn reject_unsupported_metal_linked_functions(san_ll: &str) -> Result<(), String>
                 .into(),
         );
     }
+    if san_ll.contains("@air.simd_prefix_exclusive_sum.u.v4i16") {
+        return Err(
+            "native emitter: unsupported AIR u16x4 SIMD exclusive prefix scan; the current \
+             subgroup lowering does not preserve Metal radix semantics through aliased \
+             threadgroup storage"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -127,6 +135,12 @@ fn options_for_air(
 ) -> passes::TransformOptions {
     if san_ll.contains("air.compile.denorms_disable") {
         options.denorm_flush_to_zero_f32 = true;
+    }
+    // AIR's simdgroup ABI is 32 lanes. Vulkan implementations may expose wider native subgroups
+    // (MoltenVK commonly exposes 64), so subgroup reductions/scans must retain 32-lane partitions
+    // instead of silently adopting the driver's width.
+    if san_ll.contains("@air.simd_") {
+        options.simd_cluster32 = true;
     }
     options
 }
@@ -994,18 +1008,35 @@ fn translate_sanitized_with_meta(
                         }
                         // The repair fallback produced a module spirv-val rejects for a structured-CFG nesting
                         // violation — retry with the cross-arm restructure, then the general relooper on the
-                        // emitted bytes; keep the default bytes if neither validates.
+                        // emitted bytes. If every validation-gated recovery declines, return an honest
+                        // translation error: known-invalid structured CFG bytes must never be shipped.
                         Err(e)
                             if native::classify_validation_error(&e)
                                 == native::ValidationClass::CfgStructurization =>
                         {
-                            Ok({
+                            {
                                 if retry_debug_on {
                                     let head: Vec<&str> = e.lines().take(4).collect();
                                     eprintln!(
                                     "[retry-debug] default module failed cfg-class spirv-val: {}",
                                     head.join(" | ")
                                 );
+                                }
+                                if let Some((blocks, reused_merges)) =
+                                    native::systematic_reused_merges_beyond_relooper(&primary_module)
+                                {
+                                    if retry_debug_on {
+                                        eprintln!(
+                                            "[retry-debug] cfg fast fallback: function blocks={blocks} \
+                                             exceeds relooper cap={} with {reused_merges} reused \
+                                             merge targets",
+                                            native::CFG_EMIT_RELOOPER_MAX_BLOCKS,
+                                        );
+                                    }
+                                    if crate::env_vars::tier_census() {
+                                        eprintln!("[tier-census] fallback");
+                                    }
+                                    return Err(e);
                                 }
                                 rc.census("val-cfg:construct_tree", rc.construct_tree_retry())
                                     .or_else(|| {
@@ -1060,7 +1091,7 @@ fn translate_sanitized_with_meta(
                                     rc.inline_sroa_raw_cfg_restructure_retry(),
                                 )
                             })
-                            .unwrap_or(out))
+                            .ok_or(e)
                         }
                         // An illegal logical-pointer `OpPhi` (pointer-induction over an aggregate) — retry the
                         // phi-the-index rewrite, then fall back to FC-dead-arm pruning (the offending phi may

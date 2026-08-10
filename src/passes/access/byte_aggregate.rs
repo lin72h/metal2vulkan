@@ -725,6 +725,249 @@ pub(in crate::passes) fn rewrite_strided_descent_access_chains(ctx: &mut Ctx, en
     }
 }
 
+/// Repair a Workgroup `OpPtrAccessChain` that combines aggregate pointer arithmetic and descent.
+/// Recent SPIR-V validators require the pointer-arithmetic result to keep the base pointee type for
+/// Workgroup memory; combining the trailing descent in the same instruction can otherwise be
+/// diagnosed as a result-pointee mismatch.
+///
+/// A module-scope Workgroup object shaped exactly as `{ [N x T] }` gets one additional structural
+/// repair.  A chain emitted as `%base %element %member_zero` has displaced the singleton struct
+/// selector behind the LLVM pointer index.  Since the base is one Workgroup object rather than an
+/// array of wrapper structs, restore the type-directed order as an ordinary access chain:
+///
+/// ```text
+/// PtrAccessChain %T_ptr %base %element %member_zero
+/// InBoundsAccessChain %T_ptr %base %member_zero %element
+/// ```
+///
+/// This is restricted to the exact singleton-struct/array/result-element relationship and a proven
+/// constant-zero member selector.  Other aggregate pointer arithmetic is split while preserving
+/// the LLVM GEP byte address exactly:
+///
+/// ```text
+/// PtrAccessChain %leaf_ptr %base %stride %field...
+/// ```
+///
+/// becomes
+///
+/// ```text
+/// PtrAccessChain      %aggregate_ptr %base    %stride
+/// InBoundsAccessChain %leaf_ptr      %strided %field...
+/// ```
+///
+/// Restrict this to Workgroup aggregate bases with a structurally valid trailing type walk.  Other
+/// storage classes accept the combined form and retain it to avoid needless SPIR-V/hash churn. If
+/// an earlier aggregate remodel omitted zero-offset descents needed to reach the recorded result
+/// pointee, append only that structurally proven zero path; every appended step preserves the byte
+/// address while restoring the declared pointer type.
+pub(in crate::passes) fn split_workgroup_ptr_access_chain_descent(
+    ctx: &mut Ctx,
+    _entry_idx: usize,
+) {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*storage, *pointee));
+            }
+        }
+    }
+
+    enum Rewrite {
+        ReorderSingletonArray {
+            function_idx: usize,
+            block_idx: usize,
+            inst_idx: usize,
+        },
+        SplitStride {
+            function_idx: usize,
+            block_idx: usize,
+            inst_idx: usize,
+            base_ptr_type: Word,
+            extra_zero_indices: usize,
+            zero: Option<Operand>,
+        },
+    }
+
+    let mut rewrites = Vec::new();
+    for (function_idx, function) in ctx.module.functions.iter().enumerate() {
+        for (block_idx, block) in function.blocks.iter().enumerate() {
+            for (inst_idx, inst) in block.instructions.iter().enumerate() {
+                if inst.class.opcode != Op::PtrAccessChain || inst.operands.len() < 3 {
+                    continue;
+                }
+                let (Some(result_type), Some(Operand::IdRef(base))) =
+                    (inst.result_type, inst.operands.first())
+                else {
+                    continue;
+                };
+                let Some((StorageClass::Workgroup, result_pointee)) =
+                    ptr_info.get(&result_type).copied()
+                else {
+                    continue;
+                };
+                let Some(base_ptr_type) = value_result_type(ctx, *base) else {
+                    continue;
+                };
+                let Some((StorageClass::Workgroup, base_pointee)) =
+                    ptr_info.get(&base_ptr_type).copied()
+                else {
+                    continue;
+                };
+                if base_pointee == result_pointee {
+                    continue;
+                }
+                if inst.operands.len() == 3
+                    && is_module_variable(ctx, *base)
+                    && singleton_array_element(ctx, base_pointee) == Some(result_pointee)
+                    && matches!(
+                        inst.operands.get(2),
+                        Some(Operand::IdRef(id)) if const_u32(ctx, *id) == Some(0)
+                    )
+                    && walk_into_type(
+                        ctx,
+                        base_pointee,
+                        &[inst.operands[2].clone(), inst.operands[1].clone()],
+                    ) == Some(result_pointee)
+                {
+                    rewrites.push(Rewrite::ReorderSingletonArray {
+                        function_idx,
+                        block_idx,
+                        inst_idx,
+                    });
+                    continue;
+                }
+                let Some(walked) = walk_into_type(ctx, base_pointee, &inst.operands[2..]) else {
+                    continue;
+                };
+                let Some(extra_zero_indices) =
+                    zero_descent_steps_to_type(ctx, walked, result_pointee)
+                else {
+                    continue;
+                };
+                let zero = inst.operands[2..]
+                    .iter()
+                    .find(|operand| match operand {
+                        Operand::IdRef(id) => const_u32(ctx, *id) == Some(0),
+                        _ => false,
+                    })
+                    .cloned();
+                if extra_zero_indices > 0 && zero.is_none() {
+                    continue;
+                }
+                rewrites.push(Rewrite::SplitStride {
+                    function_idx,
+                    block_idx,
+                    inst_idx,
+                    base_ptr_type,
+                    extra_zero_indices,
+                    zero,
+                });
+            }
+        }
+    }
+
+    for rewrite in rewrites.into_iter().rev() {
+        match rewrite {
+            Rewrite::ReorderSingletonArray {
+                function_idx,
+                block_idx,
+                inst_idx,
+            } => {
+                let inst = &mut ctx.module.functions[function_idx].blocks[block_idx].instructions
+                    [inst_idx];
+                inst.class.opcode = Op::InBoundsAccessChain;
+                inst.operands.swap(1, 2);
+            }
+            Rewrite::SplitStride {
+                function_idx,
+                block_idx,
+                inst_idx,
+                base_ptr_type,
+                extra_zero_indices,
+                zero,
+            } => {
+                let original = ctx.module.functions[function_idx].blocks[block_idx].instructions
+                    [inst_idx]
+                    .clone();
+                let strided = ctx.module.fresh_id();
+                let stride = Instruction::new(
+                    Op::PtrAccessChain,
+                    Some(base_ptr_type),
+                    Some(strided),
+                    original.operands[..2].to_vec(),
+                );
+                let mut descent_operands = vec![Operand::IdRef(strided)];
+                descent_operands.extend_from_slice(&original.operands[2..]);
+                if let Some(zero) = zero {
+                    descent_operands.extend(std::iter::repeat_n(zero, extra_zero_indices));
+                }
+                let descent = Instruction::new(
+                    Op::InBoundsAccessChain,
+                    original.result_type,
+                    original.result_id,
+                    descent_operands,
+                );
+                let block = &mut ctx.module.functions[function_idx].blocks[block_idx];
+                block.instructions[inst_idx] = descent;
+                block.instructions.insert(inst_idx, stride);
+            }
+        }
+    }
+}
+
+fn is_module_variable(ctx: &Ctx, id: Word) -> bool {
+    ctx.new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .any(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(id))
+}
+
+fn singleton_array_element(ctx: &Ctx, ty: Word) -> Option<Word> {
+    let structure = type_def_of(ctx, ty)?;
+    if structure.class.opcode != Op::TypeStruct || structure.operands.len() != 1 {
+        return None;
+    }
+    let Operand::IdRef(member) = structure.operands[0] else {
+        return None;
+    };
+    let array = type_def_of(ctx, member)?;
+    if !matches!(array.class.opcode, Op::TypeArray | Op::TypeRuntimeArray) {
+        return None;
+    }
+    match array.operands.first()? {
+        Operand::IdRef(element) => Some(*element),
+        _ => None,
+    }
+}
+
+fn zero_descent_steps_to_type(ctx: &Ctx, mut current: Word, target: Word) -> Option<usize> {
+    for steps in 0..=8 {
+        if current == target {
+            return Some(steps);
+        }
+        let definition = type_def_of(ctx, current)?;
+        current = match definition.class.opcode {
+            Op::TypeStruct
+            | Op::TypeArray
+            | Op::TypeRuntimeArray
+            | Op::TypeVector
+            | Op::TypeMatrix => match definition.operands.first()? {
+                Operand::IdRef(element) => *element,
+                _ => return None,
+            },
+            _ => return None,
+        };
+    }
+    None
+}
+
 /// Bit width of a type id that is DIRECTLY an `OpTypeInt`/`OpTypeFloat` scalar (not a vector/array).
 /// `None` for anything else — used as a same-width-scalar-reinterpret guard where vectors must NOT be
 /// transparently unwrapped.

@@ -15,4 +15,6 @@ pub(in crate::passes) use buffer_addresses::*;
 pub(in crate::passes) use collapse::*;
 pub(in crate::passes) use discovery::*;
 pub(in crate::passes) use query_select::rewrite_resource_query_selects;
-pub(in crate::passes) use texture_array::materialize_texture_array_loads;
+pub(in crate::passes) use texture_array::{
+    materialize_texture_array_loads, sink_loop_header_texture_array_loads,
+};

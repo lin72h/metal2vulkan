@@ -71,6 +71,7 @@ pub(crate) use emit_tiers::{
     emit_vulkan_spirv_with_primitive_phi_metadata_sidecar, emit_vulkan_spirv_with_sidecar,
 };
 use emitter::Emitter;
+pub(crate) use error_class::systematic_reused_merges_beyond_relooper;
 pub use error_class::{
     classify_emit_error, classify_validation_error, is_cfg_structurization_error,
     is_cross_binding_pointer_merge_error, is_dynamic_struct_index_error,

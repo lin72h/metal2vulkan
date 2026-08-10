@@ -277,6 +277,24 @@ preflights, but the Metal runner quarantines them instead of submitting transfor
 its bytes. Candidate runners propagate that quarantine without GPU submission; they never treat a
 historic `compare=none` row as exact, tolerance, or smoke evidence.
 
+After a candidate audit, reconcile Metal rows that MoltenVK classified as non-comparable (or that
+have a historic candidate timeout) without resolving sources or touching the GPU:
+
+```sh
+cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- \
+  --force --quarantine-invalid-oracles
+```
+
+This is deliberately ledger-only. A later targeted preflight and remint may promote a corrected
+row; a timeout is never resubmitted merely to change its ledger status.
+
+Function-constant oracle rows also record the exact specialization contract. In value mode the
+Metal oracle defines only the listed FC indices and leaves every unlisted FC undefined, matching
+the candidate specialization helper and `air.is_function_constant_defined`. Required constants
+marked by the final `i1 true` in `!air.function_constants` are listed explicitly at zero unless a
+bounded-work input rule selects another value. This avoids activating optional, mutually exclusive
+AIR interface members merely because their storage value defaults to zero.
+
 Targeted recovery of historic `compare=none` rows is deliberately two-step:
 
 ```sh
@@ -292,12 +310,16 @@ cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- \
 ```
 
 The preflight source gate rejects unsupported standalone ABIs, unsafe synthetic input
-configurations, CFG-analysis refusals, and every reachable CFG cycle before invoking Apple tools.
-It is intentionally stricter than the bounded-loop instrumentation classifier: a finite trip count
-alone does not prove a quantitative aggregate GPU-time bound. For large private corpora, split the
-hash list by its existing corpus shards so each source-analysis process releases parser memory
-before the next shard; do not run several shard-wide Metal preflights concurrently on a
-memory-constrained host.
+configurations, CFG-analysis refusals, recursion, workgroup barriers in cyclic modules, unproven
+loops, modules with more than 64 branch terminators, and work whose conservative aggregate bound
+exceeds 50 million source-instruction visits. The branch ceiling prevents quadratic CFG analysis
+from exhausting the host before any Apple tool or GPU work is reached.
+For a proven loop it expands the reachable static call graph, applies a 257x factor per reachable
+backedge (initial visit plus at most 256 trips), and multiplies by the dispatch grid. The Metal
+oracle repeats this check against the Apple-side analysis IR immediately before command-buffer
+creation. For large private corpora, split the hash list by its existing corpus shards so each
+source-analysis process releases parser memory before the next shard; do not run several
+shard-wide Metal preflights concurrently on a memory-constrained host.
 
 ### 7. Agent loop over ledger failures
 

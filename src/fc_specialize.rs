@@ -383,6 +383,7 @@ pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String>
     let definedness = specialize_fc_definedness(&mut module, &defined_indices);
     if !materialized && !definedness {
         if prune_static_fc_branches_and_drop_interface(&mut module) {
+            crate::passes::repair_specialized_workgroup_ptr_access_chains(&mut module);
             return Ok(module
                 .assemble()
                 .iter()
@@ -392,6 +393,7 @@ pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String>
         return Ok(spv.to_vec());
     }
     prune_static_fc_branches_and_drop_interface(&mut module);
+    crate::passes::repair_specialized_workgroup_ptr_access_chains(&mut module);
     Ok(module
         .assemble()
         .iter()
@@ -409,10 +411,11 @@ pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String>
 /// does at Metal pipeline creation, applied here at translation time. The byte-conformance harness
 /// pairs this with the same values on the Apple oracle so both sides take the same specialized code
 /// path (many function-constant kernels otherwise fold every FC to 0 → `udiv`-by-zero / unbounded loop → no
-/// derivable oracle). `values` maps FC index → value; unlisted indices keep their zero default. Only
-/// scalar-integer function constants are supported (the ones that gate loop bounds / divisors);
-/// a listed index whose global or scalar-int pointee type is not found is a hard error, so a stale
-/// override can never silently no-op.
+/// derivable oracle). `values` maps FC index → its little-endian scalar/vector payload; unlisted
+/// indices keep their zero default. Integer and floating-point scalar/vector constants are
+/// supported. A nonzero listed index whose global or definedness marker is not found is a hard
+/// error, so a stale behavior-changing override can never silently no-op. An absent zero override
+/// is harmless when translation has already erased every use of that FC.
 pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Result<Vec<u8>, String> {
     use crate::spirv_module::Instruction;
     use crate::spirv_module::Operand;
@@ -438,11 +441,11 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
         }
     }
 
-    // Type tables: pointer id -> pointee id; int type id -> bit width; vector int type ->
-    // (component type, lane count).
+    // Type tables: pointer id -> pointee id; numeric scalar type id -> bit width; numeric vector
+    // type -> (component type, lane count).
     let mut pointee: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    let mut int_width: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    let mut int_vectors: std::collections::HashMap<u32, (u32, u32)> =
+    let mut scalar_width: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut numeric_vectors: std::collections::HashMap<u32, (u32, u32)> =
         std::collections::HashMap::new();
     for inst in &module.types_global_values {
         match inst.class.opcode {
@@ -452,11 +455,11 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
                     pointee.insert(rid, *p);
                 }
             }
-            Op::TypeInt => {
+            Op::TypeInt | Op::TypeFloat => {
                 if let (Some(rid), Some(Operand::LiteralBit32(w))) =
                     (inst.result_id, inst.operands.first())
                 {
-                    int_width.insert(rid, *w);
+                    scalar_width.insert(rid, *w);
                 }
             }
             Op::TypeVector => {
@@ -466,13 +469,13 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
                     Some(Operand::LiteralBit32(count)),
                 ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
                 {
-                    int_vectors.insert(rid, (*component_ty, *count));
+                    numeric_vectors.insert(rid, (*component_ty, *count));
                 }
             }
             _ => {}
         }
     }
-    int_vectors.retain(|_, (component_ty, _)| int_width.contains_key(component_ty));
+    numeric_vectors.retain(|_, (component_ty, _)| scalar_width.contains_key(component_ty));
 
     // Synthesize one OpConstant per (scalar-int type, value) and repoint each targeted variable's
     // initializer at it. Allocate fresh ids above the current bound.
@@ -500,7 +503,7 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
         let scalar_ty = *pointee
             .get(&ptr_ty)
             .ok_or_else(|| format!("FC var %{vid}: pointer type %{ptr_ty} has no pointee"))?;
-        if let Some(&width) = int_width.get(&scalar_ty) {
+        if let Some(&width) = scalar_width.get(&scalar_ty) {
             let cid = int_constant_id(
                 scalar_ty,
                 width,
@@ -512,12 +515,12 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
             edits.push((vi, vec![cid], cid));
             continue;
         }
-        let Some(&(component_ty, count)) = int_vectors.get(&scalar_ty) else {
+        let Some(&(component_ty, count)) = numeric_vectors.get(&scalar_ty) else {
             return Err(format!(
-                "FC index {idx}: pointee %{scalar_ty} is not a scalar or vector integer type"
+                "FC index {idx}: pointee %{scalar_ty} is not a scalar or vector numeric type"
             ));
         };
-        let width = int_width[&component_ty];
+        let width = scalar_width[&component_ty];
         let lanes = fc_lanes_from_le_value(val, width, count);
         let mut const_ids = Vec::with_capacity(lanes.len() + 1);
         for lane in &lanes {
@@ -551,12 +554,17 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     }
 
     let requested: std::collections::HashSet<u32> = want.keys().copied().collect();
-    let applied: std::collections::HashSet<u32> = edits
+    let mut applied: std::collections::HashSet<u32> = edits
         .iter()
         .filter_map(|(vi, _, _)| module.types_global_values[*vi].result_id)
         .filter_map(|vid| var_index.get(&vid).copied())
         .collect();
-    let missing: Vec<u32> = requested.difference(&applied).copied().collect();
+    applied.extend(fc_defined_marker_indices(&module).values().copied());
+    let missing: Vec<u32> = requested
+        .difference(&applied)
+        .copied()
+        .filter(|index| want.get(index).copied().unwrap_or(0) != 0)
+        .collect();
     if !missing.is_empty() {
         return Err(format!(
             "specialize_function_constants: no MTL_FC_INIT global for FC index(es) {missing:?} \
@@ -622,6 +630,7 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     // for explicit harness/user-provided FC values.
     prune_static_fc_branches_and_drop_interface(&mut module);
     rewrite_thread_local_scalar_byte_subslot_stores(&mut module);
+    crate::passes::repair_specialized_workgroup_ptr_access_chains(&mut module);
 
     Ok(module
         .assemble()
@@ -1811,6 +1820,77 @@ mod tests {
 
         // Unknown index must error rather than silently no-op.
         assert!(specialize_function_constants(&bytes, &[(9, 1)]).is_err());
+    }
+
+    #[test]
+    fn value_specialization_materializes_float_fc_initializer_bits() {
+        let bytes = fixture_bytes(
+            5,
+            vec![
+                Instruction::new(
+                    Op::TypeFloat,
+                    None,
+                    Some(1),
+                    vec![Operand::LiteralBit32(32)],
+                ),
+                Instruction::new(
+                    Op::TypePointer,
+                    None,
+                    Some(2),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(1),
+                    ],
+                ),
+                Instruction::new(Op::ConstantNull, Some(1), Some(3), vec![]),
+                Instruction::new(
+                    Op::Variable,
+                    Some(2),
+                    Some(4),
+                    vec![
+                        Operand::StorageClass(StorageClass::Private),
+                        Operand::IdRef(3),
+                    ],
+                ),
+            ],
+            vec![name(4, "_Z5scale.MTL_FC_INIT_9_f")],
+        );
+
+        let bits = f32::to_bits(1.5) as u64;
+        let out = specialize_function_constants(&bytes, &[(9, bits)]).expect("specialize float");
+        let module = load_bytes(&out).expect("reload");
+        let initializer = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(4))
+            .and_then(|inst| inst.operands.get(1))
+            .and_then(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .expect("float initializer");
+        let constant = module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Constant && inst.result_id == Some(initializer))
+            .expect("float constant");
+        assert_eq!(constant.result_type, Some(1));
+        assert_eq!(constant.operands, vec![Operand::LiteralBit32(bits as u32)]);
+    }
+
+    #[test]
+    fn erased_zero_fc_override_is_a_safe_noop() {
+        let bytes = fixture_bytes(
+            2,
+            vec![Instruction::new(Op::TypeVoid, None, Some(1), vec![])],
+            vec![],
+        );
+
+        assert_eq!(
+            specialize_function_constants(&bytes, &[(7, 0)]).expect("zero no-op"),
+            bytes
+        );
+        assert!(specialize_function_constants(&bytes, &[(7, 1)]).is_err());
     }
 
     #[test]

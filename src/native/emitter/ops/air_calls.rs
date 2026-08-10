@@ -489,38 +489,6 @@ impl Emitter {
                 ));
                 Ok(true)
             }
-            "air.simd_broadcast_first.s.i32" | "air.simd_broadcast_first.u.i32" => {
-                // Broadcast the value held by the lowest active lane to every lane of the subgroup.
-                if call.args.len() != 1 {
-                    return Err(format!("native emitter: {} expects 1 operand", call.callee));
-                }
-                let result_ty = self.resolve_type(&call.ret)?;
-                if result_ty != LlType::Int(32) {
-                    return Err(format!(
-                        "native emitter: {} returned {result_ty:?}",
-                        call.callee
-                    ));
-                }
-                let value_ty = self.resolve_type(&call.args[0].ty)?;
-                if value_ty != LlType::Int(32) {
-                    return Err(format!(
-                        "native emitter: {} value is {value_ty:?}",
-                        call.callee
-                    ));
-                }
-                let result_type = self.type_id(&result_ty)?;
-                let result = self.result_id(name, &result_ty)?;
-                let value =
-                    self.value_id_in(&call.args[0].value, &call.args[0].ty, instructions)?;
-                let scope = self.const_uint(Scope::Subgroup as u32)?;
-                instructions.push(Self::inst(
-                    Op::GroupNonUniformBroadcastFirst,
-                    Some(result_type),
-                    Some(result),
-                    vec![Operand::IdScope(scope), Operand::IdRef(value)],
-                ));
-                Ok(true)
-            }
             "air.atomic.local.load.i32" | "air.atomic.global.load.i32" => {
                 if call.args.len() != 4 {
                     return Err(format!(

@@ -56,6 +56,9 @@ pub fn air_blob_for_oracle(source: &SourceFile) -> Result<Vec<u8>, String> {
     }
     #[cfg(target_os = "macos")]
     {
+        if let Some(path) = public_metal_source(source) {
+            return compile_metal_to_air(&path);
+        }
         metal_as_ll_to_air(source)
     }
     #[cfg(not(target_os = "macos"))]
@@ -65,6 +68,11 @@ pub fn air_blob_for_oracle(source: &SourceFile) -> Result<Vec<u8>, String> {
             source.label
         ))
     }
+}
+
+fn public_metal_source(source: &SourceFile) -> Option<PathBuf> {
+    let path = source.public_path.as_ref()?.with_extension("metal");
+    path.is_file().then_some(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -98,12 +106,7 @@ fn source_file_from_data(source: SourceData) -> SourceFile {
 #[cfg(target_os = "macos")]
 fn metal_as_ll_to_air(source: &SourceFile) -> Result<Vec<u8>, String> {
     let tmp = crate::scratch_dir_for("corpus-run-metal-as");
-    let mut text = source.air_ll.clone();
-    if !text.contains("!air.version") {
-        text.push_str(
-            "\n!air.version = !{!999001}\n!999001 = !{i32 1, i32 8, i32 0}\n!air.language_version = !{!999002}\n!999002 = !{!\"Metal\", i32 2, i32 0, i32 0}\n",
-        );
-    }
+    let text = ll_with_oracle_air_version(&source.air_ll);
     let in_ll = tmp.join("case.ll");
     let out_air = tmp.join("case.air");
     std::fs::write(&in_ll, text).map_err(|e| format!("write temp ll: {e}"))?;
@@ -126,6 +129,45 @@ fn metal_as_ll_to_air(source: &SourceFile) -> Result<Vec<u8>, String> {
     let bytes = std::fs::read(&out_air).map_err(|e| format!("read assembled air: {e}"))?;
     let _ = std::fs::remove_dir_all(&tmp);
     Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn compile_metal_to_air(path: &Path) -> Result<Vec<u8>, String> {
+    let tmp = crate::scratch_dir_for("corpus-run-metal-source");
+    let out_air = tmp.join("case.air");
+    let result = (|| {
+        let output = std::process::Command::new("xcrun")
+            .args([
+                "metal",
+                "-c",
+                path.to_str().ok_or("Metal source path utf8")?,
+                "-o",
+                out_air.to_str().ok_or("AIR output path utf8")?,
+            ])
+            .output()
+            .map_err(|e| format!("spawn metal: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "metal compile failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        std::fs::read(&out_air).map_err(|e| format!("read compiled AIR: {e}"))
+    })();
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+fn ll_with_oracle_air_version(ll: &str) -> String {
+    if ll.contains("!air.version") {
+        return ll.to_string();
+    }
+    let mut text = ll.to_string();
+    text.push_str(
+        "\n!air.version = !{!999001}\n!999001 = !{i32 1, i32 8, i32 0}\n!air.language_version = !{!999002}\n!999002 = !{!\"Metal\", i32 2, i32 0, i32 0}\n",
+    );
+    text
 }
 
 #[cfg(test)]
@@ -160,5 +202,29 @@ mod tests {
         assert!(ll.contains(metal2vulkan::tools::VULKAN_TRIPLE), "{ll}");
         assert!(!ll.contains("target datalayout"), "{ll}");
         assert!(!ll.contains("@llvm.global_ctors"), "{ll}");
+    }
+
+    #[test]
+    fn synthetic_ll_gets_matching_legacy_air_version_metadata() {
+        let text = ll_with_oracle_air_version("define void @k() { ret void }");
+        assert!(text.contains("!999001 = !{i32 1, i32 8, i32 0}"));
+        assert!(text.contains("!999002 = !{!\"Metal\", i32 2, i32 0, i32 0}"));
+
+        let existing = "!air.version = !{!0}\n!0 = !{i32 7, i32 0, i32 0}";
+        assert_eq!(ll_with_oracle_air_version(existing), existing);
+    }
+
+    #[test]
+    fn public_ll_can_select_an_owned_metal_oracle_source() {
+        let public_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/public/kernel_store_const.ll");
+        let mut source = source_with_ll("define void @store_const() { ret void }");
+        source.public_path = Some(public_path);
+        assert_eq!(
+            public_metal_source(&source)
+                .and_then(|path| path.file_name().map(|name| name.to_owned()))
+                .as_deref(),
+            Some(std::ffi::OsStr::new("kernel_store_const.metal"))
+        );
     }
 }

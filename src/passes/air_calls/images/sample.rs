@@ -93,6 +93,7 @@ pub(in crate::passes) fn lower_sample(
                     args,
                     lod,
                     sample_v4,
+                    false,
                     &mut out,
                 )?;
                 return finish_sample_result(ctx, res, rty, color, sample_v4, out);
@@ -128,14 +129,33 @@ pub(in crate::passes) fn lower_sample(
             return finish_sample_result(ctx, res, rty, color, sample_v4, out);
         }
     }
-    if ctx
+    if let Some(sampler_state) = ctx
         .sampler_states
         .get(&samp)
-        .is_some_and(|state| state.uses_bicubic_filter())
+        .copied()
+        .filter(|state| state.uses_bicubic_filter())
     {
+        if comp == crate::passes::ImageComp::Float && dim == Dim::Dim2D {
+            let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
+                Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
+                None => ctx.const_uint(0),
+            };
+            let color = lower_pixel_bicubic_sample(
+                ctx,
+                sampler_state,
+                img,
+                arrayed,
+                coord,
+                args,
+                lod,
+                sample_v4,
+                true,
+                &mut out,
+            )?;
+            return finish_sample_result(ctx, res, rty, color, sample_v4, out);
+        }
         return Err(
-            "air.sample_texture bicubic filtering is supported only for pixel-coordinate 2D float textures"
-                .into(),
+            "air.sample_texture bicubic filtering is supported only for 2D float textures".into(),
         );
     }
     if is_int_tex {
@@ -254,6 +274,7 @@ fn lower_pixel_bicubic_sample(
     args: &[Word],
     lod: Word,
     sample_v4: Word,
+    normalized_coordinates: bool,
     out: &mut Vec<Instruction>,
 ) -> Result<Word, String> {
     let (offset, dynamic_offset) = sample_const_or_dynamic_offset(ctx, arrayed, args, 2)?;
@@ -284,6 +305,32 @@ fn lower_pixel_bicubic_sample(
     {
         let Operand::IdRef(component) = component else {
             return Err("air.sample_texture bicubic coord component is not an id".into());
+        };
+        let component = if normalized_coordinates {
+            let extent = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::CompositeExtract,
+                Some(ctx.ty_uint()),
+                Some(extent),
+                vec![Operand::IdRef(size), Operand::LiteralBit32(axis as u32)],
+            ));
+            let extent_f = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::ConvertUToF,
+                Some(float_ty),
+                Some(extent_f),
+                vec![Operand::IdRef(extent)],
+            ));
+            let pixel_component = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::FMul,
+                Some(float_ty),
+                Some(pixel_component),
+                vec![Operand::IdRef(component), Operand::IdRef(extent_f)],
+            ));
+            pixel_component
+        } else {
+            component
         };
         let component =
             clamp_pixel_coord_component_finite(ctx, component, size, true, axis as u32, out);
@@ -842,4 +889,94 @@ pub(in crate::passes) fn finish_sample_result(
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::Module;
+
+    #[test]
+    fn normalized_bicubic_scales_coordinates_and_emits_sixteen_fetches() {
+        let mut ctx = Ctx::new(Module::new());
+        let image_ty = ctx.ty_image(Dim::Dim2D, false, crate::passes::ImageComp::Float);
+        let image = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Undef,
+            Some(image_ty),
+            Some(image),
+            vec![],
+        ));
+        let coord_ty = ctx.ty_vecf(2);
+        let x = ctx.const_float(0.25);
+        let y = ctx.const_float(0.75);
+        let coord = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::ConstantComposite,
+            Some(coord_ty),
+            Some(coord),
+            vec![Operand::IdRef(x), Operand::IdRef(y)],
+        ));
+        let sample_v4 = ctx.ty_vech(4);
+        let lod = ctx.const_uint(0);
+        let sampler_state = StaticSamplerState::from_air_words([34901797601023049, 0])
+            .expect("normalized bicubic AIR sampler state");
+        assert!(sampler_state.uses_bicubic_filter());
+        assert!(!sampler_state.uses_pixel_coordinates());
+
+        let mut out = Vec::new();
+        lower_pixel_bicubic_sample(
+            &mut ctx,
+            sampler_state,
+            image,
+            false,
+            coord,
+            &[image, 0, coord],
+            lod,
+            sample_v4,
+            true,
+            &mut out,
+        )
+        .expect("normalized bicubic lowering");
+
+        assert_eq!(
+            out.iter()
+                .filter(|inst| inst.class.opcode == Op::ImageFetch)
+                .count(),
+            16
+        );
+        let size_ids = out
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::ImageQuerySizeLod)
+            .filter_map(|inst| inst.result_id)
+            .collect::<HashSet<_>>();
+        let extent_float_ids = out
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::ConvertUToF)
+            .filter(|inst| {
+                let Some(Operand::IdRef(source)) = inst.operands.first() else {
+                    return false;
+                };
+                out.iter().any(|candidate| {
+                    candidate.result_id == Some(*source)
+                        && candidate.class.opcode == Op::CompositeExtract
+                        && matches!(candidate.operands.first(), Some(Operand::IdRef(id)) if size_ids.contains(id))
+                })
+            })
+            .filter_map(|inst| inst.result_id)
+            .collect::<HashSet<_>>();
+        let scaled_extent_ids = extent_float_ids
+            .iter()
+            .filter(|extent| {
+                out.iter().any(|inst| {
+                    inst.class.opcode == Op::FMul
+                        && inst
+                            .operands
+                            .iter()
+                            .any(|operand| operand == &Operand::IdRef(**extent))
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scaled_extent_ids.len(), 2);
+    }
 }

@@ -31,6 +31,25 @@ use std::collections::{HashMap, HashSet};
 /// not a product semantic contract. Keep it large enough for bounded harness work but small enough
 /// that runaway SIMT reductions do not run into the corpus worker's wall timeout.
 pub const LOOP_BUDGET_BACKEDGES: i32 = 1 << 12;
+/// Maximum conservative source-instruction visits admitted for an unmodified semantic Metal
+/// oracle submission. Semantic oracle work cannot be cancelled after command-buffer commit.
+pub const SEMANTIC_ORACLE_MAX_SOURCE_INSTRUCTION_VISITS: u128 = 50_000_000;
+/// Maximum module-wide CFG branch terminators accepted by the semantic-oracle work proof. The
+/// structurizer's graph analysis can require quadratic memory on very large harvested functions,
+/// so refuse those modules before constructing CFGs in the non-cancellable GPU safety path.
+pub const SEMANTIC_ORACLE_MAX_CFG_BRANCHES: usize = 64;
+
+pub fn semantic_oracle_cfg_is_within_analysis_limit(module_text: &str) -> bool {
+    module_text
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("br ") || line.starts_with("switch ")
+        })
+        .take(SEMANTIC_ORACLE_MAX_CFG_BRANCHES + 1)
+        .count()
+        <= SEMANTIC_ORACLE_MAX_CFG_BRANCHES
+}
 /// Cap used only when reproducing an already-banked semantic `plan_version < 3` Metal golden.
 /// Historic `compare=none` rows are non-semantic and always use the safer cap above before they are
 /// quarantined; their smoke bytes do not justify replaying the older, much larger budget.
@@ -185,6 +204,111 @@ pub fn reachable_module_has_cfg_cycle_with_loop_input_facts(
         .iter()
         .filter(|function| reachable.contains(function.name.as_str()))
         .any(|function| !function.back_edges.is_empty()))
+}
+
+/// Conservatively bound source-instruction visits for one entry invocation when every reachable
+/// CFG cycle has a structurally proven trip count of at most 256.
+///
+/// Static callees are expanded once per call site, then every preserved reachable backedge adds a
+/// factor of 257 (the initial visit plus 256 backedges). This deliberately overcounts sequential
+/// loops. Recursion, an unproven cycle, arithmetic overflow, or a cyclic module containing a
+/// Workgroup barrier returns `None` and remains forbidden for semantic GPU submission.
+pub fn semantic_oracle_work_upper_bound_with_loop_input_facts(
+    module_text: &str,
+    entry: &str,
+    input_facts: LoopInputFacts<'_>,
+) -> Result<Option<u128>, String> {
+    if !semantic_oracle_cfg_is_within_analysis_limit(module_text) {
+        return Ok(None);
+    }
+    let lines = module_text.lines().collect::<Vec<_>>();
+    let funcs = find_functions(&lines);
+    if funcs.is_empty() {
+        return Ok(Some(lines.len() as u128));
+    }
+    let facts = LoopFacts::from_module(&lines, &input_facts);
+    let preserved = funcs
+        .iter()
+        .map(|function| parse_func_preserving_loops(&lines, function, &facts))
+        .collect::<Result<Vec<_>, _>>()?;
+    let elided = funcs
+        .iter()
+        .map(|function| parse_func(&lines, function, &facts))
+        .collect::<Result<Vec<_>, _>>()?;
+    let reachable = reachable_functions_from_entry(&preserved, entry);
+    let backedges = preserved
+        .iter()
+        .filter(|function| reachable.contains(function.name.as_str()))
+        .map(|function| function.back_edges.len())
+        .sum::<usize>();
+    if backedges > 0 && module_text.contains("air.wg.barrier") {
+        return Ok(None);
+    }
+    if elided
+        .iter()
+        .filter(|function| reachable.contains(function.name.as_str()))
+        .any(|function| !function.back_edges.is_empty())
+    {
+        return Ok(None);
+    }
+
+    let spans = funcs
+        .iter()
+        .map(|function| (function.name.as_str(), function))
+        .collect::<HashMap<_, _>>();
+    let parsed = preserved
+        .iter()
+        .map(|function| (function.name.as_str(), function))
+        .collect::<HashMap<_, _>>();
+    let Some(entry_name) = preserved
+        .iter()
+        .find(|function| function_symbol_matches_entry(&function.name, entry))
+        .map(|function| function.name.as_str())
+    else {
+        return Ok(None);
+    };
+    let Some(static_visits) = expanded_static_instruction_visits(
+        entry_name,
+        &spans,
+        &parsed,
+        &mut HashMap::new(),
+        &mut HashSet::new(),
+    ) else {
+        return Ok(None);
+    };
+    let Some(loop_multiplier) = (0..backedges).try_fold(1_u128, |value, _| value.checked_mul(257))
+    else {
+        return Ok(None);
+    };
+    Ok(static_visits.checked_mul(loop_multiplier))
+}
+
+fn expanded_static_instruction_visits<'a>(
+    function: &'a str,
+    spans: &HashMap<&'a str, &'a FuncSpan>,
+    parsed: &HashMap<&'a str, &'a ParsedFunc>,
+    memo: &mut HashMap<&'a str, u128>,
+    visiting: &mut HashSet<&'a str>,
+) -> Option<u128> {
+    if let Some(value) = memo.get(function) {
+        return Some(*value);
+    }
+    if !visiting.insert(function) {
+        return None;
+    }
+    let span = spans.get(function)?;
+    let body_lines = span.close_idx.saturating_sub(span.define_idx).max(1) as u128;
+    let mut visits = body_lines;
+    for callee in &parsed.get(function)?.calls {
+        if spans.contains_key(callee.as_str()) {
+            visits = visits.checked_add(expanded_static_instruction_visits(
+                callee, spans, parsed, memo, visiting,
+            )?)?;
+        }
+    }
+    visiting.remove(function);
+    memo.insert(function, visits);
+    Some(visits)
 }
 
 /// Classify and instrument using an explicit back-edge cap. This exists so candidate runners can
@@ -7363,6 +7487,123 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
             ),
             Ok(true),
             "semantic safety gate must retain even proven finite CFG cycles"
+        );
+    }
+
+    #[test]
+    fn semantic_oracle_work_bound_accepts_a_small_fixed_trip_loop() {
+        let ll = "\
+define void @fixed(ptr addrspace(1) %0) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %next = add nuw i32 %i, 1
+  %done = icmp eq i32 %next, 4
+  br i1 %done, label %exit, label %loop
+exit:
+  ret void
+}
+";
+        let bound = semantic_oracle_work_upper_bound_with_loop_input_facts(
+            ll,
+            "fixed",
+            LoopInputFacts::default(),
+        )
+        .expect("small fixed loop should parse")
+        .expect("small fixed loop should have a finite work bound");
+        assert!(bound > 0);
+        assert!(bound <= SEMANTIC_ORACLE_MAX_SOURCE_INSTRUCTION_VISITS);
+    }
+
+    #[test]
+    fn semantic_oracle_work_bound_rejects_an_unproven_loop() {
+        let ll = "\
+define void @spin(ptr addrspace(1) %0) {
+entry:
+  br label %loop
+loop:
+  br label %loop
+}
+";
+        assert_eq!(
+            semantic_oracle_work_upper_bound_with_loop_input_facts(
+                ll,
+                "spin",
+                LoopInputFacts::default(),
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn semantic_oracle_work_bound_rejects_barriers_in_cyclic_modules() {
+        let ll = "\
+define void @fixed(ptr addrspace(1) %0) {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %loop ]
+  %next = add nuw i32 %i, 1
+  %done = icmp eq i32 %next, 4
+  br i1 %done, label %exit, label %loop
+exit:
+  call void @air.wg.barrier(i32 2, i32 1)
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+";
+        assert_eq!(
+            semantic_oracle_work_upper_bound_with_loop_input_facts(
+                ll,
+                "fixed",
+                LoopInputFacts::default(),
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn semantic_oracle_work_bound_rejects_recursive_call_graphs() {
+        let ll = "\
+define void @entry(ptr addrspace(1) %0) {
+  call void @helper(ptr addrspace(1) %0)
+  ret void
+}
+
+define void @helper(ptr addrspace(1) %0) {
+  call void @entry(ptr addrspace(1) %0)
+  ret void
+}
+";
+        assert_eq!(
+            semantic_oracle_work_upper_bound_with_loop_input_facts(
+                ll,
+                "entry",
+                LoopInputFacts::default(),
+            ),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn semantic_oracle_work_bound_rejects_oversized_cfg_before_parsing() {
+        let mut ll = String::from("define void @large() {\nentry:\n  br label %b0\n");
+        for index in 0..SEMANTIC_ORACLE_MAX_CFG_BRANCHES {
+            ll.push_str(&format!("b{index}:\n  br label %b{}\n", index + 1));
+        }
+        ll.push_str(&format!(
+            "b{}:\n  ret void\n}}\n",
+            SEMANTIC_ORACLE_MAX_CFG_BRANCHES
+        ));
+        assert_eq!(
+            semantic_oracle_work_upper_bound_with_loop_input_facts(
+                &ll,
+                "large",
+                LoopInputFacts::default(),
+            ),
+            Ok(None)
         );
     }
 
