@@ -340,6 +340,177 @@ pub fn translate_passthrough(src: &str, tmp: &Path) -> Result<Vec<u8>, String> {
     assemble_spvasm(&asm, tmp, "passthrough")
 }
 
+fn vertex_observer_fragment_spvasm(
+    meta: &meta::VertMeta,
+    varying_location: Option<u32>,
+) -> Result<String, String> {
+    let varying = varying_location
+        .map(|location| -> Result<(u32, PassTy), String> {
+            let name = meta.output_varying_type(location).ok_or_else(|| {
+                format!("vertex observer: missing type for varying location {location}")
+            })?;
+            Ok((location, passthrough_type(name)?))
+        })
+        .transpose()?;
+    let ty = varying
+        .as_ref()
+        .map(|(_, ty)| ty.clone())
+        .unwrap_or(PassTy {
+            spirv: "v4float".into(),
+            base: "float",
+            lanes: 4,
+        });
+    let output_base = match ty.base {
+        "float" | "half" => "float",
+        "int" | "short" => "int",
+        "uint" | "ushort" | "bool" => "uint",
+        _ => {
+            return Err(format!(
+                "vertex observer: unsupported type base {}",
+                ty.base
+            ))
+        }
+    };
+    let output_ty = format!("v4{output_base}");
+    let mut p = Vec::new();
+    if ty.base == "half" {
+        p.push("OpCapability Float16".into());
+    }
+    if ty.is_int16() {
+        p.push("OpCapability Int16".into());
+    }
+    p.push("OpCapability Shader".into());
+    p.push("OpMemoryModel Logical GLSL450".into());
+    p.push("OpEntryPoint Fragment %main \"main\" %vin %color".into());
+    p.push("OpExecutionMode %main OriginUpperLeft".into());
+    match varying.as_ref() {
+        Some((location, ty)) => {
+            p.push(format!("OpDecorate %vin Location {location}"));
+            if ty.needs_flat() {
+                p.push("OpDecorate %vin Flat".into());
+            }
+        }
+        None => p.push("OpDecorate %vin BuiltIn FragCoord".into()),
+    }
+    p.push("OpDecorate %color Location 0".into());
+    p.push("%void = OpTypeVoid".into());
+    p.push("%fnty = OpTypeFunction %void".into());
+    p.push("%float = OpTypeFloat 32".into());
+    p.push("%int = OpTypeInt 32 1".into());
+    p.push("%uint = OpTypeInt 32 0".into());
+    if ty.base == "half" {
+        p.push("%half = OpTypeFloat 16".into());
+    }
+    if ty.is_int16() {
+        p.push("%short = OpTypeInt 16 1".into());
+        p.push("%ushort = OpTypeInt 16 0".into());
+    }
+    for lanes in 2..=4 {
+        p.push(format!("%v{lanes}float = OpTypeVector %float {lanes}"));
+        p.push(format!("%v{lanes}int = OpTypeVector %int {lanes}"));
+        p.push(format!("%v{lanes}uint = OpTypeVector %uint {lanes}"));
+        if ty.base == "half" {
+            p.push(format!("%v{lanes}half = OpTypeVector %half {lanes}"));
+        }
+        if ty.is_int16() {
+            p.push(format!("%v{lanes}short = OpTypeVector %short {lanes}"));
+            p.push(format!("%v{lanes}ushort = OpTypeVector %ushort {lanes}"));
+        }
+    }
+    p.push(format!(
+        "%_ptr_Input_value = OpTypePointer Input %{}",
+        ty.spirv
+    ));
+    p.push(format!(
+        "%_ptr_Output_color = OpTypePointer Output %{output_ty}"
+    ));
+    p.push("%float_0 = OpConstant %float 0".into());
+    p.push("%float_1 = OpConstant %float 1".into());
+    p.push("%int_0 = OpConstant %int 0".into());
+    p.push("%int_1 = OpConstant %int 1".into());
+    p.push("%uint_0 = OpConstant %uint 0".into());
+    p.push("%uint_1 = OpConstant %uint 1".into());
+    p.push("%vin = OpVariable %_ptr_Input_value Input".into());
+    p.push("%color = OpVariable %_ptr_Output_color Output".into());
+    p.push("%main = OpFunction %void None %fnty".into());
+    p.push("%entry = OpLabel".into());
+    p.push(format!("%loaded = OpLoad %{} %vin", ty.spirv));
+    let converted = match ty.base {
+        "half" => {
+            let destination = if ty.lanes == 1 {
+                "%float".to_string()
+            } else {
+                format!("%v{}float", ty.lanes)
+            };
+            p.push(format!("%converted = OpFConvert {destination} %loaded"));
+            "%converted"
+        }
+        "short" | "ushort" => {
+            let destination = if ty.lanes == 1 {
+                format!("%{output_base}")
+            } else {
+                format!("%v{}{output_base}", ty.lanes)
+            };
+            let opcode = if ty.base == "short" {
+                "OpSConvert"
+            } else {
+                "OpUConvert"
+            };
+            p.push(format!("%converted = {opcode} {destination} %loaded"));
+            "%converted"
+        }
+        _ => "%loaded",
+    };
+    if ty.lanes == 4 && matches!(ty.base, "float" | "int" | "uint" | "bool") {
+        p.push(format!("OpStore %color {converted}"));
+    } else {
+        let scalar_ty = format!("%{output_base}");
+        let mut components = Vec::new();
+        for lane in 0..ty.lanes {
+            if ty.lanes == 1 {
+                components.push(converted.to_string());
+            } else {
+                let id = format!("%component{lane}");
+                p.push(format!(
+                    "{id} = OpCompositeExtract {scalar_ty} {converted} {lane}"
+                ));
+                components.push(id);
+            }
+        }
+        let zero = format!("%{output_base}_0");
+        let one = format!("%{output_base}_1");
+        while components.len() < 3 {
+            components.push(zero.clone());
+        }
+        while components.len() < 4 {
+            components.push(one.clone());
+        }
+        p.push(format!(
+            "%observed = OpCompositeConstruct %{output_ty} {}",
+            components.join(" ")
+        ));
+        p.push("OpStore %color %observed".into());
+    }
+    p.push("OpReturn".into());
+    p.push("OpFunctionEnd".into());
+    Ok(p.join("\n") + "\n")
+}
+
+/// Generate a fragment shader that writes one vertex-stage output into color attachment zero.
+/// `varying_location=None` observes the rasterized position consequence; `Some(location)` observes
+/// that user varying and pads it to a four-component attachment value.
+pub fn translate_vertex_observer(
+    src: &str,
+    varying_location: Option<u32>,
+    tmp: &Path,
+) -> Result<Vec<u8>, String> {
+    let san_ll = passthrough_sanitized_ll(src, tmp)?;
+    let vert = meta::parse_air_vertex_meta(&san_ll)
+        .ok_or_else(|| "vertex observer: source has no !air.vertex metadata".to_string())?;
+    let asm = vertex_observer_fragment_spvasm(&vert, varying_location)?;
+    assemble_spvasm(&asm, tmp, "vertex-observer")
+}
+
 fn fragment_requires_distinct_float3_inputs(ll: &str) -> bool {
     ll.lines()
         .filter(|line| {
@@ -474,5 +645,32 @@ declare float @air.fast_rsqrt.f32(float)
             "{asm}"
         );
         assert!(asm.contains("OpStore %viewport %uint_0"), "{asm}");
+    }
+
+    #[test]
+    fn vertex_observer_pads_float2_into_rgba32_float() {
+        let mut vert = meta::VertMeta::default();
+        vert.output_roles.push(meta::VertOutRole::Varying(3));
+        vert.output_varying_types.insert(3, "float2".into());
+        let asm = vertex_observer_fragment_spvasm(&vert, Some(3)).unwrap();
+        assert!(asm.contains("OpDecorate %vin Location 3"), "{asm}");
+        assert!(asm.contains(
+            "%observed = OpCompositeConstruct %v4float %component0 %component1 %float_0 %float_1"
+        ));
+    }
+
+    #[test]
+    fn vertex_observer_uses_flat_integer_input_and_uint_attachment() {
+        let mut vert = meta::VertMeta::default();
+        vert.output_roles.push(meta::VertOutRole::Varying(1));
+        vert.output_varying_types.insert(1, "ushort".into());
+        let asm = vertex_observer_fragment_spvasm(&vert, Some(1)).unwrap();
+        assert!(asm.contains("OpCapability Int16"), "{asm}");
+        assert!(asm.contains("OpDecorate %vin Flat"), "{asm}");
+        assert!(
+            asm.contains("%converted = OpUConvert %uint %loaded"),
+            "{asm}"
+        );
+        assert!(asm.contains("%_ptr_Output_color = OpTypePointer Output %v4uint"));
     }
 }

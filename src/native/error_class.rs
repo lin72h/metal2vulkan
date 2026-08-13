@@ -131,6 +131,31 @@ pub fn is_pointer_typing_emit_error(err: &str) -> bool {
         || err.contains("cannot store through reinterpreted pointer select")
 }
 
+/// Whether emission reached a deferred cross-storage pointer select at an opaque consumer (most
+/// commonly an internal-helper argument). Logical SPIR-V cannot materialize one pointer value for
+/// arms in different storage classes; the typed helper-inlining tier preserves the deferred carrier
+/// across the former parameter boundary and replays its loads in the value domain.
+pub fn is_deferred_pointer_materialization_emit_error(err: &str) -> bool {
+    err.contains("selected pointer") && err.contains("missing metadata")
+}
+
+pub fn deferred_pointer_materialization_name(err: &str) -> Option<String> {
+    let rest = err.split_once("selected pointer ")?.1;
+    let name = rest.split_once(" missing metadata")?.0;
+    if name.is_empty() {
+        return None;
+    }
+    // CFG cross-arm cloning names a cloned SSA value `%xa<fresh-id>_<source-name>`. Retry input is
+    // the pre-structurization AIR text, so carry the structural source suffix back across that
+    // boundary. Ordinary names pass through unchanged.
+    let source = name
+        .strip_prefix("%xa")
+        .and_then(|rest| rest.split_once('_'))
+        .filter(|(id, _)| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(name.to_string(), |(_, source)| format!("%{source}"));
+    Some(source)
+}
+
 /// Whether a native-emitter error came from the typed straight-line body dispatcher after it failed
 /// to find a migrated lowering/carrier for one instruction. CFG-only retry feeds cannot repair this
 /// class: they change structured merge handling around already-emitted blocks, but this error occurs
@@ -144,7 +169,7 @@ pub fn is_graph_walk_unmigrated_emit_error(err: &str) -> bool {
 /// relooper retry tiers can restructure. Used by [`classify_validation_error`] to route a rejected
 /// module to the `CfgStructurization` cascade; a false positive only wastes a retry that is discarded
 /// unless it independently validates. Anything pointer/parser/intrinsic-shaped returns false so the
-/// cfg retry stays off that path. The needle set is spirv-val phrasings only: the legacy emit-error
+/// cfg retry stays off that path. The needle set is spirv-val phrasings only: retired emit-error
 /// `cost budget` / `clone budget` needles were deleted at cleanup-plan S2 (the repair roster that
 /// produced them died at W4, and [`classify_emit_error`] no longer consults this predicate).
 pub fn is_cfg_structurization_error(err: &str) -> bool {
@@ -176,7 +201,7 @@ pub fn is_cfg_structurization_error(err: &str) -> bool {
 }
 
 /// Whether a spirv-val error is the illegal-logical-pointer-`OpPhi` rejection the M4 phi-the-index
-/// rewrite ([`rewrite_logical_pointer_phis_retry_module`]) targets: a pointer `OpPhi`/`OpSelect` in
+/// rewrite (`rewrite_logical_pointer_phis_retry_module`) targets: a pointer `OpPhi`/`OpSelect` in
 /// a storage class `VariablePointers` cannot cover (Private/UniformConstant/Function). Used by
 /// `lib.rs`'s retry to route a rejected module to the rewrite; a false positive only wastes a retry
 /// that is discarded unless the rewrite independently validates.
@@ -185,7 +210,8 @@ pub fn is_logical_pointer_phi_error(err: &str) -> bool {
 }
 
 /// Whether a spirv-val error is the cross-binding pointer-merge rejection the W1 PhysicalStorageBuffer64
-/// rewrite ([`rewrite_cross_binding_pointer_merges_bytes`]) targets: an `OpSelect`/`OpPhi` over pointers
+/// rewrite ([`crate::native::rewrite_cross_binding_pointer_merges_bytes`]) targets: an
+/// `OpSelect`/`OpPhi` over pointers
 /// from DISTINCT descriptor bindings, illegal under Logical addressing ("Variable pointers must point
 /// into the same structure"). Used by `lib.rs`'s retry to route a rejected module to the PSB rewrite; a
 /// false positive only wastes a retry that is discarded unless the rewrite independently validates.
@@ -259,6 +285,8 @@ pub fn classify_validation_error(err: &str) -> ValidationClass {
 /// *validation*, routing through the validation-side cfg cascade instead.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EmitErrorClass {
+    /// Deferred cross-storage pointer consumed across a helper boundary.
+    DeferredPointerMaterialization,
     /// Buffer/pointer-typing gap the raw byte model can express — [`is_pointer_typing_emit_error`].
     PointerTyping,
     /// Any other emit failure.
@@ -268,7 +296,9 @@ pub enum EmitErrorClass {
 /// Classify a native-emitter emit `Err` into its [`EmitErrorClass`]. Equivalent, arm-for-arm, to the
 /// ordered `Err(emit_err) if is_*(emit_err)` guard chain it replaces.
 pub fn classify_emit_error(err: &str) -> EmitErrorClass {
-    if is_pointer_typing_emit_error(err) {
+    if is_deferred_pointer_materialization_emit_error(err) {
+        EmitErrorClass::DeferredPointerMaterialization
+    } else if is_pointer_typing_emit_error(err) {
         EmitErrorClass::PointerTyping
     } else {
         EmitErrorClass::Other

@@ -1,7 +1,8 @@
 # Owned SPIR-V binary parser
 
 This directory owns metal2vulkan's serialized SPIR-V grammar and parser boundary for the
-locked **SPIR-V 1.4.341** core grammar (matching the direct `spirv` 0.4.0 dependency).
+SPIR-V core grammar shipped by **Vulkan SDK 1.4.341** (matching the direct `spirv` 0.4.0
+dependency).
 
 ## Generated tables
 

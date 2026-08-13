@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-/// A reconstructed AIR aggregate type, built from a buffer's `air.struct_type_info` metadata. Used to
-/// rebuild the ORIGINAL struct for a buffer the llc Vulkan backend collapsed into a bare element
+/// A reconstructed AIR aggregate type built from a buffer's `air.struct_type_info` metadata. It
+/// restores the source layout when an emitted buffer parameter is represented as a bare element
 /// pointer (homogeneous/nested aggregates → `T*` with physical/multi-level access chains). The
-/// collapsed access-chain indices are valid struct-navigation indices for this reconstructed type.
+/// access-chain indices are valid struct-navigation indices for this reconstructed type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum AirType {

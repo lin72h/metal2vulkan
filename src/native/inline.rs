@@ -23,7 +23,51 @@ use std::collections::{HashMap, HashSet};
 /// Inline every eligible direct call to a module-local `internal` helper, transitively, to a
 /// fixpoint. Returns the module text unchanged when nothing is eligible or any difficulty is hit.
 pub(super) fn inline_nonrecursive_internal_calls(san_ll: &str) -> String {
-    match try_inline(san_ll) {
+    match try_inline(san_ll, None) {
+        Some(out) => out,
+        None => san_ll.to_string(),
+    }
+}
+
+/// Inline only internal helpers that directly consume the result of a pointer `select`. This is the
+/// bounded repair for a deferred cross-storage pointer reaching a call boundary: it removes exactly
+/// that opaque consumer so ordinary selected-pointer load/store replay can operate inside the cloned
+/// helper body, without expanding the rest of a large module's internal call graph.
+pub(super) fn inline_pointer_select_consumer(
+    san_ll: &str,
+    entry_name: Option<&str>,
+    selected_pointer: &str,
+) -> String {
+    let Some(items) = parse_items(san_ll) else {
+        return san_ll.to_string();
+    };
+    let mut targets = HashSet::new();
+    for item in &items {
+        let Item::Func(function) = item else {
+            continue;
+        };
+        if let Some(entry_name) = entry_name {
+            let Some(signature) = parse_def_header(&function.header) else {
+                continue;
+            };
+            if signature.name.trim_start_matches('@') != entry_name {
+                continue;
+            }
+        }
+        for call in function.body.iter().filter_map(|line| parse_call(line)) {
+            if call
+                .args
+                .iter()
+                .any(|argument| argument == selected_pointer)
+            {
+                targets.insert(call.callee);
+            }
+        }
+    }
+    if targets.is_empty() {
+        return san_ll.to_string();
+    }
+    match try_inline(san_ll, Some((&targets, selected_pointer))) {
         Some(out) => out,
         None => san_ll.to_string(),
     }
@@ -608,7 +652,7 @@ fn preceded_by_label_keyword(out: &str) -> bool {
 
 /// The whole pass, in the fallible `Option` domain so any bail returns `None` and the caller keeps
 /// the input verbatim.
-fn try_inline(san_ll: &str) -> Option<String> {
+fn try_inline(san_ll: &str, targets: Option<(&HashSet<String>, &str)>) -> Option<String> {
     let items = parse_items(san_ll)?;
 
     // Collect the internal-function table: name -> (signature, body). Only `define internal`.
@@ -618,7 +662,9 @@ fn try_inline(san_ll: &str) -> Option<String> {
         if let Item::Func(f) = it {
             has_any_func = true;
             let sig = parse_def_header(&f.header)?;
-            if sig.internal {
+            if sig.internal
+                && targets.is_none_or(|(targets, _selected)| targets.contains(&sig.name))
+            {
                 // Every param must name a value for us to substitute; reject varargs/unnamed.
                 if sig.params.iter().any(|p| p.is_empty()) {
                     // Un-inlinable internal fn: keep it in the table only as a non-target by NOT
@@ -668,7 +714,12 @@ fn try_inline(san_ll: &str) -> Option<String> {
         match it {
             Item::Raw(r) => out_items.push(Item::Raw(r)),
             Item::Func(f) => {
-                let new_body = inline_body_to_fixpoint(f.body, &internal, &mut counter)?;
+                let new_body = inline_body_to_fixpoint(
+                    f.body,
+                    &internal,
+                    &mut counter,
+                    targets.map(|(_, selected)| selected),
+                )?;
                 out_items.push(Item::Func(FuncBlock {
                     header: f.header,
                     body: new_body,
@@ -717,7 +768,12 @@ fn drop_dead_internal_functions(items: Vec<Item>) -> Vec<Item> {
                         Some(s) => s,
                         None => continue,
                     };
-                    if sig.internal && !live.contains(&sig.name) {
+                    // AIR static constructors are implicit emitter roots: their calls are injected
+                    // after function emission and therefore do not appear in the textual IR. Keep
+                    // them live during this source-level helper sweep so targeted inlining cannot
+                    // silently discard function-constant/default-state initialization.
+                    let implicit_constructor_root = sig.name.starts_with("@_GLOBAL__sub_I");
+                    if sig.internal && !implicit_constructor_root && !live.contains(&sig.name) {
                         continue; // a not-yet-live internal fn does not propagate references
                     }
                     (f.body.as_slice(), Some(sig.name))
@@ -741,7 +797,9 @@ fn drop_dead_internal_functions(items: Vec<Item>) -> Vec<Item> {
         .into_iter()
         .filter(|it| match it {
             Item::Func(f) => match parse_def_header(&f.header) {
-                Some(sig) if sig.internal => live.contains(&sig.name),
+                Some(sig) if sig.internal => {
+                    sig.name.starts_with("@_GLOBAL__sub_I") || live.contains(&sig.name)
+                }
                 _ => true,
             },
             _ => true,
@@ -851,12 +909,13 @@ fn inline_body_to_fixpoint(
     mut body: Vec<String>,
     internal: &HashMap<String, (DefSig, Vec<String>)>,
     counter: &mut usize,
+    selected_pointer: Option<&str>,
 ) -> Option<Vec<String>> {
     // A generous bound to guarantee termination even if something pathological slips past the cycle
     // check; acyclic transitive inlining is finite, this only guards against bugs.
     let mut budget = 100_000usize;
     loop {
-        let Some(idx) = find_inlinable_call(&body, internal) else {
+        let Some(idx) = find_inlinable_call(&body, internal, selected_pointer) else {
             return Some(body);
         };
         body = inline_one(body, idx, internal, counter)?;
@@ -871,10 +930,14 @@ fn inline_body_to_fixpoint(
 fn find_inlinable_call(
     body: &[String],
     internal: &HashMap<String, (DefSig, Vec<String>)>,
+    selected_pointer: Option<&str>,
 ) -> Option<usize> {
     for (i, line) in body.iter().enumerate() {
         if let Some(c) = parse_call(line) {
-            if internal.contains_key(&c.callee) {
+            if internal.contains_key(&c.callee)
+                && selected_pointer
+                    .is_none_or(|selected| c.args.iter().any(|argument| argument == selected))
+            {
                 return Some(i);
             }
         }
@@ -1668,5 +1731,52 @@ merge:
             !out.contains("[ %pre, %bcall ]"),
             "stale %bcall phi predecessor survived:\n{out}"
         );
+    }
+
+    #[test]
+    fn pointer_select_consumer_inline_is_bounded_to_the_consuming_helper() {
+        let src = r#"
+@fallback = internal addrspace(2) global i32 0
+@fc_default = internal addrspace(2) global i8 0
+
+define internal void @_GLOBAL__sub_I_defaults() section "air.static_init" {
+entry:
+  store i8 1, ptr addrspace(2) @fc_default
+  ret void
+}
+
+define internal i32 @consume(ptr addrspace(2) %pointer, i1 %branch) {
+entry:
+  br i1 %branch, label %left, label %right
+left:
+  %value = load i32, ptr addrspace(2) %pointer
+  ret i32 %value
+right:
+  ret i32 0
+}
+
+define internal i32 @unrelated(i32 %value) {
+entry:
+  %sum = add i32 %value, 1
+  ret i32 %sum
+}
+
+define i32 @main(ptr addrspace(2) %runtime, i1 %choose) {
+entry:
+  %selected = select i1 %choose, ptr addrspace(2) %runtime, ptr addrspace(2) @fallback
+  %consumed = call i32 @consume(ptr addrspace(2) %selected, i1 %choose)
+  %other = call i32 @unrelated(i32 %consumed)
+  ret i32 %other
+}
+"#;
+        let out = inline_pointer_select_consumer(src, Some("main"), "%selected");
+        assert!(!out.contains("call i32 @consume"), "{out}");
+        assert!(out.contains("call i32 @unrelated"), "{out}");
+        assert!(out.contains("define internal i32 @unrelated"), "{out}");
+        assert!(
+            out.contains("define internal void @_GLOBAL__sub_I_defaults"),
+            "implicit constructor root was swept:\n{out}"
+        );
+        assert!(out.contains(".inl0.left:"), "{out}");
     }
 }

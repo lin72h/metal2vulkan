@@ -111,6 +111,11 @@ pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
                 .iter()
                 .map(|fact| fact.id),
         );
+        // Raw descriptor reconstruction intentionally replaces an authored aggregate with a byte
+        // transport block. The sidecar's source-layout type remains a semantic oracle until the
+        // post-native-rewrite exact-access repair has consumed every newly exposed carrier, so its
+        // type graph is live even though no serialized instruction refers to its root directly.
+        used.extend(ctx.emit_sidecar.buffer_root_source_types.values().copied());
         let mut add = |id: &Word, set: &mut HashSet<Word>| {
             set.insert(*id);
         };
@@ -208,6 +213,14 @@ pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) {
 pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
     use spirv::Capability;
     let mut want: Vec<Capability> = vec![];
+    if ctx.module.entry_points.iter().any(|instruction| {
+        instruction.operands.first()
+            == Some(&Operand::ExecutionModel(
+                spirv::ExecutionModel::TessellationEvaluation,
+            ))
+    }) {
+        want.push(Capability::Tessellation);
+    }
     let has_demote = ctx
         .module
         .functions
@@ -499,10 +512,9 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
     if has_atomic_fadd {
         want.push(Capability::AtomicFloat32AddEXT);
     }
-    // Width-based scalar capabilities: a `half` (OpTypeFloat 16) needs Float16; an 8-/16-bit int needs
-    // Int8/Int16. llc usually emits these for half shaders, but we synthesize half consts + types in the
-    // lowering (saturate edges, FConvert results, the flat-buffer `<2 x half>`/`<2 x i16>` extracts), so
-    // assert them here so the module is always self-consistent (a missing one is a spirv-val error).
+    // Width-based scalar capabilities: a `half` (OpTypeFloat 16) needs Float16; an 8-/16-bit int
+    // needs Int8/Int16. Lowering can synthesize narrow constants and types (saturate edges, FConvert
+    // results, and flat-buffer extracts), so assert the corresponding capabilities here.
     let int_width = |w: u32| {
         ctx.module.types_global_values.iter().any(|i| {
             i.class.opcode == Op::TypeInt && i.operands.first() == Some(&Operand::LiteralBit32(w))
@@ -623,6 +635,8 @@ mod tests {
             crate::emit_sidecar::LocalPointerFieldStore {
                 id: sentinel,
                 source: 99,
+                root: 98,
+                indices: Vec::new(),
             },
         );
 

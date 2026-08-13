@@ -435,7 +435,7 @@ entry:
 }
 
 #[test]
-fn mixed_pointer_and_value_helpers_keep_pointer_helper_residual() {
+fn mixed_pointer_and_value_helpers_inline_independently() {
     let ll = r#"
 define internal void @write(ptr %pointer, i32 %value) {
   store i32 %value, ptr %pointer
@@ -461,11 +461,11 @@ define void @main() {
     assert_eq!(
         stats,
         TypedInlineStats {
-            splices: 1,
-            helper_instances: 1,
+            splices: 2,
+            helper_instances: 2,
         }
     );
-    assert_eq!(call_names(function(&module, "main")), vec!["write"]);
+    assert!(call_names(function(&module, "main")).is_empty());
 }
 
 #[test]

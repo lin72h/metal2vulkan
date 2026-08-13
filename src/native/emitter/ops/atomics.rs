@@ -53,6 +53,28 @@ impl Emitter {
         ptr_arg: &TypedValue,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Word, String> {
+        if let LlValue::IntToPtr {
+            source,
+            destination,
+        } = &ptr_arg.value
+        {
+            if self.resolve_type(destination)? != LlType::Ptr(3) {
+                return Err(format!(
+                    "native emitter: atomic inttoptr constant expression targets {destination:?}, expected Workgroup pointer"
+                ));
+            }
+            let address = match source.value {
+                LlValue::Int(value) | LlValue::Hex(value) => value,
+                LlValue::SignedInt(value) if value >= 0 => value as u64,
+                _ => {
+                    return Err(
+                        "native emitter: Workgroup atomic inttoptr address is not a nonnegative integer literal"
+                            .into(),
+                    )
+                }
+            };
+            return self.workgroup_i32_pointer_for_address(address);
+        }
         if let LlValue::Local(name) = &ptr_arg.value {
             if let Some(raw) = self.raw_offsets.get(name).cloned() {
                 return self.emit_raw_word_pointer_for_access(&raw, 0, Some(4), instructions);
@@ -79,17 +101,26 @@ impl Emitter {
                 "native emitter: atomic i32 pointer targets {pointee:?}"
             ));
         };
-        let [field] = fields.as_slice() else {
-            return Err(format!(
-                "native emitter: atomic i32 pointer targets struct with {} fields",
-                fields.len()
-            ));
-        };
-        let field = self.resolve_type(field)?;
-        if field != LlType::Int(32) {
-            return Err(format!(
-                "native emitter: atomic i32 pointer targets struct field {field:?}"
-            ));
+        let mut field = LlType::Struct(fields);
+        let mut depth = 0usize;
+        loop {
+            field = self.resolve_type(&field)?;
+            match field {
+                LlType::Int(32) => break,
+                LlType::Struct(ref fields) if !fields.is_empty() => {
+                    field = fields[0].clone();
+                    depth += 1;
+                }
+                LlType::Array(ref element, count) if count > 0 => {
+                    field = element.as_ref().clone();
+                    depth += 1;
+                }
+                _ => {
+                    return Err(format!(
+                        "native emitter: atomic i32 pointer first-field chain targets {field:?}"
+                    ));
+                }
+            }
         }
         let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
             return Err(format!(
@@ -104,7 +135,9 @@ impl Emitter {
             Op::InBoundsAccessChain,
             Some(ptr_type),
             Some(result),
-            vec![Operand::IdRef(ptr), Operand::IdRef(zero)],
+            std::iter::once(Operand::IdRef(ptr))
+                .chain(std::iter::repeat_n(Operand::IdRef(zero), depth))
+                .collect(),
         ));
         Ok(result)
     }
@@ -198,6 +231,22 @@ impl Emitter {
             vec![Operand::StorageClass(StorageClass::Workgroup)],
         ));
         Ok(result)
+    }
+
+    fn workgroup_i32_pointer_for_address(&mut self, address: u64) -> Result<Word, String> {
+        if let Some(pointer) = self.workgroup_i32_addresses.get(&address) {
+            return Ok(*pointer);
+        }
+        let ptr_type = self.ptr_type_id(StorageClass::Workgroup, &LlType::Int(32))?;
+        let pointer = self.fresh();
+        self.module.types_global_values.push(Self::inst(
+            Op::Variable,
+            Some(ptr_type),
+            Some(pointer),
+            vec![Operand::StorageClass(StorageClass::Workgroup)],
+        ));
+        self.workgroup_i32_addresses.insert(address, pointer);
+        Ok(pointer)
     }
 
     pub(in crate::native::emitter) fn unmodeled_atomic_f32_pointer(

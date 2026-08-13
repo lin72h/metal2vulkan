@@ -165,6 +165,35 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
         match call.callee.as_str() {
+            // AGX2 numbers threadgroup lanes in physical 16-wide cluster rows. Preserve a typed
+            // sentinel here because the native emitter deliberately does not know Vulkan dispatch
+            // geometry; the interface pass replaces it using LocalInvocationId + LocalSize.
+            "llvm.agx2.cluster.num" => {
+                if !call.args.is_empty() {
+                    return Err(format!(
+                        "native emitter: {} expects no operands",
+                        call.callee
+                    ));
+                }
+                let result_ty = self.resolve_type(&call.ret)?;
+                if result_ty != LlType::Int(32) {
+                    return Err(format!(
+                        "native emitter: {} returned {result_ty:?}, expected i32",
+                        call.callee
+                    ));
+                }
+                let result_type = self.type_id(&result_ty)?;
+                let result = self.result_id(name, &result_ty)?;
+                let zero = self.const_uint(0)?;
+                instructions.push(Self::inst(
+                    Op::CopyObject,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdRef(zero)],
+                ));
+                self.emit_sidecar.agx2_cluster_numbers.push(result);
+                Ok(true)
+            }
             // `air.is_null_texture_<dim>(%tex)` asks whether a texture handle is the null texture.
             // We consume it HERE only when `%tex` is a value we ourselves synthesized from
             // `air.get_null_texture_*` (tracked in `null_texture_values`): that value never crosses
@@ -192,6 +221,25 @@ impl Emitter {
                     }
                 }
                 Ok(false)
+            }
+            "air.get_null_intersection_function_table" => {
+                if !call.args.is_empty() {
+                    return Err(format!(
+                        "native emitter: {} expects no operands",
+                        call.callee
+                    ));
+                }
+                let result_ty = self.resolve_type(&call.ret)?;
+                let LlType::Ptr(addrspace) = result_ty else {
+                    return Err(format!(
+                        "native emitter: {} returned {result_ty:?}, expected pointer",
+                        call.callee
+                    ));
+                };
+                self.define_unmodeled_byte_pointer_value(name, addrspace)?;
+                let is_null = self.const_bool(true)?;
+                self.record_pointer_nullness(name.to_string(), is_null);
+                Ok(true)
             }
             "air.get_instance_count_instance_acceleration_structure" => {
                 if call.args.len() != 1 {
@@ -670,6 +718,8 @@ impl Emitter {
             }
             "air.atomic.local.add.s.i32"
             | "air.atomic.local.add.u.i32"
+            | "air.atomic.local.sub.s.i32"
+            | "air.atomic.local.sub.u.i32"
             | "air.atomic.local.max.s.i32"
             | "air.atomic.local.max.u.i32"
             | "air.atomic.local.min.s.i32"
@@ -686,6 +736,7 @@ impl Emitter {
             | "air.atomic.global.max.u.i32"
             | "air.atomic.global.min.s.i32"
             | "air.atomic.global.min.u.i32"
+            | "air.atomic.global.sub.s.i32"
             | "air.atomic.global.sub.u.i32" => {
                 if call.args.len() != 5 {
                     return Err(format!(
@@ -708,6 +759,7 @@ impl Emitter {
                 let op = match call.callee.as_str() {
                     "air.atomic.local.add.s.i32" => Op::AtomicIAdd,
                     "air.atomic.local.add.u.i32" => Op::AtomicIAdd,
+                    "air.atomic.local.sub.s.i32" | "air.atomic.local.sub.u.i32" => Op::AtomicISub,
                     "air.atomic.local.max.s.i32" => Op::AtomicSMax,
                     "air.atomic.local.max.u.i32" => Op::AtomicUMax,
                     "air.atomic.local.min.s.i32" => Op::AtomicSMin,
@@ -722,7 +774,7 @@ impl Emitter {
                     "air.atomic.global.min.s.i32" => Op::AtomicSMin,
                     "air.atomic.global.min.u.i32" => Op::AtomicUMin,
                     "air.atomic.global.or.u.i32" => Op::AtomicOr,
-                    "air.atomic.global.sub.u.i32" => Op::AtomicISub,
+                    "air.atomic.global.sub.s.i32" | "air.atomic.global.sub.u.i32" => Op::AtomicISub,
                     "air.atomic.local.or.u.i32" => Op::AtomicOr,
                     "air.atomic.local.xchg.i32" => Op::AtomicExchange,
                     _ => Op::AtomicIAdd,

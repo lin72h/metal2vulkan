@@ -25,12 +25,19 @@ Hand-written crate code (`parser.rs`, `decoder.rs`, `grammar.rs`, …) is not to
 Override with `RSPIRV_REF` / `HEADERS_REF` if you deliberately bump both together with
 `Cargo.toml`'s `spirv` dependency.
 
+The script caches both repositories under `.cache/rspirv-autogen`. Set
+`METAL2VULKAN_AUTOGEN_CACHE` to use a different cache directory. It requires `git`, `cargo`,
+`rustfmt`, and Python 3, and requires network access when fetching missing revisions.
+
 ## Run
 
 ```sh
 ./scripts/regen-spirv-grammar/regen-spirv-grammar.sh
 cargo test -p metal2vulkan --lib spirv_module -- --test-threads=1
 ```
+
+The script runs `cargo fmt --all`. Review every generated diff and update the `spirv` dependency and
+locked revisions together.
 
 ## Provenance
 

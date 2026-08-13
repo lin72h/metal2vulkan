@@ -91,6 +91,9 @@ struct TypeCtx<'a> {
     int_consts: HashMap<(Word, u64), Word>, // (int type, value) -> const id
     /// Snapshot of pointee for each pointer type id, and the opcode of each type id (to classify).
     type_op: HashMap<Word, Op>,
+    type_defs: HashMap<Word, Instruction>,
+    const_values: HashMap<Word, u64>,
+    explicitly_laid_out: HashSet<Word>,
     pending: Vec<Instruction>,
 }
 
@@ -101,9 +104,12 @@ impl<'a> TypeCtx<'a> {
         let mut ptr_func = HashMap::new();
         let mut int_consts = HashMap::new();
         let mut type_op = HashMap::new();
+        let mut type_defs = HashMap::new();
+        let mut const_values = HashMap::new();
         for inst in &module.types_global_values {
             let Some(rid) = inst.result_id else { continue };
             type_op.insert(rid, inst.class.opcode);
+            type_defs.insert(rid, inst.clone());
             match inst.class.opcode {
                 Op::TypeInt => {
                     if let (Some(Operand::LiteralBit32(w)), Some(Operand::LiteralBit32(s))) =
@@ -127,6 +133,7 @@ impl<'a> TypeCtx<'a> {
                         (inst.result_type, inst.operands.first())
                     {
                         int_consts.insert((ty, *v as u64), rid);
+                        const_values.insert(rid, *v as u64);
                     }
                 }
                 _ => {}
@@ -139,6 +146,39 @@ impl<'a> TypeCtx<'a> {
             ptr_func,
             int_consts,
             type_op,
+            type_defs,
+            const_values,
+            explicitly_laid_out: module
+                .annotations
+                .iter()
+                .filter_map(|inst| {
+                    let explicit = match inst.class.opcode {
+                        Op::Decorate => matches!(
+                            inst.operands.get(1),
+                            Some(Operand::Decoration(
+                                spirv::Decoration::ArrayStride
+                                    | spirv::Decoration::Block
+                                    | spirv::Decoration::BufferBlock
+                            ))
+                        ),
+                        Op::MemberDecorate => matches!(
+                            inst.operands.get(2),
+                            Some(Operand::Decoration(
+                                spirv::Decoration::Offset
+                                    | spirv::Decoration::MatrixStride
+                                    | spirv::Decoration::RowMajor
+                                    | spirv::Decoration::ColMajor
+                            ))
+                        ),
+                        _ => false,
+                    };
+                    explicit.then(|| inst.operands.first()).flatten()
+                })
+                .filter_map(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                })
+                .collect(),
             pending: Vec::new(),
         }
     }
@@ -151,6 +191,49 @@ impl<'a> TypeCtx<'a> {
 
     fn type_opcode(&self, ty: Word) -> Option<Op> {
         self.type_op.get(&ty).copied()
+    }
+
+    fn composite_members(&self, ty: Word) -> Option<Vec<Word>> {
+        let def = self.type_defs.get(&ty)?;
+        match def.class.opcode {
+            Op::TypeStruct => Some(
+                def.operands
+                    .iter()
+                    .filter_map(|operand| match operand {
+                        Operand::IdRef(member) => Some(*member),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            Op::TypeArray => {
+                let Operand::IdRef(element) = def.operands.first()? else {
+                    return None;
+                };
+                let Operand::IdRef(length) = def.operands.get(1)? else {
+                    return None;
+                };
+                let length = usize::try_from(*self.const_values.get(length)?).ok()?;
+                Some(vec![*element; length])
+            }
+            _ => None,
+        }
+    }
+
+    fn has_explicit_layout_reachable(&self, ty: Word) -> bool {
+        let mut pending = vec![ty];
+        let mut seen = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if self.explicitly_laid_out.contains(&current) {
+                return true;
+            }
+            if let Some(members) = self.composite_members(current) {
+                pending.extend(members);
+            }
+        }
+        false
     }
 
     fn int_ty(&mut self, width: u32, signed: u32) -> Word {
@@ -233,6 +316,112 @@ enum Term {
     ReturnValue(Word),
     Unreachable,
     Kill(Instruction), // OpKill / OpTerminateInvocation / OpDemoteToHelperInvocation-as-terminator
+}
+
+const MAX_SCALARIZED_SPILL_LEAVES: usize = 64;
+const MAX_SCALARIZED_SPILL_LEAVES_PER_FUNCTION: usize = 512;
+
+enum Spill {
+    Direct { var: Word, ty: Word },
+    Composite { ty: Word, members: Vec<Spill> },
+}
+
+fn scalarized_spill_leaf_count(tc: &TypeCtx<'_>, ty: Word) -> Option<usize> {
+    if !tc.has_explicit_layout_reachable(ty) {
+        return Some(1);
+    }
+    let members = tc.composite_members(ty)?;
+    let mut leaves = 0usize;
+    for member in members {
+        leaves = leaves.checked_add(scalarized_spill_leaf_count(tc, member)?)?;
+        if leaves > MAX_SCALARIZED_SPILL_LEAVES {
+            return None;
+        }
+    }
+    Some(leaves)
+}
+
+fn build_spill(tc: &mut TypeCtx<'_>, ty: Word, variables: &mut Vec<Instruction>) -> Spill {
+    if tc.has_explicit_layout_reachable(ty) {
+        if let Some(member_types) = tc.composite_members(ty) {
+            return Spill::Composite {
+                ty,
+                members: member_types
+                    .into_iter()
+                    .map(|member| build_spill(tc, member, variables))
+                    .collect(),
+            };
+        }
+    }
+    let ptr_ty = tc.ptr_function(ty);
+    let var = tc.fresh();
+    variables.push(Instruction::new(
+        Op::Variable,
+        Some(ptr_ty),
+        Some(var),
+        vec![Operand::StorageClass(StorageClass::Function)],
+    ));
+    Spill::Direct { var, ty }
+}
+
+fn store_spill(
+    tc: &mut TypeCtx<'_>,
+    spill: &Spill,
+    value: Word,
+    instructions: &mut Vec<Instruction>,
+) {
+    match spill {
+        Spill::Direct { var, .. } => instructions.push(Instruction::new(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(*var), Operand::IdRef(value)],
+        )),
+        Spill::Composite { members, .. } => {
+            for (index, member) in members.iter().enumerate() {
+                let member_ty = match member {
+                    Spill::Direct { ty, .. } | Spill::Composite { ty, .. } => *ty,
+                };
+                let extracted = tc.fresh();
+                instructions.push(Instruction::new(
+                    Op::CompositeExtract,
+                    Some(member_ty),
+                    Some(extracted),
+                    vec![Operand::IdRef(value), Operand::LiteralBit32(index as u32)],
+                ));
+                store_spill(tc, member, extracted, instructions);
+            }
+        }
+    }
+}
+
+fn load_spill(tc: &mut TypeCtx<'_>, spill: &Spill, instructions: &mut Vec<Instruction>) -> Word {
+    match spill {
+        Spill::Direct { var, ty } => {
+            let loaded = tc.fresh();
+            instructions.push(Instruction::new(
+                Op::Load,
+                Some(*ty),
+                Some(loaded),
+                vec![Operand::IdRef(*var)],
+            ));
+            loaded
+        }
+        Spill::Composite { ty, members } => {
+            let values = members
+                .iter()
+                .map(|member| Operand::IdRef(load_spill(tc, member, instructions)))
+                .collect();
+            let reconstructed = tc.fresh();
+            instructions.push(Instruction::new(
+                Op::CompositeConstruct,
+                Some(*ty),
+                Some(reconstructed),
+                values,
+            ));
+            reconstructed
+        }
+    }
 }
 
 fn decode_term(inst: &Instruction) -> Option<Term> {
@@ -737,6 +926,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
 
     // Every demoted value must be spillable: a scalar/vector/aggregate by value, never a pointer or an
     // opaque (image/sampler/accel-structure) type. Bail the whole function otherwise.
+    let mut scalarized_spill_leaves = 0usize;
     for v in &demote {
         let Some(&ty) = value_type.get(v) else {
             return bail("non-spillable-demote");
@@ -767,6 +957,18 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
             }
             _ => {}
         }
+        if tc.has_explicit_layout_reachable(ty) {
+            let Some(leaves) = scalarized_spill_leaf_count(tc, ty) else {
+                return bail("explicit-layout-spill-too-large");
+            };
+            let Some(total) = scalarized_spill_leaves.checked_add(leaves) else {
+                return bail("explicit-layout-spill-total-too-large");
+            };
+            scalarized_spill_leaves = total;
+            if scalarized_spill_leaves > MAX_SCALARIZED_SPILL_LEAVES_PER_FUNCTION {
+                return bail("explicit-layout-spill-total-too-large");
+            }
+        }
     }
 
     // ---- Eligible. Synthesize the relooper form. ----
@@ -778,19 +980,11 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     // module bytes) is deterministic run-to-run rather than following HashSet iteration order.
     let mut demote_order: Vec<Word> = demote.iter().copied().collect();
     demote_order.sort_unstable();
-    let mut spill: HashMap<Word, (Word, Word)> = HashMap::new(); // value -> (var id, value type)
+    let mut spill: HashMap<Word, Spill> = HashMap::new();
     let mut spill_vars: Vec<Instruction> = Vec::new();
     for &v in &demote_order {
         let ty = value_type[&v];
-        let ptr_ty = tc.ptr_function(ty);
-        let var = tc.fresh();
-        spill_vars.push(Instruction::new(
-            Op::Variable,
-            Some(ptr_ty),
-            Some(var),
-            vec![Operand::StorageClass(StorageClass::Function)],
-        ));
-        spill.insert(v, (var, ty));
+        spill.insert(v, build_spill(tc, ty, &mut spill_vars));
     }
 
     // A tag spill var (i32) per rematerialized pointer phi (sorted for deterministic ids).
@@ -915,13 +1109,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
             let spill_after = inst.result_id.filter(|r| demote.contains(r));
             body.push(inst);
             if let Some(r) = spill_after {
-                let (var, _) = spill[&r];
-                body.push(Instruction::new(
-                    Op::Store,
-                    None,
-                    None,
-                    vec![Operand::IdRef(var), Operand::IdRef(r)],
-                ));
+                store_spill(tc, &spill[&r], r, &mut body);
             }
         }
 
@@ -1218,7 +1406,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
 
 /// Read-only demotion context threaded into the terminator-lowering helpers.
 struct Demo<'a> {
-    spill: &'a HashMap<Word, (Word, Word)>,
+    spill: &'a HashMap<Word, Spill>,
     demote: &'a HashSet<Word>,
     def_block: &'a HashMap<Word, usize>,
     phi: &'a HashSet<Word>,
@@ -1253,20 +1441,13 @@ fn load_demoted(
     tc: &mut TypeCtx,
     prelude: &mut Vec<Instruction>,
     local_load: &mut HashMap<Word, Word>,
-    spill: &HashMap<Word, (Word, Word)>,
+    spill: &HashMap<Word, Spill>,
     v: Word,
 ) -> Word {
     if let Some(&l) = local_load.get(&v) {
         return l;
     }
-    let (var, ty) = spill[&v];
-    let l = tc.fresh();
-    prelude.push(Instruction::new(
-        Op::Load,
-        Some(ty),
-        Some(l),
-        vec![Operand::IdRef(var)],
-    ));
+    let l = load_spill(tc, &spill[&v], prelude);
     local_load.insert(v, l);
     l
 }
@@ -1442,14 +1623,8 @@ fn store_phi_edges(
         }
         for (val, pred) in incoming {
             if *pred == this_label {
-                let (var, _) = demo.spill[&rid];
                 let rv = resolve(tc, prelude, local_load, demo, bi, *val);
-                tail.push(Instruction::new(
-                    Op::Store,
-                    None,
-                    None,
-                    vec![Operand::IdRef(var), Operand::IdRef(rv)],
-                ));
+                store_spill(tc, &demo.spill[&rid], rv, tail);
             }
         }
     }
@@ -1970,6 +2145,54 @@ OpExecutionMode %main OriginUpperLeft
             validates(&out),
             "relooper output must validate (rematerialized image load)"
         );
+    }
+
+    #[test]
+    fn relooper_scalarizes_explicit_layout_aggregate_spills() {
+        // `%values` is a by-value array loaded in one block and consumed in another, so the
+        // state-machine rewrite must demote it. Its type also belongs to a StorageBuffer block and
+        // carries ArrayStride; using that type as a Function-variable pointee is invalid Vulkan.
+        // Spill the fixed array as three scalar Function variables and reconstruct it at the use.
+        let spvasm = r#"
+                       OpCapability Shader
+                       OpMemoryModel Logical GLSL450
+                       OpEntryPoint GLCompute %main "main" %buf
+                       OpExecutionMode %main LocalSize 1 1 1
+                       OpDecorate %arr ArrayStride 4
+                       OpMemberDecorate %block 0 Offset 0
+                       OpDecorate %block Block
+                       OpDecorate %buf DescriptorSet 0
+                       OpDecorate %buf Binding 0
+               %void = OpTypeVoid
+                 %fn = OpTypeFunction %void
+               %uint = OpTypeInt 32 0
+                 %u0 = OpConstant %uint 0
+                 %u1 = OpConstant %uint 1
+                 %u3 = OpConstant %uint 3
+                %arr = OpTypeArray %uint %u3
+              %block = OpTypeStruct %arr
+          %ptr_block = OpTypePointer StorageBuffer %block
+            %ptr_arr = OpTypePointer StorageBuffer %arr
+              %ptr_u = OpTypePointer StorageBuffer %uint
+                %buf = OpVariable %ptr_block StorageBuffer
+               %main = OpFunction %void None %fn
+              %entry = OpLabel
+                       OpBranch %load
+               %load = OpLabel
+           %array_ptr = OpAccessChain %ptr_arr %buf %u0
+             %values = OpLoad %arr %array_ptr
+                       OpBranch %use
+                %use = OpLabel
+              %value = OpCompositeExtract %uint %values 1
+              %field = OpAccessChain %ptr_u %buf %u0 %u0
+                       OpStore %field %value
+                       OpReturn
+                       OpFunctionEnd
+        "#;
+        let Some(spv) = assemble(spvasm) else { return };
+        assert!(validates(&spv), "input must validate");
+        let out = relooper_bytes(&spv);
+        assert!(validates(&out), "scalarized relooper output must validate");
     }
 
     #[test]

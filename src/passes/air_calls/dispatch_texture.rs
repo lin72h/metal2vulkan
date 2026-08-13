@@ -192,6 +192,9 @@ pub(in crate::passes) fn lower_pack(
     rty: Word,
     args: &[Word],
 ) -> Result<Vec<Instruction>, String> {
+    if name.starts_with("air.pack.unorm.rgb565") {
+        return lower_pack_rgb565(ctx, name, res, rty, args);
+    }
     let (pack_op, _, _) =
         packed_format(name).ok_or_else(|| format!("unhandled pack intrinsic: {name}"))?;
     let mut out = Vec::new();
@@ -217,6 +220,141 @@ pub(in crate::passes) fn lower_pack(
             Operand::LiteralExtInstInteger(pack_op as u32),
             Operand::IdRef(pack_arg),
         ],
+    ));
+    Ok(out)
+}
+
+/// `air.pack.unorm.rgb565.<arg>` packs three normalized components into the Metal `ushort`
+/// contract: R occupies bits 0..5, G bits 5..11, and B bits 11..16. This is the same normalized
+/// conversion used by GLSL's pack-unorm instructions: clamp to [0, 1], scale by the field maximum,
+/// and round to the nearest integer. Half inputs widen before the arithmetic because SPIR-V Tools
+/// does not accept all GLSL extended instructions directly on half vectors.
+fn lower_pack_rgb565(
+    ctx: &mut Ctx,
+    name: &str,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    if args.len() != 1 {
+        return Err(format!("{name} expects 1 operand"));
+    }
+    if int_scalar_width(ctx, rty) != Some(16) {
+        return Err(format!("{name} result is not a 16-bit integer"));
+    }
+    let arg_ty = value_result_type(ctx, args[0])
+        .ok_or_else(|| format!("{name} operand has no result type"))?;
+    let v3float = ctx.ty_vecf(3);
+    if float_equivalent(ctx, arg_ty) != v3float {
+        return Err(format!(
+            "{name} operand is not a three-component float vector"
+        ));
+    }
+
+    let float = ctx.ty_float();
+    let uint = ctx.ty_uint();
+    let mut out = Vec::new();
+    let vector = if arg_ty == v3float {
+        args[0]
+    } else {
+        let widened = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::FConvert,
+            Some(v3float),
+            Some(widened),
+            vec![Operand::IdRef(args[0])],
+        ));
+        widened
+    };
+
+    let zero = ctx.const_float(0.0);
+    let one = ctx.const_float(1.0);
+    let mut fields = Vec::with_capacity(3);
+    for (component, maximum, shift) in [(0u32, 31.0f32, 0u32), (1, 63.0, 5), (2, 31.0, 11)] {
+        let extracted = ctx.module.fresh_id();
+        let clamped = ctx.module.fresh_id();
+        let scaled = ctx.module.fresh_id();
+        let rounded = ctx.module.fresh_id();
+        let integer = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::CompositeExtract,
+            Some(float),
+            Some(extracted),
+            vec![Operand::IdRef(vector), Operand::LiteralBit32(component)],
+        ));
+        out.push(Instruction::new(
+            Op::ExtInst,
+            Some(float),
+            Some(clamped),
+            vec![
+                Operand::IdRef(ctx.glsl()),
+                Operand::LiteralExtInstInteger(GLSLstd450::FClamp as u32),
+                Operand::IdRef(extracted),
+                Operand::IdRef(zero),
+                Operand::IdRef(one),
+            ],
+        ));
+        out.push(Instruction::new(
+            Op::FMul,
+            Some(float),
+            Some(scaled),
+            vec![
+                Operand::IdRef(clamped),
+                Operand::IdRef(ctx.const_float(maximum)),
+            ],
+        ));
+        out.push(Instruction::new(
+            Op::ExtInst,
+            Some(float),
+            Some(rounded),
+            vec![
+                Operand::IdRef(ctx.glsl()),
+                Operand::LiteralExtInstInteger(GLSLstd450::Round as u32),
+                Operand::IdRef(scaled),
+            ],
+        ));
+        out.push(Instruction::new(
+            Op::ConvertFToU,
+            Some(uint),
+            Some(integer),
+            vec![Operand::IdRef(rounded)],
+        ));
+        if shift == 0 {
+            fields.push(integer);
+        } else {
+            let shifted = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::ShiftLeftLogical,
+                Some(uint),
+                Some(shifted),
+                vec![
+                    Operand::IdRef(integer),
+                    Operand::IdRef(ctx.const_uint(shift)),
+                ],
+            ));
+            fields.push(shifted);
+        }
+    }
+
+    let rg = ctx.module.fresh_id();
+    let packed = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseOr,
+        Some(uint),
+        Some(rg),
+        vec![Operand::IdRef(fields[0]), Operand::IdRef(fields[1])],
+    ));
+    out.push(Instruction::new(
+        Op::BitwiseOr,
+        Some(uint),
+        Some(packed),
+        vec![Operand::IdRef(rg), Operand::IdRef(fields[2])],
+    ));
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(packed)],
     ));
     Ok(out)
 }
@@ -794,15 +932,50 @@ pub(in crate::passes) fn lower_get_num_samples_texture(
     )])
 }
 
-/// `air.calculate_unclamped_lod_texture_2d(texture, sampler, coord, flags)` returns the implicit
-/// fragment LOD for a hypothetical sample. SPIR-V exposes the same query as `OpImageQueryLod`,
-/// whose second component is the implicit level of detail relative to the image base level.
-pub(in crate::passes) fn lower_calculate_unclamped_lod_texture_2d(
+/// `air.get_num_samples.i32(flags)` returns graphics pipeline state, not a property of an image
+/// operand. Vulkan exposes no equivalent shader query, so translation embeds the exact value the
+/// caller supplied in [`TransformOptions::raster_sample_count`].
+pub(in crate::passes) fn lower_raster_sample_count(
+    ctx: &mut Ctx,
+    name: &str,
+    res: Option<Word>,
+    rty: Option<Word>,
+) -> Result<Vec<Instruction>, String> {
+    let res = res.ok_or_else(|| format!("{name} has no result"))?;
+    let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
+    if ctx.stage != Stage::Fragment {
+        return Err(format!("{name} requires fragment stage"));
+    }
+    let samples = ctx.raster_sample_count.ok_or_else(|| {
+        format!(
+            "{name} requires TransformOptions::raster_sample_count to match the graphics pipeline"
+        )
+    })?;
+    if !matches!(samples, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
+        return Err(format!(
+            "{name} raster sample count {samples} is not a Vulkan sample-count value"
+        ));
+    }
+    let value = ctx.const_uint(samples);
+    Ok(vec![Instruction::new(
+        Op::Bitcast,
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(value)],
+    )])
+}
+
+/// `air.calculate_{clamped,unclamped}_lod_texture_2d(texture, sampler, coord, flags)` returns
+/// one component of the implicit fragment LOD for a hypothetical sample. SPIR-V exposes both as
+/// `OpImageQueryLod`: component zero is the selected mipmap level and component one is the
+/// unclamped level of detail relative to the image base level.
+pub(in crate::passes) fn lower_calculate_lod_texture_2d(
     ctx: &mut Ctx,
     name: &str,
     res: Option<Word>,
     rty: Option<Word>,
     args: &[Word],
+    component: u32,
 ) -> Result<Vec<Instruction>, String> {
     let res = res.ok_or_else(|| format!("{name} has no result"))?;
     let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
@@ -873,7 +1046,7 @@ pub(in crate::passes) fn lower_calculate_unclamped_lod_texture_2d(
         Op::CompositeExtract,
         Some(float_ty),
         Some(lod),
-        vec![Operand::IdRef(lod_pair), Operand::LiteralBit32(1)],
+        vec![Operand::IdRef(lod_pair), Operand::LiteralBit32(component)],
     ));
     if lod != res {
         out.push(Instruction::new(

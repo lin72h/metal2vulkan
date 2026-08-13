@@ -3,6 +3,107 @@
 use super::*;
 
 impl Emitter {
+    pub(in crate::native::emitter) fn emit_vector_as_scalar_array_store(
+        &mut self,
+        object: &TypedValue,
+        ptr: &TypedValue,
+        pointee: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let object_ty = self.resolve_type(&object.ty)?;
+        let (LlType::Vector(vector_elem, vector_len), LlType::Array(array_elem, array_len)) =
+            (&object_ty, pointee)
+        else {
+            return Ok(false);
+        };
+        if vector_len != array_len || !types_compatible(vector_elem, array_elem) {
+            return Ok(false);
+        }
+
+        // LLVM permits a vector store through an opaque pointer whose allocation is an equivalent
+        // fixed scalar array. Rebuild the array value lane-for-lane so the SPIR-V store's object
+        // type exactly matches its pointer pointee.
+        let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
+        let elem_type = self.type_id(vector_elem)?;
+        let mut elements = Vec::with_capacity(*vector_len as usize);
+        for lane in 0..*vector_len {
+            let value = self.fresh();
+            instructions.push(Self::inst(
+                Op::CompositeExtract,
+                Some(elem_type),
+                Some(value),
+                vec![Operand::IdRef(object_id), Operand::LiteralBit32(lane)],
+            ));
+            elements.push(Operand::IdRef(value));
+        }
+        let array_type = self.type_id(pointee)?;
+        let array = self.fresh();
+        instructions.push(Self::inst(
+            Op::CompositeConstruct,
+            Some(array_type),
+            Some(array),
+            elements,
+        ));
+        let ptr_id = self.value_id(&ptr.value, &ptr.ty)?;
+        instructions.push(Self::inst(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(ptr_id), Operand::IdRef(array)],
+        ));
+        Ok(true)
+    }
+
+    pub(in crate::native::emitter) fn emit_scalar_array_as_vector_load(
+        &mut self,
+        result: Word,
+        pointee: &LlType,
+        result_ty: &LlType,
+        ptr: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let (LlType::Array(array_elem, array_len), LlType::Vector(vector_elem, vector_len)) =
+            (pointee, result_ty)
+        else {
+            return Ok(false);
+        };
+        if array_len != vector_len || !types_compatible(array_elem, vector_elem) {
+            return Ok(false);
+        }
+
+        // LLVM permits a vector load through an opaque pointer whose allocation is an equivalent
+        // fixed scalar array. Logical SPIR-V cannot bitcast the pointer or the aggregate value, so
+        // load the array and rebuild the vector lane-for-lane.
+        let array_type = self.type_id(pointee)?;
+        let loaded = self.fresh();
+        instructions.push(Self::inst(
+            Op::Load,
+            Some(array_type),
+            Some(loaded),
+            vec![Operand::IdRef(ptr)],
+        ));
+        let elem_type = self.type_id(vector_elem)?;
+        let mut lanes = Vec::with_capacity(*vector_len as usize);
+        for lane in 0..*vector_len {
+            let value = self.fresh();
+            instructions.push(Self::inst(
+                Op::CompositeExtract,
+                Some(elem_type),
+                Some(value),
+                vec![Operand::IdRef(loaded), Operand::LiteralBit32(lane)],
+            ));
+            lanes.push(Operand::IdRef(value));
+        }
+        let vector_type = self.type_id(result_ty)?;
+        instructions.push(Self::inst(
+            Op::CompositeConstruct,
+            Some(vector_type),
+            Some(result),
+            lanes,
+        ));
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_narrowing_vector_store(
         &mut self,
         object: &TypedValue,
@@ -703,10 +804,10 @@ impl Emitter {
                 ))
             }
         };
-        if storage != StorageClass::Function
-            && storage != StorageClass::Workgroup
-            && !(storage == StorageClass::Private && self.is_imageblock_scratch_pointer(&ptr.value))
-        {
+        if !matches!(
+            storage,
+            StorageClass::Function | StorageClass::Workgroup | StorageClass::Private
+        ) {
             return Ok(false);
         }
         let Some((scalar_ty, access_path)) = first_scalar_access_path(pointee) else {

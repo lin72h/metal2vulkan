@@ -7,7 +7,7 @@ use crate::spirv_module::{load_bytes, Module};
 use spirv::{Decoration, Op, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
-// Error-classifier equivalence tests (S1): the typed classifier must agree with the legacy
+// Error-classifier equivalence tests (S1): the typed classifier must agree with the prior
 // substring guard chain over captured spirv-val / emit messages. Pure-static (no external tools).
 mod error_class;
 

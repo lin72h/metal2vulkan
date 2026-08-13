@@ -87,10 +87,33 @@ pub(in crate::passes) fn fragment_varying_interface_type(
     integer_interface_type_like(ctx, ty, bits, signed, lanes, defs).unwrap_or(ty)
 }
 
+/// Vulkan vertex fetch expands 8- and 16-bit integer formats to 32-bit shader values. Model the
+/// interface with that fetched type, preserving the AIR-declared signedness and vector width; the
+/// entry binding converts back to the LLVM parameter's narrow, signless integer representation.
+pub(in crate::passes) fn vertex_attribute_interface_type(
+    ctx: &mut Ctx,
+    vert: Option<&VertMeta>,
+    loc: u32,
+    ty: Word,
+    defs: &HashMap<Word, Instruction>,
+) -> Word {
+    let Some(name) = vert.and_then(|meta| meta.vertex_input_type(loc)) else {
+        return ty;
+    };
+    let Some((bits, signed, lanes)) = air_integer_type_shape(name) else {
+        return ty;
+    };
+    let interface_bits = bits.max(32);
+    integer_interface_type_for_shape(ctx, ty, bits, interface_bits, signed, lanes, defs)
+        .unwrap_or(ty)
+}
+
 fn air_integer_type_shape(name: &str) -> Option<(u32, bool, u32)> {
     let raw = name.trim();
     let raw = raw.strip_prefix("packed_").unwrap_or(raw);
     for (prefix, bits, signed) in [
+        ("uchar", 8, false),
+        ("char", 8, true),
         ("ushort", 16, false),
         ("short", 16, true),
         ("uint", 32, false),
@@ -108,6 +131,44 @@ fn air_integer_type_shape(name: &str) -> Option<(u32, bool, u32)> {
         }
     }
     None
+}
+
+fn integer_interface_type_for_shape(
+    ctx: &mut Ctx,
+    ty: Word,
+    source_bits: u32,
+    bits: u32,
+    signed: bool,
+    lanes: u32,
+    defs: &HashMap<Word, Instruction>,
+) -> Option<Word> {
+    if lanes == 1 {
+        let (actual_bits, _) = type_int_shape(defs, ty)?;
+        if actual_bits != source_bits {
+            return None;
+        }
+        return Some(integer_scalar_type(ctx, bits, signed));
+    }
+    let def = defs.get(&ty)?;
+    if def.class.opcode != Op::TypeVector
+        || def.operands.get(1) != Some(&Operand::LiteralBit32(lanes))
+    {
+        return None;
+    }
+    let elem = match def.operands.first()? {
+        Operand::IdRef(elem) => *elem,
+        _ => return None,
+    };
+    let (actual_bits, _) = type_int_shape(defs, elem)?;
+    if actual_bits != source_bits {
+        return None;
+    }
+    let elem_ty = integer_scalar_type(ctx, bits, signed);
+    Some(ctx.get_or_create(
+        Op::TypeVector,
+        None,
+        vec![Operand::IdRef(elem_ty), Operand::LiteralBit32(lanes)],
+    ))
 }
 
 fn integer_interface_type_like(
@@ -156,7 +217,10 @@ fn integer_scalar_type(ctx: &mut Ctx, bits: u32, signed: bool) -> Word {
     )
 }
 
-fn type_int_shape(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<(u32, bool)> {
+pub(in crate::passes) fn type_int_shape(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+) -> Option<(u32, bool)> {
     let def = defs.get(&ty)?;
     if def.class.opcode != Op::TypeInt {
         return None;

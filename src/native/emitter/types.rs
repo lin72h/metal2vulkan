@@ -206,18 +206,6 @@ impl Emitter {
         if let Some(id) = self.interner.ptr_types.get(&key) {
             return Ok(*id);
         }
-        if pointee == LlType::Int(8) {
-            if let Some((_, id)) = self.interner.types.iter().find(|(ty, _)| {
-                matches!(
-                    ty,
-                    LlType::Ptr(addrspace)
-                        if llvm_pointer_storage(*addrspace).ok() == Some(storage)
-                )
-            }) {
-                self.interner.ptr_types.insert(key, *id);
-                return Ok(*id);
-            }
-        }
         let pointee_id = self.type_id(&pointee)?;
         let id = self.fresh();
         self.module.types_global_values.push(Self::inst(
@@ -419,6 +407,10 @@ impl Emitter {
                 "native emitter: getelementptr value requires instruction-local materialization"
                     .to_string(),
             ),
+            LlValue::IntToPtr { .. } => Err(
+                "native emitter: inttoptr value requires instruction-local materialization"
+                    .to_string(),
+            ),
             LlValue::Bool(value) => match self.resolve_type(ty)? {
                 LlType::Bool | LlType::Int(1) => self.const_bool(*value),
                 other => Err(format!(
@@ -427,12 +419,18 @@ impl Emitter {
             },
             LlValue::Int(value) => match self.resolve_type(ty)? {
                 LlType::Int(bits) => self.const_int(bits, *value),
+                LlType::Float if *value == 0 => self.const_float32(0.0),
+                LlType::Half if *value == 0 => self.const_float16_bits(0),
+                LlType::BFloat if *value == 0 => self.const_int(16, 0),
                 other => Err(format!(
                     "native emitter: integer literal {value} used as non-int type {other:?}"
                 )),
             },
             LlValue::SignedInt(value) => match self.resolve_type(ty)? {
                 LlType::Int(bits) => self.const_signed_int(bits, *value),
+                LlType::Float if *value == 0 => self.const_float32(0.0),
+                LlType::Half if *value == 0 => self.const_float16_bits(0),
+                LlType::BFloat if *value == 0 => self.const_int(16, 0),
                 other => Err(format!(
                     "native emitter: integer literal {value} used as non-int type {other:?}"
                 )),
@@ -504,6 +502,27 @@ impl Emitter {
             return Err(format!(
                 "native emitter: getelementptr value `{name}` did not materialize a pointer"
             ));
+        }
+        if let LlValue::IntToPtr {
+            source,
+            destination,
+        } = value
+        {
+            let expected = self.resolve_type(ty)?;
+            let destination = self.resolve_type(destination)?;
+            if expected != destination {
+                return Err(format!(
+                    "native emitter: inttoptr constant-expression destination {destination:?} does not match typed operand {expected:?}"
+                ));
+            }
+            let name = format!("%air.const.inttoptr.{}", self.module.id_bound());
+            self.emit_inttoptr_resolved(
+                source.as_ref().clone(),
+                destination,
+                name.clone(),
+                instructions,
+            )?;
+            return self.value_id(&LlValue::Local(name), ty);
         }
         if let Some(elem) = self.one_lane_vector_elem(ty)? {
             match value {

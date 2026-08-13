@@ -25,8 +25,32 @@ fn carriered_block(name: &str, lines: &[&str]) -> BodyBlock {
     BodyBlock {
         name: name.to_string(),
         role: crate::native::cfg::BlockRole::Normal,
-        typed,
+        typed: typed.map(Into::into),
     }
+}
+
+#[test]
+fn construct_tree_mode_keeps_normal_plan_merges_per_function() {
+    let ll = r#"
+define void @k() {
+entry:
+  %cond = icmp eq i32 0, 0
+  br i1 %cond, label %left, label %right
+
+left:
+  br label %merge
+
+right:
+  br label %merge
+
+merge:
+  ret void
+}
+"#;
+
+    let spv = crate::native::emit_vulkan_spirv_construct_tree(ll).expect("construct-tree emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpSelectionMerge").count(), 1, "{asm}");
 }
 
 #[test]
@@ -338,11 +362,10 @@ exit:
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(asm.contains("OpLoopMerge"), "{asm}");
     assert_eq!(asm.matches("OpBranchConditional").count(), 5, "{asm}");
-    // Structured-by-construction (R2 module 4, now the default) also wraps the loop-latch
+    // Structured-by-construction emission also wraps the loop-latch
     // exit-conditional (`br %done, %exit, %loop`) in an OpSelectionMerge — a legal conditional-break
-    // structuring — so there are 5 selection merges, one more than the old repair path's 4. spirv-val
-    // accepts it and the semantics are unchanged (an OpSelectionMerge is a structural hint, not a
-    // computation). Set METAL2VULKAN_LEGACY_REPAIR=1 to get the old 4-merge shape.
+    // structuring — so there are 5 selection merges. spirv-val accepts the result and semantics are
+    // unchanged because OpSelectionMerge is a structural declaration, not a computation.
     assert_eq!(asm.matches("OpSelectionMerge").count(), 5, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -1153,10 +1176,10 @@ entry:
 }
 
 /// A byte-view pointer whose root was NOT raw-modeled (a variable-pointer phi merging two DISTINCT
-/// device buffers cannot normalize to a raw index phi) reaches `gep float`/`gep <4 x float>` + load.
-/// The pointer stays a concrete `uchar` StorageBuffer pointer, so the scalar/vector load must
+/// device buffers cannot normalize to a raw index phi) reaches `gep half`/`gep float`/
+/// `gep <4 x float>` + load. The pointer stays a concrete `uchar` StorageBuffer pointer, so each load must
 /// byte-assemble the value (`emit_byte_view_scalar_gep` + `emit_scalar_load_from_byte_pointer`) rather
-/// than emit an illegal `OpLoad %float`/`%v4float` off a `_ptr_StorageBuffer_uchar`.
+/// than emit an illegal typed load off a `_ptr_StorageBuffer_uchar`.
 #[test]
 fn native_byte_view_multiroot_phi_scalar_and_vector_load_byte_assemble() {
     let ll = r#"
@@ -1175,12 +1198,16 @@ m:
   %p = phi ptr addrspace(1) [ %a, %t ], [ %b, %e ]
   %byte = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %o64
   %alias = bitcast ptr addrspace(1) %byte to ptr addrspace(1)
+  %hp = getelementptr inbounds half, ptr addrspace(1) %alias, i64 %o64
+  %h = load half, ptr addrspace(1) %hp, align 2
+  %hf = fpext half %h to float
   %fp = getelementptr inbounds float, ptr addrspace(1) %alias, i64 %o64
   %v = load float, ptr addrspace(1) %fp, align 4
   %vp = getelementptr inbounds <4 x float>, ptr addrspace(1) %alias, i64 %o64
   %vv = load <4 x float>, ptr addrspace(1) %vp, align 16
   %e0 = extractelement <4 x float> %vv, i64 0
-  %sum = fadd float %v, %e0
+  %sum0 = fadd float %v, %e0
+  %sum = fadd float %sum0, %hf
   store float %sum, ptr addrspace(1) %out, align 4
   ret void
 }
@@ -3142,6 +3169,14 @@ fn native_pre_phi_pointer_materialization_moves_to_incoming_predecessor() {
                         Operand::IdRef(50),
                         Operand::IdRef(3),
                     ],
+                ),
+                // Residual non-phi work unrelated to a phi incoming must still move behind the full
+                // phi prefix; unlike the access chains below it has no predecessor edge to relocate to.
+                Instruction::new(
+                    Op::IAdd,
+                    Some(10),
+                    Some(75),
+                    vec![Operand::IdRef(61), Operand::IdRef(61)],
                 ),
                 Instruction::new(
                     Op::InBoundsAccessChain,

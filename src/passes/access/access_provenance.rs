@@ -18,6 +18,7 @@ pub(in crate::passes) struct LocalPointerFieldKey {
 
 pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, entry_idx: usize) {
     let store_markers = local_pointer_field_store_markers(ctx);
+    let store_keys = local_pointer_field_store_keys(ctx);
     let load_markers = local_pointer_field_load_markers(ctx);
     if store_markers.is_empty() || load_markers.is_empty() {
         return;
@@ -38,7 +39,8 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
             else {
                 continue;
             };
-            let (Some(key), Some(source)) = (access_keys.get(ptr), store_markers.get(value)) else {
+            let key = access_keys.get(ptr).or_else(|| store_keys.get(value));
+            let (Some(key), Some(source)) = (key, store_markers.get(value)) else {
                 continue;
             };
             stored_fields.insert(key.clone(), *source);
@@ -63,10 +65,417 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
             replacements.push((result, source));
         }
     }
-    let func = &mut ctx.module.functions[entry_idx];
-    for (from, to) in replacements {
-        replace_id_in_function(func, from, to);
+    if !replacements.is_empty() {
+        // Forwarding changes the value identity seen by every consumer, including typed facts that
+        // cross this pass boundary. In particular, a runtime-indexed pointer load can be rooted at
+        // the fixed field load being forwarded here; leaving that root unchanged strands the later
+        // texture-array materializer on a dead placeholder instead of the stored array source.
+        let replacement_map = replacements.iter().copied().collect();
+        ctx.emit_sidecar.remap_ids(&replacement_map);
+        let func = &mut ctx.module.functions[entry_idx];
+        for (from, to) in replacements {
+            replace_id_in_function(func, from, to);
+        }
     }
+}
+
+/// Rebuild a runtime-indexed local pointer table from its exact typed store facts.
+///
+/// A helper can receive a pointer to element zero of a local `[N x ptr]`, index it dynamically, and
+/// load an opaque handle. Producer-side inlining necessarily emits that load before interface
+/// binding knows the stored pointers are images or samplers. The sidecar preserves both the load's
+/// dynamic field expression and each store's real source; once binding has assigned final SPIR-V
+/// types, replace the placeholder load with the same finite select table the emitter uses when the
+/// stores and load originally occur in one function.
+pub(in crate::passes) fn recover_inlined_local_dynamic_pointer_fields(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    let mut facts = ctx.emit_sidecar.local_pointer_dynamic_field_loads.clone();
+    let store_markers = local_pointer_field_store_markers(ctx);
+    let store_keys = local_pointer_field_store_keys(ctx);
+    if store_markers.is_empty() {
+        return Ok(());
+    }
+
+    let mut access_keys = HashMap::<Word, LocalPointerFieldKey>::new();
+    let mut stored_fields = HashMap::<LocalPointerFieldKey, Word>::new();
+    for inst in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+    {
+        if let Some((result, key)) = local_pointer_field_access_key(ctx, &access_keys, inst) {
+            access_keys.insert(result, key);
+        }
+        if inst.class.opcode != Op::Store {
+            continue;
+        }
+        let (Some(Operand::IdRef(ptr)), Some(Operand::IdRef(value))) =
+            (inst.operands.first(), inst.operands.get(1))
+        else {
+            continue;
+        };
+        let key = access_keys.get(ptr).or_else(|| store_keys.get(value));
+        let (Some(key), Some(source)) = (key, store_markers.get(value)) else {
+            continue;
+        };
+        stored_fields.insert(key.clone(), *source);
+    }
+
+    // Producer-side helper inlining can expose the dynamic access only after the emitter has lost
+    // its local-field carrier. Recover that same fact structurally from a type-invalid pointer load
+    // through one dynamically-indexed access chain. A later exact match against typed marker stores
+    // remains mandatory; merely finding a dynamic access is never enough to rewrite it.
+    let defs = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter_map(|inst| inst.result_id.map(|result| (result, inst.clone())))
+        .collect::<HashMap<_, _>>();
+    let known = facts.iter().map(|fact| fact.id).collect::<HashSet<_>>();
+    for inst in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+    {
+        if inst.class.opcode != Op::Load {
+            continue;
+        }
+        let (Some(id), Some(result_ty), Some(Operand::IdRef(ptr))) =
+            (inst.result_id, inst.result_type, inst.operands.first())
+        else {
+            continue;
+        };
+        if known.contains(&id)
+            || type_def_of(ctx, result_ty).is_none_or(|ty| ty.class.opcode != Op::TypePointer)
+        {
+            continue;
+        }
+        let Some(ptr_ty) = value_result_type(ctx, *ptr) else {
+            continue;
+        };
+        if pointer_pointee(ctx, ptr_ty) == Some(result_ty) {
+            continue;
+        }
+        let Some(access) = defs.get(ptr).filter(|access| {
+            matches!(
+                access.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+            )
+        }) else {
+            continue;
+        };
+        let Some(Operand::IdRef(root)) = access.operands.first() else {
+            continue;
+        };
+        let indices = &access.operands[1..];
+        let dynamic = indices
+            .iter()
+            .enumerate()
+            .filter(|(_, operand)| access_index_u32(ctx, operand).is_none())
+            .collect::<Vec<_>>();
+        let [(dynamic_position, Operand::IdRef(index))] = dynamic.as_slice() else {
+            continue;
+        };
+        let Some(prefix) = indices[..*dynamic_position]
+            .iter()
+            .map(|operand| access_index_u32(ctx, operand))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        let Some(suffix) = indices[*dynamic_position + 1..]
+            .iter()
+            .map(|operand| access_index_u32(ctx, operand))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        facts.push(crate::emit_sidecar::LocalPointerDynamicFieldLoad {
+            id,
+            root: *root,
+            prefix,
+            index: *index,
+            suffix,
+        });
+    }
+    if facts.is_empty() {
+        return Ok(());
+    }
+
+    let mut replacements = HashMap::<Word, Vec<Instruction>>::new();
+    let mut pointer_roots = Vec::<(StorageClass, Word)>::new();
+    for fact in facts {
+        if replacements.contains_key(&fact.id) {
+            continue;
+        }
+        let root = access_keys
+            .get(&fact.root)
+            .cloned()
+            .unwrap_or(LocalPointerFieldKey {
+                root: fact.root,
+                indices: Vec::new(),
+            });
+        let mut entries = dynamic_pointer_field_entries(&root, &fact, &stored_fields);
+        entries.sort_unstable_by_key(|(index, _)| *index);
+        entries.dedup_by_key(|(index, _)| *index);
+        let Some((_, first)) = entries.first().copied() else {
+            continue;
+        };
+        let Some(value_ty) = value_result_type(ctx, first) else {
+            continue;
+        };
+        if !entries
+            .iter()
+            .all(|(_, source)| value_result_type(ctx, *source) == Some(value_ty))
+        {
+            continue;
+        }
+        if let Some(pointer_type) = type_def_of(ctx, value_ty) {
+            if pointer_type.class.opcode == Op::TypePointer {
+                if let Some(Operand::StorageClass(storage)) = pointer_type.operands.first() {
+                    pointer_roots.push((*storage, fact.id));
+                }
+            }
+        }
+        let Some(index_ty) = value_result_type(ctx, fact.index) else {
+            continue;
+        };
+        if type_def_of(ctx, index_ty).is_none_or(|ty| ty.class.opcode != Op::TypeInt) {
+            continue;
+        }
+
+        let mut emitted = Vec::new();
+        let mut current = first;
+        if entries.len() == 1 {
+            emitted.push(Instruction::new(
+                Op::CopyObject,
+                Some(value_ty),
+                Some(fact.id),
+                vec![Operand::IdRef(first)],
+            ));
+        } else {
+            let bool_ty = ctx.ty_bool();
+            for (position, (entry, source)) in entries.iter().copied().enumerate().skip(1) {
+                let expected = ctx.const_int_of(index_ty, entry as i64);
+                let matches = ctx.module.fresh_id();
+                emitted.push(Instruction::new(
+                    Op::IEqual,
+                    Some(bool_ty),
+                    Some(matches),
+                    vec![Operand::IdRef(fact.index), Operand::IdRef(expected)],
+                ));
+                let selected = if position + 1 == entries.len() {
+                    fact.id
+                } else {
+                    ctx.module.fresh_id()
+                };
+                emitted.push(Instruction::new(
+                    Op::Select,
+                    Some(value_ty),
+                    Some(selected),
+                    vec![
+                        Operand::IdRef(matches),
+                        Operand::IdRef(source),
+                        Operand::IdRef(current),
+                    ],
+                ));
+                current = selected;
+            }
+        }
+        replacements.insert(fact.id, emitted);
+    }
+    if replacements.is_empty() {
+        return Ok(());
+    }
+
+    for block in &mut ctx.module.functions[entry_idx].blocks {
+        let old = std::mem::take(&mut block.instructions);
+        let mut rebuilt = Vec::with_capacity(old.len());
+        for inst in old {
+            if let Some(replacement) = inst
+                .result_id
+                .and_then(|result| replacements.remove(&result))
+            {
+                rebuilt.extend(replacement);
+            } else {
+                rebuilt.push(inst);
+            }
+        }
+        block.instructions = rebuilt;
+    }
+    let defs = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            instruction
+                .result_id
+                .map(|result| (result, instruction.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    for storage in pointer_roots
+        .iter()
+        .map(|(storage, _)| *storage)
+        .collect::<HashSet<_>>()
+    {
+        let roots = pointer_roots
+            .iter()
+            .filter_map(|(candidate, root)| (*candidate == storage).then_some(*root))
+            .collect::<Vec<_>>();
+        crate::passes::workgroup::rewrite_pointer_storage(ctx, entry_idx, &roots, storage, &defs)?;
+    }
+    Ok(())
+}
+
+/// Forward an unmarked pointer load from a uniquely initialized typed local pointer field.
+///
+/// This is the fixed-index companion to the typed sidecar recovery above. Helper inlining can hide
+/// the load behind a by-value aggregate, preventing the emitter from attaching a load fact. After
+/// aggregate forwarding reveals its exact access-chain key, a unique typed marker store earlier in
+/// the same block is sufficient provenance. A unique store in the function entry block also
+/// dominates every reachable successor block, which covers local pointer tables initialized before
+/// entering an inlined helper loop. Any second or untyped store to that exact key makes the field
+/// ambiguous and leaves it untouched.
+pub(in crate::passes) fn recover_unique_local_pointer_field_loads(ctx: &mut Ctx, entry_idx: usize) {
+    let store_markers = local_pointer_field_store_markers(ctx);
+    if store_markers.is_empty() {
+        return;
+    }
+    let mut access_keys = HashMap::<Word, LocalPointerFieldKey>::new();
+    for inst in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+    {
+        if let Some((result, key)) = local_pointer_field_access_key(ctx, &access_keys, inst) {
+            access_keys.insert(result, key);
+        }
+    }
+
+    let mut unique_stores = HashMap::<LocalPointerFieldKey, Option<(Word, usize, usize)>>::new();
+    for (block_index, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (instruction_index, inst) in block.instructions.iter().enumerate() {
+            if inst.class.opcode == Op::Store {
+                let (Some(Operand::IdRef(ptr)), Some(Operand::IdRef(value))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                else {
+                    continue;
+                };
+                if let Some(key) = access_keys.get(ptr) {
+                    let source = store_markers
+                        .get(value)
+                        .copied()
+                        .map(|source| (source, block_index, instruction_index));
+                    unique_stores
+                        .entry(key.clone())
+                        .and_modify(|stored| *stored = None)
+                        .or_insert(source);
+                }
+            }
+        }
+    }
+
+    let mut replacements = Vec::<(Word, Word)>::new();
+    for (block_index, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (instruction_index, inst) in block.instructions.iter().enumerate() {
+            if inst.class.opcode != Op::Load {
+                continue;
+            }
+            let (Some(result), Some(result_ty), Some(Operand::IdRef(ptr))) =
+                (inst.result_id, inst.result_type, inst.operands.first())
+            else {
+                continue;
+            };
+            let Some(key) = access_keys.get(ptr) else {
+                continue;
+            };
+            let Some((source, store_block, store_instruction)) =
+                unique_stores.get(key).copied().flatten()
+            else {
+                continue;
+            };
+            if (block_index == store_block && instruction_index <= store_instruction)
+                || (block_index != store_block && store_block != 0)
+            {
+                continue;
+            }
+            let Some(source_ty) = value_result_type(ctx, source) else {
+                continue;
+            };
+            if type_def_of(ctx, result_ty).is_none_or(|ty| ty.class.opcode != Op::TypePointer)
+                || !type_def_of(ctx, source_ty).is_some_and(|ty| {
+                    matches!(
+                        ty.class.opcode,
+                        Op::TypePointer | Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage
+                    )
+                })
+            {
+                continue;
+            }
+            replacements.push((result, source));
+        }
+    }
+    if replacements.is_empty() {
+        return;
+    }
+    let dead = replacements
+        .iter()
+        .map(|(result, _)| *result)
+        .collect::<HashSet<_>>();
+    for (from, to) in replacements {
+        replace_id_in_function(&mut ctx.module.functions[entry_idx], from, to);
+    }
+    for block in &mut ctx.module.functions[entry_idx].blocks {
+        block.instructions.retain(|inst| {
+            !(inst.class.opcode == Op::Load
+                && inst.result_id.is_some_and(|result| dead.contains(&result)))
+        });
+    }
+}
+
+fn dynamic_pointer_field_entries(
+    root: &LocalPointerFieldKey,
+    fact: &crate::emit_sidecar::LocalPointerDynamicFieldLoad,
+    stored_fields: &HashMap<LocalPointerFieldKey, Word>,
+) -> Vec<(u32, Word)> {
+    let mut entries = Vec::new();
+    for (key, source) in stored_fields {
+        if key.root != root.root {
+            continue;
+        }
+
+        // Dynamic descent directly from an aggregate root: root path + static prefix + table index
+        // + static suffix.
+        if key.indices.starts_with(&root.indices) {
+            let relative = &key.indices[root.indices.len()..];
+            if relative.len() == fact.prefix.len() + 1 + fact.suffix.len()
+                && relative.starts_with(&fact.prefix)
+                && relative[fact.prefix.len() + 1..] == fact.suffix
+            {
+                entries.push((relative[fact.prefix.len()], *source));
+                continue;
+            }
+        }
+
+        // A helper often receives `&table[base]`, so the dynamic index advances the terminal
+        // constant index of that concrete pointer rather than appending another aggregate level.
+        if fact.prefix.is_empty() && !root.indices.is_empty() {
+            let dynamic_position = root.indices.len() - 1;
+            if key.indices.len() == root.indices.len() + fact.suffix.len()
+                && key.indices[..dynamic_position] == root.indices[..dynamic_position]
+                && key.indices[root.indices.len()..] == fact.suffix
+            {
+                let base = root.indices[dynamic_position];
+                let candidate = key.indices[dynamic_position];
+                if let Some(entry) = candidate.checked_sub(base) {
+                    entries.push((entry, *source));
+                }
+            }
+        }
+    }
+    entries
 }
 
 pub(in crate::passes) fn local_pointer_field_store_markers(ctx: &Ctx) -> HashMap<Word, Word> {
@@ -74,6 +483,22 @@ pub(in crate::passes) fn local_pointer_field_store_markers(ctx: &Ctx) -> HashMap
         .local_pointer_field_stores
         .iter()
         .map(|fact| (fact.id, fact.source))
+        .collect()
+}
+
+fn local_pointer_field_store_keys(ctx: &Ctx) -> HashMap<Word, LocalPointerFieldKey> {
+    ctx.emit_sidecar
+        .local_pointer_field_stores
+        .iter()
+        .map(|fact| {
+            (
+                fact.id,
+                LocalPointerFieldKey {
+                    root: fact.root,
+                    indices: fact.indices.clone(),
+                },
+            )
+        })
         .collect()
 }
 
@@ -139,6 +564,7 @@ pub(in crate::passes) fn const_u32(ctx: &Ctx, id: Word) -> Option<u32> {
         .find(|inst| inst.class.opcode == Op::Constant && inst.result_id == Some(id))
         .and_then(|inst| match inst.operands.first() {
             Some(Operand::LiteralBit32(value)) => Some(*value),
+            Some(Operand::LiteralBit64(value)) => u32::try_from(*value).ok(),
             _ => None,
         })
 }
@@ -475,4 +901,142 @@ pub(in crate::passes) fn compose_access_index(
         vec![Operand::IdRef(base_index), Operand::IdRef(offset)],
     ));
     Some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function, Module, ModuleHeader};
+
+    #[test]
+    fn unique_entry_marker_store_repairs_successor_pointer_load() {
+        let ulong = 1;
+        let uint = 2;
+        let ptr_function_ulong = 3;
+        let ptr_uniform_uint = 4;
+        let zero = 5;
+        let marker = 6;
+        let root = 10;
+        let source = 11;
+        let slot = 12;
+        let loaded = 13;
+        let consumer = 14;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(ulong),
+                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(uint),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(ptr_function_ulong),
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(ulong),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(ptr_uniform_uint),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(uint),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(uint),
+                Some(zero),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(Op::ConstantNull, Some(ulong), Some(marker), vec![]),
+        ];
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![
+                Instruction::new(
+                    Op::FunctionParameter,
+                    Some(ptr_function_ulong),
+                    Some(root),
+                    vec![],
+                ),
+                Instruction::new(
+                    Op::FunctionParameter,
+                    Some(ptr_uniform_uint),
+                    Some(source),
+                    vec![],
+                ),
+            ],
+            blocks: vec![
+                Block {
+                    label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
+                    instructions: vec![
+                        Instruction::new(
+                            Op::AccessChain,
+                            Some(ptr_function_ulong),
+                            Some(slot),
+                            vec![Operand::IdRef(root), Operand::IdRef(zero)],
+                        ),
+                        Instruction::new(
+                            Op::Store,
+                            None,
+                            None,
+                            vec![Operand::IdRef(slot), Operand::IdRef(marker)],
+                        ),
+                        Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(21)]),
+                    ],
+                },
+                Block {
+                    label: Some(Instruction::new(Op::Label, None, Some(21), vec![])),
+                    instructions: vec![
+                        Instruction::new(
+                            Op::Load,
+                            Some(ptr_uniform_uint),
+                            Some(loaded),
+                            vec![Operand::IdRef(slot)],
+                        ),
+                        Instruction::new(
+                            Op::CopyObject,
+                            Some(ptr_uniform_uint),
+                            Some(consumer),
+                            vec![Operand::IdRef(loaded)],
+                        ),
+                    ],
+                },
+            ],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+        ctx.emit_sidecar.local_pointer_field_stores.push(
+            crate::emit_sidecar::LocalPointerFieldStore {
+                id: marker,
+                source,
+                root,
+                indices: vec![0],
+            },
+        );
+
+        recover_unique_local_pointer_field_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[1].instructions;
+        assert!(!body.iter().any(|inst| inst.result_id == Some(loaded)));
+        assert_eq!(
+            body.iter()
+                .find(|inst| inst.result_id == Some(consumer))
+                .unwrap()
+                .operands,
+            vec![Operand::IdRef(source)]
+        );
+    }
 }

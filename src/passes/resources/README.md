@@ -14,3 +14,7 @@ shapes and construct their descriptor ABI:
   descriptor arrays created by `ImageArray` bindings.
 - `rewrites/` owns resource-rooted raw-word access, Private atomic lowering, AIR struct-member
   remapping, and structural-load repair, together with their focused fixtures.
+
+This pass owns resource identity and the descriptor ABI, not consumer footprint inference. Reflected
+buffer byte footprints are derived later in `src/reflect/footprint.rs` from the final module that
+passed validation and retry selection.

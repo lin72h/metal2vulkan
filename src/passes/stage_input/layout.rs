@@ -20,8 +20,8 @@ pub(super) fn include_existing_private_globals(ctx: &mut Ctx) {
 
 impl Ctx {
     /// SPIR-V 1.4 requires all global variables referenced by the entry to be on the interface list,
-    /// but 1.3 forbids non-Input/Output there. The llc backend emits version 1.4, so include buffers
-    /// and resources too. We gate on header version.
+    /// while 1.3 forbids non-Input/Output variables there. Include buffers and resources when the
+    /// module header selects 1.4 or newer.
     pub(in crate::passes) fn interface_buffer_var(&mut self, var: Word) {
         let v = self.module.header.as_ref().map(|h| h.version).unwrap_or(0);
         // version word: high byte major, next minor. 1.4 = 0x00010400.
@@ -96,6 +96,99 @@ impl Ctx {
         self.interface_buffer_var(var);
         self.default_null_image_vars.insert((dim, arrayed), var);
         Ok(var)
+    }
+
+    /// Lazily create the descriptor-backed plane for one implicit imageblock attachment and AIR
+    /// data rate. Array layer is the intrinsic's explicit color/sample index; keeping that operand
+    /// prevents indexed imageblock reads from aliasing layer zero.
+    pub(in crate::passes) fn implicit_imageblock_var(
+        &mut self,
+        attachment: u32,
+        data_rate: u32,
+        format: ImageFormat,
+        comp: ImageComp,
+    ) -> Result<(Word, Word), String> {
+        if data_rate > 2 {
+            return Err(format!(
+                "implicit imageblock attachment {attachment} has unknown data rate {data_rate}"
+            ));
+        }
+        if let Some(&(var, image_ty, existing_format)) =
+            self.implicit_imageblock_vars.get(&(attachment, data_rate))
+        {
+            if existing_format != format {
+                return Err(format!(
+                    "implicit imageblock attachment {attachment} rate {data_rate} is used with conflicting formats {existing_format:?} and {format:?}"
+                ));
+            }
+            return Ok((var, image_ty));
+        }
+        let binding = crate::reflect::imageblock_resource_binding(attachment, data_rate);
+        let image_ty = self.ty_storage_image(Dim::Dim2D, true, format, comp);
+        let pointer_ty = self.ty_ptr(StorageClass::UniformConstant, image_ty);
+        let var = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pointer_ty),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        decorate_binding(&mut self.module, var, binding);
+        self.interface_buffer_var(var);
+        self.implicit_imageblock_vars
+            .insert((attachment, data_rate), (var, image_ty, format));
+        Ok((var, image_ty))
+    }
+
+    /// Lazily create one custom fragment-imageblock master plane with the storage format dictated
+    /// by the AIR field type. Each supported type has an exact Vulkan storage-image representation;
+    /// unknown layouts fail visibly instead of being widened or reinterpreted.
+    pub(in crate::passes) fn fragment_imageblock_var(
+        &mut self,
+        master_member: u32,
+        type_name: &str,
+    ) -> Result<(Word, Word), String> {
+        let format = super::super::fragment_imageblock_format(type_name).ok_or_else(|| {
+            format!(
+                "fragment imageblock master member {master_member} has unsupported type {type_name}"
+            )
+        })?;
+        if let Some(binding) = self.fragment_imageblock_vars.get(&master_member) {
+            return Ok(*binding);
+        }
+        let capability = spirv::Capability::StorageImageExtendedFormats;
+        if !self
+            .module
+            .capabilities
+            .iter()
+            .any(|instruction| instruction.operands.as_slice() == [Operand::Capability(capability)])
+        {
+            self.module.capabilities.push(Instruction::new(
+                Op::Capability,
+                None,
+                None,
+                vec![Operand::Capability(capability)],
+            ));
+        }
+        let image_ty =
+            self.ty_storage_image(Dim::Dim2D, false, format.image_format, format.component);
+        let pointer_ty = self.ty_ptr(StorageClass::UniformConstant, image_ty);
+        let var = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pointer_ty),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        decorate_binding(
+            &mut self.module,
+            var,
+            crate::reflect::fragment_imageblock_resource_binding(master_member),
+        );
+        self.interface_buffer_var(var);
+        self.fragment_imageblock_vars
+            .insert(master_member, (var, image_ty));
+        Ok((var, image_ty))
     }
 
     /// A constant/undef of `ty` for unused params (OpUndef is always legal).

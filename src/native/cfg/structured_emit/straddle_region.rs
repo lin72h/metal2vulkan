@@ -130,7 +130,7 @@ fn carrier_with_phis(
     Ok(BodyBlock {
         name: name.to_string(),
         role,
-        typed: Some(carrier),
+        typed: Some(carrier.into()),
     })
 }
 
@@ -149,6 +149,7 @@ fn collect_value_locals(value: &LlValue, out: &mut Vec<String>) {
                 collect_value_locals(&index.value, out);
             }
         }
+        LlValue::IntToPtr { source, .. } => collect_value_locals(&source.value, out),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -190,6 +191,9 @@ fn substitute_cross_slot_value(
                 substitute_cross_slot_value(&mut index.value, value_slots, source);
             }
         }
+        LlValue::IntToPtr {
+            source: operand, ..
+        } => substitute_cross_slot_value(&mut operand.value, value_slots, source),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -730,7 +734,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
     let mut updates = Vec::new();
     for (case_index, &global) in ordered.iter().enumerate() {
         let mut case = blocks[global].clone();
-        let carrier = case.typed.as_mut().expect("checked above");
+        let carrier = std::sync::Arc::make_mut(case.typed.as_mut().expect("checked above"));
         carrier.rename(&rename);
         let substitutions = value_slots
             .iter()
@@ -1189,8 +1193,7 @@ fn rewrite_entry_and_exit_phis(
         .map(|block| block.name.clone())
         .collect::<Vec<_>>();
     blocks[entry_from]
-        .typed
-        .as_mut()
+        .typed_mut()
         .expect("checked above")
         .redirect_successor(&entry_to_name, PRE);
 
@@ -1203,7 +1206,7 @@ fn rewrite_entry_and_exit_phis(
     }
     for (&(target, phi), slots) in &payload_by_target_phi {
         let target_name = block_names[target].clone();
-        let carrier = blocks[target].typed.as_mut().expect("checked above");
+        let carrier = blocks[target].typed_mut().expect("checked above");
         let inst = carrier
             .insts
             .iter()
@@ -1274,7 +1277,7 @@ mod tests {
         BodyBlock {
             name: name.to_string(),
             role: BlockRole::Normal,
-            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()),
+            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()).map(Into::into),
         }
     }
 

@@ -17,7 +17,7 @@ use spirv::{Decoration, FunctionControl, Op, SelectionControl, StorageClass};
 // (the driver even hand-unrolls some of them): running it twice must not change the module. These
 // helpers generalize the one existing hand-written idempotence check (decorate_ptr_...). Each
 // single-pass fixture below runs its pass through `run_idempotent` instead of calling it once, so a
-// pass that mutates its own output turns the fixture red — a finding to journal, not paper over.
+// pass that mutates its own output turns the fixture red as a regression to investigate.
 
 /// A comparable snapshot of the mutable state a lowering pass can touch: the function bodies, the
 /// global type/constant table, the decorations, and the pass-appended `new_globals` staging vec.
@@ -2140,6 +2140,83 @@ fn repair_phi_predecessor_edges_rewrites_stale_self_backedge_to_continue() {
 }
 
 #[test]
+fn repair_phi_predecessor_edges_moves_merge_into_synthetic_loop_header() {
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(100));
+    module.types_global_values = vec![
+        Instruction::new(Op::Constant, Some(1), Some(20), vec![]),
+        Instruction::new(Op::Constant, Some(1), Some(21), vec![]),
+    ];
+    let branch = |label, target| Block {
+        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
+        instructions: vec![Instruction::new(
+            Op::Branch,
+            None,
+            None,
+            vec![Operand::IdRef(target)],
+        )],
+    };
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(1),
+            Some(10),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(11),
+            ],
+        )),
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+        parameters: vec![],
+        blocks: vec![
+            branch(2, 3),
+            branch(3, 4),
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(4), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::Phi,
+                        Some(1),
+                        Some(22),
+                        vec![
+                            Operand::IdRef(20),
+                            Operand::IdRef(2),
+                            Operand::IdRef(21),
+                            Operand::IdRef(6),
+                        ],
+                    ),
+                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(6)]),
+                ],
+            },
+            branch(6, 7),
+            branch(7, 3),
+        ],
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    assert!(repair_phi_predecessor_edges(&mut ctx, 0));
+    let forwarded = &ctx.module.functions[0].blocks[1].instructions[0];
+    assert_eq!(forwarded.class.opcode, Op::Phi);
+    assert_eq!(
+        forwarded.operands,
+        vec![
+            Operand::IdRef(20),
+            Operand::IdRef(2),
+            Operand::IdRef(21),
+            Operand::IdRef(7),
+        ]
+    );
+    let phi = &ctx.module.functions[0].blocks[2].instructions[0];
+    assert_eq!(
+        phi.operands,
+        vec![
+            Operand::IdRef(forwarded.result_id.unwrap()),
+            Operand::IdRef(3),
+        ]
+    );
+}
+
+#[test]
 fn repair_phi_predecessor_edges_drops_stale_extra_predecessor() {
     let mut module = Module::new();
     module.header = Some(ModuleHeader::new(100));
@@ -2664,13 +2741,22 @@ fn decorate_ptr_access_chain_base_strides_adds_stride_per_pointee() {
                 Operand::IdRef(7),
             ],
         ),
-        // `ArrayStride` is an explicit layout decoration and is invalid on Workgroup pointers.
+        // `ArrayStride` is an explicit layout decoration and is invalid on Workgroup/Function pointers.
         Instruction::new(
             Op::TypePointer,
             None,
             Some(9),
             vec![
                 Operand::StorageClass(StorageClass::Workgroup),
+                Operand::IdRef(3),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(11),
+            vec![
+                Operand::StorageClass(StorageClass::Function),
                 Operand::IdRef(3),
             ],
         ),
@@ -2707,6 +2793,12 @@ fn decorate_ptr_access_chain_base_strides_adds_stride_per_pointee() {
                     Some(32),
                     vec![Operand::IdRef(42), Operand::IdRef(5)],
                 ),
+                Instruction::new(
+                    Op::PtrAccessChain,
+                    Some(11),
+                    Some(33),
+                    vec![Operand::IdRef(43), Operand::IdRef(5)],
+                ),
                 Instruction::new(Op::Return, None, None, vec![]),
             ],
         }],
@@ -2736,6 +2828,10 @@ fn decorate_ptr_access_chain_base_strides_adds_stride_per_pointee() {
     assert!(
         stride_of(&ctx, 9).is_empty(),
         "Workgroup pointer types cannot carry explicit layout decorations"
+    );
+    assert!(
+        stride_of(&ctx, 11).is_empty(),
+        "Function pointer types cannot carry explicit layout decorations"
     );
 
     // Idempotent: a second run must not append a duplicate ArrayStride for the same pointer type.
@@ -3057,8 +3153,9 @@ fn lower_cross_member_subword_store_splits_into_members() {
     );
 }
 
-// A dead, currently-invalid access chain (an unused `uchar`-pointer re-indexed to a `ushort` pointer)
-// is dropped; a used one and a valid one are kept.
+// A dead, currently-invalid access chain (an unused `uchar`-pointer re-indexed to a `ushort`
+// pointer) and the otherwise-valid PtrAccessChain suffix that keeps it live are dropped; a used
+// valid chain is kept.
 #[test]
 fn drop_dead_invalid_access_chains_removes_unused_overindex() {
     let mut module = Module::new();
@@ -3075,6 +3172,7 @@ fn drop_dead_invalid_access_chains_removes_unused_overindex() {
     let buf = 9;
     let uint_0 = 10;
     let idx = 11;
+    let ptr_offset = 12;
     module.types_global_values = vec![
         Instruction::new(
             Op::TypeInt,
@@ -3185,6 +3283,14 @@ fn drop_dead_invalid_access_chains_removes_unused_overindex() {
                     Some(61),
                     vec![Operand::IdRef(60), Operand::IdRef(idx)],
                 ),
+                // This valid zero-offset pointer chain is dead, but initially keeps the invalid
+                // parent live. Cleanup must remove the suffix and then the newly orphaned parent.
+                Instruction::new(
+                    Op::PtrAccessChain,
+                    Some(ptr_sb_ushort),
+                    Some(ptr_offset),
+                    vec![Operand::IdRef(61), Operand::IdRef(uint_0)],
+                ),
                 // Keep %60 live.
                 Instruction::new(Op::Load, Some(uchar), Some(62), vec![Operand::IdRef(60)]),
             ],
@@ -3198,6 +3304,10 @@ fn drop_dead_invalid_access_chains_removes_unused_overindex() {
     assert!(
         !insts.iter().any(|i| i.result_id == Some(61)),
         "the dead invalid chain must be dropped"
+    );
+    assert!(
+        !insts.iter().any(|i| i.result_id == Some(ptr_offset)),
+        "the dead pointer-chain suffix must be dropped"
     );
     assert!(
         insts.iter().any(|i| i.result_id == Some(60)),
@@ -4475,6 +4585,182 @@ fn repair_vector_load_through_scalar_stride_rewrites_to_ptr_access_chain() {
     );
 }
 
+// A vector view into a raw uint-word buffer is expanded to four scalar word loads. The vector index
+// is deliberately defined in the same block: the rewrite must capture its type before taking that
+// block's instructions, or it can delete the old chain while leaving an undefined load pointer. Two
+// trailing zero-stride scalar GEP indices exercise the composed opaque-pointer form seen in AIR.
+#[test]
+fn repair_vector_load_through_raw_word_pointer_handles_local_index_definition() {
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(200));
+
+    let uint = 1;
+    let float = 2;
+    let v4float = 3;
+    let words = 4;
+    let block = 5;
+    let ptr_block = 6;
+    let ptr_v4float = 7;
+    let buffer = 8;
+    let zero = 9;
+    let base_word = 10;
+    let one = 11;
+    let local_index = 12;
+    let chain = 13;
+    let load = 14;
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float),
+            vec![Operand::LiteralBit32(32)],
+        ),
+        Instruction::new(
+            Op::TypeVector,
+            None,
+            Some(v4float),
+            vec![Operand::IdRef(float), Operand::LiteralBit32(4)],
+        ),
+        Instruction::new(
+            Op::TypeRuntimeArray,
+            None,
+            Some(words),
+            vec![Operand::IdRef(uint)],
+        ),
+        Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(block),
+            vec![Operand::IdRef(words)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_block),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(block),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_v4float),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(v4float),
+            ],
+        ),
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_block),
+            Some(buffer),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(zero),
+            vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(base_word),
+            vec![Operand::LiteralBit32(20)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(one),
+            vec![Operand::LiteralBit32(1)],
+        ),
+    ];
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(uint),
+            Some(50),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(51),
+            ],
+        )),
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+        parameters: vec![],
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
+            instructions: vec![
+                Instruction::new(
+                    Op::IAdd,
+                    Some(uint),
+                    Some(local_index),
+                    vec![Operand::IdRef(zero), Operand::IdRef(one)],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_v4float),
+                    Some(chain),
+                    vec![
+                        Operand::IdRef(buffer),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(base_word),
+                        Operand::IdRef(local_index),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(one),
+                    ],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(v4float),
+                    Some(load),
+                    vec![Operand::IdRef(chain)],
+                ),
+            ],
+        }],
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    run_idempotent(&mut ctx, |c| {
+        repair_vector_load_through_raw_word_pointer(c, 0)
+    });
+
+    let body = &ctx.module.functions[0].blocks[0].instructions;
+    assert!(
+        !body.iter().any(|inst| inst.result_id == Some(chain)),
+        "the invalid vector chain must be removed"
+    );
+    assert!(body.iter().any(|inst| {
+        inst.result_id == Some(load) && inst.class.opcode == Op::CompositeConstruct
+    }));
+    assert_eq!(
+        body.iter()
+            .filter(|inst| inst.class.opcode == Op::Load && inst.result_type == Some(uint))
+            .count(),
+        4
+    );
+    let four = ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .find(|inst| {
+            inst.class.opcode == Op::Constant
+                && inst.result_type == Some(uint)
+                && inst.operands == [Operand::LiteralBit32(4)]
+        })
+        .and_then(|inst| inst.result_id)
+        .expect("one trailing vector advances four raw words");
+    assert!(body.iter().any(|inst| {
+        inst.class.opcode == Op::IAdd && inst.operands.contains(&Operand::IdRef(four))
+    }));
+}
+
 // `OpLoad %float` through a `v4float*` PtrAccessChain is the matrix-column gather's strided component
 // read; the chain gets a trailing `%uint_0` and is retyped to `float*`.
 #[test]
@@ -4758,8 +5044,8 @@ fn drop_writeonly_dead_local_array_stores_removes_invalid_stores() {
 // exactly once, so it is tested with a single call and the non-idempotence is documented, not fixed.
 
 /// A same-width int/float `OpUConvert`/`OpSConvert`/`OpFConvert` is a no-op the SPIR-V would reject as
-/// a width-preserving convert; `fix_noop_width_converts` rewrites it to `OpCopyObject`. A genuine
-/// narrowing/widening convert (differing scalar bit width) is left untouched.
+/// a width-preserving convert; `fix_noop_width_converts` uses `OpCopyObject` for identical types and
+/// `OpBitcast` for equal-width signedness changes. A genuine narrowing/widening convert is untouched.
 #[test]
 fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
     let mut module = Module::new();
@@ -4767,10 +5053,13 @@ fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
 
     let uint = 1; // TypeInt 32 0
     let ushort = 2; // TypeInt 16 0
+    let sint = 3; // TypeInt 32 1
     let p_uint = 10; // param : uint  (same width as the convert result)
     let p_ushort = 11; // param : ushort (genuinely narrower source)
+    let p_sint = 12; // param : signed int (same width, distinct type)
     let noop_res = 20;
     let real_res = 21;
+    let signedness_res = 22;
     module.types_global_values = vec![
         Instruction::new(
             Op::TypeInt,
@@ -4783,6 +5072,12 @@ fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
             None,
             Some(ushort),
             vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(sint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(1)],
         ),
     ];
     module.functions.push(Function {
@@ -4799,6 +5094,7 @@ fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
         parameters: vec![
             Instruction::new(Op::FunctionParameter, Some(uint), Some(p_uint), vec![]),
             Instruction::new(Op::FunctionParameter, Some(ushort), Some(p_ushort), vec![]),
+            Instruction::new(Op::FunctionParameter, Some(sint), Some(p_sint), vec![]),
         ],
         blocks: vec![Block {
             label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
@@ -4816,6 +5112,13 @@ fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
                     Some(uint),
                     Some(real_res),
                     vec![Operand::IdRef(p_ushort)],
+                ),
+                // Equal width and lanes but different signedness: CopyObject would be invalid.
+                Instruction::new(
+                    Op::UConvert,
+                    Some(uint),
+                    Some(signedness_res),
+                    vec![Operand::IdRef(p_sint)],
                 ),
             ],
         }],
@@ -4839,11 +5142,15 @@ fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
         "a genuine width-changing convert must be left untouched"
     );
     assert_eq!(body[1].result_id, Some(real_res));
+    assert_eq!(body[2].class.opcode, Op::Bitcast);
+    assert_eq!(body[2].result_id, Some(signedness_res));
+    assert_eq!(body[2].result_type, Some(uint));
+    assert_eq!(body[2].operands, vec![Operand::IdRef(p_sint)]);
 }
 
-/// `fix_merge_placement` slides an `OpSelectionMerge`/`OpLoopMerge` that llc's structurizer left
-/// mid-block down to sit immediately before the block's branch terminator (SPIR-V requires the merge
-/// to be the second-to-last instruction), preserving the relative order of the displaced values.
+/// `fix_merge_placement` slides a mid-block `OpSelectionMerge`/`OpLoopMerge` down to sit immediately
+/// before the block's branch terminator (SPIR-V requires the merge to be the second-to-last
+/// instruction), preserving the relative order of displaced values.
 #[test]
 fn fix_merge_placement_slides_midblock_merge_before_terminator() {
     let mut module = Module::new();
@@ -6381,6 +6688,168 @@ fn neutralize_private_placeholder_access_chains_replaces_unnamed_null_private_ch
     );
 }
 
+// A placeholder loop component is not serialized in def-use order: the phi precedes its backedge
+// chain. Placeholder discovery must therefore reach a fixed point, then replace both chains AND the
+// illegal Private pointer phi with ordinary copies of dedicated zero/discard slots.
+#[test]
+fn neutralize_private_placeholder_component_replaces_loop_phi_and_backedge() {
+    let float = 1;
+    let uint = 2;
+    let len2 = 3;
+    let arr = 4;
+    let ptr_priv_arr = 5;
+    let ptr_priv_float = 6;
+    let null_arr = 7;
+    let idx0 = 8;
+    let var = 9;
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(100));
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float),
+            vec![Operand::LiteralBit32(32)],
+        ),
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(len2),
+            vec![Operand::LiteralBit32(2)],
+        ),
+        Instruction::new(
+            Op::TypeArray,
+            None,
+            Some(arr),
+            vec![Operand::IdRef(float), Operand::IdRef(len2)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_priv_arr),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(arr),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_priv_float),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(float),
+            ],
+        ),
+        Instruction::new(Op::ConstantNull, Some(arr), Some(null_arr), vec![]),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(idx0),
+            vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_priv_arr),
+            Some(var),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(null_arr),
+            ],
+        ),
+    ];
+
+    let entry = 50;
+    let header = 51;
+    let latch = 52;
+    let first = 60;
+    let phi = 61;
+    let backedge = 62;
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(float),
+            Some(40),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(41),
+            ],
+        )),
+        parameters: vec![],
+        blocks: vec![
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(entry), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::AccessChain,
+                        Some(ptr_priv_float),
+                        Some(first),
+                        vec![Operand::IdRef(var), Operand::IdRef(idx0)],
+                    ),
+                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(header)]),
+                ],
+            },
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(header), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::Phi,
+                        Some(ptr_priv_float),
+                        Some(phi),
+                        vec![
+                            Operand::IdRef(first),
+                            Operand::IdRef(entry),
+                            Operand::IdRef(backedge),
+                            Operand::IdRef(latch),
+                        ],
+                    ),
+                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(latch)]),
+                ],
+            },
+            Block {
+                label: Some(Instruction::new(Op::Label, None, Some(latch), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::AccessChain,
+                        Some(ptr_priv_float),
+                        Some(backedge),
+                        vec![Operand::IdRef(var), Operand::IdRef(idx0)],
+                    ),
+                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(header)]),
+                ],
+            },
+        ],
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    run_idempotent(&mut ctx, |c| {
+        neutralize_private_placeholder_access_chains(c, 0).unwrap()
+    });
+
+    for result in [first, phi, backedge] {
+        let inst = ctx.module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .find(|inst| inst.result_id == Some(result))
+            .expect("placeholder-derived pointer result survives");
+        assert_eq!(inst.class.opcode, Op::CopyObject);
+        assert_eq!(inst.result_type, Some(ptr_priv_float));
+    }
+    assert!(!ctx.module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .any(|inst| matches!(inst.class.opcode, Op::Phi | Op::AccessChain)));
+}
+
 // The pass must NOT touch a Private variable that carries a debug name (a real source-level global, not
 // an emitter placeholder): its access chain is left byte-for-byte alone.
 #[test]
@@ -6525,6 +6994,7 @@ fn recover_inlined_local_pointer_fields_forwards_stored_source_to_matching_load(
     let stored_val = 70; // the value stored, marked with its source
     let chain = 60; // access chain, key {root:50, indices:[1]}
     let load = 90; // load marked with the matching key
+    let dynamic_load = 95; // a later runtime-indexed load rooted at the fixed field load
     let consumer = 100; // uses the load result
     module.functions.push(Function {
         def: Some(Instruction::new(
@@ -6593,6 +7063,8 @@ fn recover_inlined_local_pointer_fields_forwards_stored_source_to_matching_load(
         .push(crate::emit_sidecar::LocalPointerFieldStore {
             id: stored_val,
             source,
+            root,
+            indices: vec![1],
         });
     ctx.emit_sidecar
         .local_pointer_field_loads
@@ -6601,6 +7073,15 @@ fn recover_inlined_local_pointer_fields_forwards_stored_source_to_matching_load(
             root,
             indices: vec![1],
         });
+    ctx.emit_sidecar.local_pointer_dynamic_field_loads.push(
+        crate::emit_sidecar::LocalPointerDynamicFieldLoad {
+            id: dynamic_load,
+            root: load,
+            prefix: vec![],
+            index: c1,
+            suffix: vec![0],
+        },
+    );
     run_idempotent(&mut ctx, |c| recover_inlined_local_pointer_fields(c, 0));
 
     let body = &ctx.module.functions[0].blocks[0].instructions;
@@ -6614,6 +7095,10 @@ fn recover_inlined_local_pointer_fields_forwards_stored_source_to_matching_load(
     assert!(
         body.iter().any(|i| i.result_id == Some(load)),
         "the load def id is preserved; only its uses forward"
+    );
+    assert_eq!(
+        ctx.emit_sidecar.local_pointer_dynamic_field_loads[0].root, source,
+        "typed consumers observe the same forwarding as function operands"
     );
 }
 
@@ -6730,6 +7215,8 @@ fn recover_inlined_local_pointer_fields_leaves_key_mismatched_load_alone() {
         .push(crate::emit_sidecar::LocalPointerFieldStore {
             id: stored_val,
             source,
+            root,
+            indices: vec![2],
         });
     ctx.emit_sidecar
         .local_pointer_field_loads
@@ -6746,5 +7233,160 @@ fn recover_inlined_local_pointer_fields_leaves_key_mismatched_load_alone() {
         consumer_inst.operands,
         vec![Operand::IdRef(load)],
         "the key-mismatched load is not forwarded"
+    );
+}
+
+#[test]
+fn recover_inlined_dynamic_pointer_table_selects_exact_stored_sources() {
+    let float = 1;
+    let ptr = 2;
+    let uint = 3;
+    let c0 = 4;
+    let c1 = 5;
+    let c2 = 6;
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(200));
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float),
+            vec![Operand::LiteralBit32(32)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(float),
+            ],
+        ),
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(c0),
+            vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(c1),
+            vec![Operand::LiteralBit32(1)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(c2),
+            vec![Operand::LiteralBit32(2)],
+        ),
+    ];
+
+    let root = 20;
+    let index = 21;
+    let sources = [30, 31, 32];
+    let markers = [40, 41, 42];
+    let slots = [50, 51, 52];
+    let base = 53;
+    let dynamic_slot = 54;
+    let load = 60;
+    let consumer = 61;
+    let mut instructions = Vec::new();
+    for ((slot, marker), constant) in slots.into_iter().zip(markers).zip([c0, c1, c2]) {
+        instructions.push(Instruction::new(
+            Op::AccessChain,
+            Some(ptr),
+            Some(slot),
+            vec![Operand::IdRef(root), Operand::IdRef(constant)],
+        ));
+        instructions.push(Instruction::new(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(slot), Operand::IdRef(marker)],
+        ));
+    }
+    instructions.extend([
+        Instruction::new(
+            Op::AccessChain,
+            Some(ptr),
+            Some(base),
+            vec![Operand::IdRef(root), Operand::IdRef(c0)],
+        ),
+        Instruction::new(
+            Op::PtrAccessChain,
+            Some(ptr),
+            Some(dynamic_slot),
+            vec![Operand::IdRef(base), Operand::IdRef(index)],
+        ),
+        Instruction::new(
+            Op::Load,
+            Some(ptr),
+            Some(load),
+            vec![Operand::IdRef(dynamic_slot)],
+        ),
+        Instruction::new(
+            Op::CopyObject,
+            Some(ptr),
+            Some(consumer),
+            vec![Operand::IdRef(load)],
+        ),
+    ]);
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(float),
+            Some(10),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(11),
+            ],
+        )),
+        parameters: std::iter::once((root, ptr))
+            .chain(std::iter::once((index, uint)))
+            .chain(sources.into_iter().map(|source| (source, ptr)))
+            .chain(markers.into_iter().map(|marker| (marker, ptr)))
+            .map(|(id, ty)| Instruction::new(Op::FunctionParameter, Some(ty), Some(id), vec![]))
+            .collect(),
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(12), vec![])),
+            instructions,
+        }],
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+    });
+    let mut ctx = crate::passes::Ctx::new(module);
+    for (index, (id, source)) in markers.into_iter().zip(sources).enumerate() {
+        ctx.emit_sidecar.local_pointer_field_stores.push(
+            crate::emit_sidecar::LocalPointerFieldStore {
+                id,
+                source,
+                root,
+                indices: vec![index as u32],
+            },
+        );
+    }
+    recover_inlined_local_dynamic_pointer_fields(&mut ctx, 0).unwrap();
+
+    let body = &ctx.module.functions[0].blocks[0].instructions;
+    assert!(!body
+        .iter()
+        .any(|inst| inst.class.opcode == Op::Load && inst.result_id == Some(load)));
+    let selected = body
+        .iter()
+        .find(|inst| inst.result_id == Some(load))
+        .expect("final dynamic table selection");
+    assert_eq!(selected.class.opcode, Op::Select);
+    assert_eq!(selected.result_type, Some(ptr));
+    assert_eq!(
+        body.iter()
+            .filter(|inst| inst.class.opcode == Op::Select)
+            .count(),
+        2
     );
 }

@@ -103,6 +103,103 @@ pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
         .collect()
 }
 
+/// Integer mirrors derived from an AIR function-constant initializer and only read afterward. This
+/// is the product-safe subset of the metadata evaluator above: ordinary constructor state is left
+/// intact, and any non-load use outside a constructor may mutate or escape the cell, so it is
+/// excluded.
+pub(crate) fn static_init_foldable_int_global_values(ll: &str) -> HashMap<String, u32> {
+    let mut values = static_init_int_global_values(ll);
+    let mut derived_globals = ll
+        .lines()
+        .filter_map(|raw| {
+            let line = raw.split(';').next().unwrap_or(raw).trim();
+            (line.starts_with('@') && line.contains("air.fc_initializer"))
+                .then(|| line.split_once(" = ").map(|(name, _)| name.to_string()))
+                .flatten()
+        })
+        .collect::<HashSet<_>>();
+    let mut derived_locals = HashSet::<String>::new();
+    let mut in_constructor = false;
+    for raw in ll.lines() {
+        let line = raw.split(';').next().unwrap_or(raw).trim();
+        if line.starts_with("define ") {
+            in_constructor = line.contains("@_GLOBAL__sub_I");
+            derived_locals.clear();
+            continue;
+        }
+        if line == "}" {
+            in_constructor = false;
+            continue;
+        }
+        if !in_constructor {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("store ") {
+            let mut parts = rest.splitn(2, ',');
+            let value = parts.next().map(value_token);
+            let target = parts.next().and_then(parse_global_name);
+            if let (Some(value), Some(target)) = (value, target) {
+                if derived_locals.contains(value) || derived_globals.contains(value) {
+                    derived_globals.insert(target);
+                } else {
+                    derived_globals.remove(&target);
+                }
+            }
+            continue;
+        }
+        let Some((result, rhs)) = line.split_once(" = ") else {
+            continue;
+        };
+        if result.starts_with('%')
+            && derived_globals
+                .iter()
+                .chain(&derived_locals)
+                .any(|symbol| references_symbol(rhs, symbol))
+        {
+            derived_locals.insert(result.to_string());
+        }
+    }
+    values.retain(|global, _| derived_globals.contains(global));
+
+    let mut in_static_init = false;
+    let mut in_function = false;
+    for raw in ll.lines() {
+        let line = raw.split(';').next().unwrap_or(raw).trim();
+        if line.starts_with("define ") {
+            in_function = true;
+            in_static_init = line.contains("@_GLOBAL__sub_I");
+            continue;
+        }
+        if line == "}" {
+            in_function = false;
+            in_static_init = false;
+            continue;
+        }
+        if !in_function || in_static_init || line.is_empty() {
+            continue;
+        }
+        values.retain(|global, _| {
+            if !references_symbol(line, global) {
+                return true;
+            }
+            let Some(load) = line.split_once(" = load ").map(|(_, load)| load) else {
+                return false;
+            };
+            parse_global_name(load).as_ref() == Some(global)
+        });
+    }
+    values
+}
+
+fn references_symbol(text: &str, symbol: &str) -> bool {
+    text.match_indices(symbol).any(|(start, _)| {
+        let end = start + symbol.len();
+        let boundary = |byte: u8| !matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'$');
+        (start == 0 || boundary(text.as_bytes()[start - 1]))
+            && (end == text.len() || boundary(text.as_bytes()[end]))
+    })
+}
+
 fn parse_integer_global_initializers(ll: &str) -> HashMap<String, u32> {
     let mut globals = HashMap::new();
     for raw in ll.lines() {
@@ -142,6 +239,9 @@ fn eval_static_rhs(
     env: &HashMap<String, StaticValue>,
     globals: &HashMap<String, u32>,
 ) -> Option<StaticValue> {
+    if rhs.contains("@air.is_function_constant_defined(") {
+        return Some(StaticValue::Bool(false));
+    }
     if rhs.starts_with("load <4 x i32>") {
         return Some(StaticValue::Vec4([0; 4]));
     }

@@ -7,7 +7,7 @@ use crate::spirv_module::load_bytes;
 const FC_DEFINED_NAME_PREFIX: &str = "__metal2vulkan.MTL_FC_DEFINED_";
 
 /// Parse the FC index `N` out of an `air.fc_initializer` global's mangled name — the stable
-/// `...MTL_FC_INIT_<N>_<suffix>` shape the AIR/LLVM backend emits for a `[[function_constant(N)]]`.
+/// `...MTL_FC_INIT_<N>_<suffix>` shape present in AIR for a `[[function_constant(N)]]`.
 /// Returns `None` for any name lacking that ABI marker (working copies, ordinary globals), so this
 /// keys only on the documented Metal function-constant machinery, never on a shader-specific name.
 pub(crate) fn fc_init_index(name: &str) -> Option<u32> {
@@ -325,9 +325,8 @@ fn materialize_zero_fc_initializers(module: &mut crate::spirv_module::Module) ->
     true
 }
 
-fn fc_lanes_from_le_value(value: u64, width: u32, count: u32) -> Vec<u64> {
+fn fc_lanes_from_le_bytes(bytes: &[u8], width: u32, count: u32) -> Vec<u64> {
     let width_bytes = (width as usize).div_ceil(8).min(8);
-    let bytes = value.to_le_bytes();
     (0..count)
         .map(|lane| {
             let start = lane as usize * width_bytes;
@@ -340,6 +339,10 @@ fn fc_lanes_from_le_value(value: u64, width: u32, count: u32) -> Vec<u64> {
             u64::from_le_bytes(lane)
         })
         .collect()
+}
+
+fn fc_scalar_from_le_bytes(bytes: &[u8], width: u32) -> u64 {
+    fc_lanes_from_le_bytes(bytes, width, 1)[0]
 }
 
 fn int_constant_id(
@@ -417,13 +420,40 @@ pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String>
 /// error, so a stale behavior-changing override can never silently no-op. An absent zero override
 /// is harmless when translation has already erased every use of that FC.
 pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Result<Vec<u8>, String> {
+    let bytes = values
+        .iter()
+        .map(|(index, value)| (*index, value.to_le_bytes().to_vec()))
+        .collect::<Vec<_>>();
+    specialize_function_constant_bytes_impl(spv, &bytes, false)
+}
+
+/// Bake exact little-endian scalar or vector payloads into Metal function constants.
+///
+/// Unlike [`specialize_function_constants`], this entry point is not limited to one `u64` and can
+/// therefore represent the full 2/3/4-lane Metal vector ABI. The SPIR-V variable type determines
+/// the exact payload width, and every payload must match it exactly.
+pub fn specialize_function_constant_bytes(
+    spv: &[u8],
+    values: &[(u32, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    specialize_function_constant_bytes_impl(spv, values, true)
+}
+
+fn specialize_function_constant_bytes_impl(
+    spv: &[u8],
+    values: &[(u32, Vec<u8>)],
+    exact_payload_size: bool,
+) -> Result<Vec<u8>, String> {
     use crate::spirv_module::Instruction;
     use crate::spirv_module::Operand;
     use spirv::Op;
     if values.is_empty() {
         return Ok(spv.to_vec());
     }
-    let want: std::collections::HashMap<u32, u64> = values.iter().copied().collect();
+    let want: std::collections::HashMap<u32, &[u8]> = values
+        .iter()
+        .map(|(index, bytes)| (*index, bytes.as_slice()))
+        .collect();
     let mut module = load_bytes(spv).map_err(|e| format!("SPIR-V load: {e:?}"))?;
 
     // OpName: var id -> FC index, restricted to `MTL_FC_INIT_<N>` globals.
@@ -496,7 +526,9 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
         let Some(&idx) = var_index.get(&vid) else {
             continue;
         };
-        let Some(&val) = want.get(&idx) else { continue };
+        let Some(&bytes) = want.get(&idx) else {
+            continue;
+        };
         let ptr_ty = inst
             .result_type
             .ok_or_else(|| format!("FC var %{vid} has no result type"))?;
@@ -504,6 +536,14 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
             .get(&ptr_ty)
             .ok_or_else(|| format!("FC var %{vid}: pointer type %{ptr_ty} has no pointee"))?;
         if let Some(&width) = scalar_width.get(&scalar_ty) {
+            let required = (width as usize).div_ceil(8);
+            if exact_payload_size && bytes.len() != required {
+                return Err(format!(
+                    "FC index {idx}: payload has {} bytes, scalar type requires {required}",
+                    bytes.len()
+                ));
+            }
+            let val = fc_scalar_from_le_bytes(bytes, width);
             let cid = int_constant_id(
                 scalar_ty,
                 width,
@@ -521,7 +561,14 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
             ));
         };
         let width = scalar_width[&component_ty];
-        let lanes = fc_lanes_from_le_value(val, width, count);
+        let required = (width as usize).div_ceil(8) * count as usize;
+        if exact_payload_size && bytes.len() != required {
+            return Err(format!(
+                "FC index {idx}: payload has {} bytes, vector type requires {required}",
+                bytes.len()
+            ));
+        }
+        let lanes = fc_lanes_from_le_bytes(bytes, width, count);
         let mut const_ids = Vec::with_capacity(lanes.len() + 1);
         for lane in &lanes {
             const_ids.push(int_constant_id(
@@ -563,7 +610,10 @@ pub fn specialize_function_constants(spv: &[u8], values: &[(u32, u64)]) -> Resul
     let missing: Vec<u32> = requested
         .difference(&applied)
         .copied()
-        .filter(|index| want.get(index).copied().unwrap_or(0) != 0)
+        .filter(|index| {
+            want.get(index)
+                .is_some_and(|bytes| bytes.iter().any(|byte| *byte != 0))
+        })
         .collect();
     if !missing.is_empty() {
         return Err(format!(
@@ -1933,7 +1983,12 @@ mod tests {
             vec![name(5, "_ZN3app12shader_stateE.MTL_FC_INIT_0_Dv4_j")],
         );
 
-        let out = specialize_function_constants(&bytes, &[(0, 1)]).expect("specialize");
+        let payload = [1u32, 2, 3, 4]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let out = specialize_function_constant_bytes(&bytes, &[(0, payload)])
+            .expect("specialize full vector");
         let m = load_bytes(&out).expect("reload");
         let vector_init = m
             .types_global_values
@@ -1974,7 +2029,7 @@ mod tests {
                 other => panic!("unexpected composite operand: {other:?}"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(lane_values, vec![1, 0, 0, 0]);
+        assert_eq!(lane_values, vec![1, 2, 3, 4]);
     }
 
     #[test]

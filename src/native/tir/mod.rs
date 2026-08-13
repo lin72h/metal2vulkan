@@ -303,14 +303,14 @@ pub(super) struct TirInst {
     /// `text`. `None` for every other opcode (and for a `getelementptr` whose operands do not parse).
     /// Byte-identical to the retired text-walk by construction: the exact same `parse_gep` on the exact
     /// same rhs. Distinct from `operands` (which carries `getelementptr` as a single `Unresolved`).
-    pub(super) gep: Option<LlGep>,
+    pub(super) gep: Option<Box<LlGep>>,
     /// For a direct `call`/`[must|no]tail call`, the FULL parsed `LlCall` (`ret` + `callee` + typed
     /// `args`), parsed once here via the same `parse_call` the emitter uses. Retained so use-pointee
     /// inference (`atomic_call_pointees`) reads the callee name + typed args from the typed graph instead
     /// of re-lexing `text`. `None` for a non-call line or an indirect call (no `@callee`, which
     /// `parse_call` rejects) — matching the text reader's own early-out. Byte-identical by construction:
     /// the same `parse_call` on the same `<ret> @callee(args)` rhs.
-    pub(super) call: Option<LlCall>,
+    pub(super) call: Option<Box<LlCall>>,
     /// The instruction's OPCODE mnemonic (`add`/`load`/`getelementptr`/...), the first whitespace token
     /// of the rhs — computed once at build time so structured emission (`emit_body_inst`) can DISPATCH on
     /// it. Every opcode family routes by this field into its graph-driven emitter; an unmigrated opcode is
@@ -382,7 +382,7 @@ pub(super) struct TirInst {
     /// `text`; the destination stays TEXT because `convert_dst_type` is a `&mut self` emit-time method.
     /// `None` for every other opcode or a malformed line (the emitter then reaches the fail-visible
     /// unmigrated-opcode `Err`, and the retry cascade owns the raw `.lines` text walk).
-    pub(super) bitcast: Option<(TypedValue, String)>,
+    pub(super) bitcast: Option<Box<(TypedValue, String)>>,
     /// For an `icmp`: the operand TEXT after the mnemonic (`resolve_icmp_rest`), read ONLY by the
     /// POINTER-form icmp emitter to reproduce its two unsupported-form error diagnostics byte-identically
     /// (they embed the raw `rest`, which BC fingerprints). The compared values come from `operands`; this
@@ -407,22 +407,22 @@ pub(super) struct TirInst {
     /// Precomputed select arms (`resolve_select_arms`) — the parsed true/false `TypedValue` arms of a
     /// 3-operand `select`. Read by the alias inferences (which apply their own Ptr/Local filters).
     /// `None` otherwise.
-    pub(super) select_arms: Option<(TypedValue, TypedValue)>,
+    pub(super) select_arms: Option<Box<(TypedValue, TypedValue)>>,
     /// Precomputed `parse_load` (`resolve_load_inst`) — the parsed load (`ptr` + `result_ty`) of a
     /// `load`. Read by the pointee/raw-buffer inferences. `None` otherwise.
-    pub(super) load: Option<LlLoad>,
+    pub(super) load: Option<Box<LlLoad>>,
     /// Precomputed store operands (`resolve_store`) — the parsed `(object, ptr)` `TypedValue`s of a
     /// `store`. Read by the raw-buffer / local-pointer-table inferences. `None` otherwise.
-    pub(super) store: Option<(TypedValue, TypedValue)>,
+    pub(super) store: Option<Box<(TypedValue, TypedValue)>>,
     /// Precomputed alias-call parse (`resolve_alias_call`) — the `strip_call_prefix` chain fed to
     /// `parse_call`, NARROWER than `call`/`resolve_call`. Read by the ir/ alias & call-edge scans.
     /// `None` for a non-call line or an indirect call.
-    pub(super) alias_call: Option<LlCall>,
+    pub(super) alias_call: Option<Box<LlCall>>,
     /// Precomputed emitter call-scan parse (`resolve_emit_scan_call`) — the `is_ignored`/`@`-gated
     /// `strip_call_prefix` + `parse_call`, PRESERVING error propagation. Read by
     /// `infer_function_param_pointees`/`_nonnull` (which propagate with `?`). `None` = the line is
     /// skipped; `Some(Ok/Err)` = the propagatable `parse_call` result.
-    pub(super) emit_scan_call: Option<Result<LlCall, String>>,
+    pub(super) emit_scan_call: Option<Box<Result<LlCall, String>>>,
 }
 
 impl TirInst {
@@ -654,6 +654,15 @@ pub(super) struct TirFunction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instruction_carrier_keeps_sparse_opcode_payloads_compact() {
+        assert!(
+            std::mem::size_of::<TirInst>() <= 640,
+            "TirInst grew to {} bytes",
+            std::mem::size_of::<TirInst>()
+        );
+    }
 
     /// Build the raw body lines the test-only flat [`build`] consumes (`LlFunction` no longer carries a
     /// `Vec<String>` body — production lowers carriers directly).
@@ -1126,6 +1135,16 @@ mod tests {
         assert_eq!(incoming[0].1, "%entry");
         assert_eq!(incoming[1].1, "%loop");
         assert!(phi_incoming_of("%a = add i32 %x, %y").is_none());
+    }
+
+    #[test]
+    fn array_phi_incoming_does_not_confuse_the_type_bracket_for_an_operand() {
+        let (ty, incoming) = phi_incoming_of("%p = phi [14 x i8] [ %a, %entry ], [ %b, %loop ]")
+            .expect("array phi parses");
+        assert_eq!(ty, LlType::Array(Box::new(LlType::Int(8)), 14));
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(incoming[0].1, "%entry");
+        assert_eq!(incoming[1].1, "%loop");
     }
 
     #[test]

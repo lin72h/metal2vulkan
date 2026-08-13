@@ -12,7 +12,8 @@ pub(super) mod loopforest;
 // byte-identical by construction.
 pub(super) mod clone_crossarm;
 mod repair;
-// Dominator-set analysis over the emitted CFG, consumed by ssa_demote and loop_split.
+// Compact immediate-dominator analysis over the emitted CFG, shared by late rewrites and emitter
+// phi-materialization repair.
 mod exit_check;
 // Loop-closed-SSA repair on the emitted module: register-demote a value whose def block no longer
 // dominates a use (the `synth_multi_exit_merge` funnel gap), so the PRIMARY structured emit validates
@@ -34,6 +35,7 @@ pub(super) use clone_crossarm::{
     clone_cross_arm_shared, lower_unreachable_to_ret, privatize_region_cross_arm, rename_tokens,
     unify_returns,
 };
+pub(in crate::native) use exit_check::EmittedDominators;
 pub(super) use loop_split::split_multientry_loop_selection_exits;
 pub(super) use ssa_demote::demote_nondominating_values;
 pub(super) use structured_emit::{
@@ -44,8 +46,10 @@ pub(super) use structured_emit::{
 };
 
 pub(super) use blocks::{
-    implicit_entry_block_name, infer_branch_merges, infer_loop_merges, infer_switch_merges,
-    lower_unstructured_switches, split_body_blocks,
+    funnel_shared_branch_dispatches, implicit_entry_block_name,
+    infer_bounded_branch_merges_by_header, infer_branch_merges, infer_direct_branch_merges,
+    infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
+    lower_unstructured_switches, refunnel_one_deep_shared_arm, split_body_blocks,
 };
 pub(super) use repair::{block_index_by_label, id_ref_operand};
 
@@ -56,9 +60,9 @@ pub(super) struct LoopMergeInfo {
 }
 
 /// The structural ROLE of a synthesized block, stamped by the synthesizer that creates it so
-/// consumers recover the role from a typed tag instead of decoding it from the block's NAME (the
-/// name-encoded-semantics debt Workstream T3 retires). The synthesized name is still EMITTED (it is
-/// the block label / `OpName` in the output, byte-identical), but no production DECISION reads it.
+/// consumers recover the role from a typed tag instead of decoding it from the block's name. The
+/// synthesized name is still emitted as the block label / `OpName`, but no production decision
+/// reads it.
 /// `Normal` is every ordinary block (an AIR label or a synthesized block whose role no consumer yet
 /// queries); non-`Normal` variants are added as each name-prefix consumer migrates to the tag.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -102,10 +106,16 @@ pub(super) struct BodyBlock {
     /// one place block instructions are lexed) and rebuilt via the typed `phi_edit`/terminator primitives
     /// at every synthesis/mutation site. `None` only for a block whose lines did not lower (no
     /// terminator); such a block is a fail-visible `build_from_blocks` error, not a re-lower fallback.
-    pub(super) typed: Option<crate::native::tir::TirBlock>,
+    pub(super) typed: Option<std::sync::Arc<crate::native::tir::TirBlock>>,
 }
 
 impl BodyBlock {
+    /// Mutable access to the typed carrier with copy-on-write semantics. Planner candidates share
+    /// immutable AIR instruction payload; only a block whose transform actually edits it is cloned.
+    pub(super) fn typed_mut(&mut self) -> Option<&mut crate::native::tir::TirBlock> {
+        self.typed.as_mut().map(std::sync::Arc::make_mut)
+    }
+
     /// The block's instruction + terminator lines, rendered from its typed carrier (the sole substrate).
     /// TEST-ONLY: the CFG-restructuring unit tests were written against the retired `.lines` field; this
     /// reproduces those lines from the carrier so the assertions read structured output as text. Panics

@@ -1,5 +1,6 @@
 //! Byte-neutral responsibility split of the former monolith impl; see the parent module.
 
+use super::super::ops::{bfloat_lanes, shaped_type};
 use super::*;
 
 impl Emitter {
@@ -18,6 +19,9 @@ impl Emitter {
         // R3: source the incoming VALUES from the typed graph (labels stay from the parsed pairs).
         // Byte-identical to the parsed values by tir's phi-operand soundness; falls back on any mismatch.
         let incoming = self.phi_incoming_values(&name, parsed_incoming);
+        if self.emit_bda_address_phi(&name, &incoming, &result_ty, instructions)? {
+            return Ok(());
+        }
         if self.emit_raw_pointer_phi(&name, &incoming, &result_ty, instructions)? {
             return Ok(());
         }
@@ -162,6 +166,66 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let operand_ty = self.resolve_type(&lhs.ty)?;
+        let rhs_ty = self.resolve_type(&rhs.ty)?;
+        if operand_ty != rhs_ty {
+            return Err(format!(
+                "native emitter: fcmp operand type mismatch {operand_ty:?} vs {rhs_ty:?}"
+            ));
+        }
+        if let Some(lanes) = bfloat_lanes(&operand_ty) {
+            let result_ty = float_compare_result_type(&shaped_type(LlType::Float, lanes))?;
+            let result_type = self.type_id(&result_ty)?;
+            let result = self.result_id(&name, &result_ty)?;
+            let lhs_bits = self.value_id_in(&lhs.value, &lhs.ty, instructions)?;
+            let rhs_bits = self.value_id_in(&rhs.value, &rhs.ty, instructions)?;
+            if lanes <= 4 {
+                let lhs_f32 = self.bfloat_bits_to_float_shaped_id(lhs_bits, lanes, instructions)?;
+                let rhs_f32 = self.bfloat_bits_to_float_shaped_id(rhs_bits, lanes, instructions)?;
+                instructions.push(Self::inst(
+                    pred,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdRef(lhs_f32), Operand::IdRef(rhs_f32)],
+                ));
+                return Ok(());
+            }
+            let bits_type = self.type_id(&LlType::BFloat)?;
+            let bool_type = self.type_id(&LlType::Bool)?;
+            let mut comparisons = Vec::with_capacity(lanes as usize);
+            for lane in 0..lanes {
+                let lhs_lane = self.fresh();
+                instructions.push(Self::inst(
+                    Op::CompositeExtract,
+                    Some(bits_type),
+                    Some(lhs_lane),
+                    vec![Operand::IdRef(lhs_bits), Operand::LiteralBit32(lane)],
+                ));
+                let rhs_lane = self.fresh();
+                instructions.push(Self::inst(
+                    Op::CompositeExtract,
+                    Some(bits_type),
+                    Some(rhs_lane),
+                    vec![Operand::IdRef(rhs_bits), Operand::LiteralBit32(lane)],
+                ));
+                let lhs_f32 = self.bfloat_bits_to_float_shaped_id(lhs_lane, 1, instructions)?;
+                let rhs_f32 = self.bfloat_bits_to_float_shaped_id(rhs_lane, 1, instructions)?;
+                let comparison = self.fresh();
+                instructions.push(Self::inst(
+                    pred,
+                    Some(bool_type),
+                    Some(comparison),
+                    vec![Operand::IdRef(lhs_f32), Operand::IdRef(rhs_f32)],
+                ));
+                comparisons.push(Operand::IdRef(comparison));
+            }
+            instructions.push(Self::inst(
+                Op::CompositeConstruct,
+                Some(result_type),
+                Some(result),
+                comparisons,
+            ));
+            return Ok(());
+        }
         let result_ty = float_compare_result_type(&operand_ty)?;
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;

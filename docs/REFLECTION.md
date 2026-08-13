@@ -1,13 +1,17 @@
 # Shader reflection for consumers
 
-When you translate a Metal AIR / sanitized LLVM IR module with metal2vulkan, the crate already
-knows how the **stage interface** was mapped into Vulkan: descriptor set/binding numbers, Metal
-resource indices, vertex attributes, varyings, render targets, and more. That knowledge is exposed
-as [`ShaderReflection`](../src/reflect/mod.rs) so a host (engine, executor, cache) does **not** have
-to re-walk the emitted SPIR-V or re-encode the ABI.
+When metal2vulkan translates Metal AIR or sanitized LLVM IR, it has two authoritative sources of
+consumer information:
 
-Reflection is a pure re-shaping of AIR metadata the translator already parsed. It is **byte-neutral**:
-`translate_reflected` produces the same SPIR-V as `translate` for the same inputs.
+- AIR metadata plus the translator's shared descriptor ABI define resources and stage interfaces.
+- Read-only analysis of the final adopted SPIR-V defines conservative buffer byte footprints.
+
+Both are exposed as [`ShaderReflection`](../src/reflect/mod.rs), so a host does not need to reparse
+AIR or build a second general-purpose SPIR-V reflection path. Reflection remains **byte-neutral**:
+`translate_reflected` produces the same SPIR-V bytes as `translate` for identical input, stage, and
+options.
+
+For an end-to-end integration recipe, start with [How to translate and integrate a shader](HOWTO.md).
 
 ## Getting reflection
 
@@ -18,10 +22,15 @@ use metal2vulkan::passes::Stage;
 use metal2vulkan::reflect::ShaderReflection;
 use std::path::Path;
 
-fn convert(air_or_ll_path: &str) -> Result<(Vec<u8>, ShaderReflection), String> {
-    let tmp = std::env::temp_dir().join("m2v-scratch");
-    std::fs::create_dir_all(&tmp).ok();
-    metal2vulkan::translate_reflected(air_or_ll_path, Stage::Kernel, Path::new(&tmp))
+fn convert(
+    air_or_ll_path: &str,
+    caller_owned_scratch: &Path,
+) -> Result<(Vec<u8>, ShaderReflection), String> {
+    metal2vulkan::translate_reflected(
+        air_or_ll_path,
+        Stage::Kernel,
+        caller_owned_scratch,
+    )
 }
 ```
 
@@ -30,10 +39,15 @@ Other entry points:
 | API | Use when |
 |---|---|
 | `translate_reflected` / `translate_reflected_with_options` | Path to `.air` or `.ll` + stage |
-| `translate_sanitized_native_reflected` | You already have sanitized LLVM IR text |
-| `ShaderReflection::from_{fragment,vertex,kernel}` | You already have `meta::{Frag,Vert,Kern}Meta` |
+| `translate_sanitized_native_reflected` | You already have sanitized LLVM IR text and `TransformOptions` |
+| `reflect_sanitized` | You need metadata for link-time tooling even when executable translation is not yet possible; buffer footprints remain absent |
+| `ShaderReflection::from_{fragment,vertex,kernel}` | You already have `meta::{Frag,Vert,Kern}Meta`; IR-derived fields and buffer footprints remain absent |
 
-Optional transforms (e.g. `--simd-cluster32` / `TransformOptions`) go through `*_with_options`.
+Path-based optional transforms use `translate_reflected_with_options`. The sanitized reflected
+entry point takes `TransformOptions` directly.
+
+Scratch space belongs to the caller. Give concurrent translations separate directories and remove
+them on all return paths. The compiled `translate_reflected` example demonstrates that lifecycle.
 
 ### CLI JSON dump
 
@@ -46,7 +60,7 @@ metal2vulkan in.ll out.spv --stage kernel --emit-meta out.json
 
 `--emit-meta` is not supported for `--stage passthrough` (no Metal interface metadata).
 
-`out.json` is a pretty-printed `ShaderReflection` (schema version in `reflection_version`).
+`out.json` is a pretty-printed `ShaderReflection` with its schema version in `reflection_version`.
 
 ### Persist with `serde`
 
@@ -54,25 +68,38 @@ metal2vulkan in.ll out.spv --stage kernel --emit-meta out.json
 metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
-`ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature.
-Bump-aware field: `reflection_version` (`REFLECTION_VERSION`, currently `4`). Invalidate any
-on-disk cache when that constant changes.
+`ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
+current `REFLECTION_VERSION` is `21`. Serialized Rust enums use serde's externally tagged default:
+unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
+`{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
+
+Persist SPIR-V and reflection together. Invalidate both when `reflection_version` changes. If a
+cache may contain older schemas, inspect `reflection_version` as generic JSON—or store it in the
+cache envelope—before deserializing the strongly typed current structure, because a newly required
+field can make old JSON fail deserialization.
 
 ## Descriptor ABI (binding map)
 
-Every Metal-facing resource is decorated in **descriptor set 0** (`RESOURCE_DESCRIPTOR_SET`).
-Bindings are a fixed base plus the Metal resource index `n`:
+Every descriptor-backed Metal-facing resource uses **descriptor set 0**
+(`RESOURCE_DESCRIPTOR_SET`). Most bindings are a fixed base plus Metal resource index `n`:
 
 | Metal resource | Kind | SPIR-V binding |
 |---|---|---|
-| `[[buffer(n)]]` (device / constant) | `Buffer` | `BUFFER_BINDING_BASE + n` → **`n`** (`0..32`) |
+| `[[buffer(n)]]` (device / constant) | `Buffer` | `BUFFER_BINDING_BASE + n` → **`n`** (buffer band `0`–`31`) |
 | `[[buffer(n)]]` (threadgroup) | `ThreadgroupBuffer` | **no descriptor** (`descriptor: None`) |
+| Kernel `[[stage_in]]` attribute | `KernelStageInput` | first free buffer binding; AIR location is `stage_input_location` |
 | `[[texture(n)]]` | `Texture` / `StorageImage` / `TextureArray` (`access` distinguishes sampled vs storage arrays) | `TEXTURE_BINDING_BASE + n` → **`32 + n`** |
 | `[[sampler(n)]]` | `Sampler` | `SAMPLER_BINDING_BASE + n` → **`64 + n`** |
 | AIR `constexpr sampler` | `StaticSampler` | first free binding in **`64..96`** |
 | `[[color(n)]]` (framebuffer fetch) | `ColorInput` | `COLOR_INPUT_BINDING_BASE + n` → **`96 + n`** |
+| Implicit imageblock attachment `n`, data rate `r` | `implicit_imageblock_attachments` | `IMAGEBLOCK_BINDING_BASE + 3*n + r` → **`128 + 3*n + r`** |
+| Custom fragment imageblock master member `n` | `fragment_imageblock.members[n]` | `FRAGMENT_IMAGEBLOCK_BINDING_BASE + n` → **`160 + n`** when projected |
 | Acceleration-structure shadow buffer | `AccelerationStructureShadow` | Metal buffer index `n` (set 0) |
+| Primitive acceleration structure | `PrimitiveAccelerationStructure` | Metal buffer index `n` (set 0); descriptor only when AIR intersection lowering consumes its geometry shadow |
+| Authored visible/intersection function table | `VisibleFunctionTable` / `IntersectionFunctionTable` | **no descriptor** (`descriptor: None`); `metal_index` and `param_index` identify static linkage |
 | Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | `32 + synthetic_index` |
+| Device buffer embedded in argument buffer | `EmbeddedArgBufferBuffer` | **no descriptor**; owner field contains its Vulkan device address |
+| Synthesized direct-buffer address table | `BufferAddressTable` | translator-selected free binding; one `u64` address per Metal buffer slot |
 
 Constants live in `metal2vulkan::reflect`:
 
@@ -82,15 +109,35 @@ BUFFER_BINDING_BASE     = 0
 TEXTURE_BINDING_BASE    = 32
 SAMPLER_BINDING_BASE    = 64
 COLOR_INPUT_BINDING_BASE = 96
+IMAGEBLOCK_BINDING_BASE = 128
+IMAGEBLOCK_DATA_RATE_STRIDE = 3
+FRAGMENT_IMAGEBLOCK_BINDING_BASE = 160
 ```
 
 The stage-input / stage-output passes decorate the module with **exactly these** numbers. Use
-reflection to allocate descriptor sets / write descriptor updates without disassembling SPIR-V.
+reflection—not list positions or recomputed synthetic indices—to allocate descriptor sets and write
+descriptor updates.
+
+Descriptor types for `bindings`:
+
+| Kind | Vulkan descriptor type |
+|---|---|
+| `Buffer`, `KernelStageInput`, `AccelerationStructureShadow`, `PrimitiveAccelerationStructure`, `BufferAddressTable` | Storage buffer |
+| `Texture`, `EmbeddedArgBufferTexture` | Sampled image |
+| `TextureArray` | Sampled-image or storage-image array according to `access` |
+| `StorageImage` | Storage image |
+| `Sampler`, `StaticSampler` | Sampler |
+| `ColorInput` | Input attachment |
+
+`implicit_imageblock_attachments` and projected `fragment_imageblock.members` are additional
+single storage-image descriptors in set 0; they are not duplicated in `bindings`. Entries whose
+`descriptor` is `None` consume no descriptor.
 
 AIR address spaces (on buffer bindings when present):
 
 | Value | Meaning |
 |---|---|
+| `ADDRESS_SPACE_DEVICE` (1) | Device memory — descriptor-backed storage buffer |
 | `ADDRESS_SPACE_CONSTANT` (2) | Constant / `const device` — typically read-only |
 | `ADDRESS_SPACE_THREADGROUP` (3) | Threadgroup — Workgroup variable, no descriptor |
 
@@ -101,32 +148,55 @@ Top-level fields:
 | Field | Meaning |
 |---|---|
 | `reflection_version` | Schema version for cache invalidation |
-| `stage` | `Vertex` / `Fragment` / `Kernel` |
+| `stage` | `Vertex`, `TessellationEvaluation`, `Fragment`, or `Kernel` |
 | `entry_point` | **Original Metal entry name** (SPIR-V `OpEntryPoint` is always `"main"`) |
-| `bindings` | Resources in entry-parameter order (synthesized arg-buffer textures last) |
+| `bindings` | AIR entry resources followed by translator-synthesized resources |
+| `argument_buffer_fields` | Resource-handle fields inside argument buffers, with owner and Metal argument-encoder coordinates |
 | `vertex_attributes` | Vertex `[[attribute(n)]]` / stage-in locations |
-| `varyings` | Fragment stage-in or vertex user varyings (location, type, semantic) |
+| `varyings` | Fragment stage-in or vertex user varyings (location, AIR type, field name, linker semantic) |
 | `render_targets` | Fragment color attachments (member index + location + type name) |
 | `depth_members` / `stencil_members` | Fragment return members tagged depth/stencil |
+| `depth_qualifier` | Fragment depth comparison contract (`Any`, `Less`, or `Greater`) |
 | `local_size` | Kernel GLCompute local size `[x,y,z]` when known |
 | `vertex_builtins` | Whether vertex uses `VertexIndex` / `InstanceIndex` / writes `Position` |
+| `tessellation` | Post-tessellation patch domain, control-point count, locations, and synthesized system-value carriers |
 | `imageblock_layouts` | Kernel `[[imageblock]]` tiles (param index + AIR struct layout; no descriptor) |
-| `datalayout` | Source LLVM `target datalayout` string when translate started from unsanitized IR |
-| `function_constants` | `[[function_constant(N)]]` inventory (index / name / LLVM type) |
+| `implicit_imageblock_attachments` | Attachment/data-rate plane, maximum referenced index, format, access, and descriptor binding for implicit imageblock load/store calls |
+| `fragment_imageblock` | Custom fragment `[[imageblock_data]]` sample size, exact master fields (offset/type/semantic/raster-order group/access/binding), and semantic-matched input/output projections |
+| `datalayout` | Source LLVM `target datalayout` when path-based translation captured it before sanitization |
+| `function_constants` | `[[function_constant(N)]]` index, name, LLVM type, and exact Metal ABI type encoding |
+
+Custom fragment imageblock fields currently lower exactly as `half` → R16f, `half4` → RGBA16f,
+`uchar4` → RGBA8ui, and `ushort` → R16ui storage planes. AIR may provide either an explicit
+`air.imageblock_master` for narrow projections or a direct full `air.imageblock_data` struct layout;
+both forms preserve the same reflected member contract. Other field types remain an honest fallback.
+
+Each `argument_buffer_fields` entry records the owning entry parameter and Metal buffer index plus
+its struct-member ordinal, byte offset, and Metal argument index. A nested buffer additionally
+carries `resource_buffer_index`; consumers encode the native Metal buffer through
+`MTLArgumentEncoder` and write its Vulkan device address into the same owner byte offset. Embedded
+textures, buffers, and authored function tables share this coordinate, so consumers do not need to
+reparse `air.struct_type_info`.
+
+Metal post-tessellation vertex entries use `ShaderStage::TessellationEvaluation`. Their
+control-point locations are arrays of `control_point_count` values; other listed locations carry
+the `Patch` decoration. Hosts connect these values from a tessellation-control stage rather than
+binding them as ordinary vertex attributes.
 
 ### Per-binding: `ResourceBinding`
 
 | Field | Use for |
 |---|---|
-| `kind` | Choose descriptor type (UBO/SSBO/sampled image/storage image/sampler/input attachment) |
+| `kind` | Choose descriptor type using the mapping above |
 | `metal_index` | Guest Metal slot `n`, or synthetic index for embedded textures |
-| `descriptor` | `{ set, binding }` or `None` if no descriptor (threadgroup / some locals) |
+| `descriptor` | `{ set, binding, count }` or `None` if no descriptor (threadgroup / some locals) |
 | `param_index` | SPIR-V `OpFunctionParameter` order, if any |
 | `address_space` / `declared_size` / `type_layout` | Buffer address space, argument/pointee size, and aggregate layout |
 | `extent` | Buffer reachability: `Object { bytes }`, `Unbounded`, or `Unknown` |
+| `footprint` | Final-module static byte ranges, invocation-strided accesses, and an explicit unbounded-access flag |
 | `type_name` | AIR type string when metadata carried it |
-| `texture_shape` | Dim / arrayed / MS / component / writable / storage format (decoded) |
-| `embedded_source` | For arg-buffer textures: owning buffer index + field byte offset |
+| `texture_shape` | Dim / arrayed / MS / component / writable / storage format, plus fixed handle-array length when present |
+| `embedded_source` | For arg-buffer textures: owning buffer index, field byte offset, and Metal `[[id(n)]]` argument-encoder index |
 | `access` | When known: `Unused` / `ReadOnly` / `WriteOnly` / `ReadWrite` / `Sampled` / `Storage` |
 | `static_sampler` | Decoded immutable state for `StaticSampler`; `None` for other kinds |
 
@@ -151,6 +221,45 @@ an unused parameter becomes `Unused`, while sound `readonly` and `writeonly` par
 become `ReadOnly` and `WriteOnly`. When neither source proves a narrower result, the broader AIR
 classification is retained.
 
+### Buffer byte footprints
+
+Successful reflected translation derives each supported descriptor-backed buffer's `footprint` from the
+**final adopted SPIR-V module**. This is intentionally later than AIR metadata reflection: if the
+validator selects a raw-buffer, pointer-value, or CFG retry tier, the footprint describes the bytes
+that tier actually executes. Metadata-only `reflect_sanitized` leaves `footprint: null` because no
+executable module exists to audit.
+
+Footprints are populated for `Buffer`, `KernelStageInput`, and `AccelerationStructureShadow` when
+they have a descriptor. Other resource kinds leave the field null.
+
+`static_ranges` is a sorted, coalesced list of half-open byte intervals. Each item is serialized as
+`{ "offset": N, "size": M }` and denotes `[N, N + M)`. Loads, stores, atomics, and memory copies all
+contribute their complete access width; adjacent and overlapping intervals are merged.
+
+`strided_accesses` represents an address of the form:
+
+```text
+base_offset + sum(index_source * stride), spanning access_size bytes
+```
+
+`index_source` is one stable draw/dispatch domain: `VertexIndex`, `InstanceIndex`, an X/Y/Z component
+of `GlobalInvocationId`, `LocalInvocationId`, or `WorkgroupId`, or `LocalInvocationIndex`. Terms are
+sorted and repeated sources are combined. A consumer supplies the invocation bounds from its draw or
+dispatch and unions the resulting ranges with `static_ranges`. Bound calculations must use checked
+arithmetic; overflow has the same meaning as an unbounded access and requires the complete window.
+
+`has_unbounded_access` is the soundness gate. It becomes true for data-dependent runtime-array
+indices, pointer/integer escapes, unsupported aggregate transfer widths, arithmetic overflow, or any
+other rooted dereference the affine schema cannot prove. When true, consumers must retain the whole
+caller-provided window; the other entries remain useful diagnostics but do not authorize narrowing.
+When false, the union of the static and bounded strided ranges is a conservative staging footprint.
+
+Pointer-select/phi alternatives are analyzed structurally across every descriptor arm. To preserve
+the per-translation memory bound, an adversarial expression with more than 4096 address alternatives
+is compressed to one unbounded result per affected binding rather than allowed to grow
+exponentially. A binding with more than 16,384 distinct pre-coalescing footprint records likewise
+becomes unbounded instead of allowing reflection size to grow without limit.
+
 **Gaps consumers should expect:**
 
 - **Device buffer R/W:** ambiguous parameters retain their conservative AIR declaration; malformed
@@ -160,25 +269,34 @@ classification is retained.
   `function_constants` empty; populate via the reflected translate paths (they scan sanitized IR).
 - **Datalayout:** only filled when translating from unsanitized `.air`/`.ll` via
   `translate_reflected*` (sanitization strips the line; the reflected path captures it first).
-- **Static samplers:** only reflected by translated entry points because they require the sanitized
-  module's `!air.sampler_states` metadata. The state includes typed filter, address, coordinate,
-  compare, anisotropy, LOD, border, and reduction fields plus the original two AIR words.
+- **Static samplers:** reflected translate paths and `reflect_sanitized` scan
+  `!air.sampler_states`; direct `from_*` builders do not. The state includes typed filter, address,
+  coordinate, compare, anisotropy, LOD, border, and reduction fields plus the original two AIR
+  words.
 
 ## Typical consumer flow
 
-1. Call `translate_reflected` (or CLI with `--emit-meta` + `serde`).
+1. Call `translate_reflected` (or a serde-enabled CLI with `--emit-meta`).
 2. Cache `(spv_bytes, reflection)` keyed by input hash + `reflection_version` + translator version.
 3. Create a Vulkan pipeline with entry point `"main"`.
-4. For each `bindings` entry with `Some(descriptor)`:
+4. Build the ordinary portion of set 0 from every `bindings` entry with `Some(descriptor)`:
    - Map `kind` → descriptor type.
    - Write `set` / `binding` from `descriptor`.
    - Use `metal_index` to pick the host resource that was bound as Metal slot `n`.
-5. For `ThreadgroupBuffer` / `imageblock_layouts`, allocate Workgroup / tile storage from
+   - For buffers, narrow staging from `footprint` only when `has_unbounded_access` is false; bound
+     every strided term from the current draw/dispatch before taking the union.
+5. Add one set-0 storage-image descriptor for every `implicit_imageblock_attachments` entry and
+   every projected `fragment_imageblock` member, using their reported `binding` values.
+6. Populate static samplers and argument-buffer fields from their reflected state/coordinates;
+   resources with `descriptor: None` require no descriptor write.
+7. For `ThreadgroupBuffer` / `imageblock_layouts`, allocate Workgroup / tile storage from
    `declared_size` / `type_layout` (no descriptor write).
-6. For vertex: bind attributes from `vertex_attributes` and respect `vertex_builtins`.
-7. For fragment: attach color targets from `render_targets`; handle depth/stencil member lists.
-8. For kernels: set local size from `local_size` when present; specialize function constants if
-   the host supplies values (see `specialize_function_constants` / AIR FC ABI).
+8. For vertex: bind attributes from `vertex_attributes` and respect `vertex_builtins`.
+9. For fragment: attach color targets from `render_targets`; attach the reflected depth/stencil
+   aspects and derive depth comparison from `depth_qualifier`.
+10. For kernels: set local size from `local_size` when present; specialize function constants if
+   the host supplies values. Use `specialize_function_constant_bytes` for exact scalar/vector
+   payloads; the `u64`-only helper cannot carry vectors wider than eight bytes.
 
 ## Related APIs
 
@@ -188,11 +306,14 @@ classification is retained.
 | `metal2vulkan::meta` | Lower-level AIR metadata parsers (`FragMeta` / `VertMeta` / `KernMeta`) |
 | `metal2vulkan::passes::Stage` | Stage enum for translate |
 | `metal2vulkan::specialize_function_constants` | Specialize FC values on sanitized IR (when needed) |
+| `metal2vulkan::specialize_function_constant_bytes` | Specialize exact-width scalar/vector FC payloads |
 
-Unit coverage for binding numbers lives in `src/reflect/tests.rs` (ABI contract: set 0, bases 0/32/64/96).
+Unit coverage for binding numbers lives in `src/reflect/tests.rs` (ABI contract: set 0, bases
+0/32/64/96/128/160).
 
 ## What reflection is *not*
 
-- Not a full SPIR-V reflector (no walk of every `OpDecorate` / CFG).
+- Not a general-purpose SPIR-V reflector. Final-module inspection is deliberately limited to the
+  descriptor/type/value graph required for conservative buffer footprints.
 - Not a substitute for `spirv-val` or runtime pipeline creation.
 - Not populated for passthrough vertex generation (`translate_passthrough`).

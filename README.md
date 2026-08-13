@@ -2,79 +2,129 @@
 
 [![License: LGPL-3.0-or-later](https://img.shields.io/badge/License-LGPL%203.0%20or%20later-blue.svg)](LICENSE)
 
-> **Alpha.** This project is early and under active development. The public API, CLI flags,
-> reflection layout details, and SPIR-V output may change without a stable semver guarantee
-> while the crate is in the `0.x` series. Treat it as research-quality: useful for
-> experimentation and integration pilots, not a frozen interface.
+> **Alpha.** The public API, CLI, reflection schema, and emitted SPIR-V may change during the `0.x`
+> series. The project is suitable for experimentation and integration pilots, but consumers should
+> version their cached outputs and expect upgrades to require integration work.
 
-Translate **Metal AIR** (LLVM bitcode / sanitized `.ll`) to **Vulkan SPIR-V** using a native Rust
-emitter. Production translation does not invoke LLVM `llc`.
+`metal2vulkan` translates **Metal AIR**—LLVM bitcode or sanitized LLVM IR—into Vulkan 1.3 SPIR-V
+with a native Rust emitter and retained-SPIR-V passes.
 
-## Features
+## What it provides
 
-- Native AIR/LLVM-IR → `OpCapability Shader` / Logical GLSL450 SPIR-V
-- Stage interface lowering for vertex, fragment, compute (kernel), and passthrough
-- Library API plus a CLI compatible with simple `in → out.spv` harnesses
-- Optional `serde` feature for reflection metadata JSON
-- Optional workspace package for local Metal oracle / Vulkan executor experiments
+- Vertex, post-tessellation vertex, fragment, compute-kernel, and generated passthrough interfaces
+- A Rust library and an `in → out.spv` command-line interface
+- Validation-gated retry tiers: unsupported inputs fail visibly instead of returning known-invalid
+  SPIR-V
+- Consumer reflection for descriptors, stage interfaces, function constants, argument buffers, and
+  conservative buffer byte footprints
+- An optional unpublished validation workspace for authored semantic cases, GPU evidence, and exact
+  translator A/B
+
+## Requirements
+
+- Rust 1.87 or newer
+- `llvm-dis` when the input is AIR bitcode
+- `spirv-val` from SPIRV-Tools for product translation
+
+Tool paths are found through the usual search path. Override an individual tool with
+`METAL2VULKAN_LLVM_DIS`, `METAL2VULKAN_SPIRV_VAL`, or the corresponding
+`METAL2VULKAN_<TOOL>` variable.
 
 ## Install
 
 ```sh
-# CLI
+# CLI without reflection JSON
 cargo install metal2vulkan
 
-# Library (Cargo.toml)
-metal2vulkan = "0.1"
+# CLI with --emit-meta JSON support
+cargo install metal2vulkan --features serde
 ```
 
-## CLI
+For a library dependency:
+
+```toml
+[dependencies]
+metal2vulkan = { version = "0.1", features = ["serde"] } # serde is optional
+```
+
+## Quick start
+
+The CLI auto-detects vertex, fragment, or kernel stage metadata by default:
 
 ```sh
-metal2vulkan <in.air|.ll> <out.spv> --stage vertex|fragment|passthrough|kernel
-# optional interface metadata JSON (requires --features serde)
-metal2vulkan in.ll out.spv --stage kernel --emit-meta out.json
+metal2vulkan input.air output.spv
+metal2vulkan input.air output.spv --emit-meta reflection.json
 ```
 
-- Success: prints a line containing `PASS`, writes SPIR-V, exits `0`
-- Failure: prints `FALLBACK`, exits non-zero
-
-On failure the CLI writes a repro bundle under `$TMPDIR/metal2vulkan-repros` (override with
-`METAL2VULKAN_REPRO_DIR`).
-
-### Example
+Use an explicit stage when the input does not carry stage metadata or when generating a passthrough
+vertex shader:
 
 ```sh
-cargo run --example translate_native -- path/to/shader.ll kernel out.spv
+metal2vulkan input.ll output.spv --stage kernel
+metal2vulkan input.ll output.spv --stage passthrough
 ```
+
+`--emit-meta` requires a build with the `serde` feature and is unavailable for passthrough output,
+which has no Metal stage metadata. On success the CLI writes validated SPIR-V, prints `PASS`, and
+exits `0`. On failure it prints `FALLBACK`, exits nonzero, and writes a reproducer under
+`$TMPDIR/metal2vulkan-repros` by default. Set `METAL2VULKAN_REPRO_DIR` to choose another location.
+
+Fragment AIR that calls `air.get_num_samples.i32` also needs the graphics pipeline's exact sample
+count because Vulkan has no equivalent shader-side query:
+
+```sh
+metal2vulkan fragment.air fragment.spv --raster-samples 4
+```
+
+Accepted values are `1`, `2`, `4`, `8`, `16`, `32`, and `64`. Library callers set
+`TransformOptions::raster_sample_count`; translation fails visibly when the query is present and
+the value is unknown.
 
 ## Library
+
+Library translation takes caller-owned scratch space. Use a unique directory for concurrent calls
+and remove it when the operation finishes:
 
 ```rust
 use metal2vulkan::passes::Stage;
 use std::path::Path;
 
-fn translate_ll(sanitized_ll: &str) -> Result<Vec<u8>, String> {
-    let tmp = std::env::temp_dir().join("m2v-scratch");
-    std::fs::create_dir_all(&tmp).ok();
-    metal2vulkan::translate_sanitized_native(sanitized_ll, Stage::Kernel, Path::new(&tmp))
+fn translate_kernel(sanitized_ll: &str, scratch: &Path) -> Result<Vec<u8>, String> {
+    metal2vulkan::translate_sanitized_native(sanitized_ll, Stage::Kernel, scratch)
 }
 ```
 
-See crate docs (`cargo doc --open`), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
-pipeline, and [`docs/REFLECTION.md`](docs/REFLECTION.md) for how consumers read binding metadata
-after a convert. Repository layout and the developer loop are in
-[CONTRIBUTING.md](CONTRIBUTING.md). How to stay confident while refactoring (harvest, hash ledgers,
-A/B) is in [`docs/VALIDATION.md`](docs/VALIDATION.md).
+For a complete executable that auto-detects the stage, writes SPIR-V and reflection JSON, and cleans
+up its scratch directory on every return path:
+
+```sh
+cargo run --features serde --example translate_reflected -- \
+  input.air output.spv reflection.json
+```
+
+## Documentation
+
+| Document | Start here when… |
+|---|---|
+| [How to translate and integrate a shader](docs/HOWTO.md) | You want an end-to-end CLI or Rust integration recipe |
+| [Shader reflection](docs/REFLECTION.md) | You need the complete reflection schema and binding contract |
+| [Architecture](docs/ARCHITECTURE.md) | You are changing the emitter, retained module, passes, or retries |
+| [Validation playbook](docs/VALIDATION.md) | You are checking byte stability or authored semantic behavior |
+| [Contributing](CONTRIBUTING.md) | You need the repository layout and required development gates |
+| [Validation crate](validation/README.md) | You are operating the unpublished corpus tooling |
+| [Changelog](CHANGELOG.md) | You need unreleased API and behavior changes |
+
+The generated Rust API documentation is available from `cargo doc --all-features --open`.
 
 ## Coverage policy
 
-Grammar and lowering behavior is locked with **synthetic** Rust tests. This repository does not
-ship third-party captured shaders. Prefer reduced `.ll` fixtures that name structural properties.
-Optional private system-metallib harvest and hash-only drift pins are documented in
-[`docs/VALIDATION.md`](docs/VALIDATION.md).
+Grammar and lowering behavior is locked with owned synthetic Rust tests. This repository does not
+ship third-party captured shaders. Optional private system-metallib harvest, authored manifests,
+and dependency-exact evidence stay in the validation workspace and are described in the
+[validation playbook](docs/VALIDATION.md).
 
-`spirv-val` coverage is not the same as correct end-to-end pixels.
+Passing `spirv-val` proves structural validity, not agreement with Metal or correct pixels. Use the
+authored validation ladder for semantic claims.
 
 ## License
 

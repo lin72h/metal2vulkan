@@ -1,6 +1,6 @@
 //! One registry for every `METAL2VULKAN_*` environment variable the crate honors (refactor S8).
 //!
-//! Before this module the ~19 vars were read at ~33 scattered `std::env::var` sites with subtly
+//! Environment reads previously lived at scattered `std::env::var` sites with subtly
 //! different idioms (`var_os().is_some()` vs `var().is_ok()`, `map_or(true, |v| v != "0")` vs
 //! `is_ok_and(|v| v == "0")`, ad-hoc integer parses) and none were documented in `--help`. Every var
 //! now has exactly one typed accessor here plus a `REGISTRY` entry (name/default/effect) that
@@ -48,14 +48,13 @@ pub const REGISTRY: &[EnvVar] = &[
     EnvVar {
         name: "METAL2VULKAN_RETRY_DUMP",
         default: "unset",
-        effect: "path to dump a failing inline+SROA module (debug)",
+        effect: "path to dump a failing retry or corpus-audit SPIR-V module (debug)",
     },
     EnvVar {
         name: "METAL2VULKAN_<TOOL>",
         default: "PATH search",
-        effect: "dynamic family: per-external-tool path override — METAL2VULKAN_<CMD> (uppercased, \
-                 -> _) gives an absolute path to that tool binary (e.g. METAL2VULKAN_LLVM_DIS, \
-                 METAL2VULKAN_SPIRV_VAL). Absent → search the known tool dirs then PATH",
+        effect: "absolute per-tool override (for example METAL2VULKAN_LLVM_DIS or \
+                 METAL2VULKAN_SPIRV_VAL)",
     },
     // presence-flag debug/trace toggles (set to any value to enable)
     EnvVar {
@@ -71,68 +70,41 @@ pub const REGISTRY: &[EnvVar] = &[
     EnvVar {
         name: "METAL2VULKAN_TIER_CENSUS",
         default: "off",
-        effect: "print `[tier-census] <tier>` per translate: which retry tier (if any) was \
-                 adopted (M-C1 cascade-redundancy telemetry)",
+        effect: "print the adopted retry tier for each translation",
     },
     EnvVar {
         name: "METAL2VULKAN_PARAM_POINTEE_DBG",
         default: "off",
-        effect: "enumerate S18 param-pointee sidecar divergences (--param-pointee-check)",
+        effect: "trace parameter-pointee sidecar mismatches",
     },
     EnvVar {
         name: "METAL2VULKAN_POINTEE_DBG",
         default: "off",
-        effect: "enumerate M2 pointee-carrier divergences (--tir-pointee-check)",
+        effect: "trace typed-IR pointee-carrier mismatches",
     },
     EnvVar {
         name: "METAL2VULKAN_WHOLE_PART",
         default: "off",
-        effect: "M-A2(b) whole-vs-part: upgrade a SCALAR local-pointer pointee to the use-implied \
-                 WHOLE composite carrier (Vector(S,N)/[N x S] of the same scalar S) when the pointer \
-                 is dereferenced as the whole. Excludes raw_offsets/unmodeled/byte-view and any \
-                 pointer participating in a phi/select pointer merge. Byte-changing; default OFF — \
-                 the 112 changed banked cases MoltenVK-conform (109 byte-exact + 3 flag-independent \
-                 FP-drift) ONLY because the retry cascade rescues its INVALID primary emits: the \
-                 upgrade widens a load's result to the whole vector WITHOUT retyping the feeding \
-                 access-chain pointer, so a bitcast-aliased whole-vector load through a scalar-element \
-                 access chain emits `OpLoad <4 x half> from half*` (spirv-val invalid — see the \
-                 native_pointer_bitcast_vector_load_store_uses_scalar_lanes test). The flip is blocked \
-                 by that partial-retyping soundness gap, NOT by G8 hardware; it needs consistent \
-                 def-site pointer-network retyping (M-A2(c)/M-B1 keystone) first. Frozen by dead-end \
-                 A9 (read-side prefer-carrier retyping is proven unsound); kept as measurement \
-                 substrate only",
+        effect:
+            "UNSAFE diagnostic: probe whole-composite local-pointer carriers; may emit invalid \
+                 SPIR-V and must not be used as a product feature",
     },
     EnvVar {
         name: "METAL2VULKAN_REINTERP_REAL",
         default: "off",
-        effect: "M-A2(a) Float<->Int reinterpret (DIAGNOSTIC/UNSOUND — do NOT flip): upgrade a SCALAR \
-                 local-pointer pointee to a use-implied carrier scalar of the SAME bit width but \
-                 different kind (Float(32)<->Int(32), Half(16)<->Int(16), …). Enumerable via \
-                 --reinterp-real-check. Proven NON-conformant: a G7 MoltenVK sample miscompiles the \
-                 topk_common_matrix_float family (naive prefer-carrier picks one arm of a genuine \
-                 reinterpret). Frozen by dead-end A9 (read-side prefer-carrier retyping is proven \
-                 unsound). Kept default-off as the measurement substrate for the eventual sound \
-                 def-site-unambiguous version; never flip in this naive form",
+        effect: "UNSAFE diagnostic: probe same-width float/integer pointer retyping; known \
+                 nonconformant and never a product feature",
     },
     EnvVar {
         name: "METAL2VULKAN_STRADDLE_ADMIT",
         default: "off",
-        effect: "M-B1 straddle DIAGNOSTIC (default-off, NOT a fix): bypass the \
-                 `selection:straddle-loop-merge` self-check so the structured plan is admitted anyway. \
-                 For the enclosing-guard early-return shape (05/b00a8a8d — top-level `if(!c) return` \
-                 guards whose false arm is the OpReturn block that doubles as the loop merge) this lets \
-                 the downstream synth run and exposes the NEXT blocker (a byte-view pointer-phi) the \
-                 CFG reject otherwise masks. Flag-on emits invalid SPIR-V for genuine straddles, so it \
-                 is a single-case probe knob for phi/pointee work, never enabled at large scale",
+        effect:
+            "UNSAFE diagnostic: bypass one structured-CFG straddle check; may emit invalid SPIR-V",
     },
     EnvVar {
         name: "METAL2VULKAN_PTR_NETWORK_WHY",
         default: "off",
-        effect: "M-A2/M-B1 DIAGNOSTIC (default-off, read-only): per function, print each pointer \
-                 network (connected component over phi result↔incoming + select result↔arm edges) \
-                 whose recorded pointees are non-uniform, tagged whole-vs-part / reinterpret-mix / \
-                 unclassified. Builds the grouping M-A2's def-site finest-granularity recording needs \
-                 and quantifies its scope. Changes no bytes",
+        effect: "trace pointer phi/select networks with non-uniform pointee types (byte-neutral)",
     },
     EnvVar {
         name: "METAL2VULKAN_STORAGE_DBG",
@@ -162,66 +134,48 @@ pub const REGISTRY: &[EnvVar] = &[
     EnvVar {
         name: "METAL2VULKAN_RELOOP_WHY",
         default: "off",
-        effect: "M-B DIAGNOSTIC (default-off, read-only): per relooper invocation, print the function \
-                 count handed in (RELOOP-ENTER) and, per function, its block count and the reason \
-                 rewrite_to_relooper bails (RELOOP-FN / RELOOP-BAIL: too-few/too-many-blocks, \
-                 empty-block, unhandled-terminator, non-spillable-demote). Surfaces WHY the relooper \
-                 (repair's designed replacement) cannot rescue an M-B2 NO_REPAIR blocker — e.g. 05 \
-                 bails on non-spillable pointer demotion (loop-carried buffer pointers). Changes no bytes",
+        effect: "trace relooper entry, block counts, and exact bailout reasons (byte-neutral)",
     },
     EnvVar {
         name: "METAL2VULKAN_SPI_WHY",
         default: "off",
-        effect: "Keystone-2 DIAGNOSTIC (default-off, read-only eprintln): log the exact point + the \
-                 (converge_inloop, break_aware) flags at which structured_plan_inner returns \
-                 None for a function, so the ACTUAL residual reject of a merge-inloop case can be seen \
-                 (the --structured-why LABEL is computed with converge=false and does not name why the \
-                 converge/protect attempts fail). On a branch-no-merge reject it also dumps the sblocks \
-                 skeleton. Changes no bytes",
+        effect: "trace exact structured-plan rejection points and plan flags (byte-neutral)",
     },
     // default-off measurement / gate substrates
     EnvVar {
         name: "METAL2VULKAN_CONVERGE_INLOOP",
         default: "off",
-        effect: "Measurement override: force the in-loop merge-collision convergence on ALL \
-                 structured_plan attempts, not just the reject-triggered 4th (the default). Measures the \
-                 large-scale byte churn (~2170 rows) the unconditional broad form would cause vs the \
-                 bounded reject-triggered set",
+        effect:
+            "measurement override: force in-loop merge convergence on every structured-plan attempt",
     },
     // default-off diagnostics (read-only eprintln, never change bytes)
     EnvVar {
         name: "METAL2VULKAN_UNMODELED_WHY",
         default: "off",
-        effect: "log every unmodeled-pointer PLACEHOLDER the emitter synthesizes \
-                 (emit_private_zero_pointer_value) with result id, pointee, and callsite, so the \
-                 provenance behind a blocker can be identified",
+        effect: "trace synthesized unmodeled-pointer placeholders and their provenance",
     },
     EnvVar {
         name: "METAL2VULKAN_FLM_WHY",
         default: "off",
-        effect: "log every loop plan forest_loop_merges processes with its restructure kind, natural \
-                 merge block, whether that merge collides with an outer selection, and whether it \
-                 carries a phi — the loop-merge/selection-merge collision topology behind the \
-                 cond-phi-shared/loop-role/merge-inloop reject class",
+        effect: "trace loop-merge plans, selection collisions, and merge phis",
     },
     EnvVar {
         name: "METAL2VULKAN_EXIT_WHY",
         default: "off",
-        effect: "log each illegal structured-exit edge exit_check finds (EXIT-ILLEGAL \
-                 innermost-header/merge/block->succ), surfacing why a block escapes its innermost \
-                 construct",
+        effect: "trace illegal structured-exit edges and their innermost constructs",
     },
     EnvVar {
         name: "METAL2VULKAN_SWITCH_TAIL_WHY",
         default: "off",
-        effect: "log the switch-case shared-continuation candidates privatize_dominated_region's \
-                 deep-shared clone loop considers each round",
+        effect: "trace switch-case shared-continuation cloning candidates",
     },
 ];
 
 /// Multi-line `--help` block listing every registry var.
 pub fn help_text() -> String {
-    let mut out = String::from("environment variables:\n");
+    let mut out = String::from(
+        "environment variables (debug toggles are enabled by presence, regardless of value):\n",
+    );
     for v in REGISTRY {
         out.push_str(&format!(
             "  {:<32} {} [default: {}]\n",

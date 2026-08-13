@@ -77,7 +77,7 @@ pub(super) fn emit_finish_primary_module(
     entry_name: Option<&str>,
     options: passes::TransformOptions,
 ) -> Result<FinishedModule, String> {
-    let structured = tools::llc_vulkan_spirv_with_sidecar(
+    let structured = tools::emit_vulkan_spirv_with_sidecar(
         san_ll,
         Path::new(""),
         kern,
@@ -128,11 +128,14 @@ pub(crate) fn apply_xbind_phi_psb(module: &Module, spv: &[u8]) -> Vec<u8> {
 pub(crate) fn apply_primary_emit_rewrites_module(
     module: &mut Module,
     retained_global_ids: &mut [spirv::Word],
-) {
-    if native::value_lower_cross_binding_pointer_merges_module(module) {
-        passes::canonicalize_ids_and_remap(module, retained_global_ids);
+    sidecar: &mut crate::emit_sidecar::EmitSidecar,
+) -> (bool, bool) {
+    let pointer_changed = native::value_lower_cross_binding_pointer_merges_module(module);
+    if pointer_changed {
+        passes::canonicalize_ids_and_remap_sidecar(module, retained_global_ids, sidecar);
     }
-    apply_agx_fc_prune_module(module, retained_global_ids);
+    let cfg_changed = apply_agx_fc_prune_module(module, retained_global_ids);
+    (pointer_changed, cfg_changed)
 }
 
 pub(crate) fn primary_xbind_phi_psb_for_validation_error(
@@ -201,6 +204,23 @@ pub(crate) fn primary_primitive_phi_metadata_if_needed(
     }
 }
 
+/// A validator-proven StorageBuffer over-index already identifies the raw-buffer model and makes
+/// primitive-phi metadata probing irrelevant. Feed that byte view straight to the relooper before
+/// either retry repeats the expensive native structured-plan search.
+pub(crate) fn primary_storage_buffer_raw_feed_if_needed(
+    validation_error: &str,
+    retry: &retry::RetryCtx<'_>,
+) -> Option<Vec<u8>> {
+    validation_error_may_be_storage_buffer_overindex(validation_error)
+        .then(|| {
+            retry.census(
+                "val-ptr:raw_feed_then_relooper",
+                retry.raw_feed_then_relooper(),
+            )
+        })
+        .flatten()
+}
+
 /// Promote the first production pointer-typing retry as a primary candidate. For the
 /// `reached non-composite` Private-placeholder class, try the FC-buffer-promoted Logical projection
 /// first: if an FC-wrapped buffer is actually used, binding it as the real descriptor preserves the
@@ -215,7 +235,7 @@ pub(crate) fn primary_pointer_typing_raw_if_needed(
     {
         return None;
     }
-    if validation_error.contains("reached non-composite") {
+    if validation_error_may_be_fc_private_placeholder(validation_error) {
         if let Some(bytes) = retry.fc_promote_logical() {
             return Some(bytes);
         }
@@ -287,6 +307,22 @@ pub(crate) fn primary_other_prune_if_needed(
     .ok()?;
     let primary = module_bytes(&pruned_module);
     (primary != spv && tools::spirv_val_bytes(&primary, tmp).is_ok()).then_some(primary)
+}
+
+/// Prune statically-dead function-constant arms before source-level CFG re-emission when the
+/// primary failure is itself a structured-control-flow rule. If pruning alone validates, it removes
+/// both the dead CFG violation and the need to parse/emit/finish a construct-tree candidate.
+pub(crate) fn primary_cfg_prune_if_needed(
+    validation_error: &str,
+    spv: &[u8],
+    retry: &retry::RetryCtx<'_>,
+) -> Option<Vec<u8>> {
+    if native::classify_validation_error(validation_error)
+        != native::ValidationClass::CfgStructurization
+    {
+        return None;
+    }
+    retry.census("val-cfg:prune", retry.prune_retry(spv))
 }
 
 /// Adopt the ordinary relooper rewrite when the primary fails a CFG structural rule and the relooper
@@ -389,11 +425,12 @@ pub(crate) fn primary_construct_tree_if_needed(
     retry.census("val-cfg:construct_tree", retry.construct_tree_retry())
 }
 
-/// Promote the narrow `val-other:inline_sroa_relooped` composition for a dynamic structure index only
-/// after inlining/SROA changes its error class to CFG structurization. The source-level index remains
-/// dynamic on the raw primary, so no pointer retype is guessed: the existing inline pass removes the
-/// caller-owned local byte view, and the existing relooper restructures the resulting otherwise-valid
-/// CFG. Any other first or second validation class declines.
+/// Promote the narrow inline/SROA retry for a dynamic structure index when it validates directly, or
+/// compose it with the relooper only after its error class changes to CFG structurization. The
+/// source-level index remains dynamic on the raw primary, so no pointer retype is guessed: the
+/// existing inline pass removes the caller-owned local byte view, and the existing relooper
+/// restructures the resulting otherwise-valid CFG. Any other first or second validation class
+/// declines.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
     validation_error: &str,
@@ -411,7 +448,7 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
     {
         return None;
     }
-    let inlined = tools::llc_vulkan_spirv_inline_sroa_with_sidecar(
+    let inlined = tools::emit_vulkan_spirv_inline_sroa_with_sidecar(
         san_ll,
         tmp,
         kern,
@@ -432,11 +469,12 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
     })
     .map(|finished| finished.bytes)
     .ok()?;
-    let inline_error = tools::spirv_val_bytes(&inlined, tmp).err()?;
-    if native::classify_validation_error(&inline_error)
-        != native::ValidationClass::CfgStructurization
-    {
-        return None;
+    match tools::spirv_val_bytes(&inlined, tmp) {
+        Ok(()) => return Some(inlined),
+        Err(inline_error)
+            if native::classify_validation_error(&inline_error)
+                == native::ValidationClass::CfgStructurization => {}
+        Err(_) => return None,
     }
     let primary = relooper_candidate(&inlined)?;
     tools::spirv_val_bytes(&primary, tmp)
@@ -465,7 +503,7 @@ pub(crate) fn primary_logical_pointer_inline_sroa_raw_if_needed(
     {
         return None;
     }
-    let primary = tools::llc_vulkan_spirv_inline_sroa_raw_with_sidecar(
+    let primary = tools::emit_vulkan_spirv_inline_sroa_raw_with_sidecar(
         san_ll,
         tmp,
         kern,
@@ -505,10 +543,12 @@ pub(crate) fn primary_opaque_image_select_module_if_needed(
     tmp: &Path,
 ) -> Option<Vec<u8>> {
     let class = native::classify_validation_error(validation_error);
-    let opaque_phi_mismatch = class == native::ValidationClass::PointerTyping
+    let opaque_merge_mismatch = (class == native::ValidationClass::PointerTyping
         && validation_error.contains("OpPhi's result type")
-        && validation_error.contains("does not match incoming value");
-    if class != native::ValidationClass::Other && !opaque_phi_mismatch {
+        && validation_error.contains("does not match incoming value"))
+        || (validation_error.contains("Expected both objects to be of Result Type: Select")
+            && validation_error.contains("_ptr_UniformConstant_"));
+    if class != native::ValidationClass::Other && !opaque_merge_mismatch {
         return None;
     }
     let mut primary_module = module.clone();
@@ -532,15 +572,17 @@ pub(crate) fn primary_opaque_image_select_module_if_needed(
 /// by [`native::has_bodiless_agx_call_module`] (the `llvm.agx` ABI-symbol namespace, never a shader
 /// name). The result is retained only when that exact call is gone after pruning, so an AGX call in
 /// LIVE code cannot cause an unrelated constant branch to alter the primary candidate.
-fn apply_agx_fc_prune_module(module: &mut Module, retained_global_ids: &[spirv::Word]) {
+fn apply_agx_fc_prune_module(module: &mut Module, retained_global_ids: &[spirv::Word]) -> bool {
     if !native::has_bodiless_agx_call_module(module) {
-        return;
+        return false;
     }
     let original = module.clone();
     let changed = native::prune_constant_branches_module_preserving(module, retained_global_ids);
     if !changed || native::has_bodiless_agx_call_module(module) {
         *module = original;
+        false
     } else {
         native::close_module_capabilities(module);
+        true
     }
 }

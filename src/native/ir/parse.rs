@@ -44,6 +44,8 @@ impl LlModule {
         kern: Option<&meta::KernMeta>,
         entry_name: Option<&str>,
     ) -> Result<Self, String> {
+        let ray_lowered = crate::native::ray_intersection::lower_callback_free_triangle_queries(ll);
+        let ll = ray_lowered.as_deref().unwrap_or(ll);
         let mut types = HashMap::new();
         let lines: Vec<&str> = ll.lines().collect();
         let mut functions = Vec::new();
@@ -111,6 +113,8 @@ impl LlModule {
         for (f, blocks) in functions.iter_mut().zip(block_lists) {
             f.blocks = blocks;
         }
+        drop(function_bodies);
+        drop(lines);
         let entry_functions = entry_name
             .map(|name| HashSet::from([name.to_string()]))
             .unwrap_or_else(|| infer_entry_functions(ll));
@@ -154,6 +158,7 @@ impl LlModule {
             functions,
             declarations,
             globals,
+            static_init_int_globals: meta::static_init_foldable_int_global_values(ll),
             entry_name: entry_name.map(str::to_string),
             preinlined_static_initializers: HashSet::new(),
             preinlined_helper_pointer_loads: HashSet::new(),

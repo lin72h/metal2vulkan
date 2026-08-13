@@ -8,7 +8,7 @@ emission and typed stage/access lowering:
 - selection merges that collide with loop-continue targets;
 - loop-continue external predecessors and the coupled phi-edge reconciliation.
 
-A complete primary no-retry census records actual mutations for merge placement, continue
-pass-through, continue-selection splitting, and phi-edge reconciliation. The external-predecessor
-member records no primary mutation but remains coupled to the phi fixpoint until retry-tier
-reachability is measured.
+The native structurizer owns primary CFG construction; the retry relooper owns wholesale fallback
+restructuring. This directory is deliberately limited to the retained-module shapes above. Any
+expansion needs a primary no-retry mutation census and validation-gated retry evidence so it does
+not grow back into an unbounded post-hoc structurizer.

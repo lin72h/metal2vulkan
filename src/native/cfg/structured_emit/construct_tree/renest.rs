@@ -43,14 +43,6 @@ struct ValueSlot {
     next: String,
 }
 
-#[derive(Debug)]
-struct CaseUpdate {
-    join: String,
-    pc: LlValue,
-    phi_slots: Vec<LlValue>,
-    value_slots: Vec<LlValue>,
-}
-
 fn passthrough(name: &str, target: &str) -> BodyBlock {
     synthetic_block(
         name.to_string(),
@@ -82,7 +74,7 @@ fn carrier_with_phis(
     Ok(BodyBlock {
         name: name.to_string(),
         role,
-        typed: Some(carrier),
+        typed: Some(carrier.into()),
     })
 }
 
@@ -105,6 +97,7 @@ fn collect_value_locals(value: &LlValue, out: &mut Vec<String>) {
                 collect_value_locals(&index.value, out);
             }
         }
+        LlValue::IntToPtr { source, .. } => collect_value_locals(&source.value, out),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -146,6 +139,9 @@ fn substitute_cross_slot_value(
                 substitute_cross_slot_value(&mut index.value, value_slots, source);
             }
         }
+        LlValue::IntToPtr {
+            source: operand, ..
+        } => substitute_cross_slot_value(&mut operand.value, value_slots, source),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -471,24 +467,46 @@ pub(in crate::native) fn materialize_construct_tree_roles(
         BlockRole::ConstructTreeRoute,
     ));
 
-    let mut updates = Vec::with_capacity(blocks.len());
+    let mut pc_updates = Vec::with_capacity(blocks.len());
+    let mut phi_updates = slots
+        .iter()
+        .map(|_| Vec::with_capacity(blocks.len()))
+        .collect::<Vec<_>>();
+    let mut value_update_incoming = value_slots
+        .iter()
+        .map(|_| Vec::with_capacity(blocks.len()))
+        .collect::<Vec<_>>();
     for (case_index, original) in blocks.iter().enumerate() {
         let mut case = original.clone();
-        let carrier = case.typed.as_mut().expect("checked above");
+        let carrier = std::sync::Arc::make_mut(case.typed.as_mut().expect("checked above"));
         carrier.rename(&rename);
-        let substitutions = value_slots
+        // Most cross-case values are irrelevant to any one case. Building the full value-slot map
+        // for every block made this bounded transform allocate O(cases * slots) cloned names and
+        // types before it touched a single operand. Restrict the substitution map to actual uses in
+        // this carrier; the deep typed substitution below remains the sole mutation primitive.
+        let mut used_names = carrier
+            .insts
             .iter()
-            .filter(|slot| slot.owner != case_index)
-            .map(|slot| {
-                (
-                    slot.original.clone(),
-                    TypedValue {
-                        ty: slot.ty.clone(),
-                        value: LlValue::Local(slot.current.clone()),
-                    },
-                )
-            })
-            .collect::<HashMap<_, _>>();
+            .filter(|inst| !inst.is_phi())
+            .flat_map(|inst| inst.uses.iter().cloned())
+            .collect::<HashSet<_>>();
+        used_names.extend(terminator_value_uses(&carrier.terminator));
+        let mut substitutions = HashMap::new();
+        for name in used_names {
+            let Some(slot) = value_slot_by_name.get(name.as_str()) else {
+                continue;
+            };
+            if slot.owner == case_index {
+                continue;
+            }
+            substitutions.insert(
+                slot.original.clone(),
+                TypedValue {
+                    ty: slot.ty.clone(),
+                    value: LlValue::Local(slot.current.clone()),
+                },
+            );
+        }
         carrier.substitute_values(&substitutions);
         carrier.insts.retain(|inst| !inst.is_phi());
         let targets = &successors[case_index];
@@ -564,7 +582,7 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             let update = match targets.as_slice() {
                 [] => LlValue::Local(slot.current.clone()),
                 [target] => edge_value(*target)?,
-                _ => {
+                _ if targets.contains(&slot.host) => {
                     let result = format!("{PREFIX}caseslot.{case_index}.{slot_index}");
                     join_phis.push((
                         result.clone(),
@@ -579,10 +597,11 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                     ));
                     LlValue::Local(result)
                 }
+                _ => LlValue::Local(slot.current.clone()),
             };
             slot_updates.push(update);
         }
-        let value_updates = value_slots
+        let case_value_updates: Vec<_> = value_slots
             .iter()
             .map(|slot| {
                 if slot.owner == case_index {
@@ -598,34 +617,33 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             &join_phis,
             BlockRole::Normal,
         )?);
-        updates.push(CaseUpdate {
-            join,
-            pc: pc_update,
-            phi_slots: slot_updates,
-            value_slots: value_updates,
-        });
+        pc_updates.push((pc_update, join.clone()));
+        for (incoming, value) in phi_updates.iter_mut().zip(slot_updates) {
+            incoming.push((value, join.clone()));
+        }
+        for (incoming, value) in value_update_incoming.iter_mut().zip(case_value_updates) {
+            incoming.push((value, join.clone()));
+        }
     }
 
     out.push(passthrough(INVALID, MERGE));
     let mut merge_phis = vec![(
         NEXT_PC.to_string(),
         LlType::Int(32),
-        updates
-            .iter()
-            .map(|update| (update.pc.clone(), update.join.clone()))
+        pc_updates
+            .into_iter()
             .chain(std::iter::once((
                 LlValue::Int(done_state),
                 INVALID.to_string(),
             )))
             .collect(),
     )];
-    for (slot_index, slot) in slots.iter().enumerate() {
+    for (slot, incoming) in slots.iter().zip(phi_updates) {
         merge_phis.push((
             slot.next.clone(),
             slot.ty.clone(),
-            updates
-                .iter()
-                .map(|update| (update.phi_slots[slot_index].clone(), update.join.clone()))
+            incoming
+                .into_iter()
                 .chain(std::iter::once((
                     LlValue::Local(slot.current.clone()),
                     INVALID.to_string(),
@@ -633,13 +651,12 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                 .collect(),
         ));
     }
-    for (slot_index, slot) in value_slots.iter().enumerate() {
+    for (slot, incoming) in value_slots.iter().zip(value_update_incoming) {
         merge_phis.push((
             slot.next.clone(),
             slot.ty.clone(),
-            updates
-                .iter()
-                .map(|update| (update.value_slots[slot_index].clone(), update.join.clone()))
+            incoming
+                .into_iter()
                 .chain(std::iter::once((
                     LlValue::Local(slot.current.clone()),
                     INVALID.to_string(),
@@ -666,6 +683,32 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             out.len(),
             plan.block_bound
         ));
+    }
+    if crate::env_vars::why() {
+        let instructions = out
+            .iter()
+            .filter_map(|block| block.typed.as_ref())
+            .map(|block| block.insts.len())
+            .sum::<usize>();
+        let phis = out
+            .iter()
+            .filter_map(|block| block.typed.as_ref())
+            .flat_map(|block| &block.insts)
+            .filter(|inst| inst.is_phi())
+            .count();
+        let phi_incoming = out
+            .iter()
+            .filter_map(|block| block.typed.as_ref())
+            .flat_map(|block| &block.insts)
+            .filter_map(|inst| inst.phi_incoming.as_ref())
+            .map(|(_, incoming)| incoming.len())
+            .sum::<usize>();
+        eprintln!(
+            "WHY-CONSTRUCT-TREE materialized blocks={} instructions={instructions} phis={phis} phi-incoming={phi_incoming} source-phis={} cross-values={}",
+            out.len(),
+            slots.len(),
+            value_slots.len()
+        );
     }
     if super::super::structured_plan(&out).is_none() {
         let reason =

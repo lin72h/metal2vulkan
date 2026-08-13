@@ -1,18 +1,15 @@
-//! The residual SPIR-V passes — the stage-*interface* half of this crate. The structurizer is NOT
-//! here: the native emitter (`native/`, with the structured-control-flow logic in `native/cfg/` and
-//! `native/emitter/control.rs`) is what turns the AIR CFG into a structured `OpCapability Shader` /
-//! `Logical GLSL450` module, emitting OpSelectionMerge/OpLoopMerge and running the budgeted
-//! post-hoc repair. By the time a module reaches these passes it is already structured; what remains
-//! is purely the stage interface: the emitter lowers each entry parameter to an opaque
-//! pointer/value param and each `air.*` to an imported function call. The native emitter never emits
-//! the legacy LLVM backend's Linkage capability/decorations. We:
+//! Retained-SPIR-V transformation pipeline. The native emitter (`native/`, with its primary
+//! structured-control-flow planning in `native/cfg/`) produces crate-owned Logical GLSL450 SPIR-V.
+//! These passes then close both the Vulkan interface and residual AIR semantics. They:
 //!   1. turn entry parameters into Vulkan interface variables by their AIR role
 //!      (varying -> Input@Location, texture -> UniformConstant image, sampler -> UniformConstant
-//!      sampler, buffer -> Uniform Block@set/binding);
+//!      sampler, buffer -> StorageBuffer Block@set/binding);
 //!   2. turn the entry's return value into Output variable(s) @Location (MRT = struct split);
 //!   3. lower the residual `air.*` OpFunctionCalls (sample -> OpImageSample*, math -> GLSL.std.450,
 //!      dfdx/dfdy -> OpDPdx/OpDPdy, discard -> OpKill, ...);
-//!   4. synthesize OpEntryPoint + OpExecutionMode and drop the now-unused air.* function decls.
+//!   4. normalize typed access, Workgroup memory, and the narrow CFG shapes that require retained
+//!      module repair; and
+//!   5. synthesize OpEntryPoint + OpExecutionMode, close capabilities, and remove dead declarations.
 //!
 //! Everything operates on the crate-owned module representation (`crate::spirv_module::Module`),
 //! whose instructions, operands, functions, and blocks are crate-owned nodes.
@@ -53,6 +50,11 @@ pub struct TransformOptions {
     /// denormals. Vulkan exposes this only through optional float-controls features, so the native
     /// path records the request but does not emit a portability-breaking execution mode.
     pub denorm_flush_to_zero_f32: bool,
+    /// Raster sample count selected by the graphics pipeline. AIR can query this through
+    /// `air.get_num_samples.i32`, while Vulkan has no shader instruction for the same pipeline
+    /// state. Supply the exact pipeline value when translating such a module; leaving it `None`
+    /// keeps unknown state honest and makes the intrinsic fail visibly.
+    pub raster_sample_count: Option<u32>,
 }
 
 impl Default for TransformOptions {
@@ -62,6 +64,7 @@ impl Default for TransformOptions {
             kernel_threads_per_grid: None,
             simd_cluster32: false,
             denorm_flush_to_zero_f32: false,
+            raster_sample_count: None,
         }
     }
 }
@@ -75,6 +78,30 @@ pub enum ImageComp {
     Float,
     Uint,
     Sint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FragmentImageblockFormat {
+    image_format: ImageFormat,
+    component: ImageComp,
+    bits: u32,
+    lanes: u32,
+}
+
+fn fragment_imageblock_format(type_name: &str) -> Option<FragmentImageblockFormat> {
+    let (image_format, component, bits, lanes) = match type_name {
+        "half" => (ImageFormat::R16f, ImageComp::Float, 16, 1),
+        "half4" => (ImageFormat::Rgba16f, ImageComp::Float, 16, 4),
+        "uchar4" => (ImageFormat::Rgba8ui, ImageComp::Uint, 8, 4),
+        "ushort" => (ImageFormat::R16ui, ImageComp::Uint, 16, 1),
+        _ => return None,
+    };
+    Some(FragmentImageblockFormat {
+        image_format,
+        component,
+        bits,
+        lanes,
+    })
 }
 
 /// Typed cache key for the singleton types the finalize pass synthesizes (cleanup-plan S4). Each has
@@ -182,6 +209,8 @@ struct Ctx {
     kernel_threads_per_grid: Option<[u32; 3]>,
     /// M-D2 simd-reduce clustering opt-in (see [`TransformOptions::simd_cluster32`]).
     simd_cluster32: bool,
+    /// Exact graphics-pipeline sample count used to lower `air.get_num_samples.i32`.
+    raster_sample_count: Option<u32>,
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
@@ -190,6 +219,15 @@ struct Ctx {
     /// lazily-created default (null) float image variables for `air.get_null_texture_*()`, keyed by
     /// (Dim, arrayed) so a 2D and a 3D null texture get distinct bindings/types.
     default_null_image_vars: HashMap<(Dim, bool), Word>,
+    /// `(render-target attachment, AIR imageblock data rate)` -> storage-image variable/type/format.
+    /// The image is 2D-arrayed; the AIR color/sample index selects its array layer.
+    implicit_imageblock_vars: HashMap<(u32, u32), (Word, Word, ImageFormat)>,
+    /// Custom fragment-imageblock master member -> storage-image variable/type. Unlike implicit
+    /// attachment imageblocks these slots are selected by master-field ordinal.
+    fragment_imageblock_vars: HashMap<u32, (Word, Word)>,
+    /// The custom fragment imageblock contract requires ordered per-pixel access.
+    uses_fragment_imageblock: bool,
+    fragment_imageblock_coord_var: Option<Word>,
     /// Fragment output rewrite created a `BuiltIn FragDepth` Output variable.
     writes_frag_depth: bool,
 }
@@ -240,9 +278,14 @@ impl Ctx {
             kernel_local_size: options.kernel_local_size,
             kernel_threads_per_grid: options.kernel_threads_per_grid,
             simd_cluster32: options.simd_cluster32,
+            raster_sample_count: options.raster_sample_count,
             default_sampler_var: None,
             sampler_states: HashMap::new(),
             default_null_image_vars: HashMap::new(),
+            implicit_imageblock_vars: HashMap::new(),
+            fragment_imageblock_vars: HashMap::new(),
+            uses_fragment_imageblock: false,
+            fragment_imageblock_coord_var: None,
             writes_frag_depth: false,
         }
     }
@@ -460,7 +503,7 @@ impl Ctx {
     }
 
     /// Build the SPIR-V type for a reconstructed AIR aggregate (`air.struct_type_info`). Mirrors the
-    /// original Metal layout so the backend's collapsed access-chain indices land correctly: a matrix
+    /// original Metal layout so flattened access-chain indices land correctly: a matrix
     /// `floatCxR` becomes `{ [cols x vec(rows)] }` (the `metal::matrix` wrapper struct), a struct
     /// becomes an `OpTypeStruct` of its members in order.
     fn build_air_type(&mut self, t: &AirType) -> Word {
@@ -508,7 +551,7 @@ impl Ctx {
             AirScalar::ULong | AirScalar::SLong => self.ty_ulong(),
             AirScalar::UShort | AirScalar::SShort => self.ty_int16(),
             // LLVM integer values are signless. Keep buffer storage leaves as unsigned words so
-            // reconstructed `int`/`packed_intN` layouts type-check against the backend's loads/stores;
+            // reconstructed `int`/`packed_intN` layouts type-check against emitted loads/stores;
             // signed interpretation is carried by the signed SPIR-V opcodes.
             AirScalar::SInt => self.ty_uint(),
             AirScalar::UChar | AirScalar::Bool => self.ty_int8(),
@@ -531,7 +574,7 @@ impl Ctx {
     }
 
     /// Get or create OpTypeRuntimeArray <elem>. Used to wrap a `device T*` (or a homogeneous struct
-    /// the backend collapsed into a bare element pointer) as a StorageBuffer Block `{ RuntimeArray<T> }`
+    /// emitted as a bare element pointer) as a StorageBuffer Block `{ RuntimeArray<T> }`
     /// so Logical SPIR-V can express `buf[i]`.
     fn ty_runtime_array(&mut self, elem: Word) -> Word {
         self.get_or_create(Op::TypeRuntimeArray, None, vec![Operand::IdRef(elem)])
@@ -779,8 +822,8 @@ impl Ctx {
         id
     }
 
-    /// Get or create OpTypeFloat 16 (`half`). Reuses an existing one (llc emits it for any half
-    /// shader). Adds the `Float16` capability requirement implicitly (asserted in finalize).
+    /// Get or create OpTypeFloat 16 (`half`). Reuses an existing type and adds the `Float16`
+    /// capability requirement implicitly (asserted in finalize).
     fn ty_half(&mut self) -> Word {
         self.get_or_create(Op::TypeFloat, None, vec![Operand::LiteralBit32(16)])
     }
@@ -831,6 +874,7 @@ impl Ctx {
 }
 
 mod access;
+mod agx_cluster;
 mod air_calls;
 mod cfg_repair;
 mod emitted_inline;
@@ -850,23 +894,28 @@ mod workgroup;
 use access::{
     compose_derived_access_chains, decorate_ptr_access_chain_base_strides,
     drop_dead_invalid_access_chains, drop_overindexed_zero_tail,
-    drop_writeonly_dead_local_array_stores, fix_noop_width_converts,
-    guard_integer_division_by_zero, hoist_function_variables, lower_cross_member_subword_load,
-    lower_cross_member_subword_store, lower_private_byte_aggregate_reinterpret,
-    lower_private_memory_atomics, lower_scalar_i64_arithmetic_to_u32_halves,
-    lower_subword_scalar_store, narrow_access_chain_indices, neutralize_null_access_chains,
+    drop_writeonly_dead_local_array_stores, expose_nullable_access_chain_bases,
+    fix_noop_width_converts, guard_integer_division_by_zero, hoist_function_variables,
+    lower_cross_member_subword_load, lower_cross_member_subword_store,
+    lower_private_byte_aggregate_reinterpret, lower_private_memory_atomics,
+    lower_scalar_i64_arithmetic_to_u32_halves, lower_subword_scalar_store,
+    narrow_access_chain_indices, neutralize_null_access_chains,
     neutralize_private_placeholder_access_chains, normalize_int_arith_operand_widths,
-    normalize_scalar_store_types, recover_inlined_local_pointer_fields,
+    normalize_scalar_store_types, recover_inlined_local_dynamic_pointer_fields,
+    recover_inlined_local_pointer_fields, recover_unique_local_pointer_field_loads,
     remap_dynamic_word_index_to_array_member, remap_dynamic_word_index_to_array_struct_field,
     remap_overflow_word_index_to_outer_member, remap_word_index_to_struct_member,
     remodel_workgroup_flatword_aggregate, remodel_workgroup_floatarray_atomic_as_uint,
-    remodel_workgroup_single_field_struct_array, repair_scalar_load_through_vector_ptr,
+    remodel_workgroup_single_field_struct_array, repair_load_through_array_pointer,
+    repair_scalar_load_through_vector_ptr, repair_vector_load_through_raw_word_pointer,
     repair_vector_load_through_scalar_stride, reroot_demoted_array_element_overindex,
     retype_demoted_copymemory_placeholder, rewrite_byte_buffer_chained_reinterpret,
     rewrite_chained_element_reinterpret, rewrite_dynamic_homogeneous_struct_index_load,
     rewrite_dynamic_struct_index_reinterpret, rewrite_dynamic_struct_index_subword_reinterpret,
     rewrite_dynamic_struct_index_vector_reinterpret,
-    rewrite_dynamic_struct_index_wide_word_reinterpret, rewrite_raw_byte_pointer_wide_loads,
+    rewrite_dynamic_struct_index_wide_word_reinterpret, rewrite_exact_raw_byte_block_loads,
+    rewrite_flat_scalar_ptr_access_through_vector_array, rewrite_raw_byte_pointer_direct_loads,
+    rewrite_raw_byte_pointer_wide_loads, rewrite_raw_byte_pointer_wide_stores,
     rewrite_reinterpret_scalar_loads, rewrite_scalar_pointer_arithmetic_access_chains,
     rewrite_scalar_slot_array_overindex, rewrite_strided_descent_access_chains,
     split_workgroup_ptr_access_chain_descent,
@@ -877,6 +926,7 @@ use emitted_inline::{
 };
 use finalize::finalize;
 use prune::prune_unreachable_blocks;
+use resources::rewrites::{rewrite_affine_raw_word_loads, rewrite_exact_raw_word_loads};
 use resources::*;
 use stage_input::build_stage_input;
 use stage_output::rewrite_return;
@@ -896,7 +946,9 @@ fn air_names(module: &Module) -> HashMap<Word, String> {
                 if s.starts_with("air.")
                     || s.starts_with("llvm.fabs.")
                     || s.starts_with("llvm.fmuladd.")
+                    || is_agx2_matmad_symbol(s)
                     || s == "llvm.agx3.edgecheck"
+                    || s == "llvm.agx2.cluster.num"
                     || matches!(
                         s.as_str(),
                         "llvm.agx3.load.with.emask.global.v4i8"
@@ -917,6 +969,16 @@ fn air_names(module: &Module) -> HashMap<Word, String> {
         }
     }
     m
+}
+
+fn is_agx2_matmad_symbol(name: &str) -> bool {
+    matches!(
+        name,
+        "llvm.agx2.f16matmad4x4.v2f16"
+            | "llvm.agx2.f32matmad4x4.v2f32"
+            | "llvm.agx2.f16matmad8x8.v2f16"
+            | "llvm.agx2.f32matmad8x8.v2f32"
+    )
 }
 
 /// Apply every bodied helper splice to the native emitter's completed typed SPIR-V graph before it
@@ -998,6 +1060,56 @@ pub(crate) fn repair_relooped_access_chains(
     rewrite_dynamic_struct_index_wide_word_reinterpret(&mut ctx, entry_idx)?;
     rewrite_dynamic_struct_index_vector_reinterpret(&mut ctx, entry_idx)?;
     rewrite_dynamic_homogeneous_struct_index_load(&mut ctx, entry_idx)?;
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    *module = ctx.module;
+    Ok(())
+}
+
+/// Re-close exact raw-byte leaf accesses after complete-module pointer rewrites. Those rewrites run
+/// after the main transform and can expose a typed aggregate carrier only at this boundary; retain
+/// the emitter sidecar until the carrier's constant descendants have been replayed as exact bytes.
+pub(crate) fn repair_exact_raw_byte_loads_after_native_rewrites(
+    module: &mut Module,
+    emit_sidecar: &crate::emit_sidecar::EmitSidecar,
+    entry_name: Option<&str>,
+) -> Result<(), String> {
+    let input = std::mem::take(module);
+    let mut ctx = Ctx::with_options_and_sidecar(
+        input,
+        emit_sidecar.clone(),
+        Stage::Kernel,
+        TransformOptions::default(),
+    );
+    let entry_idx = find_entry_index(&ctx.module, entry_name).ok_or_else(|| {
+        "no entry function with a body found for late raw-byte repair".to_string()
+    })?;
+    rewrite_exact_raw_byte_block_loads(&mut ctx, entry_idx);
+    drop_dead_invalid_access_chains(&mut ctx, entry_idx);
+    decorate_ptr_access_chain_base_strides(&mut ctx);
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    *module = ctx.module;
+    Ok(())
+}
+
+/// Re-close null-pointer access invariants after complete-module pointer-phi rewrites. Phi-the-index
+/// can rematerialize a chain from an incoming null root after the main transform's early null cleanup;
+/// dereferencing that arm was already undefined in LLVM, so preserve the established poisoned-value
+/// lowering instead of emitting an invalid logical-pointer chain.
+pub(crate) fn neutralize_null_access_chains_after_native_rewrites(
+    module: &mut Module,
+    entry_name: Option<&str>,
+) -> Result<(), String> {
+    let input = std::mem::take(module);
+    let mut ctx = Ctx::with_options_and_sidecar(
+        input,
+        crate::emit_sidecar::EmitSidecar::default(),
+        Stage::Kernel,
+        TransformOptions::default(),
+    );
+    let entry_idx = find_entry_index(&ctx.module, entry_name).ok_or_else(|| {
+        "no entry function with a body found for late null-access repair".to_string()
+    })?;
+    neutralize_null_access_chains(&mut ctx, entry_idx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     *module = ctx.module;
     Ok(())
@@ -1129,9 +1241,9 @@ fn replace_id_in_function(func: &mut Function, from: Word, to: Word) {
     }
 }
 
-/// Top-level driver: take the llc Vulkan SPIR-V module and produce a Vulkan entry-pointed module.
+/// Top-level driver: take the native emitter's SPIR-V module and produce a Vulkan entry-pointed module.
 /// `entry_name` is the AIR stage entry function name (from `!air.<stage>` metadata) used to pick the
-/// right function among the many the Vulkan backend leaves un-inlined.
+/// right function among the emitted functions.
 /// Renumber every result id into a deterministic canonical form: walk all instructions in serialized
 /// order and assign new sequential ids on first appearance, then remap every id reference (result id,
 /// result type, and the three id-bearing operand kinds). The serialized order is fully Vec-ordered
@@ -1145,6 +1257,22 @@ pub(crate) fn canonicalize_ids(module: &mut Module) {
 /// the same remap. The tracked ids are not SPIR-V roots by themselves; callers use them to preserve
 /// semantic sidecar facts through later in-memory rewrites after debug-marker removal.
 pub(crate) fn canonicalize_ids_and_remap(module: &mut Module, tracked_ids: &mut [Word]) {
+    let _ = canonicalize_ids_and_collect_remap(module, tracked_ids);
+}
+
+pub(crate) fn canonicalize_ids_and_remap_sidecar(
+    module: &mut Module,
+    tracked_ids: &mut [Word],
+    sidecar: &mut crate::emit_sidecar::EmitSidecar,
+) {
+    let remap = canonicalize_ids_and_collect_remap(module, tracked_ids);
+    sidecar.remap_ids(&remap);
+}
+
+fn canonicalize_ids_and_collect_remap(
+    module: &mut Module,
+    tracked_ids: &mut [Word],
+) -> HashMap<Word, Word> {
     let mut remap: HashMap<Word, Word> = HashMap::new();
     let mut next: Word = 1;
     for inst in module.all_inst_iter() {
@@ -1177,6 +1305,7 @@ pub(crate) fn canonicalize_ids_and_remap(module: &mut Module, tracked_ids: &mut 
     for id in tracked_ids {
         *id = map(*id);
     }
+    remap
 }
 
 #[cfg(test)]
@@ -1392,6 +1521,115 @@ mod emitted_inline_tests {
     }
 }
 
+fn repair_structured_cfg(ctx: &mut Ctx, entry_idx: usize) {
+    let mut phase_started = std::time::Instant::now();
+    let mut debug_size = |ctx: &Ctx, phase: &str| {
+        if crate::env_vars::retry_debug() {
+            let blocks = &ctx.module.functions[entry_idx].blocks;
+            let instructions = blocks
+                .iter()
+                .map(|block| block.instructions.len())
+                .sum::<usize>();
+            let operands = blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .map(|instruction| instruction.operands.len())
+                .sum::<usize>();
+            eprintln!(
+                "[retry-debug] cfg-repair {phase}: blocks={} instructions={instructions} operands={operands} phase_ms={}",
+                blocks.len(),
+                phase_started.elapsed().as_millis()
+            );
+            phase_started = std::time::Instant::now();
+        }
+    };
+    debug_size(ctx, "start");
+    // A merge instruction must immediately precede its terminator, and loop continues must not also
+    // serve as selection merges. Establish those local prerequisites before the mutually dependent
+    // edge/phi repairs.
+    cfg_repair::fix_merge_placement(ctx, entry_idx);
+    cfg_repair::funnel_selection_merge_bypasses(ctx, entry_idx);
+    cfg_repair::privatize_shared_direct_selection_arms(ctx, entry_idx);
+    cfg_repair::repair_loop_continue_pass_through_targets(ctx, entry_idx);
+    debug_size(ctx, "local-edges");
+
+    // Fixing a loop-continue's external predecessor can leave a stale phi incoming, while repairing
+    // that phi edge can expose another external predecessor. Iterate to a checked fixpoint.
+    const CONTINUE_PHI_REPAIR_CAP: usize = 8;
+    let mut continue_phi_converged = false;
+    for _ in 0..CONTINUE_PHI_REPAIR_CAP {
+        let continue_changed =
+            cfg_repair::repair_loop_continue_external_predecessors(ctx, entry_idx);
+        let phi_changed = cfg_repair::repair_phi_predecessor_edges(ctx, entry_idx);
+        if !continue_changed && !phi_changed {
+            continue_phi_converged = true;
+            break;
+        }
+    }
+    debug_assert!(
+        continue_phi_converged,
+        "loop-continue/phi-edge repair did not converge within {CONTINUE_PHI_REPAIR_CAP} rounds"
+    );
+    // External-predecessor repair establishes whether a selection is nested in a loop or encloses
+    // it. Only then can a selection that named the old continue choose the correct merge boundary.
+    cfg_repair::repair_continue_selection_merge_targets(ctx, entry_idx);
+    debug_size(ctx, "continue-phi-fixpoint");
+
+    // Large reducible functions can contain many nested conditionals with the same natural
+    // post-dominator. Give every structured header a private merge before repairing loop ordering.
+    cfg_repair::split_reused_merge_targets(ctx, entry_idx);
+    debug_size(ctx, "private-merges");
+    cfg_repair::split_merges_that_are_enclosing_continues(ctx, entry_idx);
+    debug_size(ctx, "private-continue-merges");
+
+    // Loop-header synthesis and merge ordering feed each other: moving a merge after its dominators
+    // can reveal a serialized backward edge to a selection header. Iterate to convergence.
+    const LOOP_STRUCTURE_REPAIR_CAP: usize = 16;
+    let mut loop_structure_converged = false;
+    for _ in 0..LOOP_STRUCTURE_REPAIR_CAP {
+        let stale_changed = cfg_repair::downgrade_stale_loop_merges(ctx, entry_idx);
+        let order_changed = cfg_repair::repair_dominator_block_order(ctx, entry_idx);
+        let loop_changed = cfg_repair::repair_unmarked_natural_loops(ctx, entry_idx);
+        debug_size(ctx, "loop-round");
+        if !stale_changed && !order_changed && !loop_changed {
+            loop_structure_converged = true;
+            break;
+        }
+    }
+    debug_assert!(
+        loop_structure_converged,
+        "loop-header/order repair did not converge within {LOOP_STRUCTURE_REPAIR_CAP} rounds"
+    );
+    cfg_repair::privatize_nondominated_construct_merges(ctx, entry_idx);
+    // Loop-header synthesis can insert a pass-through between the original preheader/backedge set
+    // and a phi block after the earlier edge fixpoint has run. Reconcile those final predecessor
+    // identities, including moving a multi-edge value merge into the new header when necessary.
+    cfg_repair::repair_phi_predecessor_edges(ctx, entry_idx);
+}
+
+/// Re-establish the same structured-CFG invariant after finish-time native module rewrites.
+///
+/// Those rewrites intentionally operate on a complete SPIR-V module and can introduce or redirect
+/// control-flow edges after the main lowering pass. Routing the result through this shared phase
+/// keeps the two layers compositional instead of requiring every native rewrite to duplicate every
+/// merge, continue, and phi repair rule.
+pub(crate) fn repair_structured_cfg_after_native_rewrites(
+    module: Module,
+    stage: Stage,
+    entry_name: Option<&str>,
+) -> Result<Module, String> {
+    let mut ctx = Ctx::with_options_and_sidecar(
+        module,
+        crate::emit_sidecar::EmitSidecar::default(),
+        stage,
+        TransformOptions::default(),
+    );
+    let entry_idx = find_entry_index(&ctx.module, entry_name)
+        .ok_or_else(|| "no entry function with a body found after native rewrites".to_string())?;
+    repair_structured_cfg(&mut ctx, entry_idx);
+    Ok(ctx.module)
+}
+
 #[cfg(test)]
 pub(crate) fn transform(
     module: Module,
@@ -1432,7 +1670,15 @@ pub(crate) fn transform_with_options(
         entry_name,
         options,
     )
-    .map(|(module, _)| module)
+    .map(|(module, mut sidecar)| {
+        // This test-only byte boundary intentionally discards the sidecar. Drop its source-layout
+        // oracle roots too so direct transform tests observe the same serialized type cleanup as a
+        // completed product translation after the late repair seam.
+        sidecar.buffer_root_source_types.clear();
+        let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, stage, options);
+        module_cleanup::gc_dead_globals(&mut ctx);
+        ctx.module
+    })
 }
 
 pub(crate) fn transform_with_options_and_sidecar(
@@ -1449,10 +1695,17 @@ pub(crate) fn transform_with_options_and_sidecar(
         return Err("kernel LocalSize dimensions must be non-zero".to_string());
     }
     let mut ctx = Ctx::with_options_and_sidecar(module, emit_sidecar, stage, options);
+    let retry_debug = crate::env_vars::retry_debug();
+    let debug_phase = |phase: &str| {
+        if retry_debug {
+            eprintln!("[retry-debug] passes: {phase}");
+        }
+    };
 
     let mut entry_idx = find_entry_index(&ctx.module, entry_name)
         .ok_or_else(|| "no entry function with a body found".to_string())?;
 
+    debug_phase("cleanup start");
     // Producer-side closure already made the entry self-contained. Preserve the former residual
     // inliner's two post-splice cleanup operations at this phase.
     compose_chained_access_chains(&mut ctx, entry_idx);
@@ -1461,9 +1714,10 @@ pub(crate) fn transform_with_options_and_sidecar(
         .ok_or_else(|| "entry vanished after helper cleanup".to_string())?;
     recover_inlined_local_pointer_fields(&mut ctx, entry_idx);
     compose_derived_access_chains(&mut ctx, entry_idx);
-    neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+    agx_cluster::lower_agx2_cluster_numbers(&mut ctx, entry_idx, &stage)?;
     neutralize_null_access_chains(&mut ctx, entry_idx);
 
+    debug_phase("interface start");
     // 1a) decoded params -> stage-input/resource vars and entry-body replacements. Preserve the
     //     original type snapshot for the immediately-following return rewrite.
     let input_defs = build_stage_input(&mut ctx, entry_idx, &stage, frag, vert, kern)?;
@@ -1479,9 +1733,24 @@ pub(crate) fn transform_with_options_and_sidecar(
     // Entry texture parameters become loaded image ids only after interface binding. Replay any
     // helper-field markers that still reference those parameters before image calls lower.
     recover_inlined_local_pointer_fields(&mut ctx, entry_idx);
+    // The replay above can reveal that a helper-local runtime table is populated by fixed elements
+    // of one descriptor array. Re-run the materializer so it can replace that table's pointer select
+    // with a descriptor-array access using the exact recorded store mapping.
+    resources::materialize_texture_array_loads(&mut ctx, entry_idx);
+    // Resource binding must get first refusal on pointer-shaped texture handles. Only after exact
+    // single-image and descriptor-array roots have been materialized may remaining private
+    // placeholders be neutralized as genuinely unmodeled memory.
+    neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
 
+    debug_phase("air lowering start");
     // 2) lower residual air.* calls inside the entry function.
     lower_air_calls(&mut ctx, entry_idx)?;
+    // AIR calls can materialize opaque handles after interface binding's earlier resource-wrapper
+    // collapse (notably `air.get_null_texture_*`). Re-establish the same aggregate invariant for
+    // those late values before any subsequent pass observes their former pointer-shaped fields.
+    resources::collapse_late_pointer_and_opaque_wrappers(&mut ctx, entry_idx)?;
+    recover_unique_local_pointer_field_loads(&mut ctx, entry_idx);
+    recover_inlined_local_dynamic_pointer_fields(&mut ctx, entry_idx)?;
     lower_private_memory_atomics(&mut ctx, entry_idx);
 
     // 2b) repair width-preserving int/float converts (illegal in SPIR-V) that arise from binding a
@@ -1493,45 +1762,19 @@ pub(crate) fn transform_with_options_and_sidecar(
     //     divergent values from guarded select expressions.
     guard_integer_division_by_zero(&mut ctx, entry_idx);
 
-    // 2d) repair structured-CFG merge placement (an OpSelectionMerge/OpLoopMerge that llc's
-    //     structurizer left mid-block, separated from its branch by a hoisted value computation).
-    cfg_repair::fix_merge_placement(&mut ctx, entry_idx);
-    cfg_repair::repair_loop_continue_pass_through_targets(&mut ctx, entry_idx);
-    cfg_repair::repair_continue_selection_merge_targets(&mut ctx, entry_idx);
-    // The external-predecessor and phi-edge repairs feed each other: fixing a loop-continue's
-    // external predecessor can leave a stale phi incoming, and rewriting a phi edge can expose a new
-    // external predecessor. This was hand-unrolled as exactly two rounds; run it as an explicit
-    // bounded fixpoint instead, asserting it settles — a case that never converges is a repair bug we
-    // want surfaced, not silently truncated. Byte-identical while two rounds sufficed (the extra
-    // convergence-confirming round makes no change); a case needing a third changing round is exactly
-    // what the assert/gates now catch. `Block` is not `PartialEq`, so compare its content directly.
-    const CONTINUE_PHI_REPAIR_CAP: usize = 8;
-    let mut converged = false;
-    for _ in 0..CONTINUE_PHI_REPAIR_CAP {
-        let before = ctx.module.functions[entry_idx].blocks.clone();
-        cfg_repair::repair_loop_continue_external_predecessors(&mut ctx, entry_idx);
-        cfg_repair::repair_phi_predecessor_edges(&mut ctx, entry_idx);
-        let after = &ctx.module.functions[entry_idx].blocks;
-        if before.len() == after.len()
-            && before
-                .iter()
-                .zip(after)
-                .all(|(a, b)| a.label == b.label && a.instructions == b.instructions)
-        {
-            converged = true;
-            break;
-        }
-    }
-    debug_assert!(
-        converged,
-        "loop-continue/phi-edge repair did not converge within {CONTINUE_PHI_REPAIR_CAP} rounds"
-    );
+    debug_phase("cfg repair start");
+    // 2d) establish the complete structured-CFG invariant. The same compositional phase is rerun
+    // after finish_module's native module rewrites, because those late rewrites can create new CFG
+    // edges and must not bypass the invariant established here.
+    repair_structured_cfg(&mut ctx, entry_idx);
 
+    debug_phase("memory lowering start");
     // 2e) narrow 64-bit access-chain INDEX operands to 32-bit. NVIDIA's SPIR-V->NVVM compiler crashes
     //     when an access-chain index is a 64-bit (`%ulong`) value (a driver-fragility class), so we
     //     value-preservingly rewrite each i64 index to a 32-bit equivalent. After this the i64 index
     //     constants/types are dead and `finalize` can drop the now-unused `OpCapability Int64`.
     narrow_access_chain_indices(&mut ctx, entry_idx);
+    expose_nullable_access_chain_bases(&mut ctx, entry_idx);
     compose_derived_access_chains(&mut ctx, entry_idx);
     rewrite_scalar_pointer_arithmetic_access_chains(&mut ctx, entry_idx);
     drop_overindexed_zero_tail(&mut ctx, entry_idx);
@@ -1541,6 +1784,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     remap_dynamic_word_index_to_array_member(&mut ctx, entry_idx);
     remap_dynamic_word_index_to_array_struct_field(&mut ctx, entry_idx);
     repair_vector_load_through_scalar_stride(&mut ctx, entry_idx);
+    repair_vector_load_through_raw_word_pointer(&mut ctx, entry_idx);
     repair_scalar_load_through_vector_ptr(&mut ctx, entry_idx);
     drop_writeonly_dead_local_array_stores(&mut ctx, entry_idx);
     lower_cross_member_subword_load(&mut ctx, entry_idx)?;
@@ -1558,7 +1802,9 @@ pub(crate) fn transform_with_options_and_sidecar(
     rewrite_byte_buffer_chained_reinterpret(&mut ctx, entry_idx)?;
     // The raw-byte replay introduces PtrAccessChain byte pointers.  Decorate their common uchar
     // base type immediately below, together with every pre-existing PtrAccessChain base.
+    rewrite_raw_byte_pointer_direct_loads(&mut ctx, entry_idx);
     rewrite_raw_byte_pointer_wide_loads(&mut ctx, entry_idx);
+    rewrite_raw_byte_pointer_wide_stores(&mut ctx, entry_idx);
     decorate_ptr_access_chain_base_strides(&mut ctx);
     // Runs AFTER the stride decoration so the byte-buffer (PtrAccessChain) widen can read the base
     // pointer's ArrayStride to prove slot contiguity.
@@ -1569,7 +1815,27 @@ pub(crate) fn transform_with_options_and_sidecar(
     remodel_workgroup_floatarray_atomic_as_uint(&mut ctx, entry_idx)?;
     lower_private_byte_aggregate_reinterpret(&mut ctx, entry_idx)?;
     retype_demoted_copymemory_placeholder(&mut ctx, entry_idx);
+    // Memory/interface rewrites above can expose a concrete pointer only after the first late
+    // wrapper pass ran. Re-close the no-pointer-carrier invariant before finalization so an exact
+    // insert/extract round trip cannot retain the aggregate field's stale opaque-pointer type.
+    resources::collapse_late_pointer_and_opaque_wrappers(&mut ctx, entry_idx)?;
+    // The newly concrete root can be a canonical raw-byte buffer block. Replay wide loads that were
+    // formerly hidden behind the stale private pointer, then decorate the PtrAccessChains introduced
+    // by that replay just as in the primary raw-memory phase above.
+    rewrite_exact_raw_byte_block_loads(&mut ctx, entry_idx);
+    rewrite_raw_byte_pointer_wide_loads(&mut ctx, entry_idx);
+    repair_load_through_array_pointer(&mut ctx, entry_idx);
+    rewrite_flat_scalar_ptr_access_through_vector_array(&mut ctx, entry_idx);
+    rewrite_exact_raw_word_loads(&mut ctx, entry_idx);
+    rewrite_affine_raw_word_loads(&mut ctx, entry_idx);
+    drop_dead_invalid_access_chains(&mut ctx, entry_idx);
+    decorate_ptr_access_chain_base_strides(&mut ctx);
+    // Late raw-memory rewrites can introduce new access chains rooted in the same unnamed,
+    // null-initialized Private placeholders that represent absent optional resources. Reapply the
+    // structural placeholder closure after every pointer-producing memory pass has run.
+    neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
 
+    debug_phase("integer lowering start");
     // 2h) width-normalize integer arithmetic operands. A value widened to `ulong` for a StorageBuffer
     //     access-chain index that is then reused in a 32-bit offset multiply leaves an `OpIMul %uint`
     //     with a `ulong` operand, which spirv-val rejects. This inserts a truncating `OpUConvert` for
@@ -1582,6 +1848,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     //     modular result as the original `ulong` arithmetic and is structural over integer width.
     lower_scalar_i64_arithmetic_to_u32_halves(&mut ctx);
 
+    debug_phase("workgroup/finalize start");
     // 2g) deterministic threadgroup memory: zero-fill every Workgroup variable at kernel entry
     //     (stores of OpConstantNull + one control barrier), the candidate half of the harness's
     //     defined refinement of Metal's undefined threadgroup contents. Kernel-only: Workgroup
@@ -1598,10 +1865,11 @@ pub(crate) fn transform_with_options_and_sidecar(
     resources::sink_loop_header_texture_array_loads(&mut ctx, entry_idx);
     // 3) finalize: append synthesized globals, drop dead air.* decls, add entry point + exec modes,
     //    bump the bound.
-    finalize(&mut ctx, entry_idx, &stage)?;
+    finalize(&mut ctx, entry_idx, &stage, vert)?;
     // Run on the complete type graph: retained helper functions can carry a Workgroup aggregate
     // stride that entry-focused lowering could not see until all synthesized globals were appended.
     split_workgroup_ptr_access_chain_descent(&mut ctx, entry_idx);
+    debug_phase("complete");
 
     Ok((ctx.module, ctx.emit_sidecar))
 }

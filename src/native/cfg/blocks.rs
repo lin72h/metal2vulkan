@@ -1,9 +1,7 @@
 use super::super::ir::{LlFunction, LlType, LlValue};
 use super::super::parse::{strip_comment, LlSwitch};
-use super::graph::{
-    reachable_before_target, reachable_from, reachable_from_without_revisiting, Cfg,
-};
-use super::loopforest::analyze;
+use super::graph::{reachable_from, Cfg};
+use super::loopforest::{analyze, post_idom};
 use super::{BlockRole, BodyBlock, LoopMergeInfo};
 use std::collections::{HashMap, HashSet};
 
@@ -35,7 +33,8 @@ pub(in crate::native) fn split_body_blocks(
         if let Some(label) = trimmed.strip_suffix(':') {
             if !cur_lines.is_empty() || !blocks.is_empty() {
                 let typed =
-                    crate::native::tir::lower_block_carrier(&cur_name, &cur_lines, named_types);
+                    crate::native::tir::lower_block_carrier(&cur_name, &cur_lines, named_types)
+                        .map(Into::into);
                 blocks.push(BodyBlock {
                     name: cur_name,
                     role: BlockRole::Normal,
@@ -48,7 +47,8 @@ pub(in crate::native) fn split_body_blocks(
             cur_lines.push(line.clone());
         }
     }
-    let typed = crate::native::tir::lower_block_carrier(&cur_name, &cur_lines, named_types);
+    let typed =
+        crate::native::tir::lower_block_carrier(&cur_name, &cur_lines, named_types).map(Into::into);
     blocks.push(BodyBlock {
         name: cur_name,
         role: BlockRole::Normal,
@@ -69,7 +69,8 @@ pub(in crate::native) fn synthetic_block(
     lines: Vec<String>,
     role: BlockRole,
 ) -> BodyBlock {
-    let typed = crate::native::tir::lower_block_carrier(&name, &lines, &HashMap::new());
+    let typed =
+        crate::native::tir::lower_block_carrier(&name, &lines, &HashMap::new()).map(Into::into);
     BodyBlock { name, role, typed }
 }
 
@@ -85,6 +86,117 @@ pub(in crate::native) fn implicit_entry_block_name(f: &LlFunction) -> String {
     format!("%{next_numeric}")
 }
 
+/// Index-based reachability scratch for branch-merge inference. Boolean vectors avoid cloning block
+/// names into thousands of short-lived hash sets and keep repeated graph walks allocator-stable.
+struct IndexedReachability {
+    index: HashMap<String, usize>,
+    names: Vec<String>,
+    successors: Vec<Vec<usize>>,
+    unreachable: Vec<bool>,
+}
+
+impl IndexedReachability {
+    fn new(blocks: &[BodyBlock], successors: &HashMap<String, Vec<String>>) -> Self {
+        let names = blocks.iter().map(|block| block.name.clone()).collect();
+        let index = blocks
+            .iter()
+            .enumerate()
+            .map(|(idx, block)| (block.name.clone(), idx))
+            .collect::<HashMap<_, _>>();
+        let successors = blocks
+            .iter()
+            .map(|block| {
+                successors
+                    .get(&block.name)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|successor| index.get(successor).copied())
+                    .collect()
+            })
+            .collect();
+        let unreachable = blocks
+            .iter()
+            .map(|block| {
+                block.typed.as_ref().is_some_and(|carrier| {
+                    matches!(
+                        carrier.terminator,
+                        crate::native::tir::TirTerminator::Unreachable
+                    )
+                })
+            })
+            .collect();
+        Self {
+            index,
+            names,
+            successors,
+            unreachable,
+        }
+    }
+
+    fn reachable(&self, start: &str, excluded: Option<&str>) -> Vec<bool> {
+        let mut seen = vec![false; self.successors.len()];
+        let Some(&start) = self.index.get(start) else {
+            return seen;
+        };
+        let excluded = excluded.and_then(|name| self.index.get(name).copied());
+        let mut pending = vec![start];
+        while let Some(node) = pending.pop() {
+            if Some(node) == excluded || seen[node] {
+                continue;
+            }
+            seen[node] = true;
+            pending.extend(self.successors[node].iter().copied());
+        }
+        seen
+    }
+
+    fn contains(&self, reachable: &[bool], name: &str) -> bool {
+        self.index
+            .get(name)
+            .is_some_and(|index| reachable.get(*index) == Some(&true))
+    }
+
+    fn all_paths_reach(&self, start: &str, target: &str, allow_unreachable: bool) -> bool {
+        let (Some(&start), Some(&target)) = (self.index.get(start), self.index.get(target)) else {
+            return false;
+        };
+        fn walk(
+            graph: &IndexedReachability,
+            node: usize,
+            target: usize,
+            allow_unreachable: bool,
+            visiting: &mut [bool],
+            memo: &mut [Option<bool>],
+        ) -> bool {
+            if node == target || (allow_unreachable && graph.unreachable[node]) {
+                return true;
+            }
+            if let Some(cached) = memo[node] {
+                return cached;
+            }
+            if visiting[node] {
+                return true;
+            }
+            visiting[node] = true;
+            let ok = !graph.successors[node].is_empty()
+                && graph.successors[node].iter().copied().all(|successor| {
+                    walk(graph, successor, target, allow_unreachable, visiting, memo)
+                });
+            visiting[node] = false;
+            memo[node] = Some(ok);
+            ok
+        }
+        walk(
+            self,
+            start,
+            target,
+            allow_unreachable,
+            &mut vec![false; self.successors.len()],
+            &mut vec![None; self.successors.len()],
+        )
+    }
+}
+
 pub(in crate::native) fn infer_branch_merges(
     blocks: &[BodyBlock],
 ) -> HashMap<(String, String), String> {
@@ -93,10 +205,10 @@ pub(in crate::native) fn infer_branch_merges(
         .iter()
         .map(|b| (b.name.clone(), block_successors(b)))
         .collect();
+    let reachability = IndexedReachability::new(blocks, &successors);
     let switch_merges = infer_switch_merges(blocks);
     let loop_merges = infer_loop_merges(blocks);
     let mut merges = HashMap::new();
-    let mut reachable_cache: HashMap<String, HashSet<String>> = HashMap::new();
     loop {
         let mut changed = false;
         for block in blocks {
@@ -123,12 +235,13 @@ pub(in crate::native) fn infer_branch_merges(
                 &switch_merges,
                 &loop_merges,
             );
-            let true_reaches_false =
-                cached_reachable_from(&true_label, &successors, &mut reachable_cache)
-                    .contains(&false_label);
-            let false_reaches_true =
-                cached_reachable_from(&false_label, &successors, &mut reachable_cache)
-                    .contains(&true_label);
+            // Keep reachability scratch bounded to this header. Caching the transitive closure for
+            // every arm is O(V²) memory and made generated thousand-block functions exceed the
+            // translation budget; two graph walks perform the same queries in O(V + E) live space.
+            let true_reachable = reachability.reachable(&true_label, None);
+            let false_reachable = reachability.reachable(&false_label, None);
+            let true_reaches_false = reachability.contains(&true_reachable, &false_label);
+            let false_reaches_true = reachability.contains(&false_reachable, &true_label);
             let is_loop_continue =
                 is_loop_continue_branch(&block.name, &true_label, &false_label, &loop_merges);
             let merge = match (true_exit, false_exit) {
@@ -137,13 +250,13 @@ pub(in crate::native) fn infer_branch_merges(
                 (_, Some(b)) if b == true_label => Some(b),
                 (Some(a), _)
                     if false_merge.as_ref() == Some(&a)
-                        && all_paths_reach_target(&false_label, &a, &successors) =>
+                        && reachability.all_paths_reach(&false_label, &a, false) =>
                 {
                     Some(a)
                 }
                 (_, Some(b))
                     if true_merge.as_ref() == Some(&b)
-                        && all_paths_reach_target(&true_label, &b, &successors) =>
+                        && reachability.all_paths_reach(&true_label, &b, false) =>
                 {
                     Some(b)
                 }
@@ -155,8 +268,8 @@ pub(in crate::native) fn infer_branch_merges(
                         &by_name,
                     )
                     .is_some_and(|candidate| {
-                        all_paths_reach_target(&true_label, &candidate, &successors)
-                            && all_paths_reach_target(&false_label, &candidate, &successors)
+                        reachability.all_paths_reach(&true_label, &candidate, false)
+                            && reachability.all_paths_reach(&false_label, &candidate, false)
                     }) =>
                 {
                     conditional_merge_through_shared_body(&true_label, &false_label, &by_name)
@@ -169,8 +282,8 @@ pub(in crate::native) fn infer_branch_merges(
                         &by_name,
                     )
                     .is_some_and(|candidate| {
-                        all_paths_reach_target(&true_label, &candidate, &successors)
-                            && all_paths_reach_target(&false_label, &candidate, &successors)
+                        reachability.all_paths_reach(&true_label, &candidate, false)
+                            && reachability.all_paths_reach(&false_label, &candidate, false)
                     }) =>
                 {
                     conditional_merge_through_shared_body(&false_label, &true_label, &by_name)
@@ -178,8 +291,8 @@ pub(in crate::native) fn infer_branch_merges(
                 _ if true_merge.as_ref().zip(false_merge.as_ref()).is_some_and(
                     |(true_merge, false_merge)| {
                         true_merge == false_merge
-                            && all_paths_reach_target(&true_label, true_merge, &successors)
-                            && all_paths_reach_target(&false_label, true_merge, &successors)
+                            && reachability.all_paths_reach(&true_label, true_merge, false)
+                            && reachability.all_paths_reach(&false_label, true_merge, false)
                     },
                 ) =>
                 {
@@ -188,14 +301,14 @@ pub(in crate::native) fn infer_branch_merges(
                 _ if false_reaches_true
                     && !true_reaches_false
                     && !is_loop_continue
-                    && all_paths_reach_target(&false_label, &true_label, &successors) =>
+                    && reachability.all_paths_reach(&false_label, &true_label, false) =>
                 {
                     Some(true_label.clone())
                 }
                 _ if true_reaches_false
                     && !false_reaches_true
                     && !is_loop_continue
-                    && all_paths_reach_target(&true_label, &false_label, &successors) =>
+                    && reachability.all_paths_reach(&true_label, &false_label, false) =>
                 {
                     Some(false_label.clone())
                 }
@@ -209,17 +322,15 @@ pub(in crate::native) fn infer_branch_merges(
                     &block.name,
                     &true_label,
                     blocks,
-                    &successors,
-                    &by_name,
-                    &mut reachable_cache,
+                    &reachability,
+                    &true_reachable,
                 ),
                 _ if block_is_unreachable(&true_label, &by_name) => reachable_merge_after_header(
                     &block.name,
                     &false_label,
                     blocks,
-                    &successors,
-                    &by_name,
-                    &mut reachable_cache,
+                    &reachability,
+                    &false_reachable,
                 ),
                 _ if loop_merges.get(&true_label).is_some_and(|info| {
                     info.merge == false_label && info.continue_target != block.name
@@ -252,8 +363,9 @@ pub(in crate::native) fn infer_branch_merges(
                     &true_label,
                     &false_label,
                     blocks,
-                    &successors,
-                    &by_name,
+                    &reachability,
+                    &true_reachable,
+                    &false_reachable,
                 ),
                 _ => None,
             };
@@ -269,6 +381,7 @@ pub(in crate::native) fn infer_branch_merges(
                         &false_label,
                         &merge,
                         &successors,
+                        &reachability,
                         &by_name,
                     )
                 {
@@ -281,6 +394,7 @@ pub(in crate::native) fn infer_branch_merges(
                         &false_label,
                         &merge,
                         &successors,
+                        &reachability,
                         &by_name,
                     )
                 {
@@ -342,29 +456,39 @@ fn common_reachable_merge_after_header(
     true_label: &str,
     false_label: &str,
     blocks: &[BodyBlock],
-    successors: &HashMap<String, Vec<String>>,
-    by_name: &HashMap<String, &BodyBlock>,
+    reachability: &IndexedReachability,
+    true_reachable: &[bool],
+    false_reachable: &[bool],
 ) -> Option<String> {
     let start = blocks
         .iter()
         .position(|block| block.name == header)
         .map(|idx| idx + 1)?;
-    let true_reachable = reachable_from_without_revisiting(true_label, header, successors);
-    let false_reachable = reachable_from_without_revisiting(false_label, header, successors);
+    // Exclude a back-edge through the header from the candidate proof, matching the old bounded
+    // traversal. If either arm can revisit the header, derive the exact no-revisit set locally.
+    let true_without_header;
+    let false_without_header;
+    let true_reachable = if reachability.contains(true_reachable, header) {
+        true_without_header = reachability.reachable(true_label, Some(header));
+        &true_without_header
+    } else {
+        true_reachable
+    };
+    let false_reachable = if reachability.contains(false_reachable, header) {
+        false_without_header = reachability.reachable(false_label, Some(header));
+        &false_without_header
+    } else {
+        false_reachable
+    };
     blocks
         .iter()
         .skip(start)
         .map(|block| &block.name)
         .find(|candidate| {
-            true_reachable.contains(*candidate)
-                && false_reachable.contains(*candidate)
-                && all_paths_reach_target_or_unreachable(true_label, candidate, successors, by_name)
-                && all_paths_reach_target_or_unreachable(
-                    false_label,
-                    candidate,
-                    successors,
-                    by_name,
-                )
+            reachability.contains(true_reachable, candidate)
+                && reachability.contains(false_reachable, candidate)
+                && reachability.all_paths_reach(true_label, candidate, true)
+                && reachability.all_paths_reach(false_label, candidate, true)
         })
         .cloned()
 }
@@ -373,35 +497,22 @@ fn reachable_merge_after_header(
     header: &str,
     label: &str,
     blocks: &[BodyBlock],
-    successors: &HashMap<String, Vec<String>>,
-    by_name: &HashMap<String, &BodyBlock>,
-    reachable_cache: &mut HashMap<String, HashSet<String>>,
+    reachability: &IndexedReachability,
+    reachable: &[bool],
 ) -> Option<String> {
     let start = blocks
         .iter()
         .position(|block| block.name == header)
         .map(|idx| idx + 1)?;
-    let reachable = cached_reachable_from(label, successors, reachable_cache);
     blocks
         .iter()
         .skip(start)
         .map(|block| &block.name)
         .find(|candidate| {
-            reachable.contains(*candidate)
-                && all_paths_reach_target_or_unreachable(label, candidate, successors, by_name)
+            reachability.contains(reachable, candidate)
+                && reachability.all_paths_reach(label, candidate, true)
         })
         .cloned()
-}
-
-fn cached_reachable_from<'a>(
-    label: &str,
-    successors: &HashMap<String, Vec<String>>,
-    cache: &'a mut HashMap<String, HashSet<String>>,
-) -> &'a HashSet<String> {
-    if !cache.contains_key(label) {
-        cache.insert(label.to_string(), reachable_from(label, successors));
-    }
-    cache.get(label).unwrap()
 }
 
 fn all_paths_reach_target(
@@ -446,54 +557,6 @@ fn all_paths_reach_target(
     )
 }
 
-fn all_paths_reach_target_or_unreachable(
-    start: &str,
-    target: &str,
-    successors: &HashMap<String, Vec<String>>,
-    by_name: &HashMap<String, &BodyBlock>,
-) -> bool {
-    fn walk(
-        node: &str,
-        target: &str,
-        successors: &HashMap<String, Vec<String>>,
-        by_name: &HashMap<String, &BodyBlock>,
-        visiting: &mut HashSet<String>,
-        memo: &mut HashMap<String, bool>,
-    ) -> bool {
-        if node == target {
-            return true;
-        }
-        if block_is_unreachable(node, by_name) {
-            return true;
-        }
-        if let Some(&cached) = memo.get(node) {
-            return cached;
-        }
-        if !visiting.insert(node.to_string()) {
-            return true;
-        }
-        let ok = successors
-            .get(node)
-            .filter(|next| !next.is_empty())
-            .is_some_and(|next| {
-                next.iter()
-                    .all(|succ| walk(succ, target, successors, by_name, visiting, memo))
-            });
-        visiting.remove(node);
-        memo.insert(node.to_string(), ok);
-        ok
-    }
-
-    walk(
-        start,
-        target,
-        successors,
-        by_name,
-        &mut HashSet::new(),
-        &mut HashMap::new(),
-    )
-}
-
 fn block_is_unreachable(label: &str, by_name: &HashMap<String, &BodyBlock>) -> bool {
     // Read the block's structured terminator from its carrier (the sole substrate). A block with no
     // carrier lowered no terminator, so it cannot be `unreachable` (which IS a terminator) → false.
@@ -513,9 +576,10 @@ fn has_unrepairable_external_predecessor_to_branch_body(
     false_label: &str,
     merge: &str,
     successors: &HashMap<String, Vec<String>>,
+    reachability: &IndexedReachability,
     by_name: &HashMap<String, &BodyBlock>,
 ) -> bool {
-    let reachable = reachable_from(header, successors);
+    let reachable = reachability.reachable(header, None);
     [true_label, false_label]
         .into_iter()
         .filter(|target| **target != *merge)
@@ -524,12 +588,18 @@ fn has_unrepairable_external_predecessor_to_branch_body(
                 pred != header
                     && pred != true_label
                     && pred != false_label
-                    && !reachable.contains(pred)
+                    && !reachability.contains(&reachable, pred)
                     && targets.iter().any(|target| target == body)
             });
             has_external_pred
                 && !external_entry_is_repairable_selection_target(
-                    body, header, merge, &reachable, successors, by_name,
+                    body,
+                    header,
+                    merge,
+                    &reachable,
+                    reachability,
+                    successors,
+                    by_name,
                 )
         })
 }
@@ -540,28 +610,32 @@ fn branch_merge_path_has_unrepairable_external_entry(
     false_label: &str,
     merge: &str,
     successors: &HashMap<String, Vec<String>>,
+    reachability: &IndexedReachability,
     by_name: &HashMap<String, &BodyBlock>,
 ) -> bool {
-    let header_reachable = reachable_from(header, successors);
-    let mut reachable_to_merge = HashSet::new();
-    reachable_to_merge.extend(reachable_before_target(true_label, merge, successors));
-    reachable_to_merge.extend(reachable_before_target(false_label, merge, successors));
-    reachable_to_merge.remove(header);
-    reachable_to_merge.remove(merge);
+    let header_reachable = reachability.reachable(header, None);
+    let true_to_merge = reachability.reachable(true_label, Some(merge));
+    let false_to_merge = reachability.reachable(false_label, Some(merge));
 
-    reachable_to_merge.into_iter().any(|node| {
-        if !reachable_from(&node, successors).contains(merge) {
+    reachability.names.iter().enumerate().any(|(index, node)| {
+        if node == header
+            || node == merge
+            || (!true_to_merge[index] && !false_to_merge[index])
+            || !reachability.contains(&reachability.reachable(node, None), merge)
+        {
             return false;
         }
         let has_external_pred = successors.iter().any(|(pred, targets)| {
-            !header_reachable.contains(pred) && targets.iter().any(|target| target == &node)
+            !reachability.contains(&header_reachable, pred)
+                && targets.iter().any(|target| target == node)
         });
         has_external_pred
             && !external_entry_is_repairable_selection_target(
-                &node,
+                node,
                 header,
                 merge,
                 &header_reachable,
+                reachability,
                 successors,
                 by_name,
             )
@@ -572,7 +646,8 @@ fn external_entry_is_repairable_selection_target(
     node: &str,
     header: &str,
     merge: &str,
-    header_reachable: &HashSet<String>,
+    header_reachable: &[bool],
+    reachability: &IndexedReachability,
     successors: &HashMap<String, Vec<String>>,
     by_name: &HashMap<String, &BodyBlock>,
 ) -> bool {
@@ -583,7 +658,13 @@ fn external_entry_is_repairable_selection_target(
         return false;
     }
     std::iter::once(header)
-        .chain(header_reachable.iter().map(String::as_str))
+        .chain(
+            reachability
+                .names
+                .iter()
+                .filter(|name| reachability.contains(header_reachable, name))
+                .map(String::as_str),
+        )
         .filter_map(|pred| successors.get(pred).map(|targets| (pred, targets)))
         .any(|(pred, targets)| {
             pred != node && targets.len() == 2 && targets.iter().any(|target| target == node)
@@ -815,6 +896,539 @@ pub(in crate::native) fn infer_switch_merges(blocks: &[BodyBlock]) -> HashMap<St
     merges
 }
 
+/// Infer only switches whose live targets are the merge itself or branch directly to one common
+/// merge. This linear-time subset is used when a rejected function is too large for the complete
+/// structured planner and the transitive-closure switch heuristic. It never guesses through an
+/// intermediate region: every accepted arm provides a local edge proof.
+pub(in crate::native) fn infer_direct_switch_merges(
+    blocks: &[BodyBlock],
+) -> HashMap<String, String> {
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.clone(), block))
+        .collect::<HashMap<_, _>>();
+    let order = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut merges = HashMap::new();
+    for block in blocks {
+        let Some(targets) = switch_targets(block) else {
+            continue;
+        };
+        let live_targets = targets
+            .into_iter()
+            .filter(|target| !block_is_unreachable(target, &by_name))
+            .collect::<Vec<_>>();
+        let Some(first) = live_targets.first() else {
+            continue;
+        };
+        let mut candidates = Vec::with_capacity(2);
+        if let Some(target) = unconditional_branch_target(by_name.get(first).copied()) {
+            candidates.push(target);
+        }
+        candidates.push(first.clone());
+        candidates.dedup();
+        let Some(header_order) = order.get(block.name.as_str()) else {
+            continue;
+        };
+        let merge = candidates.into_iter().find(|candidate| {
+            order
+                .get(candidate.as_str())
+                .is_some_and(|candidate_order| candidate_order > header_order)
+                && live_targets.iter().all(|target| {
+                    target == candidate
+                        || unconditional_branch_target(by_name.get(target).copied()).as_ref()
+                            == Some(candidate)
+                })
+        });
+        if let Some(merge) = merge {
+            merges.insert(block.name.clone(), merge);
+        }
+    }
+    merges
+}
+
+/// Linear-time direct-reconvergence subset for conditional branches in oversized rejected CFGs.
+/// A merge is accepted only when each arm is the merge or branches to it immediately.
+pub(in crate::native) fn infer_direct_branch_merges(
+    blocks: &[BodyBlock],
+) -> HashMap<(String, String), String> {
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.clone(), block))
+        .collect::<HashMap<_, _>>();
+    let order = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut merges = HashMap::new();
+    for block in blocks {
+        let Some((on_true, on_false)) = conditional_branch_targets(block) else {
+            continue;
+        };
+        let Some(header_order) = order.get(block.name.as_str()) else {
+            continue;
+        };
+        let mut candidates = Vec::with_capacity(4);
+        for arm in [&on_true, &on_false] {
+            if let Some(target) = unconditional_branch_target(by_name.get(arm).copied()) {
+                candidates.push(target);
+            }
+            candidates.push(arm.clone());
+        }
+        candidates.dedup();
+        let merge = candidates.into_iter().find(|candidate| {
+            order
+                .get(candidate.as_str())
+                .is_some_and(|candidate_order| candidate_order > header_order)
+                && [&on_true, &on_false].into_iter().all(|arm| {
+                    block_is_unreachable(arm, &by_name)
+                        || arm == candidate
+                        || unconditional_branch_target(by_name.get(arm).copied()).as_ref()
+                            == Some(candidate)
+                })
+        });
+        if let Some(merge) = merge {
+            merges.insert((on_true, on_false), merge);
+        }
+    }
+    merges
+}
+
+/// Infer conditional merges for an oversized rejected CFG with bounded graph storage. Direct local
+/// reconvergence handles terminal-arm shapes that ordinary post-dominance cannot represent; the CHK
+/// immediate-post-dominator tree then covers larger diamonds without building one reachability set
+/// per branch. Loop headers are excluded because their conditional owns `OpLoopMerge`, not
+/// `OpSelectionMerge`.
+pub(in crate::native) fn infer_bounded_branch_merges_by_header(
+    blocks: &[BodyBlock],
+) -> HashMap<String, String> {
+    let direct = infer_direct_branch_merges(blocks);
+    let Some(cfg) = Cfg::from_blocks(blocks) else {
+        return HashMap::new();
+    };
+    let dominators = cfg.dominators();
+    let post_dominators = post_idom(blocks);
+    let order = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut merges = HashMap::new();
+
+    for block in blocks {
+        let Some((on_true, on_false)) = conditional_branch_targets(block) else {
+            continue;
+        };
+        if let Some(merge) = direct.get(&(on_true, on_false)) {
+            merges.insert(block.name.clone(), merge.clone());
+            continue;
+        }
+        let is_loop_header = cfg
+            .predecessors
+            .get(&block.name)
+            .into_iter()
+            .flatten()
+            .any(|predecessor| dominators.dominates(&block.name, predecessor));
+        if is_loop_header {
+            continue;
+        }
+        let Some(merge) = post_dominators.get(&block.name) else {
+            continue;
+        };
+        let ordered_after_header = order
+            .get(block.name.as_str())
+            .zip(order.get(merge.as_str()))
+            .is_some_and(|(header, merge)| merge > header);
+        if ordered_after_header {
+            merges.insert(block.name.clone(), merge.clone());
+        }
+    }
+    merges
+}
+
+/// Funnel the common two-way dispatch reached from both arms of an outer branch through one predicate
+/// phi. The source shape
+/// `H -> {A,B}; A -> {T,F}; B -> {T,F}` is irreducible as nested SPIR-V selections because `T` and
+/// `F` are entered from sibling constructs. Rewriting it to
+/// `H -> {A,B}; A/B -> J; J -> {T,F}` preserves the chosen predicate and gives both selections one
+/// entry. Destination phis are funneled through matching value phis in `J`.
+pub(in crate::native) fn funnel_shared_branch_dispatches(blocks: &[BodyBlock]) -> Vec<BodyBlock> {
+    let mut current = blocks.to_vec();
+    let mut counter = 0usize;
+    // Each successful round turns both candidate arm terminators into unconditional branches, so
+    // that source header can never match again. One round per original block is therefore a hard
+    // convergence bound rather than an arbitrary workload-sized cap.
+    for _ in 0..blocks.len() {
+        let Some(next) = funnel_one_shared_branch_dispatch(&current, &mut counter) else {
+            break;
+        };
+        current = next;
+    }
+    current
+}
+
+fn funnel_one_shared_branch_dispatch(
+    blocks: &[BodyBlock],
+    counter: &mut usize,
+) -> Option<Vec<BodyBlock>> {
+    let cfg = Cfg::from_blocks(blocks)?;
+    let by_name = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let names = by_name.keys().copied().collect::<HashSet<_>>();
+
+    'header: for header in blocks {
+        let Some((left, right)) = conditional_branch_targets(header) else {
+            continue;
+        };
+        if left == right {
+            continue;
+        }
+        let (Some(&left_index), Some(&right_index)) =
+            (by_name.get(left.as_str()), by_name.get(right.as_str()))
+        else {
+            continue;
+        };
+        let private_arm = |arm: &str| {
+            cfg.predecessors
+                .get(arm)
+                .is_some_and(|preds| preds.len() == 1 && preds[0] == header.name)
+        };
+        if !private_arm(&left) || !private_arm(&right) {
+            continue;
+        }
+        let Some(left_typed) = blocks[left_index].typed.as_deref() else {
+            continue;
+        };
+        let Some(right_typed) = blocks[right_index].typed.as_deref() else {
+            continue;
+        };
+        let crate::native::tir::TirTerminator::BrCond {
+            cond: left_cond,
+            t: left_true,
+            f: left_false,
+        } = &left_typed.terminator
+        else {
+            continue;
+        };
+        let crate::native::tir::TirTerminator::BrCond {
+            cond: right_cond,
+            t: right_true,
+            f: right_false,
+        } = &right_typed.terminator
+        else {
+            continue;
+        };
+        if left_true != right_true
+            || left_false != right_false
+            || left_true == left_false
+            || !names.contains(left_true.as_str())
+            || !names.contains(left_false.as_str())
+        {
+            continue;
+        }
+        let insertion = left_index.max(right_index) + 1;
+        if [left_true, left_false].into_iter().any(|target| {
+            by_name
+                .get(target.as_str())
+                .is_none_or(|target_index| *target_index < insertion)
+        }) {
+            continue;
+        }
+
+        let mut join_name = format!("%metal2vulkan.branch_funnel.{}", *counter);
+        while names.contains(join_name.as_str()) {
+            *counter += 1;
+            join_name = format!("%metal2vulkan.branch_funnel.{}", *counter);
+        }
+        *counter += 1;
+        let predicate = format!("{join_name}.predicate");
+        let join_lines = vec![
+            format!("{predicate} = phi i1 [ {left_cond}, {left} ], [ {right_cond}, {right} ]"),
+            format!("br i1 {predicate}, label {left_true}, label {left_false}"),
+        ];
+        let Some(join_typed) =
+            crate::native::tir::lower_block_carrier(&join_name, &join_lines, &HashMap::new())
+        else {
+            continue;
+        };
+
+        // Every destination phi must carry both soon-to-be-funnelled predecessors. The late CFG
+        // repair could diagnose a malformed source, but this semantic transform declines it instead.
+        let mut target_rewrites = Vec::new();
+        let mut join_typed = join_typed;
+        let mut join_phi_index = 0usize;
+        for target in [left_true, left_false] {
+            let target_index = *by_name.get(target.as_str())?;
+            let Some(target_typed) = blocks[target_index].typed.as_deref() else {
+                continue 'header;
+            };
+            let mut rewrites = Vec::new();
+            for inst in &target_typed.insts {
+                let Some((ty, incoming)) = &inst.phi_incoming else {
+                    continue;
+                };
+                let from_left = incoming
+                    .iter()
+                    .filter(|(_, pred)| pred == &left)
+                    .collect::<Vec<_>>();
+                let from_right = incoming
+                    .iter()
+                    .filter(|(_, pred)| pred == &right)
+                    .collect::<Vec<_>>();
+                if from_left.is_empty() && from_right.is_empty() {
+                    continue;
+                }
+                if from_left.len() != 1 || from_right.len() != 1 {
+                    continue 'header;
+                }
+                let result = inst.result.as_ref()?;
+                let phi_name = format!("{join_name}.phi.{join_phi_index}");
+                join_phi_index += 1;
+                join_typed.push_value_phi(
+                    &phi_name,
+                    ty,
+                    &[
+                        (from_left[0].0.clone(), left.clone()),
+                        (from_right[0].0.clone(), right.clone()),
+                    ],
+                );
+                let mut replacement = Vec::with_capacity(incoming.len() - 1);
+                let mut inserted = false;
+                for (value, pred) in incoming {
+                    if pred == &left || pred == &right {
+                        if !inserted {
+                            replacement.push((LlValue::Local(phi_name.clone()), join_name.clone()));
+                            inserted = true;
+                        }
+                    } else {
+                        replacement.push((value.clone(), pred.clone()));
+                    }
+                }
+                rewrites.push((result.clone(), replacement));
+            }
+            target_rewrites.push((target_index, rewrites));
+        }
+
+        let mut out = blocks.to_vec();
+        for arm_index in [left_index, right_index] {
+            let typed = std::sync::Arc::make_mut(out[arm_index].typed.as_mut()?);
+            typed.set_unconditional_branch(&join_name);
+        }
+        for (target_index, rewrites) in target_rewrites {
+            let typed = std::sync::Arc::make_mut(out[target_index].typed.as_mut()?);
+            for (result, incoming) in rewrites {
+                typed.set_phi_incomings(&result, &incoming);
+            }
+        }
+        out.insert(
+            insertion,
+            BodyBlock {
+                name: join_name,
+                role: BlockRole::Normal,
+                typed: Some(join_typed.into()),
+            },
+        );
+        if crate::env_vars::retry_debug() {
+            eprintln!(
+                "[retry-debug] funnel shared dispatch: header={} arms=({}, {}) targets=({}, {})",
+                header.name, left, right, left_true, left_false
+            );
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// Refunnel a deep short-circuit arm shared with its enclosing selection. For header `H`, immediate
+/// arm `S`, and post-dominator `M`, every entry into `S` from the construct and every construct path
+/// that bypasses `S` into `M` is redirected through `J`; `J` phis the route bit and branches to
+/// `{S,M}`. This removes the cross-arm entry without cloning the (potentially very large) `S` region.
+pub(in crate::native) fn refunnel_one_deep_shared_arm(
+    blocks: &[BodyBlock],
+    counter: &mut usize,
+) -> Option<Vec<BodyBlock>> {
+    let cfg = Cfg::from_blocks(blocks)?;
+    let dominators = cfg.dominators();
+    let post_dominators = post_idom(blocks);
+    let by_name = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let names = by_name.keys().copied().collect::<HashSet<_>>();
+
+    'header: for header in blocks {
+        let Some((on_true, on_false)) = conditional_branch_targets(header) else {
+            continue;
+        };
+        let Some(merge) = post_dominators.get(&header.name) else {
+            continue;
+        };
+        if cfg
+            .predecessors
+            .get(&header.name)
+            .into_iter()
+            .flatten()
+            .any(|pred| dominators.dominates(&header.name, pred))
+        {
+            continue;
+        }
+        for shared in [&on_true, &on_false] {
+            if shared == merge {
+                continue;
+            }
+            let candidate_entries = cfg
+                .predecessors
+                .get(shared)
+                .into_iter()
+                .flatten()
+                .filter(|pred| dominators.dominates(&header.name, pred))
+                .cloned()
+                .collect::<Vec<_>>();
+            if candidate_entries.len() < 2
+                || !candidate_entries.iter().any(|pred| pred == &header.name)
+            {
+                continue;
+            }
+            let shared_reachable = cfg.reachable_from(shared);
+            let shared_entries = candidate_entries
+                .into_iter()
+                .filter(|pred| !shared_reachable.contains(pred.as_str()))
+                .collect::<Vec<_>>();
+            if shared_entries.len() < 2 || !shared_entries.iter().any(|pred| pred == &header.name) {
+                continue;
+            }
+            let bypass_entries = cfg
+                .predecessors
+                .get(merge)
+                .into_iter()
+                .flatten()
+                .filter(|pred| {
+                    dominators.dominates(&header.name, pred)
+                        && !shared_reachable.contains(pred.as_str())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if bypass_entries.is_empty() {
+                continue;
+            }
+            let mut all_entries = shared_entries
+                .iter()
+                .map(|pred| (pred.clone(), true))
+                .chain(bypass_entries.iter().map(|pred| (pred.clone(), false)))
+                .collect::<Vec<_>>();
+            all_entries.sort_by_key(|(pred, _)| by_name.get(pred.as_str()).copied());
+            all_entries.dedup_by(|left, right| left.0 == right.0);
+
+            let mut join_name = format!("%metal2vulkan.branch_refunnel.{}", *counter);
+            while names.contains(join_name.as_str()) {
+                *counter += 1;
+                join_name = format!("%metal2vulkan.branch_refunnel.{}", *counter);
+            }
+            *counter += 1;
+            let route = format!("{join_name}.route");
+            let incoming_text = all_entries
+                .iter()
+                .map(|(pred, takes_shared)| format!("[ {takes_shared}, {pred} ]"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let join_lines = vec![
+                format!("{route} = phi i1 {incoming_text}"),
+                format!("br i1 {route}, label {shared}, label {merge}"),
+            ];
+            let Some(mut join_typed) =
+                crate::native::tir::lower_block_carrier(&join_name, &join_lines, &HashMap::new())
+            else {
+                continue;
+            };
+
+            let mut target_rewrites = Vec::new();
+            let mut join_phi_index = 0usize;
+            for (target, entries) in [
+                (shared.as_str(), shared_entries.as_slice()),
+                (merge.as_str(), bypass_entries.as_slice()),
+            ] {
+                let target_index = *by_name.get(target)?;
+                let Some(target_typed) = blocks[target_index].typed.as_deref() else {
+                    continue 'header;
+                };
+                let entry_set = entries.iter().map(String::as_str).collect::<HashSet<_>>();
+                let mut rewrites = Vec::new();
+                for inst in &target_typed.insts {
+                    let Some((ty, incoming)) = &inst.phi_incoming else {
+                        continue;
+                    };
+                    let selected = incoming
+                        .iter()
+                        .filter(|(_, pred)| entry_set.contains(pred.as_str()))
+                        .collect::<Vec<_>>();
+                    if selected.is_empty() {
+                        continue;
+                    }
+                    if selected.len() != entry_set.len() {
+                        continue 'header;
+                    }
+                    let result = inst.result.as_ref()?;
+                    let phi_name = format!("{join_name}.phi.{join_phi_index}");
+                    join_phi_index += 1;
+                    let join_incoming = selected
+                        .iter()
+                        .map(|(value, pred)| ((*value).clone(), pred.clone()))
+                        .collect::<Vec<_>>();
+                    join_typed.push_value_phi(&phi_name, ty, &join_incoming);
+                    let mut replacement = Vec::with_capacity(incoming.len() + 1 - selected.len());
+                    let mut inserted = false;
+                    for (value, pred) in incoming {
+                        if entry_set.contains(pred.as_str()) {
+                            if !inserted {
+                                replacement
+                                    .push((LlValue::Local(phi_name.clone()), join_name.clone()));
+                                inserted = true;
+                            }
+                        } else {
+                            replacement.push((value.clone(), pred.clone()));
+                        }
+                    }
+                    rewrites.push((result.clone(), replacement));
+                }
+                target_rewrites.push((target_index, rewrites));
+            }
+
+            let mut out = blocks.to_vec();
+            for (pred, takes_shared) in &all_entries {
+                let target = if *takes_shared { shared } else { merge };
+                let pred_index = *by_name.get(pred.as_str())?;
+                let typed = std::sync::Arc::make_mut(out[pred_index].typed.as_mut()?);
+                typed.redirect_successor(target, &join_name);
+            }
+            for (target_index, rewrites) in target_rewrites {
+                let typed = std::sync::Arc::make_mut(out[target_index].typed.as_mut()?);
+                for (result, incoming) in rewrites {
+                    typed.set_phi_incomings(&result, &incoming);
+                }
+            }
+            let insertion = *by_name.get(merge.as_str())?;
+            out.insert(
+                insertion,
+                BodyBlock {
+                    name: join_name,
+                    role: BlockRole::Normal,
+                    typed: Some(join_typed.into()),
+                },
+            );
+            return Some(out);
+        }
+    }
+    None
+}
+
 pub(in crate::native) fn lower_unstructured_switches(blocks: &[BodyBlock]) -> Vec<BodyBlock> {
     lower_switches(blocks, false)
 }
@@ -886,13 +1500,17 @@ fn lower_switches(blocks: &[BodyBlock], force_loop_exit_ladders: bool) -> Vec<Bo
             // The block reuses the original switch block's instruction PREFIX + a synthetic `br` — build
             // its carrier from the source's typed prefix (`block.typed.insts` == the block's non-terminator
             // instructions) + the synthetic tail (no module named-types needed).
-            let typed = block.typed.as_ref().and_then(|p| {
-                crate::native::tir::lower_block_carrier_with_prefix(
-                    &block.name,
-                    p,
-                    std::slice::from_ref(&terminator),
-                )
-            });
+            let typed = block
+                .typed
+                .as_ref()
+                .and_then(|p| {
+                    crate::native::tir::lower_block_carrier_with_prefix(
+                        &block.name,
+                        p,
+                        std::slice::from_ref(&terminator),
+                    )
+                })
+                .map(Into::into);
             lowered.push(BodyBlock {
                 name: block.name.clone(),
                 // Reuses the original block's name → preserves its role (a switch block is `Normal`).
@@ -937,7 +1555,8 @@ fn lower_switches(blocks: &[BodyBlock], force_loop_exit_ladders: bool) -> Vec<Bo
                 })
             } else {
                 crate::native::tir::lower_block_carrier(&name, &tail, &HashMap::new())
-            };
+            }
+            .map(Into::into);
             // case 0 reuses the original block's name (preserve its role); every other case is a
             // fresh `%metal2vulkan_switch_*` synth name, which is never a terminal-return clone.
             let role = if case_index == 0 {
@@ -952,7 +1571,8 @@ fn lower_switches(blocks: &[BodyBlock], force_loop_exit_ladders: bool) -> Vec<Bo
                     &false_label,
                     &merge_lines,
                     &HashMap::new(),
-                );
+                )
+                .map(Into::into);
                 lowered.push(BodyBlock {
                     name: false_label,
                     role: BlockRole::Normal,
@@ -1129,7 +1749,7 @@ fn rewrite_lowered_switch_target_phis(
         };
         // Expand each target phi's incoming predecessors on the carrier directly (a switch predecessor
         // that lowered to a comparison ladder fans out into the ladder's leaf blocks).
-        if let Some(t) = &mut block.typed {
+        if let Some(t) = block.typed_mut() {
             t.expand_phi_predecessors(block_rewrites);
         }
     }
@@ -1353,7 +1973,7 @@ fn rewrite_switch_bypass_merge(
     for (pred_idx, pred, synthetic) in redirects {
         // Redirect the terminator successor merge -> synthetic bypass on the carrier (the typed dual of
         // the string `rewrite_text_successor`).
-        if let Some(t) = &mut blocks[pred_idx].typed {
+        if let Some(t) = blocks[pred_idx].typed_mut() {
             t.redirect_successor(merge, &synthetic);
         }
         insert_after.insert(pred, synthetic);
@@ -1361,7 +1981,7 @@ fn rewrite_switch_bypass_merge(
     // Extend the intermediate carrier's phis from the typed additions (merge-carrier-sourced values).
     // Every `typed_additions` key names an intermediate phi (checked against `intermediate_phi_results`
     // above), so each `append_phi_incoming` targets an existing carrier phi.
-    if let Some(t) = &mut blocks[intermediate_idx].typed {
+    if let Some(t) = blocks[intermediate_idx].typed_mut() {
         for (result, extra) in &typed_additions {
             for (value, pred) in extra {
                 t.append_phi_incoming(result, value.clone(), pred);
@@ -1372,7 +1992,7 @@ fn rewrite_switch_bypass_merge(
     // phi that had a bypass incoming is non-aggregate (the plan loop bailed otherwise), so
     // `rebuild_phi_incomings` reproduces the same incoming set / operands / uses a re-lower of the
     // bypass-dropped line would.
-    if let Some(t) = &mut blocks[merge_idx].typed {
+    if let Some(t) = blocks[merge_idx].typed_mut() {
         t.rebuild_phi_incomings(|pred| !bypass_set.contains(pred));
     }
 
@@ -1385,7 +2005,8 @@ fn rewrite_switch_bypass_merge(
             // Purely synthetic single-`br` bypass block — lower its carrier directly (empty named-types
             // is exact for a `br`).
             let typed =
-                crate::native::tir::lower_block_carrier(&synthetic, &lines, &HashMap::new());
+                crate::native::tir::lower_block_carrier(&synthetic, &lines, &HashMap::new())
+                    .map(Into::into);
             rebuilt.push(BodyBlock {
                 name: synthetic,
                 // A `%metal2vulkan_switch_bypass_*` block — the one SwitchBypass synthesis site;
@@ -1498,6 +2119,7 @@ mod tests {
                 ("%named".to_string(), LlType::Int(32)),
                 ("%6".to_string(), LlType::Int(32)),
             ],
+            byval_param_pointees: vec![None; 3],
             blocks: Vec::new(),
         };
 
@@ -1507,6 +2129,7 @@ mod tests {
             name: "main".to_string(),
             ret: LlType::Void,
             params: vec![("%named".to_string(), LlType::Int(32))],
+            byval_param_pointees: vec![None],
             blocks: Vec::new(),
         };
 
@@ -1593,6 +2216,160 @@ mod tests {
             Some(&"%122".to_string()),
             "{merges:?}"
         );
+    }
+
+    #[test]
+    fn direct_switch_merge_accepts_only_local_common_reconvergence() {
+        let blocks = vec![
+            block(
+                "%switch",
+                "switch i32 %tag, label %dead [ i32 0, label %a i32 1, label %b ]",
+            ),
+            block("%a", "br label %merge"),
+            block("%b", "br label %merge"),
+            block("%dead", "unreachable"),
+            block("%merge", "ret void"),
+        ];
+        assert_eq!(
+            infer_direct_switch_merges(&blocks).get("%switch"),
+            Some(&"%merge".to_string())
+        );
+
+        let mut divergent = blocks;
+        divergent[2] = block("%b", "br label %other");
+        divergent.push(block("%other", "ret void"));
+        assert!(infer_direct_switch_merges(&divergent).is_empty());
+    }
+
+    #[test]
+    fn direct_branch_merge_accepts_only_local_common_reconvergence() {
+        let blocks = vec![
+            block("%if", "br i1 %cond, label %a, label %b"),
+            block("%a", "br label %merge"),
+            block("%b", "br label %merge"),
+            block("%merge", "ret void"),
+        ];
+        assert_eq!(
+            infer_direct_branch_merges(&blocks).get(&("%a".to_string(), "%b".to_string())),
+            Some(&"%merge".to_string())
+        );
+
+        let mut divergent = blocks;
+        divergent[2] = block("%b", "br label %other");
+        divergent.push(block("%other", "ret void"));
+        assert!(infer_direct_branch_merges(&divergent).is_empty());
+
+        let terminal = vec![
+            block("%if", "br i1 %cond, label %live, label %dead"),
+            block("%live", "br label %merge"),
+            block("%dead", "unreachable"),
+            block("%merge", "ret void"),
+        ];
+        assert_eq!(
+            infer_direct_branch_merges(&terminal).get(&("%live".to_string(), "%dead".to_string())),
+            Some(&"%merge".to_string())
+        );
+    }
+
+    #[test]
+    fn bounded_branch_merge_uses_post_dominance_but_excludes_loop_headers() {
+        let blocks = vec![
+            block("%if", "br i1 %cond, label %a, label %b"),
+            block("%a", "br label %a_tail"),
+            block("%a_tail", "br label %merge"),
+            block("%b", "br label %b_tail"),
+            block("%b_tail", "br label %merge"),
+            block("%merge", "ret void"),
+        ];
+        assert_eq!(
+            infer_bounded_branch_merges_by_header(&blocks).get("%if"),
+            Some(&"%merge".to_string())
+        );
+
+        let loop_blocks = vec![
+            block("%loop", "br i1 %cond, label %body, label %exit"),
+            block("%body", "br label %loop"),
+            block("%exit", "ret void"),
+        ];
+        assert!(infer_bounded_branch_merges_by_header(&loop_blocks).is_empty());
+    }
+
+    #[test]
+    fn shared_branch_dispatch_is_funnelled_with_destination_phis() {
+        let blocks = vec![
+            block("%header", "br i1 %outer, label %left, label %right"),
+            block("%left", "br i1 %left_cond, label %taken, label %done"),
+            block("%right", "br i1 %right_cond, label %taken, label %done"),
+            synthetic_block(
+                "%taken".to_string(),
+                vec![
+                    "%value = phi i32 [ 1, %left ], [ 2, %right ]".to_string(),
+                    "ret void".to_string(),
+                ],
+                BlockRole::Normal,
+            ),
+            block("%done", "ret void"),
+        ];
+        let out = funnel_shared_branch_dispatches(&blocks);
+        let join = out
+            .iter()
+            .find(|block| block.name.starts_with("%metal2vulkan.branch_funnel."))
+            .expect("shared dispatch receives a funnel");
+        assert_eq!(block_successors(&out[1]), vec![join.name.clone()]);
+        assert_eq!(block_successors(&out[2]), vec![join.name.clone()]);
+        assert_eq!(
+            conditional_branch_targets(join),
+            Some(("%taken".to_string(), "%done".to_string()))
+        );
+
+        let taken = out.iter().find(|block| block.name == "%taken").unwrap();
+        let incoming = &taken.typed.as_ref().unwrap().insts[0]
+            .phi_incoming
+            .as_ref()
+            .unwrap()
+            .1;
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].1, join.name);
+        assert_eq!(
+            join.typed
+                .as_ref()
+                .unwrap()
+                .insts
+                .iter()
+                .filter(|inst| inst.opcode == "phi")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn deep_shared_arm_is_refunnelled_without_cloning_its_region() {
+        let blocks = vec![
+            block("%header", "br i1 %outer, label %shared, label %inner"),
+            block("%inner", "br label %dispatch"),
+            block(
+                "%dispatch",
+                "br i1 %nested, label %via_shared, label %bypass",
+            ),
+            block("%via_shared", "br label %shared"),
+            block("%bypass", "br label %merge"),
+            block("%shared", "br label %merge"),
+            block("%merge", "ret void"),
+        ];
+        let out = refunnel_one_deep_shared_arm(&blocks, &mut 0).unwrap();
+        let join = out
+            .iter()
+            .find(|block| block.name.starts_with("%metal2vulkan.branch_refunnel."))
+            .expect("deep shared arm receives a refunnel");
+        assert_eq!(
+            conditional_branch_targets(join),
+            Some(("%shared".to_string(), "%merge".to_string()))
+        );
+        for predecessor in ["%header", "%via_shared", "%bypass"] {
+            let block = out.iter().find(|block| block.name == predecessor).unwrap();
+            assert!(block_successors(block).contains(&join.name));
+        }
+        assert_eq!(out.len(), blocks.len() + 1);
     }
 
     /// A switch in a natural-loop body whose default directly breaks the loop cannot remain an

@@ -295,9 +295,11 @@ pub(in crate::native) fn materialize_construct_routes(
             .map(|step| format!("{ROUTE_PREFIX}{route_index}.{step}"))
             .collect();
         if let Some(source) = out[route.edge.from].typed.as_mut() {
+            let source = std::sync::Arc::make_mut(source);
             source.redirect_successor(&target_name, &route_names[0]);
         }
         if let Some(target) = out[route.edge.to].typed.as_mut() {
+            let target = std::sync::Arc::make_mut(target);
             target.rewrite_phi_predecessor(
                 &source_name,
                 route_names.last().expect("non-empty route"),
@@ -337,7 +339,7 @@ mod tests {
         BodyBlock {
             name: name.to_string(),
             role: BlockRole::Normal,
-            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()),
+            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()).map(Into::into),
         }
     }
 

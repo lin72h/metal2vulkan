@@ -104,7 +104,7 @@ pub(in crate::native) fn split_phi_overlap(
             exit_rewrites.push((dst, kept_plus));
         }
     }
-    if let Some(t) = &mut blocks[exit_idx].typed {
+    if let Some(t) = blocks[exit_idx].typed_mut() {
         for (dst, kept_plus) in &exit_rewrites {
             t.set_phi_incomings(dst, kept_plus);
         }
@@ -113,7 +113,7 @@ pub(in crate::native) fn split_phi_overlap(
     // Redirect the inner-loop predecessors' terminators from `exit` to the pass-through.
     for b in blocks.iter_mut() {
         if preds.iter().any(|p| p == &b.name) {
-            if let Some(t) = &mut b.typed {
+            if let Some(t) = b.typed_mut() {
                 t.redirect_successor(exit, &new_name);
             }
         }
@@ -139,7 +139,7 @@ pub(in crate::native) fn split_phi_overlap(
         BodyBlock {
             name: new_name.clone(),
             role: role_for_name(&new_name),
-            typed: Some(blk),
+            typed: Some(blk.into()),
         },
     );
 

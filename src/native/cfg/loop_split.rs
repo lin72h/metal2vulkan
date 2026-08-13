@@ -25,8 +25,8 @@
 //! place (that function stays on the floor, no regression). Decides purely from IR structure (loop
 //! merges, block edges, dominance), never a shader name.
 
-use super::exit_check::dominator_sets;
 use super::graph::{spirv_block_successors_by_label, spirv_predecessor_ids_by_label};
+use super::EmittedDominators;
 use crate::spirv_module::Module;
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Block, Function, Instruction};
@@ -82,9 +82,9 @@ fn split_in_function(function: &mut Function, fresh: &mut impl FnMut() -> Word) 
     let label_set: HashSet<Word> = labels.iter().copied().collect();
     let successors = spirv_block_successors_by_label(&function.blocks);
     let preds = spirv_predecessor_ids_by_label(&successors);
-    let doms = dominator_sets(entry, &labels, &successors);
-    let dominates = |a: Word, b: Word| doms.get(&b).is_some_and(|s| s.contains(&a));
-    let depth = |n: Word| doms.get(&n).map(|s| s.len()).unwrap_or(0);
+    let dominators = EmittedDominators::new(entry, &labels, &successors);
+    let dominates = |a: Word, b: Word| dominators.dominates(a, b);
+    let depth = |n: Word| dominators.depth(n);
 
     // Loop headers (block with OpLoopMerge) → its merge block.
     let mut loop_merge: HashMap<Word, Word> = HashMap::new();

@@ -752,16 +752,33 @@ pub(in crate::passes) fn rewrite_scalar_pointer_arithmetic_access_chains(
     entry_idx: usize,
 ) {
     let mut pointer_storage = HashMap::new();
+    let aggregate_types = ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .filter(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::TypeStruct | Op::TypeArray | Op::TypeRuntimeArray | Op::TypeMatrix
+            )
+        })
+        .filter_map(|inst| inst.result_id)
+        .collect::<HashSet<_>>();
+    let mut pointer_pointees = HashMap::new();
     for inst in ctx
         .new_globals
         .iter()
         .chain(ctx.module.types_global_values.iter())
     {
         if inst.class.opcode == Op::TypePointer {
-            if let (Some(result), Some(Operand::StorageClass(storage))) =
-                (inst.result_id, inst.operands.first())
+            if let (
+                Some(result),
+                Some(Operand::StorageClass(storage)),
+                Some(Operand::IdRef(pointee)),
+            ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
             {
                 pointer_storage.insert(result, *storage);
+                pointer_pointees.insert(result, *pointee);
             }
         }
     }
@@ -805,6 +822,12 @@ pub(in crate::passes) fn rewrite_scalar_pointer_arithmetic_access_chains(
             {
                 continue;
             }
+            if pointer_pointees
+                .get(&result_type)
+                .is_some_and(|pointee| aggregate_types.contains(pointee))
+            {
+                continue;
+            }
             let Some(Operand::IdRef(base)) = inst.operands.first() else {
                 continue;
             };
@@ -817,6 +840,58 @@ pub(in crate::passes) fn rewrite_scalar_pointer_arithmetic_access_chains(
                 inst.result_id,
                 inst.operands.clone(),
             );
+        }
+    }
+}
+
+/// Replace a nullable pointer select used as an access-chain base with its concrete arm.
+///
+/// Dereferencing the null arm is undefined in LLVM, so every defined execution that reaches the
+/// access chain necessarily selected the concrete arm. Removing the select at that use exposes the
+/// original aggregate-rooted chain to the ordinary composition and reinterpret passes. This is
+/// especially important after helper inlining, where a nullable buffer argument can otherwise hide
+/// the aggregate root behind `OpSelect` and strand an invalid scalar-pointee chain.
+pub(in crate::passes) fn expose_nullable_access_chain_bases(ctx: &mut Ctx, entry_idx: usize) {
+    let null_ids: HashSet<Word> = ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .filter(|inst| inst.class.opcode == Op::ConstantNull)
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    let concrete_arm: HashMap<Word, Word> = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter(|inst| inst.class.opcode == Op::Select)
+        .filter_map(|inst| {
+            let result = inst.result_id?;
+            let [_, Operand::IdRef(on_true), Operand::IdRef(on_false)] = inst.operands.as_slice()
+            else {
+                return None;
+            };
+            match (null_ids.contains(on_true), null_ids.contains(on_false)) {
+                (true, false) => Some((result, *on_false)),
+                (false, true) => Some((result, *on_true)),
+                _ => None,
+            }
+        })
+        .collect();
+
+    for block in &mut ctx.module.functions[entry_idx].blocks {
+        for inst in &mut block.instructions {
+            if !matches!(
+                inst.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+            ) {
+                continue;
+            }
+            let Some(Operand::IdRef(base)) = inst.operands.first_mut() else {
+                continue;
+            };
+            if let Some(concrete) = concrete_arm.get(base) {
+                *base = *concrete;
+            }
         }
     }
 }
@@ -893,12 +968,14 @@ pub(in crate::passes) fn decorate_ptr_access_chain_base_strides(ctx: &mut Ctx) {
         }
         // `ArrayStride` is an explicit layout decoration. Vulkan permits it on the logical
         // StorageBuffer/PhysicalStorageBuffer pointer view used by `OpPtrAccessChain`, but rejects
-        // the same decoration on a Workgroup pointer type (VUID-StandaloneSpirv-None-10684).
-        // Workgroup `OpPtrAccessChain`s retain their undecorated pointer type.
+        // it on Function and Workgroup pointer types (VUID-StandaloneSpirv-None-10684).
         let Some(Operand::StorageClass(storage)) = def.operands.first() else {
             continue;
         };
-        if matches!(storage, StorageClass::Workgroup) {
+        if !matches!(
+            storage,
+            StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer
+        ) {
             continue;
         }
         // OpTypePointer %storage %pointee — pointee is operand[1].

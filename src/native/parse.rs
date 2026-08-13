@@ -41,7 +41,7 @@ pub(super) fn parse_function(
     let close = matching_paren(head, open)
         .ok_or_else(|| format!("native emitter: unmatched params in define: {head}"))?;
     let ret = parse_return_type(&head["define".len()..at])?;
-    let params = parse_params(&head[open + 1..close])?;
+    let (params, byval_param_pointees) = parse_params(&head[open + 1..close])?;
     let mut body = Vec::new();
     let mut i = start + 1;
     while i < lines.len() {
@@ -52,6 +52,7 @@ pub(super) fn parse_function(
                     name,
                     ret,
                     params,
+                    byval_param_pointees,
                     // Lowered to carriers by `LlModule::parse_inner` from the returned `body` lines,
                     // once the module type table is complete; the text is then dropped.
                     blocks: Vec::new(),
@@ -215,7 +216,7 @@ pub(super) fn parse_decl_params(s: &str) -> Result<Vec<LlType>, String> {
         .collect()
 }
 
-pub(super) fn parse_return_type(prefix: &str) -> Result<LlType, String> {
+pub(crate) fn parse_return_type(prefix: &str) -> Result<LlType, String> {
     let toks = split_top_level_whitespace(prefix);
     for i in (0..toks.len()).rev() {
         let candidate = toks[i..].join(" ");
@@ -229,10 +230,13 @@ pub(super) fn parse_return_type(prefix: &str) -> Result<LlType, String> {
     ))
 }
 
-pub(super) fn parse_params(s: &str) -> Result<Vec<(String, LlType)>, String> {
+pub(super) fn parse_params(
+    s: &str,
+) -> Result<(Vec<(String, LlType)>, Vec<Option<LlType>>), String> {
     let mut out = Vec::new();
+    let mut byval_pointees = Vec::new();
     if s.trim().is_empty() {
-        return Ok(out);
+        return Ok((out, byval_pointees));
     }
     for raw in split_top_level(s, ',') {
         let raw = raw.trim();
@@ -245,12 +249,19 @@ pub(super) fn parse_params(s: &str) -> Result<Vec<(String, LlType)>, String> {
             .ok_or_else(|| format!("native emitter: malformed parameter name: {raw}"))?
             .to_string();
         let ty = parse_type_prefix(raw[..pct].trim())?;
+        let byval_pointee = raw.find("byval(").map(|byval| {
+            let open = byval + "byval".len();
+            let close = matching_paren(raw, open)
+                .ok_or_else(|| format!("native emitter: unmatched byval type: {raw}"))?;
+            parse_type(raw[open + 1..close].trim())
+        });
         out.push((name, ty));
+        byval_pointees.push(byval_pointee.transpose()?);
     }
-    Ok(out)
+    Ok((out, byval_pointees))
 }
 
-pub(super) fn parse_type_prefix(s: &str) -> Result<LlType, String> {
+pub(crate) fn parse_type_prefix(s: &str) -> Result<LlType, String> {
     let toks = split_top_level_whitespace(s);
     for i in (1..=toks.len()).rev() {
         let candidate = toks[..i].join(" ");
@@ -345,6 +356,17 @@ pub(super) fn parse_value(s: &str) -> Result<LlValue, String> {
         Ok(LlValue::Splat(Box::new(parse_typed_value(inner)?)))
     } else if let Some(rest) = s.strip_prefix("getelementptr ") {
         Ok(LlValue::Gep(Box::new(parse_gep(rest)?)))
+    } else if let Some(inner) = s
+        .strip_prefix("inttoptr (")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (source, destination) = inner.rsplit_once(" to ").ok_or_else(|| {
+            format!("native emitter: malformed inttoptr constant expression `{s}`")
+        })?;
+        Ok(LlValue::IntToPtr {
+            source: Box::new(parse_typed_value(source)?),
+            destination: parse_type(destination.trim())?,
+        })
     } else if s.starts_with('%') {
         Ok(LlValue::Local(s.to_string()))
     } else if s.starts_with('@') {
@@ -611,6 +633,7 @@ fn parse_argument_align(s: &str) -> Option<u64> {
 }
 
 pub(super) fn parse_gep(s: &str) -> Result<LlGep, String> {
+    let inbounds = split_top_level_whitespace(s).contains(&"inbounds");
     let s = strip_wrapping_parens(strip_native_gep_flags(s));
     let parts = split_top_level(s, ',');
     if parts.len() < 3 {
@@ -623,6 +646,7 @@ pub(super) fn parse_gep(s: &str) -> Result<LlGep, String> {
         .map(|idx| parse_typed_value(idx))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LlGep {
+        inbounds,
         source_ty,
         base,
         indices,
@@ -689,11 +713,8 @@ pub(super) fn parse_memory_alignment(parts: &[&str]) -> Result<Option<u64>, Stri
 /// values are then overlaid from the typed graph by
 /// `phi_incoming_values`, but the predecessor LABELS exist only here (control-flow edges, not operands).
 pub(super) fn parse_phi(rest: &str) -> Result<(LlType, Vec<(LlValue, String)>), String> {
-    let first_incoming = rest
-        .find('[')
-        .ok_or_else(|| format!("native emitter: malformed phi: {rest}"))?;
-    let phi_ty = parse_type(rest[..first_incoming].trim())?;
-    let incoming = split_top_level(&rest[first_incoming..], ',')
+    let (phi_ty, incoming_text) = split_phi_type_and_incoming(rest)?;
+    let incoming = split_top_level(&incoming_text, ',')
         .into_iter()
         .map(|incoming| {
             let incoming = incoming
@@ -711,6 +732,20 @@ pub(super) fn parse_phi(rest: &str) -> Result<(LlType, Vec<(LlValue, String)>), 
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok((phi_ty, incoming))
+}
+
+fn split_phi_type_and_incoming(rest: &str) -> Result<(LlType, String), String> {
+    let tokens = split_top_level_whitespace(rest);
+    for incoming_start in 1..tokens.len() {
+        if !tokens[incoming_start].starts_with('[') {
+            continue;
+        }
+        let type_text = tokens[..incoming_start].join(" ");
+        if let Ok(ty) = parse_type(&type_text) {
+            return Ok((ty, tokens[incoming_start..].join(" ")));
+        }
+    }
+    Err(format!("native emitter: malformed phi: {rest}"))
 }
 
 pub(super) fn parse_switch(s: &str) -> Result<LlSwitch, String> {
@@ -859,10 +894,8 @@ pub(super) fn parse_identity_ptr_bitcast(line: &str) -> Option<(String, String)>
 }
 
 pub(super) fn parse_phi_incoming_values(rest: &str) -> Result<Vec<LlValue>, String> {
-    let first_incoming = rest
-        .find('[')
-        .ok_or_else(|| format!("native emitter: malformed phi: {rest}"))?;
-    split_top_level(&rest[first_incoming..], ',')
+    let (_, incoming_text) = split_phi_type_and_incoming(rest)?;
+    split_top_level(&incoming_text, ',')
         .into_iter()
         .map(|incoming| {
             let incoming = incoming
@@ -1174,6 +1207,19 @@ mod parse_tests {
         assert_eq!(tv.ty, LlType::Ptr(1));
         assert!(matches!(tv.value, LlValue::Local(ref s) if s == "%0"));
 
+        let tv = parse_typed_value(
+            "ptr addrspace(3) nonnull captures(none) inttoptr (i64 1024 to ptr addrspace(3))",
+        )
+        .unwrap();
+        assert_eq!(tv.ty, LlType::Ptr(3));
+        assert!(matches!(
+            tv.value,
+            LlValue::IntToPtr {
+                source,
+                destination: LlType::Ptr(3),
+            } if matches!(source.value, LlValue::Int(1024))
+        ));
+
         assert!(parse_typed_value("i32").is_err()); // no value token
         assert!(parse_typed_value("").is_err());
     }
@@ -1199,7 +1245,7 @@ mod parse_tests {
     }
 
     // Deterministic, dependency-free fuzz: mutate valid seeds and assert the parsers return a
-    // Result (never panic). A panic here is a real finding to journal, not something to paper over.
+    // Result (never panic). A panic here is a parser bug rather than an input classification.
     #[test]
     fn parsers_never_panic_on_ascii_mutations() {
         let seeds = [

@@ -41,6 +41,11 @@ name = "metal2vulkan"
 path = "src/main.rs"
 required-features = []
 
+[[example]]
+name = "translate_reflected"
+path = "examples/translate_reflected.rs"
+required-features = ["serde"]
+
 [lib]
 name = "metal2vulkan"
 path = "src/lib.rs"

@@ -695,8 +695,18 @@ mod tests {
                 vec![Operand::LiteralBit32(0)],
             ),
             Instruction::new(Op::TypeStruct, None, Some(17), vec![Operand::IdRef(7)]),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(18),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(8),
+                ],
+            ),
         ];
         module.functions.push(one_block_function(vec![
+            Instruction::new(Op::Undef, Some(2), Some(62), vec![]),
             Instruction::new(
                 Op::InBoundsAccessChain,
                 Some(14),
@@ -704,6 +714,12 @@ mod tests {
                 vec![Operand::IdRef(50), Operand::IdRef(15)],
             ),
             Instruction::new(Op::Load, Some(17), Some(61), vec![Operand::IdRef(60)]),
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(18),
+                Some(63),
+                vec![Operand::IdRef(50), Operand::IdRef(62), Operand::IdRef(15)],
+            ),
         ]));
 
         let defs = defs_from_module(&module);
@@ -741,6 +757,22 @@ mod tests {
             .find(|inst| inst.result_id == Some(61))
             .expect("load");
         assert_eq!(load.result_type, Some(8));
+        let indexed = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|inst| inst.result_id == Some(63))
+            .expect("record-indexed access chain");
+        assert_eq!(indexed.operands[0], Operand::IdRef(13));
+        assert_eq!(indexed.operands[2], Operand::IdRef(62));
+        assert_eq!(
+            const_u32(&defs, id_ref(&indexed.operands[3]).unwrap()),
+            Some(4),
+            "the source member after an elided padding field must use its compact ordinal"
+        );
+        assert_eq!(
+            pointer_pointee_including_new(&ctx, &defs, indexed.result_type.unwrap()),
+            Some(8)
+        );
     }
 
     // A record element whose members and a nested struct both start on a natural alignment gap:
@@ -882,6 +914,126 @@ mod tests {
         assert_eq!(
             pointer_pointee_including_new(&ctx, &defs, access.result_type.unwrap()),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn record_array_flattens_source_dimensions_from_affine_layout() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(Op::TypeStruct, None, Some(3), vec![Operand::IdRef(2)]),
+            Instruction::new(
+                Op::Constant,
+                Some(2),
+                Some(4),
+                vec![Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(5),
+                vec![Operand::IdRef(3), Operand::IdRef(4)],
+            ),
+            Instruction::new(Op::TypeStruct, None, Some(6), vec![Operand::IdRef(5)]),
+            Instruction::new(Op::TypeRuntimeArray, None, Some(7), vec![Operand::IdRef(6)]),
+            Instruction::new(Op::TypeStruct, None, Some(8), vec![Operand::IdRef(7)]),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(9),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(8),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(9),
+                Some(10),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(11),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(2),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(2),
+                Some(12),
+                vec![Operand::LiteralBit32(0)],
+            ),
+        ];
+        module.functions.push(one_block_function(vec![
+            Instruction::new(Op::Undef, Some(2), Some(20), vec![]),
+            Instruction::new(Op::Undef, Some(2), Some(21), vec![]),
+            Instruction::new(Op::Undef, Some(2), Some(22), vec![]),
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(11),
+                Some(60),
+                vec![
+                    Operand::IdRef(50),
+                    Operand::IdRef(20),
+                    Operand::IdRef(12),
+                    Operand::IdRef(21),
+                    Operand::IdRef(22),
+                    Operand::IdRef(12),
+                ],
+            ),
+        ]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        ctx.emit_sidecar.buffer_access_affine_offsets.push(
+            crate::emit_sidecar::BufferAccessAffineOffset {
+                id: 60,
+                root: 50,
+                constant: 0,
+                terms: vec![(20, 16), (21, 8), (22, 4)],
+            },
+        );
+        rewrite_record_array_buffer(&mut ctx, 0, 50, 10, 8, 6, &defs);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        let scale = body
+            .iter()
+            .find(|instruction| instruction.class.opcode == Op::IMul)
+            .unwrap_or_else(|| {
+                panic!("first source dimension scaled by its row stride: {body:#?}")
+            });
+        let sum = body
+            .iter()
+            .find(|instruction| instruction.class.opcode == Op::IAdd)
+            .expect("flattened source dimensions summed");
+        assert_eq!(sum.operands[0], Operand::IdRef(scale.result_id.unwrap()));
+        assert_eq!(sum.operands[1], Operand::IdRef(22));
+        let access = body
+            .iter()
+            .find(|instruction| instruction.result_id == Some(60))
+            .expect("access chain");
+        assert_eq!(
+            access.operands,
+            vec![
+                Operand::IdRef(10),
+                Operand::IdRef(12),
+                Operand::IdRef(20),
+                Operand::IdRef(12),
+                Operand::IdRef(sum.result_id.unwrap()),
+                Operand::IdRef(12),
+            ]
         );
     }
 

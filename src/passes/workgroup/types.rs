@@ -3,7 +3,7 @@
 use super::*;
 use crate::passes::stage_input::array_type;
 
-pub(in crate::passes) fn split_workgroup_block_type_aliases(
+pub(in crate::passes) fn split_explicit_layout_type_aliases(
     ctx: &mut Ctx,
     buffer_structs: &[(Word, Word)],
     defs: &mut HashMap<Word, Instruction>,
@@ -16,11 +16,17 @@ pub(in crate::passes) fn split_workgroup_block_type_aliases(
         return;
     }
 
+    // A struct can be the root of one StorageBuffer while also appearing inside another root. The
+    // root needs `Block`, but Vulkan forbids carrying that decoration into the nested occurrence.
+    // Clone only the nested path and retarget the outer root's member graph; both copies retain the
+    // same member/array layout, while only the independently bound original remains a Block root.
+    split_nested_block_root_aliases(ctx, &block_structs, defs);
+
     // Every aggregate reachable from a Block struct gets explicit Offset/ArrayStride layout when
-    // `decorate_block_struct` recurses. A Workgroup variable whose pointee graph shares any of those
-    // ids would inherit illegal explicit layout (VUID-StandaloneSpirv-None-10684). Clone the complete
-    // path from each Workgroup root down to every shared aggregate; cloning only a top-level struct is
-    // insufficient when the Workgroup root is an array or the shared type is a nested array.
+    // `decorate_block_struct` recurses. A Function or Workgroup pointer whose pointee graph shares
+    // any of those ids would inherit illegal explicit layout (VUID-StandaloneSpirv-None-10684).
+    // Clone the complete path from each unlaid root down to every shared aggregate; cloning only a
+    // top-level struct is insufficient when the root is an array or the shared type is nested.
     let laid_out_types = layout_types_reachable_from(&block_structs, defs);
 
     // Preserve the established byte-stable path for a top-level struct alias: clone only that struct
@@ -68,22 +74,35 @@ pub(in crate::passes) fn split_workgroup_block_type_aliases(
         defs.insert(clone_ty, clone_inst);
         defs.insert(clone_ptr_ty, clone_ptr_inst);
     }
-    let workgroup_roots = ctx
+    // Function and Workgroup pointers must never inherit explicit interface layout. Discover roots
+    // from pointer declarations rather than variables: Function variables live inside functions,
+    // and intermediate access-chain pointer types can expose a nested shared aggregate even when no
+    // variable points to it directly.
+    let unlaid_roots = ctx
         .module
         .types_global_values
         .iter()
         .chain(ctx.new_globals.iter())
         .filter(|inst| {
-            inst.class.opcode == Op::Variable
-                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Workgroup))
+            inst.class.opcode == Op::TypePointer
+                && matches!(
+                    inst.operands.first(),
+                    Some(Operand::StorageClass(
+                        StorageClass::Workgroup | StorageClass::Function
+                    ))
+                )
         })
-        .filter_map(|inst| inst.result_type.and_then(|ptr| ptr_pointee(defs, ptr)))
+        .filter_map(|inst| inst.operands.get(1))
+        .filter_map(|operand| match operand {
+            Operand::IdRef(pointee) => Some(*pointee),
+            _ => None,
+        })
         .collect::<Vec<_>>();
 
     let mut resolved = HashMap::new();
     let mut cloned_types = vec![];
-    for root in workgroup_roots {
-        clone_workgroup_layout_conflicts(
+    for root in unlaid_roots {
+        clone_unlaid_layout_conflicts(
             ctx,
             root,
             &laid_out_types,
@@ -106,8 +125,8 @@ pub(in crate::passes) fn split_workgroup_block_type_aliases(
         }
     }
 
-    // Cloned definitions must precede the first Workgroup pointer type that references them. All
-    // clone operands are existing types/constants or earlier post-order clones.
+    // Cloned definitions must precede the first unlaid pointer type that references them. All clone
+    // operands are existing types/constants or earlier post-order clones.
     let insert_at = ctx
         .module
         .types_global_values
@@ -130,10 +149,9 @@ pub(in crate::passes) fn split_workgroup_block_type_aliases(
         .types_global_values
         .splice(insert_at..insert_at, cloned_types);
 
-    // Retarget Workgroup pointer types and Function pointers that exchange an aggregate with them
-    // (for example through OpCopyMemory). Both storage classes require the undecorated clone, while
-    // StorageBuffer keeps the original explicit-layout type. Refresh the structural interner keys
-    // because these existing type instructions changed shape in place.
+    // Retarget Function and Workgroup pointer types. Both storage classes require the undecorated
+    // clone, while StorageBuffer keeps the original explicit-layout type. Refresh the structural
+    // interner keys because these existing type instructions changed shape in place.
     let mut cache_updates = vec![];
     repoint_unlaid_pointer_types(
         &mut ctx.module.types_global_values,
@@ -152,7 +170,148 @@ pub(in crate::passes) fn split_workgroup_block_type_aliases(
     }
 }
 
-pub(in crate::passes) fn clone_workgroup_layout_conflicts(
+fn split_nested_block_root_aliases(
+    ctx: &mut Ctx,
+    block_structs: &HashSet<Word>,
+    defs: &mut HashMap<Word, Instruction>,
+) {
+    let mut roots = block_structs.iter().copied().collect::<Vec<_>>();
+    roots.sort_unstable();
+    for root in roots {
+        let Some(root_def) = defs.get(&root).cloned() else {
+            continue;
+        };
+        if root_def.class.opcode != Op::TypeStruct {
+            continue;
+        }
+        let mut resolved = HashMap::new();
+        let mut cloned_types = Vec::new();
+        let mut operands = root_def.operands.clone();
+        let mut changed = false;
+        for operand in &mut operands {
+            let Operand::IdRef(member) = operand else {
+                continue;
+            };
+            let cloned = clone_nested_block_path(
+                ctx,
+                *member,
+                block_structs,
+                defs,
+                &mut resolved,
+                &mut cloned_types,
+            );
+            changed |= cloned != *member;
+            *member = cloned;
+        }
+        if !changed {
+            continue;
+        }
+        let Some(root_position) = ctx
+            .module
+            .types_global_values
+            .iter()
+            .position(|instruction| instruction.result_id == Some(root))
+        else {
+            continue;
+        };
+        for instruction in &cloned_types {
+            if let Some(id) = instruction.result_id {
+                defs.insert(id, instruction.clone());
+            }
+        }
+        ctx.module
+            .types_global_values
+            .splice(root_position..root_position, cloned_types);
+        let root_position = ctx
+            .module
+            .types_global_values
+            .iter()
+            .position(|instruction| instruction.result_id == Some(root))
+            .expect("existing block root remains present");
+        let old_operands = ctx.module.types_global_values[root_position]
+            .operands
+            .clone();
+        ctx.module.types_global_values[root_position].operands = operands.clone();
+        let old_key = (Op::TypeStruct, None, old_operands);
+        if ctx.struct_cache.get(&old_key) == Some(&root) {
+            ctx.struct_cache.remove(&old_key);
+        }
+        ctx.struct_cache
+            .insert((Op::TypeStruct, None, operands), root);
+        defs.insert(root, ctx.module.types_global_values[root_position].clone());
+    }
+}
+
+fn clone_nested_block_path(
+    ctx: &mut Ctx,
+    ty: Word,
+    block_structs: &HashSet<Word>,
+    defs: &HashMap<Word, Instruction>,
+    resolved: &mut HashMap<Word, Word>,
+    cloned_types: &mut Vec<Instruction>,
+) -> Word {
+    if let Some(&resolved) = resolved.get(&ty) {
+        return resolved;
+    }
+    let Some(definition) = defs.get(&ty) else {
+        resolved.insert(ty, ty);
+        return ty;
+    };
+    let mut operands = definition.operands.clone();
+    let mut child_changed = false;
+    match definition.class.opcode {
+        Op::TypeStruct => {
+            for operand in &mut operands {
+                let Operand::IdRef(member) = operand else {
+                    continue;
+                };
+                let cloned = clone_nested_block_path(
+                    ctx,
+                    *member,
+                    block_structs,
+                    defs,
+                    resolved,
+                    cloned_types,
+                );
+                child_changed |= cloned != *member;
+                *member = cloned;
+            }
+        }
+        Op::TypeArray | Op::TypeRuntimeArray => {
+            if let Some(Operand::IdRef(element)) = operands.first_mut() {
+                let cloned = clone_nested_block_path(
+                    ctx,
+                    *element,
+                    block_structs,
+                    defs,
+                    resolved,
+                    cloned_types,
+                );
+                child_changed = cloned != *element;
+                *element = cloned;
+            }
+        }
+        _ => {
+            resolved.insert(ty, ty);
+            return ty;
+        }
+    }
+    if !child_changed && !block_structs.contains(&ty) {
+        resolved.insert(ty, ty);
+        return ty;
+    }
+    let cloned = ctx.module.fresh_id();
+    cloned_types.push(type_inst(definition.class.opcode, cloned, operands));
+    if definition.class.opcode == Op::TypeStruct {
+        if let Some(offsets) = ctx.air_struct_offsets.get(&ty).cloned() {
+            ctx.air_struct_offsets.insert(cloned, offsets);
+        }
+    }
+    resolved.insert(ty, cloned);
+    cloned
+}
+
+pub(in crate::passes) fn clone_unlaid_layout_conflicts(
     ctx: &mut Ctx,
     ty: Word,
     laid_out_types: &HashSet<Word>,
@@ -175,7 +334,7 @@ pub(in crate::passes) fn clone_workgroup_layout_conflicts(
                 let Operand::IdRef(member) = operand else {
                     continue;
                 };
-                let cloned = clone_workgroup_layout_conflicts(
+                let cloned = clone_unlaid_layout_conflicts(
                     ctx,
                     *member,
                     laid_out_types,
@@ -189,7 +348,7 @@ pub(in crate::passes) fn clone_workgroup_layout_conflicts(
         }
         Op::TypeArray | Op::TypeRuntimeArray => {
             if let Some(Operand::IdRef(elem)) = operands.first_mut() {
-                let cloned = clone_workgroup_layout_conflicts(
+                let cloned = clone_unlaid_layout_conflicts(
                     ctx,
                     *elem,
                     laid_out_types,

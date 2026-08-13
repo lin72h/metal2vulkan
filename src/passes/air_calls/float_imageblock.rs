@@ -2,6 +2,318 @@
 
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageblockConversion {
+    None,
+    Float,
+    Bitcast,
+}
+
+pub(in crate::passes) fn lower_implicit_imageblock_load(
+    ctx: &mut Ctx,
+    name: &str,
+    result: Word,
+    result_ty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    if args.len() != 4 {
+        return Err(format!(
+            "{name} expects attachment, coordinate, index, and data rate"
+        ));
+    }
+    let (attachment, data_rate) = implicit_imageblock_constants(ctx, name, args)?;
+    let (format, comp, storage_ty, conversion, lanes) =
+        implicit_imageblock_format(ctx, name, result_ty)?;
+    let (var, image_ty) = ctx.implicit_imageblock_var(attachment, data_rate, format, comp)?;
+    let mut out = Vec::new();
+    let image = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Load,
+        Some(image_ty),
+        Some(image),
+        vec![Operand::IdRef(var)],
+    ));
+    ctx.image_dims.insert(image, (Dim::Dim2D, true));
+    ctx.image_comp.insert(image, comp);
+    ctx.image_storage.insert(image);
+    let coord = build_fetch_coord(ctx, Dim::Dim2D, true, args[1], Some(args[2]), &mut out)?;
+    let read_result = if conversion != ImageblockConversion::None || lanes != 4 {
+        ctx.module.fresh_id()
+    } else {
+        result
+    };
+    out.push(Instruction::new(
+        Op::ImageRead,
+        Some(storage_ty),
+        Some(read_result),
+        vec![Operand::IdRef(image), Operand::IdRef(coord)],
+    ));
+    let converted_source = if lanes == 1 {
+        let component = if conversion != ImageblockConversion::None {
+            ctx.module.fresh_id()
+        } else {
+            result
+        };
+        let component_ty = match comp {
+            ImageComp::Float => ctx.ty_float(),
+            ImageComp::Uint => ctx.ty_uint(),
+            ImageComp::Sint => ctx.ty_sint(),
+        };
+        out.push(Instruction::new(
+            Op::CompositeExtract,
+            Some(component_ty),
+            Some(component),
+            vec![Operand::IdRef(read_result), Operand::LiteralBit32(0)],
+        ));
+        component
+    } else if lanes < 4 {
+        let prefix = ctx.module.fresh_id();
+        let prefix_ty = match comp {
+            ImageComp::Float => ctx.ty_vecf(lanes),
+            ImageComp::Uint => ctx.ty_vec_uint(lanes),
+            ImageComp::Sint => ctx.ty_vec_sint(lanes),
+        };
+        out.push(Instruction::new(
+            Op::VectorShuffle,
+            Some(prefix_ty),
+            Some(prefix),
+            std::iter::once(Operand::IdRef(read_result))
+                .chain(std::iter::once(Operand::IdRef(read_result)))
+                .chain((0..lanes).map(Operand::LiteralBit32))
+                .collect(),
+        ));
+        prefix
+    } else {
+        read_result
+    };
+    if conversion != ImageblockConversion::None {
+        let opcode = match conversion {
+            ImageblockConversion::Float => Op::FConvert,
+            ImageblockConversion::Bitcast => Op::Bitcast,
+            ImageblockConversion::None => unreachable!(),
+        };
+        out.push(Instruction::new(
+            opcode,
+            Some(result_ty),
+            Some(result),
+            vec![Operand::IdRef(converted_source)],
+        ));
+    }
+    Ok(out)
+}
+
+pub(in crate::passes) fn lower_implicit_imageblock_store(
+    ctx: &mut Ctx,
+    name: &str,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    if args.len() != 5 {
+        return Err(format!(
+            "{name} expects value, attachment, coordinate, index, and data rate"
+        ));
+    }
+    let abi_args = &args[1..];
+    let (attachment, data_rate) = implicit_imageblock_constants(ctx, name, abi_args)?;
+    let value_ty = value_result_type(ctx, args[0])
+        .ok_or_else(|| format!("{name} value has no result type"))?;
+    let (format, comp, storage_ty, conversion, lanes) =
+        implicit_imageblock_format(ctx, name, value_ty)?;
+    let (var, image_ty) = ctx.implicit_imageblock_var(attachment, data_rate, format, comp)?;
+    let mut out = Vec::new();
+    let image = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Load,
+        Some(image_ty),
+        Some(image),
+        vec![Operand::IdRef(var)],
+    ));
+    ctx.image_dims.insert(image, (Dim::Dim2D, true));
+    ctx.image_comp.insert(image, comp);
+    ctx.image_storage.insert(image);
+    let coord = build_fetch_coord(
+        ctx,
+        Dim::Dim2D,
+        true,
+        abi_args[1],
+        Some(abi_args[2]),
+        &mut out,
+    )?;
+    let value = if conversion != ImageblockConversion::None {
+        let storage_value_ty = if lanes == 1 {
+            match conversion {
+                ImageblockConversion::Float => ctx.ty_float(),
+                ImageblockConversion::Bitcast => match comp {
+                    ImageComp::Float => ctx.ty_float(),
+                    ImageComp::Uint => ctx.ty_uint(),
+                    ImageComp::Sint => ctx.ty_sint(),
+                },
+                ImageblockConversion::None => unreachable!(),
+            }
+        } else if lanes < 4 {
+            match comp {
+                ImageComp::Float => ctx.ty_vecf(lanes),
+                ImageComp::Uint => ctx.ty_vec_uint(lanes),
+                ImageComp::Sint => ctx.ty_vec_sint(lanes),
+            }
+        } else {
+            storage_ty
+        };
+        let converted = ctx.module.fresh_id();
+        let opcode = match conversion {
+            ImageblockConversion::Float => Op::FConvert,
+            ImageblockConversion::Bitcast => Op::Bitcast,
+            ImageblockConversion::None => unreachable!(),
+        };
+        out.push(Instruction::new(
+            opcode,
+            Some(storage_value_ty),
+            Some(converted),
+            vec![Operand::IdRef(args[0])],
+        ));
+        converted
+    } else {
+        args[0]
+    };
+    let value = if lanes == 1 {
+        let texel = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::CompositeConstruct,
+            Some(storage_ty),
+            Some(texel),
+            vec![Operand::IdRef(value); 4],
+        ));
+        texel
+    } else if lanes < 4 {
+        let texel = ctx.module.fresh_id();
+        let operands = std::iter::once(Operand::IdRef(value))
+            .chain(std::iter::once(Operand::IdRef(value)))
+            .chain(
+                (0..4)
+                    .map(|lane| Operand::LiteralBit32(if lane < lanes { lane } else { u32::MAX })),
+            )
+            .collect();
+        out.push(Instruction::new(
+            Op::VectorShuffle,
+            Some(storage_ty),
+            Some(texel),
+            operands,
+        ));
+        texel
+    } else {
+        value
+    };
+    out.push(Instruction::new(
+        Op::ImageWrite,
+        None,
+        None,
+        vec![
+            Operand::IdRef(image),
+            Operand::IdRef(coord),
+            Operand::IdRef(value),
+        ],
+    ));
+    Ok(out)
+}
+
+fn implicit_imageblock_constants(
+    ctx: &Ctx,
+    name: &str,
+    args: &[Word],
+) -> Result<(u32, u32), String> {
+    let attachment = constant_u32(ctx, args[0])
+        .ok_or_else(|| format!("{name} requires a constant render-target attachment"))?;
+    let data_rate = constant_u32(ctx, args[3])
+        .ok_or_else(|| format!("{name} requires a constant imageblock data rate"))?;
+    Ok((attachment, data_rate))
+}
+
+fn implicit_imageblock_format(
+    ctx: &mut Ctx,
+    name: &str,
+    value_ty: Word,
+) -> Result<(ImageFormat, ImageComp, Word, ImageblockConversion, u32), String> {
+    use crate::meta::TextureFormat;
+
+    let format = crate::meta::implicit_imageblock_texture_format(name)?
+        .ok_or_else(|| format!("{name} is not an implicit imageblock intrinsic"))?;
+    let lowered = match format {
+        TextureFormat::R16f => {
+            require_storage_image_extended_formats(ctx);
+            (
+                ImageFormat::R16f,
+                ImageComp::Float,
+                ctx.ty_vecf(4),
+                ImageblockConversion::Float,
+                1,
+            )
+        }
+        TextureFormat::Rg16f => {
+            require_storage_image_extended_formats(ctx);
+            (
+                ImageFormat::Rg16f,
+                ImageComp::Float,
+                ctx.ty_vecf(4),
+                ImageblockConversion::Float,
+                2,
+            )
+        }
+        TextureFormat::Rgba16f => (
+            ImageFormat::Rgba16f,
+            ImageComp::Float,
+            ctx.ty_vecf(4),
+            ImageblockConversion::Float,
+            4,
+        ),
+        TextureFormat::R32f => {
+            require_storage_image_extended_formats(ctx);
+            (
+                ImageFormat::R32f,
+                ImageComp::Float,
+                ctx.ty_vecf(4),
+                ImageblockConversion::None,
+                1,
+            )
+        }
+        TextureFormat::Rgba32f => (
+            ImageFormat::Rgba32f,
+            ImageComp::Float,
+            value_ty,
+            ImageblockConversion::None,
+            4,
+        ),
+        TextureFormat::R32ui => {
+            require_storage_image_extended_formats(ctx);
+            (
+                ImageFormat::R32ui,
+                ImageComp::Uint,
+                ctx.ty_vec_uint(4),
+                ImageblockConversion::Bitcast,
+                1,
+            )
+        }
+        _ => return Err(format!("{name} has unsupported implicit imageblock format")),
+    };
+    Ok(lowered)
+}
+
+fn require_storage_image_extended_formats(ctx: &mut Ctx) {
+    let capability = spirv::Capability::StorageImageExtendedFormats;
+    if ctx
+        .module
+        .capabilities
+        .iter()
+        .any(|instruction| instruction.operands.as_slice() == [Operand::Capability(capability)])
+    {
+        return;
+    }
+    ctx.module.capabilities.push(Instruction::new(
+        Op::Capability,
+        None,
+        None,
+        vec![Operand::Capability(capability)],
+    ));
+}
+
 /// Lower the residual floating-point / transcendental AIR intrinsic family and the generic
 /// GLSL.std.450 ext-inst tail (sincos, cospi/sinpi/tanpi, exp10, fmod, log10, integer & float
 /// min/max/clamp, min3/max3/fmedian3, bfloat fmuladd, ldexp, fast_tanh, the `glsl_extinst` map,
@@ -844,7 +1156,18 @@ pub(in crate::passes) fn lower_imageblock_slice_write_texel(
         .get(&img)
         .copied()
         .unwrap_or((Dim::Dim2D, false));
-    let coord32 = build_fetch_coord(ctx, dim, arrayed, args[5], None, &mut out)?;
+    // The imageblock-slice ABI puts the destination coordinate at operand 5 and, for an array
+    // texture, its slice at operand 6.
+    let layer = if arrayed {
+        Some(
+            args.get(6)
+                .copied()
+                .ok_or("air.write_imageblock_slice_to_texture array texture missing layer")?,
+        )
+    } else {
+        None
+    };
+    let coord32 = build_fetch_coord(ctx, dim, arrayed, args[5], layer, &mut out)?;
     let region_gate =
         gate_imageblock_region_in_bounds(ctx, args, img, dim, arrayed, coord32, &mut out)?;
     let comp = ctx

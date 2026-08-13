@@ -430,7 +430,15 @@ impl Emitter {
             return Ok(ids);
         }
         let args = self.function_call_args_for_params(call, &callee_params)?;
-        let mut ids = Vec::with_capacity(args.len());
+        let nullness_args = args
+            .iter()
+            .filter(|(index, _, _)| {
+                self.function_param_nullness
+                    .contains(&(call.callee.clone(), *index))
+            })
+            .map(|(_, argument, _)| argument.value.clone())
+            .collect::<Vec<_>>();
+        let mut ids = Vec::with_capacity(args.len() + nullness_args.len());
         for (index, arg, (param_name, param_ty)) in args {
             if let Some(id) = self.raw_workgroup_call_arg_id(
                 &call.callee,
@@ -466,7 +474,22 @@ impl Emitter {
             }
             ids.push(self.value_id_in(&arg.value, &arg.ty, instructions)?);
         }
+        for value in &nullness_args {
+            ids.push(self.pointer_call_arg_nullness_id(value)?);
+        }
         Ok(ids)
+    }
+
+    fn pointer_call_arg_nullness_id(&mut self, value: &LlValue) -> Result<Word, String> {
+        match value {
+            LlValue::Zero => self.const_bool(true),
+            LlValue::Local(name) => self.pointer_nullness.get(name).copied().ok_or_else(|| {
+                format!("native emitter: pointer nullness is not tracked for call argument {name}")
+            }),
+            LlValue::Global(_) => self.const_bool(false),
+            LlValue::Gep(gep) => self.pointer_call_arg_nullness_id(&gep.base.value),
+            _ => Err("native emitter: helper pointer nullness requires a pointer value".into()),
+        }
     }
 
     fn function_call_args_for_params(
@@ -636,6 +659,18 @@ impl Emitter {
         let Some(raw) = self.raw_offsets.get(arg_name).cloned() else {
             return Ok(None);
         };
+        if self.bda_device_pointers && raw.addrspace == 1 && !raw.unmodelable {
+            let mut address_raw = raw.clone();
+            if address_raw.device_addr_base.is_none() {
+                let Some(base) = self.bda_direct_addresses.get(&raw.root).copied() else {
+                    return Ok(None);
+                };
+                address_raw.device_addr_base = Some(base);
+            }
+            return self
+                .materialize_device_address(&address_raw, instructions)
+                .map(Some);
+        }
         if raw.addrspace != 1
             || !raw.dyn_terms.is_empty()
             || raw.unmodelable

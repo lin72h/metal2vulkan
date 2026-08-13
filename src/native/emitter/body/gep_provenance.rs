@@ -66,17 +66,9 @@ impl Emitter {
                 }
             }
             if let Some(selected) = self.selected_load_pointers.get(base_name).cloned() {
-                let storage = self
-                    .pointer_storage
-                    .get(base_name)
-                    .copied()
-                    .ok_or_else(|| {
-                        format!("native emitter: selected pointer GEP {base_name} missing storage")
-                    })?;
                 if self.emit_selected_load_pointer_gep(
                     name,
                     &selected,
-                    storage,
                     &parsed_source_ty,
                     &gep.indices,
                     instructions,
@@ -636,6 +628,51 @@ impl Emitter {
         if indices.len() == 1 {
             self.materialize_reserved_pointer_index(name, &indices[0], instructions)?;
         }
+        let fact_source_ty = if entry_metadata_indices.is_some() {
+            base_pointee.clone().unwrap_or_else(|| source_ty.clone())
+        } else {
+            source_ty.clone()
+        };
+        let fact_indices = entry_metadata_indices
+            .clone()
+            .unwrap_or_else(|| indices.clone());
+        let raw = self.apply_raw_gep(
+            RawBufferOffset::root(String::new(), provenance_addrspace),
+            &fact_source_ty,
+            &fact_indices,
+        )?;
+        if !raw.unmodelable && raw.const_off >= 0 {
+            if raw.dyn_terms.is_empty() {
+                self.emit_sidecar.buffer_access_offsets.push(
+                    crate::emit_sidecar::BufferAccessOffset {
+                        id: result,
+                        root,
+                        byte_offset: raw.const_off as u64,
+                    },
+                );
+            } else if raw.dyn_terms.iter().all(|(_, stride)| *stride >= 0) {
+                let terms = raw
+                    .dyn_terms
+                    .iter()
+                    .map(|(index, stride)| {
+                        Ok((
+                            self.value_id(&index.value, &index.ty)?,
+                            u64::try_from(*stride).map_err(|_| {
+                                "native emitter: negative affine buffer stride".to_string()
+                            })?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                self.emit_sidecar.buffer_access_affine_offsets.push(
+                    crate::emit_sidecar::BufferAccessAffineOffset {
+                        id: result,
+                        root,
+                        constant: raw.const_off as u64,
+                        terms,
+                    },
+                );
+            }
+        }
         self.gep_provenance.insert(
             name.to_string(),
             GepProvenance {
@@ -1070,24 +1107,6 @@ impl Emitter {
         Ok(Some(current))
     }
 
-    /// True only for a pointer whose decoded GEP provenance originates at the emitter-owned
-    /// imageblock scratch variable. This permits a private complete cell's first scalar member to
-    /// be addressed structurally without broadening aggregate-reinterpret stores elsewhere.
-    pub(in crate::native::emitter) fn is_imageblock_scratch_pointer(
-        &self,
-        pointer: &LlValue,
-    ) -> bool {
-        let LlValue::Local(name) = pointer else {
-            return false;
-        };
-        let Some(provenance) = self.gep_provenance.get(name) else {
-            return false;
-        };
-        self.imageblock_data_scratch
-            .as_ref()
-            .is_some_and(|(root, _)| provenance.root == *root)
-    }
-
     pub(in crate::native::emitter) fn byte_array_reinterpret_raw_gep(
         &self,
         base_value: &LlValue,
@@ -1099,9 +1118,6 @@ impl Emitter {
         indices: &[TypedValue],
     ) -> Result<Option<RawBufferOffset>, String> {
         if !matches!(base_storage, StorageClass::Function | StorageClass::Private) {
-            return Ok(None);
-        }
-        if !matches!(source_ty, LlType::Array(_, _) | LlType::Struct(_)) {
             return Ok(None);
         }
         let Some(root) = self
@@ -1394,6 +1410,18 @@ impl Emitter {
         let LlValue::Local(name) = value else {
             return Ok(None);
         };
+        if let Some(root) = self.byte_array_reinterpret_root(value, self.pointer_pointees.get(name))
+        {
+            let addrspace = self
+                .values
+                .get(name)
+                .and_then(|(_, ty)| match ty {
+                    LlType::Ptr(addrspace) => Some(*addrspace),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            return Ok(Some(RawBufferOffset::root(root, addrspace)));
+        }
         let Some(provenance) = self.gep_provenance.get(name) else {
             return Ok(None);
         };

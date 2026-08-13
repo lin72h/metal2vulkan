@@ -39,6 +39,15 @@ impl Emitter {
             )? {
                 return Ok(());
             }
+            if self.record_cross_storage_pointer_select(
+                &name,
+                &result_ty,
+                &true_value.value,
+                &false_value.value,
+                cond_id,
+            )? {
+                return Ok(());
+            }
         }
         let pointer_meta =
             self.pointer_merge_meta(&[&true_value.value, &false_value.value], &result_ty)?;
@@ -191,6 +200,73 @@ impl Emitter {
             );
         }
         Ok(())
+    }
+
+    /// Defer a pointer select whose concrete arms occupy different SPIR-V storage classes. Logical
+    /// SPIR-V cannot represent that pointer value, but loads through it are exactly representable:
+    /// derive each arm independently and select the loaded values. Recording the source operands
+    /// here lets the existing selected-pointer GEP/load machinery perform that value-domain replay.
+    pub(in crate::native::emitter) fn record_cross_storage_pointer_select(
+        &mut self,
+        name: &str,
+        result_ty: &LlType,
+        true_value: &LlValue,
+        false_value: &LlValue,
+        cond_id: Word,
+    ) -> Result<bool, String> {
+        let LlType::Ptr(addrspace) = result_ty else {
+            return Ok(false);
+        };
+        if matches!(true_value, LlValue::Zero | LlValue::Undef)
+            || matches!(false_value, LlValue::Zero | LlValue::Undef)
+            || self.pointer_phi_incoming_values.contains(name)
+        {
+            return Ok(false);
+        }
+        let true_storage = self.pointer_storage_for(true_value, *addrspace)?;
+        let false_storage = self.pointer_storage_for(false_value, *addrspace)?;
+        if true_storage == false_storage {
+            return Ok(false);
+        }
+        let value_readable = |storage| {
+            matches!(
+                storage,
+                StorageClass::Private
+                    | StorageClass::UniformConstant
+                    | StorageClass::StorageBuffer
+                    | StorageClass::Workgroup
+            )
+        };
+        if !value_readable(true_storage) || !value_readable(false_storage) {
+            return Ok(false);
+        }
+        // An addrspace(2) opaque parameter is a sampler handle, not data memory. Selected sampler
+        // pointers are intentionally represented by the same typed placeholder consumed by
+        // `valid_sampler_value`; the AIR image pass replaces it with its descriptor-backed default
+        // sampler instead of attempting an illegal cross-storage pointer OpSelect. Data-buffer
+        // parameters stay on the per-arm value replay below.
+        let opaque_parameter_arm = |value: &LlValue| {
+            matches!(value, LlValue::Local(local)
+                if self.param_values.contains(local) && !self.data_buffer_params.contains(local))
+        };
+        let selected_has_data_pointee = self.tir_use_pointees.contains_key(name);
+        if *addrspace == 2
+            && !selected_has_data_pointee
+            && (opaque_parameter_arm(true_value) || opaque_parameter_arm(false_value))
+        {
+            self.define_unmodeled_byte_pointer_value(name, *addrspace)?;
+            return Ok(true);
+        }
+        self.selected_pointers.insert(
+            name.to_string(),
+            SelectedPointer {
+                cond: cond_id,
+                true_value: true_value.clone(),
+                false_value: false_value.clone(),
+                ty: result_ty.clone(),
+            },
+        );
+        Ok(true)
     }
 
     pub(in crate::native::emitter) fn pointer_select_arm_id(
@@ -520,6 +596,8 @@ impl Emitter {
                 cond: cond_id,
                 true_ptr: Some(true_ptr),
                 false_ptr: Some(false_ptr),
+                true_storage: storage,
+                false_storage: storage,
                 pointee: LlType::Void,
                 true_raw: None,
                 false_raw: None,

@@ -37,7 +37,7 @@ pub(in crate::native) fn find_deep_shared_continuations(
                 && selection.contains_key(&b.name)
         })
         .collect();
-    headers.sort_by_key(|b| std::cmp::Reverse(depth(&b.name)));
+    headers.sort_by_cached_key(|b| std::cmp::Reverse(depth(&b.name)));
 
     let mut found = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -109,7 +109,7 @@ pub(in crate::native) fn find_switch_case_shared_continuations(
                 && selection.contains_key(&b.name)
         })
         .collect();
-    switches.sort_by_key(|b| std::cmp::Reverse(depth(&b.name)));
+    switches.sort_by_cached_key(|b| std::cmp::Reverse(depth(&b.name)));
 
     let mut found = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();

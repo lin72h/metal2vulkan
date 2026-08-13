@@ -203,6 +203,47 @@ declare i32 @air.pack.unorm4x8.v4f32(<4 x float>)
 }
 
 #[test]
+fn native_air_pack_unorm_rgb565_f16_lowers_to_exact_fields() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(ptr addrspace(1) %out) {
+entry:
+  %packed = call i16 @air.pack.unorm.rgb565.v3f16(<3 x half> <half 0xH3C00, half 0xH3800, half 0xH0000>)
+  store i16 %packed, ptr addrspace(1) %out, align 2
+  ret void
+}
+
+declare i16 @air.pack.unorm.rgb565.v3f16(<3 x half>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"ushort*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_pack_unorm_rgb565_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpFConvert"), "{asm}");
+    assert_eq!(asm.matches(" FClamp ").count(), 3, "{asm}");
+    assert_eq!(asm.matches(" Round ").count(), 3, "{asm}");
+    assert_eq!(asm.matches("OpShiftLeftLogical").count(), 2, "{asm}");
+    assert!(asm.contains("OpUConvert"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_coherent_air_store_and_fence_lower_to_memory_ops() {
     let ll = r#"
 target triple = "air64-apple-macosx14.0.0"
@@ -308,6 +349,62 @@ declare float @air.fast_ceil.f32(float)
     assert!(asm.contains("OpName"), "{asm}");
     assert!(asm.contains("air.fast_ceil.f32"), "{asm}");
     assert!(asm.contains("OpFunctionCall"), "{asm}");
+}
+
+#[test]
+fn native_agx2_cluster_number_uses_padded_local_invocation_coordinates() {
+    let ll = r#"
+target triple = "air64-apple-macosx14.0.0"
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %cluster = tail call i32 @llvm.agx2.cluster.num()
+  store i32 %cluster, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @llvm.agx2.cluster.num()
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_agx2_cluster_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions {
+            kernel_local_size: [10, 8, 1],
+            ..passes::TransformOptions::default()
+        },
+    )
+    .expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("BuiltIn LocalInvocationId"), "{asm}");
+    assert!(asm.contains("LocalSize 10 8 1"), "{asm}");
+    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+    assert!(asm.contains("OpIMul"), "{asm}");
+    assert!(!asm.contains("llvm.agx2.cluster.num"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpConstant") && line.ends_with(" 16")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -428,10 +525,10 @@ declare void @postfixPrimary_f.MTL_VISIBLE_FN_REF(ptr addrspace(2)) section "air
 }
 
 #[test]
-fn native_patch_control_point_reference_fails_before_emit() {
+fn native_patch_control_point_reference_lowers_to_tessellation_evaluation() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
-define <{ <4 x float> }> @main(ptr %patch) {
+define <{ <4 x float> }> @main(ptr %patch, <2 x float> %position_in_patch) {
 entry:
   %cp = tail call { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32 0, ptr %patch)
   %pos = insertvalue <{ <4 x float> }> undef, <4 x float> zeroinitializer, 0
@@ -440,24 +537,30 @@ entry:
 
 declare { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32, ptr) section "air.externally_defined"
 !air.vertex = !{!0}
-!0 = !{ptr @main, !1, !2}
+!0 = !{ptr @main, !1, !2, !7}
 !1 = !{!3}
-!2 = !{!4}
+!2 = !{!4, !8}
 !3 = !{!"air.position", !"air.arg_type_name", !"float4"}
-!4 = !{i32 0, !"air.patch_control_point_input", !5}
+!4 = !{i32 0, !"air.patch_control_point_input", !5, !6}
 !5 = !{!"air.patch_control_point_function", ptr @control.MTL_CONTROL_POINT_FN}
+!6 = !{!"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float3"}
+!7 = !{!"air.patch", !"triangle", !"air.patch_control_point", i32 3}
+!8 = !{i32 1, !"air.position_in_patch", !"air.arg_type_name", !"float2"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_patch_control_point_ref_{}",
         std::process::id()
     ));
-    let err = crate::translate_sanitized_native(ll, Stage::Vertex, &tmp)
-        .expect_err("patch control point functions are unsupported");
+    let out = crate::translate_sanitized_native(ll, Stage::Vertex, &tmp)
+        .expect("patch control points lower through tessellation evaluation");
+    let asm = disassemble(&out).expect("disassemble tessellation evaluation module");
+    assert!(asm.contains("OpEntryPoint TessellationEvaluation"), "{asm}");
     assert!(
-        err.contains("unsupported Metal patch control point function"),
-        "{err}"
+        asm.contains("OpExecutionMode") && asm.contains("Triangles"),
+        "{asm}"
     );
-    assert!(err.contains("Vulkan tessellation interface"), "{err}");
+    assert!(asm.contains("BuiltIn TessCoord"), "{asm}");
+    assert!(!asm.contains("MTL_CONTROL_POINT_FN"), "{asm}");
 }
 
 #[test]
@@ -641,6 +744,42 @@ declare i32 @air.extract_bits.u.i32(i32, i32, i32)
 }
 
 #[test]
+fn native_extract_bits_u64_avoids_maintenance9_bitfield_opcode() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main() {
+entry:
+  %bits = tail call i64 @air.extract_bits.u.i64(i64 81985529216486895, i32 40, i32 8)
+  ret void
+}
+
+declare i64 @air.extract_bits.u.i64(i64, i32, i32)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_extract_bits_u64_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("OpBitFieldUExtract"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_insert_bits_u32_intrinsic_lowers() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -667,6 +806,42 @@ declare i32 @air.insert_bits.u.i32(i32, i32, i32, i32)
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(asm.contains("OpBitFieldInsert"), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_insert_bits_u64_avoids_maintenance9_bitfield_opcode() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main() {
+entry:
+  %bits = tail call i64 @air.insert_bits.u.i64(i64 81985529216486895, i64 10, i32 40, i32 8)
+  ret void
+}
+
+declare i64 @air.insert_bits.u.i64(i64, i64, i32, i32)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_insert_bits_u64_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("OpBitFieldInsert"), "{asm}");
+    assert!(asm.contains("OpBitwiseOr"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

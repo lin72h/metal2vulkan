@@ -30,7 +30,7 @@ use crate::spirv_module::Instruction;
 use crate::spirv_module::Operand;
 use spirv::{Op, StorageClass, Word};
 
-use super::super::{air_names, type_def_of, Ctx};
+use super::super::{air_names, type_def_of, value_result_type, Ctx};
 
 /// Materialize per-element image loads for every `ImageArray`-bound texture argument. No-op unless the
 /// stage-input pass recorded at least one array-texture variable.
@@ -56,22 +56,89 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         .iter()
         .filter_map(|fact| fixed_array_element(ctx, fact).map(|resolved| (fact.id, resolved)))
         .collect::<Vec<_>>();
-    let fixed_handles: HashMap<Word, (Word, Word)> = fixed_elements
+    let mut fixed_handles: HashMap<Word, (Word, Word)> = fixed_elements
         .into_iter()
         .map(|(id, (arrayvar, element))| (id, (arrayvar, ctx.const_uint(element))))
         .collect();
-    let dynamic_handles: HashMap<Word, (Word, Word)> = ctx
+    let buffer_fixed_elements = ctx
+        .emit_sidecar
+        .buffer_pointer_field_loads
+        .iter()
+        .filter(|fact| ctx.image_array_vars.contains_key(&fact.root) && fact.byte_offset % 8 == 0)
+        .map(|fact| (fact.id, fact.root, (fact.byte_offset / 8) as u32))
+        .collect::<Vec<_>>();
+    fixed_handles.extend(
+        buffer_fixed_elements
+            .into_iter()
+            .map(|(id, root, element)| (id, (root, ctx.const_uint(element)))),
+    );
+    // A pointer-field load is represented as a typed CopyObject until interface binding gives the
+    // result its final image type. The sidecar keys the CopyObject result, while a later helper-table
+    // store can retain its source operand. Both ids denote the same exact fixed descriptor element.
+    for (id, resolved) in fixed_handles.clone() {
+        let mut alias = id;
+        for _ in 0..8 {
+            let Some(inst) = defs
+                .get(&alias)
+                .filter(|inst| inst.class.opcode == Op::CopyObject)
+            else {
+                break;
+            };
+            let Some(Operand::IdRef(source)) = inst.operands.first() else {
+                break;
+            };
+            fixed_handles.entry(*source).or_insert(resolved);
+            alias = *source;
+        }
+    }
+    let mut local_table_handles = HashMap::new();
+    for fact in &ctx.emit_sidecar.local_pointer_dynamic_field_loads {
+        let resolved = local_table_array_elements(ctx, &defs, fact, &fixed_handles);
+        if let Some(resolved) = resolved {
+            local_table_handles.insert(fact.id, resolved);
+        }
+    }
+    let mut dynamic_handles: HashMap<Word, (Word, Word)> = ctx
         .emit_sidecar
         .local_pointer_dynamic_field_loads
         .iter()
         .filter_map(|fact| dynamic_array_element(ctx, fact).map(|resolved| (fact.id, resolved)))
+        .chain(
+            ctx.emit_sidecar
+                .buffer_pointer_dynamic_field_loads
+                .iter()
+                .filter(|fact| ctx.image_array_vars.contains_key(&fact.root))
+                .map(|fact| (fact.id, (fact.root, fact.index))),
+        )
         .collect();
+    // Dynamic pointer-field loads use the same typed CopyObject representation as fixed loads.
+    // Texture lowering can retain the source operand after the sidecar has recorded the result id,
+    // so make both ids resolve to the same descriptor element. Unlike a byte-offset guess, this is
+    // an identity-preserving alias and therefore does not infer any missing resource semantics.
+    for (id, resolved) in dynamic_handles.clone() {
+        let mut alias = id;
+        for _ in 0..8 {
+            let Some(inst) = defs
+                .get(&alias)
+                .filter(|inst| inst.class.opcode == Op::CopyObject)
+            else {
+                break;
+            };
+            let Some(Operand::IdRef(source)) = inst.operands.first() else {
+                break;
+            };
+            dynamic_handles.entry(*source).or_insert(resolved);
+            alias = *source;
+        }
+    }
 
     // 1. Find each texture-intrinsic call's handle operand (arg 0) whose defining load addresses an
     //    array element. Collect `(handle, load-pointer)` first (immutable module borrow), then resolve
     //    to `(arrayvar, idx)` — resolution mints a constant, which mutates `ctx`.
     let mut candidates: Vec<(Word, Word)> = Vec::new();
+    let mut table_candidates = Vec::new();
     let mut handles: HashMap<Word, (Word, Word)> = HashMap::new();
+    let mut handle_preludes: HashMap<Word, Vec<Instruction>> = HashMap::new();
     let mut seen: std::collections::HashSet<Word> = std::collections::HashSet::new();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
@@ -101,6 +168,10 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
                 handles.insert(*handle, (arrayvar, idx));
                 continue;
             }
+            if let Some((arrayvar, selector, entries)) = local_table_handles.get(handle).cloned() {
+                table_candidates.push((*handle, arrayvar, selector, entries));
+                continue;
+            }
             // The handle must be an OpLoad of a pointer that roots at an array variable.
             let Some(load) = defs.get(handle) else {
                 continue;
@@ -119,6 +190,12 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             handles.insert(handle, (arrayvar, idx));
         }
     }
+    for (handle, arrayvar, selector, entries) in table_candidates {
+        if let Some((idx, prelude)) = descriptor_table_index(ctx, selector, &entries) {
+            handles.insert(handle, (arrayvar, idx));
+            handle_preludes.insert(handle, prelude);
+        }
+    }
     if handles.is_empty() {
         return;
     }
@@ -129,6 +206,9 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     let mut retyped_load_ptr: HashMap<Word, (Word, Word)> = HashMap::new(); // handle -> (image_ty, p)
     let mut dead_roots: Vec<Word> = Vec::new();
     for (&handle, &(arrayvar, idx)) in &handles {
+        if !defs.contains_key(&handle) {
+            continue;
+        }
         let &(elem_image_ty, dim, comp, multisampled) =
             ctx.image_array_vars.get(&arrayvar).unwrap();
         let ptr_image = ctx.ty_ptr(StorageClass::UniformConstant, elem_image_ty);
@@ -161,18 +241,82 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         }
     }
 
+    // Opaque pointer loads that the generic emitter cannot type are represented by a Private
+    // placeholder variable. Such an id has no function instruction to retype, so materialize the
+    // descriptor element immediately at each intrinsic use and replace only that handle operand.
+    // Per-use insertion is required for control-flow safety: the dynamic selector need only dominate
+    // its original intrinsic, not another use of the same placeholder in a different block.
+    let mut placeholder_uses: HashMap<(usize, usize), (Instruction, Instruction, Word)> =
+        HashMap::new();
+    let mut placeholder_specs = Vec::new();
+    for (block_idx, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (inst_idx, inst) in block.instructions.iter().enumerate() {
+            if inst.class.opcode != Op::FunctionCall {
+                continue;
+            }
+            let Some(Operand::IdRef(handle)) = inst.operands.get(1) else {
+                continue;
+            };
+            let Some(&(arrayvar, idx)) = handles.get(handle) else {
+                continue;
+            };
+            if defs.contains_key(handle) {
+                continue;
+            }
+            placeholder_specs.push((block_idx, inst_idx, arrayvar, idx));
+        }
+    }
+    for (block_idx, inst_idx, arrayvar, idx) in placeholder_specs {
+        let &(image_ty, dim, comp, multisampled) = ctx.image_array_vars.get(&arrayvar).unwrap();
+        let ptr_image = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
+        let pointer = ctx.module.fresh_id();
+        let image = ctx.module.fresh_id();
+        let chain = Instruction::new(
+            Op::AccessChain,
+            Some(ptr_image),
+            Some(pointer),
+            vec![Operand::IdRef(arrayvar), Operand::IdRef(idx)],
+        );
+        let load = Instruction::new(
+            Op::Load,
+            Some(image_ty),
+            Some(image),
+            vec![Operand::IdRef(pointer)],
+        );
+        ctx.image_dims.insert(image, dim);
+        ctx.image_comp.insert(image, comp);
+        if multisampled {
+            ctx.image_multisampled.insert(image);
+        }
+        if image_type_is_storage(ctx, image_ty) {
+            ctx.image_storage.insert(image);
+        }
+        placeholder_uses.insert((block_idx, inst_idx), (chain, load, image));
+    }
+
     // 3. Apply: rewrite each block's instruction list, inserting the access chain before each retyped
     //    load and retyping the load's pointer operand + result type.
     let func = &mut ctx.module.functions[entry_idx];
-    for blk in &mut func.blocks {
+    for (block_idx, blk) in func.blocks.iter_mut().enumerate() {
         let mut rebuilt: Vec<Instruction> =
             Vec::with_capacity(blk.instructions.len() + handles.len());
-        for inst in blk.instructions.drain(..) {
+        for (inst_idx, inst) in blk.instructions.drain(..).enumerate() {
+            if let Some((chain, load, image)) = placeholder_uses.remove(&(block_idx, inst_idx)) {
+                rebuilt.push(chain);
+                rebuilt.push(load);
+                let mut call = inst;
+                call.operands[1] = Operand::IdRef(image);
+                rebuilt.push(call);
+                continue;
+            }
             if let Some(handle) = inst.result_id {
                 if let (Some(chain), Some(&(image_ty, p))) = (
                     new_access_chains.get(&handle),
                     retyped_load_ptr.get(&handle),
                 ) {
+                    if let Some(prelude) = handle_preludes.remove(&handle) {
+                        rebuilt.extend(prelude);
+                    }
                     rebuilt.push(chain.clone());
                     let mut load = inst;
                     load.class.opcode = Op::Load;
@@ -186,6 +330,11 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         }
         blk.instructions = rebuilt;
     }
+    // These exact dynamic facts now denote concrete image loads. Leaving them live would let the
+    // later generic pointer-table recovery replace the image load with the old pointer-typed select.
+    ctx.emit_sidecar
+        .local_pointer_dynamic_field_loads
+        .retain(|fact| !handles.contains_key(&fact.id));
 
     // 4. Sweep the now-dead pointer derivations (the old access chains + any bitcast/copyobject alias
     //    of the array pointer). A pure pointer-derivation with no remaining use is safe to delete; run
@@ -325,7 +474,6 @@ fn is_texture_intrinsic(name: &str) -> bool {
         || name.starts_with("air.get_num_samples_texture")
         || name.starts_with("air.is_null_texture")
 }
-
 fn image_type_is_storage(ctx: &Ctx, image_ty: Word) -> bool {
     type_def_of(ctx, image_ty)
         .filter(|def| def.class.opcode == Op::TypeImage)
@@ -347,6 +495,108 @@ fn dynamic_array_element(
         return None;
     }
     Some((fact.root, fact.index))
+}
+
+fn local_table_array_elements(
+    ctx: &Ctx,
+    defs: &HashMap<Word, Instruction>,
+    fact: &crate::emit_sidecar::LocalPointerDynamicFieldLoad,
+    fixed_handles: &HashMap<Word, (Word, Word)>,
+) -> Option<(Word, Word, Vec<(u32, Word)>)> {
+    let mut entries = Vec::new();
+    let mut arrayvar = None;
+    for store in &ctx.emit_sidecar.local_pointer_field_stores {
+        if store.root != fact.root {
+            continue;
+        }
+        let prefix_len = fact.prefix.len();
+        if store.indices.len() != prefix_len + 1 + fact.suffix.len()
+            || !store.indices.starts_with(&fact.prefix)
+            || store.indices[prefix_len + 1..] != fact.suffix
+        {
+            continue;
+        }
+        let (source_array, descriptor_index) =
+            fixed_descriptor_element(defs, fixed_handles, store.source)?;
+        match arrayvar {
+            Some(existing) if existing != source_array => return None,
+            Some(_) => {}
+            None => arrayvar = Some(source_array),
+        }
+        entries.push((store.indices[prefix_len], descriptor_index));
+    }
+    entries.sort_unstable_by_key(|(table_index, _)| *table_index);
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0 && pair[0].1 != pair[1].1)
+    {
+        return None;
+    }
+    entries.dedup_by_key(|(table_index, _)| *table_index);
+    (entries.len() >= 2).then_some((arrayvar?, fact.index, entries))
+}
+
+fn fixed_descriptor_element(
+    defs: &HashMap<Word, Instruction>,
+    fixed_handles: &HashMap<Word, (Word, Word)>,
+    mut value: Word,
+) -> Option<(Word, Word)> {
+    for _ in 0..8 {
+        if let Some(resolved) = fixed_handles.get(&value) {
+            return Some(*resolved);
+        }
+        let inst = defs.get(&value)?;
+        value = match inst.class.opcode {
+            Op::CopyObject => match inst.operands.first()? {
+                Operand::IdRef(source) => *source,
+                _ => return None,
+            },
+            Op::CompositeExtract => {
+                let Operand::IdRef(composite) = inst.operands.first()? else {
+                    return None;
+                };
+                let path = literal_index_path(&inst.operands[1..])?;
+                resolve_inserted_value(defs, *composite, &path)?
+            }
+            _ => return None,
+        };
+    }
+    None
+}
+
+fn descriptor_table_index(
+    ctx: &mut Ctx,
+    selector: Word,
+    entries: &[(u32, Word)],
+) -> Option<(Word, Vec<Instruction>)> {
+    let mut instructions = Vec::new();
+    let mut current = entries.first()?.1;
+    let selector_ty = value_result_type(ctx, selector)?;
+    let bool_ty = ctx.ty_bool();
+    let uint_ty = ctx.ty_uint();
+    for (table_index, descriptor_index) in entries.iter().copied().skip(1) {
+        let expected = ctx.const_int_of(selector_ty, i64::from(table_index));
+        let matches = ctx.module.fresh_id();
+        instructions.push(Instruction::new(
+            Op::IEqual,
+            Some(bool_ty),
+            Some(matches),
+            vec![Operand::IdRef(selector), Operand::IdRef(expected)],
+        ));
+        let selected = ctx.module.fresh_id();
+        instructions.push(Instruction::new(
+            Op::Select,
+            Some(uint_ty),
+            Some(selected),
+            vec![
+                Operand::IdRef(matches),
+                Operand::IdRef(descriptor_index),
+                Operand::IdRef(current),
+            ],
+        ));
+        current = selected;
+    }
+    Some((current, instructions))
 }
 
 fn fixed_array_element(
@@ -414,10 +664,59 @@ fn resolve_ptr_root(ctx: &Ctx, defs: &HashMap<Word, Instruction>, mut ptr: Word)
                 };
                 ptr = *src;
             }
+            Op::CompositeExtract => {
+                let Operand::IdRef(composite) = inst.operands.first()? else {
+                    return None;
+                };
+                let path = literal_index_path(&inst.operands[1..])?;
+                ptr = resolve_inserted_value(defs, *composite, &path)?;
+            }
             _ => return None,
         }
     }
     None
+}
+
+fn resolve_inserted_value(
+    defs: &HashMap<Word, Instruction>,
+    mut composite: Word,
+    path: &[u32],
+) -> Option<Word> {
+    for _ in 0..8 {
+        let inst = defs.get(&composite)?;
+        match inst.class.opcode {
+            Op::CompositeInsert => {
+                let Operand::IdRef(inserted) = inst.operands.first()? else {
+                    return None;
+                };
+                let Operand::IdRef(base) = inst.operands.get(1)? else {
+                    return None;
+                };
+                if literal_index_path(&inst.operands[2..])?.as_slice() == path {
+                    return Some(*inserted);
+                }
+                composite = *base;
+            }
+            Op::CopyObject => {
+                let Operand::IdRef(source) = inst.operands.first()? else {
+                    return None;
+                };
+                composite = *source;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn literal_index_path(operands: &[Operand]) -> Option<Vec<u32>> {
+    operands
+        .iter()
+        .map(|operand| match operand {
+            Operand::LiteralBit32(index) => Some(*index),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Delete dead pure pointer-derivations (AccessChain/PtrAccessChain/Bitcast/CopyObject) reachable from
@@ -496,6 +795,193 @@ mod tests {
     use crate::passes::ImageComp;
     use crate::spirv_module::{Block, Function, Module};
     use spirv::Dim;
+
+    #[test]
+    fn descriptor_array_root_survives_insert_extract_wrapper() {
+        let mut ctx = Ctx::new(Module::new());
+        let image_ty = ctx.ty_image(Dim::Dim2D, false, ImageComp::Float);
+        let root = ctx.module.fresh_id();
+        ctx.image_array_vars.insert(
+            root,
+            (image_ty, (Dim::Dim2D, false), ImageComp::Float, false),
+        );
+        let alias = ctx.module.fresh_id();
+        let poison = ctx.module.fresh_id();
+        let aggregate = ctx.module.fresh_id();
+        let extracted = ctx.module.fresh_id();
+        let defs = HashMap::from([
+            (
+                alias,
+                Instruction::new(Op::Bitcast, None, Some(alias), vec![Operand::IdRef(root)]),
+            ),
+            (
+                aggregate,
+                Instruction::new(
+                    Op::CompositeInsert,
+                    None,
+                    Some(aggregate),
+                    vec![
+                        Operand::IdRef(alias),
+                        Operand::IdRef(poison),
+                        Operand::LiteralBit32(0),
+                    ],
+                ),
+            ),
+            (
+                extracted,
+                Instruction::new(
+                    Op::CompositeExtract,
+                    None,
+                    Some(extracted),
+                    vec![Operand::IdRef(aggregate), Operand::LiteralBit32(0)],
+                ),
+            ),
+        ]);
+
+        assert_eq!(resolve_ptr_root(&ctx, &defs, extracted), Some(root));
+    }
+
+    #[test]
+    fn local_pointer_table_becomes_descriptor_array_load_once() {
+        let mut ctx = Ctx::new(Module::new());
+        let image_ty = ctx.ty_image(Dim::Dim2D, false, ImageComp::Float);
+        let array_ty = ctx.ty_array(image_ty, 2);
+        let ptr_array = ctx.ty_ptr(StorageClass::UniformConstant, array_ty);
+        let ptr_image = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
+        let uint_ty = ctx.ty_uint();
+        let private_byte = ctx.ty_ptr(StorageClass::Private, uint_ty);
+        let root = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(ptr_array),
+            Some(root),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        ctx.image_array_vars.insert(
+            root,
+            (image_ty, (Dim::Dim2D, false), ImageComp::Float, false),
+        );
+
+        let fixed0 = ctx.module.fresh_id();
+        let source0 = ctx.module.fresh_id();
+        let fixed1 = ctx.module.fresh_id();
+        let source1 = ctx.module.fresh_id();
+        let selector = ctx.const_uint(1);
+        let table_root = ctx.module.fresh_id();
+        let handle = ctx.module.fresh_id();
+        let bool_ty = ctx.ty_bool();
+        let condition = ctx.const_bool_of(bool_ty, false);
+        let callee = ctx.module.fresh_id();
+        let call_result = ctx.module.fresh_id();
+        ctx.module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(callee),
+                Operand::LiteralString("air.get_width_texture_2d".into()),
+            ],
+        ));
+        ctx.emit_sidecar.local_pointer_field_loads.extend([
+            crate::emit_sidecar::LocalPointerFieldLoad {
+                id: fixed0,
+                root,
+                indices: vec![0],
+            },
+            crate::emit_sidecar::LocalPointerFieldLoad {
+                id: fixed1,
+                root,
+                indices: vec![1],
+            },
+        ]);
+        ctx.emit_sidecar.local_pointer_field_stores.extend([
+            crate::emit_sidecar::LocalPointerFieldStore {
+                id: ctx.module.fresh_id(),
+                source: source0,
+                root: table_root,
+                indices: vec![0, 0, 0],
+            },
+            crate::emit_sidecar::LocalPointerFieldStore {
+                id: ctx.module.fresh_id(),
+                source: source1,
+                root: table_root,
+                indices: vec![0, 1, 0],
+            },
+        ]);
+        ctx.emit_sidecar.local_pointer_dynamic_field_loads.push(
+            crate::emit_sidecar::LocalPointerDynamicFieldLoad {
+                id: handle,
+                root: table_root,
+                prefix: vec![0],
+                index: selector,
+                suffix: vec![0],
+            },
+        );
+        let function_id = ctx.module.fresh_id();
+        let label = ctx.module.fresh_id();
+        ctx.module.functions.push(Function {
+            def: Some(Instruction::new(
+                Op::Function,
+                None,
+                Some(function_id),
+                vec![],
+            )),
+            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CopyObject,
+                        Some(private_byte),
+                        Some(fixed0),
+                        vec![Operand::IdRef(source0)],
+                    ),
+                    Instruction::new(
+                        Op::CopyObject,
+                        Some(private_byte),
+                        Some(fixed1),
+                        vec![Operand::IdRef(source1)],
+                    ),
+                    Instruction::new(
+                        Op::Select,
+                        Some(private_byte),
+                        Some(handle),
+                        vec![
+                            Operand::IdRef(condition),
+                            Operand::IdRef(source1),
+                            Operand::IdRef(source0),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::FunctionCall,
+                        Some(uint_ty),
+                        Some(call_result),
+                        vec![Operand::IdRef(callee), Operand::IdRef(handle)],
+                    ),
+                ],
+            }],
+        });
+
+        materialize_texture_array_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        let load = body
+            .iter()
+            .find(|inst| inst.result_id == Some(handle))
+            .expect("materialized handle");
+        assert_eq!(load.class.opcode, Op::Load);
+        assert_eq!(load.result_type, Some(image_ty));
+        assert!(body.iter().any(|inst| {
+            inst.class.opcode == Op::AccessChain
+                && inst.result_type == Some(ptr_image)
+                && inst.operands.first() == Some(&Operand::IdRef(root))
+        }));
+        assert!(ctx
+            .emit_sidecar
+            .local_pointer_dynamic_field_loads
+            .is_empty());
+    }
 
     #[test]
     fn single_use_texture_array_load_sinks_out_of_loop_header() {

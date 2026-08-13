@@ -1,8 +1,5 @@
 use super::*;
-use crate::native::cfg::graph::{
-    bit_is_set, clear_unused_bits, set_bit, spirv_block_successors as cloned_block_successors,
-    spirv_label_dominates as label_dominates,
-};
+use crate::native::cfg::graph::spirv_block_successors as cloned_block_successors;
 
 mod loop_continue;
 mod merge_helpers;

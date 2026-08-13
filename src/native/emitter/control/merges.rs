@@ -15,8 +15,12 @@ impl Emitter {
         &mut self,
         blocks: &mut [Block],
     ) {
+        // Relocating an instruction changes its defining block but never changes the CFG. Build the
+        // compact dominator tree once; only the much smaller value-definition map must be refreshed
+        // after a move. The former full dominator-set map was O(V^2) and rebuilt for every relocated
+        // materialization, leaving hundreds of MiB of allocator high-water pages on large functions.
+        let dominators = emitted_block_dominators(blocks);
         loop {
-            let dominators = block_dominators(blocks);
             let defs = block_value_defs(blocks);
             let mut moved = false;
             'scan: for target_idx in 0..blocks.len() {
@@ -74,6 +78,25 @@ impl Emitter {
             if !moved {
                 break;
             }
+        }
+
+        // A non-phi instruction can remain between phis even when it is not itself a phi incoming
+        // materialization (for example, index arithmetic rematerialized for an earlier pointer phi in
+        // the same block). Every OpPhi semantically executes at block entry and its operands come from
+        // predecessor edges, so stable-partitioning the residual phis ahead of ordinary instructions is
+        // the canonical SPIR-V order. Materializations that actually feed a phi were relocated by the
+        // dominance-checked loop above first; any unsupported same-block dependency remains invalid and
+        // is still rejected by the caller's module-level validation gate.
+        for block in blocks {
+            if !has_non_leading_phi(block) {
+                continue;
+            }
+            let instructions = std::mem::take(&mut block.instructions);
+            let (mut phis, rest): (Vec<_>, Vec<_>) = instructions
+                .into_iter()
+                .partition(|inst| inst.class.opcode == Op::Phi);
+            phis.extend(rest);
+            block.instructions = phis;
         }
     }
 }

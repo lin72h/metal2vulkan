@@ -28,6 +28,10 @@ fn fragment_output_type(
     ty: Word,
     defs: &HashMap<Word, Instruction>,
 ) -> Word {
+    let interface_ty = user_location_output_type(ctx, ty);
+    if interface_ty != ty {
+        return interface_ty;
+    }
     let Some(name) = frag.and_then(|meta| meta.render_target_type_name(member_idx as u32)) else {
         return ty;
     };
@@ -35,6 +39,14 @@ fn fragment_output_type(
         return int32_render_target_interface_type(ctx, signed, lanes, ty, defs).unwrap_or(ty);
     }
     ty
+}
+
+fn user_location_output_type(ctx: &mut Ctx, ty: Word) -> Word {
+    if type_def_of(ctx, ty).is_some_and(|definition| definition.class.opcode == Op::TypeBool) {
+        ctx.ty_uint()
+    } else {
+        ty
+    }
 }
 
 fn air_integer_render_target_shape(name: &str) -> Option<(bool, u32)> {
@@ -96,6 +108,22 @@ fn bitcast_for_store(
 ) -> Word {
     if src_ty == dst_ty {
         return value;
+    }
+    if type_def_of(ctx, src_ty).is_some_and(|ty| ty.class.opcode == Op::TypeBool)
+        && int_component_shape_live(ctx, dst_ty) == Some((32, false))
+    {
+        let selected = ctx.module.fresh_id();
+        stores.push(Instruction::new(
+            Op::Select,
+            Some(dst_ty),
+            Some(selected),
+            vec![
+                Operand::IdRef(value),
+                Operand::IdRef(ctx.const_uint(1)),
+                Operand::IdRef(ctx.const_uint(0)),
+            ],
+        ));
+        return selected;
     }
     let cast = ctx.module.fresh_id();
     stores.push(Instruction::new(
@@ -161,6 +189,72 @@ fn int_component_shape_live(ctx: &Ctx, ty: Word) -> Option<(u32, bool)> {
         _ => return None,
     };
     Some((bits, signed))
+}
+
+fn fragment_imageblock_coord(
+    ctx: &mut Ctx,
+    coord_var: Word,
+    instructions: &mut Vec<Instruction>,
+) -> Word {
+    let v4float = ctx.ty_vecf(4);
+    let float_ty = ctx.ty_float();
+    let sint_ty = ctx.ty_sint();
+    let v2sint = ctx.ty_vec_sint(2);
+    let coord_value = ctx.module.fresh_id();
+    instructions.push(Instruction::new(
+        Op::Load,
+        Some(v4float),
+        Some(coord_value),
+        vec![Operand::IdRef(coord_var)],
+    ));
+    let mut components = Vec::with_capacity(2);
+    for component in 0..2 {
+        let value = ctx.module.fresh_id();
+        instructions.push(Instruction::new(
+            Op::CompositeExtract,
+            Some(float_ty),
+            Some(value),
+            vec![
+                Operand::IdRef(coord_value),
+                Operand::LiteralBit32(component),
+            ],
+        ));
+        let converted = ctx.module.fresh_id();
+        instructions.push(Instruction::new(
+            Op::ConvertFToS,
+            Some(sint_ty),
+            Some(converted),
+            vec![Operand::IdRef(value)],
+        ));
+        components.push(Operand::IdRef(converted));
+    }
+    let coord = ctx.module.fresh_id();
+    instructions.push(Instruction::new(
+        Op::CompositeConstruct,
+        Some(v2sint),
+        Some(coord),
+        components,
+    ));
+    coord
+}
+
+fn ensure_fragment_imageblock_coord_var(ctx: &mut Ctx) -> Word {
+    if let Some(var) = ctx.fragment_imageblock_coord_var {
+        return var;
+    }
+    let coord_ty = ctx.ty_vecf(4);
+    let pointer_ty = ctx.ty_ptr(StorageClass::Input, coord_ty);
+    let var = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::Variable,
+        Some(pointer_ty),
+        Some(var),
+        vec![Operand::StorageClass(StorageClass::Input)],
+    ));
+    decorate_builtin(&mut ctx.module, var, BuiltIn::FragCoord);
+    ctx.interface.push(var);
+    ctx.fragment_imageblock_coord_var = Some(var);
+    var
 }
 
 fn vertex_builtin_output_type(ctx: &mut Ctx, builtin: BuiltIn, member_ty: Word) -> Word {
@@ -300,6 +394,12 @@ pub(in crate::passes) fn rewrite_return(
         }
     }
     if ret_locs.is_empty() {
+        if ctx.uses_fragment_imageblock {
+            return Err(
+                "fragment imageblock entry has no value return at which to end pixel interlock"
+                    .to_string(),
+            );
+        }
         // void return (e.g. a discard-only shader): nothing to do.
         return Ok(());
     }
@@ -328,6 +428,16 @@ pub(in crate::passes) fn rewrite_return(
             member: u32,
             src_ty: Word,
             elem_ty: Word,
+        },
+        FragmentImageblock {
+            image_var: Word,
+            image_ty: Word,
+            return_member: u32,
+            projection_member: u32,
+            projection_ty: Word,
+            member_ty: Word,
+            coord_var: Word,
+            format: FragmentImageblockFormat,
         },
     }
 
@@ -397,6 +507,97 @@ pub(in crate::passes) fn rewrite_return(
                     ));
                     return stores;
                 }
+                OutputWrite::FragmentImageblock {
+                    image_var,
+                    image_ty,
+                    return_member,
+                    projection_member,
+                    projection_ty,
+                    member_ty,
+                    coord_var,
+                    format,
+                } => {
+                    if composite_member_is_statically_undef(ctx, retval, return_member) {
+                        return stores;
+                    }
+                    let projection = ctx.module.fresh_id();
+                    stores.push(Instruction::new(
+                        Op::CompositeExtract,
+                        Some(projection_ty),
+                        Some(projection),
+                        vec![Operand::IdRef(retval), Operand::LiteralBit32(return_member)],
+                    ));
+                    let member = ctx.module.fresh_id();
+                    stores.push(Instruction::new(
+                        Op::CompositeExtract,
+                        Some(member_ty),
+                        Some(member),
+                        vec![
+                            Operand::IdRef(projection),
+                            Operand::LiteralBit32(projection_member),
+                        ],
+                    ));
+                    let wide_scalar_ty = match format.component {
+                        ImageComp::Float => ctx.ty_float(),
+                        ImageComp::Uint => ctx.ty_uint(),
+                        ImageComp::Sint => ctx.ty_sint(),
+                    };
+                    let wide_ty = if format.lanes == 1 {
+                        wide_scalar_ty
+                    } else {
+                        match format.component {
+                            ImageComp::Float => ctx.ty_vecf(4),
+                            ImageComp::Uint => ctx.ty_vec_uint(4),
+                            ImageComp::Sint => ctx.ty_vec_sint(4),
+                        }
+                    };
+                    let converted = ctx.module.fresh_id();
+                    stores.push(Instruction::new(
+                        match format.component {
+                            ImageComp::Float => Op::FConvert,
+                            ImageComp::Uint => Op::UConvert,
+                            ImageComp::Sint => Op::SConvert,
+                        },
+                        Some(wide_ty),
+                        Some(converted),
+                        vec![Operand::IdRef(member)],
+                    ));
+                    let texel = if format.lanes == 1 {
+                        let texel = ctx.module.fresh_id();
+                        stores.push(Instruction::new(
+                            Op::CompositeConstruct,
+                            Some(match format.component {
+                                ImageComp::Float => ctx.ty_vecf(4),
+                                ImageComp::Uint => ctx.ty_vec_uint(4),
+                                ImageComp::Sint => ctx.ty_vec_sint(4),
+                            }),
+                            Some(texel),
+                            vec![Operand::IdRef(converted); 4],
+                        ));
+                        texel
+                    } else {
+                        converted
+                    };
+                    let coord = fragment_imageblock_coord(ctx, coord_var, &mut stores);
+                    let image = ctx.module.fresh_id();
+                    stores.push(Instruction::new(
+                        Op::Load,
+                        Some(image_ty),
+                        Some(image),
+                        vec![Operand::IdRef(image_var)],
+                    ));
+                    stores.push(Instruction::new(
+                        Op::ImageWrite,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(image),
+                            Operand::IdRef(coord),
+                            Operand::IdRef(texel),
+                        ],
+                    ));
+                    return stores;
+                }
             };
             let value = value_for_store(ctx, &mut stores, value, src_ty, dst_ty);
             stores.push(Instruction::new(
@@ -419,6 +620,85 @@ pub(in crate::passes) fn rewrite_return(
                     // MRT/depth: one Output per modeled return member.
                     for (mi, op) in def.operands.clone().iter().enumerate() {
                         let Operand::IdRef(mty) = op else { continue };
+                        if let Some((imageblock, projection)) = frag
+                            .and_then(|meta| meta.fragment_imageblock.as_ref())
+                            .and_then(|imageblock| {
+                                imageblock
+                                    .outputs
+                                    .iter()
+                                    .find(|projection| projection.interface_index == mi as u32)
+                                    .map(|projection| (imageblock, projection))
+                            })
+                        {
+                            let projected_types = defs
+                                .get(mty)
+                                .filter(|definition| definition.class.opcode == Op::TypeStruct)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "fragment imageblock return member {mi} is not a struct value"
+                                    )
+                                })?
+                                .operands
+                                .iter()
+                                .filter_map(|operand| match operand {
+                                    Operand::IdRef(ty) => Some(*ty),
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>();
+                            if projected_types.len() != projection.members.len() {
+                                return Err(format!(
+                                    "fragment imageblock return member {mi} exposes {} fields but AIR projects {}",
+                                    projected_types.len(),
+                                    projection.members.len()
+                                ));
+                            }
+                            let coord_var = ensure_fragment_imageblock_coord_var(ctx);
+                            for (projected_ty, projected) in
+                                projected_types.into_iter().zip(projection.members.iter())
+                            {
+                                let master = imageblock
+                                    .members
+                                    .get(projected.master_member as usize)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "fragment imageblock return member {mi} references missing master member {}",
+                                            projected.master_member
+                                        )
+                                    })?;
+                                let format = fragment_imageblock_format(&master.type_name)
+                                    .ok_or_else(|| {
+                                        format!(
+                                            "fragment imageblock return member {mi} field {} has unsupported master type {}",
+                                            projected.projection_member, master.type_name
+                                        )
+                                    })?;
+                                if !super::stage_input::fragment_imageblock_projection_type_matches(
+                                    defs,
+                                    projected_ty,
+                                    format,
+                                ) {
+                                    return Err(format!(
+                                        "fragment imageblock return member {mi} field {} does not match AIR master type {}",
+                                        projected.projection_member, master.type_name
+                                    ));
+                                }
+                                let (image_var, image_ty) = ctx.fragment_imageblock_var(
+                                    projected.master_member,
+                                    &master.type_name,
+                                )?;
+                                outputs.push(OutputWrite::FragmentImageblock {
+                                    image_var,
+                                    image_ty,
+                                    return_member: mi as u32,
+                                    projection_member: projected.projection_member,
+                                    projection_ty: *mty,
+                                    member_ty: projected_ty,
+                                    coord_var,
+                                    format,
+                                });
+                            }
+                            continue;
+                        }
                         #[derive(Clone, Copy)]
                         enum OutKind {
                             Location(u32),
@@ -540,7 +820,7 @@ pub(in crate::passes) fn rewrite_return(
                             (OutKind::Builtin(builtin), _) => {
                                 vertex_builtin_output_type(ctx, builtin, *mty)
                             }
-                            (OutKind::Location(_), _) => *mty,
+                            (OutKind::Location(_), _) => user_location_output_type(ctx, *mty),
                         };
                         let var = make_output_var(ctx, output_ty);
                         match kind {
@@ -594,6 +874,14 @@ pub(in crate::passes) fn rewrite_return(
         let mut replacement = Vec::new();
         for output in &outputs {
             replacement.extend(output.stores(ctx, retval));
+        }
+        if ctx.uses_fragment_imageblock {
+            replacement.push(Instruction::new(
+                Op::EndInvocationInterlockEXT,
+                None,
+                None,
+                vec![],
+            ));
         }
         replacement.push(Instruction::new(Op::Return, None, None, vec![]));
 
@@ -796,4 +1084,28 @@ fn make_output_var(ctx: &mut Ctx, ty: Word) -> Word {
         vec![Operand::StorageClass(StorageClass::Output)],
     ));
     var
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::passes::resources::rewrites::combined_type_defs;
+
+    #[test]
+    fn scalar_bool_fragment_output_uses_uint_interface_and_select() {
+        let mut ctx = Ctx::new(Module::new());
+        let bool_ty = ctx.ty_bool();
+        let defs = combined_type_defs(&ctx, &HashMap::new());
+
+        let output_ty = fragment_output_type(&mut ctx, None, 0, bool_ty, &defs);
+        assert_eq!(output_ty, ctx.ty_uint());
+
+        let bool_value = ctx.module.fresh_id();
+        let mut stores = Vec::new();
+        let converted = value_for_store(&mut ctx, &mut stores, bool_value, bool_ty, output_ty);
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].class.opcode, Op::Select);
+        assert_eq!(stores[0].result_id, Some(converted));
+        assert_eq!(stores[0].result_type, Some(output_ty));
+    }
 }

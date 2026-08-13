@@ -1,7 +1,7 @@
 //! Unit coverage for the reflection facade: parse a known AIR fixture into meta, build the
 //! [`ShaderReflection`], and assert the exported binding numbers match the ABI convention the
 //! interface pass decorates (buffers = index, textures = 32+n, samplers = 64+n, colors = 96+n,
-//! all in descriptor set 0).
+//! implicit imageblock attachment planes = 128+3*attachment+data-rate, all in descriptor set 0).
 
 use super::*;
 use crate::meta::{
@@ -23,6 +23,10 @@ const FRAG_LL: &str = r#"
 
 #[test]
 fn fragment_reflection_matches_abi_convention() {
+    assert_eq!(ADDRESS_SPACE_DEVICE, 1);
+    assert_eq!(ADDRESS_SPACE_CONSTANT, 2);
+    assert_eq!(ADDRESS_SPACE_THREADGROUP, 3);
+
     let meta = parse_air_fragment_meta(FRAG_LL).unwrap();
     let r = ShaderReflection::from_fragment(&meta, Some("myFragment"));
 
@@ -36,7 +40,8 @@ fn fragment_reflection_matches_abi_convention() {
         tex.descriptor,
         Some(DescriptorLocation {
             set: 0,
-            binding: TEXTURE_BINDING_BASE
+            binding: TEXTURE_BINDING_BASE,
+            count: 1,
         })
     );
     assert_eq!(tex.param_index, Some(2));
@@ -48,7 +53,11 @@ fn fragment_reflection_matches_abi_convention() {
     let buf = r.binding_at(ResourceKind::Buffer, 5).expect("buffer 5");
     assert_eq!(
         buf.descriptor,
-        Some(DescriptorLocation { set: 0, binding: 5 })
+        Some(DescriptorLocation {
+            set: 0,
+            binding: 5,
+            count: 1,
+        })
     );
     // R1.6: the fragment buffer's declared byte size is exported from `air.buffer_size` (32 in the
     // fixture) instead of being dropped, so a consumer never re-parses the AIR arg metadata.
@@ -60,7 +69,8 @@ fn fragment_reflection_matches_abi_convention() {
         smp.descriptor,
         Some(DescriptorLocation {
             set: 0,
-            binding: SAMPLER_BINDING_BASE + 2
+            binding: SAMPLER_BINDING_BASE + 2,
+            count: 1,
         })
     );
 
@@ -84,6 +94,378 @@ fn fragment_reflection_matches_abi_convention() {
         .bindings
         .iter()
         .all(|b| b.kind != ResourceKind::ColorInput));
+}
+
+#[test]
+fn reflected_buffer_footprint_reports_static_and_global_id_strides() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(i32 %gid, ptr addrspace(1) %input, ptr addrspace(1) %output) {
+entry:
+  %wide = zext i32 %gid to i64
+  %shifted = add i64 %wide, 2
+  %source = getelementptr inbounds i32, ptr addrspace(1) %input, i64 %shifted
+  %value = load i32, ptr addrspace(1) %source, align 4
+  %fixed1 = getelementptr inbounds i32, ptr addrspace(1) %input, i64 1
+  %a = load i32, ptr addrspace(1) %fixed1, align 4
+  %fixed2 = getelementptr inbounds i32, ptr addrspace(1) %input, i64 2
+  %b = load i32, ptr addrspace(1) %fixed2, align 4
+  %sum = add i32 %value, %a
+  %sum2 = add i32 %sum, %b
+  store i32 %sum2, ptr addrspace(1) %output, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"input"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"output"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_buffer_footprint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Kernel,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+    let plain = crate::translate_sanitized_native(ll, crate::passes::Stage::Kernel, &tmp)
+        .expect("plain translate");
+    assert_eq!(spv, plain, "footprint reflection must remain byte-neutral");
+
+    let input = reflection
+        .binding_at(ResourceKind::Buffer, 1)
+        .and_then(|binding| binding.footprint.as_ref())
+        .expect("input footprint");
+    assert_eq!(
+        input.static_ranges,
+        vec![BufferByteRange { offset: 4, size: 8 }]
+    );
+    assert_eq!(
+        input.strided_accesses,
+        vec![BufferStridedAccess {
+            base_offset: 8,
+            access_size: 4,
+            terms: vec![BufferStrideTerm {
+                source: BufferIndexSource::GlobalInvocationIdX,
+                stride: 4,
+            }],
+        }],
+        "{input:?}"
+    );
+    assert!(!input.has_unbounded_access);
+
+    let output = reflection
+        .binding_at(ResourceKind::Buffer, 2)
+        .and_then(|binding| binding.footprint.as_ref())
+        .expect("output footprint");
+    assert_eq!(
+        output.static_ranges,
+        vec![BufferByteRange { offset: 0, size: 4 }]
+    );
+    assert!(output.strided_accesses.is_empty());
+    assert!(!output.has_unbounded_access);
+
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn reflected_buffer_footprint_marks_data_dependent_index_unbounded() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(ptr addrspace(1) %indices, ptr addrspace(1) %data, ptr addrspace(1) %output) {
+entry:
+  %index = load i32, ptr addrspace(1) %indices, align 4
+  %wide = zext i32 %index to i64
+  %source = getelementptr inbounds i32, ptr addrspace(1) %data, i64 %wide
+  %value = load i32, ptr addrspace(1) %source, align 4
+  store i32 %value, ptr addrspace(1) %output, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"indices"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"data"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"output"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_unbounded_footprint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Kernel,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+
+    let indices = reflection
+        .binding_at(ResourceKind::Buffer, 0)
+        .and_then(|binding| binding.footprint.as_ref())
+        .expect("indices footprint");
+    assert_eq!(
+        indices.static_ranges,
+        vec![BufferByteRange { offset: 0, size: 4 }]
+    );
+    assert!(!indices.has_unbounded_access);
+
+    let data = reflection
+        .binding_at(ResourceKind::Buffer, 1)
+        .and_then(|binding| binding.footprint.as_ref())
+        .expect("data footprint");
+    assert!(data.static_ranges.is_empty());
+    assert!(data.strided_accesses.is_empty());
+    assert!(data.has_unbounded_access);
+
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn reflected_vertex_buffer_footprints_use_vertex_and_instance_indices() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define <4 x float> @v(i32 %vid, i32 %iid, ptr addrspace(1) %vertices, ptr addrspace(1) %instances) {
+entry:
+  %vwide = zext i32 %vid to i64
+  %vptr = getelementptr inbounds float, ptr addrspace(1) %vertices, i64 %vwide
+  %x = load float, ptr addrspace(1) %vptr, align 4
+  %iwide = zext i32 %iid to i64
+  %iptr = getelementptr inbounds float, ptr addrspace(1) %instances, i64 %iwide
+  %y = load float, ptr addrspace(1) %iptr, align 4
+  %p0 = insertelement <4 x float> poison, float %x, i64 0
+  %p1 = insertelement <4 x float> %p0, float %y, i64 1
+  %p2 = insertelement <4 x float> %p1, float 0.000000e+00, i64 2
+  %p3 = insertelement <4 x float> %p2, float 1.000000e+00, i64 3
+  ret <4 x float> %p3
+}
+
+!air.vertex = !{!0}
+!0 = !{ptr @v, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6, !7}
+!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"vid"}
+!5 = !{i32 1, !"air.instance_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"iid"}
+!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"vertices"}
+!7 = !{i32 3, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"instances"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_vertex_footprint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Vertex,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+
+    for (metal_index, source) in [
+        (3, BufferIndexSource::VertexIndex),
+        (4, BufferIndexSource::InstanceIndex),
+    ] {
+        let footprint = reflection
+            .binding_at(ResourceKind::Buffer, metal_index)
+            .and_then(|binding| binding.footprint.as_ref())
+            .expect("buffer footprint");
+        assert_eq!(
+            footprint.strided_accesses,
+            [BufferStridedAccess {
+                base_offset: 0,
+                access_size: 4,
+                terms: vec![BufferStrideTerm { source, stride: 4 }],
+            }],
+            "metal buffer {metal_index}: {footprint:?}"
+        );
+        assert!(!footprint.has_unbounded_access);
+    }
+
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn reflected_buffer_footprint_preserves_multiaxis_affine_terms() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(<3 x i32> %tid, ptr addrspace(1) %grid, ptr addrspace(1) %output) {
+entry:
+  %x = extractelement <3 x i32> %tid, i64 0
+  %y = extractelement <3 x i32> %tid, i64 1
+  %xwide = zext i32 %x to i64
+  %ywide = zext i32 %y to i64
+  %source = getelementptr inbounds [8 x i32], ptr addrspace(1) %grid, i64 %xwide, i64 %ywide
+  %value = load i32, ptr addrspace(1) %source, align 4
+  store i32 %value, ptr addrspace(1) %output, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"tid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"grid"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"output"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_multiaxis_footprint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Kernel,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+    let footprint = reflection
+        .binding_at(ResourceKind::Buffer, 0)
+        .and_then(|binding| binding.footprint.as_ref())
+        .expect("grid footprint");
+    assert_eq!(
+        footprint.strided_accesses,
+        [BufferStridedAccess {
+            base_offset: 0,
+            access_size: 4,
+            terms: vec![
+                BufferStrideTerm {
+                    source: BufferIndexSource::GlobalInvocationIdX,
+                    stride: 32,
+                },
+                BufferStrideTerm {
+                    source: BufferIndexSource::GlobalInvocationIdY,
+                    stride: 4,
+                },
+            ],
+        }],
+        "{footprint:?}"
+    );
+    assert!(!footprint.has_unbounded_access);
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn reflected_buffer_footprint_covers_every_cross_binding_pointer_arm() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @k(i32 %gid, ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %output) {
+entry:
+  %wide = zext i32 %gid to i64
+  %choose_a = icmp eq i32 %gid, 0
+  %selected = select i1 %choose_a, ptr addrspace(1) %a, ptr addrspace(1) %b
+  %source = getelementptr inbounds i32, ptr addrspace(1) %selected, i64 %wide
+  %value = load i32, ptr addrspace(1) %source, align 4
+  store i32 %value, ptr addrspace(1) %output, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"a"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"b"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"output"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_pointer_arms_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Kernel,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+    let expected = [BufferStridedAccess {
+        base_offset: 0,
+        access_size: 4,
+        terms: vec![BufferStrideTerm {
+            source: BufferIndexSource::GlobalInvocationIdX,
+            stride: 4,
+        }],
+    }];
+    for metal_index in [1, 2] {
+        let footprint = reflection
+            .binding_at(ResourceKind::Buffer, metal_index)
+            .and_then(|binding| binding.footprint.as_ref())
+            .expect("selected buffer footprint");
+        assert_eq!(footprint.strided_accesses, expected, "{footprint:?}");
+        assert!(!footprint.has_unbounded_access);
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn reflected_buffer_footprint_counts_atomic_memory_width() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%"struct.metal::_atomic" = type { i32 }
+
+define void @k(ptr addrspace(1) %counts) {
+entry:
+  %slot = getelementptr inbounds %"struct.metal::_atomic", ptr addrspace(1) %counts, i64 3, i32 0
+  %old = tail call i32 @air.atomic.global.add.u.i32(ptr addrspace(1) %slot, i32 1, i32 0, i32 2, i1 true)
+  ret void
+}
+
+declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"atomic_uint", !"air.arg_name", !"counts"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reflect_atomic_footprint_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Kernel,
+        &tmp,
+        crate::passes::TransformOptions::default(),
+    )
+    .expect("translate");
+    let footprint = reflection
+        .binding_at(ResourceKind::Buffer, 0)
+        .and_then(|binding| binding.footprint.as_ref())
+        .expect("atomic footprint");
+    assert_eq!(
+        footprint.static_ranges,
+        [BufferByteRange {
+            offset: 12,
+            size: 4,
+        }],
+        "{footprint:?}"
+    );
+    assert!(!footprint.has_unbounded_access);
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -141,6 +523,10 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     assert!(asm.contains("Binding 96"), "{asm}");
     assert!(!asm.contains("Binding 97"), "{asm}");
     assert!(!asm.contains("Binding 98"), "{asm}");
+    let color_input = reflection
+        .binding_at(ResourceKind::ColorInput, 0)
+        .expect("framebuffer-fetch input");
+    assert_eq!(color_input.type_name.as_deref(), Some("float4"));
 
     let static_samplers = reflection
         .bindings
@@ -187,12 +573,12 @@ fn fragment_and_vertex_buffer_address_space_exported_when_known() {
         roles: vec![(0, FragRole::Buffer(0)), (1, FragRole::Buffer(1))],
         ..Default::default()
     };
-    frag.buffer_address_spaces.insert(0, 2); // constant
+    frag.buffer_address_spaces.insert(0, ADDRESS_SPACE_CONSTANT);
     frag.buffer_type_sizes.insert(0, 64);
     // param 1 has no recorded address space -> reflection reports None (not a guessed default).
     let rf = ShaderReflection::from_fragment(&frag, Some("f"));
     let b0 = rf.binding_at(ResourceKind::Buffer, 0).expect("buffer 0");
-    assert_eq!(b0.address_space, Some(2));
+    assert_eq!(b0.address_space, Some(ADDRESS_SPACE_CONSTANT));
     assert_eq!(b0.declared_size, Some(64));
     let b1 = rf.binding_at(ResourceKind::Buffer, 1).expect("buffer 1");
     assert_eq!(b1.address_space, None);
@@ -202,22 +588,23 @@ fn fragment_and_vertex_buffer_address_space_exported_when_known() {
         roles: vec![(0, VertRole::Buffer(3))],
         ..Default::default()
     };
-    vert.buffer_address_spaces.insert(0, 1); // device
+    vert.buffer_address_spaces.insert(0, ADDRESS_SPACE_DEVICE);
     let rv = ShaderReflection::from_vertex(&vert, Some("v"));
     let vb = rv
         .binding_at(ResourceKind::Buffer, 3)
         .expect("vertex buffer 3");
-    assert_eq!(vb.address_space, Some(1));
+    assert_eq!(vb.address_space, Some(ADDRESS_SPACE_DEVICE));
 }
 
 const VERT_LL: &str = r#"
 !air.vertex = !{!5}
 !5 = !{ptr @V, !6, !8}
-!6 = !{!7}
+!6 = !{!7, !11}
 !7 = !{i32 0, !"air.position", !"air.center"}
 !8 = !{!9, !10}
 !9 = !{i32 0, !"air.vertex_input", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos", !"air.location_index", i32 0, i32 1}
 !10 = !{i32 1, !"air.buffer", !"air.location_index", i32 2, i32 1}
+!11 = !{!"air.vertex_output", !"generated(2uvDv2_f)", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
 "#;
 
 #[test]
@@ -230,7 +617,11 @@ fn vertex_reflection_exports_attributes_and_buffer() {
     let buf = r.binding_at(ResourceKind::Buffer, 2).expect("buffer 2");
     assert_eq!(
         buf.descriptor,
-        Some(DescriptorLocation { set: 0, binding: 2 })
+        Some(DescriptorLocation {
+            set: 0,
+            binding: 2,
+            count: 1,
+        })
     );
 
     // Vertex attribute at location 0 exported with its type/name.
@@ -241,12 +632,64 @@ fn vertex_reflection_exports_attributes_and_buffer() {
         .expect("attribute 0");
     assert_eq!(attr.type_name.as_deref(), Some("float4"));
     assert_eq!(attr.name.as_deref(), Some("pos"));
+    assert_eq!(
+        r.varyings,
+        [Varying {
+            location: 0,
+            type_name: Some("float2".into()),
+            name: Some("uv".into()),
+            user_semantic: Some("generated(2uvDv2_f)".into()),
+        }]
+    );
+}
+
+#[test]
+fn tessellation_reflection_exports_patch_interface_locations() {
+    let ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @tes, !1, !2, !8}
+!1 = !{!3}
+!2 = !{!4, !7, !9}
+!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.patch_control_point_input", !5, !6}
+!5 = !{!"air.patch_control_point_function", ptr @control.MTL_CONTROL_POINT_FN}
+!6 = !{!"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"float3"}
+!7 = !{i32 1, !"air.patch_input", !"air.location_index", i32 4, i32 1, !"air.arg_type_name", !"float4"}
+!8 = !{!"air.patch", !"quad", !"air.patch_control_point", i32 16}
+!9 = !{i32 2, !"air.instance_id", !"air.arg_type_name", !"uint"}
+"#;
+    let meta = parse_air_vertex_meta(ll).unwrap();
+    let reflection = ShaderReflection::from_vertex(&meta, Some("tes"));
+    assert_eq!(reflection.stage, ShaderStage::TessellationEvaluation);
+    let tessellation = reflection.tessellation.unwrap();
+    assert_eq!(tessellation.control_point_count, 16);
+    assert_eq!(tessellation.control_point_locations, [1]);
+    assert_eq!(tessellation.patch_input_locations, [4]);
+    assert_eq!(tessellation.control_point_attributes[0].location, 1);
+    assert_eq!(
+        tessellation.control_point_attributes[0]
+            .type_name
+            .as_deref(),
+        Some("float3")
+    );
+    assert_eq!(tessellation.patch_attributes[0].location, 4);
+    assert_eq!(
+        tessellation.patch_attributes[0].type_name.as_deref(),
+        Some("float4")
+    );
+    assert_eq!(
+        tessellation.instance_id,
+        Some(TessellationAttribute {
+            location: 5,
+            type_name: Some("uint".into()),
+        })
+    );
 }
 
 #[test]
 fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
     // Build a KernMeta directly: a device buffer at index 0, a threadgroup buffer at index 1
-    // (address space 3), a texture at index 0, and one embedded arg-buffer texture.
+    // (address space 3), a texture at index 0, and one embedded arg-buffer texture array.
     let mut meta = KernMeta {
         roles: vec![
             (0, KernRole::Buffer(0)),
@@ -255,19 +698,46 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
         ],
         ..Default::default()
     };
-    meta.buffer_address_spaces.insert(0, 1); // device
+    meta.buffer_address_spaces.insert(0, ADDRESS_SPACE_DEVICE);
     meta.buffer_address_spaces
         .insert(1, ADDRESS_SPACE_THREADGROUP);
     meta.buffer_type_sizes.insert(0, 64);
     meta.texture_type_names
         .insert(2, "texture2d<float, sample>".to_string());
     meta.embedded_textures.push(EmbeddedTexture {
+        buffer_param_index: 0,
         buffer_index: 0,
         field_offset: 8,
+        field_ordinal: 1,
+        argument_index: 0,
         dim: spirv::Dim::Dim2D,
+        arrayed: false,
         comp: crate::passes::ImageComp::Float,
         storage_format: None,
+        array_length: Some(2),
         synthetic_texture_index: 3,
+    });
+    meta.embedded_arguments.push(crate::meta::EmbeddedArgument {
+        buffer_param_index: 0,
+        buffer_index: 0,
+        field_ordinal: 1,
+        field_offset: 8,
+        argument_index: 0,
+        resource_buffer_index: None,
+        resource_address_space: None,
+        resource_declared_size: None,
+        resource_access: None,
+    });
+    meta.embedded_arguments.push(crate::meta::EmbeddedArgument {
+        buffer_param_index: 0,
+        buffer_index: 0,
+        field_ordinal: 2,
+        field_offset: 16,
+        argument_index: 7,
+        resource_buffer_index: Some(7),
+        resource_address_space: Some(ADDRESS_SPACE_DEVICE),
+        resource_declared_size: Some(32),
+        resource_access: Some(crate::meta::BufferAccess::ReadWrite),
     });
 
     let r = ShaderReflection::from_kernel(&meta, Some("myKernel"), [64, 1, 1]);
@@ -280,10 +750,14 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
         .expect("device buffer");
     assert_eq!(
         dev.descriptor,
-        Some(DescriptorLocation { set: 0, binding: 0 })
+        Some(DescriptorLocation {
+            set: 0,
+            binding: 0,
+            count: 1,
+        })
     );
     assert_eq!(dev.declared_size, Some(64));
-    assert_eq!(dev.address_space, Some(1));
+    assert_eq!(dev.address_space, Some(ADDRESS_SPACE_DEVICE));
 
     // Threadgroup buffer 1 -> NO descriptor.
     let tg = r
@@ -298,7 +772,8 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
         tex.descriptor,
         Some(DescriptorLocation {
             set: 0,
-            binding: TEXTURE_BINDING_BASE
+            binding: TEXTURE_BINDING_BASE,
+            count: 1,
         })
     );
 
@@ -310,7 +785,8 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
         emb.descriptor,
         Some(DescriptorLocation {
             set: 0,
-            binding: TEXTURE_BINDING_BASE + 3
+            binding: TEXTURE_BINDING_BASE + 3,
+            count: 2,
         })
     );
     assert_eq!(emb.param_index, None);
@@ -318,8 +794,12 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
     assert_eq!(
         emb.embedded_source,
         Some(EmbeddedArgBuffer {
+            buffer_param_index: 0,
             buffer_index: 0,
-            field_offset: 8
+            field_offset: 8,
+            field_ordinal: 1,
+            argument_index: 0,
+            resource_buffer_index: None,
         })
     );
     // The embedded texture's decoded shape rides `texture_shape` too (always sampled 2D here).
@@ -327,6 +807,61 @@ fn kernel_reflection_threadgroup_buffer_has_no_descriptor() {
     assert_eq!(shape.dimension, crate::meta::TextureDimension::D2);
     assert_eq!(shape.component, crate::meta::TextureComponent::Float);
     assert!(!shape.writable);
+    assert!(shape.array_ref);
+    assert_eq!(shape.array_length, Some(2));
+
+    let nested = r
+        .binding_at(ResourceKind::EmbeddedArgBufferBuffer, 7)
+        .expect("embedded buffer");
+    assert_eq!(nested.descriptor, None);
+    assert_eq!(nested.param_index, None);
+    assert_eq!(
+        nested.embedded_source,
+        Some(EmbeddedArgBuffer {
+            buffer_param_index: 0,
+            buffer_index: 0,
+            field_offset: 16,
+            field_ordinal: 2,
+            argument_index: 7,
+            resource_buffer_index: Some(7),
+        })
+    );
+}
+
+#[test]
+fn kernel_stage_inputs_share_the_lowerings_synthetic_buffer_allocator() {
+    let mut meta = KernMeta {
+        roles: vec![
+            (0, KernRole::Buffer(0)),
+            (1, KernRole::StageInput(6)),
+            (2, KernRole::StageInput(9)),
+        ],
+        ..Default::default()
+    };
+    meta.stage_input_type_names.insert(1, "uint3".into());
+    meta.stage_input_type_names.insert(2, "float2".into());
+    let reflection = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
+    let first = reflection
+        .binding_at(ResourceKind::KernelStageInput, 1)
+        .expect("first free buffer slot");
+    assert_eq!(first.param_index, Some(1));
+    assert_eq!(first.stage_input_location, Some(6));
+    assert_eq!(first.type_name.as_deref(), Some("uint3"));
+    assert_eq!(first.access, Some(ResourceAccess::ReadOnly));
+    assert_eq!(first.extent, Some(BufferExtent::Unbounded));
+    assert_eq!(
+        first.descriptor,
+        Some(DescriptorLocation {
+            set: RESOURCE_DESCRIPTOR_SET,
+            binding: 1,
+            count: 1,
+        })
+    );
+    let second = reflection
+        .binding_at(ResourceKind::KernelStageInput, 2)
+        .expect("second free buffer slot");
+    assert_eq!(second.stage_input_location, Some(9));
+    assert_eq!(second.descriptor.expect("descriptor").binding, 2);
 }
 
 #[test]
@@ -353,6 +888,38 @@ fn imageblock_layouts_exported_for_kernel() {
     assert!(ShaderReflection::from_fragment(&frag, None)
         .imageblock_layouts
         .is_empty());
+}
+
+#[test]
+fn primitive_acceleration_structure_has_a_distinct_geometry_shadow_contract() {
+    let meta = KernMeta {
+        roles: vec![(0, KernRole::PrimitiveAccelerationStructureShadow(5))],
+        ..KernMeta::default()
+    };
+    let reflection = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
+    let binding = reflection
+        .binding_at(ResourceKind::PrimitiveAccelerationStructure, 5)
+        .expect("primitive acceleration structure");
+    assert_eq!(binding.param_index, Some(0));
+    assert_eq!(binding.access, Some(ResourceAccess::ReadOnly));
+    assert_eq!(
+        binding.descriptor,
+        Some(DescriptorLocation {
+            set: 0,
+            binding: 5,
+            count: 1,
+        })
+    );
+
+    let native_only = KernMeta {
+        roles: vec![(0, KernRole::PrimitiveAccelerationStructure(6))],
+        ..KernMeta::default()
+    };
+    let reflection = ShaderReflection::from_kernel(&native_only, Some("k"), [1, 1, 1]);
+    let binding = reflection
+        .binding_at(ResourceKind::PrimitiveAccelerationStructure, 6)
+        .expect("native-only primitive acceleration structure");
+    assert_eq!(binding.descriptor, None);
 }
 
 #[test]
@@ -451,12 +1018,26 @@ fn texture_access_classification_matches_declared_qualifier() {
         meta.texture_type_names.insert(i as u32, name.to_string());
     }
     let r = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
-    for (n, _, kind, access) in cases {
+    for (n, name, kind, access) in cases {
         let b = r
             .binding_at(kind, n)
             .unwrap_or_else(|| panic!("binding {n}"));
         assert_eq!(b.kind, kind, "kind for texture {n}");
         assert_eq!(b.access, Some(access), "access for texture {n}");
+        assert_eq!(
+            b.descriptor.expect("texture descriptor").count,
+            if kind == ResourceKind::TextureArray {
+                crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
+            } else {
+                1
+            },
+            "descriptor count for {name}"
+        );
+        assert_eq!(
+            b.texture_shape.and_then(|shape| shape.array_length),
+            (name == "array<texture2d<half, sample>, 32>").then_some(32),
+            "fixed array length for {name}"
+        );
     }
 }
 
@@ -612,7 +1193,7 @@ fn constant_buffer_is_read_only_device_is_unknown() {
         ..Default::default()
     };
     meta.buffer_address_spaces.insert(0, ADDRESS_SPACE_CONSTANT);
-    meta.buffer_address_spaces.insert(1, 1); // device
+    meta.buffer_address_spaces.insert(1, ADDRESS_SPACE_DEVICE);
     let r = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
     assert_eq!(
         r.binding_at(ResourceKind::Buffer, 0).unwrap().access,
@@ -636,8 +1217,8 @@ fn reflection_serde_round_trips() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn reflection_serde_covers_every_v4_field() {
-    // R6: the persisted-cache contract. Build a reflection with EVERY field populated to a
+fn reflection_serde_covers_every_reflection_field() {
+    // Persisted-cache contract: build a reflection with EVERY field populated to a
     // non-default value — including the translate-path-only fields a stage builder never fills
     // (function_constants, datalayout, imageblock_layouts) and the storage-format / embedded-source
     // texture facts — then prove serialize→deserialize is loss-free. `assert_eq!` over the whole
@@ -655,9 +1236,25 @@ fn reflection_serde_covers_every_v4_field() {
                 metal_index: 0,
                 descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, 0),
                 param_index: Some(0),
+                stage_input_location: None,
                 address_space: Some(2),
                 declared_size: Some(64),
                 extent: Some(BufferExtent::Object { bytes: 64 }),
+                footprint: Some(BufferFootprint {
+                    static_ranges: vec![BufferByteRange {
+                        offset: 16,
+                        size: 12,
+                    }],
+                    strided_accesses: vec![BufferStridedAccess {
+                        base_offset: 32,
+                        access_size: 16,
+                        terms: vec![BufferStrideTerm {
+                            source: BufferIndexSource::GlobalInvocationIdX,
+                            stride: 16,
+                        }],
+                    }],
+                    has_unbounded_access: true,
+                }),
                 type_layout: Some(AirType::Vec {
                     scalar: AirScalar::Float,
                     lanes: 4,
@@ -673,15 +1270,21 @@ fn reflection_serde_covers_every_v4_field() {
                 metal_index: 0,
                 descriptor: ResourceBinding::descriptor_at(TEXTURE_BINDING_BASE, 0),
                 param_index: None,
+                stage_input_location: None,
                 address_space: None,
                 declared_size: None,
                 extent: None,
+                footprint: None,
                 type_layout: None,
                 type_name: Some("texture2d<float, write>".to_string()),
                 texture_shape: Some(storage_tex),
                 embedded_source: Some(EmbeddedArgBuffer {
+                    buffer_param_index: 0,
                     buffer_index: 0,
                     field_offset: 8,
+                    field_ordinal: 1,
+                    argument_index: 0,
+                    resource_buffer_index: None,
                 }),
                 access: Some(ResourceAccess::Storage),
                 static_sampler: None,
@@ -691,9 +1294,11 @@ fn reflection_serde_covers_every_v4_field() {
                 metal_index: 1,
                 descriptor: ResourceBinding::descriptor_at(SAMPLER_BINDING_BASE, 1),
                 param_index: None,
+                stage_input_location: None,
                 address_space: None,
                 declared_size: None,
                 extent: None,
+                footprint: None,
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
@@ -708,6 +1313,14 @@ fn reflection_serde_covers_every_v4_field() {
                 ),
             },
         ],
+        argument_buffer_fields: vec![EmbeddedArgBuffer {
+            buffer_param_index: 0,
+            buffer_index: 0,
+            field_offset: 8,
+            field_ordinal: 1,
+            argument_index: 0,
+            resource_buffer_index: None,
+        }],
         vertex_attributes: vec![VertexAttribute {
             location: 0,
             type_name: Some("float4".to_string()),
@@ -725,6 +1338,7 @@ fn reflection_serde_covers_every_v4_field() {
             type_name: Some("float4".to_string()),
         }],
         depth_members: vec![1],
+        depth_qualifier: None,
         stencil_members: vec![2],
         local_size: Some([8, 8, 1]),
         vertex_builtins: Some(VertexBuiltins {
@@ -732,15 +1346,19 @@ fn reflection_serde_covers_every_v4_field() {
             uses_instance_index: true,
             writes_position: true,
         }),
+        tessellation: None,
         imageblock_layouts: vec![ImageblockLayout {
             param_index: 3,
             type_layout: AirType::Scalar(AirScalar::Float),
         }],
+        implicit_imageblock_attachments: Vec::new(),
+        fragment_imageblock: None,
         datalayout: Some("e-p:64:64-i64:64-n32:64".to_string()),
         function_constants: vec![FunctionConstant {
             index: 0,
             name: "myConst".to_string(),
             type_name: "i32".to_string(),
+            abi_type_encoding: "i".to_string(),
         }],
     };
     let json = serde_json::to_string(&r).expect("serialize reflection");
@@ -800,4 +1418,29 @@ fn abi_base_constants_are_the_contract() {
     assert_eq!(TEXTURE_BINDING_BASE, 32);
     assert_eq!(SAMPLER_BINDING_BASE, 64);
     assert_eq!(COLOR_INPUT_BINDING_BASE, 96);
+    assert_eq!(IMAGEBLOCK_BINDING_BASE, 128);
+    assert_eq!(IMAGEBLOCK_DATA_RATE_STRIDE, 3);
+    assert_eq!(imageblock_resource_binding(2, 1), 135);
+}
+
+#[test]
+fn function_tables_are_reflected_as_descriptor_free_link_resources() {
+    let meta = KernMeta {
+        roles: vec![
+            (0, KernRole::VisibleFunctionTable(7)),
+            (1, KernRole::IntersectionFunctionTable(9)),
+        ],
+        ..Default::default()
+    };
+    let reflection = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
+    assert!(reflection.bindings.iter().any(|binding| {
+        binding.kind == ResourceKind::VisibleFunctionTable
+            && binding.metal_index == 7
+            && binding.descriptor.is_none()
+    }));
+    assert!(reflection.bindings.iter().any(|binding| {
+        binding.kind == ResourceKind::IntersectionFunctionTable
+            && binding.metal_index == 9
+            && binding.descriptor.is_none()
+    }));
 }

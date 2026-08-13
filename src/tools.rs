@@ -200,8 +200,8 @@ pub fn air_to_sanitized_ll_with_datalayout(
 /// Sanitize LLVM IR text that is already in `.ll` form.
 ///
 /// This is the text-only core used by [`air_to_sanitized_ll_with_datalayout`]: rewrite the target
-/// triple to Vulkan, drop the AIR datalayout, and remove LLVM metadata/runtime root globals that are
-/// not part of the shader entry body.
+/// triple to Vulkan, drop the AIR datalayout and llvm-dis's input-path `ModuleID` comment, and
+/// remove LLVM metadata/runtime root globals that are not part of the shader entry body.
 pub fn sanitize_ll_text_with_datalayout(ll_text: &str) -> (String, Option<String>) {
     let mut out = String::with_capacity(ll_text.len());
     let mut datalayout = None;
@@ -213,6 +213,12 @@ pub fn sanitize_ll_text_with_datalayout(ll_text: &str) -> (String, Option<String
         }
         if t.starts_with("target datalayout") {
             datalayout = datalayout_value(t);
+            continue;
+        }
+        // llvm-dis derives this comment from its input filename. Validation disassembles through
+        // a uniquely named scratch directory, so retaining it makes identical bitcode acquire a
+        // different corpus identity on every harvest.
+        if t.starts_with("; ModuleID =") {
             continue;
         }
         if t.starts_with("@llvm.global_ctors")
@@ -238,14 +244,13 @@ fn datalayout_value(line: &str) -> Option<String> {
 
 /// Emit Vulkan SPIR-V from sanitized `.ll`, returning the raw SPIR-V binary words.
 ///
-/// Kept under the historical name because the rest of metal2vulkan's contract is built around this swap
-/// point: sanitized LLVM IR in, parseable SPIR-V words out. The implementation is native Rust now;
-/// unsupported IR shapes return explicit errors instead of invoking LLVM's SPIR-V backend.
-pub fn llc_vulkan_spirv(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
+/// This is an in-process native Rust emission boundary. Unsupported IR shapes return explicit
+/// errors.
+pub fn emit_vulkan_spirv(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -255,13 +260,13 @@ pub(crate) fn llc_vulkan_spirv_with_sidecar(
     native::emit_vulkan_spirv_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
 }
 
-/// Like [`llc_vulkan_spirv`], but enables the reject-only construct-tree own-arm candidate. Used only
+/// Like [`emit_vulkan_spirv`], but enables the reject-only construct-tree own-arm candidate. Used only
 /// by an adopt-if-validates retry tier after primary CFG validation failure.
-pub fn llc_vulkan_spirv_construct_tree(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
+pub fn emit_vulkan_spirv_construct_tree(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_construct_tree(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_construct_tree_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_construct_tree_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -271,13 +276,13 @@ pub(crate) fn llc_vulkan_spirv_construct_tree_with_sidecar(
     native::emit_vulkan_spirv_construct_tree_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
 }
 
-/// Like [`llc_vulkan_spirv`], but models every device/constant buffer param raw. Used by the R4
+/// Like [`emit_vulkan_spirv`], but models every device/constant buffer param raw. Used by the R4
 /// ground-truth retry when the default typed emission produces a mistyped buffer access.
-pub fn llc_vulkan_spirv_all_buffers_raw(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
+pub fn emit_vulkan_spirv_all_buffers_raw(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_all_buffers_raw(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_all_buffers_raw_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -287,17 +292,17 @@ pub(crate) fn llc_vulkan_spirv_all_buffers_raw_with_sidecar(
     native::emit_vulkan_spirv_all_buffers_raw_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
 }
 
-/// Like [`llc_vulkan_spirv_all_buffers_raw`], but also models threadgroup (`addrspace(3)`) buffer
+/// Like [`emit_vulkan_spirv_all_buffers_raw`], but also models threadgroup (`addrspace(3)`) buffer
 /// params raw. The second tier of the R4 ground-truth retry, used only after the device/constant-only
 /// raw retry itself fails spirv-val.
-pub fn llc_vulkan_spirv_all_buffers_raw_with_workgroup(
+pub fn emit_vulkan_spirv_all_buffers_raw_with_workgroup(
     san_ll: &str,
     _tmp: &Path,
 ) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_all_buffers_raw_with_workgroup(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
+pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -314,14 +319,14 @@ pub(crate) fn llc_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
 
 /// Emit the all-device/constant-buffer raw view with repair skipped for the W2 relooper's exclusive
 /// consumption. The caller must rebuild and validate its CFG before adopting any bytes.
-pub fn llc_vulkan_spirv_all_buffers_raw_relooper_feed(
+pub fn emit_vulkan_spirv_all_buffers_raw_relooper_feed(
     san_ll: &str,
     _tmp: &Path,
 ) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_all_buffers_raw_relooper_feed(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -336,15 +341,15 @@ pub(crate) fn llc_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
     )
 }
 
-/// Like [`llc_vulkan_spirv_all_buffers_raw`], but also enables BDA device-pointer modeling (a device
+/// Like [`emit_vulkan_spirv_all_buffers_raw`], but also enables BDA device-pointer modeling (a device
 /// pointer loaded from a buffer becomes its real 64-bit PhysicalStorageBuffer64 address). The honest
 /// retry tier for the `raw store for Ptr(1)` BDA frontier class — see
 /// [`native::emit_vulkan_spirv_all_buffers_raw_bda`].
-pub fn llc_vulkan_spirv_all_buffers_raw_bda(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
+pub fn emit_vulkan_spirv_all_buffers_raw_bda(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_all_buffers_raw_bda(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -359,7 +364,7 @@ pub(crate) fn llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
     )
 }
 
-pub(crate) fn llc_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -374,16 +379,16 @@ pub(crate) fn llc_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
     )
 }
 
-/// Like [`llc_vulkan_spirv`], but inlines non-recursive internal helper calls and promotes the
+/// Like [`emit_vulkan_spirv`], but inlines non-recursive internal helper calls and promotes the
 /// resulting entry-stored non-escaping Function allocas (scalar-replacement + aggregate fold) before
 /// emission. The honest retry tier for the MPS NDArray multi-destination (TopK) `missing pointer
 /// storage` frontier class — a device-buffer-pointer array staged through a Function struct forwarded
 /// by value into a helper. See [`native::emit_vulkan_spirv_inline_sroa`].
-pub fn llc_vulkan_spirv_inline_sroa(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
+pub fn emit_vulkan_spirv_inline_sroa(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_inline_sroa(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_inline_sroa_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_inline_sroa_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -393,16 +398,33 @@ pub(crate) fn llc_vulkan_spirv_inline_sroa_with_sidecar(
     native::emit_vulkan_spirv_inline_sroa_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
 }
 
-/// Like [`llc_vulkan_spirv_inline_sroa`], but ALSO models device/constant buffers raw so the byte-
+pub(crate) fn emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
+    san_ll: &str,
+    selected_pointer: &str,
+    _tmp: &Path,
+    kern: Option<&crate::meta::KernMeta>,
+    entry_name: Option<&str>,
+    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
+    native::emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
+        san_ll,
+        selected_pointer,
+        kern,
+        entry_name,
+        buffer_layouts,
+    )
+}
+
+/// Like [`emit_vulkan_spirv_inline_sroa`], but ALSO models device/constant buffers raw so the byte-
 /// addressed float/uint traffic surviving the inline+SROA collapse becomes Logical-legal word-offset
 /// access. The escalation tier for the TopK multi-destination kernels whose lowered `%10` device-
 /// pointer array feeds typed loads/stores at byte offsets. See
 /// [`native::emit_vulkan_spirv_inline_sroa_raw`].
-pub fn llc_vulkan_spirv_inline_sroa_raw(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
+pub fn emit_vulkan_spirv_inline_sroa_raw(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_inline_sroa_raw(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_inline_sroa_raw_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_inline_sroa_raw_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -412,18 +434,18 @@ pub(crate) fn llc_vulkan_spirv_inline_sroa_raw_with_sidecar(
     native::emit_vulkan_spirv_inline_sroa_raw_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
 }
 
-/// Like [`llc_vulkan_spirv_inline_sroa_raw`], but ALSO enables the R2 cross-arm restructure — the
+/// Like [`emit_vulkan_spirv_inline_sroa_raw`], but ALSO enables the R2 cross-arm restructure — the
 /// missing composition for the straddle-loop-merge + cross-binding-phi cluster (05), where the raw
 /// model needs a restructured CFG before the following PSB rewrite can dissolve the cross-binding phi.
 /// See [`native::emit_vulkan_spirv_inline_sroa_raw_cfg_restructure`]. Adopt-if-validates at the caller.
-pub fn llc_vulkan_spirv_inline_sroa_raw_cfg_restructure(
+pub fn emit_vulkan_spirv_inline_sroa_raw_cfg_restructure(
     san_ll: &str,
     _tmp: &Path,
 ) -> Result<Vec<u8>, String> {
     native::emit_vulkan_spirv_inline_sroa_raw_cfg_restructure(san_ll)
 }
 
-pub(crate) fn llc_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
@@ -539,7 +561,8 @@ mod tests {
     #[test]
     fn text_sanitizer_matches_file_sanitizer_rules() {
         let (san, datalayout) = sanitize_ll_text_with_datalayout(
-            "target datalayout = \"e-p:64:64\"\n\
+            "; ModuleID = '/tmp/random/case.air'\n\
+             target datalayout = \"e-p:64:64\"\n\
              target triple = \"air64-apple-ios\"\n\
              @llvm.global_ctors = appending global [0 x { i32, ptr, ptr }] []\n\
              @llvm.compiler.used = appending global [0 x ptr] [], section \"llvm.metadata\"\n\
@@ -549,9 +572,23 @@ mod tests {
         assert_eq!(datalayout.as_deref(), Some("e-p:64:64"));
         assert!(san.contains(&format!("target triple = \"{VULKAN_TRIPLE}\"")));
         assert!(!san.contains("target datalayout"));
+        assert!(!san.contains("ModuleID"));
         assert!(!san.contains("@llvm.global_ctors"));
         assert!(!san.contains("@llvm.compiler.used"));
         assert!(san.contains("define void @k()"));
+    }
+
+    #[test]
+    fn sanitizer_identity_ignores_llvm_dis_scratch_path() {
+        let first = sanitize_ll_text_with_datalayout(
+            "; ModuleID = '/tmp/first/case.air'\nsource_filename = \"stable\"\ndefine void @k() { ret void }\n",
+        )
+        .0;
+        let second = sanitize_ll_text_with_datalayout(
+            "; ModuleID = '/tmp/second/case.air'\nsource_filename = \"stable\"\ndefine void @k() { ret void }\n",
+        )
+        .0;
+        assert_eq!(first, second);
     }
 
     #[test]

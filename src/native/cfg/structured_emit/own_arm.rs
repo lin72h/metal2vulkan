@@ -69,7 +69,7 @@ fn carrier_with_phis(
     Ok(BodyBlock {
         name: name.to_string(),
         role: BlockRole::Normal,
-        typed: Some(carrier),
+        typed: Some(carrier.into()),
     })
 }
 
@@ -379,8 +379,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
             &mut synthetic,
         );
         blocks[outer]
-            .typed
-            .as_mut()
+            .typed_mut()
             .expect("carrier")
             .redirect_successor(target_name, &first);
         outer_incoming.push((LlValue::Int(state), synthetic.last().unwrap().name.clone()));
@@ -393,8 +392,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
     synthetic
         .last_mut()
         .unwrap()
-        .typed
-        .as_mut()
+        .typed_mut()
         .expect("carrier")
         .set_terminator_line(&format!(
             "switch i32 {OUTER_PC}, label {OUTER_PASS} [ i32 0, label {} ]",
@@ -423,8 +421,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
             &mut synthetic,
         );
         blocks[header]
-            .typed
-            .as_mut()
+            .typed_mut()
             .expect("carrier")
             .redirect_successor(target_name, &first);
         inner_incoming.push((LlValue::Int(state), synthetic.last().unwrap().name.clone()));
@@ -499,8 +496,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
     synthetic
         .last_mut()
         .unwrap()
-        .typed
-        .as_mut()
+        .typed_mut()
         .expect("carrier")
         .set_terminator_line(&format!(
             "switch i32 {COMMON_PC}, label {} [ i32 0, label {} ]",
@@ -511,7 +507,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
             .iter()
             .map(|(source, _, carried)| (source.clone(), carried.clone()))
             .collect::<HashMap<_, _>>();
-        blocks[index].typed.as_mut().expect("carrier").rename(&map);
+        blocks[index].typed_mut().expect("carrier").rename(&map);
     }
 
     // Funnel every exact region exit through one private final gateway. Natural-merge phi payloads
@@ -550,8 +546,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
     for (edge, (source, _)) in exit_edges.iter().copied().enumerate() {
         let tail = format!("{PREFIX}final.route.{edge}");
         blocks[source]
-            .typed
-            .as_mut()
+            .typed_mut()
             .expect("carrier")
             .redirect_successor(&natural_name, &tail);
         synthetic.push(passthrough(&tail, FINAL));
@@ -592,8 +587,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
             .collect::<Vec<_>>();
         kept.push((LlValue::Local(payload), FINAL.to_string()));
         blocks[natural]
-            .typed
-            .as_mut()
+            .typed_mut()
             .expect("carrier")
             .set_phi_incomings(result, &kept);
     }
@@ -702,7 +696,7 @@ mod tests {
         BodyBlock {
             name: name.to_string(),
             role: BlockRole::Normal,
-            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()),
+            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()).map(Into::into),
         }
     }
 

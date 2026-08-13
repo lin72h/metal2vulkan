@@ -150,9 +150,10 @@ impl Emitter {
     /// Returns `None` when the layout cannot be linearized (dynamic struct index, size mismatch,
     /// non-divisible stride) so the caller can leave the chain alone rather than miscompile.
     ///
-    /// Index list is the AIR/LLVM GEP list (leading const-0 dropped via [`gep_spirv_indices`], same
-    /// as the structured emit path). First remaining index strides by `sizeof(source_ty)`; further
-    /// indices walk members/elements.
+    /// Index list is the original AIR/LLVM GEP list. Its first index always strides by
+    /// `sizeof(source_ty)`; later indices walk members/elements. In particular, a leading zero must
+    /// remain in the walk: dropping it would misread the following struct-member ordinal as a
+    /// whole-struct stride.
     pub(in crate::native::emitter) fn linearize_gep_indices_in_scalar_units(
         &mut self,
         source_ty: &LlType,
@@ -160,10 +161,6 @@ impl Emitter {
         scalar: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Option<TypedValue>, String> {
-        let indices = match gep_spirv_indices(indices) {
-            Ok(v) => v,
-            Err(_) => return Ok(None),
-        };
         if indices.is_empty() {
             return Ok(None);
         }

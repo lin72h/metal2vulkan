@@ -440,6 +440,8 @@ fn inlining_remaps_local_pointer_field_store_source() {
         .push(crate::emit_sidecar::LocalPointerFieldStore {
             id: sentinel,
             source: object,
+            root: object,
+            indices: vec![0],
         });
     inline_helpers(&mut ctx, 0).expect("inline ok");
 
@@ -941,4 +943,63 @@ fn byte_view_reinterpret_recognized_and_reassembled_little_endian() {
     assert_eq!(last.class.opcode, Op::CopyObject);
     assert_eq!(last.result_id, Some(out_id));
     assert_eq!(last.result_type, Some(uint));
+}
+
+#[test]
+fn half_byte_view_uses_a_16_bit_accumulator_for_load_and_store() {
+    let uchar = 10;
+    let half = 11;
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(100));
+    module.types_global_values = vec![
+        type_inst(
+            Op::TypeInt,
+            uchar,
+            vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+        ),
+        type_inst(Op::TypeFloat, half, vec![Operand::LiteralBit32(16)]),
+    ];
+    let mut ctx = Ctx::new(module);
+    let integer_width = |ctx: &Ctx, ty| {
+        ctx.module
+            .types_global_values
+            .iter()
+            .chain(ctx.new_globals.iter())
+            .find(|instruction| instruction.result_id == Some(ty))
+            .and_then(|instruction| match instruction.operands.first() {
+                Some(Operand::LiteralBit32(width)) => Some(*width),
+                _ => None,
+            })
+    };
+    let plan = ByteViewPlan {
+        arg: 20,
+        storage: StorageClass::Function,
+        elem_uchar_ty: Some(uchar),
+        scalar_backing_ty: None,
+        offset: 0,
+        width: 2,
+        scalar_ty: half,
+    };
+
+    let load = emit_byte_view_load(&mut ctx, &plan, 30, half);
+    let load_bitcast = load.last().expect("load ends in its scalar bitcast");
+    assert_eq!(load_bitcast.class.opcode, Op::Bitcast);
+    assert_eq!(load_bitcast.result_type, Some(half));
+    let Operand::IdRef(load_bits) = load_bitcast.operands[0] else {
+        panic!("load bitcast has an id operand");
+    };
+    let load_bits_ty = load
+        .iter()
+        .find(|instruction| instruction.result_id == Some(load_bits))
+        .and_then(|instruction| instruction.result_type)
+        .expect("assembled load has a type");
+    assert_eq!(integer_width(&ctx, load_bits_ty), Some(16));
+
+    let store = emit_byte_view_store(&mut ctx, &plan, 31);
+    let store_bitcast = store.first().expect("store starts with its scalar bitcast");
+    assert_eq!(store_bitcast.class.opcode, Op::Bitcast);
+    let store_bits_ty = store_bitcast
+        .result_type
+        .expect("store bitcast has a result type");
+    assert_eq!(integer_width(&ctx, store_bits_ty), Some(16));
 }

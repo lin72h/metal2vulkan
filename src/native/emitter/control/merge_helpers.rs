@@ -2,82 +2,24 @@
 
 use super::*;
 
-pub(in crate::native::emitter) fn block_dominators(
+pub(in crate::native::emitter) fn emitted_block_dominators(
     blocks: &[Block],
-) -> HashMap<Word, HashSet<Word>> {
+) -> crate::native::cfg::EmittedDominators {
     let labels = blocks
         .iter()
         .filter_map(|block| block.label.as_ref()?.result_id)
         .collect::<Vec<_>>();
-    let Some(entry) = labels.first().copied() else {
-        return HashMap::new();
-    };
-    let label_indices = labels
+    let entry = labels.first().copied().unwrap_or_default();
+    let successors = blocks
         .iter()
-        .copied()
-        .enumerate()
-        .map(|(idx, label)| (label, idx))
+        .filter_map(|block| {
+            Some((
+                block.label.as_ref()?.result_id?,
+                cloned_block_successors(block),
+            ))
+        })
         .collect::<HashMap<_, _>>();
-    let word_len = labels.len().div_ceil(u64::BITS as usize);
-    let mut full = vec![u64::MAX; word_len];
-    clear_unused_bits(&mut full, labels.len());
-    let mut predecessors = vec![Vec::<usize>::new(); labels.len()];
-    for block in blocks {
-        let Some(label) = block.label.as_ref().and_then(|label| label.result_id) else {
-            continue;
-        };
-        let Some(label_idx) = label_indices.get(&label).copied() else {
-            continue;
-        };
-        for successor in cloned_block_successors(block) {
-            if let Some(successor_idx) = label_indices.get(&successor).copied() {
-                predecessors[successor_idx].push(label_idx);
-            }
-        }
-    }
-
-    let mut dominators = vec![full.clone(); labels.len()];
-    dominators[0] = vec![0; word_len];
-    set_bit(&mut dominators[0], 0);
-
-    loop {
-        let mut changed = false;
-        for idx in 1..labels.len() {
-            let mut next = if let Some((first, rest)) = predecessors[idx].split_first() {
-                let mut out = dominators[*first].clone();
-                for pred in rest {
-                    for word in 0..word_len {
-                        out[word] &= dominators[*pred][word];
-                    }
-                }
-                out
-            } else {
-                vec![0; word_len]
-            };
-            set_bit(&mut next, idx);
-            if dominators[idx] != next {
-                dominators[idx] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    let mut out = HashMap::new();
-    for (idx, label) in labels.iter().copied().enumerate() {
-        let mut doms = HashSet::new();
-        for (candidate_idx, candidate_label) in labels.iter().copied().enumerate() {
-            if bit_is_set(&dominators[idx], candidate_idx) {
-                doms.insert(candidate_label);
-            }
-        }
-        out.insert(label, doms);
-    }
-    debug_assert!(out
-        .get(&entry)
-        .is_some_and(|doms| doms == &HashSet::from([entry])));
-    out
+    crate::native::cfg::EmittedDominators::new(entry, &labels, &successors)
 }
 
 pub(in crate::native::emitter) fn block_value_defs(blocks: &[Block]) -> HashMap<Word, Word> {
@@ -168,7 +110,7 @@ pub(in crate::native::emitter) fn materialization_operands_dominate_pred(
     target_label: Word,
     pred: Word,
     defs: &HashMap<Word, Word>,
-    dominators: &HashMap<Word, HashSet<Word>>,
+    dominators: &crate::native::cfg::EmittedDominators,
 ) -> bool {
     for operand in &inst.operands {
         let Some(id) = id_ref_operand(operand) else {
@@ -180,7 +122,7 @@ pub(in crate::native::emitter) fn materialization_operands_dominate_pred(
         let Some(def_label) = defs.get(&id).copied() else {
             continue;
         };
-        if def_label == target_label || !label_dominates(dominators, def_label, pred) {
+        if def_label == target_label || !dominators.dominates(def_label, pred) {
             return false;
         }
     }

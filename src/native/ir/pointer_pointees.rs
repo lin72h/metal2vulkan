@@ -5,6 +5,14 @@ use super::*;
 impl LlModule {
     pub(in crate::native) fn infer_pointer_pointees(&mut self) {
         for f in &self.functions {
+            for ((name, ty), pointee) in f.params.iter().zip(&f.byval_param_pointees) {
+                if matches!(ty, LlType::Ptr(_)) {
+                    if let Some(pointee) = pointee {
+                        self.ptr_pointees
+                            .insert((f.name.clone(), name.clone()), pointee.clone());
+                    }
+                }
+            }
             let params = f
                 .params
                 .iter()
@@ -21,7 +29,7 @@ impl LlModule {
                 let Some(result) = &inst.result else {
                     continue;
                 };
-                let Some((true_value, false_value)) = &inst.select_arms else {
+                let Some((true_value, false_value)) = inst.select_arms.as_deref() else {
                     continue;
                 };
                 if !matches!(true_value.ty, LlType::Ptr(_))
@@ -143,7 +151,7 @@ impl LlModule {
                         }
                         continue;
                     }
-                    if let Some((true_value, false_value)) = &inst.select_arms {
+                    if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
                         let (LlValue::Local(true_name), LlValue::Local(false_name)) =
                             (&true_value.value, &false_value.value)
                         else {
@@ -331,7 +339,7 @@ impl LlModule {
                 continue;
             }
 
-            let Some((object, ptr)) = &inst.store else {
+            let Some((object, ptr)) = inst.store.as_deref() else {
                 continue;
             };
             let LlValue::Local(param) = &object.value else {

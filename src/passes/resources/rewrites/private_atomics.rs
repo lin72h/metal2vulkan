@@ -447,7 +447,13 @@ pub(in crate::passes) fn combined_type_defs(
     ctx: &Ctx,
     defs: &HashMap<Word, Instruction>,
 ) -> HashMap<Word, Instruction> {
-    let mut types = defs.clone();
+    let mut types = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+        .collect::<HashMap<_, _>>();
+    types.extend(defs.clone());
     for inst in &ctx.new_globals {
         if let Some(id) = inst.result_id {
             types.insert(id, inst.clone());
@@ -580,31 +586,6 @@ pub(in crate::passes) fn direct_raw_root_word_index(
             Some(*word)
         }
         _ => None,
-    }
-}
-
-pub(in crate::passes) fn is_raw_uint_runtime_block(
-    types: &HashMap<Word, Instruction>,
-    block_ty: Word,
-) -> bool {
-    let Some(block) = types.get(&block_ty) else {
-        return false;
-    };
-    if block.class.opcode != Op::TypeStruct || block.operands.len() != 1 {
-        return false;
-    }
-    let Some(Operand::IdRef(runtime_array_ty)) = block.operands.first() else {
-        return false;
-    };
-    let Some(runtime_array) = types.get(runtime_array_ty) else {
-        return false;
-    };
-    if runtime_array.class.opcode != Op::TypeRuntimeArray {
-        return false;
-    }
-    match runtime_array.operands.first() {
-        Some(Operand::IdRef(elem)) => is_uint_type(types, *elem),
-        _ => false,
     }
 }
 

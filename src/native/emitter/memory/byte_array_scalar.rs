@@ -247,8 +247,11 @@ impl Emitter {
         let Some(_len) = self.raw_byte_array_root_len(raw) else {
             return Ok(false);
         };
-        let LlType::Int(bits) = ty else {
-            return Ok(false);
+        let (bits, needs_bitcast) = match ty {
+            LlType::Int(bits) => (*bits, false),
+            LlType::Float => (32, true),
+            LlType::Half => (16, true),
+            _ => return Ok(false),
         };
         if bits % 8 != 0 {
             return Ok(false);
@@ -258,7 +261,9 @@ impl Emitter {
             return Ok(false);
         }
 
-        let result_ty = self.type_id(ty)?;
+        let int_ty = LlType::Int(bits);
+        let result_ty = self.type_id(&int_ty)?;
+        let assembled_result = if needs_bitcast { self.fresh() } else { result };
         let mut acc = None;
         for byte in 0..byte_count {
             let loaded = self.emit_raw_byte_array_byte_load(
@@ -266,7 +271,7 @@ impl Emitter {
                 extra_byte + u64::from(byte),
                 instructions,
             )?;
-            let widened = if *bits == 8 {
+            let widened = if bits == 8 {
                 loaded
             } else {
                 let widened = self.fresh();
@@ -281,7 +286,7 @@ impl Emitter {
             let term = if byte == 0 {
                 widened
             } else {
-                let shift = self.const_signed_int(*bits, i64::from(byte * 8))?;
+                let shift = self.const_signed_int(bits, i64::from(byte * 8))?;
                 let shifted = self.fresh();
                 instructions.push(Self::inst(
                     Op::ShiftLeftLogical,
@@ -293,7 +298,7 @@ impl Emitter {
             };
             acc = Some(if let Some(prev) = acc {
                 let combined = if byte + 1 == byte_count {
-                    result
+                    assembled_result
                 } else {
                     self.fresh()
                 };
@@ -308,16 +313,25 @@ impl Emitter {
                 term
             });
         }
-        if acc != Some(result) {
+        if acc != Some(assembled_result) {
             instructions.push(Self::inst(
                 Op::CopyObject,
                 Some(result_ty),
-                Some(result),
+                Some(assembled_result),
                 vec![Operand::IdRef(acc.ok_or_else(|| {
                     "native emitter: raw byte-array integer load produced no accumulator \
                      (byte count must be >= 1)"
                         .to_string()
                 })?)],
+            ));
+        }
+        if needs_bitcast {
+            let value_ty = self.type_id(ty)?;
+            instructions.push(Self::inst(
+                Op::Bitcast,
+                Some(value_ty),
+                Some(result),
+                vec![Operand::IdRef(assembled_result)],
             ));
         }
         Ok(true)

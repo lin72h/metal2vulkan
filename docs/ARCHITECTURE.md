@@ -6,16 +6,15 @@ public tree is the unit/integration suite plus optional local A/B and oracle too
 
 ## The pipeline
 
-Unlike the legacy `metal2vulkanspirv` path (OpenCL/Kernel SPIR-V backend plus heavy post-rewrite),
-this crate emits `OpCapability Shader` / `Logical GLSL450` SPIR-V **directly** from sanitized AIR
-LLVM IR, structured by construction where the CFG admits it.
+The crate emits `OpCapability Shader` / `Logical GLSL450` SPIR-V directly from sanitized AIR LLVM
+IR, structured by construction where the CFG admits it.
 
 ```
 .air|.ll
   └─ tools::air_to_sanitized_ll          llvm-dis (if .air) + sanitize → textual LLVM IR
   └─ lower_async_copy_if_enabled         shared pre-emit AIR rewrites
   └─ meta::parse_air_{frag,vert,kern}    stage interface metadata (bindings, attributes)
-  └─ native emit (tools::llc_vulkan_spirv → native::emit_vulkan_spirv)
+  └─ native emit (tools::emit_vulkan_spirv → native::emit_vulkan_spirv)
         parse (native/parse.rs, lex.rs) → LlModule
         typed IR                        (native/tir/, native/ir/)
         structured-by-construction emit (native/emitter/**, native/cfg/**)
@@ -24,7 +23,8 @@ LLVM IR, structured by construction where the CFG admits it.
   └─ stage/resource/lowering passes     (passes/**)
   └─ finish_module                      id canonicalization, portability normalization
   └─ assemble → SPIR-V words
-  └─ spirv-val (vulkan1.3)              [validation gate; not part of the bytes]
+  └─ spirv-val (vulkan1.3)              validation/adoption gate; not part of the bytes
+  └─ reflect final buffer footprints    reflected entry points only; read-only over adopted bytes
 ```
 
 `translate_native_no_retry` is this path up to (but not including) spirv-val and the retry cascade.
@@ -50,12 +50,15 @@ The production body path is **parse once → typed IR → emit**. There is no mi
 ### Reflection
 
 Each translation decodes AIR metadata once into a `StageMeta` shared by emission, passes,
-reflection, and retry re-emissions. Public `translate_*_reflected` entry points return
-`(Vec<u8>, reflect::ShaderReflection)` with **bytes identical** to the non-reflected call.
+reflection, and retry re-emissions. After a reflected translation adopts its final validating
+module, a read-only analyzer derives conservative buffer byte footprints from those exact bytes.
+Public `translate_*_reflected` entry points return `(Vec<u8>, reflect::ShaderReflection)` with
+**bytes identical** to the non-reflected call.
 
 Descriptor ABI bases (buffer = index, texture = 32+n, sampler = 64+n, color = 96+n, set 0) live in
 `reflect` and are consumed by the resource pass so decorated bindings and reported reflection share
-one contract. Consumer-oriented guide: [`REFLECTION.md`](REFLECTION.md).
+one contract. Start with the integration [how-to](HOWTO.md); the complete schema and ABI contract
+are in [`REFLECTION.md`](REFLECTION.md).
 
 ### Retained module seam
 
@@ -85,6 +88,12 @@ The emit sidecar carries Word-id-keyed facts (buffer-address words, local-pointe
 static/dynamic field loads, AIR struct offsets). Producers append; inlining and resource rewrites
 remap them. There is no cross-seam `OpName` marker protocol for facts.
 
+Metal vertex entries carrying `air.patch` metadata finalize as Vulkan tessellation-evaluation
+entries. The interface pass maps `position_in_patch` to `TessCoord`, `patch_id` to `PrimitiveId`,
+per-patch arguments to `Patch` inputs, and metadata-described control-point accessors to indexed
+loads from control-point input arrays. The AIR patch domain and control-point count, never a shader
+name, determine the execution modes and array extents.
+
 ### Inlining
 
 Helpers are inlined on the producer side where structural rules allow (one-block and multi-block
@@ -103,7 +112,7 @@ Emission is structured-by-construction when possible:
    `repair_pre_phi_incoming_materializations` relocates illegal in-phi-block access chains.
 4. **Reject** → function emits with inferred merges unrepaired; the retry cascade’s **relooper**
    (`native/relooper.rs`) strips merges and rebuilds structured CFG. The relooper is the sole
-   structuring fallback after the old post-hoc repair roster was deleted.
+   general structuring fallback.
 
 Between reject and relooper, a few specialized constructions may still admit a shape
 (`structured_plan_divergent_exit`, construct-tree own-arm retry for a narrow class). Adoption of
@@ -156,23 +165,23 @@ and default-off measurement substrates only—not product feature gates.
 
 ## Verification
 
-Match the check to the change. The full developer playbook (harvest → bank hashes → A/B while
-refactoring, what to commit, recipes by change type) lives in **[`VALIDATION.md`](VALIDATION.md)**.
+Match the check to the change. The full developer playbook (harvest → author cases → exact A/B →
+targeted GPU evidence) lives in **[`VALIDATION.md`](VALIDATION.md)**.
 
 | Check | Command / tool | Catches |
 |---|---|---|
 | Lint | `cargo clippy` | style / obvious bugs |
 | Unit + integration | `cargo test -- --test-threads=1` | translator regressions |
-| SPIR-V delta class | validation `classify_spirv_delta` | id/order vs semantic drift |
-| Byte A/B | `scripts/metal2vulkan-ab/` | drift on a local sample |
-| Translate ledger | `corpus-mint` / `corpus-remint` / `corpus-why` | AIR/SPIR-V sha256 pins |
-| Execution ledgers | `corpus-run-metal` / `-vulkan` / `-moltenvk` | plan + `output_b64` + digests (JSONL) |
-| Private corpus (optional) | `validation/corpus/local/` | local shard source for ledgers / A/B |
-| Metal oracle (optional) | `validation` on macOS | host Metal execution |
-| Vulkan executor (optional) | `validation` runner | candidate vs oracle bytes |
+| Byte A/B | validation `corpus-ab` | exact old/new translator drift without a GPU |
+| Authored cases | `validation/corpus/cases/` | literal semantic inputs and output selection |
+| Exact observations | `validation/corpus/observations/` | dependency-complete current experiment slots |
+| Private corpus (optional) | `validation/corpus/local/sources/` | aligned sanitized AIR source shards |
+| Metal qualification (optional) | validation `corpus-metal` | literal case execution and golden bytes |
+| Candidate execution (optional) | `corpus-moltenvk` / `corpus-vulkan` | candidate bytes vs exact Metal observation |
 
 Always rebuild the translator binary before measuring. Default CI is synthetic-only; private
-metallib harvest is gitignored under `validation/corpus/local/` (see that README).
+metallib harvest is gitignored under `validation/corpus/local/` (see that README). GPU validation
+never affects product translation paths and never infers an execution plan from AIR.
 
 ## Hard-won constraints
 

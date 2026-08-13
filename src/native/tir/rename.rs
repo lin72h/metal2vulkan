@@ -35,6 +35,7 @@ fn rename_llvalue(v: &mut LlValue, map: &Map) {
         }
         LlValue::Splat(b) => rename_typed_value(b, map),
         LlValue::Gep(g) => rename_gep(g, map),
+        LlValue::IntToPtr { source, .. } => rename_typed_value(source, map),
         // Global(@name) is not a `%`-token; scalar constants carry no names.
         LlValue::Global(_)
         | LlValue::Bool(_)
@@ -155,7 +156,7 @@ fn rename_inst(inst: &mut TirInst, map: &Map) {
             rn_in_place(pred, map);
         }
     }
-    if let Some((tv, _dst)) = &mut inst.bitcast {
+    if let Some((tv, _dst)) = inst.bitcast.as_deref_mut() {
         rename_typed_value(tv, map);
     }
     // Parse-time inference views also carry `%`-tokens; rename them so a cloned/renamed carrier stays
@@ -170,21 +171,21 @@ fn rename_inst(inst: &mut TirInst, map: &Map) {
             rename_llvalue(value, map);
         }
     }
-    if let Some((true_value, false_value)) = &mut inst.select_arms {
+    if let Some((true_value, false_value)) = inst.select_arms.as_deref_mut() {
         rename_typed_value(true_value, map);
         rename_typed_value(false_value, map);
     }
     if let Some(load) = &mut inst.load {
         rename_typed_value(&mut load.ptr, map);
     }
-    if let Some((object, ptr)) = &mut inst.store {
+    if let Some((object, ptr)) = inst.store.as_deref_mut() {
         rename_typed_value(object, map);
         rename_typed_value(ptr, map);
     }
     if let Some(call) = &mut inst.alias_call {
         rename_call(call, map);
     }
-    match &mut inst.emit_scan_call {
+    match inst.emit_scan_call.as_deref_mut() {
         Some(Ok(call)) => rename_call(call, map),
         Some(Err(msg)) => *msg = crate::native::cfg::rename_tokens(msg, map),
         None => {}
@@ -203,7 +204,7 @@ fn rename_inst(inst: &mut TirInst, map: &Map) {
     {
         *s = crate::native::cfg::rename_tokens(s, map);
     }
-    if let Some((_, dst)) = &mut inst.bitcast {
+    if let Some((_, dst)) = inst.bitcast.as_deref_mut() {
         *dst = crate::native::cfg::rename_tokens(dst, map);
     }
     // `result_ty`/`gep_source_ty`/`alloca_ty`/`cmp_predicate`/`mem_align`/`opcode`/`aggregate_indices`/

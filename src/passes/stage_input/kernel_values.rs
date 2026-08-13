@@ -36,6 +36,8 @@ pub(in crate::passes) fn bind_kernel_uvec3_builtin_var(
             ParamBinding::LoadVarVectorPrefix {
                 var,
                 vec_ty: v3u,
+                scalar_ty: uint_ty,
+                prefix_ty: v2u,
                 out_ty: if pty == v2u { v2u } else { pty },
                 lanes: 2,
             },
@@ -46,6 +48,8 @@ pub(in crate::passes) fn bind_kernel_uvec3_builtin_var(
             ParamBinding::LoadVarVectorPrefix {
                 var,
                 vec_ty: v3u,
+                scalar_ty: uint_ty,
+                prefix_ty: v3u,
                 out_ty: pty,
                 lanes: 3,
             },

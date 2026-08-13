@@ -198,6 +198,9 @@ fn fragment_depth_output_is_not_a_render_target() {
     assert_eq!(m.n_render_targets, 0);
     assert!(m.render_target_members.is_empty());
     assert_eq!(m.depth_members, vec![0]);
+    assert_eq!(m.depth_qualifier, Some(DepthQualifier::Any));
+    let reflection = crate::reflect::ShaderReflection::from_fragment(&m, Some("F"));
+    assert_eq!(reflection.depth_qualifier, Some(DepthQualifier::Any));
     assert!(m.is_depth_member(0));
     assert!(!m.is_depth_member(1));
 }
@@ -248,6 +251,46 @@ fn vertex_builtin_roles() {
 }
 
 #[test]
+fn vertex_patch_contract_preserves_domain_control_points_and_system_locations() {
+    let ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @vmain, !1, !2, !10}
+!1 = !{!3}
+!2 = !{!4, !7, !8, !9}
+!3 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.patch_control_point_input", !5, !6}
+!5 = !{!"air.patch_control_point_function", ptr @control.MTL_CONTROL_POINT_FN}
+!6 = !{!"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"float3"}
+!7 = !{i32 1, !"air.function_constant", !11, !"air.patch_input", !"air.location_index", i32 5, i32 1, !"air.arg_type_name", !"float4"}
+!8 = !{i32 2, !"air.instance_id", !"air.arg_type_name", !"uint"}
+!9 = !{i32 3, !"air.amplification_count", !"air.arg_type_name", !"ushort"}
+!10 = !{!"air.patch", !"quad", !"air.patch_control_point", i32 16}
+!11 = !{ptr addrspace(2) @fc, !"bool", !"enabled"}
+"#;
+    let meta = parse_air_vertex_meta(ll).unwrap();
+    let tessellation = meta.tessellation.as_ref().unwrap();
+    assert_eq!(tessellation.domain, PatchDomain::Quad);
+    assert_eq!(tessellation.control_point_count, 16);
+    assert_eq!(
+        tessellation.control_point_function.as_deref(),
+        Some("control.MTL_CONTROL_POINT_FN")
+    );
+    assert_eq!(tessellation.control_point_fields[0].location, 2);
+    assert_eq!(meta.role_of(0), Some(&VertRole::PatchControlPoints));
+    assert_eq!(meta.role_of(1), Some(&VertRole::PatchInput(5)));
+    assert_eq!(meta.role_of(2), Some(&VertRole::InstanceId));
+    assert_eq!(meta.role_of(3), Some(&VertRole::AmplificationCount));
+    assert_eq!(
+        meta.tessellation_system_input_location(&VertRole::InstanceId),
+        Some(6)
+    );
+    assert_eq!(
+        meta.tessellation_system_input_location(&VertRole::AmplificationCount),
+        Some(8)
+    );
+}
+
+#[test]
 fn vertex_render_target_array_index_role() {
     let ll = r#"
 !air.vertex = !{!0}
@@ -255,7 +298,7 @@ fn vertex_render_target_array_index_role() {
 !1 = !{!2, !3, !4}
 !2 = !{!"air.position", !"air.arg_type_name", !"float4"}
 !3 = !{!"air.render_target_array_index", !"air.arg_type_name", !"uint", !"air.arg_name", !"layer"}
-!4 = !{!"air.vertex_output", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"varying"}
+!4 = !{!"air.vertex_output", !"generated(7varyingf)", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"varying"}
 !5 = !{}
 "#;
     let m = parse_air_vertex_meta(ll).unwrap();
@@ -265,6 +308,12 @@ fn vertex_render_target_array_index_role() {
         Some(&VertOutRole::RenderTargetArrayIndex)
     );
     assert_eq!(m.output_role_of(2), Some(&VertOutRole::Varying(0)));
+    assert_eq!(m.output_varying_type(0), Some("float"));
+    assert_eq!(m.output_varying_name(0), Some("varying"));
+    assert_eq!(
+        m.output_varying_user_semantic(0),
+        Some("generated(7varyingf)")
+    );
 }
 
 #[test]
@@ -336,6 +385,25 @@ fn kernel_roles() {
 }
 
 #[test]
+fn function_table_roles_preserve_metal_buffer_indices() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %visible, ptr addrspace(1) %intersection) { ret void }
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.visible_function_table", !"air.location_index", i32 7}
+!4 = !{i32 1, !"air.intersection_function_table", !"air.location_index", i32 9}
+"#;
+    let meta = parse_air_kernel_meta(ll).unwrap();
+    assert_eq!(meta.role_of(0), Some(&KernRole::VisibleFunctionTable(7)));
+    assert_eq!(
+        meta.role_of(1),
+        Some(&KernRole::IntersectionFunctionTable(9))
+    );
+}
+
+#[test]
 fn kernel_texture_sampler_roles() {
     let ll = r#"
 !air.kernel = !{!0}
@@ -381,6 +449,13 @@ fn kernel_indirect_buffer_is_a_buffer_role() {
     assert_eq!(m.buffer_address_space(1), Some(2));
     assert_eq!(m.buffer_type_size(1), Some(8));
     assert!(matches!(m.layout_of(1), Some(AirType::Struct(fields)) if fields.len() == 2));
+    assert_eq!(m.embedded_arguments.len(), 2);
+    assert_eq!(m.embedded_arguments[0].buffer_param_index, 1);
+    assert_eq!(m.embedded_arguments[0].buffer_index, 3);
+    assert_eq!(m.embedded_arguments[0].field_ordinal, 0);
+    assert_eq!(m.embedded_arguments[0].field_offset, 0);
+    assert_eq!(m.embedded_arguments[1].field_ordinal, 1);
+    assert_eq!(m.embedded_arguments[1].field_offset, 4);
 }
 
 #[test]
@@ -406,6 +481,29 @@ declare i32 @air.get_instance_count_instance_acceleration_structure(ptr addrspac
         Some(&KernRole::AccelerationStructureShadow(8))
     );
     assert_eq!(m.role_of(1), Some(&KernRole::Buffer(0)));
+}
+
+#[test]
+fn kernel_primitive_acceleration_structure_is_always_a_literal_geometry_resource() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %as, ptr addrspace(1) %out) {
+  store i32 7, ptr addrspace(1) %out
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.primitive_acceleration_structure", !"air.location_index", i32 5, i32 1, !"air.read", !"air.arg_type_name", !"acceleration_structure<>", !"air.arg_name", !"as"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let meta = parse_air_kernel_meta(ll).unwrap();
+    assert_eq!(
+        meta.role_of(0),
+        Some(&KernRole::PrimitiveAccelerationStructure(5))
+    );
+    assert_eq!(meta.role_of(1), Some(&KernRole::Buffer(0)));
 }
 
 #[test]
@@ -464,6 +562,73 @@ fn kernel_function_constant_imageblock_keeps_its_cell_layout() {
                 }]
             )
     ));
+}
+
+#[test]
+fn kernel_implicit_imageblock_inventory_preserves_attachment_rate_index_and_access() {
+    let ll = r#"
+define void @k() {
+  %a = call <4 x half> @air.load.implicit_imageblock.v4f16(i32 2, <2 x i16> zeroinitializer, i32 3, i16 1)
+  call void @air.store.implicit_imageblock.v4f16(<4 x half> %a, i32 2, <2 x i16> zeroinitializer, i32 5, i16 1)
+  %b = call <2 x half> @air.load.implicit_imageblock.v2f16(i32 3, <2 x i16> zeroinitializer, i32 0, i16 0)
+  call void @air.store.implicit_imageblock.i32(i32 7, i32 4, <2 x i16> zeroinitializer, i32 0, i16 0)
+  ret void
+}
+
+declare <4 x half> @air.load.implicit_imageblock.v4f16(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i32, i16)
+declare <2 x half> @air.load.implicit_imageblock.v2f16(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.i32(i32, i32, <2 x i16>, i32, i16)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let meta = parse_air_kernel_meta(ll).unwrap();
+    assert_eq!(
+        meta.implicit_imageblock_attachments,
+        [
+            ImplicitImageblockAttachment {
+                attachment: 2,
+                data_rate: 1,
+                max_index: Some(5),
+                format: TextureFormat::Rgba16f,
+                reads: true,
+                writes: true,
+            },
+            ImplicitImageblockAttachment {
+                attachment: 3,
+                data_rate: 0,
+                max_index: Some(0),
+                format: TextureFormat::Rg16f,
+                reads: true,
+                writes: false,
+            },
+            ImplicitImageblockAttachment {
+                attachment: 4,
+                data_rate: 0,
+                max_index: Some(0),
+                format: TextureFormat::R32ui,
+                reads: false,
+                writes: true,
+            },
+        ]
+    );
+}
+
+#[test]
+fn unknown_implicit_imageblock_suffix_cannot_disappear_from_reflection() {
+    let ll = r#"
+define void @k() {
+  %value = call <3 x half> @air.load.implicit_imageblock.v3f16(i32 0, <2 x i16> zeroinitializer, i32 0, i16 0)
+  ret void
+}
+declare <3 x half> @air.load.implicit_imageblock.v3f16(i32, <2 x i16>, i32, i16)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    assert!(parse_air_kernel_meta(ll).is_none());
+    assert!(implicit_imageblock_texture_format("air.load.implicit_imageblock.v3f16").is_err());
 }
 
 #[test]
@@ -711,6 +876,7 @@ entry:
   %1 = load <4 x i32>, ptr addrspace(2) @_ZN2RB6Shader8Constant13_shader_stateE.MTL_FC_INIT_0_Dv4_j
   ret void
 }
+
 ";
     let fcs = parse_function_constants(ll);
     assert_eq!(fcs.len(), 2, "two distinct FC indices");
@@ -718,9 +884,71 @@ entry:
     assert_eq!(fcs[0].index, 0);
     assert_eq!(fcs[0].name, "_ZN2RB6Shader8Constant13_shader_stateE");
     assert_eq!(fcs[0].type_name, "<4 x i32>");
+    assert_eq!(fcs[0].abi_type_encoding, "Dv4_j");
     assert_eq!(fcs[1].index, 3);
     assert_eq!(fcs[1].type_name, "i32");
+    assert_eq!(fcs[1].abi_type_encoding, "i");
     // The `load` use of the same global must NOT create a duplicate; the plain implicit global is
     // ignored (no MTL_FC_INIT marker).
     assert!(parse_function_constants("@x = global i32 0").is_empty());
+}
+
+#[test]
+fn fragment_imageblock_projects_members_by_semantic() {
+    let ll = r#"
+define { <4 x half>, { half } } @f({ half } %tile) { ret { <4 x half>, { half } } poison }
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !2}
+!1 = !{!3, !4}
+!2 = !{!5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{!"air.imageblock_data", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !6, !"air.imageblock_master", !7}
+!5 = !{i32 0, !"air.imageblock_data", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !6, !"air.imageblock_master", !7}
+!6 = !{i32 0, i32 2, i32 0, !"half", !"user(depth)"}
+!7 = !{i32 0, i32 2, i32 0, !"half", !"user(other)", !"air.raster_order_group", i32 1, i32 2, i32 2, i32 0, !"half", !"user(depth)", !"air.raster_order_group", i32 3}
+"#;
+    let meta = parse_air_fragment_meta(ll).expect("fragment metadata");
+    assert_eq!(meta.role_of(0), Some(&FragRole::ImageblockData));
+    let reflection = crate::reflect::ShaderReflection::from_fragment(&meta, Some("f"));
+    let reflected = reflection
+        .fragment_imageblock
+        .expect("reflected imageblock master");
+    assert_eq!(reflected.members[0].binding, None);
+    assert_eq!(reflected.members[1].binding, Some(161));
+    assert_eq!(
+        reflected.members[1].access,
+        crate::reflect::ResourceAccess::ReadWrite
+    );
+    let imageblock = meta.fragment_imageblock.expect("imageblock master");
+    assert_eq!(imageblock.sample_size, 8);
+    assert_eq!(imageblock.members[1].offset, 2);
+    assert_eq!(imageblock.members[1].raster_order_group, 3);
+    assert_eq!(imageblock.inputs[0].members[0].master_member, 1);
+    assert_eq!(imageblock.outputs[0].interface_index, 1);
+    assert_eq!(imageblock.outputs[0].members[0].master_member, 1);
+}
+
+#[test]
+fn direct_fragment_imageblock_data_layout_is_its_own_master() {
+    let ll = r#"
+define { { <4 x half>, i16 } } @f({ <4 x half>, i16 } %tile) { ret { { <4 x half>, i16 } } poison }
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.imageblock_data", !"air.imageblock_data_size", i32 16, !"air.struct_type_info", !5}
+!4 = !{i32 0, !"air.imageblock_data", !"air.imageblock_data_size", i32 16, !"air.struct_type_info", !5}
+!5 = !{i32 0, i32 8, i32 0, !"half4", !"color", !"air.raster_order_group", i32 0, i32 8, i32 2, i32 0, !"ushort", !"depth", !"air.raster_order_group", i32 1}
+"#;
+    let imageblock = parse_air_fragment_meta(ll)
+        .expect("fragment metadata")
+        .fragment_imageblock
+        .expect("direct imageblock master");
+    assert_eq!(imageblock.sample_size, 16);
+    assert_eq!(imageblock.members.len(), 2);
+    assert_eq!(imageblock.members[0].type_name, "half4");
+    assert_eq!(imageblock.members[1].semantic, "depth");
+    assert_eq!(imageblock.members[1].raster_order_group, 1);
+    assert_eq!(imageblock.inputs[0].members[1].master_member, 1);
+    assert_eq!(imageblock.outputs[0].members[0].master_member, 0);
 }

@@ -149,6 +149,9 @@ pub(in crate::passes) fn lower_integer_op(
         return Ok(Some(rotate_left_i32(ctx, res, rty, args[0], args[1])));
     }
     if name.starts_with("air.extract_bits.u.") && args.len() == 3 {
+        if int_scalar_width(ctx, rty) == Some(64) {
+            return Ok(Some(extract_bits_i64(ctx, res, rty, args, false)?));
+        }
         return Ok(Some(vec![Instruction::new(
             Op::BitFieldUExtract,
             Some(rty),
@@ -161,6 +164,9 @@ pub(in crate::passes) fn lower_integer_op(
         )]));
     }
     if name.starts_with("air.extract_bits.s.") && args.len() == 3 {
+        if int_scalar_width(ctx, rty) == Some(64) {
+            return Ok(Some(extract_bits_i64(ctx, res, rty, args, true)?));
+        }
         return Ok(Some(vec![Instruction::new(
             Op::BitFieldSExtract,
             Some(rty),
@@ -173,6 +179,9 @@ pub(in crate::passes) fn lower_integer_op(
         )]));
     }
     if name.starts_with("air.insert_bits.") && args.len() == 4 {
+        if int_scalar_width(ctx, rty) == Some(64) {
+            return Ok(Some(insert_bits_i64(ctx, res, rty, args)?));
+        }
         return Ok(Some(vec![Instruction::new(
             Op::BitFieldInsert,
             Some(rty),
@@ -201,6 +210,64 @@ pub(in crate::passes) fn lower_integer_op(
                         args[0],
                         result_lanes,
                     )));
+                }
+            }
+            if let (Some(result_width), Some(arg_width)) =
+                (int_scalar_width(ctx, rty), int_scalar_width(ctx, arg_ty))
+            {
+                if result_width < 32 && arg_width < 32 {
+                    let uint = ctx.ty_uint();
+                    let widened = ctx.module.fresh_id();
+                    let counted = ctx.module.fresh_id();
+                    return Ok(Some(vec![
+                        Instruction::new(
+                            Op::UConvert,
+                            Some(uint),
+                            Some(widened),
+                            vec![Operand::IdRef(args[0])],
+                        ),
+                        Instruction::new(
+                            Op::BitCount,
+                            Some(uint),
+                            Some(counted),
+                            vec![Operand::IdRef(widened)],
+                        ),
+                        Instruction::new(
+                            Op::UConvert,
+                            Some(rty),
+                            Some(res),
+                            vec![Operand::IdRef(counted)],
+                        ),
+                    ]));
+                }
+            }
+            if let (Some((result_lanes, result_width)), Some((arg_lanes, arg_width))) =
+                (int_vector_width(ctx, rty), int_vector_width(ctx, arg_ty))
+            {
+                if result_lanes == arg_lanes && result_width < 32 && arg_width < 32 {
+                    let uint_vec = ctx.ty_vec_uint(result_lanes);
+                    let widened = ctx.module.fresh_id();
+                    let counted = ctx.module.fresh_id();
+                    return Ok(Some(vec![
+                        Instruction::new(
+                            Op::UConvert,
+                            Some(uint_vec),
+                            Some(widened),
+                            vec![Operand::IdRef(args[0])],
+                        ),
+                        Instruction::new(
+                            Op::BitCount,
+                            Some(uint_vec),
+                            Some(counted),
+                            vec![Operand::IdRef(widened)],
+                        ),
+                        Instruction::new(
+                            Op::UConvert,
+                            Some(rty),
+                            Some(res),
+                            vec![Operand::IdRef(counted)],
+                        ),
+                    ]));
                 }
             }
         }
@@ -346,9 +413,383 @@ pub(in crate::passes) fn lower_integer_op(
     Ok(None)
 }
 
-/// Lower the SIMD/subgroup lane-op family (`air.is_uniform`, `air.quad_all`, `air.get_simdgroup_size`,
-/// `air.simd_is_first`, the simd/quad shuffle/broadcast/fill variants, `air.simd_{prefix_*,sum,or,xor,
-/// and,min,max}`) plus the vector-reduction / function-constant predicates (`air.all`/`air.any`,
+/// Vulkan without maintenance9 restricts `OpBitFieldInsert`'s base to 32 bits. Preserve the AIR
+/// 64-bit scalar contract with ordinary integer operations:
+/// `(base & ~(field_mask << offset)) | ((insert & field_mask) << offset)`.
+fn insert_bits_i64(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    let _offset_ty = value_result_type(ctx, args[2])
+        .filter(|ty| int_scalar_width(ctx, *ty).is_some())
+        .ok_or("air.insert_bits i64 offset is not a scalar integer")?;
+    let count_ty = value_result_type(ctx, args[3])
+        .filter(|ty| int_scalar_width(ctx, *ty).is_some())
+        .ok_or("air.insert_bits i64 count is not a scalar integer")?;
+    let all_ones = ctx.const_int_of(rty, -1);
+    let zero_value = ctx.const_int_of(rty, 0);
+    let zero_count = ctx.const_int_of(count_ty, 0);
+    let width = ctx.const_int_of(count_ty, 64);
+    let remaining = ctx.module.fresh_id();
+    let candidate_mask = ctx.module.fresh_id();
+    let count_is_zero = ctx.module.fresh_id();
+    let field_mask = ctx.module.fresh_id();
+    let positioned_mask = ctx.module.fresh_id();
+    let inserted_bits = ctx.module.fresh_id();
+    let positioned_bits = ctx.module.fresh_id();
+    let inverse_mask = ctx.module.fresh_id();
+    let cleared_base = ctx.module.fresh_id();
+    let bool_ty = ctx.ty_bool();
+    Ok(vec![
+        Instruction::new(
+            Op::ISub,
+            Some(count_ty),
+            Some(remaining),
+            vec![Operand::IdRef(width), Operand::IdRef(args[3])],
+        ),
+        Instruction::new(
+            Op::ShiftRightLogical,
+            Some(rty),
+            Some(candidate_mask),
+            vec![Operand::IdRef(all_ones), Operand::IdRef(remaining)],
+        ),
+        Instruction::new(
+            Op::IEqual,
+            Some(bool_ty),
+            Some(count_is_zero),
+            vec![Operand::IdRef(args[3]), Operand::IdRef(zero_count)],
+        ),
+        Instruction::new(
+            Op::Select,
+            Some(rty),
+            Some(field_mask),
+            vec![
+                Operand::IdRef(count_is_zero),
+                Operand::IdRef(zero_value),
+                Operand::IdRef(candidate_mask),
+            ],
+        ),
+        Instruction::new(
+            Op::ShiftLeftLogical,
+            Some(rty),
+            Some(positioned_mask),
+            vec![Operand::IdRef(field_mask), Operand::IdRef(args[2])],
+        ),
+        Instruction::new(
+            Op::BitwiseAnd,
+            Some(rty),
+            Some(inserted_bits),
+            vec![Operand::IdRef(args[1]), Operand::IdRef(field_mask)],
+        ),
+        Instruction::new(
+            Op::ShiftLeftLogical,
+            Some(rty),
+            Some(positioned_bits),
+            vec![Operand::IdRef(inserted_bits), Operand::IdRef(args[2])],
+        ),
+        Instruction::new(
+            Op::Not,
+            Some(rty),
+            Some(inverse_mask),
+            vec![Operand::IdRef(positioned_mask)],
+        ),
+        Instruction::new(
+            Op::BitwiseAnd,
+            Some(rty),
+            Some(cleared_base),
+            vec![Operand::IdRef(args[0]), Operand::IdRef(inverse_mask)],
+        ),
+        Instruction::new(
+            Op::BitwiseOr,
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(cleared_base),
+                Operand::IdRef(positioned_bits),
+            ],
+        ),
+    ])
+}
+
+/// Vulkan applies the same pre-maintenance9 32-bit-base restriction to `OpBitField*Extract`.
+/// Re-express 64-bit extraction with shifts (and a mask for the unsigned form).
+fn extract_bits_i64(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+    signed: bool,
+) -> Result<Vec<Instruction>, String> {
+    let offset_ty = value_result_type(ctx, args[1])
+        .filter(|ty| int_scalar_width(ctx, *ty).is_some())
+        .ok_or("air.extract_bits i64 offset is not a scalar integer")?;
+    let count_ty = value_result_type(ctx, args[2])
+        .filter(|ty| int_scalar_width(ctx, *ty).is_some())
+        .ok_or("air.extract_bits i64 count is not a scalar integer")?;
+    if offset_ty != count_ty {
+        return Err("air.extract_bits i64 offset/count type mismatch".into());
+    }
+    let width = ctx.const_int_of(count_ty, 64);
+    let zero_count = ctx.const_int_of(count_ty, 0);
+    let zero_value = ctx.const_int_of(rty, 0);
+    let count_is_zero = ctx.module.fresh_id();
+    let bool_ty = ctx.ty_bool();
+    let mut instructions = vec![Instruction::new(
+        Op::IEqual,
+        Some(bool_ty),
+        Some(count_is_zero),
+        vec![Operand::IdRef(args[2]), Operand::IdRef(zero_count)],
+    )];
+    let extracted = ctx.module.fresh_id();
+    if signed {
+        let end = ctx.module.fresh_id();
+        let left_amount = ctx.module.fresh_id();
+        let right_amount = ctx.module.fresh_id();
+        let shifted_left = ctx.module.fresh_id();
+        instructions.extend([
+            Instruction::new(
+                Op::IAdd,
+                Some(count_ty),
+                Some(end),
+                vec![Operand::IdRef(args[1]), Operand::IdRef(args[2])],
+            ),
+            Instruction::new(
+                Op::ISub,
+                Some(count_ty),
+                Some(left_amount),
+                vec![Operand::IdRef(width), Operand::IdRef(end)],
+            ),
+            Instruction::new(
+                Op::ISub,
+                Some(count_ty),
+                Some(right_amount),
+                vec![Operand::IdRef(width), Operand::IdRef(args[2])],
+            ),
+            Instruction::new(
+                Op::ShiftLeftLogical,
+                Some(rty),
+                Some(shifted_left),
+                vec![Operand::IdRef(args[0]), Operand::IdRef(left_amount)],
+            ),
+            Instruction::new(
+                Op::ShiftRightArithmetic,
+                Some(rty),
+                Some(extracted),
+                vec![Operand::IdRef(shifted_left), Operand::IdRef(right_amount)],
+            ),
+        ]);
+    } else {
+        let all_ones = ctx.const_int_of(rty, -1);
+        let remaining = ctx.module.fresh_id();
+        let candidate_mask = ctx.module.fresh_id();
+        let field_mask = ctx.module.fresh_id();
+        let shifted = ctx.module.fresh_id();
+        instructions.extend([
+            Instruction::new(
+                Op::ISub,
+                Some(count_ty),
+                Some(remaining),
+                vec![Operand::IdRef(width), Operand::IdRef(args[2])],
+            ),
+            Instruction::new(
+                Op::ShiftRightLogical,
+                Some(rty),
+                Some(candidate_mask),
+                vec![Operand::IdRef(all_ones), Operand::IdRef(remaining)],
+            ),
+            Instruction::new(
+                Op::Select,
+                Some(rty),
+                Some(field_mask),
+                vec![
+                    Operand::IdRef(count_is_zero),
+                    Operand::IdRef(zero_value),
+                    Operand::IdRef(candidate_mask),
+                ],
+            ),
+            Instruction::new(
+                Op::ShiftRightLogical,
+                Some(rty),
+                Some(shifted),
+                vec![Operand::IdRef(args[0]), Operand::IdRef(args[1])],
+            ),
+            Instruction::new(
+                Op::BitwiseAnd,
+                Some(rty),
+                Some(extracted),
+                vec![Operand::IdRef(shifted), Operand::IdRef(field_mask)],
+            ),
+        ]);
+    }
+    instructions.push(Instruction::new(
+        Op::Select,
+        Some(rty),
+        Some(res),
+        vec![
+            Operand::IdRef(count_is_zero),
+            Operand::IdRef(zero_value),
+            Operand::IdRef(extracted),
+        ],
+    ));
+    Ok(instructions)
+}
+
+fn lower_quad_vote(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    predicate: Word,
+    all: bool,
+) -> Result<Vec<Instruction>, String> {
+    if !is_bool_type(ctx, rty) {
+        return Err("quad vote result type is not bool".to_string());
+    }
+    // Metal quads are fixed aligned four-lane partitions. SPIR-V's subgroup vote instructions cover
+    // the entire implementation subgroup, which may contain several Metal quads, so they are not a
+    // semantic match. Convert the predicate to 0/1 and use the same XOR butterfly as quad_sum:
+    // mask 1 combines adjacent lanes, then mask 2 combines the two pairs. Every lane receives the
+    // exact result for its own four-lane partition, independent of the physical subgroup width.
+    let uint = ctx.ty_uint();
+    let one = ctx.const_uint(1);
+    let zero = ctx.const_uint(0);
+    let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let word = ctx.module.fresh_id();
+    let peer_one = ctx.module.fresh_id();
+    let pair = ctx.module.fresh_id();
+    let peer_two = ctx.module.fresh_id();
+    let quad = ctx.module.fresh_id();
+    let op = if all { Op::BitwiseAnd } else { Op::BitwiseOr };
+    Ok(vec![
+        Instruction::new(
+            Op::Select,
+            Some(uint),
+            Some(word),
+            vec![
+                Operand::IdRef(predicate),
+                Operand::IdRef(one),
+                Operand::IdRef(zero),
+            ],
+        ),
+        Instruction::new(
+            Op::GroupNonUniformShuffleXor,
+            Some(uint),
+            Some(peer_one),
+            vec![
+                Operand::IdScope(scope),
+                Operand::IdRef(word),
+                Operand::IdRef(one),
+            ],
+        ),
+        Instruction::new(
+            op,
+            Some(uint),
+            Some(pair),
+            vec![Operand::IdRef(word), Operand::IdRef(peer_one)],
+        ),
+        Instruction::new(
+            Op::GroupNonUniformShuffleXor,
+            Some(uint),
+            Some(peer_two),
+            vec![
+                Operand::IdScope(scope),
+                Operand::IdRef(pair),
+                Operand::IdRef(ctx.const_uint(2)),
+            ],
+        ),
+        Instruction::new(
+            op,
+            Some(uint),
+            Some(quad),
+            vec![Operand::IdRef(pair), Operand::IdRef(peer_two)],
+        ),
+        Instruction::new(
+            if all { Op::IEqual } else { Op::INotEqual },
+            Some(rty),
+            Some(res),
+            vec![
+                Operand::IdRef(quad),
+                Operand::IdRef(if all { one } else { zero }),
+            ],
+        ),
+    ])
+}
+
+fn lower_quad_active_threads_mask(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+) -> Result<Vec<Instruction>, String> {
+    if int_scalar_width(ctx, rty) != Some(16) {
+        return Err("air.quad_active_threads_mask result is not i16".to_string());
+    }
+    // AIR reports a quad-relative four-bit mask. A subgroup ballot is absolute, so select the
+    // current 32-lane word and shift its aligned four-lane partition down to bits 0..3. Quad bases
+    // are multiples of four and therefore never straddle the ballot's 32-bit words.
+    let uint = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
+    let ballot_ty = ctx.ty_vec_uint(4);
+    let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let active = ctx.const_bool_of(bool_ty, true);
+    let mut insts = Vec::new();
+    let lane = subgroup_lane_index_u32(ctx, &mut insts);
+    let ballot = ctx.module.fresh_id();
+    let word_index = ctx.module.fresh_id();
+    let word = ctx.module.fresh_id();
+    let quad_shift = ctx.module.fresh_id();
+    let shifted = ctx.module.fresh_id();
+    let masked = ctx.module.fresh_id();
+    insts.extend([
+        Instruction::new(
+            Op::GroupNonUniformBallot,
+            Some(ballot_ty),
+            Some(ballot),
+            vec![Operand::IdScope(scope), Operand::IdRef(active)],
+        ),
+        Instruction::new(
+            Op::ShiftRightLogical,
+            Some(uint),
+            Some(word_index),
+            vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(5))],
+        ),
+        Instruction::new(
+            Op::VectorExtractDynamic,
+            Some(uint),
+            Some(word),
+            vec![Operand::IdRef(ballot), Operand::IdRef(word_index)],
+        ),
+        Instruction::new(
+            Op::BitwiseAnd,
+            Some(uint),
+            Some(quad_shift),
+            vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(28))],
+        ),
+        Instruction::new(
+            Op::ShiftRightLogical,
+            Some(uint),
+            Some(shifted),
+            vec![Operand::IdRef(word), Operand::IdRef(quad_shift)],
+        ),
+        Instruction::new(
+            Op::BitwiseAnd,
+            Some(uint),
+            Some(masked),
+            vec![Operand::IdRef(shifted), Operand::IdRef(ctx.const_uint(15))],
+        ),
+        Instruction::new(
+            Op::UConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(masked)],
+        ),
+    ]);
+    Ok(insts)
+}
+
+/// Lower the SIMD/subgroup lane-op family (`air.is_uniform`, `air.quad_{all,any}`, `air.get_simdgroup_size`,
+/// `air.simd_is_first`, `air.quad_is_first`, the simd/quad shuffle/broadcast/fill variants,
+/// `air.simd_{prefix_*,sum,or,xor,and,min,max}`) plus the vector-reduction / function-constant predicates (`air.all`/`air.any`,
 /// `function_constant_predicate`, `air.is_function_constant_defined`). Returns `Ok(Some(insts))` when a
 /// branch handled the call, `Ok(None)` when no guard matched (the caller then continues its dispatch
 /// cascade), or `Err` when a matched branch rejected its operands. Guard order/precedence is preserved.
@@ -368,14 +809,11 @@ pub(in crate::passes) fn lower_simd_op(
             vec![Operand::IdScope(scope), Operand::IdRef(args[0])],
         )]));
     }
-    if name == "air.quad_all" && args.len() == 1 {
-        let scope = ctx.const_uint(Scope::Subgroup as u32);
-        return Ok(Some(vec![Instruction::new(
-            Op::GroupNonUniformAll,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdScope(scope), Operand::IdRef(args[0])],
-        )]));
+    if matches!(name, "air.quad_all" | "air.quad_any") && args.len() == 1 {
+        return lower_quad_vote(ctx, res, rty, args[0], name == "air.quad_all").map(Some);
+    }
+    if name == "air.quad_active_threads_mask" && args.is_empty() {
+        return lower_quad_active_threads_mask(ctx, res, rty).map(Some);
     }
     if name.starts_with("air.get_simdgroup_size.") && args.is_empty() {
         if int_scalar_width(ctx, rty).is_none() {
@@ -388,6 +826,31 @@ pub(in crate::passes) fn lower_simd_op(
             Some(res),
             vec![Operand::IdRef(width)],
         )]));
+    }
+    if name == "air.quad_is_first" && args.is_empty() {
+        if !is_bool_type(ctx, rty) {
+            return Err(format!("{name} result type is not bool"));
+        }
+        // Metal quads are the fixed four-lane partitions already used by the quad shuffle and sum
+        // lowerings. The first lane is therefore exactly `(SubgroupLocalInvocationId & 3) == 0`,
+        // independent of the physical subgroup width.
+        let mut insts = Vec::new();
+        let lane = subgroup_lane_index_u32(ctx, &mut insts);
+        let uint = ctx.ty_uint();
+        let quad_lane = ctx.module.fresh_id();
+        insts.push(Instruction::new(
+            Op::BitwiseAnd,
+            Some(uint),
+            Some(quad_lane),
+            vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(3))],
+        ));
+        insts.push(Instruction::new(
+            Op::IEqual,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(quad_lane), Operand::IdRef(ctx.const_uint(0))],
+        ));
+        return Ok(Some(insts));
     }
     if name == "air.simd_is_first" && args.is_empty() {
         if !is_bool_type(ctx, rty) {
@@ -536,6 +999,9 @@ pub(in crate::passes) fn lower_simd_op(
     }
     if name.starts_with("air.quad_sum.") && args.len() == 1 {
         return lower_quad_sum(ctx, res, rty, args[0]).map(Some);
+    }
+    if (name.starts_with("air.quad_min.") || name.starts_with("air.quad_max.")) && args.len() == 1 {
+        return lower_quad_integer_extrema(ctx, name, res, rty, args[0]).map(Some);
     }
     // `air.quad_shuffle_xor.<ty>(value, mask)` returns `value` from quad-lane `lane ^ mask`. Metal's
     // quad mask is 0..3, so xoring the full subgroup lane id keeps the exchange inside the 4-aligned
@@ -719,6 +1185,10 @@ pub(in crate::passes) fn lower_one(
     args: &[Word],
     v4: Word,
 ) -> Result<Vec<Instruction>, String> {
+    if name.starts_with("air.") && crate::air_intrinsics::air_intrinsic_disposition(name).is_none()
+    {
+        return Err(format!("unrecognized AIR intrinsic family: {name}"));
+    }
     // texture sampling: air.sample_texture_<dim>.<ret>. Result is a {vecN, i8} struct in AIR; the
     // body then CompositeExtract member 0. We make our sample produce the same struct so the extract
     // still works: build {sample, 0u8}.
@@ -761,11 +1231,20 @@ pub(in crate::passes) fn lower_one(
     if name.starts_with("air.write_texture") {
         return lower_write(ctx, args, v4);
     }
+    if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
+        return lower_atomic_texture_fetch_max(ctx, name, res, rty, args);
+    }
     if name == "air.calculate_unclamped_lod_texture_2d" {
-        return lower_calculate_unclamped_lod_texture_2d(ctx, name, res, rty, args);
+        return lower_calculate_lod_texture_2d(ctx, name, res, rty, args, 1);
+    }
+    if name == "air.calculate_clamped_lod_texture_2d" {
+        return lower_calculate_lod_texture_2d(ctx, name, res, rty, args, 0);
     }
     if name.starts_with("air.write_imageblock_slice_to_texture") {
         return lower_imageblock_slice_write(ctx, name, args, v4);
+    }
+    if name.starts_with("air.store.implicit_imageblock.") {
+        return lower_implicit_imageblock_store(ctx, name, args);
     }
     if name.starts_with("air.discard_fragment") {
         // OpKill is a block terminator; but AIR calls it mid-block. Use OpDemoteToHelperInvocation
@@ -777,7 +1256,7 @@ pub(in crate::passes) fn lower_one(
             vec![],
         )]);
     }
-    if is_command_encoder_helper(name) {
+    if crate::air_intrinsics::is_command_encoder_helper(name) {
         if let Some(rty) = rty {
             if !is_void_type(ctx, rty) {
                 return Err(format!(
@@ -850,6 +1329,9 @@ pub(in crate::passes) fn lower_one(
     if name.starts_with("air.get_num_samples_texture") {
         return lower_get_num_samples_texture(ctx, name, res, rty);
     }
+    if name == "air.get_num_samples.i32" {
+        return lower_raster_sample_count(ctx, name, res, rty);
+    }
     // The private capture harness synthesizes `metal::rasterization_rate_map_data` as a single physical tile.
     // The observed Apple helper maps through that 1x1 tile to the first physical texel; full
     // variable-rate rasterization map decoding remains a separate resource-model problem.
@@ -872,7 +1354,7 @@ pub(in crate::passes) fn lower_one(
     // LocalSize x/y — the same values `air.threads_per_threadgroup` exposes. Lowered here (not the
     // emitter) because only the pass Ctx knows `kernel_local_size`. Byte-relevant: the imageblock
     // slice-write OOB gate compares `origin + region` (region defaults to these dimensions) against
-    // the texture extent; a wrong constant (the old emitter stub said 1) under-reports the region
+    // the texture extent; a constant value of 1 under-reports the region
     // and lets Apple-discarded out-of-bounds block writes land at the origin texel.
     if name == "air.get_imageblock_width" || name == "air.get_imageblock_height" {
         return lower_get_imageblock_extent(ctx, name, res, rty);
@@ -901,6 +1383,12 @@ pub(in crate::passes) fn lower_one(
 
     if name == "llvm.agx3.edgecheck" {
         return lower_agx3_edgecheck(ctx, name, res, rty, args);
+    }
+    if name.starts_with("air.load.implicit_imageblock.") {
+        return lower_implicit_imageblock_load(ctx, name, res, rty, args);
+    }
+    if let Some(dimension) = agx2_matmad_dimension(name) {
+        return lower_agx2_matmad(ctx, name, res, rty, args, dimension);
     }
 
     // numeric conversions: air.convert.<dst>.<...>.<src> -> OpConvert* / OpBitcast.
@@ -936,6 +1424,11 @@ pub(in crate::passes) fn lower_one(
     // the operand types, never from a shader identifier.
     if name.starts_with("air.simdgroup_matrix_8x8_multiply_accumulate.") {
         return lower_simdgroup_matrix_8x8_mac(ctx, res, rty, args);
+    }
+    if name.starts_with("air.simdgroup_matrix_16x16x16_multiply_accumulate.")
+        || name.starts_with("air.simdgroup_matrix_16x16x16_widening_multiply_accumulate.")
+    {
+        return lower_simdgroup_matrix_16x16_mac(ctx, name, res, rty, args);
     }
     if name.starts_with("air.simdgroup_matrix_8x8_init_diag.") {
         return lower_simdgroup_matrix_8x8_init_diag(ctx, res, rty, args);

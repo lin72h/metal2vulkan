@@ -10,7 +10,7 @@
 use crate::spirv_module::Block;
 use crate::spirv_module::Operand;
 use spirv::{Op, Word};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Successor block labels of one owned `Block`, read from its terminator. Branch/BranchConditional
 /// arms in operand order; switch default + case targets sorted and deduped. Non-terminating or
@@ -61,16 +61,4 @@ pub(in crate::passes) fn block_successors_by_label(blocks: &[Block]) -> HashMap<
         .iter()
         .filter_map(|block| Some((block.label.as_ref()?.result_id?, block_successors(block))))
         .collect()
-}
-
-/// Whether `dominator` dominates `label` in a precomputed Word-keyed dominator-set map
-/// (`label -> {blocks that dominate it}`).
-pub(in crate::passes) fn label_dominates(
-    dominators: &HashMap<Word, HashSet<Word>>,
-    dominator: Word,
-    label: Word,
-) -> bool {
-    dominators
-        .get(&label)
-        .is_some_and(|labels| labels.contains(&dominator))
 }

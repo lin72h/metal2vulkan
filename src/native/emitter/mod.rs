@@ -1,6 +1,8 @@
 use super::cfg::{
-    block_index_by_label, id_ref_operand, infer_branch_merges, infer_loop_merges,
-    infer_switch_merges, lower_unstructured_switches, LoopMergeInfo,
+    block_index_by_label, funnel_shared_branch_dispatches, id_ref_operand,
+    infer_bounded_branch_merges_by_header, infer_branch_merges, infer_direct_branch_merges,
+    infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
+    lower_unstructured_switches, refunnel_one_deep_shared_arm, LoopMergeInfo,
 };
 use super::ir::{
     LlDeclaration, LlFunction, LlGep, LlGlobal, LlModule, LlType, LlTypeCapability, LlValue,
@@ -51,8 +53,8 @@ pub(super) struct Emitter {
     /// (`air.atomic.*.i32`) but are declared with a 32-bit-bitcastable *non*-integer scalar pointee
     /// (e.g. a `float` threadgroup scratch slot used for the atomic-min/max bit-pattern idiom).
     /// Under Logical addressing an integer atomic needs an `i32`-typed pointer to that exact memory,
-    /// which — for a global — only exists if the variable itself is declared `i32`; the old path
-    /// reinterpreted the float pointer with an illegal logical-pointer `OpBitcast`. So `emit_global`
+    /// which — for a global — only exists if the variable itself is declared `i32`. Reinterpreting
+    /// the float pointer would require an illegal logical-pointer `OpBitcast`, so `emit_global`
     /// declares these as `i32` instead, and the existing scalar value-reinterpret load/store paths
     /// (32-bit `OpBitcast` on the *value*) carry the float accesses. Computed structurally from the
     /// `air.atomic.*.i32` ABI symbol family before globals emit; excludes any global also accessed by
@@ -80,6 +82,14 @@ pub(super) struct Emitter {
     pointer_pointees: HashMap<String, LlType>,
     local_alloca_pointees: HashMap<String, LlType>,
     pointer_nullness: HashMap<String, Word>,
+    /// BDA-mode integer sources for `inttoptr` results in the current function. Collected from the
+    /// typed graph before block emission so a loop-header address phi can reserve a backedge value
+    /// whose `inttoptr` definition appears in the latch.
+    bda_inttoptr_sources: HashMap<String, TypedValue>,
+    /// Runtime 64-bit addresses for descriptor-rooted direct buffer parameters. In BDA mode these
+    /// are materialized once in the entry block from the reflected buffer-address sidecar, then used
+    /// as ordinary dominating integer values by address-domain pointer merges.
+    bda_direct_addresses: HashMap<String, Word>,
     /// The two little-endian 32-bit words of a serialized 64-bit pointer loaded through a raw
     /// buffer view. Logical SPIR-V pointers cannot represent or compare this wire payload, so raw
     /// pointer equality and stores operate on these integer words instead.
@@ -93,6 +103,10 @@ pub(super) struct Emitter {
     tir_phi_incomings: HashMap<String, Vec<(LlValue, String)>>,
     function_param_pointees: HashMap<(String, usize), LlType>,
     function_param_nonnull: HashSet<(String, usize)>,
+    /// Residual helper pointer parameters whose authored LLVM nullness is observed. Logical SPIR-V
+    /// pointers cannot carry a null value portably, so calls append one Boolean shadow for exactly
+    /// these parameters and the callee binds that shadow to its ordinary pointer SSA name.
+    function_param_nullness: HashSet<(String, usize)>,
     direct_param_values: HashSet<String>,
     direct_param_indices: HashMap<String, u32>,
     param_values: HashSet<String>,
@@ -108,6 +122,10 @@ pub(super) struct Emitter {
     raw_offsets: HashMap<String, RawBufferOffset>,
     int_alignments: HashMap<String, u64>,
     unmodeled_pointers: HashSet<String>,
+    /// AIR occasionally embeds a numeric Workgroup address directly in an atomic operand. Logical
+    /// SPIR-V has no integer-to-Workgroup-pointer conversion, so preserve equality of identical
+    /// numeric addresses with one module-scope atomic slot per address.
+    workgroup_i32_addresses: HashMap<u64, Word>,
     /// SSA value names bound by `air.get_null_texture_*`. A strict subset of `unmodeled_pointers`
     /// (many other placeholders land there too), so `air.is_null_texture` keys on THIS set — a
     /// value synthesized as a null texture answers TRUE, everything else stays on the default path.
@@ -116,6 +134,11 @@ pub(super) struct Emitter {
     block_labels: HashMap<String, Word>,
     branch_merges: HashMap<(String, String), String>,
     branch_merges_by_header: HashMap<String, String>,
+    /// The current function was planned by the construct tree, whose merge ownership is keyed by
+    /// header rather than by a potentially shared target pair. This is per-function provenance:
+    /// enabling the construct-tree retry for the module does not change how normally planned helper
+    /// functions look up their merges.
+    branch_merges_header_only: bool,
     loop_merges: HashMap<String, LoopMergeInfo>,
     switch_merges: HashMap<String, String>,
     current_block: Option<String>,
@@ -261,6 +284,8 @@ struct SelectedLoadPointer {
     cond: Word,
     true_ptr: Option<Word>,
     false_ptr: Option<Word>,
+    true_storage: StorageClass,
+    false_storage: StorageClass,
     pointee: LlType,
     true_raw: Option<RawBufferOffset>,
     false_raw: Option<RawBufferOffset>,
@@ -272,7 +297,8 @@ struct SelectedLoadPointer {
 
 #[derive(Clone, Debug)]
 struct DynamicPointerTable {
-    index: TypedValue,
+    selector: Word,
+    selector_bits: u32,
     entries: Vec<(u32, TypedValue)>,
 }
 
@@ -383,6 +409,7 @@ impl Emitter {
 
     pub(super) fn new(mut ir: LlModule) -> Self {
         ir.inline_simple_static_initializers();
+        ir.fold_static_initializer_constants();
         ir.inline_ordinary_leaf_helpers();
         let mut module = Module::new();
         module.capabilities.push(Instruction::new(
@@ -434,6 +461,8 @@ impl Emitter {
             pointer_pointees: HashMap::new(),
             local_alloca_pointees: HashMap::new(),
             pointer_nullness: HashMap::new(),
+            bda_inttoptr_sources: HashMap::new(),
+            bda_direct_addresses: HashMap::new(),
             pointer_payload_words: HashMap::new(),
             pointer_payload_values: HashSet::new(),
             pointer_phi_values: HashSet::new(),
@@ -441,6 +470,7 @@ impl Emitter {
             tir_phi_incomings: HashMap::new(),
             function_param_pointees: HashMap::new(),
             function_param_nonnull: HashSet::new(),
+            function_param_nullness: HashSet::new(),
             direct_param_values: HashSet::new(),
             direct_param_indices: HashMap::new(),
             param_values: HashSet::new(),
@@ -451,11 +481,13 @@ impl Emitter {
             raw_offsets: HashMap::new(),
             int_alignments: HashMap::new(),
             unmodeled_pointers: HashSet::new(),
+            workgroup_i32_addresses: HashMap::new(),
             null_texture_values: HashSet::new(),
             function_ids: HashMap::new(),
             block_labels: HashMap::new(),
             branch_merges: HashMap::new(),
             branch_merges_by_header: HashMap::new(),
+            branch_merges_header_only: false,
             loop_merges: HashMap::new(),
             switch_merges: HashMap::new(),
             current_block: None,
@@ -548,7 +580,7 @@ impl Emitter {
                 let Some(call_result) = &inst.emit_scan_call else {
                     continue;
                 };
-                let call = call_result.as_ref().map_err(|e| e.clone())?;
+                let call = call_result.as_ref().as_ref().map_err(|e| e.clone())?;
                 let Some(callee) = functions_by_name.get(&call.callee) else {
                     continue;
                 };
@@ -608,7 +640,7 @@ impl Emitter {
                 let Some(call_result) = &inst.emit_scan_call else {
                     continue;
                 };
-                let call = call_result.as_ref().map_err(|e| e.clone())?;
+                let call = call_result.as_ref().as_ref().map_err(|e| e.clone())?;
                 let Some(callee) = functions_by_name.get(&call.callee) else {
                     continue;
                 };
@@ -635,6 +667,82 @@ impl Emitter {
         }
         all_nonnull.retain(|key| seen.contains(key) && !rejected.contains(key));
         Ok(all_nonnull)
+    }
+
+    pub(super) fn infer_function_param_nullness(
+        &self,
+        functions: &[LlFunction],
+    ) -> Result<HashSet<(String, usize)>, String> {
+        let function_param_nonnull = self.infer_function_param_nonnull(functions)?;
+        let mut required = HashSet::new();
+        for function in functions {
+            for inst in function.carrier_insts() {
+                if !matches!(inst.cmp_predicate.as_deref(), Some("eq" | "ne")) {
+                    continue;
+                }
+                let operands = inst
+                    .operands
+                    .iter()
+                    .map(crate::native::tir::TirOperand::as_typed_value)
+                    .collect::<Option<Vec<_>>>();
+                let Some(operands) = operands else {
+                    continue;
+                };
+                let [lhs, rhs] = operands.as_slice() else {
+                    continue;
+                };
+                if !matches!(self.resolve_type(&lhs.ty)?, LlType::Ptr(_)) {
+                    continue;
+                }
+                let observed = match (&lhs.value, &rhs.value) {
+                    (LlValue::Zero, LlValue::Local(name))
+                    | (LlValue::Local(name), LlValue::Zero) => name,
+                    _ => continue,
+                };
+                if let Some(index) = function
+                    .params
+                    .iter()
+                    .position(|(name, _)| name == observed)
+                {
+                    required.insert((function.name.clone(), index));
+                }
+            }
+        }
+
+        // A helper may forward one of its parameters directly to another helper that observes
+        // nullness. Propagate that ABI requirement back through direct parameter-to-parameter calls;
+        // ordinary SSA aliases carry their already-recorded Boolean at emission time.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for function in functions {
+                for inst in function.carrier_insts() {
+                    let Some(call) = inst.call.as_ref() else {
+                        continue;
+                    };
+                    for (callee_index, argument) in call.args.iter().enumerate() {
+                        if !required.contains(&(call.callee.clone(), callee_index)) {
+                            continue;
+                        }
+                        let LlValue::Local(argument_name) = &argument.value else {
+                            continue;
+                        };
+                        let Some(caller_index) = function
+                            .params
+                            .iter()
+                            .position(|(name, _)| name == argument_name)
+                        else {
+                            continue;
+                        };
+                        changed |= required.insert((function.name.clone(), caller_index));
+                    }
+                }
+            }
+        }
+        required.retain(|key| {
+            !self.ir.entry_functions.contains(&key.0) && !function_param_nonnull.contains(key)
+        });
+        Ok(required)
     }
 
     fn local_call_arg_nonnull_values(
@@ -669,7 +777,7 @@ impl Emitter {
                 }
                 // `bitcast` carries the parsed src + dst TEXT (`convert_dst_type` stays emit-time); re-parse
                 // the dst text to keep the reader's `parse_type(dst_text)? -> resolve_type?` propagation.
-                if let Some((src, dst_text)) = &inst.bitcast {
+                if let Some((src, dst_text)) = inst.bitcast.as_deref() {
                     if matches!(self.resolve_type(&parse_type(dst_text)?)?, LlType::Ptr(_))
                         && self.call_arg_known_nonnull(&src.value, &nonnull)
                     {
@@ -679,7 +787,9 @@ impl Emitter {
                     continue;
                 }
                 if let Some(gep) = &inst.gep {
-                    if self.call_arg_known_nonnull(&gep.base.value, &nonnull) {
+                    if self.call_arg_known_nonnull(&gep.base.value, &nonnull)
+                        || self.inbounds_gep_has_nonzero_constant_offset(gep)?
+                    {
                         nonnull.insert(name.clone());
                         changed = true;
                     }
@@ -687,6 +797,22 @@ impl Emitter {
             }
         }
         Ok(nonnull)
+    }
+
+    fn inbounds_gep_has_nonzero_constant_offset(&self, gep: &LlGep) -> Result<bool, String> {
+        if !gep.inbounds {
+            return Ok(false);
+        }
+        let Some(first) = const_index(gep.indices.first()) else {
+            return Ok(false);
+        };
+        let source_ty = self.resolve_type(&gep.source_ty)?;
+        if first != 0 && self.raw_type_size_align(&source_ty)?.0 != 0 {
+            return Ok(true);
+        }
+        Ok(self
+            .constant_aggregate_gep_offset(&source_ty, &gep.indices[1..])?
+            .is_some_and(|(offset, _)| offset != 0))
     }
 
     fn call_arg_known_nonnull(&self, value: &LlValue, local_nonnull: &HashSet<String>) -> bool {
@@ -727,7 +853,7 @@ impl Emitter {
                 if pointees.contains_key(name) {
                     continue;
                 }
-                if let Some((src, dst_text)) = &inst.bitcast {
+                if let Some((src, dst_text)) = inst.bitcast.as_deref() {
                     let dst_ty = self.resolve_type(&parse_type(dst_text)?)?;
                     if matches!(dst_ty, LlType::Ptr(_)) {
                         if let LlValue::Local(src_name) = &src.value {
@@ -828,6 +954,7 @@ impl Emitter {
         self.emit_inner()?;
         self.record_air_struct_offsets(buffer_layouts);
         if self.used_device_address {
+            self.lower_bda_null_aggregate_pointers()?;
             self.switch_to_physical_storage_buffer64();
         }
         Ok((self.module, self.emit_sidecar))
@@ -846,6 +973,239 @@ impl Emitter {
         self.require_capability(Capability::PhysicalStorageBufferAddresses);
         self.require_capability(Capability::Int64);
         self.require_extension("SPV_KHR_physical_storage_buffer");
+    }
+
+    /// PhysicalStorageBuffer64 does not permit logical pointers as aggregate values. Callback-free
+    /// AIR intersection lowering can leave one such value behind as an opaque result field that is
+    /// structurally always null. Re-type only fields reached exclusively by a null-pointer
+    /// `OpCompositeInsert` to the integer address representation used by the BDA path. Any other use
+    /// leaves the pointer untouched, so an unsupported live logical-pointer aggregate still fails
+    /// validation rather than acquiring invented semantics.
+    fn lower_bda_null_aggregate_pointers(&mut self) -> Result<(), String> {
+        let null_pointers =
+            self.module
+                .types_global_values
+                .iter()
+                .filter_map(|inst| {
+                    (inst.class.opcode == Op::ConstantNull)
+                        .then_some((inst.result_id?, inst.result_type?))
+                })
+                .filter(|(_, ty)| {
+                    self.module.types_global_values.iter().any(|inst| {
+                        inst.class.opcode == Op::TypePointer && inst.result_id == Some(*ty)
+                    })
+                })
+                .collect::<HashMap<_, _>>();
+        if null_pointers.is_empty() {
+            return Ok(());
+        }
+
+        let type_defs = self
+            .module
+            .types_global_values
+            .iter()
+            .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+            .collect::<HashMap<_, _>>();
+        let mut fields_by_null: HashMap<Word, Vec<(Word, usize)>> = HashMap::new();
+        let mut unsupported_use = HashSet::new();
+        for function in &self.module.functions {
+            for inst in function
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter())
+            {
+                for (operand_index, operand) in inst.operands.iter().enumerate() {
+                    let Operand::IdRef(id) = operand else {
+                        continue;
+                    };
+                    let Some(pointer_ty) = null_pointers.get(id).copied() else {
+                        continue;
+                    };
+                    if inst.class.opcode != Op::CompositeInsert || operand_index != 0 {
+                        unsupported_use.insert(*id);
+                        continue;
+                    }
+                    let Some(mut aggregate_ty) = inst.result_type else {
+                        unsupported_use.insert(*id);
+                        continue;
+                    };
+                    let mut target = None;
+                    for index in inst.operands.iter().skip(2) {
+                        let Operand::LiteralBit32(member) = index else {
+                            target = None;
+                            break;
+                        };
+                        let Some(def) = type_defs.get(&aggregate_ty) else {
+                            target = None;
+                            break;
+                        };
+                        let Some(Operand::IdRef(member_ty)) = def.operands.get(*member as usize)
+                        else {
+                            target = None;
+                            break;
+                        };
+                        target = Some((aggregate_ty, *member as usize, *member_ty));
+                        aggregate_ty = *member_ty;
+                    }
+                    match target {
+                        Some((owner, member, leaf_ty)) if leaf_ty == pointer_ty => {
+                            fields_by_null.entry(*id).or_default().push((owner, member));
+                        }
+                        _ => {
+                            unsupported_use.insert(*id);
+                        }
+                    }
+                }
+            }
+        }
+        fields_by_null.retain(|id, fields| !fields.is_empty() && !unsupported_use.contains(id));
+        if fields_by_null.is_empty() {
+            return Ok(());
+        }
+
+        let address_ty = self.type_id(&LlType::Int(64))?;
+        let zero = self.const_signed_int(64, 0)?;
+        let lowered_nulls = fields_by_null.keys().copied().collect::<HashSet<_>>();
+        let mut address_values = lowered_nulls.clone();
+        let mut lowered_fields = fields_by_null
+            .into_values()
+            .flatten()
+            .collect::<HashSet<_>>();
+        let result_types = self
+            .module
+            .types_global_values
+            .iter()
+            .chain(self.module.functions.iter().flat_map(|function| {
+                function.parameters.iter().chain(
+                    function
+                        .blocks
+                        .iter()
+                        .flat_map(|block| block.instructions.iter()),
+                )
+            }))
+            .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
+            .collect::<HashMap<_, _>>();
+        loop {
+            let mut changed = false;
+            for function in &self.module.functions {
+                for inst in function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.instructions.iter())
+                {
+                    match inst.class.opcode {
+                        Op::CompositeExtract => {
+                            let Some(Operand::IdRef(composite)) = inst.operands.first() else {
+                                continue;
+                            };
+                            let Some(mut aggregate_ty) = result_types.get(composite).copied() else {
+                                continue;
+                            };
+                            let mut target = None;
+                            for index in inst.operands.iter().skip(1) {
+                                let Operand::LiteralBit32(member) = index else {
+                                    target = None;
+                                    break;
+                                };
+                                let Some(def) = type_defs.get(&aggregate_ty) else {
+                                    target = None;
+                                    break;
+                                };
+                                let Some(Operand::IdRef(member_ty)) =
+                                    def.operands.get(*member as usize)
+                                else {
+                                    target = None;
+                                    break;
+                                };
+                                target = Some((aggregate_ty, *member as usize));
+                                aggregate_ty = *member_ty;
+                            }
+                            if target.is_some_and(|field| lowered_fields.contains(&field)) {
+                                if let Some(result) = inst.result_id {
+                                    changed |= address_values.insert(result);
+                                }
+                            }
+                        }
+                        Op::CompositeInsert => {
+                            let Some(Operand::IdRef(object)) = inst.operands.first() else {
+                                continue;
+                            };
+                            if !address_values.contains(object) {
+                                continue;
+                            }
+                            let Some(mut aggregate_ty) = inst.result_type else {
+                                continue;
+                            };
+                            let mut target = None;
+                            for index in inst.operands.iter().skip(2) {
+                                let Operand::LiteralBit32(member) = index else {
+                                    target = None;
+                                    break;
+                                };
+                                let Some(def) = type_defs.get(&aggregate_ty) else {
+                                    target = None;
+                                    break;
+                                };
+                                let Some(Operand::IdRef(member_ty)) =
+                                    def.operands.get(*member as usize)
+                                else {
+                                    target = None;
+                                    break;
+                                };
+                                target = Some((aggregate_ty, *member as usize));
+                                aggregate_ty = *member_ty;
+                            }
+                            if let Some(field) = target {
+                                changed |= lowered_fields.insert(field);
+                            }
+                        }
+                        Op::CopyObject
+                            if inst.operands.iter().any(|operand| {
+                                matches!(operand, Operand::IdRef(id) if address_values.contains(id))
+                            }) =>
+                        {
+                            if let Some(result) = inst.result_id {
+                                changed |= address_values.insert(result);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for inst in &mut self.module.types_global_values {
+            let Some(owner) = inst.result_id else {
+                continue;
+            };
+            for (member, operand) in inst.operands.iter_mut().enumerate() {
+                if lowered_fields.contains(&(owner, member)) {
+                    *operand = Operand::IdRef(address_ty);
+                }
+            }
+        }
+        for function in &mut self.module.functions {
+            for inst in function
+                .blocks
+                .iter_mut()
+                .flat_map(|block| block.instructions.iter_mut())
+            {
+                if inst
+                    .result_id
+                    .is_some_and(|id| address_values.contains(&id))
+                {
+                    inst.result_type = Some(address_ty);
+                }
+                for operand in &mut inst.operands {
+                    if matches!(operand, Operand::IdRef(id) if lowered_nulls.contains(id)) {
+                        *operand = Operand::IdRef(zero);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Run the full emission for its side effect of populating `storage_snapshots` (one per function's
@@ -907,6 +1267,7 @@ impl Emitter {
         }
         self.infer_function_param_pointees(&functions)?;
         self.function_param_nonnull = self.infer_function_param_nonnull(&functions)?;
+        self.function_param_nullness = self.infer_function_param_nullness(&functions)?;
         for f in &functions {
             self.emit_function_with_raw_retry(f)?;
         }
@@ -1001,12 +1362,29 @@ impl Emitter {
 
     fn rewrite_scalar_pointer_arithmetic_access_chains(&mut self) {
         let mut pointer_storage = HashMap::new();
+        let aggregate_types = self
+            .module
+            .types_global_values
+            .iter()
+            .filter(|inst| {
+                matches!(
+                    inst.class.opcode,
+                    Op::TypeStruct | Op::TypeArray | Op::TypeRuntimeArray | Op::TypeMatrix
+                )
+            })
+            .filter_map(|inst| inst.result_id)
+            .collect::<HashSet<_>>();
+        let mut pointer_pointees = HashMap::new();
         for inst in &self.module.types_global_values {
             if inst.class.opcode == Op::TypePointer {
-                if let (Some(result), Some(Operand::StorageClass(storage))) =
-                    (inst.result_id, inst.operands.first())
+                if let (
+                    Some(result),
+                    Some(Operand::StorageClass(storage)),
+                    Some(Operand::IdRef(pointee)),
+                ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
                 {
                     pointer_storage.insert(result, *storage);
+                    pointer_pointees.insert(result, *pointee);
                 }
             }
         }
@@ -1050,6 +1428,12 @@ impl Emitter {
                     if !pointer_storage
                         .get(&result_type)
                         .is_some_and(|storage| ptr_access_chain_allowed_storage(*storage))
+                    {
+                        continue;
+                    }
+                    if pointer_pointees
+                        .get(&result_type)
+                        .is_some_and(|pointee| aggregate_types.contains(pointee))
                     {
                         continue;
                     }

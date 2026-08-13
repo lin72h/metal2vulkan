@@ -11,9 +11,31 @@ pub(crate) struct EmitSidecar {
     /// Emitted `OpTypeStruct` id -> exact AIR member offsets, including backend padding members.
     pub(crate) air_struct_offsets: HashMap<Word, Vec<u32>>,
     pub(crate) buffer_address_words: Vec<BufferAddressWord>,
+    /// Exact constant byte address of a GEP result relative to one buffer root. This preserves the
+    /// source aggregate layout across the native-emitter → remodeled-interface seam, where an
+    /// overlapping struct/union may intentionally become a raw word block.
+    pub(crate) buffer_access_offsets: Vec<BufferAccessOffset>,
+    /// Affine byte address of a dynamic GEP relative to one buffer root. Each term is an emitted
+    /// integer index id and its exact source-layout byte stride.
+    pub(crate) buffer_access_affine_offsets: Vec<BufferAccessAffineOffset>,
+    /// Final descriptor variable -> original emitted parameter pointee type. Raw interface blocks
+    /// deliberately discard that aggregate shape; constant late access paths still need it as the
+    /// exact AIR layout oracle.
+    pub(crate) buffer_root_source_types: HashMap<Word, Word>,
+    /// Pointer-handle value loaded from a fixed byte offset of a buffer parameter root. The root id
+    /// is remapped with helper parameters during inlining, so the fact reaches the entry parameter
+    /// without retaining a callee-local ordinal.
+    pub(crate) buffer_pointer_field_loads: Vec<BufferPointerFieldLoad>,
+    /// Pointer handle loaded from element `index` of a buffer parameter whose AIR element is one
+    /// serialized 64-bit opaque handle (for example `array_ref<texture2d<...>>`).
+    pub(crate) buffer_pointer_dynamic_field_loads: Vec<BufferPointerDynamicFieldLoad>,
     pub(crate) local_pointer_field_stores: Vec<LocalPointerFieldStore>,
     pub(crate) local_pointer_field_loads: Vec<LocalPointerFieldLoad>,
     pub(crate) local_pointer_dynamic_field_loads: Vec<LocalPointerDynamicFieldLoad>,
+    /// Result ids emitted as typed sentinels for the stable `llvm.agx2.cluster.num` ABI intrinsic.
+    /// The final interface pass replaces each sentinel with the AGX2 physical-cluster number derived
+    /// from Vulkan `LocalInvocationId` and the caller-supplied kernel local size.
+    pub(crate) agx2_cluster_numbers: Vec<Word>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,9 +46,41 @@ pub(crate) struct BufferAddressWord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferAccessOffset {
+    pub(crate) id: Word,
+    pub(crate) root: Word,
+    pub(crate) byte_offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferAccessAffineOffset {
+    pub(crate) id: Word,
+    pub(crate) root: Word,
+    pub(crate) constant: u64,
+    pub(crate) terms: Vec<(Word, u64)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferPointerFieldLoad {
+    pub(crate) id: Word,
+    pub(crate) root: Word,
+    pub(crate) byte_offset: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BufferPointerDynamicFieldLoad {
+    pub(crate) id: Word,
+    pub(crate) root: Word,
+    pub(crate) byte_offset: u64,
+    pub(crate) index: Word,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LocalPointerFieldStore {
     pub(crate) id: Word,
     pub(crate) source: Word,
+    pub(crate) root: Word,
+    pub(crate) indices: Vec<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,9 +114,30 @@ impl EmitSidecar {
         for fact in &mut self.buffer_address_words {
             replace(&mut fact.id);
         }
+        for fact in &mut self.buffer_access_offsets {
+            replace(&mut fact.id);
+            replace(&mut fact.root);
+        }
+        for fact in &mut self.buffer_access_affine_offsets {
+            replace(&mut fact.id);
+            replace(&mut fact.root);
+            for (index, _) in &mut fact.terms {
+                replace(index);
+            }
+        }
+        for fact in &mut self.buffer_pointer_field_loads {
+            replace(&mut fact.id);
+            replace(&mut fact.root);
+        }
+        for fact in &mut self.buffer_pointer_dynamic_field_loads {
+            replace(&mut fact.id);
+            replace(&mut fact.root);
+            replace(&mut fact.index);
+        }
         for fact in &mut self.local_pointer_field_stores {
             replace(&mut fact.id);
             replace(&mut fact.source);
+            replace(&mut fact.root);
         }
         for fact in &mut self.local_pointer_field_loads {
             replace(&mut fact.id);
@@ -73,13 +148,94 @@ impl EmitSidecar {
             replace(&mut fact.root);
             replace(&mut fact.index);
         }
+        for id in &mut self.agx2_cluster_numbers {
+            replace(id);
+        }
         self.air_struct_offsets = std::mem::take(&mut self.air_struct_offsets)
             .into_iter()
             .map(|(id, offsets)| (remap.get(&id).copied().unwrap_or(id), offsets))
             .collect();
+        self.buffer_root_source_types = std::mem::take(&mut self.buffer_root_source_types)
+            .into_iter()
+            .map(|(root, source_ty)| {
+                (
+                    remap.get(&root).copied().unwrap_or(root),
+                    remap.get(&source_ty).copied().unwrap_or(source_ty),
+                )
+            })
+            .collect();
     }
 
-    pub(crate) fn clone_inlined_local_pointer_field_loads(&mut self, remap: &HashMap<Word, Word>) {
+    pub(crate) fn clone_inlined_facts(&mut self, remap: &HashMap<Word, Word>) {
+        let clones = self
+            .buffer_access_offsets
+            .iter()
+            .filter_map(|fact| {
+                Some(BufferAccessOffset {
+                    id: remap.get(&fact.id).copied()?,
+                    root: remap.get(&fact.root).copied().unwrap_or(fact.root),
+                    byte_offset: fact.byte_offset,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.buffer_access_offsets.extend(clones);
+        let clones = self
+            .buffer_access_affine_offsets
+            .iter()
+            .filter_map(|fact| {
+                Some(BufferAccessAffineOffset {
+                    id: remap.get(&fact.id).copied()?,
+                    root: remap.get(&fact.root).copied().unwrap_or(fact.root),
+                    constant: fact.constant,
+                    terms: fact
+                        .terms
+                        .iter()
+                        .map(|(index, stride)| {
+                            (remap.get(index).copied().unwrap_or(*index), *stride)
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.buffer_access_affine_offsets.extend(clones);
+        let clones = self
+            .local_pointer_field_stores
+            .iter()
+            .filter_map(|fact| {
+                Some(LocalPointerFieldStore {
+                    id: remap.get(&fact.id).copied().unwrap_or(fact.id),
+                    source: remap.get(&fact.source).copied().unwrap_or(fact.source),
+                    root: remap.get(&fact.root).copied()?,
+                    indices: fact.indices.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.local_pointer_field_stores.extend(clones);
+        let clones = self
+            .buffer_pointer_field_loads
+            .iter()
+            .filter_map(|fact| {
+                Some(BufferPointerFieldLoad {
+                    id: remap.get(&fact.id).copied()?,
+                    root: remap.get(&fact.root).copied().unwrap_or(fact.root),
+                    byte_offset: fact.byte_offset,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.buffer_pointer_field_loads.extend(clones);
+        let clones = self
+            .buffer_pointer_dynamic_field_loads
+            .iter()
+            .filter_map(|fact| {
+                Some(BufferPointerDynamicFieldLoad {
+                    id: remap.get(&fact.id).copied()?,
+                    root: remap.get(&fact.root).copied().unwrap_or(fact.root),
+                    byte_offset: fact.byte_offset,
+                    index: remap.get(&fact.index).copied().unwrap_or(fact.index),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.buffer_pointer_dynamic_field_loads.extend(clones);
         let clones = self
             .local_pointer_field_loads
             .iter()
@@ -108,6 +264,12 @@ impl EmitSidecar {
             })
             .collect::<Vec<_>>();
         self.local_pointer_dynamic_field_loads.extend(clones);
+        let clones = self
+            .agx2_cluster_numbers
+            .iter()
+            .filter_map(|id| remap.get(id).copied())
+            .collect::<Vec<_>>();
+        self.agx2_cluster_numbers.extend(clones);
     }
 
     pub(crate) fn remap_local_pointer_field_store_sources(&mut self, remap: &HashMap<Word, Word>) {
@@ -142,7 +304,28 @@ mod tests {
     #[test]
     fn inlining_clones_load_facts_and_remaps_store_sources() {
         let mut sidecar = EmitSidecar {
-            local_pointer_field_stores: vec![LocalPointerFieldStore { id: 10, source: 20 }],
+            buffer_access_offsets: vec![BufferAccessOffset {
+                id: 82,
+                root: 92,
+                byte_offset: 28,
+            }],
+            buffer_pointer_field_loads: vec![BufferPointerFieldLoad {
+                id: 80,
+                root: 90,
+                byte_offset: 16,
+            }],
+            buffer_pointer_dynamic_field_loads: vec![BufferPointerDynamicFieldLoad {
+                id: 81,
+                root: 91,
+                byte_offset: 8,
+                index: 71,
+            }],
+            local_pointer_field_stores: vec![LocalPointerFieldStore {
+                id: 10,
+                source: 20,
+                root: 40,
+                indices: vec![1, 2],
+            }],
             local_pointer_field_loads: vec![LocalPointerFieldLoad {
                 id: 30,
                 root: 40,
@@ -157,17 +340,88 @@ mod tests {
             }],
             ..EmitSidecar::default()
         };
-        let remap = HashMap::from([(20, 120), (30, 130), (40, 140), (50, 150), (60, 160)]);
+        let remap = HashMap::from([
+            (20, 120),
+            (30, 130),
+            (40, 140),
+            (50, 150),
+            (60, 160),
+            (80, 180),
+            (90, 190),
+            (81, 181),
+            (91, 191),
+            (82, 182),
+            (92, 192),
+        ]);
 
-        sidecar.clone_inlined_local_pointer_field_loads(&remap);
+        sidecar.clone_inlined_facts(&remap);
         sidecar.remap_local_pointer_field_store_sources(&remap);
 
         assert_eq!(
+            sidecar.buffer_access_offsets,
+            vec![
+                BufferAccessOffset {
+                    id: 82,
+                    root: 92,
+                    byte_offset: 28,
+                },
+                BufferAccessOffset {
+                    id: 182,
+                    root: 192,
+                    byte_offset: 28,
+                },
+            ]
+        );
+
+        assert_eq!(
+            sidecar.buffer_pointer_field_loads,
+            vec![
+                BufferPointerFieldLoad {
+                    id: 80,
+                    root: 90,
+                    byte_offset: 16,
+                },
+                BufferPointerFieldLoad {
+                    id: 180,
+                    root: 190,
+                    byte_offset: 16,
+                },
+            ]
+        );
+        assert_eq!(
+            sidecar.buffer_pointer_dynamic_field_loads,
+            vec![
+                BufferPointerDynamicFieldLoad {
+                    id: 81,
+                    root: 91,
+                    byte_offset: 8,
+                    index: 71,
+                },
+                BufferPointerDynamicFieldLoad {
+                    id: 181,
+                    root: 191,
+                    byte_offset: 8,
+                    index: 71,
+                },
+            ]
+        );
+
+        assert_eq!(
             sidecar.local_pointer_field_stores,
-            vec![LocalPointerFieldStore {
-                id: 10,
-                source: 120
-            }]
+            vec![
+                LocalPointerFieldStore {
+                    id: 10,
+                    source: 120,
+                    root: 40,
+                    indices: vec![1, 2],
+                },
+                LocalPointerFieldStore {
+                    id: 10,
+                    source: 120,
+                    root: 140,
+                    indices: vec![1, 2],
+                },
+            ]
         );
         assert_eq!(
             sidecar.local_pointer_field_loads,
@@ -214,7 +468,35 @@ mod tests {
                 param_index: 2,
                 component: 1,
             }],
-            local_pointer_field_stores: vec![LocalPointerFieldStore { id: 20, source: 21 }],
+            buffer_access_offsets: vec![BufferAccessOffset {
+                id: 16,
+                root: 17,
+                byte_offset: 28,
+            }],
+            buffer_access_affine_offsets: vec![BufferAccessAffineOffset {
+                id: 23,
+                root: 24,
+                constant: 32,
+                terms: vec![(25, 48)],
+            }],
+            buffer_root_source_types: HashMap::from([(18, 19)]),
+            buffer_pointer_field_loads: vec![BufferPointerFieldLoad {
+                id: 11,
+                root: 12,
+                byte_offset: 24,
+            }],
+            buffer_pointer_dynamic_field_loads: vec![BufferPointerDynamicFieldLoad {
+                id: 13,
+                root: 14,
+                byte_offset: 16,
+                index: 15,
+            }],
+            local_pointer_field_stores: vec![LocalPointerFieldStore {
+                id: 20,
+                source: 21,
+                root: 22,
+                indices: vec![3],
+            }],
             local_pointer_field_loads: vec![LocalPointerFieldLoad {
                 id: 30,
                 root: 31,
@@ -227,30 +509,64 @@ mod tests {
                 index: 42,
                 suffix: vec![6],
             }],
+            agx2_cluster_numbers: vec![50],
         };
         let remap = HashMap::from([
             (10, 110),
+            (11, 111),
+            (12, 112),
+            (13, 113),
+            (14, 114),
+            (15, 115),
+            (16, 116),
+            (17, 117),
+            (18, 118),
+            (19, 119),
             (20, 120),
             (21, 121),
+            (22, 122),
+            (23, 123),
+            (24, 124),
+            (25, 125),
             (30, 130),
             (31, 131),
             (40, 140),
             (41, 141),
             (42, 142),
             (5, 105),
+            (50, 150),
         ]);
 
         sidecar.remap_ids(&remap);
+        assert_eq!(
+            sidecar.buffer_root_source_types,
+            HashMap::from([(118, 119)])
+        );
 
         assert_eq!(sidecar.air_struct_offsets.get(&105), Some(&vec![0, 16]));
         assert!(!sidecar.air_struct_offsets.contains_key(&5));
         assert_eq!(sidecar.buffer_address_words[0].id, 110);
+        assert_eq!(sidecar.buffer_access_offsets[0].id, 116);
+        assert_eq!(sidecar.buffer_access_offsets[0].root, 117);
+        assert_eq!(sidecar.buffer_access_affine_offsets[0].id, 123);
+        assert_eq!(sidecar.buffer_access_affine_offsets[0].root, 124);
+        assert_eq!(
+            sidecar.buffer_access_affine_offsets[0].terms,
+            vec![(125, 48)]
+        );
+        assert_eq!(sidecar.buffer_pointer_field_loads[0].id, 111);
+        assert_eq!(sidecar.buffer_pointer_field_loads[0].root, 112);
+        assert_eq!(sidecar.buffer_pointer_dynamic_field_loads[0].id, 113);
+        assert_eq!(sidecar.buffer_pointer_dynamic_field_loads[0].root, 114);
+        assert_eq!(sidecar.buffer_pointer_dynamic_field_loads[0].index, 115);
         assert_eq!(sidecar.local_pointer_field_stores[0].id, 120);
         assert_eq!(sidecar.local_pointer_field_stores[0].source, 121);
+        assert_eq!(sidecar.local_pointer_field_stores[0].root, 122);
         assert_eq!(sidecar.local_pointer_field_loads[0].id, 130);
         assert_eq!(sidecar.local_pointer_field_loads[0].root, 131);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].id, 140);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].root, 141);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].index, 142);
+        assert_eq!(sidecar.agx2_cluster_numbers, vec![150]);
     }
 }

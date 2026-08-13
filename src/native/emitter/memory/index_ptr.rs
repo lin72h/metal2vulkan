@@ -298,12 +298,9 @@ impl Emitter {
         let nbytes = bits / 8;
         let uchar_ty = self.type_id(&LlType::Int(8))?;
         let ptr_ty = self.ptr_type_id(storage, &LlType::Int(8))?;
-        // Accumulate in the integer width we bitcast from (u32 for <=32-bit results, u64 for 64-bit).
-        let acc_ty_ll = if bits <= 32 {
-            LlType::Int(32)
-        } else {
-            LlType::Int(64)
-        };
+        // Accumulate in the exact integer width we bitcast from. In particular, a half must be
+        // assembled as u16: SPIR-V OpBitcast requires equal total bit widths.
+        let acc_ty_ll = LlType::Int(bits);
         let acc_ty = self.type_id(&acc_ty_ll)?;
         let mut acc: Option<Word> = None;
         for k in 0..nbytes {

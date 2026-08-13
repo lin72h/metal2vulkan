@@ -11,6 +11,7 @@ pub(in crate::passes) fn finalize(
     ctx: &mut Ctx,
     entry_idx: usize,
     stage: &Stage,
+    vert: Option<&VertMeta>,
 ) -> Result<(), String> {
     // The entry must be `void main()` with FunctionControl None. The backend gave it the AIR return
     // type + `Const` control; retype it now that the return value goes to Output variables. Create the
@@ -44,10 +45,14 @@ pub(in crate::passes) fn finalize(
         .as_ref()
         .and_then(|d| d.result_id)
         .ok_or("finalize: entry function def has no result id")?;
-    let exec_model = match stage {
-        Stage::Vertex => spirv::ExecutionModel::Vertex,
-        Stage::Fragment => spirv::ExecutionModel::Fragment,
-        Stage::Kernel => spirv::ExecutionModel::GLCompute,
+    let tessellation = matches!(stage, Stage::Vertex)
+        .then(|| vert.and_then(|meta| meta.tessellation.as_ref()))
+        .flatten();
+    let exec_model = match (stage, tessellation) {
+        (Stage::Vertex, Some(_)) => spirv::ExecutionModel::TessellationEvaluation,
+        (Stage::Vertex, None) => spirv::ExecutionModel::Vertex,
+        (Stage::Fragment, _) => spirv::ExecutionModel::Fragment,
+        (Stage::Kernel, _) => spirv::ExecutionModel::GLCompute,
     };
     let mut ep_operands = vec![
         Operand::ExecutionModel(exec_model),
@@ -80,6 +85,34 @@ pub(in crate::passes) fn finalize(
         .entry_points
         .push(Instruction::new(Op::EntryPoint, None, None, ep_operands));
 
+    if let Some(tessellation) = tessellation {
+        use crate::meta::PatchDomain;
+        let domain = match tessellation.domain {
+            PatchDomain::Triangle => spirv::ExecutionMode::Triangles,
+            PatchDomain::Quad => spirv::ExecutionMode::Quads,
+            PatchDomain::Isoline => spirv::ExecutionMode::Isolines,
+        };
+        for mode in [domain, spirv::ExecutionMode::SpacingEqual] {
+            ctx.module.execution_modes.push(Instruction::new(
+                Op::ExecutionMode,
+                None,
+                None,
+                vec![Operand::IdRef(entry_id), Operand::ExecutionMode(mode)],
+            ));
+        }
+        if !matches!(tessellation.domain, PatchDomain::Isoline) {
+            ctx.module.execution_modes.push(Instruction::new(
+                Op::ExecutionMode,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(entry_id),
+                    Operand::ExecutionMode(spirv::ExecutionMode::VertexOrderCcw),
+                ],
+            ));
+        }
+    }
+
     if matches!(stage, Stage::Fragment) {
         ctx.module.execution_modes.push(Instruction::new(
             Op::ExecutionMode,
@@ -98,6 +131,43 @@ pub(in crate::passes) fn finalize(
                 vec![
                     Operand::IdRef(entry_id),
                     Operand::ExecutionMode(spirv::ExecutionMode::DepthReplacing),
+                ],
+            ));
+        }
+        if ctx.uses_fragment_imageblock {
+            let capability = spirv::Capability::FragmentShaderPixelInterlockEXT;
+            if !ctx.module.capabilities.iter().any(|instruction| {
+                instruction.operands.as_slice() == [Operand::Capability(capability)]
+            }) {
+                ctx.module.capabilities.push(Instruction::new(
+                    Op::Capability,
+                    None,
+                    None,
+                    vec![Operand::Capability(capability)],
+                ));
+            }
+            if !ctx.module.extensions.iter().any(|instruction| {
+                instruction.operands.first()
+                    == Some(&Operand::LiteralString(
+                        "SPV_EXT_fragment_shader_interlock".to_string(),
+                    ))
+            }) {
+                ctx.module.extensions.push(Instruction::new(
+                    Op::Extension,
+                    None,
+                    None,
+                    vec![Operand::LiteralString(
+                        "SPV_EXT_fragment_shader_interlock".to_string(),
+                    )],
+                ));
+            }
+            ctx.module.execution_modes.push(Instruction::new(
+                Op::ExecutionMode,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(entry_id),
+                    Operand::ExecutionMode(spirv::ExecutionMode::PixelInterlockOrderedEXT),
                 ],
             ));
         }
@@ -133,6 +203,14 @@ pub(in crate::passes) fn finalize(
                 .as_ref()
                 .and_then(|definition| definition.result_id)
                 .is_none_or(|id| !air_ids.contains(&id))
+    });
+    ctx.module.functions.retain(|function| {
+        !function.blocks.is_empty()
+            || function
+                .def
+                .as_ref()
+                .and_then(|definition| definition.result_id)
+                .is_some_and(|id| referenced_from_functions.contains(&id))
     });
     ctx.module.debug_names.retain(|instruction| {
         !matches!(

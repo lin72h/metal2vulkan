@@ -2,22 +2,25 @@
 //!
 //! The only durable private artifacts are:
 //!
-//! - `validation/corpus/local/shards/shard_NN.jsonl`
+//! - `validation/corpus/local/sources/shard_NNN.jsonl`
+//! - `validation/corpus/local/library-modules/shard_NNN.jsonl`
 
 use base64::Engine as _;
-use metal2vulkan_validation::air::{entry_name_from_ll, stage_label_from_ll};
-use metal2vulkan_validation::corpus_shards::{
-    self, shard_name_for_hash, sort_json, ShardRecord, SHARD_COUNT,
-};
+use metal2vulkan_validation::air::stage_entry_from_ll;
+use metal2vulkan_validation::hash::sha256_bytes;
+use metal2vulkan_validation::library_module::{self, LibraryModuleRow};
+use metal2vulkan_validation::source::{self, SourceRow};
+use metal2vulkan_validation::ScratchDir;
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Instant;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+use wait_timeout::ChildExt as _;
 
 const PROGRAM: &str = "corpus-harvest";
 const DEFAULT_MAX_AIR_BYTES: usize = 1024 * 1024;
+const DEFAULT_LLVM_DIS_TIMEOUT: Duration = Duration::from_secs(60);
 const AIR_WRAP: &[u8; 4] = b"\xde\xc0\x17\x0b";
 
 #[derive(Debug)]
@@ -30,6 +33,7 @@ struct Options {
     metallibs: Vec<PathBuf>,
     llvm_dis: Option<PathBuf>,
     max_air_bytes: usize,
+    llvm_dis_timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +74,9 @@ struct HarvestStats {
     libs_failed: usize,
     blobs_carved: usize,
     rows_kept: usize,
+    library_modules_kept: usize,
     skipped_large: usize,
-    dropped_helpers: usize,
+    dropped_nonfunctions: usize,
     llvm_failed: usize,
     duplicates: usize,
 }
@@ -92,7 +97,7 @@ fn parse_args() -> Option<Options> {
     let env_max = std::env::var("METAL2VULKAN_HARVEST_MAX_AIR_BYTES").ok();
 
     let mut opts = Options {
-        out: manifest_dir.join("corpus/local"),
+        out: default_output_dir(&manifest_dir),
         limit: env_limit
             .as_deref()
             .filter(|s| !s.is_empty())
@@ -120,6 +125,7 @@ fn parse_args() -> Option<Options> {
             .transpose()
             .unwrap_or_else(|e| fatal(&e))
             .unwrap_or(DEFAULT_MAX_AIR_BYTES),
+        llvm_dis_timeout: DEFAULT_LLVM_DIS_TIMEOUT,
     };
 
     let mut args = std::env::args().skip(1);
@@ -167,6 +173,12 @@ fn parse_args() -> Option<Options> {
                     .unwrap_or_else(|| fatal("--max-air-bytes requires N"));
                 opts.max_air_bytes = parse_usize_arg("--max-air-bytes", &n);
             }
+            "--llvm-dis-timeout-secs" => {
+                let seconds = args
+                    .next()
+                    .unwrap_or_else(|| fatal("--llvm-dis-timeout-secs requires N"));
+                opts.llvm_dis_timeout = parse_timeout_arg(&seconds);
+            }
             other if other.starts_with("--out=") => {
                 opts.out = PathBuf::from(other.trim_start_matches("--out="));
             }
@@ -194,6 +206,10 @@ fn parse_args() -> Option<Options> {
                 let n = other.trim_start_matches("--max-air-bytes=");
                 opts.max_air_bytes = parse_usize_arg("--max-air-bytes", n);
             }
+            other if other.starts_with("--llvm-dis-timeout-secs=") => {
+                opts.llvm_dis_timeout =
+                    parse_timeout_arg(other.trim_start_matches("--llvm-dis-timeout-secs="));
+            }
             other => fatal(&format!("unknown arg: {other}")),
         }
     }
@@ -201,14 +217,19 @@ fn parse_args() -> Option<Options> {
     Some(opts)
 }
 
+fn default_output_dir(manifest_dir: &Path) -> PathBuf {
+    manifest_dir.join(source::DEFAULT_CORPUS_REL)
+}
+
 fn print_usage() {
     eprintln!(
         "usage: {PROGRAM} [--out DIR] [--limit N] [--offset N]\n\
                 \t\t[--start-set system|apps|all] [--include-apps]\n\
                 \t\t[--metallib PATH ...] [--llvm-dis PATH]\n\
-                \t\t[--max-air-bytes N]\n\
+                \t\t[--max-air-bytes N] [--llvm-dis-timeout-secs N]\n\
          \n\
-         Harvests metallib AIR directly into local/shards/shard_NN.jsonl.\n\
+         DIR is the corpus root. Harvests metallib AIR directly into\n\
+         DIR/local/sources/shard_NNN.jsonl.\n\
          No local/air, local/metallib, local/ledger, or local/tmp\n\
          intermediates are retained. Environment defaults: METAL2VULKAN_HARVEST_LIMIT,\n\
          METAL2VULKAN_HARVEST_OFFSET, METAL2VULKAN_HARVEST_START_SET,\n\
@@ -224,6 +245,14 @@ fn parse_usize_env(s: &str) -> Result<usize, String> {
 fn parse_usize_arg(flag: &str, s: &str) -> usize {
     s.parse::<usize>()
         .unwrap_or_else(|e| fatal(&format!("bad {flag} {s:?}: {e}")))
+}
+
+fn parse_timeout_arg(value: &str) -> Duration {
+    let seconds = parse_usize_arg("--llvm-dis-timeout-secs", value);
+    if seconds == 0 {
+        fatal("--llvm-dis-timeout-secs must be greater than zero");
+    }
+    Duration::from_secs(seconds as u64)
 }
 
 fn fatal(msg: &str) -> ! {
@@ -273,33 +302,87 @@ fn run(opts: Options) -> i32 {
     let _cleanup_intermediates_on_exit = HarvestIntermediateCleanup::new(opts.out.clone());
 
     let mut stats = HarvestStats::default();
-    let mut by_hash: HashMap<String, ShardRecord> = HashMap::new();
+    let mut by_hash = HashMap::new();
+    let mut library_modules = HashMap::new();
+    let mut indexed_entry_duplicates = 0usize;
+    let indexed_source_hashes = match source::indexed_source_hashes(&opts.out) {
+        Ok(hashes) => hashes,
+        Err(error) => {
+            eprintln!("{PROGRAM}: load source index: {error}");
+            return 1;
+        }
+    };
     for lib in batch {
-        harvest_one(&lib, &llvm_dis, &opts, &mut by_hash, &mut stats);
+        harvest_one(
+            &lib,
+            &llvm_dis,
+            &opts,
+            &mut by_hash,
+            &mut library_modules,
+            &mut stats,
+        );
+        // Dependency modules are deliberately retained independently. Only stage-entry rows can
+        // be discarded here, after each metallib, before a broad reharvest accumulates gigabytes
+        // of entries that SQLite already indexes.
+        let before_filter = by_hash.len();
+        by_hash.retain(|hash, _| !indexed_source_hashes.contains(hash));
+        indexed_entry_duplicates += before_filter - by_hash.len();
     }
 
-    if by_hash.is_empty() {
+    if by_hash.is_empty() && library_modules.is_empty() {
         eprintln!(
-            "# RESULT: no shard rows (libs_ok={} libs_failed={} carved={} llvm_failed={})",
+            "# RESULT: no new AIR modules (libs_ok={} libs_failed={} carved={} llvm_failed={})",
             stats.libs_ok, stats.libs_failed, stats.blobs_carved, stats.llvm_failed
         );
         return if stats.libs_failed == 0 { 0 } else { 1 };
     }
 
-    if let Err(e) = write_shards(&opts.out, by_hash.into_values().collect()) {
-        eprintln!("{PROGRAM}: write shards: {e}");
-        return 1;
-    }
+    let missing_source_hashes =
+        match source::unindexed_source_hashes(&opts.out, by_hash.keys().cloned()) {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                eprintln!("{PROGRAM}: query source index: {error}");
+                return 1;
+            }
+        };
+    let indexed_duplicates = by_hash.len() - missing_source_hashes.len();
+    by_hash.retain(|hash, _| missing_source_hashes.contains(hash));
+    let mut merge = match source::merge_source_shards(&opts.out, by_hash.into_values()) {
+        Ok(merge) => merge,
+        Err(error) => {
+            eprintln!("{PROGRAM}: merge source shards: {error}");
+            return 1;
+        }
+    };
+    merge.duplicates += indexed_duplicates;
+    merge.duplicates += indexed_entry_duplicates;
+    let library_merge =
+        match library_module::merge_library_module_shards(&opts.out, library_modules.into_values())
+        {
+            Ok(merge) => merge,
+            Err(error) => {
+                eprintln!("{PROGRAM}: merge library-module shards: {error}");
+                return 1;
+            }
+        };
 
     eprintln!(
-        "# RESULT: libs_ok={} libs_failed={} carved={} kept={} dup={} large={} dropped_helpers={} llvm_failed={} ({:.1}s)",
+        "# RESULT: libs_ok={} libs_failed={} carved={} entry_batch_unique={} entry_inserted={} entry_replaced={} entry_dup={} entry_shards={} library_module_batch_unique={} library_module_inserted={} library_memberships_added={} library_module_dup={} library_module_shards={} large={} dropped_nonfunctions={} llvm_failed={} ({:.1}s)",
         stats.libs_ok,
         stats.libs_failed,
         stats.blobs_carved,
         stats.rows_kept,
-        stats.duplicates,
+        merge.inserted,
+        merge.replaced,
+        stats.duplicates + merge.duplicates,
+        merge.affected_shards,
+        stats.library_modules_kept,
+        library_merge.inserted,
+        library_merge.merged_memberships,
+        library_merge.duplicates,
+        library_merge.affected_shards,
         stats.skipped_large,
-        stats.dropped_helpers,
+        stats.dropped_nonfunctions,
         stats.llvm_failed,
         t0.elapsed().as_secs_f64()
     );
@@ -463,17 +546,18 @@ impl HarvestIntermediateCleanup {
 
 impl Drop for HarvestIntermediateCleanup {
     fn drop(&mut self) {
-        cleanup_intermediate_dirs(&self.out);
+        cleanup_intermediate_dirs(&self.out.join("local"));
     }
 }
 
 fn cleanup_legacy_intermediates(out: &Path) {
-    cleanup_intermediate_dirs(out);
-    cleanup_legacy_root_shards(out);
+    let local = out.join("local");
+    cleanup_intermediate_dirs(&local);
+    cleanup_legacy_root_shards(&local);
 }
 
 fn cleanup_intermediate_dirs(out: &Path) {
-    for sub in ["air", "metallib", "ledger", "tmp"] {
+    for sub in ["air", "metallib", "ledger", "tmp", "shards"] {
         let path = out.join(sub);
         if path.exists() {
             if let Err(e) = fs::remove_dir_all(&path) {
@@ -508,7 +592,8 @@ fn harvest_one(
     lib: &Path,
     llvm_dis: &Path,
     opts: &Options,
-    by_hash: &mut HashMap<String, ShardRecord>,
+    by_hash: &mut HashMap<String, SourceRow>,
+    library_modules: &mut HashMap<String, LibraryModuleRow>,
     stats: &mut HarvestStats,
 ) {
     let lib_bytes = match fs::read(lib) {
@@ -519,14 +604,20 @@ fn harvest_one(
             return;
         }
     };
-    let lib_sha = corpus_shards::sha256_bytes(&lib_bytes);
+    let lib_sha = sha256_bytes(&lib_bytes);
     let blobs = extract_air_blobs(&lib_bytes, opts.max_air_bytes, stats);
     let carved_for_lib = blobs.len();
     stats.blobs_carved += carved_for_lib;
     let mut kept_for_lib = 0usize;
 
     for blob in blobs {
-        let ll_text = match disassemble_air(&blob.bytes, llvm_dis, &lib_sha, blob.offset) {
+        let raw_ll = match disassemble_air(
+            &blob.bytes,
+            llvm_dis,
+            &lib_sha,
+            blob.offset,
+            opts.llvm_dis_timeout,
+        ) {
             Ok(ll) => ll,
             Err(e) => {
                 stats.llvm_failed += 1;
@@ -538,39 +629,39 @@ fn harvest_one(
                 continue;
             }
         };
+        let ll_text = metal2vulkan::tools::sanitize_ll_text_with_datalayout(&raw_ll).0;
+        let air_sha = sha256_bytes(ll_text.as_bytes());
+        let blob_b64 = base64::engine::general_purpose::STANDARD.encode(&blob.bytes);
         let Some((stage, entry)) = classify_module(&ll_text) else {
-            stats.dropped_helpers += 1;
+            if !ll_text
+                .lines()
+                .any(|line| line.trim_start().starts_with("define "))
+            {
+                stats.dropped_nonfunctions += 1;
+                continue;
+            }
+            let row = LibraryModuleRow {
+                module_sha256: air_sha.clone(),
+                air_ll: ll_text,
+                blob_b64,
+                lib_sha256s: vec![lib_sha.clone()],
+                label: format!("local/library-module/{air_sha}.ll"),
+            };
+            merge_library_module_row(library_modules, row, stats);
             continue;
         };
-        let air_sha = corpus_shards::sha256_bytes(ll_text.as_bytes());
-        let short = air_sha.get(..8).unwrap_or("unknown").to_string();
         let label = format!("local/{air_sha}.ll");
-        let row = ShardRecord {
-            id: format!("metallib/{entry}/{short}"),
-            hash: short,
-            shard: Some(shard_name_for_hash(&air_sha)),
-            label: Some(label),
-            lib: Some(lib.display().to_string()),
-            lib_sha256: Some(lib_sha.clone()),
-            fn_name: Some(entry),
-            stage: Some(stage),
-            blob_b64: Some(base64::engine::general_purpose::STANDARD.encode(&blob.bytes)),
-            air_ll: ll_text,
+        let row = SourceRow {
             air_sha256: air_sha.clone(),
+            stage,
+            entry,
+            air_ll: ll_text,
+            blob_b64: Some(blob_b64),
+            lib_sha256: lib_sha.clone(),
+            label,
         };
-        match by_hash.get(&air_sha) {
-            None => {
-                by_hash.insert(air_sha, row);
-                kept_for_lib += 1;
-                stats.rows_kept += 1;
-            }
-            Some(prev) if row.lib.as_deref().unwrap_or("") < prev.lib.as_deref().unwrap_or("") => {
-                by_hash.insert(air_sha, row);
-                stats.duplicates += 1;
-            }
-            Some(_) => {
-                stats.duplicates += 1;
-            }
+        if merge_source_row(by_hash, row, stats) {
+            kept_for_lib += 1;
         }
     }
 
@@ -581,6 +672,52 @@ fn harvest_one(
         carved_for_lib,
         lib.display()
     );
+}
+
+fn merge_library_module_row(
+    by_hash: &mut HashMap<String, LibraryModuleRow>,
+    row: LibraryModuleRow,
+    stats: &mut HarvestStats,
+) {
+    let hash = row.module_sha256.clone();
+    match by_hash.get_mut(&hash) {
+        None => {
+            by_hash.insert(hash, row);
+            stats.library_modules_kept += 1;
+        }
+        Some(previous) => {
+            previous.lib_sha256s.extend(row.lib_sha256s);
+            previous.lib_sha256s.sort();
+            previous.lib_sha256s.dedup();
+            if row.blob_b64 < previous.blob_b64 {
+                previous.blob_b64 = row.blob_b64;
+            }
+        }
+    }
+}
+
+fn merge_source_row(
+    by_hash: &mut HashMap<String, SourceRow>,
+    row: SourceRow,
+    stats: &mut HarvestStats,
+) -> bool {
+    let hash = row.air_sha256.clone();
+    match by_hash.get(&hash) {
+        None => {
+            by_hash.insert(hash, row);
+            stats.rows_kept += 1;
+            true
+        }
+        Some(previous) if row.lib_sha256 < previous.lib_sha256 => {
+            by_hash.insert(hash, row);
+            stats.duplicates += 1;
+            false
+        }
+        Some(_) => {
+            stats.duplicates += 1;
+            false
+        }
+    }
 }
 
 fn extract_air_blobs(data: &[u8], max_air_bytes: usize, stats: &mut HarvestStats) -> Vec<AirBlob> {
@@ -616,91 +753,77 @@ fn disassemble_air(
     llvm_dis: &Path,
     lib_sha: &str,
     offset: usize,
+    timeout: Duration,
 ) -> Result<String, String> {
-    let tmp = std::env::temp_dir().join(format!(
-        "m2v-corpus-harvest-{}-{}-{offset}",
-        std::process::id(),
+    let scratch = ScratchDir::new(&format!(
+        "harvest-disassemble-{}-{offset}",
         lib_sha.get(..12).unwrap_or(lib_sha)
-    ));
-    let _ = fs::remove_dir_all(&tmp);
-    fs::create_dir_all(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    let in_air = tmp.join("case.air");
-    let out_ll = tmp.join("case.ll");
+    ))?;
+    let in_air = scratch.path().join("case.air");
+    let out_ll = scratch.path().join("case.ll");
+    let stdout_path = scratch.path().join("stdout.txt");
+    let stderr_path = scratch.path().join("stderr.txt");
     fs::write(&in_air, air).map_err(|e| format!("write {}: {e}", in_air.display()))?;
-    let output = Command::new(llvm_dis)
+    let mut child = Command::new(llvm_dis)
         .arg(&in_air)
         .arg("-o")
         .arg(&out_ll)
-        .output()
-        .map_err(|e| format!("spawn {}: {e}", llvm_dis.display()));
-    let result = match output {
-        Ok(output) if output.status.success() && out_ll.is_file() => {
-            fs::read_to_string(&out_ll).map_err(|e| format!("read {}: {e}", out_ll.display()))
-        }
-        Ok(output) => Err(format!(
-            "llvm-dis exited {}: {}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )),
-        Err(e) => Err(e),
+        .stdout(Stdio::from(fs::File::create(&stdout_path).map_err(
+            |error| format!("create {}: {error}", stdout_path.display()),
+        )?))
+        .stderr(Stdio::from(fs::File::create(&stderr_path).map_err(
+            |error| format!("create {}: {error}", stderr_path.display()),
+        )?))
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", llvm_dis.display()))?;
+    let status = child
+        .wait_timeout(timeout)
+        .map_err(|error| format!("wait for {}: {error}", llvm_dis.display()))?;
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "llvm-dis timed out after {} seconds",
+            timeout.as_secs_f64()
+        ));
     };
-    let _ = fs::remove_dir_all(&tmp);
-    result
+    if status.success() && out_ll.is_file() {
+        fs::read_to_string(&out_ll).map_err(|e| format!("read {}: {e}", out_ll.display()))
+    } else {
+        let stdout = fs::read(&stdout_path).unwrap_or_default();
+        let stderr = fs::read(&stderr_path).unwrap_or_default();
+        Err(format!(
+            "llvm-dis exited {status}: {}{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        ))
+    }
 }
 
 fn classify_module(ll: &str) -> Option<(String, String)> {
-    let stage = stage_label_from_ll(ll)?.to_string();
-    let entry = entry_name_from_ll(ll).unwrap_or_else(|| "unknown".into());
+    let (stage, entry) = stage_entry_from_ll(ll)?;
 
     if entry.starts_with("_GLOBAL__sub_I_") || entry.contains("_stitching_traits_impl") {
         return None;
     }
-    Some((stage, entry))
-}
-
-fn write_shards(out: &Path, mut rows: Vec<ShardRecord>) -> std::io::Result<()> {
-    let shards_dir = out.join("shards");
-    if shards_dir.exists() {
-        fs::remove_dir_all(&shards_dir)?;
-    }
-    fs::create_dir_all(&shards_dir)?;
-
-    rows.sort_by(|a, b| {
-        a.lib
-            .cmp(&b.lib)
-            .then_with(|| a.fn_name.cmp(&b.fn_name))
-            .then_with(|| a.air_sha256.cmp(&b.air_sha256))
-    });
-
-    let mut shards: Vec<Vec<ShardRecord>> = vec![Vec::new(); SHARD_COUNT];
-    for mut row in rows {
-        let index = corpus_shards::shard_index_for_hash(&row.air_sha256);
-        row.shard = Some(corpus_shards::shard_name_for_index(index));
-        shards[index].push(row);
-    }
-
-    for (index, rows) in shards.iter().enumerate() {
-        let path = shards_dir.join(corpus_shards::shard_name_for_index(index));
-        let mut file = File::create(&path)?;
-        for row in rows {
-            let value = serde_json::to_value(row).map_err(std::io::Error::other)?;
-            let line = serde_json::to_string(&sort_json(value)).map_err(std::io::Error::other)?;
-            writeln!(file, "{line}")?;
-        }
-        eprintln!(
-            "  shard_{index:02}: {} row(s) -> {}",
-            rows.len(),
-            path.display()
-        );
-    }
-    Ok(())
+    Some((stage.to_string(), entry))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn default_output_is_the_corpus_root() {
+        let manifest_dir = Path::new("/validation");
+        let output = default_output_dir(manifest_dir);
+        assert_eq!(output, Path::new("/validation/corpus"));
+        assert_eq!(
+            source::source_shards_dir(&output),
+            Path::new("/validation/corpus/local/sources")
+        );
+    }
 
     #[test]
     fn exit_cleanup_removes_air_and_metallib_dirs() {
@@ -712,18 +835,148 @@ mod tests {
             "m2v-corpus-harvest-cleanup-test-{}-{nonce}",
             std::process::id()
         ));
-        fs::create_dir_all(root.join("air")).expect("create air dir");
-        fs::create_dir_all(root.join("metallib")).expect("create metallib dir");
-        fs::write(root.join("air/case.air"), b"air").expect("write air fixture");
-        fs::write(root.join("metallib/case.metallib"), b"metallib")
+        fs::create_dir_all(root.join("local/air")).expect("create air dir");
+        fs::create_dir_all(root.join("local/metallib")).expect("create metallib dir");
+        fs::write(root.join("local/air/case.air"), b"air").expect("write air fixture");
+        fs::write(root.join("local/metallib/case.metallib"), b"metallib")
             .expect("write metallib fixture");
 
         {
             let _cleanup = HarvestIntermediateCleanup::new(root.clone());
         }
 
-        assert!(!root.join("air").exists());
-        assert!(!root.join("metallib").exists());
+        assert!(!root.join("local/air").exists());
+        assert!(!root.join("local/metallib").exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extracts_valid_wrappers_and_enforces_size_limit() {
+        let payload = b"ABCD";
+        let mut wrapper = vec![0u8; 0x18];
+        wrapper[..4].copy_from_slice(AIR_WRAP);
+        wrapper[8..12].copy_from_slice(&0x14u32.to_le_bytes());
+        wrapper[12..16].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        wrapper[0x14..].copy_from_slice(payload);
+        let mut stats = HarvestStats::default();
+        let blobs = extract_air_blobs(&wrapper, wrapper.len(), &mut stats);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].bytes, wrapper);
+        assert!(extract_air_blobs(&wrapper, wrapper.len() - 1, &mut stats).is_empty());
+        assert_eq!(stats.skipped_large, 1);
+    }
+
+    #[test]
+    fn classification_requires_stable_stage_metadata() {
+        let ll = "define void @k() { ret void }\n!air.kernel = !{!0}\n!0 = !{ptr @k}";
+        assert_eq!(classify_module(ll), Some(("Kernel".into(), "k".into())));
+        assert_eq!(classify_module("define void @helper() { ret void }"), None);
+        assert_eq!(
+            classify_module("define void @k() { ret void }\n!air.kernel = !{!0}\n!0 = !{i32 1}"),
+            None
+        );
+    }
+
+    #[test]
+    fn non_entry_function_modules_retain_every_parent_library() {
+        let ll = "define void @visible() { ret void }";
+        assert_eq!(classify_module(ll), None);
+        let mut modules = HashMap::new();
+        let mut stats = HarvestStats::default();
+        for library in ["11".repeat(32), "22".repeat(32)] {
+            merge_library_module_row(
+                &mut modules,
+                LibraryModuleRow {
+                    module_sha256: sha256_bytes(ll.as_bytes()),
+                    air_ll: ll.into(),
+                    blob_b64: base64::engine::general_purpose::STANDARD.encode(b"bitcode"),
+                    lib_sha256s: vec![library],
+                    label: "local/library-module.ll".into(),
+                },
+                &mut stats,
+            );
+        }
+        assert_eq!(stats.library_modules_kept, 1);
+        assert_eq!(modules.values().next().unwrap().lib_sha256s.len(), 2);
+    }
+
+    #[test]
+    fn deduplication_is_by_sanitized_air_hash_and_order_independent() {
+        fn row(library: &str) -> SourceRow {
+            SourceRow {
+                air_sha256: "11".repeat(32),
+                stage: "Kernel".into(),
+                entry: "k".into(),
+                air_ll: "ll".into(),
+                blob_b64: Some("YmxvYg==".into()),
+                lib_sha256: library.into(),
+                label: "local/test.ll".into(),
+            }
+        }
+        let mut forward = HashMap::new();
+        let mut forward_stats = HarvestStats::default();
+        merge_source_row(&mut forward, row("bb"), &mut forward_stats);
+        merge_source_row(&mut forward, row("aa"), &mut forward_stats);
+
+        let mut reverse = HashMap::new();
+        let mut reverse_stats = HarvestStats::default();
+        merge_source_row(&mut reverse, row("aa"), &mut reverse_stats);
+        merge_source_row(&mut reverse, row("bb"), &mut reverse_stats);
+        assert_eq!(forward[&"11".repeat(32)].lib_sha256, "aa");
+        assert_eq!(reverse[&"11".repeat(32)].lib_sha256, "aa");
+        assert_eq!(forward_stats.duplicates, 1);
+        assert_eq!(reverse_stats.duplicates, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disassembler_scratch_is_removed_on_success_failure_timeout_and_signal() {
+        use std::collections::HashSet;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn scratch_paths() -> HashSet<PathBuf> {
+            fs::read_dir(std::env::temp_dir())
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("metal2vulkan-validation-")
+                                && name.contains("-harvest-disassemble-")
+                        })
+                })
+                .collect()
+        }
+
+        let outer = ScratchDir::new("harvest-disassembler-test").unwrap();
+        let tool = outer.path().join("llvm-dis.sh");
+        let baseline = scratch_paths();
+        for (script, timeout, succeeds) in [
+            (
+                "#!/bin/sh\nprintf 'define void @k() { ret void }' > \"$3\"\n",
+                Duration::from_secs(2),
+                true,
+            ),
+            ("#!/bin/sh\nexit 1\n", Duration::from_secs(2), false),
+            (
+                "#!/bin/sh\nexec sleep 2\n",
+                Duration::from_millis(30),
+                false,
+            ),
+            ("#!/bin/sh\nkill -TERM $$\n", Duration::from_secs(2), false),
+        ] {
+            fs::write(&tool, script).unwrap();
+            let mut permissions = fs::metadata(&tool).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&tool, permissions).unwrap();
+            assert_eq!(
+                disassemble_air(b"air", &tool, &"11".repeat(32), 0, timeout).is_ok(),
+                succeeds
+            );
+            assert_eq!(scratch_paths(), baseline);
+        }
     }
 }

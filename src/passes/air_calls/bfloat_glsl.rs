@@ -346,6 +346,7 @@ pub(in crate::passes) enum GLSLstd450 {
     FMix = 46,
     Trunc = 3,
     Fma = 50,
+    Ldexp = 53,
     PackSnorm4x8 = 54,
     PackUnorm4x8 = 55,
     PackSnorm2x16 = 56,

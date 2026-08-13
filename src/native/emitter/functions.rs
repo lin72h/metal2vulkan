@@ -39,6 +39,8 @@ impl Emitter {
             .map(|((_func, name), pointee)| (name.clone(), pointee.clone()))
             .collect();
         self.pointer_nullness.clear();
+        self.bda_inttoptr_sources.clear();
+        self.bda_direct_addresses.clear();
         self.pointer_payload_words.clear();
         self.pointer_payload_values.clear();
         self.pointer_phi_values.clear();
@@ -85,7 +87,24 @@ impl Emitter {
             .enumerate()
             .map(|(index, (name, ty))| self.param_type_id(&f.name, index, name, ty))
             .collect::<Result<Vec<_>, _>>()?;
-        let fn_ty = self.function_type_id(ret_id, &param_types);
+        let nullness_params = f
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.function_param_nullness
+                    .contains(&(f.name.clone(), *index))
+            })
+            .map(|(index, (name, _))| (index, name.clone()))
+            .collect::<Vec<_>>();
+        let bool_type = (!nullness_params.is_empty())
+            .then(|| self.type_id(&LlType::Bool))
+            .transpose()?;
+        let mut function_param_types = param_types.clone();
+        if let Some(bool_type) = bool_type {
+            function_param_types.extend(std::iter::repeat_n(bool_type, nullness_params.len()));
+        }
+        let fn_ty = self.function_type_id(ret_id, &function_param_types);
 
         let func_id = *self
             .function_ids
@@ -100,7 +119,7 @@ impl Emitter {
                 Operand::LiteralString(f.name.clone()),
             ],
         ));
-        let mut params = Vec::with_capacity(f.params.len());
+        let mut params = Vec::with_capacity(function_param_types.len());
         for (param_index, ((name, ty), type_id)) in
             f.params.iter().zip(param_types.iter()).enumerate()
         {
@@ -163,6 +182,15 @@ impl Emitter {
                         .cloned()
                         .unwrap_or_else(|| RawBufferOffset::root(name.clone(), addrspace));
                     raw.root = name.clone();
+                    if self.bda_device_pointers
+                        && addrspace == 1
+                        && !self.ir.entry_functions.contains(&f.name)
+                    {
+                        raw.device_addr_base = Some(id);
+                        self.used_device_address = true;
+                        self.pointer_storage
+                            .insert(name.clone(), StorageClass::PhysicalStorageBuffer);
+                    }
                     self.raw_offsets.insert(name.clone(), raw);
                 }
             }
@@ -172,6 +200,16 @@ impl Emitter {
                     .insert(name.clone(), param_index as u32);
             }
             self.param_values.insert(name.clone());
+        }
+        for (_, name) in nullness_params {
+            let id = self.fresh();
+            params.push(Self::inst(
+                Op::FunctionParameter,
+                bool_type,
+                Some(id),
+                vec![],
+            ));
+            self.record_pointer_nullness(name, id);
         }
 
         // T5/T8 keystone: seed every block's typed carrier from its lines at SPLIT time — BEFORE
@@ -201,13 +239,27 @@ impl Emitter {
         // intermediate bypasses them.
         let relooper_feed = self.relooper_feed;
         if crate::env_vars::why() && !relooper_feed {
-            match crate::native::cfg::structured_reject_reason(&body_blocks) {
-                None => eprintln!("WHY ADMIT"),
-                Some(r) => eprintln!("WHY REJECT {r}"),
+            if body_blocks.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS {
+                match crate::native::cfg::structured_reject_reason(&body_blocks) {
+                    None => eprintln!("WHY ADMIT"),
+                    Some(r) => eprintln!("WHY REJECT {r}"),
+                }
+            } else {
+                eprintln!(
+                    "WHY LARGE-CFG blocks={} local-reject-replay=skipped",
+                    body_blocks.len()
+                );
             }
         }
         let mut structured_active = false;
         let mut construct_tree_plan = None;
+        // Planning is pure for a fixed `body_blocks` graph and can dominate translation time on
+        // generated functions. Carry the result through the decision tree and invalidate it only
+        // when a retry actually rewrites the CFG; do not re-run the full ladder merely to ask the
+        // same admission question at a later branch.
+        let mut ordinary_plan = (!relooper_feed)
+            .then(|| crate::native::cfg::structured_plan(&body_blocks))
+            .flatten();
         if !relooper_feed {
             // R2 cross-arm restructure — produces a CANDIDATE, adopted at the translate level ONLY if
             // the whole module then passes spirv-val (`self.cfg_restructure`, set by the
@@ -221,16 +273,26 @@ impl Emitter {
             // which is exactly why adoption is gated on spirv-val at the caller, not on admission here.
             // The DEFAULT emit leaves `cfg_restructure` false, so a reject emits its inferred merges
             // unrepaired (post-W4) and an admitting case can never be hijacked.
-            if (self.cfg_restructure || self.construct_tree)
-                && body_blocks.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS
-                && crate::native::cfg::structured_plan(&body_blocks).is_none()
+            if (self.construct_tree
+                || (self.cfg_restructure
+                    && body_blocks.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS))
+                && ordinary_plan.is_none()
             {
                 let mut candidate = body_blocks.clone();
+                let mut candidate_changed = false;
                 let mut construct_tree_applied = false;
-                if self.construct_tree {
+                // The own-arm/straddle recognizers are local clone prepasses. Each begins by running
+                // the full source-CFG reject classifier and can retain rewritten candidates; on a
+                // large graph that duplicates the very planner work the global ownership tier exists
+                // to replace. Keep those bounded like the other local clone machinery and send large
+                // functions straight to the raw construct tree below.
+                if self.construct_tree
+                    && body_blocks.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS
+                {
                     match crate::native::cfg::renest_cond_phi_shared_own_arm(&candidate) {
                         Ok(Some(renested)) => {
                             candidate = renested;
+                            candidate_changed = true;
                             construct_tree_applied = true;
                             construct_tree_plan =
                                 crate::native::cfg::structured_plan_construct_tree(&candidate);
@@ -249,6 +311,7 @@ impl Emitter {
                         match crate::native::cfg::renest_straddle_loop_merge(&candidate) {
                             Ok(Some(renested)) => {
                                 candidate = renested;
+                                candidate_changed = true;
                                 construct_tree_applied = true;
                                 construct_tree_plan =
                                     crate::native::cfg::structured_plan_construct_tree(&candidate);
@@ -265,6 +328,37 @@ impl Emitter {
                         }
                     }
                 }
+                if self.construct_tree && !construct_tree_applied {
+                    // The global ownership planner is useful even when neither optional pre-renesting
+                    // transform changes the graph, and it is the primary path for large CFGs whose
+                    // local recognizers are deliberately skipped above.
+                    construct_tree_plan =
+                        crate::native::cfg::structured_plan_construct_tree(&candidate);
+                    if crate::env_vars::why() {
+                        if let Some(plan) = &construct_tree_plan {
+                            eprintln!(
+                                "WHY-CONSTRUCT-TREE function={} raw plan-admit blocks={} switches={}",
+                                f.name,
+                                plan.blocks.len(),
+                                plan.switch_merges.len()
+                            );
+                        } else {
+                            eprintln!("WHY-CONSTRUCT-TREE function={} raw plan-decline", f.name);
+                        }
+                    }
+                    if crate::env_vars::why() && construct_tree_plan.is_none() {
+                        // The detailed witness deliberately replays several planner variants. Keep it
+                        // for the small graphs it was built to explain; on a global CFG the SPI
+                        // breadcrumbs already identify the exact rejecting header.
+                        if candidate.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS {
+                            for witness in
+                                crate::native::cfg::construct_tree_gate_witness_lines(&candidate)
+                            {
+                                eprintln!("WHY-CONSTRUCT-TREE {witness}");
+                            }
+                        }
+                    }
+                }
                 // Straddle-loop-merge restructure first: give a loop whose exit merge straddles an
                 // enclosing early-return guard its OWN pass-through merge, so the construct boundaries
                 // no longer invert (05/MPSRNNBreakUpToOutputVecs). Runs before the cross-arm passes so
@@ -274,6 +368,7 @@ impl Emitter {
                         crate::native::cfg::restructure_straddle_loop_merges(&candidate)
                     {
                         candidate = destraddled;
+                        candidate_changed = true;
                     }
                 }
                 // Merge-PRESERVING dominated-region privatization first: clones each cross-arm's
@@ -287,49 +382,93 @@ impl Emitter {
                         crate::native::cfg::privatize_region_cross_arm(&candidate);
                     if region_privatized.len() != candidate.len() {
                         candidate = region_privatized;
+                        candidate_changed = true;
                     }
                     if let Some(cloned) = crate::native::cfg::clone_cross_arm_shared(&candidate) {
                         candidate = cloned;
+                        candidate_changed = true;
                     }
                     if let Some(lowered) = crate::native::cfg::lower_unreachable_to_ret(&candidate)
                     {
                         candidate = lowered;
+                        candidate_changed = true;
                     }
                     if let Some(unified) = crate::native::cfg::unify_returns(&candidate) {
                         candidate = unified;
+                        candidate_changed = true;
                     }
                 }
-                if crate::env_vars::why() {
+                if crate::env_vars::why()
+                    && candidate.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS
+                {
                     match crate::native::cfg::structured_reject_reason(&candidate) {
                         None => eprintln!("WHY-CANDIDATE ADMIT"),
                         Some(r) => eprintln!("WHY-CANDIDATE REJECT {r}"),
                     }
                 }
-                if construct_tree_plan.is_some()
-                    || crate::native::cfg::structured_plan(&candidate).is_some()
-                {
+                let candidate_plan = (construct_tree_plan.is_none() && candidate_changed)
+                    .then(|| crate::native::cfg::structured_plan(&candidate))
+                    .flatten();
+                if construct_tree_plan.is_some() || candidate_plan.is_some() {
                     body_blocks = candidate;
+                    ordinary_plan = candidate_plan;
                 }
             }
-            if let Some(plan) =
-                construct_tree_plan.or_else(|| crate::native::cfg::structured_plan(&body_blocks))
-            {
+            let construct_tree_active = construct_tree_plan.is_some();
+            if let Some(plan) = construct_tree_plan.or(ordinary_plan) {
                 body_blocks = plan.blocks;
                 self.block_labels.clear();
                 self.branch_merges = plan.branch_merges;
                 self.branch_merges_by_header = plan.branch_merges_by_header;
+                self.branch_merges_header_only = construct_tree_active;
                 self.loop_merges = plan.loop_merges;
                 self.switch_merges = plan.switch_merges;
                 structured_active = true;
             }
         }
         if !structured_active {
+            self.branch_merges_header_only = false;
             self.block_labels.clear();
             self.branch_merges_by_header.clear();
             if relooper_feed {
-                self.branch_merges.clear();
+                self.branch_merges = infer_direct_branch_merges(&body_blocks);
                 self.loop_merges.clear();
                 self.switch_merges = infer_switch_merges(&body_blocks);
+            } else if body_blocks.len() > crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS {
+                // Large rejected CFGs are owned by the construct-tree retry. Building heuristic
+                // branch/loop transitive-closure maps here can exceed the memory budget before the
+                // validator gets a chance to request that global structurizer. Preserve only branch
+                // and switch ownership proved by direct local reconvergence; these linear subsets
+                // handle ordinary case blocks and lowered switch ladders without restoring the
+                // transitive-closure analysis. The intermediate is only a validation probe and cannot
+                // be returned unless it independently passes.
+                body_blocks = funnel_shared_branch_dispatches(&body_blocks);
+                let mut refunnel_counter = body_blocks.len();
+                if let Some(refunnelled) =
+                    refunnel_one_deep_shared_arm(&body_blocks, &mut refunnel_counter)
+                {
+                    let plan = crate::native::cfg::structured_plan(&refunnelled).or_else(|| {
+                        crate::native::cfg::structured_plan_construct_tree(&refunnelled)
+                    });
+                    if let Some(plan) = plan {
+                        body_blocks = plan.blocks;
+                        self.block_labels.clear();
+                        self.branch_merges = plan.branch_merges;
+                        self.branch_merges
+                            .extend(infer_direct_branch_merges(&body_blocks));
+                        self.branch_merges_by_header = plan.branch_merges_by_header;
+                        self.loop_merges = plan.loop_merges;
+                        self.switch_merges = plan.switch_merges;
+                        structured_active = true;
+                    }
+                }
+                if !structured_active {
+                    self.branch_merges_by_header =
+                        infer_bounded_branch_merges_by_header(&body_blocks);
+                    self.branch_merges.clear();
+                    self.loop_merges.clear();
+                    self.switch_merges = infer_direct_switch_merges(&body_blocks);
+                }
             } else {
                 self.branch_merges = infer_branch_merges(&body_blocks);
                 self.loop_merges = infer_loop_merges(&body_blocks);
@@ -373,6 +512,16 @@ impl Emitter {
             self.forward_geps = tir.forward_geps.clone();
             for block in &tir.blocks {
                 for inst in &block.insts {
+                    if self.bda_device_pointers && inst.opcode == "inttoptr" {
+                        if let (Some(result), Some(source)) = (
+                            inst.result.as_ref(),
+                            inst.operands
+                                .first()
+                                .and_then(|operand| operand.as_typed_value()),
+                        ) {
+                            self.bda_inttoptr_sources.insert(result.clone(), source);
+                        }
+                    }
                     if matches!(inst.cmp_predicate.as_deref(), Some("eq" | "ne")) {
                         if let [crate::native::tir::TirOperand::Value {
                             name: lhs_name,
@@ -458,7 +607,40 @@ impl Emitter {
                 .block_labels
                 .get(&body_block.name)
                 .ok_or_else(|| format!("native emitter: missing block {}", body_block.name))?;
+            if crate::env_vars::spi_why() {
+                self.module.debug_names.push(Self::inst(
+                    Op::Name,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(label),
+                        Operand::LiteralString(format!("block {}", body_block.name)),
+                    ],
+                ));
+            }
             let mut instructions = Vec::new();
+            if self.bda_device_pointers && block_idx == 0 {
+                let direct_buffers = self
+                    .raw_offsets
+                    .iter()
+                    .filter_map(|(name, raw)| {
+                        (raw.root == *name
+                            && raw.const_off == 0
+                            && raw.dyn_terms.is_empty()
+                            && self.data_buffer_params.contains(name)
+                            && self.direct_param_indices.contains_key(name))
+                        .then_some(name.clone())
+                    })
+                    .collect::<Vec<_>>();
+                for name in direct_buffers {
+                    let (low, high) =
+                        self.emit_direct_buffer_address_payload(&name, &mut instructions)?;
+                    let address =
+                        self.combine_pointer_payload_words(low, high, &mut instructions)?;
+                    self.pointer_payload_words.insert(name.clone(), (low, high));
+                    self.bda_direct_addresses.insert(name, address);
+                }
+            }
             let tir_block = &tir.blocks[block_idx];
             for inst in &tir_block.insts {
                 // M-A4: dispatch each instruction through the graph-driven `emit_body_inst`, which
@@ -491,7 +673,13 @@ impl Emitter {
         // materialization to its unique phi-incoming predecessor edge under dominance guards; never
         // reorders blocks or rewrites merges), load-bearing for the banked phi-materialization rows
         // (f2eeff34/e91bba5c/36f701c5/a4440d75/0691c869/f5d57f02) independent of the deleted roster.
-        if structured_active {
+        // The large-CFG direct-switch subset is also locally structured even though the complete
+        // planner declined the surrounding function. Its pointer-phi materializations require this
+        // same CFG-independent normalization before finish-time predecessor repair can consume them.
+        if structured_active
+            || (body_blocks.len() > crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS
+                && !self.switch_merges.is_empty())
+        {
             // The structurizer produces correct CFG structure but, like the default path, can still
             // materialize a pointer phi's incoming access-chain inside the phi's OWN block (between phi
             // nodes) — spirv-val rejects it ("OpPhi must appear within a non-entry block before all
@@ -923,7 +1111,7 @@ impl Emitter {
                     let Some(call_result) = &inst.emit_scan_call else {
                         continue;
                     };
-                    let call = call_result.as_ref().map_err(|e| e.clone())?;
+                    let call = call_result.as_ref().as_ref().map_err(|e| e.clone())?;
                     let Some(callee) = functions_by_name.get(call.callee.as_str()) else {
                         continue;
                     };
@@ -1262,6 +1450,12 @@ impl Emitter {
                 .raw_buffer_params
                 .contains(&(func.to_string(), name.to_string()))
             {
+                if self.bda_device_pointers
+                    && *addrspace == 1
+                    && !self.ir.entry_functions.contains(func)
+                {
+                    return self.type_id(&LlType::Int(64));
+                }
                 if *addrspace == 3 {
                     if let Some(pointee) =
                         self.concrete_vector_workgroup_raw_param_pointee(func, index, name)
@@ -1570,7 +1764,7 @@ mod tests {
         BodyBlock {
             name: name.to_string(),
             role: crate::native::cfg::BlockRole::Normal,
-            typed,
+            typed: typed.map(Into::into),
         }
     }
 

@@ -46,6 +46,7 @@ pub(in crate::native) fn lower_unreachable_to_ret(blocks: &[BodyBlock]) -> Optio
         if is_unreachable {
             // Rewrite the `unreachable` -> `ret` terminator on the carrier.
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.set_terminator_line(&model);
             }
             hit = true;
@@ -151,6 +152,7 @@ fn unify_return_like_exits(
         // Rewrite the return-like terminator to a branch to the unified exit (on the carrier, the sole
         // substrate).
         if let Some(t) = &mut out[*idx].typed {
+            let t = std::sync::Arc::make_mut(t);
             t.set_unconditional_branch(&exit);
         }
     }
@@ -172,7 +174,7 @@ fn unify_return_like_exits(
     out.push(BodyBlock {
         name: exit,
         role,
-        typed,
+        typed: typed.map(Into::into),
     });
     Some(out)
 }

@@ -450,7 +450,38 @@ pub(in crate::native) fn dce_preserving(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spirv_module::ModuleHeader;
+    use crate::spirv_module::{Block, Function, ModuleHeader};
+
+    #[test]
+    fn single_incoming_phi_substitutes_its_concrete_value() {
+        let mut block = Block::new();
+        block.label = Some(Instruction::new(Op::Label, None, Some(7), vec![]));
+        block.instructions = vec![
+            // The deliberately stale result type models an interface-refined image value still
+            // wrapped in the pointer carrier recorded before CFG edge splitting.
+            Instruction::new(
+                Op::Phi,
+                Some(2),
+                Some(10),
+                vec![Operand::IdRef(5), Operand::IdRef(7)],
+            ),
+            Instruction::new(
+                Op::SampledImage,
+                Some(3),
+                Some(11),
+                vec![Operand::IdRef(10), Operand::IdRef(6)],
+            ),
+        ];
+        let mut function = Function::new();
+        function.blocks.push(block);
+
+        assert!(collapse_trivial_phis(&mut function));
+        assert_eq!(function.blocks[0].instructions.len(), 1);
+        assert_eq!(
+            function.blocks[0].instructions[0].operands.first(),
+            Some(&Operand::IdRef(5))
+        );
+    }
 
     #[test]
     fn dce_keeps_only_typed_sidecar_rooted_dead_global() {

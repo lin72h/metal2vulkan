@@ -15,8 +15,8 @@
 //!   64-bit device address, loaded from a synthesized address-table descriptor (`{ runtimearray u64 }`
 //!   at a fresh binding in set 0) indexed by the buffer's OWN descriptor Binding — so the executor
 //!   fills `table[binding] = vkGetBufferDeviceAddress(buffer_at_binding)` directly from the bound
-//!   resources, no side-channel slot→binding map needed (the validation executor in
-//!   `validation/src/runner_linux.rs`; the kext `buffer_device_address` ABI fills the same table);
+//!   resources, no side-channel slot→binding map needed (the consumer's
+//!   `buffer_device_address` ABI fills the same table);
 //! - the merges / `OpPtrAccessChain`s are retyped to PhysicalStorageBuffer pointers (ArrayStride-
 //!   decorated, required for `OpPtrAccessChain` on a physical pointer);
 //! - loads/stores through the sub-graph get an `Aligned` operand.
@@ -88,7 +88,7 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
     // module-scope variable id -> its descriptor Binding number. The address-table slot for each
     // merged buffer is its OWN descriptor binding, so the executor can fill the table deterministically
     // from the bound resources (`table[binding] = vkGetBufferDeviceAddress(buffer_at_binding)`) without
-    // a side-channel slot->binding map. See the executor in `validation/src/runner_linux.rs`.
+    // a side-channel slot->binding map.
     let var_binding: HashMap<Word, u32> = module
         .annotations
         .iter()

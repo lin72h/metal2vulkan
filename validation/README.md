@@ -1,171 +1,203 @@
 # metal2vulkan-validation
 
-Optional helpers for exercising `metal2vulkan` against a local Metal oracle (macOS) and/or a local
-Vulkan ICD (Linux or MoltenVK on macOS).
+This unpublished workspace crate implements authored-case validation. Every GPU resource, initial
+byte, function constant, dispatch/draw parameter, output region, and comparison rule comes from a
+checked manifest. Runners do not infer, seed, resize, repair, or reinterpret cases.
 
-This package is a **workspace member** and is **not published** to crates.io. It does not ship
-third-party captured shaders.
+Acceleration structures are literal resources too. Instance entries carry host-defined child
+references for introspection. Primitive entries carry tightly packed little-endian triangle
+vertices; those exact bytes build Metal's native BLAS and the Vulkan geometry shadow.
 
-## Build / test
+Kernel, fragment, and vertex cases share one literal-resource preparation contract across the checker,
+Metal oracle, and Vulkan candidate. It covers buffers, textures, explicit and reflected static
+samplers, function-constant bit patterns, acceleration-structure shadows, and render targets;
+texture and render-target outputs are compared as tightly packed selected regions rather than
+backend-specific row-pitched storage.
 
-From the repository root:
+Fragment cases use their authored draw and render-target records directly. The Metal oracle and
+Vulkan candidate each synthesize the same fullscreen vertex interface from the fragment AIR
+varyings, then execute a real render pipeline. Vulkan hashes both SPIR-V stages into the candidate
+dependency, so changes to the generated companion invalidate evidence instead of being hidden.
+
+Vertex cases author ordinary per-vertex attributes plus a `vertex_observation`. The generated
+fragment observer routes either rasterized position or one typed user varying into render target
+zero, padding scalars and short vectors to a four-component float, signed-integer, or
+unsigned-integer attachment. Metal and Vulkan consume the same draw and attribute bytes; Vulkan
+uses a negative-height viewport for the same screen-space orientation as Metal.
+
+A vertex entry with no raster position may instead omit `vertex_observation` and all attachments,
+then select a writable shader resource as its output. Both executors run that draw with
+rasterization disabled; Vulkan emits no fragment companion, while Metal uses a private 1x1 encoder
+sink that cannot participate in the authored observation. This covers void vertex functions whose
+contract is a buffer or storage-texture side effect rather than raster output.
+
+Post-tessellation vertex cases replace `draw` with a `tessellation` record: exact binary16 edge
+and inner factors per patch, instance/amplification counts, and typed control-point/per-patch
+records. Metal consumes those records through native per-patch vertex stepping and `drawPatches`;
+Vulkan generates the matching vertex and tessellation-control stages, including reflected 16-bit
+system-value types. All generated SPIR-V modules participate in the candidate dependency hash.
+
+Dynamic Metal `threadgroup` arguments are declared through `threadgroup_memory` binding/length
+pairs. Metal binds that exact allocation; Vulkan uses the translator's descriptor-free `Workgroup`
+storage. The schema intentionally has no initial bytes because both APIs leave this storage
+uninitialized—authored shaders must initialize every location they read.
+
+Compute imageblocks use explicit `imageblock.dimensions`; explicit layouts have no host bytes. The
+checker requires those dimensions to match the dispatch threadgroup x/y size. Implicit layouts
+reuse authored `render_targets` as their initial attachment values and additionally require
+`imageblock.implicit_coverage: full_single_sample`. Both runners therefore begin with the same
+fully covered, single-sample pixels: Metal encodes a color-write-disabled coverage draw before its
+kernel tile dispatch, while Vulkan initializes the reflected attachment image directly. This is an
+authored execution fact, not an executor-supplied default.
+
+Custom fragment imageblocks use the distinct `fragment_imageblock` resource. Each accessed master
+member is identified by its AIR `user(...)` semantic and carries an exact tightly packed `half`,
+`half4`, `uchar4`, or `ushort` plane; scalar `half` is the backward-compatible default format.
+`output.kind: fragment_imageblock` reads a selected plane region. The Metal runner uses same-pass
+initializer/resolver fragments, while Vulkan binds the matching reflected storage format under
+ordered fragment interlock.
+
+Textures nested in an `air.indirect_buffer` are authored through
+`argument_buffer_textures`, keyed by owning buffer binding plus field byte offset. Product
+reflection supplies the Metal argument-encoder `[[id(n)]]` and the synthetic Vulkan descriptor,
+so manifests do not encode backend-specific binding numbers. A fixed embedded array authors one
+texture per handle at `field_offset + 8 * element`; Metal binds consecutive argument IDs and Vulkan
+binds those same elements into the single reflected descriptor array.
+
+Top-level `array<texture..., N>` and runtime `array_ref<texture...>` arguments use
+`texture_arrays`. Element order is the AIR handle index. Fixed arrays must author exactly `N`
+elements; runtime arrays author their valid logical prefix. Vulkan binds that prefix into the
+reflected 128-descriptor array and fills the unreachable remainder with the final valid descriptor;
+Metal binds the same prefix to consecutive texture slots.
+
+Texture `dimensions` describe spatial extent and array layers. Multisample textures additionally
+carry an explicit `sample_count`; literal bytes are tightly packed by layer, row, texel, then sample.
+This keeps 2D multisample arrays unambiguous instead of overloading the third dimension.
+
+Kernel `[[stage_in]]` attributes use `kernel_stage_inputs`, keyed by AIR attribute location. Each
+literal supplies a typed format, the product's reflected runtime-array stride, and record bytes.
+Product reflection owns the collision-free synthetic buffer slot: Metal uses it in an
+`MTLStageInputOutputDescriptor` with x-grid stepping, and Vulkan binds the same bytes as the
+read-only StorageBuffer array indexed by `GlobalInvocationId.x`.
+
+## Commands
+
+| Command | Responsibility |
+|---|---|
+| `corpus-harvest` | Extract and sanitize AIR into deterministic private source shards |
+| `corpus-index` | Incrementally sync or check the disposable SQLite index (`--rebuild` for recovery) |
+| `corpus-next` | Select unplanned AIR or record a durable non-evidence review note |
+| `corpus-triage` | Run cached structural, capability, or bounded translation audits over indexed rows |
+| `corpus-case-check` | Strictly validate or install an explicit manifest |
+| `corpus-status` | Report the exact missing-evidence queue |
+| `corpus-ab` | Compare two translator binaries without a GPU |
+| `corpus-openrouter-propose` | Record local, untrusted model-proposed cases without installing them |
+| `corpus-metal` | Qualify explicit checked cases on Metal |
+| `corpus-moltenvk` | Execute explicit cases against exact Metal observations |
+| `corpus-vulkan` | Execute explicit cases against exact Metal observations |
+| `corpus-refresh` | Refresh stale/missing Metal + MoltenVK slots in one cached macOS process (`--all` forces every case) |
+
+For operational sequences and the evidence each command establishes, use the repository
+[validation playbook](../docs/VALIDATION.md). This README describes the validation package and its
+resource model; it is not a substitute for the ordered gates in that playbook.
+
+Harvest merges new hashes into only their first-six-bit source shards. It does not load or rewrite
+the other source shards, and it publishes rewritten-row locations directly to the disposable
+index. The following incremental index sync normally reads zero source bytes; after an interrupted
+publication it repairs only shards whose full file stamp changed. Both commands report their
+affected/scanned shard counts. llvm-dis's scratch-path `ModuleID` comment is excluded from sanitized
+AIR identity, so reharvesting identical bitcode is a duplicate rather than a new row. Non-entry AIR
+modules are retained in separate private `local/library-modules` shards, preserving their parent
+library memberships for visible/intersection-function dependency resolution instead of dropping
+them during stage classification.
+
+Candidate observations record a build-time SHA-256 fingerprint of the product `Cargo.toml` and
+`src/` tree. `corpus-status` compares that fingerprint instead of retranslating every authored AIR
+row, so status and index refresh do not read source bodies. Any translator-source change makes old
+candidate evidence stale until it is refreshed.
+
+MoltenVK execution is macOS-only. Native Vulkan execution is currently Linux-only; the Vulkan
+command rejects macOS so one portability-stack run cannot occupy both backend slots.
+
+Run all ordinary validation tests serially:
 
 ```sh
 cargo test -p metal2vulkan-validation -- --test-threads=1
 ```
 
-Or from this directory:
+GPU execution is machine-specific. Ordinary CI covers identities, strict manifest rejection,
+dependency matching, storage transactions, indexing, and A/B policy using owned fixtures.
+
+## Optional model proposals
+
+`corpus-openrouter-propose` can send fresh private AIR rows to an explicitly selected
+OpenRouter model and record untrusted case proposals under `corpus/local/proposals/`. This uploads
+private sanitized AIR to a third party. A live run therefore requires both
+`OPENROUTER_API_KEY` and `--acknowledge-private-air-upload`; never put the key on the command line
+or in the repository.
+
+Start with a dry run and a small explicit limit:
 
 ```sh
-cargo test -- --test-threads=1
+cargo run -p metal2vulkan-validation --release --bin corpus-openrouter-propose -- \
+  --model '~deepseek/deepseek-v4-flash-latest' --limit 10 --dry-run
+
+OPENROUTER_API_KEY=... cargo run -p metal2vulkan-validation --release \
+  --bin corpus-openrouter-propose -- \
+  --model '~deepseek/deepseek-v4-flash-latest' --limit 100 \
+  --concurrency 50 --acknowledge-private-air-upload
 ```
 
-Linux **executor** tests (notably `atomic_float_executor`) need a Vulkan ICD. On a machine with
-no GPU, install lavapipe:
+The Rust tool selects AIR with neither a case nor a review note, skips recorded results on later runs,
+and writes each response atomically. Use `--retry-failures` to retry recorded failures. Model
+output is only a proposal: inspect it against the exact AIR, replace the zero `case_id` with the
+locally computed canonical ID, run `corpus-case-check`, and qualify it on Metal before treating it
+as evidence. The script never installs cases or review notes.
+Requests set OpenRouter's provider sort to `price`, so compatible endpoints are tried from cheapest
+to most expensive instead of using the default price-weighted load balancing. Account-level
+provider restrictions still apply. The default `--reasoning-effort low` reserves output budget for
+the structured manifest and excludes reasoning text from the recorded response; override it only
+when the selected model supports the requested level. The request deliberately omits `max_tokens`,
+allowing the selected OpenRouter model/provider to use its native completion limit instead of
+truncating a long structured result.
+For models that support JSON mode but not provider-enforced structured outputs, `--json-object`
+places the generated Rust case schema in the prompt and enforces it through local deserialization;
+provider-side strict JSON Schema remains the default.
+
+## Small authoring loop
 
 ```sh
-# Debian/Ubuntu
-sudo apt-get install -y mesa-vulkan-drivers libvulkan1
+cargo run -p metal2vulkan-validation --bin corpus-index
+cargo run -p metal2vulkan-validation --bin corpus-next -- --limit 1
+# Inspect that exact AIR and write one manifest row.
+cargo run -p metal2vulkan-validation --bin corpus-case-check -- \
+  --manifest /path/to/case.json --install
+cargo run -p metal2vulkan-validation --bin corpus-index
+cargo run -p metal2vulkan-validation --bin corpus-status
 ```
 
-Missing ICDs surface as `create Vulkan instance: … IncompatibleDriver` /
-`VK_ERROR_INCOMPATIBLE_DRIVER`, not as old `spirv-tools` / LLVM. The test file is
-`#![cfg(target_os = "linux")]`, so macOS CI skips it rather than exercising MoltenVK for that
-proof.
+A manifest edit replaces the stable `(air_sha256, name)` slot. Its semantic `case_id` changes and
+only observations for the old identity are removed. Sibling cases remain intact.
 
-## Tools
+## GPU-free refactor gate
 
-### SPIR-V / pipeline utilities
-
-| Binary | Purpose |
-|---|---|
-| `spirv_delta` | Classify SPIR-V byte/ID/order deltas |
-| `spirv_pipeline_probe` | Load a module and build a compute pipeline |
-| `spirv_pipeline_crash_predicate` | Interestingness predicate for pipeline crash reduction |
-| `corpus-harvest` | Harvest `.metallib` AIR into JSONL shards |
-
-### Corpus ledger CLIs (`corpus-*`)
-
-Design: repo-root [`plan.md`](../plan.md). Ledgers are **JSONL**: translate ledger is hashes only;
-execution ledgers (`-metal` / `-vulkan` / `-moltenvk`) store hash-identified plans, deterministic
-input/output digests, and full run `output_b64` payloads (no AIR/source bodies).
-
-| Binary | Writes / role |
-|---|---|
-| `corpus-mint` | Append **new** `air_sha256` rows → `corpus/metal2vulkan-ledger.jsonl` (translate pins) |
-| `corpus-remint` | Re-translate existing ledger rows; rewrite those rows (`--failed-only` = `status != ok`) |
-| `corpus-why` | One `air_sha256` → real translate FALLBACK error (no ledger write) |
-| `corpus-run-metal` | macOS Metal oracle → `corpus/metal2vulkan-ledger-metal.jsonl` (plan + golden `output_b64`) |
-| `corpus-run-vulkan` | Linux Vulkan vs metal golden → `corpus/metal2vulkan-ledger-vulkan.jsonl` |
-| `corpus-run-moltenvk` | MoltenVK vs metal golden → `corpus/metal2vulkan-ledger-moltenvk.jsonl` |
-| `corpus-triage` | Summarize ledgers, bucket failures, print single-case rerun commands |
-
-#### Translate pins
+Build or preserve the old binary before editing, build the new binary, then select an explicit
+canary, AIR hash/list, or aligned shard:
 
 ```sh
-# Additive: public fixtures + local shards; only hashes not already in the ledger
-cargo run -p metal2vulkan-validation --release --bin corpus-mint -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-mint
+cargo run -p metal2vulkan-validation --release --bin corpus-ab -- \
+  --old ./m2v-old --new target/release/metal2vulkan \
+  --canary --expect-no-change
 
-# Remint existing rows (all, failures only, or a bounded failure slice)
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-remint
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only --status fallback --limit 50
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --status timeout --skip 50 --limit 50 --case-timeout-secs 60
-
-# Diagnose one hash (surfaces the translator error mint banks as status=fallback)
-cargo run -p metal2vulkan-validation --release --bin corpus-why -- <air_sha256>
+cargo run -p metal2vulkan-validation --release --bin corpus-ab -- \
+  --old ./m2v-old --new target/release/metal2vulkan \
+  --shard 12 --fail-on-unlisted-change \
+  --allow-spv-change /path/to/intentional-spv-hashes.txt
 ```
 
-`corpus-mint`: `--jobs N`, `--quiet`, `--ledger PATH`, `--dry-run`.
-`corpus-remint`: same flags plus `--failed-only`, `--status STATUS`, `--contains TEXT`, `--skip N`,
-`--limit N`, `--case-timeout-secs N` (`0` keeps the legacy in-process path).
+The cache key includes AIR hash, translator binary hash, translation options, stage, exact
+external validator identity, and relevant translator environment. Delta classification is not
+semantic evidence.
 
-#### Execution goldens (Metal → Vulkan / MoltenVK)
-
-For each eligible translate-ledger row **missing** from the tech ledger (or an existing row selected
-by `--force`, `--failed-only`, `--status`, `--bucket`, or `--contains`): resolve or infer a harness
-plan, seed non-zero inputs, run, append to a per-run delta, then merge that delta into the backend
-ledger once with `air_sha256` dedupe.
-
-- **`corpus-run-metal`:** translate `status=ok` **or** `fallback` (Metal runs AIR; translator
-  FALLBACK does not block the oracle).
-- **`corpus-run-vulkan` / `corpus-run-moltenvk`:** translate `status=ok` only (need SPIR-V).
-
-```sh
-# macOS: Metal oracle (banks plan + full output_b64 + digests)
-cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-run-metal
-
-# Linux: Vulkan candidate vs metal golden (needs metal rows)
-cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan
-
-# macOS: MoltenVK candidate (separate ledger; same plan as metal)
-cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk
-```
-
-Runners: `--force`, `--failed-only`, `--status STATUS`, `--bucket TEXT`, `--contains TEXT`,
-`--quiet`, `--jobs N` (default **min(CPU cores, 4)** parallel workers; raise carefully on GPU
-hosts), `--air-sha256 HEX`, `--ledger-dir DIR`, `--dry-run`.
-Per-case worker timeout defaults to **60s** and can be overridden with
-`METAL2VULKAN_CORPUS_TIMEOUT_SECS=N`; there is no timeout CLI flag.
-Tech JSONL files are **deduped by `air_sha256` at delta merge** (last row for a hash wins).
-For candidate ledgers, `status=ok` and `status=tolerance` are accepted success states;
-`--failed-only` reruns existing non-success rows. Use `--status` / `--bucket` / `--contains` for a
-targeted batch over one triage group.
-
-**Plan source of truth:** metal JSONL row when present; otherwise lazy `infer_plan` from `.ll`.
-Candidates **reuse** the metal plan. Tolerances for candidate outcomes live **on the candidate
-JSONL line** (`status` / `tolerance` / `observed`), not a separate global file.
-
-Eligibility for `corpus-run-*`:
-
-```text
-source in public fixtures or local shards  AND  air_sha256 not yet in tech ledger
-  AND  (metal: translate status ok|fallback
-        vulkan/moltenvk: translate status ok)
-```
-
-`--force` ignores the tech-ledger presence check. `--failed-only`, `--status`, `--bucket`, and
-`--contains` select existing tech rows instead of new missing rows.
-
-macOS oracle entry points live in the library (`oracle_macos`); the Vulkan byte-run executor is
-`runner_linux` (built on both Linux and macOS for MoltenVK).
-
-#### Triage / agent loop
-
-```sh
-# Summarize all ledgers and list the first non-success rows
-cargo run -p metal2vulkan-validation --release --bin corpus-triage
-
-# Pick MoltenVK pipeline failures and print exact reproduction commands
-cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
-  --backend moltenvk --status fallback --contains pipeline --commands
-
-# Rerun one hash, then the matching bucket
-cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
-  --air-sha256 <air_sha256> --force --jobs 1
-cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
-  --status fallback --bucket "create vertex validation pipeline" --jobs 1
-
-# Full non-success sweep; useful late, but broad.
-cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk -- \
-  --failed-only --dry-run
-```
-
-## Optional private corpus
-
-See [`corpus/README.md`](corpus/README.md). `corpus-harvest` writes shard JSONL under
-`corpus/local/shards/` (gitignored). Corpus ledger tools resolve those shards directly.
-
-Cross-version **translate** pins: `corpus/metal2vulkan-ledger.jsonl`.  
-**Execution** pins: `metal2vulkan-ledger-{metal,vulkan,moltenvk}.jsonl` (optional tracked
-reproducibility artifacts; no AIR/source bodies).
-
-For live before/after SPIR-V compares without execution goldens, use
-[`scripts/metal2vulkan-ab/`](../scripts/metal2vulkan-ab/).
-
-**Developer playbook:** [`docs/VALIDATION.md`](../docs/VALIDATION.md). Full execution design:
-[`plan.md`](../plan.md).
+See [the corpus format](corpus/README.md) and the repository
+[validation playbook](../docs/VALIDATION.md).

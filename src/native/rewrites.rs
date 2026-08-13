@@ -512,6 +512,38 @@ pub(crate) fn drop_dangling_debug_targets_module(module: &mut Module) -> bool {
     module.debug_names.len() != before_names || module.annotations.len() != before_annotations
 }
 
+/// Collapse every one-incoming `OpPhi` to its sole value and substitute its uses within the owning
+/// function. CFG edge splitting legitimately creates this forwarding form; keeping it until
+/// validation is both redundant and hazardous when an earlier interface rewrite refined the value
+/// type but left the phi's stale carrier type behind. The rewrite is an SSA identity, bounded to one
+/// small substitution map per function, and does not clone consumer subgraphs.
+pub(crate) fn collapse_single_incoming_phis_module(module: &mut Module) -> bool {
+    let mut changed = false;
+    for function in &mut module.functions {
+        changed |= constfold::collapse_trivial_phis(function);
+    }
+    if changed {
+        drop_dangling_debug_targets_module(module);
+    }
+    changed
+}
+
+/// Replace already-invalid packed `i32` loads through a Private 16-bit vector word view with a
+/// direct vector load plus a two-lane bitcast. Returns whether any load was legalized.
+pub(crate) fn rewrite_private_vector_word_loads_module(module: &mut Module) -> bool {
+    let changed = private_vector_word::rewrite_private_vector_word_loads(module);
+    if changed {
+        drop_dangling_debug_targets_module(module);
+    }
+    changed
+}
+
+/// Retype validator-invalid `OpSampledImage` instructions to the concrete image operand's sampled
+/// type after interface refinement.
+pub(crate) fn repair_sampled_image_result_types_module(module: &mut Module) -> bool {
+    sampled_image_type::repair_sampled_image_result_types(module)
+}
+
 /// Apply the W1 PhysicalStorageBuffer64 lowering in place. Errors if no cross-binding pointer-merge
 /// sub-graph was rewritten. The caller (the failure-triggered retry) adopts the result ONLY if it
 /// independently validates, so this is floor-safe by construction.
@@ -625,6 +657,12 @@ pub(crate) fn rewrite_logical_pointer_phis_module(module: &mut Module) -> bool {
     phi_index::rewrite_logical_pointer_phis(module)
 }
 
+/// Lower an invalid direct-load `OpSelect` whose opaque-pointer arms cross logical storage classes
+/// into per-arm loads followed by a value select. The structural pass refuses pointer escapes.
+pub(crate) fn rewrite_mixed_storage_pointer_select_loads_module(module: &mut Module) -> bool {
+    mixed_pointer_select::rewrite_mixed_storage_pointer_select_loads(module)
+}
+
 /// Legalize integer `OpPhi` result/incoming width mismatches in an in-flight module (the PRIMARY emit
 /// tail) by truncating a wide incoming to the phi's narrower integer result type. Only touches phis
 /// that are already spirv-val-INVALID (an integer phi whose operand type differs from its result
@@ -729,6 +767,168 @@ pub(crate) fn prune_constant_branches_module(module: &mut Module) -> Result<(), 
     drop_dangling_debug_targets_module(module);
     add_native_module_capabilities(module);
     Ok(())
+}
+
+/// Remove dead pure chains rooted at invalid logical-pointer nulls after late primary rewrites.
+/// Preserve every result outside those chains explicitly, so this remains a focused legalization and
+/// cannot become whole-module DCE or perturb unrelated diagnostic instructions.
+pub(crate) fn drop_unused_values_module(module: &mut Module) -> bool {
+    let defs = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut removable = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::ConstantNull)
+        .filter_map(|instruction| {
+            let id = instruction.result_id?;
+            let storage = ptr_storage(&defs, instruction.result_type?)?;
+            (!matches!(
+                storage,
+                StorageClass::StorageBuffer | StorageClass::Workgroup
+            ))
+            .then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    if removable.is_empty() {
+        return false;
+    }
+
+    loop {
+        let additions = module
+            .all_inst_iter()
+            .filter(|instruction| {
+                constfold::is_pure(instruction.class.opcode) && instruction.result_id.is_some()
+            })
+            .filter(|instruction| {
+                instruction
+                    .operands
+                    .iter()
+                    .any(|operand| matches!(operand, Operand::IdRef(id) if removable.contains(id)))
+            })
+            .filter_map(|instruction| instruction.result_id)
+            .filter(|id| !removable.contains(id))
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            break;
+        }
+        removable.extend(additions);
+    }
+
+    let preserved = module
+        .all_inst_iter()
+        .filter_map(|instruction| instruction.result_id)
+        .filter(|id| !removable.contains(id))
+        .collect::<HashSet<_>>();
+    constfold::dce_preserving(module, &preserved)
+}
+
+/// Reconcile the storage class of every typed access-chain result with its actual base pointer.
+///
+/// SPIR-V requires these storage classes to match. Earlier lowering normally establishes that
+/// invariant, but a late value substitution can replace a pointer merge with one of its concrete
+/// roots after the access chain was typed. In particular, folding an AIR function-constant switch
+/// can replace an `addrspace(2)` pointer carrier with a module-scope `Private` constant table while
+/// leaving the chain's former `UniformConstant` result type behind. Retyping only the pointer storage
+/// class is exact: the pointee and every index remain unchanged, and the base determines the only
+/// legal storage class.
+///
+/// Run to a fixpoint because one repaired chain can itself be the base of a later chain. Returns
+/// whether any result type changed.
+pub(crate) fn reconcile_access_chain_storage_classes_module(module: &mut Module) -> bool {
+    let mut changed = false;
+    loop {
+        let pointer_types = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| {
+                if instruction.class.opcode != Op::TypePointer {
+                    return None;
+                }
+                let id = instruction.result_id?;
+                let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
+                    (instruction.operands.first(), instruction.operands.get(1))
+                else {
+                    return None;
+                };
+                Some((id, (*storage, *pointee)))
+            })
+            .collect::<HashMap<_, _>>();
+        let value_types = module
+            .all_inst_iter()
+            .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+            .collect::<HashMap<_, _>>();
+
+        let repairs = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(
+                    instruction.class.opcode,
+                    Op::AccessChain
+                        | Op::InBoundsAccessChain
+                        | Op::PtrAccessChain
+                        | Op::InBoundsPtrAccessChain
+                )
+            })
+            .filter_map(|instruction| {
+                let result = instruction.result_id?;
+                let result_type = instruction.result_type?;
+                let Operand::IdRef(base) = instruction.operands.first()? else {
+                    return None;
+                };
+                let base_type = value_types.get(base)?;
+                let (base_storage, _) = pointer_types.get(base_type)?;
+                let (result_storage, pointee) = pointer_types.get(&result_type)?;
+                (base_storage != result_storage).then_some((result, (*base_storage, *pointee)))
+            })
+            .collect::<Vec<_>>();
+        if repairs.is_empty() {
+            break;
+        }
+
+        let mut replacement_types = HashMap::new();
+        for (_, key) in &repairs {
+            if replacement_types.contains_key(key) {
+                continue;
+            }
+            if let Some(existing) = pointer_types
+                .iter()
+                .find_map(|(id, candidate)| (candidate == key).then_some(*id))
+            {
+                replacement_types.insert(*key, existing);
+                continue;
+            }
+            let id = module.fresh_id();
+            module.types_global_values.push(Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(id),
+                vec![Operand::StorageClass(key.0), Operand::IdRef(key.1)],
+            ));
+            replacement_types.insert(*key, id);
+        }
+        let repairs = repairs.into_iter().collect::<HashMap<_, _>>();
+        for function in &mut module.functions {
+            for block in &mut function.blocks {
+                for instruction in &mut block.instructions {
+                    let Some(result) = instruction.result_id else {
+                        continue;
+                    };
+                    let Some(key) = repairs.get(&result) else {
+                        continue;
+                    };
+                    instruction.result_type = replacement_types.get(key).copied();
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Preserving form of [`prune_constant_branches_module`] for a primary module that still carries
@@ -842,6 +1042,80 @@ mod tests {
 
     fn inst(op: Op, ty: Option<Word>, id: Option<Word>, operands: Vec<Operand>) -> Instruction {
         Instruction::new(op, ty, id, operands)
+    }
+
+    #[test]
+    fn access_chain_storage_follows_late_substituted_base() {
+        let mut module = Module::default();
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeVector,
+                None,
+                Some(2),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(2)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(3),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(2),
+                ],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(4),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(2),
+                ],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(5),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(5),
+                Some(6),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Variable,
+                Some(3),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::Private)],
+            ),
+        ];
+        module.functions = vec![Function {
+            blocks: vec![Block {
+                label: None,
+                instructions: vec![inst(
+                    Op::InBoundsAccessChain,
+                    Some(4),
+                    Some(8),
+                    vec![Operand::IdRef(7), Operand::IdRef(6)],
+                )],
+            }],
+            ..Default::default()
+        }];
+
+        assert!(reconcile_access_chain_storage_classes_module(&mut module));
+        assert_eq!(
+            module.functions[0].blocks[0].instructions[0].result_type,
+            Some(3)
+        );
+        assert!(!reconcile_access_chain_storage_classes_module(&mut module));
     }
 
     fn workgroup_struct_byte_store_module(byte_offset: u32) -> Module {

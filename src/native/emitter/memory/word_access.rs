@@ -124,9 +124,47 @@ impl Emitter {
         word_index: Word,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(Word, StorageClass), String> {
-        let root_id = self.raw_root_value_id(raw)?;
         let storage = self.raw_access_storage(raw)?;
         let ptr_ty = self.ptr_type_id(storage, &LlType::Int(32))?;
+        if let Some(base_address) = raw.device_addr_base {
+            if storage != StorageClass::PhysicalStorageBuffer {
+                return Err(format!(
+                    "native emitter: device-address raw word uses non-physical storage {storage:?}"
+                ));
+            }
+            let i64_ty = self.type_id(&LlType::Int(64))?;
+            let index64 = self.fresh();
+            instructions.push(Self::inst(
+                Op::UConvert,
+                Some(i64_ty),
+                Some(index64),
+                vec![Operand::IdRef(word_index)],
+            ));
+            let byte_offset = self.fresh();
+            let four = self.const_signed_int(64, 4)?;
+            instructions.push(Self::inst(
+                Op::IMul,
+                Some(i64_ty),
+                Some(byte_offset),
+                vec![Operand::IdRef(index64), Operand::IdRef(four)],
+            ));
+            let address = self.fresh();
+            instructions.push(Self::inst(
+                Op::IAdd,
+                Some(i64_ty),
+                Some(address),
+                vec![Operand::IdRef(base_address), Operand::IdRef(byte_offset)],
+            ));
+            let ptr = self.fresh();
+            instructions.push(Self::inst(
+                Op::ConvertUToPtr,
+                Some(ptr_ty),
+                Some(ptr),
+                vec![Operand::IdRef(address)],
+            ));
+            return Ok((ptr, storage));
+        }
+        let root_id = self.raw_root_value_id(raw)?;
         let ptr = self.fresh();
         if storage == StorageClass::Private
             && self

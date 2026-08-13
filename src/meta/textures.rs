@@ -1,9 +1,13 @@
 use crate::passes::ImageComp;
 use spirv::{Dim, ImageFormat};
 
+/// Descriptor capacity used for AIR texture-handle arrays. Fixed arrays occupy their prefix;
+/// runtime `array_ref` cases author the logical prefix they may access.
+pub const TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT: u32 = 128;
+
 /// Texture dimensionality decoded from a Metal texture type name, independent of the SPIR-V emit
 /// enum (`spirv::Dim`) so it can appear in the serializable reflection ABI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextureDimension {
     D1,
@@ -71,10 +75,13 @@ impl TextureComponent {
 /// The SPIR-V `OpTypeImage` format a write-capable Metal texture lowers to, decoded from its type
 /// name's scalar. Neutral of the emit enum (`spirv::ImageFormat`) so it can appear in the reflection
 /// ABI; the emitter maps it back via [`TextureFormat::to_spirv_format`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextureFormat {
+    R16f,
+    Rg16f,
     R32f,
+    R32ui,
     Rgba32f,
     Rgba16f,
     Rgba8ui,
@@ -86,7 +93,10 @@ impl TextureFormat {
     /// The SPIR-V `ImageFormat` the emitter decorates the storage image with.
     pub fn to_spirv_format(self) -> ImageFormat {
         match self {
+            TextureFormat::R16f => ImageFormat::R16f,
+            TextureFormat::Rg16f => ImageFormat::Rg16f,
             TextureFormat::R32f => ImageFormat::R32f,
+            TextureFormat::R32ui => ImageFormat::R32ui,
             TextureFormat::Rgba32f => ImageFormat::Rgba32f,
             TextureFormat::Rgba16f => ImageFormat::Rgba16f,
             TextureFormat::Rgba8ui => ImageFormat::Rgba8ui,
@@ -112,6 +122,9 @@ pub struct TextureShape {
     pub writable: bool,
     /// The argument is a runtime-indexed descriptor array of texture handles.
     pub array_ref: bool,
+    /// Fixed texture-handle array length (`array<texture..., N>`), or `None` for a runtime
+    /// `array_ref` and for a single texture.
+    pub array_length: Option<u32>,
     /// For a `writable` texture, the storage-image texel format the emitter decorates the
     /// `OpTypeImage` with; `None` for a sampled texture.
     pub storage_format: Option<TextureFormat>,
@@ -119,12 +132,14 @@ pub struct TextureShape {
 
 /// Decode a Metal texture argument/type name into its [`TextureShape`]. The dimensionality/arrayed
 /// classification is substring-order-sensitive (`1d_array` before `1d`, `cube_array` before `cube`)
-/// and matches exactly what the interface pass decorates the emitted image type with; `multisampled`
-/// is an additive flag the emit path ignores.
+/// and matches what the interface pass uses to construct the emitted image type, including its
+/// multisample operand.
 pub fn texture_shape_from_name(name: &str) -> TextureShape {
     let (writable, array_ref) = texture_access_from_name(name);
+    let array_length = fixed_texture_array_length(name);
     let shape_name = if array_ref {
         name.find("texture")
+            .or_else(|| name.find("depth"))
             .and_then(|start| name.get(start..))
             .unwrap_or(name)
     } else {
@@ -165,8 +180,22 @@ pub fn texture_shape_from_name(name: &str) -> TextureShape {
         component,
         writable,
         array_ref,
+        array_length,
         storage_format,
     }
+}
+
+fn fixed_texture_array_length(name: &str) -> Option<u32> {
+    let compact = name
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    if !compact.starts_with("array<texture") && !compact.starts_with("array<depth") {
+        return None;
+    }
+    let end = compact.rfind('>')?;
+    let before_end = &compact[..end];
+    before_end.rsplit_once(',')?.1.parse().ok()
 }
 
 /// The storage-image texel format a write-capable texture lowers to, from its scalar precision. A
@@ -217,7 +246,10 @@ fn texture_access_from_name(name: &str) -> (bool, bool) {
         .chars()
         .filter(|ch| !ch.is_ascii_whitespace())
         .collect::<String>();
-    let array_ref = compact.contains("array_ref<texture") || compact.contains("array<texture");
+    let array_ref = compact.contains("array_ref<texture")
+        || compact.contains("array<texture")
+        || compact.contains("array_ref<depth")
+        || compact.contains("array<depth");
     let Some((_, rest)) = name.split_once('<') else {
         return (false, array_ref);
     };

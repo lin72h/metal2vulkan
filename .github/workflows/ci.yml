@@ -37,17 +37,14 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          # llvm: llvm-dis; spirv-tools: spirv-val, spirv-as, spirv-diff (needed by spirv_delta)
-          # mesa-vulkan-drivers + libvulkan1: lavapipe software ICD so the Linux validation
-          # executor can create a VkInstance on GPU-less GitHub runners. Without an ICD,
-          # Instance::new fails with VK_ERROR_INCOMPATIBLE_DRIVER (not an apt-tool-age issue).
-          sudo apt-get install -y llvm clang spirv-tools mesa-vulkan-drivers libvulkan1
+          # llvm: llvm-dis; spirv-tools: spirv-val + the product passthrough path's spirv-as.
+          # Keep lavapipe available for explicit
+          # corpus-vulkan qualification on GPU-less Linux runners.
+          sudo apt-get install -y llvm spirv-tools mesa-vulkan-drivers libvulkan1
           command -v llvm-dis
           command -v spirv-val
           command -v spirv-as
-          command -v spirv-diff
-          # Fail setup early if the loader has nothing to bind — otherwise the atomic-float
-          # executor (and any other runner_linux test) panics mid-suite.
+          # Fail setup early if an explicit corpus-vulkan run would have no ICD.
           shopt -s nullglob
           icds=(/usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json)
           echo "Vulkan ICDs: ${icds[*]:-none}"
@@ -67,7 +64,6 @@ jobs:
           command -v llvm-dis
           command -v spirv-val
           command -v spirv-as
-          command -v spirv-diff
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -76,8 +72,40 @@ jobs:
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Build public documentation (warnings denied)
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+        run: cargo doc --workspace --all-features --no-deps
+
       - name: Test metal2vulkan
         run: cargo test -p metal2vulkan -- --test-threads=1
 
       - name: Test validation suite
         run: cargo test -p metal2vulkan-validation -- --test-threads=1
+
+      # Machine-specific semantic qualification remains explicit. Linux CI has lavapipe, so it can
+      # execute the owned public cases against their exact committed Metal observations without a
+      # physical GPU. Rows written here are ephemeral CI evidence, not committed environment slots.
+      - name: Qualify public cases on native Vulkan (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo build -p metal2vulkan-validation --bins
+          for case_id in \
+            d9ce86618e0924966fbb1e7de63761ef471bb6e85b592a70193a26375ec0423f \
+            4659fedddd1695fba79c3faa797ec3be647e3fd1a87ecec23bde55ccbfbcf656 \
+            1e54315eb0ffcac633d4992c577f3e6ac384ed1bdf2321887c1f37242c00c887
+          do
+            target/debug/corpus-vulkan \
+              --case-id "$case_id" \
+              --metal-environment-id apple-m2-macos26.5.2 \
+              --environment-id ubuntu-26.04-lavapipe
+          done
+          target/debug/corpus-index
+          target/debug/corpus-index --check
+          status=$(target/debug/corpus-status --limit 20)
+          echo "$status"
+          if grep -Eq 'vulkan=(missing|stale|failed)' <<<"$status"; then
+            echo "native Vulkan qualification is incomplete" >&2
+            exit 1
+          fi

@@ -7,7 +7,7 @@ use super::*;
 /// `(texture, sampler, coord, normalized, offset, component, flags)`.
 pub(in crate::passes) fn lower_gather(
     ctx: &mut Ctx,
-    _name: &str,
+    name: &str,
     res: Option<Word>,
     rty: Option<Word>,
     args: &[Word],
@@ -29,7 +29,8 @@ pub(in crate::passes) fn lower_gather(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
-    let (dim, arrayed, _) = image_shape_or_recorded(ctx, img);
+    let (dim, _, _) = image_shape_or_recorded(ctx, img);
+    let arrayed = name.starts_with("air.gather_texture_2d_array.");
     let (layer, offset, component) = if arrayed {
         if args.len() < 7 {
             return Err("air.gather_texture array form missing layer/offset/component".into());
@@ -52,7 +53,7 @@ pub(in crate::passes) fn lower_gather(
 /// `OpImageGather` coordinate is validator-clean but byte-wrong against Apple.
 pub(in crate::passes) fn lower_gather_depth(
     ctx: &mut Ctx,
-    _name: &str,
+    name: &str,
     res: Option<Word>,
     rty: Option<Word>,
     args: &[Word],
@@ -74,7 +75,8 @@ pub(in crate::passes) fn lower_gather_depth(
             return lower_null_texture_result(ctx, res, rty);
         }
     }
-    let (dim, arrayed, _) = image_shape_or_recorded(ctx, img);
+    let (dim, _, _) = image_shape_or_recorded(ctx, img);
+    let arrayed = name.starts_with("air.gather_depth_2d_array.");
     let coord = args[3];
     let (layer, normalized_index, offset_index) = if arrayed {
         if args.len() < 8 {

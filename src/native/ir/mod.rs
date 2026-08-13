@@ -61,12 +61,17 @@ pub(super) enum LlValue {
     Struct(Vec<TypedValue>),
     Splat(Box<TypedValue>),
     Gep(Box<LlGep>),
+    IntToPtr {
+        source: Box<TypedValue>,
+        destination: LlType,
+    },
     Zero,
     Undef,
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct LlGep {
+    pub(super) inbounds: bool,
     pub(super) source_ty: LlType,
     pub(super) base: TypedValue,
     pub(super) indices: Vec<TypedValue>,
@@ -77,6 +82,10 @@ pub(super) struct LlFunction {
     pub(super) name: String,
     pub(super) ret: LlType,
     pub(super) params: Vec<(String, LlType)>,
+    /// Explicit aggregate pointees carried by LLVM's `byval(T)` parameter attribute. Opaque
+    /// pointer syntax otherwise erases `T`, and a parameter used only as a memcpy source has no
+    /// dereference from which the ordinary body-use inference could recover it.
+    pub(super) byval_param_pointees: Vec<Option<LlType>>,
     /// The function's basic blocks lowered to typed carriers — the parse-once typed IR and the SOLE
     /// body substrate. `parse_function` lexes the body lines transiently and hands them to
     /// `parse_inner`, which lowers them once (via `split_body_blocks`, where the module type table is
@@ -125,6 +134,8 @@ pub(super) struct LlModule {
     pub(super) functions: Vec<LlFunction>,
     pub(super) declarations: Vec<LlDeclaration>,
     pub(super) globals: Vec<LlGlobal>,
+    /// Proven immutable integer values materialized by AIR static initializers.
+    static_init_int_globals: HashMap<String, u32>,
     /// Stage entry selected by the caller's parsed AIR metadata. `None` preserves the downstream
     /// transform's historical fallback to the first bodied function.
     pub(super) entry_name: Option<String>,
@@ -236,7 +247,7 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
                 }
                 continue;
             }
-            if let Some((true_value, false_value)) = &inst.select_arms {
+            if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
                 if !matches!(true_value.ty, LlType::Ptr(_))
                     || !matches!(false_value.ty, LlType::Ptr(_))
                 {
@@ -325,7 +336,7 @@ fn cross_buffer_pointer_phi_gep_sources(f: &LlFunction) -> HashMap<String, HashS
                     merged.extend(value_roots.iter().cloned());
                 }
                 (complete.then_some(merged), true)
-            } else if let Some((true_value, false_value)) = &inst.select_arms {
+            } else if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
                 if !matches!(true_value.ty, LlType::Ptr(_))
                     || !matches!(false_value.ty, LlType::Ptr(_))
                 {
@@ -446,7 +457,14 @@ fn infer_metadata_data_buffer_params(
         return out;
     };
     for (idx, (name, ty)) in entry.params.iter().enumerate() {
-        if kern.buffer_type_name(idx as u32).is_none() {
+        if !matches!(
+            kern.role_of(idx as u32),
+            Some(
+                KernRole::Buffer(_)
+                    | KernRole::AccelerationStructureShadow(_)
+                    | KernRole::PrimitiveAccelerationStructureShadow(_)
+            )
+        ) {
             continue;
         }
         if matches!(ty, LlType::Ptr(1 | 2)) {
@@ -1224,5 +1242,25 @@ join:
             "}\n",
         );
         assert!(parsed(air).local_alloca_pointees.is_empty());
+    }
+
+    #[test]
+    fn scalar_alloca_with_byte_view_uses_bounded_byte_storage() {
+        let air = concat!(
+            "define void @k() {\n",
+            "entry:\n",
+            "  %slot = alloca float, align 4\n",
+            "  %alias = bitcast ptr %slot to ptr\n",
+            "  %high = getelementptr i8, ptr %alias, i64 2\n",
+            "  store half 0xH3C00, ptr %high, align 2\n",
+            "  ret void\n",
+            "}\n",
+        );
+        assert_eq!(
+            parsed(air)
+                .local_alloca_pointees
+                .get(&("k".to_string(), "%slot".to_string())),
+            Some(&LlType::Array(Box::new(LlType::Int(8)), 4))
+        );
     }
 }

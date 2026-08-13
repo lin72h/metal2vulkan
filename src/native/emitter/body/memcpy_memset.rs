@@ -852,6 +852,24 @@ impl Emitter {
             return Ok(true);
         }
 
+        // A named AIR wrapper can contain the exact aggregate copied into a bare local array
+        // (`metal::matrix<T>` -> its `[N x vector<T>]` storage). Descend through the source's
+        // offset-zero field just as the symmetric destination-wrapper path below does. The helper's
+        // extent guard keeps this honest when a struct has trailing fields or padding covered by the
+        // requested byte count.
+        if matches!(src_pointee, LlType::Struct(_))
+            && self.emit_prefix_source_struct_memcpy(
+                &call.args[0],
+                &call.args[1],
+                &dst_pointee,
+                &src_pointee,
+                len,
+                instructions,
+            )?
+        {
+            return Ok(true);
+        }
+
         if let (LlType::Struct(dst_fields), LlType::Struct(src_fields)) =
             (&dst_pointee, &src_pointee)
         {
@@ -1060,6 +1078,10 @@ impl Emitter {
         let src_field = function_storage_local_type(&src_field);
         let dst_pointee = function_storage_local_type(dst_pointee);
         if !types_compatible(&dst_pointee, &src_field) {
+            return Ok(false);
+        }
+        let (field_size, _) = self.raw_type_size_align(&src_field)?;
+        if len > field_size {
             return Ok(false);
         }
 

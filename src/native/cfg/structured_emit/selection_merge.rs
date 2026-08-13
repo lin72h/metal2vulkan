@@ -57,6 +57,342 @@ pub(in crate::native) fn refine_loop_exit_selection_merges(
     }
 }
 
+/// Recover the merge of a conditional carried by the sole successor of a loop header when some
+/// paths terminate instead of reaching the ordinary post-dominator. This is the structural form
+/// produced when a genuine loop-header selection is lifted off the header, but the proof deliberately
+/// uses CFG ownership rather than a synthesized name. A direct arm is a valid merge when every path
+/// from the other arm either reaches it or exits through the enclosing loop/return/unreachable.
+///
+/// The search considers only the two direct arms and traverses each edge at most once per candidate,
+/// so it remains available for large generated functions where the general convergence search is
+/// intentionally bounded.
+pub(in crate::native) fn refine_loop_entry_terminal_selection_merges(
+    blocks: &[BodyBlock],
+    forest: &LoopForest,
+    loop_merges: &HashMap<String, LoopMergeInfo>,
+    selection_merges: &mut HashMap<String, String>,
+) {
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    for loop_info in &forest.loops {
+        let Some(info) = loop_merges.get(&loop_info.header) else {
+            continue;
+        };
+        let Some(loop_header) = by_name.get(loop_info.header.as_str()) else {
+            continue;
+        };
+        let successors = block_successors(loop_header);
+        let [selection_header] = successors.as_slice() else {
+            continue;
+        };
+        if selection_merges.contains_key(selection_header) {
+            continue;
+        }
+        let Some(selection_block) = by_name.get(selection_header.as_str()) else {
+            continue;
+        };
+        let Some((left, right)) = conditional_branch_targets(selection_block) else {
+            continue;
+        };
+        let loop_body = loop_info
+            .body
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        for (candidate, other) in [(&left, &right), (&right, &left)] {
+            if !loop_body.contains(candidate.as_str())
+                || candidate == &loop_info.header
+                || candidate == &info.merge
+                || candidate == &info.continue_target
+            {
+                continue;
+            }
+            if loop_entry_arm_reaches_merge_or_structured_exit(
+                blocks, &by_name, &loop_body, loop_info, info, other, candidate,
+            ) {
+                selection_merges.insert(selection_header.clone(), candidate.clone());
+                if crate::env_vars::spi_why() {
+                    eprintln!(
+                        "[spi-why]   loop-entry-terminal header={} owner={} merge={}",
+                        selection_header, loop_info.header, candidate,
+                    );
+                }
+                break;
+            }
+        }
+        if !selection_merges.contains_key(selection_header) {
+            if let Some(candidate) = loop_exit_selection_convergence(
+                blocks,
+                forest,
+                loop_merges,
+                loop_info,
+                info,
+                selection_header,
+            ) {
+                selection_merges.insert(selection_header.clone(), candidate.clone());
+                if crate::env_vars::spi_why() {
+                    eprintln!(
+                        "[spi-why]   loop-entry-terminal header={} owner={} merge={}",
+                        selection_header, loop_info.header, candidate,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Recover terminal-aware merges for ordinary selections nested inside loops. Only headers absent
+/// from both ordinary post-dominance and the explicit terminal-owner map are considered. For each,
+/// the innermost enclosing loop supplies the legal break/continue/back-edge exits, while
+/// [`loop_exit_selection_convergence`] proves every remaining live path reaches the candidate.
+pub(in crate::native) fn refine_nested_terminal_selection_merges(
+    blocks: &[BodyBlock],
+    forest: &LoopForest,
+    loop_merges: &HashMap<String, LoopMergeInfo>,
+    forced_terminal_merges: &HashMap<String, String>,
+    selection_merges: &mut HashMap<String, String>,
+) {
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    let mut headers = blocks
+        .iter()
+        .filter(|block| conditional_branch_targets(block).is_some() || is_switch_block(block))
+        .filter(|block| !selection_merges.contains_key(&block.name))
+        .filter(|block| !forced_terminal_merges.contains_key(&block.name))
+        .map(|block| block.name.clone())
+        .collect::<Vec<_>>();
+    headers.sort();
+    for header in headers {
+        let direct_enclosing_loop_exit = |target: &str| {
+            forest.loops.iter().any(|candidate_loop| {
+                candidate_loop.header != header
+                    && candidate_loop.body.iter().any(|node| node == &header)
+                    && (candidate_loop.header == target
+                        || loop_merges.get(&candidate_loop.header).is_some_and(|role| {
+                            role.merge == target || role.continue_target == target
+                        }))
+            })
+        };
+        let mut enclosing = forest
+            .loops
+            .iter()
+            .filter(|loop_info| loop_info.header != header)
+            .filter(|loop_info| loop_info.body.iter().any(|node| node == &header))
+            .filter_map(|loop_info| {
+                loop_merges
+                    .get(&loop_info.header)
+                    .map(|info| (loop_info, info))
+            })
+            .collect::<Vec<_>>();
+        enclosing.sort_by_key(|(loop_info, _)| loop_info.body.len());
+        if enclosing.is_empty() {
+            if let Some(candidate) = terminal_exit_convergence(blocks, forest, &header) {
+                selection_merges.insert(header.clone(), candidate.clone());
+                if crate::env_vars::spi_why() {
+                    eprintln!(
+                        "[spi-why]   terminal-convergence header={} merge={}",
+                        header, candidate,
+                    );
+                }
+                continue;
+            }
+        }
+        for (loop_info, info) in enclosing {
+            let direct = by_name
+                .get(header.as_str())
+                .and_then(|block| conditional_branch_targets(block))
+                .and_then(|(left, right)| {
+                    let loop_body = loop_info
+                        .body
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
+                    [(&left, &right), (&right, &left)]
+                        .into_iter()
+                        .find_map(|(candidate, other)| {
+                            (loop_body.contains(candidate.as_str())
+                                && candidate != &loop_info.header
+                                && candidate != &info.merge
+                                && candidate != &info.continue_target
+                                && (direct_enclosing_loop_exit(other)
+                                    || loop_entry_arm_reaches_merge_or_structured_exit(
+                                        blocks, &by_name, &loop_body, loop_info, info, other,
+                                        candidate,
+                                    )))
+                            .then(|| candidate.clone())
+                        })
+                });
+            let candidate = direct.or_else(|| {
+                loop_exit_selection_convergence(
+                    blocks,
+                    forest,
+                    loop_merges,
+                    loop_info,
+                    info,
+                    &header,
+                )
+            });
+            if let Some(candidate) = candidate {
+                selection_merges.insert(header.clone(), candidate.clone());
+                if crate::env_vars::spi_why() {
+                    eprintln!(
+                        "[spi-why]   nested-loop-terminal header={} owner={} merge={}",
+                        header, loop_info.header, candidate,
+                    );
+                }
+                break;
+            }
+        }
+        if crate::env_vars::spi_why() && !selection_merges.contains_key(&header) {
+            let arms = by_name
+                .get(header.as_str())
+                .map(|block| block_successors(block))
+                .unwrap_or_default();
+            let roles = forest
+                .loops
+                .iter()
+                .filter(|loop_info| loop_info.body.iter().any(|node| node == &header))
+                .map(|loop_info| {
+                    let role = loop_merges.get(&loop_info.header);
+                    (
+                        loop_info.header.as_str(),
+                        role.map(|role| role.merge.as_str()),
+                        role.map(|role| role.continue_target.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[spi-why]   nested-loop-terminal-decline header={} arms={:?} roles={:?}",
+                header, arms, roles,
+            );
+        }
+    }
+}
+
+/// Re-run terminal convergence after construct-tree edge splits have exposed an enclosing
+/// continuation that was not provable in the source CFG.
+///
+/// Direct terminal-guard composition deliberately works innermost-first. Once those guards own
+/// private returns, an outer header can become the ordinary `H -> { nested-guard, continuation }`
+/// shape whose live paths all reach `continuation`. The initial selection analysis cannot see that
+/// ownership yet. Reuse the same terminal-convergence proof late, but accept only a merge that is
+/// header-dominated and not already owned by a selection or loop role. Anything ambiguous remains
+/// absent and therefore falls back rather than weakening structured-CFG ownership. A header that
+/// already had a source-time natural merge is also excluded: failure to synthesize that merge is a
+/// collision-repair problem, not evidence that it became a terminal selection.
+pub(in crate::native) fn complete_construct_tree_terminal_convergences(
+    blocks: &[BodyBlock],
+    loop_merges: &HashMap<String, LoopMergeInfo>,
+    forced_terminal_merges: &HashMap<String, String>,
+    source_selection_merges: &HashMap<String, String>,
+    header_merges: &mut HashMap<String, String>,
+) -> bool {
+    let forest = analyze(blocks);
+    let mut proposed = header_merges.clone();
+    refine_nested_terminal_selection_merges(
+        blocks,
+        &forest,
+        loop_merges,
+        forced_terminal_merges,
+        &mut proposed,
+    );
+
+    let loop_roles = loop_role_targets_with_passthroughs(blocks, loop_merges);
+    let mut claimed = header_merges.values().cloned().collect::<HashSet<_>>();
+    let mut additions = proposed
+        .into_iter()
+        .filter(|(header, _)| {
+            !header_merges.contains_key(header) && !source_selection_merges.contains_key(header)
+        })
+        .collect::<Vec<_>>();
+    additions.sort();
+
+    let mut changed = false;
+    for (header, merge) in additions {
+        if loop_roles.contains(&merge)
+            || claimed.contains(&merge)
+            || !forest.dominates(&header, &merge)
+        {
+            if crate::env_vars::spi_why() {
+                eprintln!(
+                    "[spi-why]   late-terminal-convergence-decline header={} merge={} loop-role={} claimed={} dominated={}",
+                    header,
+                    merge,
+                    loop_roles.contains(&merge),
+                    claimed.contains(&merge),
+                    forest.dominates(&header, &merge),
+                );
+            }
+            continue;
+        }
+        if crate::env_vars::spi_why() {
+            eprintln!(
+                "[spi-why]   late-terminal-convergence header={} merge={}",
+                header, merge,
+            );
+        }
+        claimed.insert(merge.clone());
+        header_merges.insert(header, merge);
+        changed = true;
+    }
+    changed
+}
+
+#[allow(clippy::too_many_arguments)]
+fn loop_entry_arm_reaches_merge_or_structured_exit(
+    blocks: &[BodyBlock],
+    by_name: &HashMap<&str, &BodyBlock>,
+    loop_body: &HashSet<&str>,
+    loop_info: &super::loopforest::NaturalLoop,
+    info: &LoopMergeInfo,
+    start: &str,
+    candidate: &str,
+) -> bool {
+    let mut reached = false;
+    let direct_structured_exit = start == loop_info.header
+        || start == info.merge
+        || start == info.continue_target
+        || block_ends_in_void_return(blocks, start)
+        || block_ends_in_unreachable(blocks, start);
+    let mut seen = HashSet::new();
+    let mut stack = vec![start.to_string()];
+    while let Some(node) = stack.pop() {
+        if node == candidate {
+            reached = true;
+            continue;
+        }
+        if node == loop_info.header || node == info.merge || node == info.continue_target {
+            continue;
+        }
+        if block_ends_in_void_return(blocks, &node) || block_ends_in_unreachable(blocks, &node) {
+            continue;
+        }
+        if !loop_body.contains(node.as_str()) {
+            return false;
+        }
+        if !seen.insert(node.clone()) {
+            continue;
+        }
+        let Some(block) = by_name.get(node.as_str()) else {
+            return false;
+        };
+        let successors = block_successors(block);
+        if successors.is_empty() {
+            return false;
+        }
+        stack.extend(successors);
+    }
+    // `candidate` is itself the other direct arm, so it is reached by that side of the selection. A
+    // *direct* break/continue/terminal opposite arm is also complete without reaching it. Do not
+    // generalize this to a later exit: an ordinary live subgraph may have a deeper shared convergence
+    // that must win over either direct arm.
+    reached || direct_structured_exit
+}
+
 /// Find a loop-local convergence for one selection whose normal post-dominator is the loop merge.
 /// Every path starting at every arm must either reach the returned block or exit via this loop's
 /// merge/continue/header. A nested loop or any other exit makes the proof fail conservatively.
@@ -114,8 +450,9 @@ pub(in crate::native) fn loop_exit_selection_convergence(
     for (candidate, depth) in candidates {
         // A candidate need not be reached by every arm: an arm that only breaks/continues the
         // enclosing loop is a legal structured exit. Prefer the candidate reached by the MOST arms,
-        // then the deepest one. That chooses the true outer convergence (`latch`) over a one-arm body
-        // block, while still handling `if (c) break; else body` when the body is the only candidate.
+        // then the earliest one. Arm coverage chooses a shared convergence (`latch`) over a one-arm
+        // body block; minimum dominator depth avoids skipping that convergence for a later shared
+        // block, which would make a switch or selection claim more of the loop than it owns.
         let mut valid = true;
         let mut reaching_arms = 0usize;
         for arm in &arms {
@@ -130,6 +467,11 @@ pub(in crate::native) fn loop_exit_selection_convergence(
                 // A loop break, continue, or direct back-edge is a legal structured exit from this
                 // selection. It deliberately does not need to pass through the selection merge.
                 if node == info.merge || node == info.continue_target || node == loop_info.header {
+                    continue;
+                }
+                if block_ends_in_void_return(blocks, &node)
+                    || block_ends_in_unreachable(blocks, &node)
+                {
                     continue;
                 }
                 if !seen.insert(node.clone()) {
@@ -157,12 +499,13 @@ pub(in crate::native) fn loop_exit_selection_convergence(
             reaching_arms += reached as usize;
         }
         if valid && reaching_arms > 0 {
-            let score = (reaching_arms, depth, candidate);
-            if best
-                .as_ref()
-                .is_none_or(|current| score > (current.0, current.1, current.2))
-            {
-                best = Some(score);
+            let replace = best.as_ref().is_none_or(|current| {
+                reaching_arms > current.0
+                    || (reaching_arms == current.0 && depth < current.1)
+                    || (reaching_arms == current.0 && depth == current.1 && candidate < current.2)
+            });
+            if replace {
+                best = Some((reaching_arms, depth, candidate));
             }
         }
     }
@@ -179,7 +522,7 @@ pub(in crate::native) fn synth_unique_selection_merge(
     natural: &str,
     counter: &mut usize,
 ) -> Option<String> {
-    let preds: Vec<String> = blocks
+    let preds: HashSet<String> = blocks
         .iter()
         .filter(|b| {
             b.role != BlockRole::ConstructTreeRoute
@@ -194,8 +537,8 @@ pub(in crate::native) fn synth_unique_selection_merge(
     let new_name = format!("{SPLIT_PREFIX}{SEL_TOKEN}{counter}");
     *counter += 1;
     for b in blocks.iter_mut() {
-        if preds.iter().any(|p| p == &b.name) {
-            if let Some(t) = &mut b.typed {
+        if preds.contains(&b.name) {
+            if let Some(t) = b.typed_mut() {
                 t.redirect_successor(natural, &new_name);
             }
         }
@@ -228,7 +571,7 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
     natural: &str,
     counter: &mut usize,
 ) -> Option<String> {
-    let preds: Vec<String> = blocks
+    let preds = blocks
         .iter()
         .filter(|b| {
             b.role != BlockRole::ConstructTreeRoute
@@ -236,11 +579,60 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
                 && forest.dominates(header, &b.name)
         })
         .map(|b| b.name.clone())
-        .collect();
-    if preds.is_empty() {
+        .collect::<Vec<_>>();
+    synth_unique_selection_merge_phi_explicit(blocks, &preds, natural, &HashSet::new(), counter)
+}
+
+/// Phi-aware unique-merge synthesis over an explicit set of owned predecessors.
+///
+/// A construct-tree gateway can sit between an owned predecessor and the shared natural merge. In
+/// that case redirect the owned predecessor around the gateway and copy the gateway's phi value onto
+/// the new predecessor edge. If outside control still enters the gateway, its original natural-phi
+/// incoming remains; otherwise the private merge replaces it completely.
+pub(in crate::native) fn synth_unique_selection_merge_phi_explicit(
+    blocks: &mut Vec<BodyBlock>,
+    preds: &[String],
+    natural: &str,
+    routes_into_natural: &HashSet<String>,
+    counter: &mut usize,
+) -> Option<String> {
+    let pred_set = preds.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut redirects = Vec::<(String, String)>::new();
+    for block in blocks.iter() {
+        if !pred_set.contains(block.name.as_str()) {
+            continue;
+        }
+        for target in block_successors(block) {
+            if target == natural || routes_into_natural.contains(&target) {
+                redirects.push((block.name.clone(), target));
+            }
+        }
+    }
+    if redirects.is_empty() {
         return None;
     }
-    let is_redirected = |pred: &str| preds.iter().any(|p| p == pred);
+
+    let direct_preds = redirects
+        .iter()
+        .filter(|(_, target)| target == natural)
+        .map(|(pred, _)| pred.as_str())
+        .collect::<HashSet<_>>();
+    let route_preds = redirects
+        .iter()
+        .filter(|(_, target)| target != natural)
+        .fold(
+            HashMap::<&str, Vec<&str>>::new(),
+            |mut map, (pred, route)| {
+                map.entry(route.as_str()).or_default().push(pred.as_str());
+                map
+            },
+        );
+    let route_has_unredirected_predecessor = |route: &str| {
+        blocks.iter().any(|block| {
+            !pred_set.contains(block.name.as_str())
+                && block_successors(block).iter().any(|target| target == route)
+        })
+    };
 
     let new_name = format!("{SPLIT_PREFIX}{SEL_TOKEN}{counter}");
     *counter += 1;
@@ -264,8 +656,26 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
             else {
                 continue;
             };
-            let (typed_red, mut kept_plus): (Vec<_>, Vec<_>) =
-                inc.into_iter().partition(|(_, pred)| is_redirected(pred));
+            let mut typed_red = Vec::new();
+            let mut kept_plus = Vec::new();
+            for (value, predecessor) in inc {
+                if direct_preds.contains(predecessor.as_str()) {
+                    typed_red.push((value, predecessor));
+                    continue;
+                }
+                if let Some(owned_preds) = route_preds.get(predecessor.as_str()) {
+                    typed_red.extend(
+                        owned_preds
+                            .iter()
+                            .map(|owned| (value.clone(), (*owned).to_string())),
+                    );
+                    if route_has_unredirected_predecessor(&predecessor) {
+                        kept_plus.push((value, predecessor));
+                    }
+                    continue;
+                }
+                kept_plus.push((value, predecessor));
+            }
             if typed_red.is_empty() {
                 continue;
             }
@@ -278,17 +688,15 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
             nat_rewrites.push((dst, kept_plus));
         }
     }
-    if let Some(t) = &mut blocks[nat_idx].typed {
+    if let Some(t) = blocks[nat_idx].typed_mut() {
         for (dst, kept_plus) in &nat_rewrites {
             t.set_phi_incomings(dst, kept_plus);
         }
     }
 
-    for b in blocks.iter_mut() {
-        if preds.iter().any(|p| p == &b.name) {
-            if let Some(t) = &mut b.typed {
-                t.redirect_successor(natural, &new_name);
-            }
+    for (predecessor, old_target) in &redirects {
+        if let Some(block) = blocks.iter_mut().find(|block| block.name == *predecessor) {
+            block.typed_mut()?.redirect_successor(old_target, &new_name);
         }
     }
 
@@ -312,7 +720,7 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
         BodyBlock {
             name: new_name.clone(),
             role: role_for_name(&new_name),
-            typed: Some(blk),
+            typed: Some(blk.into()),
         },
     );
 
@@ -390,7 +798,7 @@ pub(in crate::native) fn split_no_phi_overlap(
     // Redirect each in-body predecessor's terminator from `exit` to the new block.
     for b in blocks.iter_mut() {
         if preds.iter().any(|p| p == &b.name) {
-            if let Some(t) = &mut b.typed {
+            if let Some(t) = b.typed_mut() {
                 t.redirect_successor(exit, &new_name);
             }
         }
@@ -440,13 +848,13 @@ pub(in crate::native) fn synth_dowhile_continue(
 
     // Redirect the latch's back-edge arm (-> header) to the new continue block.
     if let Some(lb) = blocks.iter_mut().find(|b| b.name == latch) {
-        if let Some(t) = &mut lb.typed {
+        if let Some(t) = lb.typed_mut() {
             t.redirect_successor(header, &cont);
         }
     }
     // Rewrite the header's phi incomings: the back-edge predecessor is now C, not the latch.
     if let Some(hb) = blocks.iter_mut().find(|b| b.name == header) {
-        if let Some(t) = &mut hb.typed {
+        if let Some(t) = hb.typed_mut() {
             t.rewrite_phi_predecessor(latch, &cont);
         }
     }
@@ -481,6 +889,7 @@ pub(in crate::native) fn split_loop_header_selection(
     header: &str,
     merge: &str,
     continue_target: &str,
+    loop_body: &HashSet<String>,
     counter: &mut usize,
 ) -> Option<String> {
     let (t, f) = {
@@ -490,7 +899,11 @@ pub(in crate::native) fn split_loop_header_selection(
     // Only a genuine in-loop selection: neither arm is the loop's merge/continue, and neither is the
     // header itself (a self-back-edge latch — that is the do-while rotation's job, not a selection).
     let roles = [merge, continue_target, header];
-    if roles.contains(&t.as_str()) || roles.contains(&f.as_str()) {
+    if roles.contains(&t.as_str())
+        || roles.contains(&f.as_str())
+        || !loop_body.contains(&t)
+        || !loop_body.contains(&f)
+    {
         return None;
     }
 
@@ -502,7 +915,7 @@ pub(in crate::native) fn split_loop_header_selection(
     let sel_carrier = {
         let hb = blocks.iter_mut().find(|b| b.name == header)?;
         let sel_carrier = hb.typed.as_ref()?.terminator_only_block(&sel);
-        if let Some(t) = &mut hb.typed {
+        if let Some(t) = hb.typed_mut() {
             t.set_unconditional_branch(&sel);
         }
         sel_carrier
@@ -510,7 +923,7 @@ pub(in crate::native) fn split_loop_header_selection(
     // Phi incomings in the arms that named the header as their predecessor now flow through `sel`.
     for arm in [&t, &f] {
         if let Some(ab) = blocks.iter_mut().find(|b| &b.name == arm) {
-            if let Some(t) = &mut ab.typed {
+            if let Some(t) = ab.typed_mut() {
                 t.rewrite_phi_predecessor(header, &sel);
             }
         }
@@ -526,7 +939,7 @@ pub(in crate::native) fn split_loop_header_selection(
         BodyBlock {
             name: sel.clone(),
             role: role_for_name(&sel),
-            typed: Some(sel_carrier),
+            typed: Some(sel_carrier.into()),
         },
     );
     Some(sel)
@@ -547,6 +960,7 @@ pub(in crate::native) fn split_loop_header_switch(
     header: &str,
     merge: &str,
     continue_target: &str,
+    loop_body: &HashSet<String>,
     counter: &mut usize,
 ) -> Option<String> {
     let targets = {
@@ -559,7 +973,10 @@ pub(in crate::native) fn split_loop_header_switch(
     };
     // Only a genuine in-loop switch: no case/default target is the loop's merge/continue/header.
     let roles = [merge, continue_target, header];
-    if targets.iter().any(|t| roles.contains(&t.as_str())) {
+    if targets
+        .iter()
+        .any(|t| roles.contains(&t.as_str()) || !loop_body.contains(t))
+    {
         return None;
     }
 
@@ -571,7 +988,7 @@ pub(in crate::native) fn split_loop_header_switch(
     let sel_carrier = {
         let hb = blocks.iter_mut().find(|b| b.name == header)?;
         let sel_carrier = hb.typed.as_ref()?.terminator_only_block(&sel);
-        if let Some(t) = &mut hb.typed {
+        if let Some(t) = hb.typed_mut() {
             t.set_unconditional_branch(&sel);
         }
         sel_carrier
@@ -579,7 +996,7 @@ pub(in crate::native) fn split_loop_header_switch(
     // Phi incomings in the switch targets that named the header as their predecessor flow through `sel`.
     for arm in &targets {
         if let Some(ab) = blocks.iter_mut().find(|b| &b.name == arm) {
-            if let Some(t) = &mut ab.typed {
+            if let Some(t) = ab.typed_mut() {
                 t.rewrite_phi_predecessor(header, &sel);
             }
         }
@@ -594,7 +1011,7 @@ pub(in crate::native) fn split_loop_header_switch(
         BodyBlock {
             name: sel.clone(),
             role: role_for_name(&sel),
-            typed: Some(sel_carrier),
+            typed: Some(sel_carrier.into()),
         },
     );
     Some(sel)
@@ -706,6 +1123,26 @@ pub(in crate::native) fn bare_loop_exit_branch_with_passthroughs(
     false
 }
 
+/// Final-CFG counterpart of [`bare_loop_exit_branch`]. Late construct-tree synthesis can replace a
+/// loop header and thereby stale the header-keyed `LoopMergeInfo` map, while natural-loop analysis
+/// still proves the branch shape directly: one arm stays in the loop and the other is an actual loop
+/// exit. Such a conditional is a structured bare break and must not acquire an `OpSelectionMerge`.
+pub(in crate::native) fn bare_natural_loop_exit_branch(
+    forest: &LoopForest,
+    block: &str,
+    true_target: &str,
+    false_target: &str,
+) -> bool {
+    forest.loops.iter().any(|loop_| {
+        loop_.header != block
+            && loop_.body.iter().any(|name| name == block)
+            && ((loop_.body.iter().any(|name| name == true_target)
+                && loop_.exits.iter().any(|name| name == false_target))
+                || (loop_.body.iter().any(|name| name == false_target)
+                    && loop_.exits.iter().any(|name| name == true_target)))
+    })
+}
+
 /// Return the first target outside `b`'s dominated region that is still inside an enclosing
 /// construct-tree selection region. The caller uses this as a continuation split point: the nested
 /// branch remains a structured selection by merging at a private pass-through before that shared
@@ -753,7 +1190,8 @@ fn first_enclosing_selection_region_exit(
 ) -> Option<String> {
     let by_name = blocks
         .iter()
-        .map(|block| (block.name.as_str(), block))
+        .enumerate()
+        .map(|(index, block)| (block.name.clone(), index))
         .collect::<HashMap<_, _>>();
     let mut seen = HashSet::new();
     let mut stack = vec![target.to_string()];
@@ -764,7 +1202,7 @@ fn first_enclosing_selection_region_exit(
         if merge.is_some_and(|merge| node == merge) {
             continue;
         }
-        let Some(block) = by_name.get(node.as_str()) else {
+        let Some(block) = by_name.get(node.as_str()).map(|index| &blocks[*index]) else {
             continue;
         };
         for successor in block_successors(block) {
@@ -777,6 +1215,7 @@ fn first_enclosing_selection_region_exit(
                 blocks,
                 forest,
                 selection_merges,
+                &by_name,
                 b,
                 &successor,
             ) {
@@ -811,36 +1250,95 @@ fn dominated_region_exits(
 /// check on the final header->merge map: if an in-region block escapes to an enclosing selection's
 /// recorded merge/region, split that escape target and make the fresh pass-through this header's
 /// merge. Loop break/continue exits stay untouched.
-pub(in crate::native) fn repair_construct_tree_enclosing_selection_region_escapes(
+pub(in crate::native) fn repair_enclosing_selection_region_escapes(
     blocks: &mut Vec<BodyBlock>,
     loop_merges: &HashMap<String, LoopMergeInfo>,
     header_merges: &mut HashMap<String, String>,
     counter: &mut usize,
-) {
-    for _ in 0..64 {
+) -> bool {
+    let mut any_repaired = false;
+    let mut attempted = HashSet::<(String, String)>::new();
+    loop {
         let forest = analyze(blocks);
+        let by_name = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.name.clone(), index))
+            .collect::<HashMap<_, _>>();
         let mut headers = header_merges
             .iter()
             .filter_map(|(header, merge)| {
-                let block = blocks.iter().find(|block| block.name == *header)?;
+                let block = &blocks[*by_name.get(header.as_str())?];
                 conditional_branch_targets(block)?;
                 Some((header.clone(), merge.clone()))
             })
             .collect::<Vec<_>>();
-        headers.sort_by_key(|(header, _)| std::cmp::Reverse(depth_from_forest(&forest, header)));
+        // The CFG can contain hundreds of nested selection headers. Cache the idom-chain depth once
+        // per header; `sort_by_key` would recompute it for every comparison.
+        headers.sort_by_cached_key(|(header, _)| {
+            std::cmp::Reverse(depth_from_forest(&forest, header))
+        });
 
         let mut repaired = false;
         for (header, merge) in headers {
+            if let Some((true_target, false_target)) =
+                conditional_branch_targets(&blocks[by_name[&header]])
+            {
+                if bare_loop_exit_branch_with_passthroughs(
+                    blocks,
+                    &forest,
+                    loop_merges,
+                    &header,
+                    &true_target,
+                    &false_target,
+                ) {
+                    continue;
+                }
+            }
+            // A conditional natural-loop latch is the loop's own back-edge/exit dispatch, not an
+            // ordinary nested selection. Its non-backedge arm may enter an enclosing selection
+            // merge, but wrapping that edge in a fresh selection merge would make the wrapper an
+            // illegal loop exit (the edge must leave through the loop's declared merge).
+            let header_successors = block_successors(&blocks[by_name[&header]]);
+            if forest.loops.iter().any(|loop_info| {
+                loop_info.latches.iter().any(|latch| latch == &header)
+                    && header_successors
+                        .iter()
+                        .any(|successor| successor == &loop_info.header)
+            }) {
+                continue;
+            }
+            // A fully terminal selection deliberately owns a disconnected unreachable merge: every
+            // real arm exits via return/unreachable, so there is no ordinary reconvergence to repair.
+            // Replacing that marker with one terminal arm would pull the shared return into the
+            // construct and make unrelated return predecessors illegal external entries.
+            if by_name
+                .get(&merge)
+                .map(|index| &blocks[*index])
+                .is_some_and(is_bare_unreachable)
+            {
+                continue;
+            }
             let Some(exit_target) = selection_region_enclosing_escape_target(
                 blocks,
                 &forest,
                 loop_merges,
                 header_merges,
+                &by_name,
                 &header,
                 &merge,
             ) else {
                 continue;
             };
+            if crate::env_vars::spi_why() {
+                eprintln!(
+                    "[spi-why]   final-escape header={} merge={} target={}",
+                    header, merge, exit_target,
+                );
+            }
+            if !attempted.insert((header.clone(), exit_target.clone())) {
+                continue;
+            }
             let synth = if block_has_phi(blocks, &exit_target) {
                 synth_unique_selection_merge_phi(blocks, &forest, &header, &exit_target, counter)
             } else {
@@ -848,6 +1346,7 @@ pub(in crate::native) fn repair_construct_tree_enclosing_selection_region_escape
             };
             if let Some(private_merge) = synth {
                 header_merges.insert(header, private_merge);
+                any_repaired = true;
                 repaired = true;
                 break;
             }
@@ -856,6 +1355,204 @@ pub(in crate::native) fn repair_construct_tree_enclosing_selection_region_escape
             break;
         }
     }
+    any_repaired
+}
+
+/// Replace a terminal marker when one arm actually reaches an enclosing selection merge.
+///
+/// Late return privatization can leave `H -> { terminal, live }` with H still mapped to the private
+/// return while the live arm exits to an enclosing construct's merge. Funnel H-owned incoming edges
+/// to that unique enclosing merge through a private phi-aware merge. Restricting the search to
+/// terminal-marked headers and already-declared enclosing merges avoids the broad whole-plan frontier
+/// churn of the general escape repair.
+pub(in crate::native) fn repair_terminal_selection_live_escapes(
+    blocks: &mut Vec<BodyBlock>,
+    loop_merges: &HashMap<String, LoopMergeInfo>,
+    header_merges: &mut HashMap<String, String>,
+    counter: &mut usize,
+) -> bool {
+    let mut changed = false;
+    let mut attempted = HashSet::<(String, String)>::new();
+    loop {
+        let forest = analyze(blocks);
+        let by_name = blocks
+            .iter()
+            .map(|block| (block.name.as_str(), block))
+            .collect::<HashMap<_, _>>();
+        let reaches_terminal = |start: &str| {
+            let mut current = start.to_string();
+            let mut seen = HashSet::new();
+            while seen.insert(current.clone()) {
+                let Some(block) = by_name.get(current.as_str()) else {
+                    return false;
+                };
+                if is_bare_unreachable(block)
+                    || block.role == BlockRole::TerminalExitReturn
+                        && block_ends_in_void_return(blocks, &current)
+                {
+                    return true;
+                }
+                if block.role != BlockRole::LMerge {
+                    return false;
+                }
+                let successors = block_successors(block);
+                let [successor] = successors.as_slice() else {
+                    return false;
+                };
+                current = successor.clone();
+            }
+            false
+        };
+        let mut headers = header_merges
+            .iter()
+            .filter(|(_, merge)| reaches_terminal(merge))
+            .map(|(header, merge)| {
+                (
+                    header.clone(),
+                    merge.clone(),
+                    depth_from_forest(&forest, header),
+                )
+            })
+            .collect::<Vec<_>>();
+        headers.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
+
+        let mut repaired = false;
+        for (header, current_merge, _) in headers {
+            let enclosing_merges = header_merges
+                .iter()
+                .filter(|(owner, merge)| {
+                    owner.as_str() != header
+                        && merge.as_str() != current_merge
+                        && forest.dominates(owner, &header)
+                })
+                .map(|(_, merge)| merge.clone())
+                .collect::<HashSet<_>>();
+            if enclosing_merges.is_empty() {
+                continue;
+            }
+            let mut exits = HashSet::new();
+            for block in blocks
+                .iter()
+                .filter(|block| forest.dominates(&header, &block.name))
+            {
+                for successor in block_successors(block) {
+                    if successor != current_merge
+                        && !forest.dominates(&header, &successor)
+                        && enclosing_merges.contains(&successor)
+                        && !legal_enclosing_loop_exit(&forest, loop_merges, &block.name, &successor)
+                    {
+                        exits.insert(successor);
+                    }
+                }
+            }
+            if exits.len() != 1 {
+                continue;
+            }
+            let exit_target = exits.into_iter().next().expect("one exit was checked");
+            if !attempted.insert((header.clone(), exit_target.clone())) {
+                continue;
+            }
+            let private = if block_has_phi(blocks, &exit_target) {
+                synth_unique_selection_merge_phi(blocks, &forest, &header, &exit_target, counter)
+            } else {
+                synth_unique_selection_merge(blocks, &forest, &header, &exit_target, counter)
+            };
+            if let Some(private) = private {
+                if crate::env_vars::spi_why() {
+                    eprintln!(
+                        "[spi-why]   terminal-live-refunnel header={} old_merge={} target={} merge={}",
+                        header, current_merge, exit_target, private,
+                    );
+                }
+                header_merges.insert(header, private);
+                changed = true;
+                repaired = true;
+                break;
+            }
+        }
+        if !repaired {
+            break;
+        }
+    }
+    changed
+}
+
+/// Remove a selection assignment from a conditional that owns no region of its own and only routes
+/// between exits of an enclosing selection.
+///
+/// Unique-merge synthesis can leave `H -> { shared, M -> outer-merge }`, where `shared` is entered by
+/// an enclosing sibling and `M` is H's phi-carrying private pass-through. Declaring `M` as H's merge
+/// makes the `shared` arm illegally escape H's construct. The conditional is instead a bare routing
+/// branch inside the enclosing construct: both arms leave H immediately, while `M` remains in place to
+/// preserve its edge phis. This is the selection analogue of a bare loop break/continue branch.
+pub(in crate::native) fn drop_pure_enclosing_selection_routes(
+    blocks: &[BodyBlock],
+    header_merges: &mut HashMap<String, String>,
+) -> bool {
+    let forest = analyze(blocks);
+    let by_name = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.clone(), index))
+        .collect::<HashMap<_, _>>();
+    let mut headers = header_merges
+        .iter()
+        .filter_map(|(header, merge)| {
+            let block = &blocks[*by_name.get(header)?];
+            conditional_branch_targets(block)?;
+            Some((
+                header.clone(),
+                merge.clone(),
+                depth_from_forest(&forest, header),
+            ))
+        })
+        .collect::<Vec<_>>();
+    headers.sort_by(|left, right| right.2.cmp(&left.2).then(left.0.cmp(&right.0)));
+
+    let mut removed = false;
+    for (header, merge, _) in headers {
+        let Some(block) = by_name.get(&header).map(|index| &blocks[*index]) else {
+            continue;
+        };
+        let Some((left, right)) = conditional_branch_targets(block) else {
+            continue;
+        };
+        let other = match (left == merge, right == merge) {
+            (true, false) => right,
+            (false, true) => left,
+            _ => continue,
+        };
+        let Some(merge_block) = by_name.get(&merge).map(|index| &blocks[*index]) else {
+            continue;
+        };
+        let merge_successors = block_successors(merge_block);
+        let [merge_successor] = merge_successors.as_slice() else {
+            continue;
+        };
+        let merge_routes_out = !forest.dominates(&header, merge_successor)
+            && exits_to_enclosing_selection_region(
+                blocks,
+                &forest,
+                header_merges,
+                &by_name,
+                &header,
+                merge_successor,
+            );
+        let other_routes_out = !forest.dominates(&header, &other)
+            && exits_to_enclosing_selection_region(
+                blocks,
+                &forest,
+                header_merges,
+                &by_name,
+                &header,
+                &other,
+            );
+        if merge_routes_out && other_routes_out {
+            header_merges.remove(&header);
+            removed = true;
+        }
+    }
+    removed
 }
 
 fn selection_region_enclosing_escape_target(
@@ -863,14 +1560,11 @@ fn selection_region_enclosing_escape_target(
     forest: &LoopForest,
     loop_merges: &HashMap<String, LoopMergeInfo>,
     header_merges: &HashMap<String, String>,
+    by_name: &HashMap<String, usize>,
     header: &str,
     merge: &str,
 ) -> Option<String> {
-    let by_name = blocks
-        .iter()
-        .map(|block| (block.name.as_str(), block))
-        .collect::<HashMap<_, _>>();
-    let header_block = by_name.get(header)?;
+    let header_block = &blocks[*by_name.get(header)?];
     let mut seen = HashSet::new();
     let mut stack = block_successors(header_block)
         .into_iter()
@@ -881,7 +1575,7 @@ fn selection_region_enclosing_escape_target(
         if node == merge || !seen.insert(node.clone()) {
             continue;
         }
-        let Some(block) = by_name.get(node.as_str()) else {
+        let Some(block) = by_name.get(node.as_str()).map(|index| &blocks[*index]) else {
             continue;
         };
         if !forest.dominates(header, &node) {
@@ -898,8 +1592,14 @@ fn selection_region_enclosing_escape_target(
                 stack.push(successor);
                 continue;
             }
-            if exits_to_enclosing_selection_region(blocks, forest, header_merges, &node, &successor)
-            {
+            if exits_to_enclosing_selection_region(
+                blocks,
+                forest,
+                header_merges,
+                by_name,
+                &node,
+                &successor,
+            ) {
                 if exit_target
                     .as_ref()
                     .is_some_and(|target: &String| target != &successor)
@@ -952,11 +1652,12 @@ pub(in crate::native) fn bare_enclosing_selection_region_escape(
     }
     let by_name = blocks
         .iter()
-        .map(|block| (block.name.as_str(), block))
+        .enumerate()
+        .map(|(index, block)| (block.name.clone(), index))
         .collect::<HashMap<_, _>>();
     let mut current = Some(source);
     while let Some(candidate) = current {
-        if let Some(block) = by_name.get(candidate) {
+        if let Some(block) = by_name.get(candidate).map(|index| &blocks[*index]) {
             if !selection_merges.contains_key(candidate)
                 && conditional_branch_targets(block).is_some()
                 && !dominated_region_exits(blocks, forest, candidate, None).is_empty()
@@ -966,6 +1667,7 @@ pub(in crate::native) fn bare_enclosing_selection_region_escape(
                     blocks,
                     forest,
                     selection_merges,
+                    &by_name,
                     candidate,
                     target,
                 )
@@ -982,17 +1684,14 @@ fn exits_to_enclosing_selection_region(
     blocks: &[BodyBlock],
     forest: &LoopForest,
     selection_merges: &HashMap<String, String>,
+    by_name: &HashMap<String, usize>,
     b: &str,
     target: &str,
 ) -> bool {
-    let by_name = blocks
-        .iter()
-        .map(|block| (block.name.as_str(), block))
-        .collect::<HashMap<_, _>>();
     let mut current = b;
     while let Some(parent) = forest.idom(current) {
         if let Some(merge) = selection_merges.get(parent) {
-            if let Some(header) = by_name.get(parent) {
+            if let Some(header) = by_name.get(parent).map(|index| &blocks[*index]) {
                 if let Some((left, right)) = conditional_branch_targets(header) {
                     let in_left = forest.dominates(&left, b);
                     let in_right = forest.dominates(&right, b);

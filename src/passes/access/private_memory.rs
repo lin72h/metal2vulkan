@@ -126,6 +126,83 @@ pub(in crate::passes) fn neutralize_private_placeholder_access_chains(
         })
         .collect();
 
+    // Discover the complete placeholder-derived pointer component before rewriting it. In
+    // particular, a loop phi is visited before its backedge access chain in serialized block order;
+    // a one-pass walk therefore misses exactly the illegal `Private` pointer phi that joins two
+    // otherwise-neutralized arms. Copies preserve placeholder identity, while a select/phi is a
+    // placeholder only when every pointer arm is one. Use a dependency worklist so each edge is
+    // visited once instead of repeatedly walking a very large module to reach the same fixed point.
+    let mut dependencies = Vec::<(Word, Vec<Word>)>::new();
+    for inst in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+    {
+        let (Some(result_type), Some(result)) = (inst.result_type, inst.result_id) else {
+            continue;
+        };
+        if private_pointer_pointee(ctx, result_type).is_none() {
+            continue;
+        }
+        let deps = match inst.class.opcode {
+            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain | Op::CopyObject => {
+                inst.operands.first().and_then(|operand| match operand {
+                    Operand::IdRef(base) => Some(vec![*base]),
+                    _ => None,
+                })
+            }
+            Op::Select => match inst.operands.as_slice() {
+                [_, Operand::IdRef(on_true), Operand::IdRef(on_false), ..] => {
+                    Some(vec![*on_true, *on_false])
+                }
+                _ => None,
+            },
+            Op::Phi if !inst.operands.is_empty() && inst.operands.len().is_multiple_of(2) => inst
+                .operands
+                .chunks_exact(2)
+                .map(|pair| match pair.first() {
+                    Some(Operand::IdRef(value)) => Some(*value),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>(),
+            _ => None,
+        };
+        if let Some(mut deps) = deps {
+            deps.sort_unstable();
+            deps.dedup();
+            dependencies.push((result, deps));
+        }
+    }
+    let mut waiting = HashMap::<Word, Vec<usize>>::new();
+    let mut remaining = Vec::with_capacity(dependencies.len());
+    let mut ready = Vec::new();
+    for (candidate, (result, deps)) in dependencies.iter().enumerate() {
+        let mut missing = 0usize;
+        for dependency in deps {
+            if !roots.contains(dependency) {
+                missing += 1;
+                waiting.entry(*dependency).or_default().push(candidate);
+            }
+        }
+        remaining.push(missing);
+        if missing == 0 {
+            ready.push(*result);
+        }
+    }
+    while let Some(root) = ready.pop() {
+        if !roots.insert(root) {
+            continue;
+        }
+        if let Some(dependents) = waiting.remove(&root) {
+            for candidate in dependents {
+                remaining[candidate] -= 1;
+                if remaining[candidate] == 0 {
+                    ready.push(dependencies[candidate].0);
+                }
+            }
+        }
+    }
+
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
         let insts = ctx.module.functions[entry_idx].blocks[bi]
@@ -133,22 +210,30 @@ pub(in crate::passes) fn neutralize_private_placeholder_access_chains(
             .clone();
         let mut out = Vec::with_capacity(insts.len());
         for inst in insts {
-            if matches!(
-                inst.class.opcode,
-                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst
-                .operands
-                .first()
-                .and_then(|operand| match operand {
-                    Operand::IdRef(base) => Some(roots.contains(base)),
-                    _ => None,
-                })
-                .unwrap_or(false)
-            {
+            let neutralize = match inst.class.opcode {
+                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
+                    matches!(inst.operands.first(), Some(Operand::IdRef(base)) if roots.contains(base))
+                }
+                Op::Select => {
+                    matches!(
+                        inst.operands.as_slice(),
+                        [_, Operand::IdRef(on_true), Operand::IdRef(on_false), ..]
+                            if roots.contains(on_true) && roots.contains(on_false)
+                    )
+                }
+                Op::Phi => {
+                    !inst.operands.is_empty()
+                        && inst.operands.len().is_multiple_of(2)
+                        && inst.operands.chunks_exact(2).all(|pair| {
+                            matches!(pair.first(), Some(Operand::IdRef(value)) if roots.contains(value))
+                        })
+                }
+                _ => false,
+            };
+            if neutralize {
                 if let (Some(result_type), Some(result)) = (inst.result_type, inst.result_id) {
                     if private_pointer_pointee(ctx, result_type).is_some() {
                         let placeholder = private_zero_pointer_for_type(ctx, result_type)?;
-                        roots.insert(result);
                         out.push(Instruction::new(
                             Op::CopyObject,
                             Some(result_type),
@@ -345,8 +430,10 @@ pub(in crate::passes) fn is_function_variable(inst: &Instruction) -> bool {
 /// Lower every OpFunctionCall to a residual AIR/LLVM helper inside the entry function into native ops /
 /// GLSL.std.450 ext-insts / image samples / derivatives. Unknown residual calls are a hard error
 /// (caller falls back).
-/// Replace any width-preserving `OpUConvert`/`OpSConvert`/`OpFConvert` in the entry with `OpCopyObject`
-/// — these are illegal in SPIR-V (the converts REQUIRE differing bit widths). They arise when our
+/// Replace any width-preserving `OpUConvert`/`OpSConvert`/`OpFConvert` in the entry with a legal
+/// identity operation — these are illegal in SPIR-V (the converts REQUIRE differing bit widths). An
+/// exactly matching type uses `OpCopyObject`; equal-width/equal-lane signedness changes use
+/// `OpBitcast`, because `OpCopyObject` requires identical types. They arise when our
 /// interface pass binds a narrower AIR param (`ushort` `[[vertex_id]]`, an `i16` index) to the 32-bit
 /// Vulkan builtin: the body's original `zext i16 -> i32` then compiles to a same-width `OpUConvert
 /// %uint %uint`. A no-op copy is the semantically-correct result. General (a true convert keeps its op).
@@ -357,7 +444,7 @@ pub(in crate::passes) fn fix_noop_width_converts(ctx: &mut Ctx, entry_idx: usize
             .instructions
             .len();
         for ii in 0..n_insts {
-            let (op, rty, src) = {
+            let (rty, src) = {
                 let inst = &ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
                 if !matches!(
                     inst.class.opcode,
@@ -371,20 +458,37 @@ pub(in crate::passes) fn fix_noop_width_converts(ctx: &mut Ctx, entry_idx: usize
                 let Some(Operand::IdRef(src)) = inst.operands.first() else {
                     continue;
                 };
-                (inst.class.opcode, rty, *src)
+                (rty, *src)
             };
             let Some(src_ty) = value_result_type(ctx, src) else {
                 continue;
             };
-            if src_ty == rty || scalar_bit_width(ctx, src_ty) == scalar_bit_width(ctx, rty) {
-                // Same width (or identical type) -> the convert is a no-op; make it an OpCopyObject.
-                let _ = op;
+            let replacement = if src_ty == rty {
+                Some(Op::CopyObject)
+            } else if scalar_bit_width(ctx, src_ty) == scalar_bit_width(ctx, rty)
+                && type_lane_count(ctx, src_ty) == type_lane_count(ctx, rty)
+            {
+                Some(Op::Bitcast)
+            } else {
+                None
+            };
+            if let Some(replacement) = replacement {
                 let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
                 let res = inst.result_id;
-                *inst = Instruction::new(Op::CopyObject, Some(rty), res, vec![Operand::IdRef(src)]);
+                *inst = Instruction::new(replacement, Some(rty), res, vec![Operand::IdRef(src)]);
             }
         }
     }
+}
+
+fn type_lane_count(ctx: &Ctx, ty: Word) -> u32 {
+    type_def_of(ctx, ty)
+        .filter(|definition| definition.class.opcode == Op::TypeVector)
+        .and_then(|definition| match definition.operands.get(1) {
+            Some(Operand::LiteralBit32(lanes)) => Some(*lanes),
+            _ => None,
+        })
+        .unwrap_or(1)
 }
 
 /// Integer division/remainder by zero is undefined in SPIR-V. Some AIR comes from guarded source

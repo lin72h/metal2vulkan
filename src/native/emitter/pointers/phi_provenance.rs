@@ -457,6 +457,11 @@ impl Emitter {
                 if let Some(id) = self.pointer_nullness.get(name).copied() {
                     return Ok(id);
                 }
+                if self.bda_device_pointers && self.bda_inttoptr_sources.contains_key(name) {
+                    let id = self.result_id(&pointer_null_name(name), &LlType::Bool)?;
+                    self.pointer_nullness.insert(name.clone(), id);
+                    return Ok(id);
+                }
                 if !self.values.contains_key(name) && self.pointer_phi_values.contains(name) {
                     let id = self.result_id(&pointer_null_name(name), &LlType::Bool)?;
                     self.pointer_nullness.insert(name.clone(), id);

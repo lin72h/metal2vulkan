@@ -30,6 +30,7 @@ fn collect_locals(v: &LlValue, out: &mut Vec<String>) {
                 collect_locals(&idx.value, out);
             }
         }
+        LlValue::IntToPtr { source, .. } => collect_locals(&source.value, out),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)

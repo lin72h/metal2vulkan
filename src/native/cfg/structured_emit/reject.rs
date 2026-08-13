@@ -110,7 +110,17 @@ pub(in crate::native) fn plan_self_check_reason(
         // reaches it directly without passing through this header — the header does not dominate it and
         // the selection/switch "exits the selection ... but not via a structured exit" (banked
         // `e848bc87`/`72cbab44`). The repair path re-nests these; reject and fall back.
-        if !plan_forest.dominates(&b.name, m) {
+        let unreachable_terminal_merge = ordered
+            .iter()
+            .find(|block| block.name == *m)
+            .is_some_and(|block| block.role == BlockRole::LMerge && is_bare_unreachable(block));
+        if !plan_forest.dominates(&b.name, m) && !unreachable_terminal_merge {
+            if crate::env_vars::spi_why() {
+                eprintln!(
+                    "[spi-why]   merge-not-dominated header={} merge={}",
+                    b.name, m,
+                );
+            }
             return Some("selection:merge-not-dominated");
         }
         for a in block_successors(b) {
@@ -140,58 +150,62 @@ pub(in crate::native) fn plan_self_check_reason(
     // rejected. Computed edge-wise via idom walk (O(edges * dom-depth), NOT O(headers * blocks)): for a
     // NON-forward edge B->S, walk B's idom chain; at each selection-header ancestor H whose arm target
     // taken by B is `child`, the OTHER arm target `t1` making `dominates(t1, S)` true is the sibling arm.
-    if ordered.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
-        // header -> its two conditional branch targets. ONLY blocks with an assigned selection merge
-        // (`header_merge`) are real OpSelectionMerge constructs; a conditional without one emits no
-        // merge instruction, so its arms are not structured arms and a cross-arm edge on it is not a
-        // structured-exit violation (matching self-check 2, which also keys on `header_merge`). Loops
-        // and switches are excluded (a break/continue is a legal exit, not a cross-arm jump).
-        let targets: HashMap<&str, (String, String)> = ordered
-            .iter()
-            .filter(|h| !plan_loop_headers.contains(h.name.as_str()))
-            .filter_map(|h| {
-                let m = header_merge.get(&h.name)?;
-                let (t0, t1) = conditional_branch_targets(h)?;
-                // Skip an if with an EMPTY arm (an arm target == the merge): the only exits are the real
-                // arm and the merge, so there is no sibling arm to cross into and a branch to the merge
-                // is a legal exit, not a cross-arm jump (matches the O(H*B) `&t == m` skip).
-                if &t0 == m || &t1 == m || t0 == t1 {
-                    return None;
-                }
-                Some((h.name.as_str(), (t0, t1)))
-            })
-            .collect();
-        for b in ordered {
-            for s in block_successors(b) {
-                // Forward edge (S in B's own subtree) is always a legal in-arm edge.
-                if plan_forest.dominates(&b.name, &s) {
-                    continue;
-                }
-                // Walk B's dominator chain; `child` is the arm target of the header `cur` that B entered.
-                let mut child: &str = &b.name;
-                while let Some(cur) = plan_forest.idom(child) {
-                    if let Some((x, y)) = targets.get(cur) {
-                        let sibling = if child == x {
-                            Some(y)
-                        } else if child == y {
-                            Some(x)
-                        } else {
-                            None
-                        };
-                        if let Some(t1) = sibling {
-                            if plan_forest.dominates(t1, &s) {
-                                if crate::env_vars::spi_why() {
-                                    eprintln!(
+    // header -> its two conditional branch targets. ONLY blocks with an assigned selection merge
+    // (`header_merge`) are real OpSelectionMerge constructs; a conditional without one emits no
+    // merge instruction, so its arms are not structured arms and a cross-arm edge on it is not a
+    // structured-exit violation (matching self-check 2, which also keys on `header_merge`). Loops
+    // and switches are excluded (a break/continue is a legal exit, not a cross-arm jump).
+    let targets: HashMap<&str, (String, String)> = ordered
+        .iter()
+        .filter(|h| !plan_loop_headers.contains(h.name.as_str()))
+        .filter_map(|h| {
+            let m = header_merge.get(&h.name)?;
+            let (t0, t1) = conditional_branch_targets(h)?;
+            // Skip an if with an EMPTY arm (an arm target == the merge): the only exits are the real
+            // arm and the merge, so there is no sibling arm to cross into and a branch to the merge
+            // is a legal exit, not a cross-arm jump (matches the O(H*B) `&t == m` skip).
+            if &t0 == m || &t1 == m || t0 == t1 {
+                return None;
+            }
+            Some((h.name.as_str(), (t0, t1)))
+        })
+        .collect();
+    for b in ordered {
+        for s in block_successors(b) {
+            // A function return or unreachable target exits every enclosing selection; it is not a
+            // sibling-arm entry. Fully terminal selections deliberately keep their source returns
+            // and use a private disconnected unreachable merge.
+            if block_ends_in_void_return(ordered, &s) || block_ends_in_unreachable(ordered, &s) {
+                continue;
+            }
+            // Forward edge (S in B's own subtree) is always a legal in-arm edge.
+            if plan_forest.dominates(&b.name, &s) {
+                continue;
+            }
+            // Walk B's dominator chain; `child` is the arm target of the header `cur` that B entered.
+            let mut child: &str = &b.name;
+            while let Some(cur) = plan_forest.idom(child) {
+                if let Some((x, y)) = targets.get(cur) {
+                    let sibling = if child == x {
+                        Some(y)
+                    } else if child == y {
+                        Some(x)
+                    } else {
+                        None
+                    };
+                    if let Some(t1) = sibling {
+                        if plan_forest.dominates(t1, &s) {
+                            if crate::env_vars::spi_why() {
+                                eprintln!(
                                         "[spi-why]   cross-arm-edge header={} sibling={} block={} -> {}",
                                         cur, t1, b.name, s
                                     );
-                                }
-                                return Some("selection:cross-arm-edge");
                             }
+                            return Some("selection:cross-arm-edge");
                         }
                     }
-                    child = cur;
                 }
+                child = cur;
             }
         }
     }
@@ -316,14 +330,24 @@ pub(in crate::native) fn structured_reject_reason(blocks: &[BodyBlock]) -> Optio
         if admits {
             return None;
         }
+    } else if structured_plan_inner5(blocks, true, false, false, false, true).is_some() {
+        return None;
     }
-    if blocks.len() <= TERMINAL_EXIT_SELECTION_MAX_BLOCKS
-        && [(false, false), (true, false), (true, true)]
-            .into_iter()
-            .any(|(converge, break_aware)| {
-                structured_plan_inner6(blocks, converge, break_aware, false, false, false, true)
-                    .is_some()
-            })
+    if [(false, false), (true, false), (true, true)]
+        .into_iter()
+        .any(|(converge, break_aware)| {
+            structured_plan_inner6(blocks, converge, break_aware, false, false, true, true)
+                .is_some()
+        })
+    {
+        return None;
+    }
+    if [(false, false), (true, false), (true, true)]
+        .into_iter()
+        .any(|(converge, break_aware)| {
+            structured_plan_inner6(blocks, converge, break_aware, false, false, false, true)
+                .is_some()
+        })
     {
         return None;
     }
@@ -1254,7 +1278,8 @@ mod tests {
         BodyBlock {
             name: name.to_string(),
             role,
-            typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new()),
+            typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new())
+                .map(Into::into),
         }
     }
 

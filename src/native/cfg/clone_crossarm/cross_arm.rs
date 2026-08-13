@@ -270,6 +270,7 @@ pub(in crate::native) fn privatize_trivial(
     for b in out.iter_mut() {
         if redirect.contains(&b.name) {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.redirect_successor(arm, &arm_clone);
             }
         }
@@ -283,6 +284,7 @@ pub(in crate::native) fn privatize_trivial(
     for b in out.iter_mut() {
         if b.name == arm {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.rebuild_phi_incomings(|p| !redirect.contains(p));
             }
         }
@@ -295,6 +297,7 @@ pub(in crate::native) fn privatize_trivial(
     for b in out.iter_mut() {
         if b.name == s {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.duplicate_phi_incoming(arm, &arm_clone, &rename);
             }
         }
@@ -308,10 +311,10 @@ pub(in crate::native) fn privatize_trivial(
     //    lists every pred. No module named-types needed — the source resolved them.
     let role = role_for_name(&arm_clone);
     let typed = arm_block.typed.as_ref().map(|src| {
-        let mut c = src.clone();
+        let mut c = (**src).clone();
         c.rebuild_phi_incomings(|p| redirect.contains(p));
         c.rename(&rename);
-        c
+        c.into()
     });
     out.push(BodyBlock {
         name: arm_clone,

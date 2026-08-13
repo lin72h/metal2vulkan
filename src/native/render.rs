@@ -44,6 +44,15 @@ pub(in crate::native) fn render_value(value: &LlValue) -> Option<String> {
         LlValue::Bool(false) => "false".to_string(),
         LlValue::Int(v) => v.to_string(),
         LlValue::SignedInt(v) => v.to_string(),
+        LlValue::IntToPtr {
+            source,
+            destination,
+        } => format!(
+            "inttoptr ({} {} to {})",
+            render_type(&source.ty)?,
+            render_value(&source.value)?,
+            render_type(destination)?
+        ),
         LlValue::Hex(_)
         | LlValue::Float(_)
         | LlValue::HalfBits(_)

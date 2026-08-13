@@ -92,7 +92,7 @@ mod tests {
         BodyBlock {
             name,
             role: crate::native::cfg::BlockRole::Normal,
-            typed,
+            typed: typed.map(Into::into),
         }
     }
 
@@ -141,7 +141,11 @@ mod tests {
             find_cross_arm(&blocks),
             Some(("%checkb".to_string(), "%taken".to_string()))
         );
-        let out = clone_cross_arm_shared(&blocks).expect("should apply a clone");
+        // The complete planner now admits the fully-terminal source directly, so exercise the
+        // cross-arm primitive itself rather than its reject-only retry driver.
+        let mut counter = 0;
+        let out = privatize_region(&blocks, "%checkb", "%taken", &mut counter)
+            .expect("should apply a clone");
         // A clone of %taken exists; %checkb now branches to it; original %taken keeps the %entry edge.
         let clone = out
             .iter()
@@ -469,9 +473,8 @@ mod tests {
         );
     }
 
-    /// Return unification: a divergent void selection (`if(c) ret; else ret`) has no natural merge
-    /// until both rets are routed through one exit. The ordinary ladder still rejects it, while the
-    /// explicitly unified graph is directly structurable.
+    /// Return unification remains a valid normalization for a divergent void selection even though
+    /// the planner can now represent two terminal arms with a disconnected unreachable merge.
     #[test]
     fn unify_returns_void_makes_divergent_selection_structurable() {
         let blocks = vec![
@@ -479,10 +482,7 @@ mod tests {
             blk("a", &["ret void"]),
             blk("b", &["ret void"]),
         ];
-        assert!(
-            super::super::structured_emit::structured_plan_ladder(&blocks, false).is_none(),
-            "ordinary ladder must retain the pre-C1 reject proxy"
-        );
+        assert!(super::super::structured_emit::structured_plan_ladder(&blocks, false).is_some());
         let out = unify_returns(&blocks).expect("two rets to unify");
         // Both arms now branch to the same exit.
         let a = out.iter().find(|x| x.name == "%a").unwrap();
@@ -540,10 +540,7 @@ mod tests {
                 &["%rv = phi i32 [ 1, %entry ], [ 2, %a ]", "ret i32 %rv"],
             ),
         ];
-        assert!(
-            super::super::structured_emit::structured_plan_ladder(&blocks, false).is_none(),
-            "ordinary ladder must retain the divergent-exit reject proxy"
-        );
+        assert!(super::super::structured_emit::structured_plan_ladder(&blocks, false).is_some());
         let unified =
             separate_divergent_selection_exits(&blocks).expect("return-like exits must unify");
         let private = privatize_shared_phi_exit_predecessors(&unified);

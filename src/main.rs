@@ -1,5 +1,5 @@
-//! metal2vulkan CLI — host translator used by fixtures, coverage tools, and replay/oracle experiments.
-//! Usage:  metal2vulkan <in.air|.ll> <out.spv> --stage vertex|fragment|passthrough|kernel
+//! metal2vulkan CLI — AIR/LLVM-IR to validated Vulkan SPIR-V.
+//! Usage: metal2vulkan <in.air|.ll> <out.spv> [--stage auto|vertex|fragment|passthrough|kernel]
 //! Prints a line containing `PASS` on success (spirv-val vulkan1.3 clean), nonzero exit + `FALLBACK`
 //! on any failure.
 
@@ -38,13 +38,29 @@ fn main() {
     let mut stage = "auto".to_string();
     let mut emit_meta: Option<String> = None;
     let mut simd_cluster32 = false;
+    let mut raster_sample_count = None;
     let mut pos: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => {
                 println!(
-                    "usage: metal2vulkan <in.air|.ll> <out.spv> [--stage auto|vertex|fragment|passthrough|kernel] [--emit-meta out.json] [--simd-cluster32]  (default stage: auto)\n"
+                    r#"usage: metal2vulkan <in.air|.ll> [out.spv] [options]
+
+If out.spv is omitted, the default is <input-without-extension>.vk.spv.
+
+options:
+  --stage auto|vertex|fragment|passthrough|kernel
+      shader stage (default: auto from AIR metadata; compute aliases kernel)
+  --emit-meta out.json
+      write ShaderReflection JSON (requires the serde feature; not passthrough)
+  --simd-cluster32
+      request 32-lane clustered subgroup reductions
+  --raster-samples 1|2|4|8|16|32|64
+      exact graphics-pipeline sample count for AIR sample-count queries
+  -h, --help
+      show this help
+"#
                 );
                 print!("{}", metal2vulkan::env_vars::help_text());
                 process::exit(0);
@@ -64,7 +80,14 @@ fn main() {
                 simd_cluster32 = true;
                 i += 1;
             }
-            // accept (and ignore) the legacy flags so the harness/contract is a superset.
+            "--raster-samples" => {
+                raster_sample_count = args.get(i + 1).and_then(|value| value.parse().ok());
+                if !matches!(raster_sample_count, Some(1 | 2 | 4 | 8 | 16 | 32 | 64)) {
+                    fail("--raster-samples requires one of 1, 2, 4, 8, 16, 32, or 64");
+                }
+                i += 2;
+            }
+            // Accept and ignore compatibility options used by external harnesses.
             "--entry" | "--local" => {
                 i += 2;
             }
@@ -98,6 +121,7 @@ fn main() {
 
     let options = TransformOptions {
         simd_cluster32,
+        raster_sample_count,
         ..TransformOptions::default()
     };
     let want_meta = emit_meta.is_some();

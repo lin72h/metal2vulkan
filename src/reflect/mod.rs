@@ -7,22 +7,26 @@
 //! that knowledge was DROPPED at the crate boundary: `translate_*` returned bare `Result<Vec<u8>,
 //! String>`, forcing consumers to re-reflect the produced SPIR-V and re-hardcode the ABI bases.
 //!
-//! This module exposes that knowledge as one consumer-shaped [`ShaderReflection`] value, computed as
-//! a distilled facade over the parser-shaped meta structs plus the ABI constants below. The binding
-//! numbers here are the SAME ones the interface pass decorates the module with (all in descriptor
-//! [`RESOURCE_DESCRIPTOR_SET`], via `BASE + metal_index`); this is a pure re-shaping of already-parsed
-//! data and never re-reads the emitted SPIR-V, so it is byte-neutral on the translator.
+//! This module exposes that knowledge as one consumer-shaped [`ShaderReflection`] value. Interface
+//! declarations come from the parser-shaped AIR metadata and the ABI constants below; buffer access
+//! footprints are then derived from the final adopted SPIR-V module. The binding numbers here are the
+//! SAME ones the interface pass decorates (all in descriptor [`RESOURCE_DESCRIPTOR_SET`], via
+//! `BASE + metal_index`). Reflection never mutates the module, so reflected and non-reflected
+//! translation remain byte-identical.
 
 use crate::meta::{
     texture_shape_from_name, AirType, BufferAccess, FragMeta, FragRole, FunctionConstant, KernMeta,
     KernRole, TextureComponent, TextureDimension, TextureShape, VertMeta, VertOutRole, VertRole,
 };
 
+mod footprint;
+
 /// Schema version of [`ShaderReflection`]. Bump on any breaking change to the serialized shape so a
-/// consumer's persisted reflection cache invalidates cleanly rather than
-/// deserializing stale fields. See plan Workstream M3.
+/// consumer's persisted reflection cache invalidates cleanly rather than deserializing stale fields.
 ///
-/// v2 (cleanup-plan Workstream R): the shape grew the consumer-readiness fields — per-binding typed
+/// Notable schema milestones (see `CHANGELOG.md` for release-level history):
+///
+/// v2 added the core consumer-readiness fields — per-binding typed
 /// `texture_shape` (dimension/arrayed/multisampled/component/writable/storage_format) and
 /// `embedded_source`; stage-level `vertex_builtins`, `imageblock_layouts`, `function_constants`, and
 /// the source `datalayout`; plus fragment/vertex buffer `address_space`/`declared_size` population.
@@ -31,7 +35,23 @@ use crate::meta::{
 ///
 /// v4 adds conservative buffer extent classes, all-stage buffer type names / declared sizes, and
 /// declared buffer access (including write-only).
-pub const REFLECTION_VERSION: u32 = 4;
+///
+/// v5 adds the Metal argument-encoder index for embedded argument-buffer textures.
+///
+/// v6 adds descriptor counts and fixed texture-handle array lengths.
+///
+/// v7 exposes kernel stage-input attributes as reflected read-only buffer resources, including both
+/// their AIR attribute location and the shared synthetic Metal/Vulkan buffer slot.
+///
+/// v14 exposes device buffers embedded in AIR argument buffers and their nested Metal resource
+/// index, enabling consumers to encode the Metal handle and populate the Vulkan device address.
+/// v18 preserves each function constant's Metal ABI type encoding so consumers can bind exact
+/// signed scalar/vector values rather than guessing from LLVM's signless integer types.
+///
+/// v21 adds conservative static and invocation-strided buffer access footprints. The footprint is
+/// derived from the final adopted SPIR-V module, so retry-tier selection cannot leave reflection
+/// describing bytes other than those the consumer receives.
+pub const REFLECTION_VERSION: u32 = 21;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
@@ -47,7 +67,28 @@ pub const SAMPLER_BINDING_BASE: u32 = 64;
 /// Descriptor binding base for `[[color(n)]]` framebuffer-fetch inputs (Vulkan input attachments):
 /// binding = `COLOR_INPUT_BINDING_BASE + n`.
 pub const COLOR_INPUT_BINDING_BASE: u32 = 96;
+/// Descriptor binding base for implicit imageblock render-target planes. Each attachment occupies
+/// three storage-image bindings, one for AIR data rates 0 (default), 1 (color), and 2 (sample).
+pub const IMAGEBLOCK_BINDING_BASE: u32 = 128;
+pub const IMAGEBLOCK_DATA_RATE_STRIDE: u32 = 3;
+/// Descriptor binding base for custom fragment `[[imageblock_data]]` master fields. Each master
+/// member occupies one storage-image binding, preserving independent formats and raster-order
+/// groups without conflating custom tile data with color-attachment imageblocks.
+pub const FRAGMENT_IMAGEBLOCK_BINDING_BASE: u32 = 160;
 
+/// Storage-image descriptor used to emulate one implicit imageblock render-target/data-rate plane.
+pub const fn imageblock_resource_binding(attachment: u32, data_rate: u32) -> u32 {
+    IMAGEBLOCK_BINDING_BASE
+        .saturating_add(attachment.saturating_mul(IMAGEBLOCK_DATA_RATE_STRIDE))
+        .saturating_add(data_rate)
+}
+
+pub const fn fragment_imageblock_resource_binding(master_member: u32) -> u32 {
+    FRAGMENT_IMAGEBLOCK_BINDING_BASE.saturating_add(master_member)
+}
+
+/// AIR address space 1 = device memory (`device`) — a descriptor-backed storage buffer.
+pub const ADDRESS_SPACE_DEVICE: u32 = 1;
 /// AIR address space 2 = constant memory (`constant` / `const device`) — a read-only buffer.
 pub const ADDRESS_SPACE_CONSTANT: u32 = 2;
 /// AIR address space 3 = threadgroup memory. A `[[buffer(n)]]` in this space becomes a Workgroup
@@ -59,6 +100,7 @@ pub const ADDRESS_SPACE_THREADGROUP: u32 = 3;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ShaderStage {
     Vertex,
+    TessellationEvaluation,
     Fragment,
     Kernel,
 }
@@ -81,12 +123,16 @@ pub enum ResourceKind {
     Buffer,
     /// A `[[buffer(n)]]` in threadgroup address space — a Workgroup variable, no descriptor.
     ThreadgroupBuffer,
+    /// A kernel `[[stage_in]]` attribute array. `metal_index` is the synthetic Metal buffer slot,
+    /// and `stage_input_location` is its AIR attribute location.
+    KernelStageInput,
     /// A `[[texture(n)]]` sampled image. Bound at `TEXTURE_BINDING_BASE + n`.
     Texture,
     /// A runtime-indexed texture descriptor array. Bound at `TEXTURE_BINDING_BASE + n`.
     /// See `ResourceBinding::access` to distinguish sampled from storage arrays.
     TextureArray,
-    /// A write-only storage image (`texture` with `access::write`). Bound at `TEXTURE_BINDING_BASE + n`.
+    /// A write-capable storage image (`texture` with `access::write` or `access::read_write`). Bound
+    /// at `TEXTURE_BINDING_BASE + n`.
     StorageImage,
     /// A `[[sampler(n)]]`. Bound at `SAMPLER_BINDING_BASE + n`.
     Sampler,
@@ -99,9 +145,23 @@ pub enum ResourceKind {
     /// A host-populated StorageBuffer shadow of an opaque acceleration structure. Bound at the
     /// resource's Metal buffer index.
     AccelerationStructureShadow,
+    /// An authored primitive acceleration structure. Metal binds the native object. Its descriptor
+    /// is present only when Vulkan intersection lowering consumes the triangle-geometry shadow.
+    PrimitiveAccelerationStructure,
+    /// An authored Metal visible-function table resolved during dependency linking. It consumes no
+    /// Vulkan descriptor after indirect calls are specialized to linked functions.
+    VisibleFunctionTable,
+    /// An authored Metal intersection-function table resolved during dependency linking.
+    IntersectionFunctionTable,
     /// A texture embedded inside an `air.indirect_buffer` argument buffer, surfaced as a standalone
     /// sampled image. Bound at `TEXTURE_BINDING_BASE + synthetic_index`.
     EmbeddedArgBufferTexture,
+    /// A device buffer embedded inside an `air.indirect_buffer`. The Vulkan module dereferences the
+    /// device address written into the owner field, so this consumes no descriptor of its own.
+    EmbeddedArgBufferBuffer,
+    /// Synthesized table of Vulkan buffer device addresses indexed by Metal buffer location. Used
+    /// by the BDA retry tier for direct device-buffer parameters.
+    BufferAddressTable,
 }
 
 /// The descriptor location the interface pass decorates a resource with. Absent for resources that
@@ -111,13 +171,15 @@ pub enum ResourceKind {
 pub struct DescriptorLocation {
     pub set: u32,
     pub binding: u32,
+    /// Number of descriptors occupied at this binding. Top-level texture-handle arrays use the
+    /// reflected ABI capacity, embedded fixed arrays use their exact length, and scalar resources
+    /// use `1`.
+    pub count: u32,
 }
 
-/// Per-binding access classification. Populated at translate time from the declared Metal access:
-/// texture access from the type-name qualifier (`sample`/`read` → `Sampled`, `write`/`read_write` →
-/// `Storage`), and buffer access from the constant address space (`ReadOnly`). A DEVICE buffer's
-/// precise read-vs-write requires IR dataflow the facade does not carry, so it stays `None` (the
-/// consumer determines it SPIR-V-side). See plan Workstream M2.
+/// Per-binding access classification. Populated at translate time from Metal's declared access and
+/// tightened by specialized-entry parameter attributes (`readnone`, `readonly`, `writeonly`).
+/// Ambiguous device buffers retain the conservative declared result or `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ResourceAccess {
@@ -151,6 +213,71 @@ pub enum BufferExtent {
     Unbounded,
     /// The metadata does not distinguish a bounded object from an unbounded pointer.
     Unknown,
+}
+
+/// Conservative byte footprint of every memory access rooted at one reflected buffer descriptor.
+///
+/// A consumer may narrow staging to the union of [`Self::static_ranges`] and the ranges obtained by
+/// bounding [`Self::strided_accesses`] only when [`Self::has_unbounded_access`] is false. A true
+/// unbounded flag means at least one reachable dereference could not be expressed by this schema;
+/// the complete caller-provided buffer window must then remain available.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BufferFootprint {
+    /// Coalesced half-open byte ranges whose addresses are independent of draw/dispatch indices.
+    pub static_ranges: Vec<BufferByteRange>,
+    /// Accesses whose byte address is an affine expression of stable Vulkan invocation builtins.
+    pub strided_accesses: Vec<BufferStridedAccess>,
+    /// Whether any access rooted at this binding could not be represented conservatively above.
+    pub has_unbounded_access: bool,
+}
+
+/// One half-open byte interval `[offset, offset + size)` in a buffer binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BufferByteRange {
+    pub offset: u64,
+    pub size: u64,
+}
+
+/// One buffer access at `base_offset + sum(index * stride)`, spanning `access_size` bytes.
+///
+/// Terms are sorted by [`BufferIndexSource`] and duplicate sources are combined. The expression is
+/// deliberately limited to stable invocation inputs whose bounds a draw/dispatch consumer knows;
+/// data-dependent indices are reported through [`BufferFootprint::has_unbounded_access`] instead.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BufferStridedAccess {
+    pub base_offset: u64,
+    pub access_size: u64,
+    pub terms: Vec<BufferStrideTerm>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BufferStrideTerm {
+    /// Draw/dispatch index used by this address term.
+    pub source: BufferIndexSource,
+    /// Bytes added to the address for each increment of `source`.
+    pub stride: u64,
+}
+
+/// Stable draw/dispatch index that participates in a reflected affine buffer address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BufferIndexSource {
+    VertexIndex,
+    InstanceIndex,
+    GlobalInvocationIdX,
+    GlobalInvocationIdY,
+    GlobalInvocationIdZ,
+    LocalInvocationIdX,
+    LocalInvocationIdY,
+    LocalInvocationIdZ,
+    WorkgroupIdX,
+    WorkgroupIdY,
+    WorkgroupIdZ,
+    LocalInvocationIndex,
 }
 
 /// Minification or magnification filtering encoded in an AIR constexpr sampler.
@@ -382,10 +509,19 @@ fn half_to_f32(bits: u16) -> f32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EmbeddedArgBuffer {
+    /// Kernel parameter index of the owning `air.indirect_buffer`.
+    pub buffer_param_index: u32,
     /// Kernel parameter index of the owning `air.indirect_buffer` argument.
     pub buffer_index: u32,
     /// Byte offset of the texture handle within the argument-buffer struct.
     pub field_offset: u32,
+    /// Zero-based member ordinal used by the LLVM GEP that loads this handle.
+    pub field_ordinal: u32,
+    /// Metal argument-encoder index (`[[id(n)]]`) of the texture field.
+    pub argument_index: u32,
+    /// Nested Metal `[[buffer(n)]]` location when this field is an `air.buffer` resource handle.
+    /// Consumers write that buffer's native handle/address into the owner argument buffer.
+    pub resource_buffer_index: Option<u32>,
 }
 
 /// One bound shader resource: its Metal index, descriptor location, and any decoded layout facts.
@@ -401,13 +537,20 @@ pub struct ResourceBinding {
     /// The entry-parameter index this resource came from (SPIR-V `OpFunctionParameter` order), when
     /// applicable. `None` for synthesized resources (embedded argument-buffer textures).
     pub param_index: Option<u32>,
-    /// For a buffer: the raw AIR address space (3 = threadgroup). `None` for non-buffers / when absent.
+    /// AIR attribute location for [`ResourceKind::KernelStageInput`]; `None` otherwise.
+    pub stage_input_location: Option<u32>,
+    /// For a buffer: the raw AIR address space (1 = device, 2 = constant, 3 = threadgroup). `None`
+    /// for non-buffers or when metadata does not carry it.
     pub address_space: Option<u32>,
     /// For a buffer: the declared AIR argument byte size, when the metadata carries one.
     pub declared_size: Option<u32>,
     /// For a buffer: whether AIR bounds the binding to one object or leaves its array extent open.
     /// `None` for non-buffer resources.
     pub extent: Option<BufferExtent>,
+    /// Final-module byte footprint for descriptor-backed `Buffer`, `KernelStageInput`, and
+    /// `AccelerationStructureShadow` resources. `None` for other resources, threadgroup memory, and
+    /// metadata-only reflection that did not translate a SPIR-V module.
+    pub footprint: Option<BufferFootprint>,
     /// For a buffer with `air.struct_type_info`: the reconstructed AIR aggregate layout.
     pub type_layout: Option<AirType>,
     /// The AIR argument type name (`texture2d<uint, read>`, a struct name, `char`, …), when carried.
@@ -419,7 +562,8 @@ pub struct ResourceBinding {
     /// For an `EmbeddedArgBufferTexture`: the arg-buffer argument + offset it was synthesized from.
     /// `None` for every other binding.
     pub embedded_source: Option<EmbeddedArgBuffer>,
-    /// Per-binding access, once Workstream M2 computes it; `None` otherwise.
+    /// Declared or structurally tightened access classification; `None` when AIR does not provide
+    /// enough information for a conservative classification.
     pub access: Option<ResourceAccess>,
     /// Decoded AIR state for [`ResourceKind::StaticSampler`]; `None` for every other kind.
     pub static_sampler: Option<StaticSamplerState>,
@@ -430,6 +574,7 @@ impl ResourceBinding {
         Some(DescriptorLocation {
             set: RESOURCE_DESCRIPTOR_SET,
             binding: base.saturating_add(metal_index),
+            count: 1,
         })
     }
 }
@@ -499,9 +644,82 @@ pub struct ImageblockLayout {
     pub type_layout: AirType,
 }
 
-/// The consumer-shaped reflection of one translated shader. Built as a facade over the parser-shaped
-/// [`FragMeta`]/[`VertMeta`]/[`KernMeta`]; every binding number matches what the interface pass
-/// decorated the emitted module with.
+/// One descriptor-backed implicit-imageblock render-target/data-rate plane. The storage image is
+/// 2D-arrayed and the AIR color/sample index selects its array layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ImplicitImageblockAttachment {
+    pub attachment: u32,
+    pub data_rate: u32,
+    pub max_index: Option<u32>,
+    pub binding: u32,
+    pub format: crate::meta::TextureFormat,
+    pub access: ResourceAccess,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FragmentImageblockMember {
+    pub offset: u32,
+    pub size: u32,
+    pub type_name: String,
+    pub semantic: String,
+    pub raster_order_group: u32,
+    /// Storage-image binding when at least one entry projection accesses this member.
+    pub binding: Option<u32>,
+    pub access: ResourceAccess,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FragmentImageblock {
+    pub sample_size: u32,
+    pub members: Vec<FragmentImageblockMember>,
+    pub inputs: Vec<crate::meta::FragmentImageblockProjection>,
+    pub outputs: Vec<crate::meta::FragmentImageblockProjection>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TessellationInterface {
+    pub domain: crate::meta::PatchDomain,
+    pub control_point_count: u32,
+    pub control_point_locations: Vec<u32>,
+    pub patch_input_locations: Vec<u32>,
+    pub control_point_attributes: Vec<TessellationAttribute>,
+    pub patch_attributes: Vec<TessellationAttribute>,
+    pub instance_id: Option<TessellationAttribute>,
+    pub amplification_id: Option<TessellationAttribute>,
+    pub amplification_count: Option<TessellationAttribute>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TessellationAttribute {
+    pub location: u32,
+    pub type_name: Option<String>,
+}
+
+fn tessellation_system_attribute(
+    meta: &VertMeta,
+    expected_role: &VertRole,
+) -> Option<TessellationAttribute> {
+    let (parameter, role) = meta
+        .roles
+        .iter()
+        .find(|(_, role)| *role == *expected_role)?;
+    Some(TessellationAttribute {
+        location: meta.tessellation_system_input_location(role)?,
+        type_name: meta.parameter_type_names.get(parameter).cloned(),
+    })
+}
+
+/// Consumer-shaped reflection of one translated shader.
+///
+/// Interface declarations are built from parser-shaped AIR metadata and the translator's shared
+/// descriptor ABI. Successful reflected translation additionally audits the final adopted SPIR-V
+/// for conservative buffer footprints. Every reported binding number matches the module returned
+/// alongside this value.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShaderReflection {
@@ -511,8 +729,11 @@ pub struct ShaderReflection {
     /// The ORIGINAL Metal entry-point function name (the emitted SPIR-V `OpEntryPoint` string is
     /// always `"main"`, so the meaningful identity a consumer keys on is this name).
     pub entry_point: Option<String>,
-    /// Every bound resource, in entry-parameter order (synthesized embedded textures last).
+    /// Every bound resource: AIR entry resources first, followed by translator-synthesized resources.
     pub bindings: Vec<ResourceBinding>,
+    /// All resource-handle fields declared inside shader argument buffers. Authored resources use
+    /// this shared coordinate to obtain the Metal argument index without re-parsing AIR metadata.
+    pub argument_buffer_fields: Vec<EmbeddedArgBuffer>,
     /// Vertex input attributes (vertex stage only).
     pub vertex_attributes: Vec<VertexAttribute>,
     /// Varyings: fragment `[[stage_in]]` inputs, or vertex user-varying outputs.
@@ -521,14 +742,23 @@ pub struct ShaderReflection {
     pub render_targets: Vec<RenderTarget>,
     /// Fragment return-struct members tagged `[[depth]]`.
     pub depth_members: Vec<u32>,
+    /// AIR depth-output qualifier used to derive the graphics pipeline's depth comparison.
+    pub depth_qualifier: Option<crate::meta::DepthQualifier>,
     /// Fragment return-struct members tagged `[[stencil]]`.
     pub stencil_members: Vec<u32>,
     /// Kernel GLCompute local size (`[x, y, z]`), when the stage is a kernel.
     pub local_size: Option<[u32; 3]>,
     /// Vertex-stage builtin usage (`Some` only for the vertex stage).
     pub vertex_builtins: Option<VertexBuiltins>,
+    /// Vulkan tessellation-evaluation interface synthesized from Metal patch metadata.
+    pub tessellation: Option<TessellationInterface>,
     /// Kernel `[[imageblock]]` threadgroup tiles (kernel stage only), sorted by parameter index.
     pub imageblock_layouts: Vec<ImageblockLayout>,
+    /// Implicit imageblock attachment planes consumed by stable AIR load/store intrinsics.
+    pub implicit_imageblock_attachments: Vec<ImplicitImageblockAttachment>,
+    /// Custom fragment imageblock master/projection ABI. Every master field maps to the reflected
+    /// storage-image binding and is serialized independently from kernel/implicit imageblocks.
+    pub fragment_imageblock: Option<FragmentImageblock>,
     /// The source LLVM-IR `target datalayout` string, when the reflected translate started from an
     /// unsanitized module (sanitization strips it). A consumer uses it to lay out struct members
     /// without re-reading the source `.ll`. `None` when translated from already-sanitized IR.
@@ -540,6 +770,60 @@ pub struct ShaderReflection {
 }
 
 impl ShaderReflection {
+    /// Enrich descriptor-backed buffer bindings from the final adopted SPIR-V module.
+    pub(crate) fn add_buffer_footprints(&mut self, spv: &[u8]) -> Result<(), String> {
+        footprint::attach_buffer_footprints(self, spv)
+    }
+
+    pub(crate) fn add_buffer_address_table(&mut self) {
+        if self
+            .bindings
+            .iter()
+            .any(|binding| binding.kind == ResourceKind::BufferAddressTable)
+        {
+            return;
+        }
+        let binding = self
+            .bindings
+            .iter()
+            .filter_map(|resource| resource.descriptor.map(|location| location.binding))
+            .chain(
+                self.implicit_imageblock_attachments
+                    .iter()
+                    .map(|attachment| attachment.binding),
+            )
+            .chain(
+                self.fragment_imageblock
+                    .iter()
+                    .flat_map(|imageblock| &imageblock.members)
+                    .filter_map(|member| member.binding),
+            )
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.bindings.push(ResourceBinding {
+            kind: ResourceKind::BufferAddressTable,
+            metal_index: 0,
+            descriptor: Some(DescriptorLocation {
+                set: RESOURCE_DESCRIPTOR_SET,
+                binding,
+                count: 1,
+            }),
+            param_index: None,
+            stage_input_location: None,
+            address_space: None,
+            declared_size: None,
+            extent: None,
+            footprint: None,
+            type_layout: None,
+            type_name: None,
+            texture_shape: None,
+            embedded_source: None,
+            access: Some(ResourceAccess::ReadOnly),
+            static_sampler: None,
+        });
+    }
+
     /// Build reflection for a fragment shader from its parsed meta and (optional) entry name.
     pub fn from_fragment(meta: &FragMeta, entry_point: Option<&str>) -> Self {
         let mut bindings = Vec::new();
@@ -551,6 +835,7 @@ impl ShaderReflection {
                     metal_index: *n,
                     descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
                     param_index: Some(idx),
+                    stage_input_location: None,
                     address_space: meta.buffer_address_spaces.get(&idx).copied(),
                     declared_size: meta.buffer_type_sizes.get(&idx).copied(),
                     extent: Some(buffer_extent(
@@ -558,6 +843,7 @@ impl ShaderReflection {
                         meta.buffer_type_sizes.get(&idx).copied(),
                         meta.buffer_type_names.get(&idx),
                     )),
+                    footprint: None,
                     type_layout: meta.buffer_layouts.get(&idx).cloned(),
                     type_name: meta.buffer_type_names.get(&idx).cloned(),
                     texture_shape: None,
@@ -570,16 +856,24 @@ impl ShaderReflection {
                 },
                 FragRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
                 FragRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                FragRole::VisibleFunctionTable(n) => {
+                    function_table_binding(ResourceKind::VisibleFunctionTable, *n, idx)
+                }
+                FragRole::IntersectionFunctionTable(n) => {
+                    function_table_binding(ResourceKind::IntersectionFunctionTable, *n, idx)
+                }
                 FragRole::ColorInput(n) => ResourceBinding {
                     kind: ResourceKind::ColorInput,
                     metal_index: *n,
                     descriptor: ResourceBinding::descriptor_at(COLOR_INPUT_BINDING_BASE, *n),
                     param_index: Some(idx),
+                    stage_input_location: None,
                     address_space: None,
                     declared_size: None,
                     extent: None,
+                    footprint: None,
                     type_layout: None,
-                    type_name: None,
+                    type_name: meta.color_input_type_names.get(n).cloned(),
                     texture_shape: None,
                     embedded_source: None,
                     access: None,
@@ -592,12 +886,23 @@ impl ShaderReflection {
                 | FragRole::SampleId
                 | FragRole::ViewportArrayIndex
                 | FragRole::Varying(_)
+                | FragRole::ImageblockData
                 | FragRole::Other => {
                     continue;
                 }
             };
             bindings.push(binding);
         }
+        append_embedded_resources(
+            &mut bindings,
+            &meta.embedded_textures,
+            &meta.embedded_arguments,
+        );
+        append_embedded_resources(
+            &mut bindings,
+            &meta.embedded_textures,
+            &meta.embedded_arguments,
+        );
         let varyings = meta
             .varying_types
             .keys()
@@ -627,14 +932,60 @@ impl ShaderReflection {
             stage: ShaderStage::Fragment,
             entry_point: entry_point.map(str::to_string),
             bindings,
+            argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
             vertex_attributes: Vec::new(),
             varyings,
             render_targets,
             depth_members: meta.depth_members.clone(),
+            depth_qualifier: meta.depth_qualifier,
             stencil_members: meta.stencil_members.clone(),
             local_size: None,
             vertex_builtins: None,
+            tessellation: None,
             imageblock_layouts: Vec::new(),
+            implicit_imageblock_attachments: Vec::new(),
+            fragment_imageblock: meta.fragment_imageblock.as_ref().map(|imageblock| {
+                FragmentImageblock {
+                    sample_size: imageblock.sample_size,
+                    members: imageblock
+                        .members
+                        .iter()
+                        .enumerate()
+                        .map(|(index, member)| {
+                            let index = index as u32;
+                            let reads = imageblock.inputs.iter().any(|projection| {
+                                projection
+                                    .members
+                                    .iter()
+                                    .any(|projected| projected.master_member == index)
+                            });
+                            let writes = imageblock.outputs.iter().any(|projection| {
+                                projection
+                                    .members
+                                    .iter()
+                                    .any(|projected| projected.master_member == index)
+                            });
+                            FragmentImageblockMember {
+                                offset: member.offset,
+                                size: member.size,
+                                type_name: member.type_name.clone(),
+                                semantic: member.semantic.clone(),
+                                raster_order_group: member.raster_order_group,
+                                binding: (reads || writes)
+                                    .then(|| fragment_imageblock_resource_binding(index)),
+                                access: match (reads, writes) {
+                                    (true, true) => ResourceAccess::ReadWrite,
+                                    (true, false) => ResourceAccess::ReadOnly,
+                                    (false, true) => ResourceAccess::WriteOnly,
+                                    (false, false) => ResourceAccess::Unused,
+                                },
+                            }
+                        })
+                        .collect(),
+                    inputs: imageblock.inputs.clone(),
+                    outputs: imageblock.outputs.clone(),
+                }
+            }),
             datalayout: None,
             function_constants: Vec::new(),
         }
@@ -642,9 +993,11 @@ impl ShaderReflection {
 
     /// Build reflection for a vertex shader from its parsed meta and (optional) entry name.
     pub fn from_vertex(meta: &VertMeta, entry_point: Option<&str>) -> Self {
+        let is_tessellation = meta.is_tessellation_evaluation();
         let vertex_builtins = VertexBuiltins {
             uses_vertex_index: meta.roles.iter().any(|(_, r)| *r == VertRole::VertexId),
-            uses_instance_index: meta.roles.iter().any(|(_, r)| *r == VertRole::InstanceId),
+            uses_instance_index: !is_tessellation
+                && meta.roles.iter().any(|(_, r)| *r == VertRole::InstanceId),
             writes_position: meta.output_roles.contains(&VertOutRole::Position),
         };
         let mut bindings = Vec::new();
@@ -656,6 +1009,7 @@ impl ShaderReflection {
                     metal_index: *n,
                     descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
                     param_index: Some(idx),
+                    stage_input_location: None,
                     address_space: meta.buffer_address_spaces.get(&idx).copied(),
                     declared_size: meta.buffer_type_sizes.get(&idx).copied(),
                     extent: Some(buffer_extent(
@@ -663,6 +1017,7 @@ impl ShaderReflection {
                         meta.buffer_type_sizes.get(&idx).copied(),
                         meta.buffer_type_names.get(&idx),
                     )),
+                    footprint: None,
                     type_layout: meta.buffer_layouts.get(&idx).cloned(),
                     type_name: meta.buffer_type_names.get(&idx).cloned(),
                     texture_shape: None,
@@ -675,9 +1030,21 @@ impl ShaderReflection {
                 },
                 VertRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
                 VertRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                VertRole::VisibleFunctionTable(n) => {
+                    function_table_binding(ResourceKind::VisibleFunctionTable, *n, idx)
+                }
+                VertRole::IntersectionFunctionTable(n) => {
+                    function_table_binding(ResourceKind::IntersectionFunctionTable, *n, idx)
+                }
                 VertRole::VertexInput(_)
                 | VertRole::VertexId
                 | VertRole::InstanceId
+                | VertRole::PatchControlPoints
+                | VertRole::PatchInput(_)
+                | VertRole::PositionInPatch
+                | VertRole::PatchId
+                | VertRole::AmplificationId
+                | VertRole::AmplificationCount
                 | VertRole::Other => continue,
             };
             bindings.push(binding);
@@ -701,26 +1068,80 @@ impl ShaderReflection {
             .filter_map(|role| match role {
                 VertOutRole::Varying(loc) => Some(Varying {
                     location: *loc,
-                    type_name: None,
-                    name: None,
-                    user_semantic: None,
+                    type_name: meta.output_varying_types.get(loc).cloned(),
+                    name: meta.output_varying_names.get(loc).cloned(),
+                    user_semantic: meta.output_varying_user_semantics.get(loc).cloned(),
                 }),
                 _ => None,
             })
             .collect();
         ShaderReflection {
             reflection_version: REFLECTION_VERSION,
-            stage: ShaderStage::Vertex,
+            stage: if is_tessellation {
+                ShaderStage::TessellationEvaluation
+            } else {
+                ShaderStage::Vertex
+            },
             entry_point: entry_point.map(str::to_string),
             bindings,
+            argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
             vertex_attributes,
             varyings,
             render_targets: Vec::new(),
             depth_members: Vec::new(),
+            depth_qualifier: None,
             stencil_members: Vec::new(),
             local_size: None,
             vertex_builtins: Some(vertex_builtins),
+            tessellation: meta.tessellation.as_ref().map(|tessellation| {
+                let mut patch_input_locations = meta
+                    .roles
+                    .iter()
+                    .filter_map(|(_, role)| match role {
+                        VertRole::PatchInput(location) => Some(*location),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                patch_input_locations.sort_unstable();
+                let patch_attributes = patch_input_locations
+                    .iter()
+                    .map(|location| TessellationAttribute {
+                        location: *location,
+                        type_name: meta.patch_input_types.get(location).cloned(),
+                    })
+                    .collect();
+                TessellationInterface {
+                    domain: tessellation.domain,
+                    control_point_count: tessellation.control_point_count,
+                    control_point_locations: tessellation
+                        .control_point_fields
+                        .iter()
+                        .map(|field| field.location)
+                        .collect(),
+                    patch_input_locations,
+                    control_point_attributes: tessellation
+                        .control_point_fields
+                        .iter()
+                        .map(|field| TessellationAttribute {
+                            location: field.location,
+                            type_name: field.type_name.clone(),
+                        })
+                        .collect(),
+                    patch_attributes,
+                    instance_id: tessellation_system_attribute(meta, &VertRole::InstanceId),
+                    amplification_id: tessellation_system_attribute(
+                        meta,
+                        &VertRole::AmplificationId,
+                    ),
+                    amplification_count: tessellation_system_attribute(
+                        meta,
+                        &VertRole::AmplificationCount,
+                    ),
+                }
+            }),
             imageblock_layouts: Vec::new(),
+            implicit_imageblock_attachments: Vec::new(),
+            fragment_imageblock: None,
             datalayout: None,
             function_constants: Vec::new(),
         }
@@ -729,6 +1150,7 @@ impl ShaderReflection {
     /// Build reflection for a compute kernel from its parsed meta, entry name, and local size.
     pub fn from_kernel(meta: &KernMeta, entry_point: Option<&str>, local_size: [u32; 3]) -> Self {
         let mut bindings = Vec::new();
+        let stage_input_bindings = meta.stage_input_bindings();
         for (idx, role) in &meta.roles {
             let idx = *idx;
             let binding = match role {
@@ -749,6 +1171,7 @@ impl ShaderReflection {
                             ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n)
                         },
                         param_index: Some(idx),
+                        stage_input_location: None,
                         address_space,
                         declared_size: meta.buffer_type_sizes.get(&idx).copied(),
                         extent: Some(buffer_extent(
@@ -756,6 +1179,7 @@ impl ShaderReflection {
                             meta.buffer_type_sizes.get(&idx).copied(),
                             meta.buffer_type_names.get(&idx),
                         )),
+                        footprint: None,
                         type_layout: meta.buffer_layouts.get(&idx).cloned(),
                         type_name: meta.buffer_type_names.get(&idx).cloned(),
                         texture_shape: None,
@@ -769,14 +1193,42 @@ impl ShaderReflection {
                 }
                 KernRole::Texture(n) => texture_binding(*n, Some(idx), &meta.texture_type_names),
                 KernRole::Sampler(n) => sampler_binding(*n, Some(idx)),
+                KernRole::StageInput(location) => {
+                    let metal_index = stage_input_bindings
+                        .get(&idx)
+                        .copied()
+                        .expect("stage-input binding was allocated");
+                    ResourceBinding {
+                        kind: ResourceKind::KernelStageInput,
+                        metal_index,
+                        descriptor: ResourceBinding::descriptor_at(
+                            BUFFER_BINDING_BASE,
+                            metal_index,
+                        ),
+                        param_index: Some(idx),
+                        stage_input_location: Some(*location),
+                        address_space: None,
+                        declared_size: None,
+                        extent: Some(BufferExtent::Unbounded),
+                        footprint: None,
+                        type_layout: None,
+                        type_name: meta.stage_input_type_names.get(&idx).cloned(),
+                        texture_shape: None,
+                        embedded_source: None,
+                        access: Some(ResourceAccess::ReadOnly),
+                        static_sampler: None,
+                    }
+                }
                 KernRole::AccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::AccelerationStructureShadow,
                     metal_index: *n,
                     descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
                     param_index: Some(idx),
+                    stage_input_location: None,
                     address_space: None,
                     declared_size: None,
                     extent: None,
+                    footprint: None,
                     type_layout: None,
                     type_name: None,
                     texture_shape: None,
@@ -784,53 +1236,70 @@ impl ShaderReflection {
                     access: None,
                     static_sampler: None,
                 },
+                KernRole::PrimitiveAccelerationStructure(n) => ResourceBinding {
+                    kind: ResourceKind::PrimitiveAccelerationStructure,
+                    metal_index: *n,
+                    descriptor: None,
+                    param_index: Some(idx),
+                    stage_input_location: None,
+                    address_space: None,
+                    declared_size: None,
+                    extent: None,
+                    footprint: None,
+                    type_layout: None,
+                    type_name: Some("acceleration_structure<>".into()),
+                    texture_shape: None,
+                    embedded_source: None,
+                    access: Some(ResourceAccess::ReadOnly),
+                    static_sampler: None,
+                },
+                KernRole::PrimitiveAccelerationStructureShadow(n) => ResourceBinding {
+                    kind: ResourceKind::PrimitiveAccelerationStructure,
+                    metal_index: *n,
+                    descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
+                    param_index: Some(idx),
+                    stage_input_location: None,
+                    address_space: None,
+                    declared_size: None,
+                    extent: Some(BufferExtent::Unbounded),
+                    footprint: None,
+                    type_layout: None,
+                    type_name: Some("acceleration_structure<>".into()),
+                    texture_shape: None,
+                    embedded_source: None,
+                    access: Some(ResourceAccess::ReadOnly),
+                    static_sampler: None,
+                },
+                KernRole::VisibleFunctionTable(n) => {
+                    function_table_binding(ResourceKind::VisibleFunctionTable, *n, idx)
+                }
+                KernRole::IntersectionFunctionTable(n) => {
+                    function_table_binding(ResourceKind::IntersectionFunctionTable, *n, idx)
+                }
                 _ => continue,
             };
             bindings.push(binding);
         }
-        for embedded in &meta.embedded_textures {
-            bindings.push(ResourceBinding {
-                kind: ResourceKind::EmbeddedArgBufferTexture,
-                metal_index: embedded.synthetic_texture_index,
-                descriptor: ResourceBinding::descriptor_at(
-                    TEXTURE_BINDING_BASE,
-                    embedded.synthetic_texture_index,
-                ),
-                param_index: None,
-                address_space: None,
-                declared_size: None,
-                extent: None,
-                type_layout: None,
-                type_name: None,
-                texture_shape: Some(TextureShape {
-                    dimension: TextureDimension::from_spirv_dim(embedded.dim),
-                    arrayed: false,
-                    multisampled: false,
-                    component: TextureComponent::from_image_comp(embedded.comp),
-                    writable: false,
-                    array_ref: false,
-                    storage_format: None,
-                }),
-                embedded_source: Some(EmbeddedArgBuffer {
-                    buffer_index: embedded.buffer_index,
-                    field_offset: embedded.field_offset,
-                }),
-                access: Some(ResourceAccess::Sampled),
-                static_sampler: None,
-            });
-        }
+        append_embedded_resources(
+            &mut bindings,
+            &meta.embedded_textures,
+            &meta.embedded_arguments,
+        );
         ShaderReflection {
             reflection_version: REFLECTION_VERSION,
             stage: ShaderStage::Kernel,
             entry_point: entry_point.map(str::to_string),
             bindings,
+            argument_buffer_fields: embedded_argument_fields(&meta.embedded_arguments),
             vertex_attributes: Vec::new(),
             varyings: Vec::new(),
             render_targets: Vec::new(),
             depth_members: Vec::new(),
+            depth_qualifier: None,
             stencil_members: Vec::new(),
             local_size: Some(local_size),
             vertex_builtins: None,
+            tessellation: None,
             imageblock_layouts: {
                 let mut ibs: Vec<ImageblockLayout> = meta
                     .imageblock_layouts
@@ -843,6 +1312,27 @@ impl ShaderReflection {
                 ibs.sort_by_key(|ib| ib.param_index);
                 ibs
             },
+            implicit_imageblock_attachments: meta
+                .implicit_imageblock_attachments
+                .iter()
+                .map(|attachment| ImplicitImageblockAttachment {
+                    attachment: attachment.attachment,
+                    data_rate: attachment.data_rate,
+                    max_index: attachment.max_index,
+                    binding: imageblock_resource_binding(
+                        attachment.attachment,
+                        attachment.data_rate,
+                    ),
+                    format: attachment.format,
+                    access: match (attachment.reads, attachment.writes) {
+                        (true, true) => ResourceAccess::ReadWrite,
+                        (true, false) => ResourceAccess::ReadOnly,
+                        (false, true) => ResourceAccess::WriteOnly,
+                        (false, false) => ResourceAccess::Unused,
+                    },
+                })
+                .collect(),
+            fragment_imageblock: None,
             datalayout: None,
             function_constants: Vec::new(),
         }
@@ -921,11 +1411,14 @@ impl ShaderReflection {
                 descriptor: Some(DescriptorLocation {
                     set: RESOURCE_DESCRIPTOR_SET,
                     binding,
+                    count: 1,
                 }),
                 param_index: None,
+                stage_input_location: None,
                 address_space: None,
                 declared_size: None,
                 extent: None,
+                footprint: None,
                 type_layout: None,
                 type_name: None,
                 texture_shape: None,
@@ -1127,14 +1620,21 @@ fn texture_binding(
     let type_name = param_index.and_then(|idx| type_names.get(&idx).cloned());
     let texture_shape = type_name.as_deref().map(texture_shape_from_name);
     let (kind, access) = classify_texture(texture_shape.as_ref());
+    let mut descriptor = ResourceBinding::descriptor_at(TEXTURE_BINDING_BASE, n);
+    if kind == ResourceKind::TextureArray {
+        descriptor.as_mut().expect("texture descriptor").count =
+            crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT;
+    }
     ResourceBinding {
         kind,
         metal_index: n,
-        descriptor: ResourceBinding::descriptor_at(TEXTURE_BINDING_BASE, n),
+        descriptor,
         param_index,
+        stage_input_location: None,
         address_space: None,
         declared_size: None,
         extent: None,
+        footprint: None,
         type_layout: None,
         type_name,
         texture_shape,
@@ -1195,20 +1695,144 @@ fn buffer_access(
     }
 }
 
+fn append_embedded_resources(
+    bindings: &mut Vec<ResourceBinding>,
+    textures: &[crate::meta::EmbeddedTexture],
+    arguments: &[crate::meta::EmbeddedArgument],
+) {
+    for embedded in textures {
+        bindings.push(ResourceBinding {
+            kind: ResourceKind::EmbeddedArgBufferTexture,
+            metal_index: embedded.synthetic_texture_index,
+            descriptor: Some(DescriptorLocation {
+                set: RESOURCE_DESCRIPTOR_SET,
+                binding: TEXTURE_BINDING_BASE.saturating_add(embedded.synthetic_texture_index),
+                count: embedded.array_length.unwrap_or(1),
+            }),
+            param_index: None,
+            stage_input_location: None,
+            address_space: None,
+            declared_size: None,
+            extent: None,
+            footprint: None,
+            type_layout: None,
+            type_name: None,
+            texture_shape: Some(TextureShape {
+                dimension: TextureDimension::from_spirv_dim(embedded.dim),
+                arrayed: embedded.arrayed,
+                multisampled: false,
+                component: TextureComponent::from_image_comp(embedded.comp),
+                writable: embedded.storage_format.is_some(),
+                array_ref: embedded.array_length.is_some(),
+                array_length: embedded.array_length,
+                storage_format: embedded.storage_format,
+            }),
+            embedded_source: Some(EmbeddedArgBuffer {
+                buffer_param_index: embedded.buffer_param_index,
+                buffer_index: embedded.buffer_index,
+                field_offset: embedded.field_offset,
+                field_ordinal: embedded.field_ordinal,
+                argument_index: embedded.argument_index,
+                resource_buffer_index: None,
+            }),
+            access: Some(if embedded.storage_format.is_some() {
+                ResourceAccess::Storage
+            } else {
+                ResourceAccess::Sampled
+            }),
+            static_sampler: None,
+        });
+    }
+    for argument in arguments {
+        let Some(resource_index) = argument.resource_buffer_index else {
+            continue;
+        };
+        bindings.push(ResourceBinding {
+            kind: ResourceKind::EmbeddedArgBufferBuffer,
+            metal_index: resource_index,
+            descriptor: None,
+            param_index: None,
+            stage_input_location: None,
+            address_space: argument.resource_address_space,
+            declared_size: argument.resource_declared_size,
+            extent: Some(buffer_extent(None, argument.resource_declared_size, None)),
+            footprint: None,
+            type_layout: None,
+            type_name: None,
+            texture_shape: None,
+            embedded_source: Some(EmbeddedArgBuffer {
+                buffer_param_index: argument.buffer_param_index,
+                buffer_index: argument.buffer_index,
+                field_offset: argument.field_offset,
+                field_ordinal: argument.field_ordinal,
+                argument_index: argument.argument_index,
+                resource_buffer_index: Some(resource_index),
+            }),
+            access: buffer_access(argument.resource_access, argument.resource_address_space),
+            static_sampler: None,
+        });
+    }
+}
+
+fn embedded_argument_fields(arguments: &[crate::meta::EmbeddedArgument]) -> Vec<EmbeddedArgBuffer> {
+    arguments
+        .iter()
+        .map(|argument| EmbeddedArgBuffer {
+            buffer_param_index: argument.buffer_param_index,
+            buffer_index: argument.buffer_index,
+            field_offset: argument.field_offset,
+            field_ordinal: argument.field_ordinal,
+            argument_index: argument.argument_index,
+            resource_buffer_index: argument.resource_buffer_index,
+        })
+        .collect()
+}
+
 fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {
     ResourceBinding {
         kind: ResourceKind::Sampler,
         metal_index: n,
         descriptor: ResourceBinding::descriptor_at(SAMPLER_BINDING_BASE, n),
         param_index,
+        stage_input_location: None,
         address_space: None,
         declared_size: None,
         extent: None,
+        footprint: None,
         type_layout: None,
         type_name: None,
         texture_shape: None,
         embedded_source: None,
         access: None,
+        static_sampler: None,
+    }
+}
+
+fn function_table_binding(
+    kind: ResourceKind,
+    metal_index: u32,
+    param_index: u32,
+) -> ResourceBinding {
+    let type_name = match kind {
+        ResourceKind::VisibleFunctionTable => "visible_function_table",
+        ResourceKind::IntersectionFunctionTable => "intersection_function_table",
+        _ => unreachable!("function-table helper requires a function-table kind"),
+    };
+    ResourceBinding {
+        kind,
+        metal_index,
+        descriptor: None,
+        param_index: Some(param_index),
+        stage_input_location: None,
+        address_space: None,
+        declared_size: None,
+        extent: None,
+        footprint: None,
+        type_layout: None,
+        type_name: Some(type_name.into()),
+        texture_shape: None,
+        embedded_source: None,
+        access: Some(ResourceAccess::ReadOnly),
         static_sampler: None,
     }
 }

@@ -2,6 +2,7 @@
 
 use super::rewrites::*;
 use super::*;
+use crate::passes::access::{is_unsigned_byte_scalar, single_member_array_scalar_elem};
 use crate::passes::stage_input::{const_ivec, BufWrap, ParamBinding};
 
 /// Apply the per-param bindings to the entry function body:
@@ -24,6 +25,10 @@ pub(in crate::passes) fn apply_bindings(
     let mut splices: Vec<(Word, Word)> = vec![];
     let mut resource_values: HashSet<Word> = HashSet::new();
     let mut buffer_param_ids: Vec<Word> = vec![];
+    // Every buffer parameter gets a descriptor variable root, including collapsed/record-array
+    // buffers whose body ids are rewritten per-use rather than through the generic splice list.
+    // Typed emitter sidecar facts must cross that same root substitution.
+    let mut buffer_root_splices: Vec<(Word, Word)> = vec![];
     // Collapsed buffers (RuntimeArray-wrapped arrays + reconstructed structs): (param id, var,
     // block type, prepend_member0). Rewritten after the generic splices, since their uses need
     // per-use handling (re-root chains vs route direct loads through the offset-0 leaf).
@@ -220,6 +225,8 @@ pub(in crate::passes) fn apply_bindings(
             ParamBinding::LoadVarVectorPrefix {
                 var,
                 vec_ty,
+                scalar_ty,
+                prefix_ty,
                 out_ty,
                 lanes,
             } => {
@@ -230,8 +237,6 @@ pub(in crate::passes) fn apply_bindings(
                     Some(vid),
                     vec![Operand::IdRef(var)],
                 ));
-                let scalar_ty = ctx.ty_uint();
-                let prefix_ty = ctx.ty_vec_uint(lanes);
                 let mut components = Vec::with_capacity(lanes as usize);
                 for lane in 0..lanes {
                     let cid = ctx.module.fresh_id();
@@ -341,6 +346,114 @@ pub(in crate::passes) fn apply_bindings(
                     }
                 }
             }
+            ParamBinding::FragmentImageblockProjection {
+                coord_var,
+                param_ty,
+                members,
+            } => {
+                let v4float = ctx.ty_vecf(4);
+                let float_ty = ctx.ty_float();
+                let sint_ty = ctx.ty_sint();
+                let v2sint = ctx.ty_vec_sint(2);
+                let coord_value = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(v4float),
+                    Some(coord_value),
+                    vec![Operand::IdRef(coord_var)],
+                ));
+                let mut coord_components = Vec::with_capacity(2);
+                for component in 0..2 {
+                    let float_component = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::CompositeExtract,
+                        Some(float_ty),
+                        Some(float_component),
+                        vec![
+                            Operand::IdRef(coord_value),
+                            Operand::LiteralBit32(component),
+                        ],
+                    ));
+                    let int_component = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::ConvertFToS,
+                        Some(sint_ty),
+                        Some(int_component),
+                        vec![Operand::IdRef(float_component)],
+                    ));
+                    coord_components.push(Operand::IdRef(int_component));
+                }
+                let coord = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::CompositeConstruct,
+                    Some(v2sint),
+                    Some(coord),
+                    coord_components,
+                ));
+                let mut projected_values = Vec::with_capacity(members.len());
+                for (image_var, image_ty, member_ty, format) in members {
+                    let image = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::Load,
+                        Some(image_ty),
+                        Some(image),
+                        vec![Operand::IdRef(image_var)],
+                    ));
+                    let texel_ty = match format.component {
+                        ImageComp::Float => ctx.ty_vecf(4),
+                        ImageComp::Uint => ctx.ty_vec_uint(4),
+                        ImageComp::Sint => ctx.ty_vec_sint(4),
+                    };
+                    let texel = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::ImageRead,
+                        Some(texel_ty),
+                        Some(texel),
+                        vec![Operand::IdRef(image), Operand::IdRef(coord)],
+                    ));
+                    let wide_ty = if format.lanes == 1 {
+                        match format.component {
+                            ImageComp::Float => float_ty,
+                            ImageComp::Uint => ctx.ty_uint(),
+                            ImageComp::Sint => ctx.ty_sint(),
+                        }
+                    } else {
+                        texel_ty
+                    };
+                    let wide = if format.lanes == 1 {
+                        let component = ctx.module.fresh_id();
+                        loads.push(Instruction::new(
+                            Op::CompositeExtract,
+                            Some(wide_ty),
+                            Some(component),
+                            vec![Operand::IdRef(texel), Operand::LiteralBit32(0)],
+                        ));
+                        component
+                    } else {
+                        texel
+                    };
+                    let projected = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        match format.component {
+                            ImageComp::Float => Op::FConvert,
+                            ImageComp::Uint => Op::UConvert,
+                            ImageComp::Sint => Op::SConvert,
+                        },
+                        Some(member_ty),
+                        Some(projected),
+                        vec![Operand::IdRef(wide)],
+                    ));
+                    projected_values.push(Operand::IdRef(projected));
+                }
+                let projection = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::CompositeConstruct,
+                    Some(param_ty),
+                    Some(projection),
+                    projected_values,
+                ));
+                splices.push((pid, projection));
+            }
             ParamBinding::Sampler { var } => {
                 let sty = ctx.ty_sampler();
                 let lid = ctx.module.fresh_id();
@@ -387,6 +500,7 @@ pub(in crate::passes) fn apply_bindings(
                 // `image_array_vars`. No function-top load: the array as a whole is never an operand.
                 ctx.image_array_vars
                     .insert(var, (elem_image_ty, dim, comp, multisampled));
+                remove_dead_local_image_array_memcpy(ctx, entry_idx, pid);
                 resource_values.insert(var);
                 splices.push((pid, var));
             }
@@ -434,23 +548,51 @@ pub(in crate::passes) fn apply_bindings(
                 let value = adapt_input_attachment_read(ctx, &mut loads, read, read_ty, param_ty)?;
                 splices.push((pid, value));
             }
-            ParamBinding::Buffer { var, wrap } => match wrap {
-                BufWrap::Direct => {
-                    // struct buffer: the body's access chains index into the struct off the var.
-                    splices.push((pid, var));
-                    buffer_param_ids.push(var);
+            ParamBinding::Buffer { var, wrap } => {
+                buffer_root_splices.push((pid, var));
+                let raw_block_ty = match wrap {
+                    BufWrap::Direct => None,
+                    BufWrap::Collapsed { block_ty, .. } | BufWrap::RecordArray { block_ty, .. } => {
+                        Some(block_ty)
+                    }
+                };
+                if let Some(source_pointee) = raw_block_ty
+                    .filter(|block_ty| {
+                        single_member_array_scalar_elem(ctx, *block_ty)
+                            .is_some_and(|element| is_unsigned_byte_scalar(ctx, element))
+                    })
+                    .and_then(|_| value_result_type(ctx, pid))
+                    .and_then(|pointer_ty| ptr_pointee(defs, pointer_ty))
+                {
+                    ctx.emit_sidecar
+                        .buffer_root_source_types
+                        .entry(var)
+                        .or_insert(source_pointee);
                 }
-                BufWrap::Collapsed {
-                    block_ty,
-                    prepend_member0,
-                } => {
-                    // re-rooted / leaf-routed after splices (see below).
-                    collapsed_buffers.push((pid, var, block_ty, prepend_member0));
+                match wrap {
+                    BufWrap::Direct => {
+                        // struct buffer: the body's access chains index into the struct off the var.
+                        splices.push((pid, var));
+                        buffer_param_ids.push(var);
+                    }
+                    BufWrap::Collapsed {
+                        block_ty,
+                        prepend_member0,
+                    } => {
+                        // The parameter may be carried through a by-value helper aggregate. Collapse
+                        // that carrier while the original parameter id is still available, so the
+                        // per-use buffer rewrite sees the extracted access chain rather than mistaking
+                        // CompositeInsert itself for a direct scalar-leaf use.
+                        resource_values.insert(pid);
+                        // re-rooted / leaf-routed after splices (see below).
+                        collapsed_buffers.push((pid, var, block_ty, prepend_member0));
+                    }
+                    BufWrap::RecordArray { block_ty, elem_ty } => {
+                        resource_values.insert(pid);
+                        record_array_buffers.push((pid, var, block_ty, elem_ty));
+                    }
                 }
-                BufWrap::RecordArray { block_ty, elem_ty } => {
-                    record_array_buffers.push((pid, var, block_ty, elem_ty));
-                }
-            },
+            }
             ParamBinding::StageInput {
                 var,
                 value_ty,
@@ -531,8 +673,13 @@ pub(in crate::passes) fn apply_bindings(
     // Keep typed pointer-field provenance in step with the interface splice so cross-function helper
     // recovery can replay texture handles after entry parameters become loaded image ids or descriptor
     // array variables.
-    ctx.emit_sidecar
-        .remap_ids(&splices.iter().copied().collect());
+    ctx.emit_sidecar.remap_ids(
+        &splices
+            .iter()
+            .chain(&buffer_root_splices)
+            .copied()
+            .collect(),
+    );
 
     // Splice param ids -> their replacement ids.
     {
@@ -541,7 +688,7 @@ pub(in crate::passes) fn apply_bindings(
             replace_id_in_function(func, from, to);
         }
     }
-    collapse_resource_wrappers(ctx, entry_idx, &resource_values);
+    let _ = collapse_resource_wrappers(ctx, entry_idx, &resource_values);
 
     // Rewrite collapsed-buffer uses. Done after the generic splices (these param ids were deliberately
     // NOT spliced) so each use can be handled by kind.
@@ -599,6 +746,116 @@ pub(in crate::passes) fn apply_bindings(
     rewrite_structural_load_result_types(ctx, entry_idx, defs);
     rewrite_ulong_uint2_memory_reinterprets(ctx, entry_idx, defs);
     Ok(())
+}
+
+/// Remove an opaque-handle array copy only when the exact local destination subobject is never read
+/// or escaped. AIR can retain function-constant-dead context initialization after every consumer was
+/// pruned; Vulkan images cannot be copied as aggregate data, and keeping the bodiless intrinsic then
+/// produces an invalid generic call. Live copies remain an honest unsupported path.
+fn remove_dead_local_image_array_memcpy(ctx: &mut Ctx, entry_idx: usize, param: Word) {
+    let memcpy_ids = ctx
+        .module
+        .debug_names
+        .iter()
+        .filter_map(|instruction| match instruction.operands.as_slice() {
+            [Operand::IdRef(id), Operand::LiteralString(name), ..]
+                if instruction.class.opcode == Op::Name && name.starts_with("llvm.memcpy.") =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut dead = Vec::new();
+    for (block_index, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            let (
+                Some(Operand::IdRef(callee)),
+                Some(Operand::IdRef(destination)),
+                Some(Operand::IdRef(source)),
+            ) = (
+                instruction.operands.first(),
+                instruction.operands.get(1),
+                instruction.operands.get(2),
+            )
+            else {
+                continue;
+            };
+            if instruction.class.opcode == Op::FunctionCall
+                && *source == param
+                && memcpy_ids.contains(callee)
+                && local_copy_destination_is_write_only(
+                    &ctx.module.functions[entry_idx],
+                    *destination,
+                    *callee,
+                )
+            {
+                dead.push((block_index, instruction_index));
+            }
+        }
+    }
+    for (block_index, instruction_index) in dead.into_iter().rev() {
+        ctx.module.functions[entry_idx].blocks[block_index]
+            .instructions
+            .remove(instruction_index);
+    }
+}
+
+fn local_copy_destination_is_write_only(
+    function: &crate::spirv_module::Function,
+    destination: Word,
+    memcpy: Word,
+) -> bool {
+    let mut region = HashSet::from([destination]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            let derived = matches!(
+                instruction.class.opcode,
+                Op::AccessChain
+                    | Op::InBoundsAccessChain
+                    | Op::PtrAccessChain
+                    | Op::Bitcast
+                    | Op::CopyObject
+            ) && instruction.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if region.contains(id)),
+            );
+            if derived {
+                if let Some(result) = instruction.result_id {
+                    changed |= region.insert(result);
+                }
+            }
+        }
+    }
+
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        for (operand_index, operand) in instruction.operands.iter().enumerate() {
+            let Operand::IdRef(id) = operand else {
+                continue;
+            };
+            if !region.contains(id) {
+                continue;
+            }
+            let allowed_derivation = operand_index == 0
+                && matches!(
+                    instruction.class.opcode,
+                    Op::AccessChain
+                        | Op::InBoundsAccessChain
+                        | Op::PtrAccessChain
+                        | Op::Bitcast
+                        | Op::CopyObject
+                );
+            let allowed_store = instruction.class.opcode == Op::Store && operand_index == 0;
+            let allowed_memcpy_destination = instruction.class.opcode == Op::FunctionCall
+                && operand_index == 1
+                && matches!(instruction.operands.first(), Some(Operand::IdRef(id)) if *id == memcpy);
+            if !(allowed_derivation || allowed_store || allowed_memcpy_destination) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn adapt_input_attachment_read(
@@ -867,13 +1124,15 @@ pub(in crate::passes) fn collapse_resource_wrappers(
     ctx: &mut Ctx,
     entry_idx: usize,
     resource_values: &HashSet<Word>,
-) {
+) -> Vec<Word> {
     if resource_values.is_empty() {
-        return;
+        return vec![];
     }
 
     let func = &ctx.module.functions[entry_idx];
     let mut paths: HashMap<Word, HashMap<Vec<u32>, Word>> = HashMap::new();
+    let mut inserts: HashMap<Word, (Word, Vec<u32>)> = HashMap::new();
+    let mut extract_bases: Vec<(Word, Word)> = vec![];
     let mut replacements: Vec<(Word, Word)> = vec![];
 
     for blk in &func.blocks {
@@ -890,6 +1149,7 @@ pub(in crate::passes) fn collapse_resource_wrappers(
                         continue;
                     };
                     let path = literal_path(&inst.operands[2..]);
+                    inserts.insert(result, (*base, path.clone()));
                     let mut result_paths = paths.get(base).cloned().unwrap_or_default();
                     insert_resource_path(
                         &mut result_paths,
@@ -937,7 +1197,27 @@ pub(in crate::passes) fn collapse_resource_wrappers(
                         continue;
                     };
                     let path = literal_path(&inst.operands[1..]);
-                    let Some(composite_paths) = paths.get(composite) else {
+                    // A mixed aggregate may contain an opaque resource in one field while this
+                    // extract reads a disjoint ordinary field. Bypass resource-bearing inserts
+                    // that cannot affect the requested path. Besides being ordinary composite
+                    // algebra, this is essential after interface binding: the resource now has an
+                    // OpTypeImage/OpTypeSampler and cannot remain inserted into the aggregate's
+                    // former LLVM pointer field merely because another field is still live.
+                    let original_composite = *composite;
+                    let mut composite = original_composite;
+                    while paths.contains_key(&composite) {
+                        let Some((base, inserted_path)) = inserts.get(&composite) else {
+                            break;
+                        };
+                        if !composite_paths_are_disjoint(inserted_path, &path) {
+                            break;
+                        }
+                        composite = *base;
+                    }
+                    if composite != original_composite {
+                        extract_bases.push((result, composite));
+                    }
+                    let Some(composite_paths) = paths.get(&composite) else {
                         continue;
                     };
                     if let Some(resource) = composite_paths.get(&path).copied() {
@@ -959,17 +1239,178 @@ pub(in crate::passes) fn collapse_resource_wrappers(
         }
     }
 
-    if replacements.is_empty() {
-        return;
+    if !extract_bases.is_empty() {
+        let extract_bases = extract_bases.into_iter().collect::<HashMap<_, _>>();
+        for inst in ctx.module.functions[entry_idx]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| block.instructions.iter_mut())
+        {
+            if inst.class.opcode != Op::CompositeExtract {
+                continue;
+            }
+            let Some(base) = inst
+                .result_id
+                .and_then(|result| extract_bases.get(&result))
+                .copied()
+            else {
+                continue;
+            };
+            inst.operands[0] = Operand::IdRef(base);
+        }
     }
 
-    {
-        let func = &mut ctx.module.functions[entry_idx];
-        for (from, to) in replacements {
-            replace_id_in_function(func, from, to);
+    let replacement_roots = replacements.iter().map(|(_, to)| *to).collect::<Vec<_>>();
+    if !replacements.is_empty() {
+        // The typed sidecar crosses the same resource-wrapper seam as the function body. In
+        // particular, a dynamic pointer-field load can retain an `OpCompositeExtract` result as its
+        // root after the actual instruction is collapsed to a descriptor-array variable. Remap
+        // those facts before the dead wrapper instructions are swept, or the later texture-array
+        // materializer sees a dangling root even though the body now refers to the correct resource.
+        let replacement_map = replacements.iter().copied().collect();
+        ctx.emit_sidecar.remap_ids(&replacement_map);
+        {
+            let func = &mut ctx.module.functions[entry_idx];
+            for (from, to) in replacements {
+                replace_id_in_function(func, from, to);
+            }
         }
     }
     remove_dead_resource_wrapper_ops(ctx, entry_idx);
+    replacement_roots
+}
+
+/// Re-apply wrapper collapse after AIR-call lowering for concrete pointers and opaque SPIR-V values.
+///
+/// Interface-bound images and samplers are known during `apply_bindings`, but stable AIR calls such
+/// as `air.get_null_texture_*` materialize their image values later. Discovering values from their
+/// final SPIR-V type keeps both producers on the same structural path and prevents a late image or
+/// sampler from remaining in an LLVM pointer-shaped private aggregate. Concrete logical pointers
+/// need the same forwarding after helper inlining: opaque LLVM `ptr` fields cannot nominate one
+/// SPIR-V storage class and pointee type that fits every inserted value.
+pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) -> Result<(), String> {
+    let resource_values = ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .chain(
+            ctx.module.functions[entry_idx]
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter()),
+        )
+        .filter_map(|inst| {
+            let result = inst.result_id?;
+            let ty = type_def_of(ctx, inst.result_type?)?;
+            matches!(
+                ty.class.opcode,
+                Op::TypePointer | Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage
+            )
+            .then_some(result)
+        })
+        .collect::<HashSet<_>>();
+    let replacement_roots = collapse_resource_wrappers(ctx, entry_idx, &resource_values);
+
+    // Wrapper forwarding can expose a concrete pointer root only after apply_bindings' original
+    // storage-class walk has finished. Re-run that same transitive rewrite from the forwarded
+    // roots, grouped by their actual SPIR-V storage class, so descendant access chains cannot keep
+    // the aggregate field's former opaque UniformConstant pointer type.
+    let value_types = combined_value_types(ctx, entry_idx);
+    let mut roots_by_storage: Vec<(StorageClass, Vec<Word>)> = vec![];
+    let mut pointer_roots = replacement_roots;
+    // A second late collapse can erase the wrapper path that originally identified a forwarded
+    // pointer before this storage walk begins. The remaining access chain is self-describing: if
+    // its base pointer and result pointer nominate different storage classes, the base is another
+    // concrete root whose descendants must follow the base. Collect those roots as an invariant
+    // check instead of relying solely on wrapper-replacement bookkeeping.
+    for inst in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.iter())
+        .filter(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+            )
+        })
+    {
+        let Some(base) = inst.operands.first().and_then(|operand| match operand {
+            Operand::IdRef(id) => Some(*id),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(base_pointer_type) = value_types.get(&base).copied() else {
+            continue;
+        };
+        let Some(base_storage) = ptr_storage_from_type(ctx, base_pointer_type) else {
+            continue;
+        };
+        let Some(result_storage) = inst
+            .result_type
+            .and_then(|pointer_type| ptr_storage_from_type(ctx, pointer_type))
+        else {
+            continue;
+        };
+        if base_storage != result_storage {
+            pointer_roots.push(base);
+        }
+    }
+    for root in pointer_roots {
+        let Some(pointer_type) = value_types.get(&root).copied() else {
+            continue;
+        };
+        let Some(pointer_def) = type_def_of(ctx, pointer_type) else {
+            continue;
+        };
+        if pointer_def.class.opcode != Op::TypePointer {
+            continue;
+        }
+        let Some(Operand::StorageClass(storage)) = pointer_def.operands.first() else {
+            continue;
+        };
+        if let Some((_, roots)) = roots_by_storage
+            .iter_mut()
+            .find(|(candidate, _)| candidate == storage)
+        {
+            roots.push(root);
+        } else {
+            roots_by_storage.push((*storage, vec![root]));
+        }
+    }
+    let defs = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+        .collect();
+    for (storage, mut roots) in roots_by_storage {
+        roots.sort_unstable();
+        roots.dedup();
+        rewrite_pointer_storage(ctx, entry_idx, &roots, storage, &defs)?;
+    }
+    Ok(())
+}
+
+fn ptr_storage_from_type(ctx: &Ctx, pointer_type: Word) -> Option<StorageClass> {
+    let pointer_def = type_def_of(ctx, pointer_type)?;
+    if pointer_def.class.opcode != Op::TypePointer {
+        return None;
+    }
+    pointer_def
+        .operands
+        .first()
+        .and_then(|operand| match operand {
+            Operand::StorageClass(storage) => Some(*storage),
+            _ => None,
+        })
+}
+
+fn composite_paths_are_disjoint(left: &[u32], right: &[u32]) -> bool {
+    !left.starts_with(right) && !right.starts_with(left)
 }
 
 pub(in crate::passes) fn insert_resource_path(
@@ -1062,5 +1503,299 @@ pub(in crate::passes) fn function_used_ids(func: &Function) -> HashSet<Word> {
 pub(in crate::passes) fn collect_operand_id_refs(operand: &Operand, used: &mut HashSet<Word>) {
     if let Operand::IdRef(id) = operand {
         used.insert(*id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::ModuleHeader;
+
+    #[test]
+    fn resource_wrapper_collapse_remaps_dynamic_field_fact_root() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        let aggregate = 10;
+        let wrapped = 11;
+        let extracted = 12;
+        let resource = 20;
+        let handle = 30;
+        let index = 31;
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CompositeInsert,
+                        Some(1),
+                        Some(wrapped),
+                        vec![
+                            Operand::IdRef(resource),
+                            Operand::IdRef(aggregate),
+                            Operand::LiteralBit32(0),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::CompositeExtract,
+                        Some(2),
+                        Some(extracted),
+                        vec![Operand::IdRef(wrapped), Operand::LiteralBit32(0)],
+                    ),
+                ],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+        ctx.emit_sidecar.local_pointer_dynamic_field_loads.push(
+            crate::emit_sidecar::LocalPointerDynamicFieldLoad {
+                id: handle,
+                root: extracted,
+                prefix: vec![],
+                index,
+                suffix: vec![0],
+            },
+        );
+
+        let _ = collapse_resource_wrappers(&mut ctx, 0, &HashSet::from([resource]));
+
+        assert_eq!(
+            ctx.emit_sidecar.local_pointer_dynamic_field_loads[0].root,
+            resource
+        );
+        assert!(ctx.module.functions[0].blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn resource_insert_is_removed_when_only_a_disjoint_field_is_extracted() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        let aggregate = 10;
+        let resource = 20;
+        let resource_copy = 21;
+        let wrapped = 22;
+        let extracted = 23;
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CopyObject,
+                        Some(2),
+                        Some(resource_copy),
+                        vec![Operand::IdRef(resource)],
+                    ),
+                    Instruction::new(
+                        Op::CompositeInsert,
+                        Some(1),
+                        Some(wrapped),
+                        vec![
+                            Operand::IdRef(resource_copy),
+                            Operand::IdRef(aggregate),
+                            Operand::LiteralBit32(3),
+                            Operand::LiteralBit32(0),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::CompositeExtract,
+                        Some(3),
+                        Some(extracted),
+                        vec![
+                            Operand::IdRef(wrapped),
+                            Operand::LiteralBit32(0),
+                            Operand::LiteralBit32(0),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(50), Operand::IdRef(extracted)],
+                    ),
+                ],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+
+        let _ = collapse_resource_wrappers(&mut ctx, 0, &HashSet::from([resource]));
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(!instructions.iter().any(|inst| {
+            matches!(inst.result_id, Some(id) if id == resource_copy || id == wrapped)
+        }));
+        let extract = instructions
+            .iter()
+            .find(|inst| inst.result_id == Some(extracted))
+            .unwrap();
+        assert_eq!(extract.operands.first(), Some(&Operand::IdRef(aggregate)));
+    }
+
+    #[test]
+    fn late_pointer_wrapper_forwards_the_concrete_inserted_pointer() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values.extend([
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(2),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(1),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(3),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(1),
+                ],
+            ),
+        ]);
+        let aggregate = 10;
+        let concrete_pointer = 20;
+        let wrapped = 21;
+        let extracted = 22;
+        let derived = 23;
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CompositeInsert,
+                        Some(4),
+                        Some(wrapped),
+                        vec![
+                            Operand::IdRef(concrete_pointer),
+                            Operand::IdRef(aggregate),
+                            Operand::LiteralBit32(0),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::CompositeExtract,
+                        Some(3),
+                        Some(extracted),
+                        vec![Operand::IdRef(wrapped), Operand::LiteralBit32(0)],
+                    ),
+                    Instruction::new(
+                        Op::AccessChain,
+                        Some(3),
+                        Some(derived),
+                        vec![Operand::IdRef(extracted)],
+                    ),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(derived), Operand::IdRef(50)],
+                    ),
+                ],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+        // Interface variables are synthesized during binding and remain pending in `new_globals`
+        // until final assembly. Late wrapper discovery must see them there.
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(2),
+            Some(concrete_pointer),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ));
+
+        collapse_late_pointer_and_opaque_wrappers(&mut ctx, 0).unwrap();
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(!instructions
+            .iter()
+            .any(|inst| inst.result_id == Some(wrapped)));
+        let store = instructions
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Store)
+            .unwrap();
+        assert_eq!(store.operands.first(), Some(&Operand::IdRef(derived)));
+        let access = instructions
+            .iter()
+            .find(|inst| inst.result_id == Some(derived))
+            .unwrap();
+        assert_eq!(
+            access.operands.first(),
+            Some(&Operand::IdRef(concrete_pointer))
+        );
+        assert_eq!(access.result_type, Some(2));
+    }
+
+    #[test]
+    fn late_pointer_collapse_repairs_direct_base_storage_mismatch() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values.extend([
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(2),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(1),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(3),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(1),
+                ],
+            ),
+        ]);
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(3),
+                    Some(21),
+                    vec![Operand::IdRef(20)],
+                )],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(2),
+            Some(20),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ));
+
+        collapse_late_pointer_and_opaque_wrappers(&mut ctx, 0).unwrap();
+
+        assert_eq!(
+            ctx.module.functions[0].blocks[0].instructions[0].result_type,
+            Some(2)
+        );
     }
 }

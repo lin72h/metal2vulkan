@@ -74,7 +74,7 @@ pub(in crate::native) fn split_multi_exit_critical_edges(
 
         let source_block = blocks.iter_mut().find(|b| b.name == source)?;
         // Redirect the terminator on the carrier (typed dual of the former string redirect).
-        if let Some(t) = &mut source_block.typed {
+        if let Some(t) = source_block.typed_mut() {
             for (index, edge) in &edges {
                 t.redirect_successor(&exits[*index], edge);
             }
@@ -82,7 +82,7 @@ pub(in crate::native) fn split_multi_exit_critical_edges(
 
         for (index, edge) in &edges {
             let exit = blocks.iter_mut().find(|b| b.name == exits[*index])?;
-            if let Some(t) = &mut exit.typed {
+            if let Some(t) = exit.typed_mut() {
                 t.rewrite_phi_predecessor(&source, edge);
             }
             let edge_lines = vec![format!("br label {}", exits[*index])];
@@ -91,7 +91,8 @@ pub(in crate::native) fn split_multi_exit_critical_edges(
                     edge,
                     &edge_lines,
                     &std::collections::HashMap::new(),
-                ),
+                )
+                .map(Into::into),
                 name: edge.clone(),
                 role: role_for_name(edge),
             });
@@ -160,7 +161,7 @@ pub(in crate::native) fn synth_multi_exit_merge(
     // Redirect every in-loop exit edge directly to the merge.
     for b in blocks.iter_mut() {
         if let Some((_, idx)) = preds.iter().find(|(n, _)| n == &b.name) {
-            if let Some(t) = &mut b.typed {
+            if let Some(t) = b.typed_mut() {
                 t.redirect_successor(&exits[*idx], &merge);
             }
         }
@@ -251,7 +252,7 @@ pub(in crate::native) fn synth_multi_exit_merge(
                 typed_value_phis.push((merged, cty, merged_typed));
             }
         }
-        if let Some(t) = &mut blocks[exit_idx].typed {
+        if let Some(t) = blocks[exit_idx].typed_mut() {
             for (dst, kept_plus) in &exit_typed_merges {
                 t.set_phi_incomings(dst, kept_plus);
             }
@@ -283,7 +284,7 @@ pub(in crate::native) fn synth_multi_exit_merge(
     let merge_block = BodyBlock {
         name: merge.clone(),
         role: role_for_name(&merge),
-        typed: Some(blk),
+        typed: Some(blk.into()),
     };
     // Place it just before the first exit target so it sits in a natural position.
     let insert_at = blocks
@@ -380,7 +381,7 @@ pub(in crate::native) fn synth_multi_latch_continue(
             typed_value_phis.push((merged, cty, merged_typed));
         }
     }
-    if let Some(t) = &mut blocks[hidx].typed {
+    if let Some(t) = blocks[hidx].typed_mut() {
         for (dst, kept_plus) in &header_typed_merges {
             t.set_phi_incomings(dst, kept_plus);
         }
@@ -389,7 +390,7 @@ pub(in crate::native) fn synth_multi_latch_continue(
     // Redirect each latch's header edge to the new single latch `L`.
     for l in &latches {
         if let Some(b) = blocks.iter_mut().find(|b| &b.name == l) {
-            if let Some(t) = &mut b.typed {
+            if let Some(t) = b.typed_mut() {
                 t.redirect_successor(header, &new_latch);
             }
         }
@@ -413,7 +414,7 @@ pub(in crate::native) fn synth_multi_latch_continue(
         BodyBlock {
             name: new_latch.clone(),
             role: role_for_name(&new_latch),
-            typed: Some(blk),
+            typed: Some(blk.into()),
         }
     };
     blocks.insert(insert_at, latch_block);

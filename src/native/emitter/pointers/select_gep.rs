@@ -25,15 +25,73 @@ impl Emitter {
         let Some(storage) = true_storage.or(false_storage) else {
             return Ok(false);
         };
+        let pointee = gep_pointee(source_ty, indices)?;
+        if let (Some(true_storage), Some(false_storage)) = (true_storage, false_storage) {
+            if true_storage != false_storage {
+                let raw_arm = |emitter: &Self, value: &LlValue| match value {
+                    LlValue::Local(local) => emitter.raw_offsets.get(local).cloned(),
+                    _ => None,
+                };
+                let true_raw = raw_arm(self, &selected.true_value)
+                    .map(|raw| self.apply_raw_gep(raw, source_ty, indices))
+                    .transpose()?;
+                let false_raw = raw_arm(self, &selected.false_value)
+                    .map(|raw| self.apply_raw_gep(raw, source_ty, indices))
+                    .transpose()?;
+                let true_ptr = if true_raw.is_none() {
+                    let ptr_type = self.ptr_type_id(true_storage, &pointee)?;
+                    Some(self.emit_selected_pointer_access_chain(
+                        ptr_type,
+                        &selected.true_value,
+                        &selected.ty,
+                        source_ty,
+                        &pointee,
+                        true_storage,
+                        indices,
+                        instructions,
+                    )?)
+                } else {
+                    None
+                };
+                let false_ptr = if false_raw.is_none() {
+                    let ptr_type = self.ptr_type_id(false_storage, &pointee)?;
+                    Some(self.emit_selected_pointer_access_chain(
+                        ptr_type,
+                        &selected.false_value,
+                        &selected.ty,
+                        source_ty,
+                        &pointee,
+                        false_storage,
+                        indices,
+                        instructions,
+                    )?)
+                } else {
+                    None
+                };
+                self.selected_load_pointers.insert(
+                    name.to_string(),
+                    SelectedLoadPointer {
+                        cond: selected.cond,
+                        true_ptr,
+                        false_ptr,
+                        true_storage,
+                        false_storage,
+                        pointee: pointee.clone(),
+                        true_raw,
+                        false_raw,
+                        load_typed: false,
+                    },
+                );
+                self.pointer_pointees.insert(name.to_string(), pointee);
+                return Ok(true);
+            }
+        }
         if !matches!(
             storage,
             StorageClass::StorageBuffer | StorageClass::UniformConstant
-        ) || true_storage.is_some_and(|true_storage| true_storage != storage)
-            || false_storage.is_some_and(|false_storage| false_storage != storage)
-        {
+        ) {
             return Ok(false);
         }
-        let pointee = gep_pointee(source_ty, indices)?;
         if true_is_null || false_is_null {
             return self.emit_nullable_selected_pointer_gep(
                 name,
@@ -110,6 +168,8 @@ impl Emitter {
                 cond: selected.cond,
                 true_ptr,
                 false_ptr,
+                true_storage: storage,
+                false_storage: storage,
                 pointee: pointee.clone(),
                 true_raw,
                 false_raw,
@@ -129,7 +189,6 @@ impl Emitter {
         &mut self,
         name: &str,
         selected: &SelectedLoadPointer,
-        storage: StorageClass,
         source_ty: &LlType,
         indices: &[TypedValue],
         instructions: &mut Vec<Instruction>,
@@ -148,14 +207,21 @@ impl Emitter {
             .clone()
             .map(|raw| self.apply_raw_gep(raw, source_ty, indices))
             .transpose()?;
-        let ptr_type = (selected.true_ptr.is_some() || selected.false_ptr.is_some())
-            .then(|| self.ptr_type_id(storage, &pointee))
+        let true_ptr_type = selected
+            .true_ptr
+            .is_some()
+            .then(|| self.ptr_type_id(selected.true_storage, &pointee))
             .transpose()?;
-        let true_ptr = match (selected.true_ptr, ptr_type) {
+        let false_ptr_type = selected
+            .false_ptr
+            .is_some()
+            .then(|| self.ptr_type_id(selected.false_storage, &pointee))
+            .transpose()?;
+        let true_ptr = match (selected.true_ptr, true_ptr_type) {
             (Some(ptr), Some(ptr_type)) => Some(self.emit_selected_pointer_access_chain_from_id(
                 ptr_type,
                 ptr,
-                storage,
+                selected.true_storage,
                 source_ty,
                 &pointee,
                 indices,
@@ -164,11 +230,11 @@ impl Emitter {
             (None, _) => None,
             (Some(_), None) => return Ok(false),
         };
-        let false_ptr = match (selected.false_ptr, ptr_type) {
+        let false_ptr = match (selected.false_ptr, false_ptr_type) {
             (Some(ptr), Some(ptr_type)) => Some(self.emit_selected_pointer_access_chain_from_id(
                 ptr_type,
                 ptr,
-                storage,
+                selected.false_storage,
                 source_ty,
                 &pointee,
                 indices,
@@ -177,8 +243,8 @@ impl Emitter {
             (None, _) => None,
             (Some(_), None) => return Ok(false),
         };
-        if (true_ptr.is_none() || false_ptr.is_none())
-            && (true_raw.is_none() || false_raw.is_none())
+        if (true_ptr.is_none() && true_raw.is_none())
+            || (false_ptr.is_none() && false_raw.is_none())
         {
             return Ok(false);
         }
@@ -188,13 +254,18 @@ impl Emitter {
                 cond: selected.cond,
                 true_ptr,
                 false_ptr,
+                true_storage: selected.true_storage,
+                false_storage: selected.false_storage,
                 pointee: pointee.clone(),
                 true_raw,
                 false_raw,
                 load_typed: false,
             },
         );
-        self.pointer_storage.insert(name.to_string(), storage);
+        if selected.true_storage == selected.false_storage {
+            self.pointer_storage
+                .insert(name.to_string(), selected.true_storage);
+        }
         self.pointer_pointees.insert(name.to_string(), pointee);
         if !self.pointer_phi_values.is_empty() {
             let is_null = self.const_bool(false)?;

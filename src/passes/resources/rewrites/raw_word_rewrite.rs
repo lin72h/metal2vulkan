@@ -1,6 +1,7 @@
 //! Raw-word and raw-byte resource access rewrites.
 
 use super::*;
+use crate::passes::access::{flatten_affine_offset_roots, inherited_affine_byte_offset};
 
 #[derive(Clone, Debug)]
 pub(in crate::passes) struct BufferAccessPath {
@@ -118,7 +119,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
                     {
                         if buffer_types
                             .get(base)
-                            .is_some_and(|ty| is_raw_uint_runtime_block(&types, *ty))
+                            .is_some_and(|ty| is_raw_uint_word_block(&types, *ty))
                         {
                             if let Some(word) =
                                 direct_raw_root_word_index(&types, &snapshot.operands[1..])
@@ -292,6 +293,48 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
             }
 
             if snapshot.class.opcode == Op::Load {
+                if let Some(rewrite) = plan_structured_raw_vector_load_rewrite(
+                    ctx,
+                    &mut value_types,
+                    &mut raw_alias_vars,
+                    StructuredRawInputs {
+                        types: &types,
+                        defs,
+                        buffer_types: &buffer_types,
+                        paths: &paths,
+                    },
+                    &snapshot,
+                ) {
+                    let inserted = rewrite.prefix.len();
+                    let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                    for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                        insts.insert(ii + offset, inst);
+                    }
+                    insts[ii + inserted] = rewrite.replacement;
+                    ii += inserted + 1;
+                    continue;
+                }
+                if let Some(rewrite) = plan_structured_raw_subword_load_rewrite(
+                    ctx,
+                    &mut value_types,
+                    &mut raw_alias_vars,
+                    StructuredRawInputs {
+                        types: &types,
+                        defs,
+                        buffer_types: &buffer_types,
+                        paths: &paths,
+                    },
+                    &snapshot,
+                ) {
+                    let inserted = rewrite.prefix.len();
+                    let insts = &mut ctx.module.functions[entry_idx].blocks[bi].instructions;
+                    for (offset, inst) in rewrite.prefix.into_iter().enumerate() {
+                        insts.insert(ii + offset, inst);
+                    }
+                    insts[ii + inserted] = rewrite.replacement;
+                    ii += inserted + 1;
+                    continue;
+                }
                 if let Some(rewrite) = plan_mismatched_raw_word_load_rewrite(
                     ctx,
                     &types,
@@ -389,6 +432,252 @@ pub(in crate::passes) struct RawStoreRewrite {
 pub(in crate::passes) struct RawLoadRewrite {
     pub(in crate::passes) prefix: Vec<Instruction>,
     pub(in crate::passes) replacement: Instruction,
+}
+
+#[derive(Clone, Copy)]
+struct StructuredRawInputs<'a> {
+    types: &'a HashMap<Word, Instruction>,
+    defs: &'a HashMap<Word, Instruction>,
+    buffer_types: &'a HashMap<Word, Word>,
+    paths: &'a HashMap<Word, BufferAccessPath>,
+}
+
+/// Reconstruct a vector of 32-bit lanes from the raw descriptor that replaced its source aggregate.
+/// Each lane is addressed from the emitter's exact byte fact, so overlapping source layouts remain
+/// representable after interface remodeling has erased their aggregate type.
+fn plan_structured_raw_vector_load_rewrite(
+    ctx: &mut Ctx,
+    value_types: &mut HashMap<Word, Word>,
+    raw_alias_vars: &mut HashMap<Word, Word>,
+    inputs: StructuredRawInputs<'_>,
+    load: &Instruction,
+) -> Option<RawLoadRewrite> {
+    if load.operands.len() != 1 {
+        return None;
+    }
+    let result = load.result_id?;
+    let result_ty = load.result_type?;
+    let vector = inputs.types.get(&result_ty)?;
+    let (Some(Operand::IdRef(component_ty)), Some(Operand::LiteralBit32(lanes))) =
+        (vector.operands.first(), vector.operands.get(1))
+    else {
+        return None;
+    };
+    if vector.class.opcode != Op::TypeVector
+        || !(is_integer_type_with_width(inputs.types, *component_ty, 32)
+            || inputs.types.get(component_ty).is_some_and(|ty| {
+                ty.class.opcode == Op::TypeFloat && ty.operands == [Operand::LiteralBit32(32)]
+            }))
+    {
+        return None;
+    }
+    let Operand::IdRef(ptr) = load.operands[0] else {
+        return None;
+    };
+    exact_raw_word_fact(ctx, inputs.types, inputs.buffer_types, ptr)?;
+    let access = structured_raw_word_access(
+        ctx,
+        inputs.types,
+        raw_alias_vars,
+        inputs.defs,
+        inputs.buffer_types,
+        inputs.paths,
+        ptr,
+    )?;
+    let uint = ctx.ty_uint();
+    let mut prefix = Vec::new();
+    let mut components = Vec::with_capacity(*lanes as usize);
+    for lane in 0..*lanes {
+        let byte_offset = access.byte_offset.checked_add(lane.checked_mul(4)?)?;
+        let raw = raw_u32_at_const_byte_offset(
+            ctx,
+            value_types,
+            access.raw_var,
+            byte_offset,
+            &mut prefix,
+        );
+        let component = if *component_ty == uint {
+            raw
+        } else {
+            let converted = ctx.module.fresh_id();
+            prefix.push(Instruction::new(
+                Op::Bitcast,
+                Some(*component_ty),
+                Some(converted),
+                vec![Operand::IdRef(raw)],
+            ));
+            value_types.insert(converted, *component_ty);
+            converted
+        };
+        components.push(Operand::IdRef(component));
+    }
+    Some(RawLoadRewrite {
+        prefix,
+        replacement: Instruction::new(
+            Op::CompositeConstruct,
+            Some(result_ty),
+            Some(result),
+            components,
+        ),
+    })
+}
+
+fn raw_u32_at_const_byte_offset(
+    ctx: &mut Ctx,
+    value_types: &mut HashMap<Word, Word>,
+    raw_var: Word,
+    byte_offset: u32,
+    prefix: &mut Vec<Instruction>,
+) -> Word {
+    let uint = ctx.ty_uint();
+    let low = raw_word_load_at_const_index(ctx, value_types, raw_var, byte_offset / 4, prefix);
+    let byte_lane = byte_offset % 4;
+    if byte_lane == 0 {
+        return low;
+    }
+    let shifted_low = ctx.module.fresh_id();
+    prefix.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(uint),
+        Some(shifted_low),
+        vec![
+            Operand::IdRef(low),
+            Operand::IdRef(ctx.const_uint(byte_lane * 8)),
+        ],
+    ));
+    value_types.insert(shifted_low, uint);
+    let high = raw_word_load_at_const_index(ctx, value_types, raw_var, byte_offset / 4 + 1, prefix);
+    let shifted_high = ctx.module.fresh_id();
+    prefix.push(Instruction::new(
+        Op::ShiftLeftLogical,
+        Some(uint),
+        Some(shifted_high),
+        vec![
+            Operand::IdRef(high),
+            Operand::IdRef(ctx.const_uint(32 - byte_lane * 8)),
+        ],
+    ));
+    value_types.insert(shifted_high, uint);
+    let assembled = ctx.module.fresh_id();
+    prefix.push(Instruction::new(
+        Op::BitwiseOr,
+        Some(uint),
+        Some(assembled),
+        vec![Operand::IdRef(shifted_low), Operand::IdRef(shifted_high)],
+    ));
+    value_types.insert(assembled, uint);
+    assembled
+}
+
+/// Recover a direct 8/16-bit integer load after its buffer interface has been remodeled as raw
+/// 32-bit words. Typed emitter provenance preserves the exact byte offset even when the rewritten
+/// descriptor no longer carries the source struct/union shape. Load the containing word(s),
+/// assemble little-endian bits, mask, and narrow to the source integer type.
+fn plan_structured_raw_subword_load_rewrite(
+    ctx: &mut Ctx,
+    value_types: &mut HashMap<Word, Word>,
+    raw_alias_vars: &mut HashMap<Word, Word>,
+    inputs: StructuredRawInputs<'_>,
+    load: &Instruction,
+) -> Option<RawLoadRewrite> {
+    if load.operands.len() != 1 {
+        return None;
+    }
+    let result = load.result_id?;
+    let result_ty = load.result_type?;
+    let bits = if is_integer_type_with_width(inputs.types, result_ty, 8) {
+        8
+    } else if is_integer_type_with_width(inputs.types, result_ty, 16) {
+        16
+    } else {
+        return None;
+    };
+    let Operand::IdRef(ptr) = load.operands[0] else {
+        return None;
+    };
+    exact_raw_word_fact(ctx, inputs.types, inputs.buffer_types, ptr)?;
+    let access = structured_raw_word_access(
+        ctx,
+        inputs.types,
+        raw_alias_vars,
+        inputs.defs,
+        inputs.buffer_types,
+        inputs.paths,
+        ptr,
+    )?;
+    let uint = ctx.ty_uint();
+    let word_index = access.byte_offset / 4;
+    let byte_lane = access.byte_offset % 4;
+    let mut prefix = Vec::new();
+    let low =
+        raw_word_load_at_const_index(ctx, value_types, access.raw_var, word_index, &mut prefix);
+    let shifted_low = if byte_lane == 0 {
+        low
+    } else {
+        let shifted = ctx.module.fresh_id();
+        prefix.push(Instruction::new(
+            Op::ShiftRightLogical,
+            Some(uint),
+            Some(shifted),
+            vec![
+                Operand::IdRef(low),
+                Operand::IdRef(ctx.const_uint(byte_lane * 8)),
+            ],
+        ));
+        value_types.insert(shifted, uint);
+        shifted
+    };
+    let assembled = if byte_lane * 8 + bits <= 32 {
+        shifted_low
+    } else {
+        let high = raw_word_load_at_const_index(
+            ctx,
+            value_types,
+            access.raw_var,
+            word_index + 1,
+            &mut prefix,
+        );
+        let shifted_high = ctx.module.fresh_id();
+        prefix.push(Instruction::new(
+            Op::ShiftLeftLogical,
+            Some(uint),
+            Some(shifted_high),
+            vec![
+                Operand::IdRef(high),
+                Operand::IdRef(ctx.const_uint(32 - byte_lane * 8)),
+            ],
+        ));
+        value_types.insert(shifted_high, uint);
+        let assembled = ctx.module.fresh_id();
+        prefix.push(Instruction::new(
+            Op::BitwiseOr,
+            Some(uint),
+            Some(assembled),
+            vec![Operand::IdRef(shifted_low), Operand::IdRef(shifted_high)],
+        ));
+        value_types.insert(assembled, uint);
+        assembled
+    };
+    let masked = ctx.module.fresh_id();
+    prefix.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(uint),
+        Some(masked),
+        vec![
+            Operand::IdRef(assembled),
+            Operand::IdRef(ctx.const_uint((1u32 << bits) - 1)),
+        ],
+    ));
+    value_types.insert(masked, uint);
+    Some(RawLoadRewrite {
+        prefix,
+        replacement: Instruction::new(
+            Op::UConvert,
+            Some(result_ty),
+            Some(result),
+            vec![Operand::IdRef(masked)],
+        ),
+    })
 }
 
 pub(in crate::passes) fn plan_mismatched_raw_word_load_rewrite(
@@ -750,12 +1039,7 @@ pub(in crate::passes) fn plan_structured_raw_word_load_rewrite(
     result_ty: Word,
     result_kind: RawStoreObject,
 ) -> Option<RawLoadRewrite> {
-    let path = paths.get(&ptr)?;
-    let block_ty = buffer_types.get(&path.root).copied()?;
-    let byte_offset = access_path_byte_offset(types, block_ty, &path.indices)?;
-    if byte_offset % 4 == 0 {
-        return None;
-    }
+    let has_exact_raw_fact = exact_raw_word_fact(ctx, types, buffer_types, ptr).is_some();
     let access =
         structured_raw_word_access(ctx, types, raw_alias_vars, defs, buffer_types, paths, ptr)?;
 
@@ -768,6 +1052,31 @@ pub(in crate::passes) fn plan_structured_raw_word_load_rewrite(
         access.byte_offset / 4,
         &mut prefix,
     );
+    if access.byte_offset % 4 == 0 {
+        if !has_exact_raw_fact {
+            return None;
+        }
+        return match result_kind {
+            RawStoreObject::Uint32 => Some(RawLoadRewrite {
+                prefix,
+                replacement: Instruction::new(
+                    Op::CopyObject,
+                    Some(result_ty),
+                    Some(result),
+                    vec![Operand::IdRef(low_word)],
+                ),
+            }),
+            RawStoreObject::Float32 => Some(RawLoadRewrite {
+                prefix,
+                replacement: Instruction::new(
+                    Op::Bitcast,
+                    Some(result_ty),
+                    Some(result),
+                    vec![Operand::IdRef(low_word)],
+                ),
+            }),
+        };
+    }
     let high_word = raw_word_load_at_const_index(
         ctx,
         value_types,
@@ -891,6 +1200,22 @@ pub(in crate::passes) fn structured_raw_word_access(
     paths: &HashMap<Word, BufferAccessPath>,
     ptr: Word,
 ) -> Option<StructuredRawWordAccess> {
+    if let Some((root, byte_offset)) = exact_raw_word_fact(ctx, types, buffer_types, ptr) {
+        let binding = descriptor_binding(&ctx.module, root)?;
+        let raw_var = match raw_alias_vars.get(&root).copied() {
+            Some(var) => var,
+            None => {
+                let mut type_defs = combined_type_defs(ctx, defs);
+                let var = create_raw_alias_buffer(ctx, binding, defs, &mut type_defs);
+                raw_alias_vars.insert(root, var);
+                var
+            }
+        };
+        return Some(StructuredRawWordAccess {
+            raw_var,
+            byte_offset,
+        });
+    }
     let path = paths.get(&ptr)?;
     let block_ty = buffer_types.get(&path.root).copied()?;
     let byte_offset = access_path_byte_offset(types, block_ty, &path.indices)?;
@@ -908,6 +1233,67 @@ pub(in crate::passes) fn structured_raw_word_access(
         raw_var,
         byte_offset,
     })
+}
+
+fn exact_raw_word_fact(
+    ctx: &Ctx,
+    types: &HashMap<Word, Instruction>,
+    buffer_types: &HashMap<Word, Word>,
+    ptr: Word,
+) -> Option<(Word, u32)> {
+    let mut fact_ptr = ptr;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(fact_ptr) {
+            return None;
+        }
+        if let Some(fact) = ctx.emit_sidecar.buffer_access_offsets.iter().find(|fact| {
+            fact.id == fact_ptr
+                && buffer_types
+                    .get(&fact.root)
+                    .is_some_and(|block| is_raw_uint_word_block(types, *block))
+        }) {
+            return Some((fact.root, u32::try_from(fact.byte_offset).ok()?));
+        }
+        let definition = ctx.module.functions.iter().find_map(|function| {
+            function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .find(|instruction| instruction.result_id == Some(fact_ptr))
+        })?;
+        if !matches!(
+            definition.class.opcode,
+            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain | Op::CopyObject
+        ) || definition.operands.iter().skip(1).any(
+            |operand| !matches!(operand, Operand::IdRef(id) if const_u32(types, *id) == Some(0)),
+        ) {
+            return None;
+        }
+        let Operand::IdRef(base) = definition.operands.first()? else {
+            return None;
+        };
+        fact_ptr = *base;
+    }
+}
+
+fn is_raw_uint_word_block(types: &HashMap<Word, Instruction>, block_ty: Word) -> bool {
+    let Some(block) = types.get(&block_ty) else {
+        return false;
+    };
+    let [Operand::IdRef(array_ty)] = block.operands.as_slice() else {
+        return false;
+    };
+    if block.class.opcode != Op::TypeStruct {
+        return false;
+    }
+    let Some(array) = types.get(array_ty) else {
+        return false;
+    };
+    if !matches!(array.class.opcode, Op::TypeArray | Op::TypeRuntimeArray) {
+        return false;
+    }
+    matches!(array.operands.first(), Some(Operand::IdRef(elem)) if is_uint_type(types, *elem))
 }
 
 pub(in crate::passes) fn raw_word_pointer_at_const_index(
@@ -954,6 +1340,540 @@ pub(in crate::passes) fn raw_word_load_at_const_index(
     ));
     value_types.insert(word, uint);
     word
+}
+
+/// Replay byte and 32-bit vector loads whose typed pointer was forwarded late onto a raw-uint block.
+/// Exact emitter sidecar offsets survive wrapper collapse; load the containing uint word, select
+/// the little-endian byte lane, and preserve the original byte result id. This closes the late
+/// counterpart of `rewrite_raw_word_alias_chains` without reconstructing stale aggregate paths.
+pub(in crate::passes) fn rewrite_exact_raw_word_loads(ctx: &mut Ctx, entry_idx: usize) {
+    let byte_ty = ctx.ty_int8();
+    let uint = ctx.ty_uint();
+    let types = combined_type_defs(ctx, &HashMap::new());
+    let mut value_types = combined_value_types(ctx, entry_idx);
+    let definitions = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+        .collect::<HashMap<_, _>>();
+    let facts = ctx
+        .emit_sidecar
+        .buffer_access_offsets
+        .iter()
+        .map(|fact| {
+            let root = zero_offset_raw_word_root(&types, &value_types, &definitions, fact.root)
+                .unwrap_or(fact.root);
+            (fact.id, (root, fact.byte_offset))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len());
+        for inst in old {
+            let Some((result, result_ty, pointer)) = (|| {
+                if inst.class.opcode != Op::Load || inst.operands.len() != 1 {
+                    return None;
+                }
+                let result = inst.result_id?;
+                let result_ty = inst.result_type?;
+                let Operand::IdRef(pointer) = inst.operands[0] else {
+                    return None;
+                };
+                Some((result, result_ty, pointer))
+            })() else {
+                rewritten.push(inst);
+                continue;
+            };
+            let Some(&(root, byte_offset)) = facts.get(&pointer) else {
+                rewritten.push(inst);
+                continue;
+            };
+            let Some(root_ty) = value_types.get(&root).copied() else {
+                rewritten.push(inst);
+                continue;
+            };
+            let Some(root_pointee) = ptr_pointee(&types, root_ty) else {
+                rewritten.push(inst);
+                continue;
+            };
+            if !is_raw_uint_word_block(&types, root_pointee) {
+                rewritten.push(inst);
+                continue;
+            }
+            let Ok(byte_offset) = u32::try_from(byte_offset) else {
+                rewritten.push(inst);
+                continue;
+            };
+            if result_ty != byte_ty {
+                let Some(rewrite) = plan_exact_raw_word_typed_load(
+                    ctx,
+                    &types,
+                    &mut value_types,
+                    root,
+                    byte_offset,
+                    result,
+                    result_ty,
+                ) else {
+                    rewritten.push(inst);
+                    continue;
+                };
+                rewritten.extend(rewrite.prefix);
+                rewritten.push(rewrite.replacement);
+                continue;
+            }
+            let word = raw_word_load_at_const_index(
+                ctx,
+                &mut value_types,
+                root,
+                byte_offset / 4,
+                &mut rewritten,
+            );
+            let shifted = if byte_offset % 4 == 0 {
+                word
+            } else {
+                let shifted = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::ShiftRightLogical,
+                    Some(uint),
+                    Some(shifted),
+                    vec![
+                        Operand::IdRef(word),
+                        Operand::IdRef(ctx.const_uint((byte_offset % 4) * 8)),
+                    ],
+                ));
+                value_types.insert(shifted, uint);
+                shifted
+            };
+            let masked = ctx.module.fresh_id();
+            rewritten.push(Instruction::new(
+                Op::BitwiseAnd,
+                Some(uint),
+                Some(masked),
+                vec![
+                    Operand::IdRef(shifted),
+                    Operand::IdRef(ctx.const_uint(0xff)),
+                ],
+            ));
+            rewritten.push(Instruction::new(
+                Op::UConvert,
+                Some(byte_ty),
+                Some(result),
+                vec![Operand::IdRef(masked)],
+            ));
+            value_types.insert(masked, uint);
+            value_types.insert(result, byte_ty);
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+}
+
+/// Replay scalar-byte and aligned scalar/vector 32-bit loads whose exact AIR address is affine
+/// after a buffer was remodeled as raw uint words. Dynamic byte coefficients must divide exactly
+/// by four; a scalar byte may additionally select its constant little-endian lane within that word.
+/// Wider non-aligned addresses are left unsupported rather than rounded.
+pub(in crate::passes) fn rewrite_affine_raw_word_loads(ctx: &mut Ctx, entry_idx: usize) {
+    let uint = ctx.ty_uint();
+    let types = combined_type_defs(ctx, &HashMap::new());
+    let mut value_types = combined_value_types(ctx, entry_idx);
+    let definitions = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut affine_offsets = ctx
+        .emit_sidecar
+        .buffer_access_affine_offsets
+        .iter()
+        .filter_map(|fact| {
+            Some((
+                fact.id,
+                (
+                    fact.root,
+                    u32::try_from(fact.constant).ok()?,
+                    fact.terms
+                        .iter()
+                        .map(|(index, stride)| Some((*index, u32::try_from(*stride).ok()?)))
+                        .collect::<Option<Vec<_>>>()?,
+                ),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let exact_offsets = ctx
+        .emit_sidecar
+        .buffer_access_offsets
+        .iter()
+        .map(|fact| (fact.id, (fact.root, fact.byte_offset)))
+        .collect::<HashMap<_, _>>();
+    flatten_affine_offset_roots(&mut affine_offsets, &exact_offsets);
+    if affine_offsets.is_empty() {
+        return;
+    }
+
+    for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len());
+        for instruction in old {
+            let Some((result, result_ty, pointer)) = (|| {
+                if instruction.class.opcode != Op::Load || instruction.operands.len() != 1 {
+                    return None;
+                }
+                let Operand::IdRef(pointer) = instruction.operands[0] else {
+                    return None;
+                };
+                Some((instruction.result_id?, instruction.result_type?, pointer))
+            })() else {
+                rewritten.push(instruction);
+                continue;
+            };
+            let Some((fact_root, constant, terms)) = inherited_affine_byte_offset(
+                ctx,
+                pointer,
+                &affine_offsets,
+                &definitions,
+                &types,
+                &value_types,
+                &mut HashSet::new(),
+            ) else {
+                rewritten.push(instruction);
+                continue;
+            };
+            if terms.iter().any(|(_, stride)| stride % 4 != 0) {
+                rewritten.push(instruction);
+                continue;
+            }
+            let Some(root) =
+                zero_offset_raw_word_root(&types, &value_types, &definitions, fact_root)
+            else {
+                rewritten.push(instruction);
+                continue;
+            };
+            let byte_result = result_ty == ctx.ty_int8();
+            let word_shape = raw_32bit_load_shape(&types, result_ty);
+            if !byte_result && (constant % 4 != 0 || word_shape.is_none()) {
+                rewritten.push(instruction);
+                continue;
+            }
+            let constant_words = constant / 4;
+            let terms = terms
+                .into_iter()
+                .map(|(index, stride)| (index, stride / 4))
+                .collect::<Vec<_>>();
+            let Some(index_ty) = terms
+                .first()
+                .and_then(|(index, _)| value_types.get(index).copied())
+            else {
+                rewritten.push(instruction);
+                continue;
+            };
+            if terms
+                .iter()
+                .any(|(index, _)| value_types.get(index).copied() != Some(index_ty))
+            {
+                rewritten.push(instruction);
+                continue;
+            }
+            let mut word_index = ctx.const_int_of(index_ty, i64::from(constant_words));
+            for (index, stride) in terms {
+                let term = if stride == 1 {
+                    index
+                } else {
+                    let product = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::IMul,
+                        Some(index_ty),
+                        Some(product),
+                        vec![
+                            Operand::IdRef(index),
+                            Operand::IdRef(ctx.const_int_of(index_ty, i64::from(stride))),
+                        ],
+                    ));
+                    value_types.insert(product, index_ty);
+                    product
+                };
+                let sum = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::IAdd,
+                    Some(index_ty),
+                    Some(sum),
+                    vec![Operand::IdRef(word_index), Operand::IdRef(term)],
+                ));
+                value_types.insert(sum, index_ty);
+                word_index = sum;
+            }
+            if byte_result {
+                let raw =
+                    raw_word_load_at_index(ctx, &mut value_types, root, word_index, &mut rewritten);
+                let shifted = if constant % 4 == 0 {
+                    raw
+                } else {
+                    let shifted = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::ShiftRightLogical,
+                        Some(uint),
+                        Some(shifted),
+                        vec![
+                            Operand::IdRef(raw),
+                            Operand::IdRef(ctx.const_uint((constant % 4) * 8)),
+                        ],
+                    ));
+                    value_types.insert(shifted, uint);
+                    shifted
+                };
+                let masked = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::BitwiseAnd,
+                    Some(uint),
+                    Some(masked),
+                    vec![
+                        Operand::IdRef(shifted),
+                        Operand::IdRef(ctx.const_uint(0xff)),
+                    ],
+                ));
+                rewritten.push(Instruction::new(
+                    Op::UConvert,
+                    Some(result_ty),
+                    Some(result),
+                    vec![Operand::IdRef(masked)],
+                ));
+                value_types.insert(masked, uint);
+                value_types.insert(result, result_ty);
+                continue;
+            }
+            let (component_ty, lanes) = word_shape.expect("32-bit load shape checked above");
+            let mut components = Vec::with_capacity(lanes as usize);
+            for lane in 0..lanes {
+                let lane_index = if lane == 0 {
+                    word_index
+                } else {
+                    let lane_index = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::IAdd,
+                        Some(index_ty),
+                        Some(lane_index),
+                        vec![
+                            Operand::IdRef(word_index),
+                            Operand::IdRef(ctx.const_int_of(index_ty, i64::from(lane))),
+                        ],
+                    ));
+                    value_types.insert(lane_index, index_ty);
+                    lane_index
+                };
+                let raw =
+                    raw_word_load_at_index(ctx, &mut value_types, root, lane_index, &mut rewritten);
+                let component = if component_ty == uint {
+                    raw
+                } else {
+                    let component = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(component_ty),
+                        Some(component),
+                        vec![Operand::IdRef(raw)],
+                    ));
+                    value_types.insert(component, component_ty);
+                    component
+                };
+                components.push(Operand::IdRef(component));
+            }
+            rewritten.push(if lanes == 1 {
+                Instruction::new(Op::CopyObject, Some(result_ty), Some(result), components)
+            } else {
+                Instruction::new(
+                    Op::CompositeConstruct,
+                    Some(result_ty),
+                    Some(result),
+                    components,
+                )
+            });
+            value_types.insert(result, result_ty);
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+}
+
+fn raw_32bit_load_shape(
+    types: &HashMap<Word, Instruction>,
+    result_ty: Word,
+) -> Option<(Word, u32)> {
+    if is_integer_type_with_width(types, result_ty, 32) || is_float32_type(types, result_ty) {
+        return Some((result_ty, 1));
+    }
+    let vector = types.get(&result_ty)?;
+    let (Some(Operand::IdRef(component)), Some(Operand::LiteralBit32(lanes))) =
+        (vector.operands.first(), vector.operands.get(1))
+    else {
+        return None;
+    };
+    (vector.class.opcode == Op::TypeVector
+        && (is_integer_type_with_width(types, *component, 32)
+            || is_float32_type(types, *component)))
+    .then_some((*component, *lanes))
+}
+
+fn raw_word_load_at_index(
+    ctx: &mut Ctx,
+    value_types: &mut HashMap<Word, Word>,
+    raw_var: Word,
+    word_index: Word,
+    instructions: &mut Vec<Instruction>,
+) -> Word {
+    let uint = ctx.ty_uint();
+    let pointer_ty = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+    let pointer = ctx.module.fresh_id();
+    instructions.push(Instruction::new(
+        Op::AccessChain,
+        Some(pointer_ty),
+        Some(pointer),
+        vec![
+            Operand::IdRef(raw_var),
+            Operand::IdRef(ctx.const_uint(0)),
+            Operand::IdRef(word_index),
+        ],
+    ));
+    value_types.insert(pointer, pointer_ty);
+    let loaded = ctx.module.fresh_id();
+    instructions.push(Instruction::new(
+        Op::Load,
+        Some(uint),
+        Some(loaded),
+        vec![Operand::IdRef(pointer)],
+    ));
+    value_types.insert(loaded, uint);
+    loaded
+}
+
+fn plan_exact_raw_word_typed_load(
+    ctx: &mut Ctx,
+    types: &HashMap<Word, Instruction>,
+    value_types: &mut HashMap<Word, Word>,
+    raw_var: Word,
+    byte_offset: u32,
+    result: Word,
+    result_ty: Word,
+) -> Option<RawLoadRewrite> {
+    let uint = ctx.ty_uint();
+    if is_integer_type_with_width(types, result_ty, 32) || is_float32_type(types, result_ty) {
+        let mut prefix = Vec::new();
+        let raw = raw_u32_at_const_byte_offset(ctx, value_types, raw_var, byte_offset, &mut prefix);
+        let replacement = if result_ty == uint {
+            Instruction::new(
+                Op::CopyObject,
+                Some(result_ty),
+                Some(result),
+                vec![Operand::IdRef(raw)],
+            )
+        } else {
+            Instruction::new(
+                Op::Bitcast,
+                Some(result_ty),
+                Some(result),
+                vec![Operand::IdRef(raw)],
+            )
+        };
+        return Some(RawLoadRewrite {
+            prefix,
+            replacement,
+        });
+    }
+    let vector = types.get(&result_ty)?;
+    let (Some(Operand::IdRef(component_ty)), Some(Operand::LiteralBit32(lanes))) =
+        (vector.operands.first(), vector.operands.get(1))
+    else {
+        return None;
+    };
+    if vector.class.opcode != Op::TypeVector
+        || !(is_integer_type_with_width(types, *component_ty, 32)
+            || types.get(component_ty).is_some_and(|ty| {
+                ty.class.opcode == Op::TypeFloat && ty.operands == [Operand::LiteralBit32(32)]
+            }))
+    {
+        return None;
+    }
+    let mut prefix = Vec::new();
+    let mut components = Vec::with_capacity(*lanes as usize);
+    for lane in 0..*lanes {
+        let lane_offset = byte_offset.checked_add(lane.checked_mul(4)?)?;
+        let raw = raw_u32_at_const_byte_offset(ctx, value_types, raw_var, lane_offset, &mut prefix);
+        let component = if *component_ty == uint {
+            raw
+        } else {
+            let converted = ctx.module.fresh_id();
+            prefix.push(Instruction::new(
+                Op::Bitcast,
+                Some(*component_ty),
+                Some(converted),
+                vec![Operand::IdRef(raw)],
+            ));
+            value_types.insert(converted, *component_ty);
+            converted
+        };
+        components.push(Operand::IdRef(component));
+    }
+    Some(RawLoadRewrite {
+        prefix,
+        replacement: Instruction::new(
+            Op::CompositeConstruct,
+            Some(result_ty),
+            Some(result),
+            components,
+        ),
+    })
+}
+
+/// Follow only address-preserving pointer carriers from a remapped emitter root back to its raw
+/// word descriptor. Sidecar offsets remain relative to the original buffer parameter, so a
+/// non-zero access path is deliberately rejected instead of being silently counted twice.
+fn zero_offset_raw_word_root(
+    types: &HashMap<Word, Instruction>,
+    value_types: &HashMap<Word, Word>,
+    definitions: &HashMap<Word, Instruction>,
+    root: Word,
+) -> Option<Word> {
+    let mut current = root;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current) {
+            return None;
+        }
+        let pointer_ty = value_types.get(&current).copied()?;
+        let pointee = ptr_pointee(types, pointer_ty)?;
+        if is_raw_uint_word_block(types, pointee) {
+            return Some(current);
+        }
+        let definition = definitions.get(&current)?;
+        if definition.class.opcode == Op::CopyObject {
+            let Operand::IdRef(base) = definition.operands.first()? else {
+                return None;
+            };
+            current = *base;
+            continue;
+        }
+        if !matches!(
+            definition.class.opcode,
+            Op::AccessChain | Op::InBoundsAccessChain
+        ) {
+            return None;
+        }
+        let Operand::IdRef(base) = definition.operands.first()? else {
+            return None;
+        };
+        let base_ty = value_types.get(base).copied()?;
+        let base_pointee = ptr_pointee(types, base_ty)?;
+        let indices = definition.operands[1..]
+            .iter()
+            .map(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if access_path_byte_offset(types, base_pointee, &indices) != Some(0) {
+            return None;
+        }
+        current = *base;
+    }
 }
 
 pub(in crate::passes) fn raw_byte_store_from_u32_at_const_offset(

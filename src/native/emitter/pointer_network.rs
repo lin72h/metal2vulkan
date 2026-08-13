@@ -200,7 +200,7 @@ fn pointer_edges_from_carrier(
             // the access census — 05's scalar `float` arm reaches its phi through
             // `%142 = bitcast (%141 = gep float …)`; without this edge `%141`'s Float access is invisible
             // and the whole-vs-part network masquerades as Uniform.
-            if let Some((src, dst)) = &inst.bitcast {
+            if let Some((src, dst)) = inst.bitcast.as_deref() {
                 if matches!(src.ty, LlType::Ptr(_)) && dst.trim_start().starts_with("ptr") {
                     if let LlValue::Local(local) = &src.value {
                         edges.push((name.clone(), local.clone()));
@@ -417,7 +417,7 @@ mod tests {
         BodyBlock {
             name: "entry".to_string(),
             role: crate::native::cfg::BlockRole::Normal,
-            typed,
+            typed: typed.map(Into::into),
         }
     }
 

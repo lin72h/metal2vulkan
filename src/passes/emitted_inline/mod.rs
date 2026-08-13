@@ -235,23 +235,28 @@ fn get_or_create_int_const(ctx: &mut Ctx, type_id: Word, value: u32) -> Word {
 // --- M-B2 lever (a): inline splice-time byte reassembly for union byte-buffer reinterprets ----------
 //
 // A `union`/byte-buffer helper takes a pointer to a struct VIEW (`%struct.anon`) but the caller
-// allocates the storage as a `[N x uchar]` byte array. When the inliner substitutes the byte-array
-// argument for the struct-pointer parameter, the callee's struct member-index chain (`i,0,0`) is
-// applied to the byte array, which spirv-val rejects (`OpInBoundsAccessChain reached non-composite`).
-// The struct byte layout is known ONLY at splice time (post-inline the struct type is gone), so we
-// compute the const byte offset here and rewrite the chain's loads/stores into little-endian byte
-// reassembly off the array. See dead-end #23.
+// allocates the storage as a `[N x uchar]` byte array or a same-size scalar. When the inliner
+// substitutes that differently shaped argument for the struct-pointer parameter, the callee's
+// struct member-index chain (`i,0,0`) is applied to it, which spirv-val rejects
+// (`OpInBoundsAccessChain reached non-composite`). The struct byte layout is known ONLY at splice
+// time (post-inline the struct type is gone), so we compute the constant byte offset here and rewrite
+// loads into little-endian extraction; explicit byte-array stores are reassembled too. See dead-end
+// #23.
 
-/// A recognized byte-view reinterpret chain: its loads/stores are reassembled from the caller array.
+/// A recognized byte-view reinterpret chain reconstructed from its caller-side backing storage.
 struct ByteViewPlan {
     /// Caller-side `[N x uchar]` array VARIABLE (the substituted argument).
     arg: Word,
     storage: StorageClass,
-    /// The `uchar` (8-bit int) element type id.
-    elem_uchar_ty: Word,
-    /// Byte offset of the reached scalar within the array.
+    /// The `uchar` (8-bit int) element type id when the caller stores an explicit byte array.
+    elem_uchar_ty: Option<Word>,
+    /// Caller scalar storage type when a same-size scalar allocation is viewed as a byte struct.
+    /// Such plans are read-only and extract the requested little-endian field from one scalar load.
+    scalar_backing_ty: Option<Word>,
+    /// Byte offset of the reached scalar within the backing storage.
     offset: u32,
-    /// Byte width of the reached scalar (>= 2).
+    /// Byte width of the reached scalar. Explicit byte arrays use this path only for width >= 2;
+    /// scalar backing also admits one-byte views.
     width: u32,
     /// The reached scalar type id (== the original chain result pointee).
     scalar_ty: Word,
@@ -397,8 +402,30 @@ fn callee_chain_uses_all_mem(callee: &Function, chain_id: Word) -> bool {
     used
 }
 
+fn callee_chain_uses_all_loads(callee: &Function, chain_id: Word) -> bool {
+    let mut used = false;
+    for inst in callee
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|inst| {
+            inst.operands
+                .iter()
+                .any(|operand| matches!(operand, Operand::IdRef(id) if *id == chain_id))
+        })
+    {
+        used = true;
+        if inst.class.opcode != Op::Load || inst.operands.first() != Some(&Operand::IdRef(chain_id))
+        {
+            return false;
+        }
+    }
+    used
+}
+
 /// Scan the callee for byte-view reinterpret chains (struct-pointee PARAMETER substituted by a caller
-/// `[N x uchar]` argument). Returns a map keyed by the callee chain result id. Immutable over `ctx`.
+/// `[N x uchar]` or same-size scalar argument). Returns a map keyed by the callee chain result id.
+/// Immutable over `ctx`.
 fn plan_byte_view_reinterprets(
     ctx: &Ctx,
     callee: &Function,
@@ -432,7 +459,8 @@ fn plan_byte_view_reinterprets(
             if defs.get(&callee_pointee).map(|d| d.class.opcode) != Some(Op::TypeStruct) {
                 continue;
             }
-            // The substituted argument (base remapped) must be a `[N x uchar]` Function/Private array.
+            // The substituted argument must be Function/Private storage backed by `[N x uchar]`, or
+            // by a same-size scalar when every use of this chain is a load.
             let Some(&arg) = remap.get(base) else {
                 continue;
             };
@@ -448,9 +476,22 @@ fn plan_byte_view_reinterprets(
             let Some(arg_pointee) = ptr_pointee(&defs, arg_ty) else {
                 continue;
             };
-            let Some((elem_uchar_ty, array_len)) = uchar_array_info(&defs, arg_pointee) else {
-                continue;
-            };
+            let (elem_uchar_ty, scalar_backing_ty, backing_size) =
+                if let Some((elem_uchar_ty, array_len)) = uchar_array_info(&defs, arg_pointee) {
+                    (Some(elem_uchar_ty), None, array_len)
+                } else if let Some(width) = scalar_byte_width(&defs, arg_pointee) {
+                    let (callee_size, _) = crate::passes::stage_input::layout_ty_size_align(
+                        ctx,
+                        callee_pointee,
+                        &defs,
+                    );
+                    if width != callee_size || !callee_chain_uses_all_loads(callee, chain_id) {
+                        continue;
+                    }
+                    (None, Some(arg_pointee), width)
+                } else {
+                    continue;
+                };
             // Constant byte offset + reached scalar from the CALLEE struct layout.
             let Some((offset, reached)) =
                 const_member_byte_offset(ctx, &defs, callee_pointee, indices)
@@ -460,7 +501,8 @@ fn plan_byte_view_reinterprets(
             let Some(width) = scalar_byte_width(&defs, reached) else {
                 continue;
             };
-            if width < 2 || offset + width > array_len {
+            if width == 0 || (elem_uchar_ty.is_some() && width < 2) || offset + width > backing_size
+            {
                 continue;
             }
             // The chain's declared result pointee must equal the reached scalar (sanity).
@@ -476,6 +518,7 @@ fn plan_byte_view_reinterprets(
                     arg,
                     storage,
                     elem_uchar_ty,
+                    scalar_backing_ty,
                     offset,
                     width,
                     scalar_ty: reached,
@@ -494,14 +537,96 @@ fn emit_byte_view_load(
     out_id: Word,
     out_ty: Word,
 ) -> Vec<Instruction> {
+    if let Some(source_ty) = plan.scalar_backing_ty {
+        let mut insts = Vec::new();
+        let source_width = scalar_byte_width(&type_defs_with_new_globals(ctx), source_ty)
+            .expect("scalar byte-view plans carry a scalar backing type");
+        let source_word_ty = ctx.get_or_create(
+            Op::TypeInt,
+            None,
+            vec![
+                Operand::LiteralBit32(source_width * 8),
+                Operand::LiteralBit32(0),
+            ],
+        );
+        let loaded = ctx.module.fresh_id();
+        insts.push(Instruction::new(
+            Op::Load,
+            Some(source_ty),
+            Some(loaded),
+            vec![Operand::IdRef(plan.arg)],
+        ));
+        let source_word = if source_ty == source_word_ty {
+            loaded
+        } else {
+            let word = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::Bitcast,
+                Some(source_word_ty),
+                Some(word),
+                vec![Operand::IdRef(loaded)],
+            ));
+            word
+        };
+        let shifted = if plan.offset == 0 {
+            source_word
+        } else {
+            let shifted = ctx.module.fresh_id();
+            let shift = ctx.const_int_of(source_word_ty, (plan.offset * 8) as i64);
+            insts.push(Instruction::new(
+                Op::ShiftRightLogical,
+                Some(source_word_ty),
+                Some(shifted),
+                vec![Operand::IdRef(source_word), Operand::IdRef(shift)],
+            ));
+            shifted
+        };
+        let field_word_ty = ctx.get_or_create(
+            Op::TypeInt,
+            None,
+            vec![
+                Operand::LiteralBit32(plan.width * 8),
+                Operand::LiteralBit32(0),
+            ],
+        );
+        let field_word = if source_word_ty == field_word_ty {
+            shifted
+        } else {
+            let narrowed = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::UConvert,
+                Some(field_word_ty),
+                Some(narrowed),
+                vec![Operand::IdRef(shifted)],
+            ));
+            narrowed
+        };
+        insts.push(Instruction::new(
+            if out_ty == field_word_ty {
+                Op::CopyObject
+            } else {
+                Op::Bitcast
+            },
+            Some(out_ty),
+            Some(out_id),
+            vec![Operand::IdRef(field_word)],
+        ));
+        return insts;
+    }
     let mut insts = vec![];
-    let uchar_ptr = ctx.ty_ptr(plan.storage, plan.elem_uchar_ty);
+    let elem_uchar_ty = plan
+        .elem_uchar_ty
+        .expect("array byte-view plans carry an uchar element type");
+    let uchar_ptr = ctx.ty_ptr(plan.storage, elem_uchar_ty);
     let idx_ty = ctx.ty_uint();
-    let acc_ty = if plan.width <= 4 {
-        ctx.ty_uint()
-    } else {
-        ctx.ty_ulong()
-    };
+    let acc_ty = ctx.get_or_create(
+        Op::TypeInt,
+        None,
+        vec![
+            Operand::LiteralBit32(plan.width * 8),
+            Operand::LiteralBit32(0),
+        ],
+    );
     let mut acc: Option<Word> = None;
     for k in 0..plan.width {
         let off_const = ctx.const_int_of(idx_ty, (plan.offset + k) as i64);
@@ -515,7 +640,7 @@ fn emit_byte_view_load(
         let byte = ctx.module.fresh_id();
         insts.push(Instruction::new(
             Op::Load,
-            Some(plan.elem_uchar_ty),
+            Some(elem_uchar_ty),
             Some(byte),
             vec![Operand::IdRef(bp)],
         ));
@@ -571,14 +696,21 @@ fn emit_byte_view_load(
 /// Emit a little-endian decomposition of `value_id : plan.scalar_ty` into `plan.width` byte stores at
 /// `plan.arg[offset..]`.
 fn emit_byte_view_store(ctx: &mut Ctx, plan: &ByteViewPlan, value_id: Word) -> Vec<Instruction> {
+    debug_assert!(plan.scalar_backing_ty.is_none());
     let mut insts = vec![];
-    let uchar_ptr = ctx.ty_ptr(plan.storage, plan.elem_uchar_ty);
+    let elem_uchar_ty = plan
+        .elem_uchar_ty
+        .expect("writable byte-view plans carry an uchar element type");
+    let uchar_ptr = ctx.ty_ptr(plan.storage, elem_uchar_ty);
     let idx_ty = ctx.ty_uint();
-    let acc_ty = if plan.width <= 4 {
-        ctx.ty_uint()
-    } else {
-        ctx.ty_ulong()
-    };
+    let acc_ty = ctx.get_or_create(
+        Op::TypeInt,
+        None,
+        vec![
+            Operand::LiteralBit32(plan.width * 8),
+            Operand::LiteralBit32(0),
+        ],
+    );
     let word = if plan.scalar_ty == acc_ty {
         value_id
     } else {
@@ -608,7 +740,7 @@ fn emit_byte_view_store(ctx: &mut Ctx, plan: &ByteViewPlan, value_id: Word) -> V
         let byte = ctx.module.fresh_id();
         insts.push(Instruction::new(
             Op::UConvert,
-            Some(plan.elem_uchar_ty),
+            Some(elem_uchar_ty),
             Some(byte),
             vec![Operand::IdRef(src)],
         ));
@@ -934,6 +1066,55 @@ fn inline_one_call(
             remap.insert(pid, *a);
         }
     }
+
+    // A raw pointer-handle load is represented by a module-scope Private placeholder, not by an
+    // instruction result owned by the helper. Clone that placeholder per call instance when its
+    // sidecar root is one of this callee's parameters. This gives the ordinary operand remap a
+    // call-local id and lets the sidecar carry the matching parameter substitution to the entry.
+    // Without the clone, two calls through different argument-buffer fields would share one global
+    // placeholder and could not be routed independently.
+    let callee_params = callee
+        .parameters
+        .iter()
+        .filter_map(|parameter| parameter.result_id)
+        .collect::<HashSet<_>>();
+    let pointer_placeholders = ctx
+        .emit_sidecar
+        .buffer_pointer_field_loads
+        .iter()
+        .filter(|fact| callee_params.contains(&fact.root))
+        .map(|fact| fact.id)
+        .chain(
+            ctx.emit_sidecar
+                .buffer_pointer_dynamic_field_loads
+                .iter()
+                .filter(|fact| callee_params.contains(&fact.root))
+                .map(|fact| fact.id),
+        )
+        .collect::<HashSet<_>>();
+    for placeholder in pointer_placeholders {
+        let Some(mut cloned) = ctx
+            .module
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(placeholder))
+            .cloned()
+        else {
+            continue;
+        };
+        if cloned.class.opcode != Op::Variable
+            || !matches!(
+                cloned.operands.first(),
+                Some(Operand::StorageClass(StorageClass::Private))
+            )
+        {
+            continue;
+        }
+        let fresh = ctx.module.fresh_id();
+        cloned.result_id = Some(fresh);
+        ctx.new_globals.push(cloned);
+        remap.insert(placeholder, fresh);
+    }
     let fresh_for = |old: Word, ctx: &mut Ctx, remap: &mut HashMap<Word, Word>| -> Word {
         *remap.entry(old).or_insert_with(|| ctx.module.fresh_id())
     };
@@ -952,8 +1133,7 @@ fn inline_one_call(
             }
         }
     }
-    ctx.emit_sidecar
-        .clone_inlined_local_pointer_field_loads(&remap);
+    ctx.emit_sidecar.clone_inlined_facts(&remap);
     ctx.emit_sidecar
         .remap_local_pointer_field_store_sources(&remap);
 
@@ -967,9 +1147,9 @@ fn inline_one_call(
     };
     let mut result_types = collect_result_types(ctx);
 
-    // M-B2 lever (a): recognize union byte-buffer reinterprets (struct-pointee param substituted by a
-    // caller `[N x uchar]` arg) so their loads/stores can be reassembled from the array at splice time.
-    // An empty plan (no such chain) makes `byte_view_splice` a no-op.
+    // M-B2 lever (a): recognize union byte-buffer reinterprets (a struct-pointee param substituted by
+    // a caller byte-array or same-size scalar) so their memory operations can be reconstructed at
+    // splice time. An empty plan (no such chain) makes `byte_view_splice` a no-op.
     let byte_view_plan = plan_byte_view_reinterprets(ctx, &callee, &remap, &result_types);
 
     // Single-block callee: splice instructions (minus terminator), capture return value.

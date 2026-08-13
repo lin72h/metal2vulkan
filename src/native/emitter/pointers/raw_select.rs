@@ -8,7 +8,7 @@ impl Emitter {
         result: Word,
         result_ty: &LlType,
         selected: &SelectedPointer,
-        _access_align: Option<u64>,
+        access_align: Option<u64>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let LlType::Ptr(addrspace) = self.resolve_type(&selected.ty)? else {
@@ -25,55 +25,31 @@ impl Emitter {
         let Some(storage) = true_storage.or(false_storage) else {
             return Err("native emitter: selected load has no concrete pointer arm".to_string());
         };
-        if !matches!(
-            storage,
-            StorageClass::StorageBuffer | StorageClass::UniformConstant
-        ) || true_storage.is_some_and(|true_storage| true_storage != storage)
-            || false_storage.is_some_and(|false_storage| false_storage != storage)
-        {
-            return Err(
-                "native emitter: selected direct load requires uniform storage-class arms"
-                    .to_string(),
-            );
-        }
-        let pointee = if true_is_null {
-            self.pointer_pointee_for_value(&selected.false_value)?
-        } else {
-            self.pointer_pointee_for_value(&selected.true_value)?
-        }
-        .ok_or_else(|| "native emitter: selected direct load missing pointee type".to_string())?;
         let result_ty = self.resolve_type(result_ty)?;
-        if !types_compatible(&self.resolve_type(&pointee)?, &result_ty) {
-            return Err(format!(
-                "native emitter: selected direct load type mismatch {pointee:?} vs {result_ty:?}"
-            ));
-        }
         let result_type = self.type_id(&result_ty)?;
         let true_value = if true_is_null {
             self.const_null(&result_ty)?
         } else {
-            let ptr = self.value_id(&selected.true_value, &selected.ty)?;
-            let value = self.fresh();
-            instructions.push(Self::inst(
-                Op::Load,
-                Some(result_type),
-                Some(value),
-                vec![Operand::IdRef(ptr)],
-            ));
-            value
+            self.emit_selected_direct_load_arm_value(
+                &selected.true_value,
+                &selected.ty,
+                true_storage.unwrap_or(storage),
+                &result_ty,
+                access_align,
+                instructions,
+            )?
         };
         let false_value = if false_is_null {
             self.const_null(&result_ty)?
         } else {
-            let ptr = self.value_id(&selected.false_value, &selected.ty)?;
-            let value = self.fresh();
-            instructions.push(Self::inst(
-                Op::Load,
-                Some(result_type),
-                Some(value),
-                vec![Operand::IdRef(ptr)],
-            ));
-            value
+            self.emit_selected_direct_load_arm_value(
+                &selected.false_value,
+                &selected.ty,
+                false_storage.unwrap_or(storage),
+                &result_ty,
+                access_align,
+                instructions,
+            )?
         };
         instructions.push(Self::inst(
             Op::Select,
@@ -86,6 +62,100 @@ impl Emitter {
             ],
         ));
         Ok(())
+    }
+
+    fn emit_selected_direct_load_arm_value(
+        &mut self,
+        value: &LlValue,
+        pointer_ty: &LlType,
+        storage: StorageClass,
+        load_ty: &LlType,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        if let LlValue::Local(name) = value {
+            if let Some(raw) = self.raw_offsets.get(name).cloned() {
+                let loaded = self.fresh();
+                self.emit_raw_load(loaded, load_ty, &raw, access_align, instructions)?;
+                return Ok(loaded);
+            }
+        }
+        if let Some(pointee) = self.pointer_pointee_for_value(value)? {
+            let pointee = self.resolve_type(&pointee)?;
+            if let (LlType::Int(source_bits), LlType::Int(result_bits)) = (&pointee, load_ty) {
+                if source_bits > result_bits {
+                    // AIR is little-endian: loading a narrower integer through the same base address
+                    // observes the low-bit prefix of the declared wider slot. Logical SPIR-V cannot
+                    // reinterpret the pointer itself, so preserve the access in value space by
+                    // loading through the arm's declared type and truncating to the requested width.
+                    let pointer = self.value_id(value, pointer_ty)?;
+                    let wide = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::Load,
+                        Some(self.type_id(&pointee)?),
+                        Some(wide),
+                        vec![Operand::IdRef(pointer)],
+                    ));
+                    let narrowed = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::UConvert,
+                        Some(self.type_id(load_ty)?),
+                        Some(narrowed),
+                        vec![Operand::IdRef(wide)],
+                    ));
+                    return Ok(narrowed);
+                }
+            }
+        }
+        let ptr = self.selected_direct_load_arm_pointer(
+            value,
+            pointer_ty,
+            storage,
+            load_ty,
+            instructions,
+        )?;
+        let loaded = self.fresh();
+        instructions.push(Self::inst(
+            Op::Load,
+            Some(self.type_id(load_ty)?),
+            Some(loaded),
+            vec![Operand::IdRef(ptr)],
+        ));
+        Ok(loaded)
+    }
+
+    fn selected_direct_load_arm_pointer(
+        &mut self,
+        value: &LlValue,
+        pointer_ty: &LlType,
+        storage: StorageClass,
+        load_ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        if let Some(pointee) = self.pointer_pointee_for_value(value)? {
+            if types_compatible(&self.resolve_type(&pointee)?, load_ty) {
+                return self.value_id(value, pointer_ty);
+            }
+        }
+        if let Some((element, levels)) = self.aggregate_pointer_arm_scalar_element(value)? {
+            if types_compatible(&self.resolve_type(&element)?, load_ty) {
+                let LlType::Ptr(addrspace) = self.resolve_type(pointer_ty)? else {
+                    return Err("native emitter: selected load arm is not a pointer".to_string());
+                };
+                return self.decay_pointer_arm_to_element(
+                    value,
+                    addrspace,
+                    storage,
+                    &element,
+                    levels,
+                    instructions,
+                );
+            }
+        }
+        let pointee = self.pointer_pointee_for_value(value)?;
+        Err(format!(
+            "native emitter: selected direct load arm {value:?} with pointee {pointee:?} cannot address {load_ty:?}"
+        ))
     }
 
     /// Store `object` THROUGH a direct pointer select (`selected_pointers`), the write-side analog of
@@ -270,37 +340,8 @@ impl Emitter {
             return Ok(());
         }
         let pointee = self.resolve_type(&selected.pointee)?;
-        if pointee == LlType::Int(8) && selected.true_ptr.is_none() && selected.false_ptr.is_none()
-        {
-            if let (Some(true_raw), Some(false_raw)) = (&selected.true_raw, &selected.false_raw) {
-                let result_type = self.type_id(&result_ty)?;
-                let true_value = self.fresh();
-                let false_value = self.fresh();
-                self.emit_raw_load(true_value, &result_ty, true_raw, access_align, instructions)?;
-                self.emit_raw_load(
-                    false_value,
-                    &result_ty,
-                    false_raw,
-                    access_align,
-                    instructions,
-                )?;
-                instructions.push(Self::inst(
-                    Op::Select,
-                    Some(result_type),
-                    Some(result),
-                    vec![
-                        Operand::IdRef(selected.cond),
-                        Operand::IdRef(true_value),
-                        Operand::IdRef(false_value),
-                    ],
-                ));
-                return Ok(());
-            }
-            return Err(
-                "native emitter: selected i8 pointer load requires raw offsets".to_string(),
-            );
-        }
-        if pointee == LlType::Int(8) && pointee != result_ty {
+        let reinterpret_raw = pointee == LlType::Int(8) && pointee != result_ty;
+        if reinterpret_raw {
             let pointee_bits = bitcast_width(&pointee).ok_or_else(|| {
                 format!("native emitter: cannot reinterpret selected load from {pointee:?}")
             })?;
@@ -312,36 +353,10 @@ impl Emitter {
                     "native emitter: selected pointer load bit width mismatch {pointee:?} ({pointee_bits}) vs {result_ty:?} ({result_bits})"
                 ));
             }
-            if let (Some(true_raw), Some(false_raw)) = (&selected.true_raw, &selected.false_raw) {
-                let result_type = self.type_id(&result_ty)?;
-                let true_value = self.fresh();
-                let false_value = self.fresh();
-                self.emit_raw_load(true_value, &result_ty, true_raw, access_align, instructions)?;
-                self.emit_raw_load(
-                    false_value,
-                    &result_ty,
-                    false_raw,
-                    access_align,
-                    instructions,
-                )?;
-                instructions.push(Self::inst(
-                    Op::Select,
-                    Some(result_type),
-                    Some(result),
-                    vec![
-                        Operand::IdRef(selected.cond),
-                        Operand::IdRef(true_value),
-                        Operand::IdRef(false_value),
-                    ],
-                ));
-                return Ok(());
-            }
-            return Err(
-                "native emitter: selected i8 pointer reinterpret load requires raw offsets"
-                    .to_string(),
-            );
         }
-        if !types_compatible(&pointee, &result_ty) {
+        if !types_compatible(&pointee, &result_ty)
+            && (selected.true_ptr.is_some() || selected.false_ptr.is_some())
+        {
             return Err(format!(
                 "native emitter: selected pointer load type mismatch {pointee:?} vs {result_ty:?}"
             ));
@@ -349,24 +364,36 @@ impl Emitter {
         let result_type = self.type_id(&result_ty)?;
         let true_value = self.fresh();
         let false_value = self.fresh();
-        let true_ptr = selected
-            .true_ptr
-            .ok_or_else(|| "native emitter: selected pointer load missing true arm".to_string())?;
-        let false_ptr = selected
-            .false_ptr
-            .ok_or_else(|| "native emitter: selected pointer load missing false arm".to_string())?;
-        instructions.push(Self::inst(
-            Op::Load,
-            Some(result_type),
-            Some(true_value),
-            vec![Operand::IdRef(true_ptr)],
-        ));
-        instructions.push(Self::inst(
-            Op::Load,
-            Some(result_type),
-            Some(false_value),
-            vec![Operand::IdRef(false_ptr)],
-        ));
+        if let Some(true_ptr) = selected.true_ptr {
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(result_type),
+                Some(true_value),
+                vec![Operand::IdRef(true_ptr)],
+            ));
+        } else if let Some(true_raw) = &selected.true_raw {
+            self.emit_raw_load(true_value, &result_ty, true_raw, access_align, instructions)?;
+        } else {
+            return Err("native emitter: selected pointer load missing true arm".to_string());
+        }
+        if let Some(false_ptr) = selected.false_ptr {
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(result_type),
+                Some(false_value),
+                vec![Operand::IdRef(false_ptr)],
+            ));
+        } else if let Some(false_raw) = &selected.false_raw {
+            self.emit_raw_load(
+                false_value,
+                &result_ty,
+                false_raw,
+                access_align,
+                instructions,
+            )?;
+        } else {
+            return Err("native emitter: selected pointer load missing false arm".to_string());
+        }
         instructions.push(Self::inst(
             Op::Select,
             Some(result_type),

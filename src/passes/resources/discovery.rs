@@ -1,5 +1,117 @@
 use super::*;
 
+/// Pointer aliases carried through by-value aggregates before interface binding.
+///
+/// AIR commonly packages entry buffers into helper structs with `insertvalue`, then extracts the
+/// same field after producer-side helper inlining. SPIR-V represents that carrier with
+/// CompositeInsert/Extract. Treat the exact matching extract as another root for layout discovery;
+/// disjoint fields remain unrelated.
+pub(in crate::passes) fn buffer_pointer_aliases(func: &Function, pid: Word) -> HashSet<Word> {
+    let mut aliases = HashSet::from([pid]);
+    let mut paths: HashMap<Word, HashMap<Vec<u32>, Word>> = HashMap::new();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for inst in func
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+        {
+            let Some(result) = inst.result_id else {
+                continue;
+            };
+            match inst.class.opcode {
+                Op::CompositeInsert => {
+                    let (Some(Operand::IdRef(object)), Some(Operand::IdRef(base))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    else {
+                        continue;
+                    };
+                    let mut result_paths = paths.get(base).cloned().unwrap_or_default();
+                    let path = literal_path(&inst.operands[2..]);
+                    if aliases.contains(object) {
+                        result_paths.insert(path.clone(), *object);
+                    }
+                    if let Some(object_paths) = paths.get(object) {
+                        for (suffix, alias) in object_paths {
+                            let mut full = path.clone();
+                            full.extend(suffix);
+                            result_paths.insert(full, *alias);
+                        }
+                    }
+                    if !result_paths.is_empty() && paths.get(&result) != Some(&result_paths) {
+                        paths.insert(result, result_paths);
+                        changed = true;
+                    }
+                }
+                Op::CompositeConstruct => {
+                    let mut result_paths = HashMap::new();
+                    for (index, operand) in inst.operands.iter().enumerate() {
+                        let Operand::IdRef(object) = operand else {
+                            continue;
+                        };
+                        let prefix = vec![index as u32];
+                        if aliases.contains(object) {
+                            result_paths.insert(prefix.clone(), *object);
+                        }
+                        if let Some(object_paths) = paths.get(object) {
+                            for (suffix, alias) in object_paths {
+                                let mut full = prefix.clone();
+                                full.extend(suffix);
+                                result_paths.insert(full, *alias);
+                            }
+                        }
+                    }
+                    if !result_paths.is_empty() && paths.get(&result) != Some(&result_paths) {
+                        paths.insert(result, result_paths);
+                        changed = true;
+                    }
+                }
+                Op::CompositeExtract => {
+                    let Some(Operand::IdRef(composite)) = inst.operands.first() else {
+                        continue;
+                    };
+                    let path = literal_path(&inst.operands[1..]);
+                    let Some(composite_paths) = paths.get(composite) else {
+                        continue;
+                    };
+                    if composite_paths.contains_key(&path) && aliases.insert(result) {
+                        changed = true;
+                    }
+                    let mut result_paths = HashMap::new();
+                    for (alias_path, alias) in composite_paths {
+                        if let Some(suffix) = path_suffix(alias_path, &path) {
+                            if !suffix.is_empty() {
+                                result_paths.insert(suffix.to_vec(), *alias);
+                            }
+                        }
+                    }
+                    if !result_paths.is_empty() && paths.get(&result) != Some(&result_paths) {
+                        paths.insert(result, result_paths);
+                        changed = true;
+                    }
+                }
+                Op::CopyObject => {
+                    let Some(Operand::IdRef(source)) = inst.operands.first() else {
+                        continue;
+                    };
+                    if aliases.contains(source) && aliases.insert(result) {
+                        changed = true;
+                    }
+                    if let Some(source_paths) = paths.get(source).cloned() {
+                        if paths.get(&result) != Some(&source_paths) {
+                            paths.insert(result, source_paths);
+                            changed = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    aliases
+}
+
 pub(in crate::passes) fn data_pointer_pointee(
     defs: &HashMap<Word, Instruction>,
     pty: Word,
@@ -30,14 +142,16 @@ pub(in crate::passes) fn access_chains_include_wrapper_member0(
     func: &Function,
     pid: Word,
 ) -> bool {
+    let aliases = buffer_pointer_aliases(func, pid);
     let mut saw_chain = false;
     for blk in &func.blocks {
         for inst in &blk.instructions {
             if matches!(
                 inst.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst.operands.first() == Some(&Operand::IdRef(pid))
-            {
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            ) {
                 let indices = &inst.operands[1..];
                 if indices.len() < 2 {
                     return false;
@@ -147,19 +261,20 @@ pub(in crate::passes) fn struct_buffer_needs_record_array(
     pid: Word,
     struct_ty: Word,
 ) -> bool {
+    let aliases = buffer_pointer_aliases(func, pid);
     for blk in &func.blocks {
         for inst in &blk.instructions {
             if matches!(
                 inst.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst.operands.first() == Some(&Operand::IdRef(pid))
-                && !access_chain_matches_direct_struct_path(
-                    defs,
-                    struct_ty,
-                    &inst.operands[1..],
-                    inst.result_type,
-                )
-            {
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            ) && !access_chain_matches_direct_struct_path(
+                defs,
+                struct_ty,
+                &inst.operands[1..],
+                inst.result_type,
+            ) {
                 return true;
             }
         }
@@ -168,24 +283,29 @@ pub(in crate::passes) fn struct_buffer_needs_record_array(
 }
 
 pub(in crate::passes) fn buffer_has_access_chains(func: &Function, pid: Word) -> bool {
+    let aliases = buffer_pointer_aliases(func, pid);
     func.blocks.iter().any(|blk| {
         blk.instructions.iter().any(|inst| {
             matches!(
                 inst.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst.operands.first() == Some(&Operand::IdRef(pid))
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            )
         })
     })
 }
 
 pub(in crate::passes) fn buffer_has_multi_index_access_chains(func: &Function, pid: Word) -> bool {
+    let aliases = buffer_pointer_aliases(func, pid);
     func.blocks.iter().any(|blk| {
         blk.instructions.iter().any(|inst| {
             matches!(
                 inst.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst.operands.first() == Some(&Operand::IdRef(pid))
-                && inst.operands.len() > 2
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            ) && inst.operands.len() > 2
         })
     })
 }
@@ -196,19 +316,20 @@ pub(in crate::passes) fn buffer_access_chains_match_struct_path(
     pid: Word,
     struct_ty: Word,
 ) -> bool {
+    let aliases = buffer_pointer_aliases(func, pid);
     for blk in &func.blocks {
         for inst in &blk.instructions {
             if matches!(
                 inst.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst.operands.first() == Some(&Operand::IdRef(pid))
-                && !access_chain_matches_direct_struct_path(
-                    defs,
-                    struct_ty,
-                    &inst.operands[1..],
-                    inst.result_type,
-                )
-            {
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            ) && !access_chain_matches_direct_struct_path(
+                defs,
+                struct_ty,
+                &inst.operands[1..],
+                inst.result_type,
+            ) {
                 return false;
             }
         }
@@ -222,35 +343,40 @@ pub(in crate::passes) fn buffer_has_struct_path_access_chain(
     pid: Word,
     struct_ty: Word,
 ) -> bool {
+    let aliases = buffer_pointer_aliases(func, pid);
     func.blocks.iter().any(|blk| {
         blk.instructions.iter().any(|inst| {
             matches!(
                 inst.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-            ) && inst.operands.first() == Some(&Operand::IdRef(pid))
-                && access_chain_matches_direct_struct_path(
-                    defs,
-                    struct_ty,
-                    &inst.operands[1..],
-                    inst.result_type,
-                )
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            ) && access_chain_matches_direct_struct_path(
+                defs,
+                struct_ty,
+                &inst.operands[1..],
+                inst.result_type,
+            )
         })
     })
 }
 
 /// The ELEMENT type the body actually reads/writes a buffer param as. For indexed uses this is the
 /// pointee of a single-index `OpAccessChain %pid %i`; for direct scalar/vector load/store uses it is
-/// the loaded/stored value type. Used when llc typed the entry param as a bare `uchar*`
-/// (opaque-pointer default) yet the inlined body accesses it as a `float`/`v2float`/`v4uint` array.
+/// the loaded/stored value type. Used when the entry param is a bare `uchar*` yet the inlined body
+/// accesses it as a `float`/`v2float`/`v4uint` array.
 /// The interface's `RuntimeArray` element type must match the body access, not the mistyped param
 /// pointee, else `spirv-val` sees pointer/result-type mismatches.
 /// Returns None if no access roots at `pid` (then keep the declared pointee).
 pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Word) -> Option<Word> {
     let defs = type_defs(&ctx.module);
+    let aliases = buffer_pointer_aliases(func, pid);
     for blk in &func.blocks {
         for inst in &blk.instructions {
             if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
-                && inst.operands.first() == Some(&Operand::IdRef(pid))
+                && inst.operands.first().is_some_and(
+                    |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+                )
                 && inst.operands.len() == 2
             // exactly one index -> bare buf[i]
             {
@@ -261,13 +387,19 @@ pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Wor
                     }
                 }
             }
-            if inst.class.opcode == Op::Load && inst.operands.first() == Some(&Operand::IdRef(pid))
+            if inst.class.opcode == Op::Load
+                && inst.operands.first().is_some_and(
+                    |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+                )
             {
                 if let Some(result_type) = inst.result_type {
                     return Some(result_type);
                 }
             }
-            if inst.class.opcode == Op::Store && inst.operands.first() == Some(&Operand::IdRef(pid))
+            if inst.class.opcode == Op::Store
+                && inst.operands.first().is_some_and(
+                    |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+                )
             {
                 if let Some(Operand::IdRef(value)) = inst.operands.get(1) {
                     if let Some(result_type) = value_result_type(ctx, func, *value) {
@@ -451,14 +583,20 @@ pub(in crate::passes) fn write_texture_dims(
             let Some(name) = names.get(callee) else {
                 continue;
             };
-            if !is_write_texture_name(name) {
+            if !is_write_texture_name(name)
+                && !name.starts_with("air.atomic_fetch_max_explicit_texture_")
+            {
                 continue;
             }
             let Some(Operand::IdRef(tex)) = inst.operands.get(1) else {
                 continue;
             };
             let (dim, arrayed) = sample_dim(name);
-            let (fmt, comp) = if name.contains(".u.") && name.contains(".v4i16") {
+            let (fmt, comp) = if name.starts_with("air.atomic_fetch_max_explicit_texture_")
+                && name.contains(".u.")
+            {
+                (ImageFormat::R32ui, ImageComp::Uint)
+            } else if name.contains(".u.") && name.contains(".v4i16") {
                 (ImageFormat::Rgba16ui, ImageComp::Uint)
             } else if name.contains(".u.") {
                 (ImageFormat::Rgba8ui, ImageComp::Uint)
@@ -469,7 +607,11 @@ pub(in crate::passes) fn write_texture_dims(
             } else {
                 (ImageFormat::Rgba32f, ImageComp::Float)
             };
-            out.entry(*tex).or_insert((dim, arrayed, fmt, comp));
+            if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
+                out.insert(*tex, (dim, arrayed, fmt, comp));
+            } else {
+                out.entry(*tex).or_insert((dim, arrayed, fmt, comp));
+            }
         }
     }
     out
@@ -568,6 +710,57 @@ fn sample_dim(name: &str) -> (Dim, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_discovery_follows_exact_by_value_wrapper_field() {
+        let parameter = 10;
+        let aggregate = 11;
+        let wrapped = 12;
+        let extracted = 13;
+        let chain = 14;
+        let function = Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CompositeInsert,
+                        Some(30),
+                        Some(wrapped),
+                        vec![
+                            Operand::IdRef(parameter),
+                            Operand::IdRef(aggregate),
+                            Operand::LiteralBit32(2),
+                            Operand::LiteralBit32(1),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::CompositeExtract,
+                        Some(31),
+                        Some(extracted),
+                        vec![
+                            Operand::IdRef(wrapped),
+                            Operand::LiteralBit32(2),
+                            Operand::LiteralBit32(1),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::AccessChain,
+                        Some(32),
+                        Some(chain),
+                        vec![Operand::IdRef(extracted), Operand::IdRef(40)],
+                    ),
+                ],
+            }],
+        };
+
+        let aliases = buffer_pointer_aliases(&function, parameter);
+        assert!(aliases.contains(&parameter));
+        assert!(aliases.contains(&extracted));
+        assert!(buffer_has_access_chains(&function, parameter));
+    }
 
     #[test]
     fn texture_arg_comp_reads_nested_texture_array_scalar() {

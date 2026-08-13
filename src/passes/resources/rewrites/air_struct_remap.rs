@@ -1,6 +1,7 @@
 //! AIR struct-member remapping for resource-rooted access chains.
 
 use super::*;
+use crate::passes::stage_input::layout_ty_size_align;
 
 pub(in crate::passes) fn type_after_spirv_access_operands(
     types: &HashMap<Word, Instruction>,
@@ -118,6 +119,20 @@ pub(in crate::passes) fn rewrite_record_array_buffer(
                         ];
                         operands.extend(indices);
                         (operands, Some(pointee))
+                    } else if let Some((record, indices, pointee)) = remap_indexed_air_struct_access(
+                        ctx,
+                        &types,
+                        elem_ty,
+                        &old_indices,
+                        result_type,
+                    ) {
+                        let mut operands = vec![
+                            Operand::IdRef(var),
+                            Operand::IdRef(u0), // Block member 0: RuntimeArray<Struct>.
+                            record,
+                        ];
+                        operands.extend(indices);
+                        (operands, Some(pointee))
                     } else if let Some((indices, pointee)) = resolve_record_member_fallback(
                         ctx,
                         &types,
@@ -129,7 +144,7 @@ pub(in crate::passes) fn rewrite_record_array_buffer(
                     ) {
                         // The plain AIR padding remap rejected these indices, but a per-level walk
                         // driven by the loaded pointee recovers a valid record-0 member path. The
-                        // backend emits access-chain indices (and the declared result type) against
+                        // native emission produces access-chain indices and result types against
                         // its own view of the record struct, so at each struct level the RAW index
                         // is the faithful choice when it already type-checks toward the loaded
                         // pointee; `remap_air_struct_member_index` is needed only where the emitter's
@@ -181,6 +196,13 @@ pub(in crate::passes) fn rewrite_record_array_buffer(
             }
         }
     }
+
+    // AIR metadata records a fixed multidimensional array as one flat element count (for example
+    // `[8 x [8 x [8 x T]]]` as `T[512]`). The emitter retains the source GEP's three indices and its
+    // exact affine byte strides in the sidecar. Once this parameter becomes a typed record array,
+    // collapse such a proven contiguous index tuple to the one index required by the metadata type.
+    // Do this after re-rooting so the walk sees the final Block -> RuntimeArray -> record shape.
+    rewrite_flattened_record_array_indices(ctx, entry_idx, var, block_ty, defs);
 
     let mut want: Vec<Word> = vec![];
     for blk in &ctx.module.functions[entry_idx].blocks {
@@ -290,6 +312,220 @@ pub(in crate::passes) fn rewrite_record_array_buffer(
 
     let _ = block_ty;
     nested_air_ordinal_roots
+}
+
+/// Remap the struct-member suffix of `buffer[record].member` while preserving the leading runtime
+/// record index. The direct record-0 resolver intentionally starts at a struct and therefore rejects
+/// a dynamic first operand; once that operand is separated, the ordinary AIR-offset remapper can
+/// account for metadata-elided padding in the record itself.
+fn remap_indexed_air_struct_access(
+    ctx: &mut Ctx,
+    types: &HashMap<Word, Instruction>,
+    elem_ty: Word,
+    indices: &[Operand],
+    result_ptr_ty: Option<Word>,
+) -> Option<(Operand, Vec<Operand>, Word)> {
+    let (record, suffix) = indices.split_first()?;
+    let Operand::IdRef(record_id) = record else {
+        return None;
+    };
+    if const_u32(types, *record_id).is_some() || suffix.is_empty() {
+        return None;
+    }
+    let (remapped, pointee) =
+        remap_direct_air_struct_access(ctx, types, elem_ty, suffix, result_ptr_ty)?;
+    Some((record.clone(), remapped, pointee))
+}
+
+fn rewrite_flattened_record_array_indices(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    var: Word,
+    block_ty: Word,
+    defs: &HashMap<Word, Instruction>,
+) {
+    let types = combined_type_defs(ctx, defs);
+    let value_types = combined_value_types(ctx, entry_idx);
+    for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len());
+        for mut instruction in old {
+            let plan = flattened_record_array_index_plan(
+                ctx,
+                &types,
+                &value_types,
+                var,
+                block_ty,
+                &instruction,
+            );
+            if let Some((start, consumed, index_ty, terms)) = plan {
+                let mut flat = None;
+                for (index, coefficient) in terms {
+                    let term = if coefficient == 1 {
+                        index
+                    } else {
+                        let coefficient = ctx.const_int_of(index_ty, coefficient as i64);
+                        let scaled = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::IMul,
+                            Some(index_ty),
+                            Some(scaled),
+                            vec![Operand::IdRef(index), Operand::IdRef(coefficient)],
+                        ));
+                        scaled
+                    };
+                    flat = Some(match flat {
+                        None => term,
+                        Some(accumulator) => {
+                            let sum = ctx.module.fresh_id();
+                            rewritten.push(Instruction::new(
+                                Op::IAdd,
+                                Some(index_ty),
+                                Some(sum),
+                                vec![Operand::IdRef(accumulator), Operand::IdRef(term)],
+                            ));
+                            sum
+                        }
+                    });
+                }
+                if let Some(flat) = flat {
+                    instruction
+                        .operands
+                        .splice(start..start + consumed, [Operand::IdRef(flat)]);
+                }
+            }
+            rewritten.push(instruction);
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+}
+
+/// Return a byte-proven linearization for consecutive source-array indices that now address one
+/// flattened metadata array. The sidecar coefficients are the source layout's exact byte strides;
+/// dividing them by the metadata element stride yields the row-major scalar coefficients. Strict
+/// divisibility, a trailing coefficient of one, and a product matching the declared flat length make
+/// the transformation layout-identical. Constants, mixed integer widths, ambiguous suffixes, and
+/// incomplete affine facts decline rather than guessing dimensions.
+fn flattened_record_array_index_plan(
+    ctx: &Ctx,
+    types: &HashMap<Word, Instruction>,
+    value_types: &HashMap<Word, Word>,
+    var: Word,
+    block_ty: Word,
+    instruction: &Instruction,
+) -> Option<(usize, usize, Word, Vec<(Word, u64)>)> {
+    if !matches!(
+        instruction.class.opcode,
+        Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+    ) || instruction.operands.first() != Some(&Operand::IdRef(var))
+    {
+        return None;
+    }
+    let result = instruction.result_id?;
+    let result_pointee = ptr_pointee(types, instruction.result_type?)?;
+    let affine = ctx
+        .emit_sidecar
+        .buffer_access_affine_offsets
+        .iter()
+        .find(|fact| fact.id == result)?;
+    let mut affine_stride = HashMap::new();
+    for &(index, stride) in &affine.terms {
+        if affine_stride.insert(index, stride).is_some() {
+            return None;
+        }
+    }
+
+    let indices = &instruction.operands[1..];
+    let mut cur = block_ty;
+    for (position, operand) in indices.iter().enumerate() {
+        let definition = types.get(&cur)?;
+        match definition.class.opcode {
+            Op::TypeStruct => {
+                let Operand::IdRef(index) = operand else {
+                    return None;
+                };
+                let member = const_u32(types, *index)? as usize;
+                let Operand::IdRef(member_ty) = definition.operands.get(member)? else {
+                    return None;
+                };
+                cur = *member_ty;
+            }
+            Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
+                let Operand::IdRef(element) = definition.operands.first()? else {
+                    return None;
+                };
+                cur = *element;
+            }
+            Op::TypeArray => {
+                let Operand::IdRef(element) = definition.operands.first()? else {
+                    return None;
+                };
+                let Operand::IdRef(length_id) = definition.operands.get(1)? else {
+                    return None;
+                };
+                let length = u64::from(const_u32(types, *length_id)?);
+                let (element_size, element_align) = layout_ty_size_align(ctx, *element, types);
+                let element_stride = u64::from(round_up(element_size, element_align));
+                if element_stride == 0 {
+                    return None;
+                }
+                for consumed in 2..=indices.len() - position {
+                    let reached = type_after_spirv_access_operands(
+                        types,
+                        *element,
+                        &indices[position + consumed..],
+                    );
+                    if !reached.is_some_and(|reached| {
+                        reached == result_pointee
+                            || types_structurally_match(ctx, types, reached, result_pointee)
+                    }) {
+                        continue;
+                    }
+                    let mut index_ty = None;
+                    let mut terms = Vec::with_capacity(consumed);
+                    for operand in &indices[position..position + consumed] {
+                        let Operand::IdRef(index) = operand else {
+                            return None;
+                        };
+                        if const_u32(types, *index).is_some() {
+                            return None;
+                        }
+                        let ty = *value_types.get(index)?;
+                        if index_ty.replace(ty).is_some_and(|old| old != ty) {
+                            return None;
+                        }
+                        let stride = *affine_stride.get(index)?;
+                        if !stride.is_multiple_of(element_stride) {
+                            return None;
+                        }
+                        terms.push((*index, stride / element_stride));
+                    }
+                    let coefficients = terms
+                        .iter()
+                        .map(|(_, coefficient)| *coefficient)
+                        .collect::<Vec<_>>();
+                    if coefficients.last() != Some(&1)
+                        || coefficients.first().is_none_or(|first| {
+                            *first == 0 || *first > length || !length.is_multiple_of(*first)
+                        })
+                        || coefficients
+                            .windows(2)
+                            .any(|pair| pair[0] <= pair[1] || !pair[0].is_multiple_of(pair[1]))
+                        || coefficients
+                            .iter()
+                            .any(|coefficient| *coefficient >= length)
+                    {
+                        return None;
+                    }
+                    // +1 accounts for the base operand at instruction.operands[0].
+                    return Some((position + 1, consumed, index_ty?, terms));
+                }
+                cur = *element;
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Remap descendant GEPs after a direct record-member chain has crossed from the padded AIR type to

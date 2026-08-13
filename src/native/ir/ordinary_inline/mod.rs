@@ -29,6 +29,13 @@ fn is_residual_intrinsic(name: &str) -> bool {
     name.starts_with("air.")
         || name.starts_with("llvm.fabs.")
         || name.starts_with("llvm.fmuladd.")
+        || matches!(
+            name,
+            "llvm.agx2.f16matmad4x4.v2f16"
+                | "llvm.agx2.f32matmad4x4.v2f32"
+                | "llvm.agx2.f16matmad8x8.v2f16"
+                | "llvm.agx2.f32matmad8x8.v2f32"
+        )
         || name.starts_with("llvm.bswap.")
         || name.starts_with("llvm.maxnum.")
         || name.starts_with("llvm.minnum.")
@@ -38,6 +45,7 @@ fn is_residual_intrinsic(name: &str) -> bool {
 fn is_literal(value: &LlValue) -> bool {
     match value {
         LlValue::Local(_) | LlValue::Global(_) | LlValue::Gep(_) => false,
+        LlValue::IntToPtr { source, .. } => is_literal(&source.value),
         LlValue::Vector(values) | LlValue::Array(values) | LlValue::Struct(values) => {
             values.iter().all(|value| is_literal(&value.value))
         }
@@ -208,6 +216,14 @@ fn collect_value_capabilities(
                 collect_value_capabilities(&index.value, aliases, visiting, capabilities);
             }
         }
+        LlValue::IntToPtr {
+            source,
+            destination,
+        } => {
+            collect_type_capabilities(&source.ty, aliases, visiting, capabilities);
+            collect_value_capabilities(&source.value, aliases, visiting, capabilities);
+            collect_type_capabilities(destination, aliases, visiting, capabilities);
+        }
         LlValue::Local(_)
         | LlValue::Global(_)
         | LlValue::Bool(_)
@@ -377,18 +393,6 @@ impl LlModule {
         if helpers.is_empty() {
             return TypedInlineStats::default();
         }
-        // A pointer-parameter helper and a value-only helper can jointly retarget the module-wide
-        // Private parameter-carrier inference: the former helper's `load i32` + value bitcast then
-        // becomes a direct float load after the latter helper is spliced. Keep only the pointer
-        // helper residual in this mixed composition. Pointer-only modules still exercise the
-        // general pointer-parameter splice.
-        let has_value_only_helper = helpers.values().any(|helper| {
-            helper
-                .params
-                .iter()
-                .all(|(_, ty)| !matches!(ty, LlType::Ptr(_)))
-        });
-
         let source_pointees = self.ptr_pointees.clone();
         let mut source_value_pointees = source_pointees.clone();
         source_value_pointees.extend(self.local_alloca_pointees.clone());
@@ -430,18 +434,6 @@ impl LlModule {
                             }
                             let call = instruction.call.as_ref()?;
                             let helper = helpers.get(&call.callee)?.clone();
-                            if has_value_only_helper
-                                && helper
-                                    .params
-                                    .iter()
-                                    .any(|(_, ty)| matches!(ty, LlType::Ptr(_)))
-                                && !call
-                                    .args
-                                    .iter()
-                                    .any(|arg| matches!(arg.value, LlValue::Gep(_)))
-                            {
-                                return None;
-                            }
                             if call.args.len() != helper.params.len() {
                                 return None;
                             }
@@ -545,8 +537,7 @@ impl LlModule {
                         .next()
                         .expect("eligible ordinary helper has one block");
                     let typed = block
-                        .typed
-                        .as_mut()
+                        .typed_mut()
                         .expect("eligible ordinary helper has a typed block");
                     typed.rename(&local_rename);
                     cloned_pointer_loads.extend(typed.insts.iter().filter_map(|instruction| {
@@ -599,14 +590,13 @@ impl LlModule {
                     let inserted = typed.insts.len();
                     let replacement = typed.insts.drain(..);
                     self.functions[function_index].blocks[block_index]
-                        .typed
-                        .as_mut()
+                        .typed_mut()
                         .expect("call site came from a typed block")
                         .insts
                         .splice(instruction_index..=instruction_index, replacement);
                     if let Some(result_substitution) = &result_substitution {
                         for caller_block in &mut self.functions[function_index].blocks {
-                            if let Some(typed) = &mut caller_block.typed {
+                            if let Some(typed) = caller_block.typed_mut() {
                                 typed.substitute_values(result_substitution);
                             }
                         }

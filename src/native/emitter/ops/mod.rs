@@ -29,7 +29,7 @@ fn air_i32_literal(value: &LlValue) -> Option<i64> {
 /// its `Int(16)` bit pattern, so arithmetic must round-trip through f32). Returns `1` for a scalar
 /// `BFloat`, `N` for `Vector(BFloat, N)`, and `None` for any non-bf16 type. Purely structural (element
 /// type + shape), never keyed on a name.
-fn bfloat_lanes(ty: &LlType) -> Option<u32> {
+pub(in crate::native::emitter) fn bfloat_lanes(ty: &LlType) -> Option<u32> {
     match ty {
         LlType::BFloat => Some(1),
         LlType::Vector(elem, n) if **elem == LlType::BFloat => Some(*n),
@@ -47,7 +47,7 @@ fn float_lanes(ty: &LlType) -> Option<u32> {
 
 /// `elem` for `n <= 1`, else `Vector(elem, n)` — the scalar-or-vector shape used by the shaped bf16
 /// widen/narrow helpers.
-fn shaped_type(elem: LlType, n: u32) -> LlType {
+pub(in crate::native::emitter) fn shaped_type(elem: LlType, n: u32) -> LlType {
     if n <= 1 {
         elem
     } else {

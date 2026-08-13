@@ -289,6 +289,7 @@ pub(in crate::native) fn privatize_region(
     for b in out.iter_mut() {
         if b.name == arm {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.rebuild_phi_incomings(|pred| !redirect.contains(pred));
             }
         }
@@ -299,6 +300,7 @@ pub(in crate::native) fn privatize_region(
     for b in out.iter_mut() {
         if redirect.contains(&b.name) {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.redirect_successor(arm, &arm_clone);
             }
         }
@@ -339,13 +341,13 @@ pub(in crate::native) fn privatize_region(
         // A rename-cloned block: its name is the carried identity, so the role tracks the (possibly
         // still-`texitret`-prefixed, possibly renamed-away) clone name.
         let role = role_for_name(&clone_name);
-        let mut c = src_carrier.clone();
+        let mut c = (**src_carrier).clone();
         c.rebuild_phi_incomings(keep);
         c.rename(&rename);
         out.push(BodyBlock {
             name: clone_name,
             role,
-            typed: Some(c),
+            typed: Some(c.into()),
         });
     }
 
@@ -476,6 +478,7 @@ pub(in crate::native) fn privatize_dominated_region(
     for b in out.iter_mut() {
         if b.name == arm {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.rebuild_phi_incomings(|p| !redirect.contains(p));
             }
         }
@@ -484,6 +487,7 @@ pub(in crate::native) fn privatize_dominated_region(
     for b in out.iter_mut() {
         if redirect.contains(&b.name) {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.redirect_successor(arm, &arm_clone);
             }
         }
@@ -494,6 +498,7 @@ pub(in crate::native) fn privatize_dominated_region(
     for b in out.iter_mut() {
         if boundary.contains(&b.name) {
             if let Some(t) = &mut b.typed {
+                let t = std::sync::Arc::make_mut(t);
                 t.mirror_region_incomings(&region, &rename);
             }
         }
@@ -523,13 +528,13 @@ pub(in crate::native) fn privatize_dominated_region(
             }
         }
         let role = role_for_name(&clone_name);
-        let mut c = src_carrier.clone();
+        let mut c = (**src_carrier).clone();
         c.rebuild_phi_incomings(keep);
         c.rename(&rename);
         out.push(BodyBlock {
             name: clone_name,
             role,
-            typed: Some(c),
+            typed: Some(c.into()),
         });
     }
     Some(out)

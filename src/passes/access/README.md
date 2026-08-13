@@ -11,10 +11,11 @@ retained SPIR-V module:
   replay structurally proven typed/raw reinterpretation paths.
 - `vector_subword.rs` and `byte_aggregate.rs` lower cross-member, subword, and aggregate byte
   accesses.
+- `scalar_store.rs` normalizes scalar stores whose pointer carrier needs structural repair.
 - `private_memory.rs` owns Private null/placeholder handling, local atomics, function-variable
   hoisting, and arithmetic guards.
 - `workgroup.rs` remodels structurally identified Workgroup aggregate and atomic layouts.
 
-Structured-CFG merge, continue, and phi repair owns to the separately measured
-`passes/cfg_repair/` subsystem. Final entry construction owns to `passes/finalize.rs`, with
-dead-global/debug and capability closure in `passes/module_cleanup.rs`.
+Structured-CFG merge, continue, and phi repair belong to the separately measured
+`passes/cfg_repair/` subsystem. Final entry construction belongs to `passes/finalize.rs`, with
+dead-global/debug cleanup and capability closure in `passes/module_cleanup.rs`.

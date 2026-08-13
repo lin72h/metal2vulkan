@@ -376,7 +376,7 @@ fn accumulate_tir_soundness(
 /// actually sees. Built and validated alongside the string path; NOT yet consumed by emission (the
 /// byte gate guards consumption). Mirrors `emit_function`'s pre-loop exactly: split → lower
 /// unstructured switches → `structured_plan` (and on a structurizer reject, validate the lowered blocks
-/// the legacy-repair path would walk).
+/// the fallback merge-repair path would walk).
 pub fn tir_structured_self_check(san_ll: &str) -> Result<TirCheckStats, String> {
     let parsed = LlModule::parse(san_ll)?;
     let mut stats = TirCheckStats::default();

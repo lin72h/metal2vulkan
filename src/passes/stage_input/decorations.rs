@@ -26,6 +26,15 @@ pub(in crate::passes) fn decorate_flat(module: &mut Module, id: Word) {
     ));
 }
 
+pub(in crate::passes) fn decorate_patch(module: &mut Module, id: Word) {
+    module.annotations.push(Instruction::new(
+        Op::Decorate,
+        None,
+        None,
+        vec![Operand::IdRef(id), Operand::Decoration(Decoration::Patch)],
+    ));
+}
+
 pub(in crate::passes) fn decorate_builtin(module: &mut Module, id: Word, b: BuiltIn) {
     module.annotations.push(Instruction::new(
         Op::Decorate,

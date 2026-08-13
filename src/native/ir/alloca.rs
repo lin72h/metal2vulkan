@@ -80,6 +80,29 @@ impl LlModule {
                 let Some(original) = allocas.get(&name) else {
                     continue;
                 };
+                // Opaque-pointer AIR commonly packs subword lanes into scalar scratch by bitcasting
+                // the alloca and indexing it as `i8` (for example, two half lanes in one float).
+                // Logical SPIR-V cannot form an `uchar*` PtrAccessChain from a scalar pointer. Model
+                // the allocation by its byte image instead; the existing raw-byte load/store path
+                // then preserves each typed access at its exact byte offset. This is structural and
+                // bounded to the allocation's declared size, never keyed to a source identifier.
+                if seen
+                    .iter()
+                    .any(|ty| self.resolve_known_type(ty) == LlType::Int(8))
+                    && !self.type_contains_pointer(original)
+                {
+                    if let Some((size, _)) = self.native_memcpy_type_size_align(original) {
+                        if let Ok(size) = u32::try_from(size) {
+                            if size > 1 {
+                                self.local_alloca_pointees.insert(
+                                    (f.name.clone(), name.clone()),
+                                    LlType::Array(Box::new(LlType::Int(8)), size),
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
                 let candidates = seen
                     .into_iter()
                     .filter(|ty| ty != original)

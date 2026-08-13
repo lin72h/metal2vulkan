@@ -1,4 +1,4 @@
-use crate::Stage;
+use crate::case::Stage;
 
 pub fn stage_label_from_ll(ll: &str) -> Option<&'static str> {
     if ll.contains("!air.vertex =") {
@@ -29,6 +29,12 @@ pub fn stage_name(stage: Stage) -> &'static str {
 }
 
 pub fn entry_name_from_ll(ll: &str) -> Option<String> {
+    stage_entry_from_ll(ll)
+        .map(|(_, entry)| entry)
+        .or_else(|| first_define_name(ll))
+}
+
+pub fn stage_entry_from_ll(ll: &str) -> Option<(&'static str, String)> {
     for key in ["kernel", "vertex", "fragment"] {
         let needle = format!("!air.{key} = !{{!");
         if let Some(pos) = ll.find(&needle) {
@@ -41,12 +47,18 @@ pub fn entry_name_from_ll(ll: &str) -> Option<String> {
             if let Some(npos) = ll.find(&node) {
                 let body = &ll[npos + node.len()..];
                 if let Some(name) = symbol_after_ptr_at(body) {
-                    return Some(name);
+                    let stage = match key {
+                        "kernel" => "Kernel",
+                        "vertex" => "Vertex",
+                        "fragment" => "Fragment",
+                        _ => unreachable!(),
+                    };
+                    return Some((stage, name));
                 }
             }
         }
     }
-    first_define_name(ll)
+    None
 }
 
 fn first_define_name(ll: &str) -> Option<String> {
@@ -129,5 +141,16 @@ define void @"persona::ksDepthDilate"(ptr addrspace(2) %0) {
             entry_name_from_ll(ll),
             Some("persona::ksDepthDilate".into())
         );
+        assert_eq!(
+            stage_entry_from_ll(ll),
+            Some(("Kernel", "persona::ksDepthDilate".into()))
+        );
+    }
+
+    #[test]
+    fn stage_entry_requires_a_well_formed_stage_node() {
+        let ll = "define void @k() { ret void }\n!air.kernel = !{!0}\n!0 = !{i32 1}";
+        assert_eq!(stage_entry_from_ll(ll), None);
+        assert_eq!(entry_name_from_ll(ll), Some("k".into()));
     }
 }

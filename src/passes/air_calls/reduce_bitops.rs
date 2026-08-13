@@ -69,6 +69,86 @@ pub(in crate::passes) fn lower_quad_sum(
     Ok(insts)
 }
 
+/// Quad-scoped integer min/max, expressed as the same two-axis XOR butterfly as `quad_sum`.
+/// SPIR-V's group extrema cover the entire subgroup, while Metal defines fixed aligned groups of
+/// four lanes. Comparing each lane with lane^1 and then the winning pair with lane^2 therefore
+/// broadcasts the exact quad extremum without assuming the implementation subgroup width.
+pub(in crate::passes) fn lower_quad_integer_extrema(
+    ctx: &mut Ctx,
+    name: &str,
+    result: Word,
+    result_type: Word,
+    value: Word,
+) -> Result<Vec<Instruction>, String> {
+    let is_max = name.starts_with("air.quad_max.");
+    let compare = match (is_max, name.contains(".s."), name.contains(".u.")) {
+        (true, true, false) => Op::SGreaterThan,
+        (true, false, true) => Op::UGreaterThan,
+        (false, true, false) => Op::SLessThan,
+        (false, false, true) => Op::ULessThan,
+        _ => {
+            return Err(format!(
+                "unsupported quad integer extrema intrinsic: {name}"
+            ))
+        }
+    };
+    let result_definition =
+        type_def_of(ctx, result_type).ok_or_else(|| format!("{name} result type is undefined"))?;
+    let lanes = match result_definition.class.opcode {
+        Op::TypeInt => 1,
+        Op::TypeVector => match result_definition.operands.get(1) {
+            Some(Operand::LiteralBit32(lanes)) => *lanes,
+            _ => return Err(format!("{name} result vector has no lane count")),
+        },
+        _ => return Err(format!("{name} result is not an integer scalar or vector")),
+    };
+    let bool_type = if lanes == 1 {
+        ctx.ty_bool()
+    } else {
+        ctx.ty_vec_bool(lanes)
+    };
+    let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let mut out = Vec::new();
+    let mut winner = value;
+    for (axis, mask) in [1, 2].into_iter().enumerate() {
+        let peer = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::GroupNonUniformShuffleXor,
+            Some(result_type),
+            Some(peer),
+            vec![
+                Operand::IdScope(scope),
+                Operand::IdRef(winner),
+                Operand::IdRef(ctx.const_uint(mask)),
+            ],
+        ));
+        let predicate = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            compare,
+            Some(bool_type),
+            Some(predicate),
+            vec![Operand::IdRef(winner), Operand::IdRef(peer)],
+        ));
+        let selected = if axis == 1 {
+            result
+        } else {
+            ctx.module.fresh_id()
+        };
+        out.push(Instruction::new(
+            Op::Select,
+            Some(result_type),
+            Some(selected),
+            vec![
+                Operand::IdRef(predicate),
+                Operand::IdRef(winner),
+                Operand::IdRef(peer),
+            ],
+        ));
+        winner = selected;
+    }
+    Ok(out)
+}
+
 /// Build the trailing operands for a `GroupNonUniform` arithmetic reduction. Under the M-D2
 /// `TransformOptions::simd_cluster32` opt-in a whole-subgroup `Reduce` is lowered to a `ClusteredReduce`
 /// over a 32-lane cluster — Metal's simdgroup width — so a driver whose subgroup is WIDER than 32

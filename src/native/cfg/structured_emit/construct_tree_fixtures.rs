@@ -198,7 +198,8 @@ fn typed_blocks(fixture: &Fixture) -> Vec<BodyBlock> {
             BodyBlock {
                 name: labels[index].clone(),
                 role: BlockRole::Normal,
-                typed: tir::lower_block_carrier(&labels[index], &lines, &HashMap::new()),
+                typed: tir::lower_block_carrier(&labels[index], &lines, &HashMap::new())
+                    .map(Into::into),
             }
         })
         .collect()

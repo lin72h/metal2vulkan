@@ -18,6 +18,24 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[test]
+fn native_typed_numeric_zero_materializes_float_zero() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define half @main(i1 %choose) {
+entry:
+  %value = select i1 %choose, half 0, half 0xH3C00
+  ret half %value
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpConstant") && line.ends_with("  0")),
+        "{asm}"
+    );
+}
+
+#[test]
 fn native_llvm_float_minmax_calls_lower_as_extinsts() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -470,6 +488,57 @@ entry:
     assert!(asm.contains("OpShiftRightLogical"), "{asm}");
     // spirv-val is the authoritative check: it rejects an `OpFAdd` whose result type is an integer
     // vector ("Expected floating scalar or vector type"), which is exactly the bug this guards.
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_bfloat_comparisons_widen_to_float() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %sa_ptr, ptr addrspace(1) %sb_ptr, ptr addrspace(1) %scalar_out, ptr addrspace(1) %va_ptr, ptr addrspace(1) %vb_ptr, ptr addrspace(1) %vector_out) {
+entry:
+  %sa = load bfloat, ptr addrspace(1) %sa_ptr, align 2
+  %sb = load bfloat, ptr addrspace(1) %sb_ptr, align 2
+  %scalar = fcmp ogt bfloat %sa, %sb
+  %scalar_byte = zext i1 %scalar to i8
+  store i8 %scalar_byte, ptr addrspace(1) %scalar_out, align 1
+  %va = load <6 x bfloat>, ptr addrspace(1) %va_ptr, align 2
+  %vb = load <6 x bfloat>, ptr addrspace(1) %vb_ptr, align 2
+  %wide = fcmp ole <6 x bfloat> %va, %vb
+  %wide_lane = extractelement <6 x i1> %wide, i32 0
+  %wide_byte = zext i1 %wide_lane to i8
+  store i8 %wide_byte, ptr addrspace(1) %vector_out, align 1
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7, !8}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat*", !"air.arg_name", !"sa"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat*", !"air.arg_name", !"sb"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar*", !"air.arg_name", !"scalar_out"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat6*", !"air.arg_name", !"va"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"bfloat6*", !"air.arg_name", !"vb"}
+!8 = !{i32 5, !"air.buffer", !"air.location_index", i32 5, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 6, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar6*", !"air.arg_name", !"vector_out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_bfloat_compare_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
+    assert!(asm.contains("OpFOrdGreaterThan"), "{asm}");
+    assert!(asm.contains("OpFOrdLessThanEqual"), "{asm}");
+    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+    assert!(asm.contains("OpCompositeConstruct"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

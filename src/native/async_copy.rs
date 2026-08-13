@@ -34,9 +34,9 @@ struct AsyncCopyCall {
     result: String,
 }
 
-/// Rewrite every `air.simdgroup_async_copy_2d` / `air.is_null_simdgroup_event` /
-/// `air.wait_simdgroup_events` in `san_ll`. Returns the text unchanged when the module does not call
-/// the async-copy intrinsic (the common case).
+/// Rewrite every `air.simdgroup_async_copy_2d` / `air.get_null_simdgroup_event` /
+/// `air.is_null_simdgroup_event` / `air.wait_simdgroup_events` in `san_ll`. Returns the text unchanged
+/// when the module does not call the async-copy intrinsic (the common case).
 pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> String {
     if !san_ll.contains("air.simdgroup_async_copy_2d") {
         return san_ll.to_string();
@@ -68,6 +68,15 @@ pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> String {
             if let Some(res) = call_result_id(trimmed) {
                 let indent = &line[..line.len() - trimmed.len()];
                 out.push(format!("{indent}{res} = icmp ne i64 0, 0"));
+                continue;
+            }
+        }
+        if trimmed.contains("air.get_null_simdgroup_event") && trimmed.contains("call") {
+            // AIR's explicit null-event constructor is the null pointer value. Keep the pointer
+            // carrier because event structs store it, while eliminating the now-unsupported call.
+            if let Some(res) = call_result_id(trimmed) {
+                let indent = &line[..line.len() - trimmed.len()];
+                out.push(format!("{indent}{res} = inttoptr i64 0 to ptr"));
                 continue;
             }
         }
@@ -274,4 +283,24 @@ fn call_result_id(line: &str) -> Option<String> {
 /// Seed a fresh-SSA counter above any `%__acN` already present (there should be none, but be safe).
 fn fresh_counter(_san_ll: &str) -> u64 {
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lower_simdgroup_async_copy;
+
+    #[test]
+    fn explicit_null_event_lowers_with_the_async_copy_family() {
+        let ll = concat!(
+            "%null = call ptr @air.get_null_simdgroup_event()\n",
+            "%event = call ptr @air.simdgroup_async_copy_2d.p3i8.p1i8(i64 2, i64 2, ptr addrspace(3) %dst, i64 8, i64 1, <2 x i64> <i64 4, i64 4>, ptr addrspace(1) %src, i64 8, i64 1, <2 x i64> <i64 4, i64 4>, <2 x i64> zeroinitializer, i32 0)\n",
+            "%is_null = call i1 @air.is_null_simdgroup_event(ptr %event)\n",
+            "call void @air.wait_simdgroup_events(i32 1, ptr %event)\n",
+        );
+        let lowered = lower_simdgroup_async_copy(ll);
+        assert!(lowered.contains("%null = inttoptr i64 0 to ptr"));
+        assert!(lowered.contains("%event = inttoptr i64 1 to ptr"));
+        assert!(lowered.contains("%is_null = icmp ne i64 0, 0"));
+        assert!(!lowered.contains("call ptr @air.get_null_simdgroup_event"));
+    }
 }

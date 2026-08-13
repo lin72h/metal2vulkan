@@ -2,6 +2,232 @@
 
 use super::*;
 
+/// Retype a plain element load whose pointer carrier is an array by explicitly selecting element
+/// zero. LLVM opaque pointers permit loading `T` from the address of `[N x T]`; Logical SPIR-V
+/// requires the otherwise address-identical zero descent to produce `T*` first.
+pub(in crate::passes) fn repair_load_through_array_pointer(ctx: &mut Ctx, entry_idx: usize) {
+    let mut plans = HashMap::<(usize, usize), (Word, Word, StorageClass)>::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, load) in block.instructions.iter().enumerate() {
+            if load.class.opcode != Op::Load || load.operands.len() != 1 {
+                continue;
+            }
+            let (Some(result_ty), Some(Operand::IdRef(pointer))) =
+                (load.result_type, load.operands.first())
+            else {
+                continue;
+            };
+            let Some(pointer_ty) = value_result_type(ctx, *pointer) else {
+                continue;
+            };
+            let Some(pointer_def) = type_def_of(ctx, pointer_ty) else {
+                continue;
+            };
+            let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(array_ty))) =
+                (pointer_def.operands.first(), pointer_def.operands.get(1))
+            else {
+                continue;
+            };
+            let Some(array_def) = type_def_of(ctx, *array_ty) else {
+                continue;
+            };
+            if !matches!(array_def.class.opcode, Op::TypeArray | Op::TypeRuntimeArray)
+                || array_def.operands.first() != Some(&Operand::IdRef(result_ty))
+            {
+                continue;
+            }
+            plans.insert((bi, ii), (*pointer, result_ty, *storage));
+        }
+    }
+    if plans.is_empty() {
+        return;
+    }
+    let zero = ctx.const_uint(0);
+    for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len());
+        for (ii, mut instruction) in old.into_iter().enumerate() {
+            let Some(&(pointer, result_ty, storage)) = plans.get(&(bi, ii)) else {
+                rewritten.push(instruction);
+                continue;
+            };
+            let element_pointer = ctx.module.fresh_id();
+            rewritten.push(Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(ctx.ty_ptr(storage, result_ty)),
+                Some(element_pointer),
+                vec![Operand::IdRef(pointer), Operand::IdRef(zero)],
+            ));
+            instruction.operands[0] = Operand::IdRef(element_pointer);
+            rewritten.push(instruction);
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+}
+
+/// Lower a flat scalar offset through `{ RuntimeArray<Vector<T, N>> }` into its exact typed path.
+/// Opaque LLVM pointers allow `T*` arithmetic from the wrapper's address; Logical SPIR-V instead
+/// needs member zero, vector index `flat / N`, and lane `flat % N` spelled out explicitly.
+pub(in crate::passes) fn rewrite_flat_scalar_ptr_access_through_vector_array(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) {
+    #[derive(Clone, Copy)]
+    struct Plan {
+        bi: usize,
+        ii: usize,
+        base: Word,
+        flat: Word,
+        index_ty: Word,
+        lanes: u32,
+        result_ty: Word,
+        result: Word,
+    }
+
+    let mut plans = Vec::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, instruction) in block.instructions.iter().enumerate() {
+            if instruction.class.opcode != Op::PtrAccessChain || instruction.operands.len() != 3 {
+                continue;
+            }
+            let (
+                Some(result_ty),
+                Some(result),
+                Some(Operand::IdRef(base)),
+                Some(Operand::IdRef(element)),
+                Some(Operand::IdRef(flat)),
+            ) = (
+                instruction.result_type,
+                instruction.result_id,
+                instruction.operands.first(),
+                instruction.operands.get(1),
+                instruction.operands.get(2),
+            )
+            else {
+                continue;
+            };
+            if const_u32(ctx, *element) != Some(0) {
+                continue;
+            }
+            let Some(result_scalar) = pointer_pointee(ctx, result_ty) else {
+                continue;
+            };
+            let Some(base_ty) = value_result_type(ctx, *base) else {
+                continue;
+            };
+            let Some(base_struct) = pointer_pointee(ctx, base_ty) else {
+                continue;
+            };
+            let Some(struct_def) = type_def_of(ctx, base_struct) else {
+                continue;
+            };
+            let [Operand::IdRef(array_ty)] = struct_def.operands.as_slice() else {
+                continue;
+            };
+            if struct_def.class.opcode != Op::TypeStruct {
+                continue;
+            }
+            let Some(array_def) = type_def_of(ctx, *array_ty) else {
+                continue;
+            };
+            if !matches!(array_def.class.opcode, Op::TypeArray | Op::TypeRuntimeArray) {
+                continue;
+            }
+            let Some(Operand::IdRef(vector_ty)) = array_def.operands.first() else {
+                continue;
+            };
+            let Some(vector_def) = type_def_of(ctx, *vector_ty) else {
+                continue;
+            };
+            let (Some(Operand::IdRef(component)), Some(Operand::LiteralBit32(lanes))) =
+                (vector_def.operands.first(), vector_def.operands.get(1))
+            else {
+                continue;
+            };
+            if vector_def.class.opcode != Op::TypeVector
+                || *component != result_scalar
+                || *lanes == 0
+            {
+                continue;
+            }
+            let Some(index_ty) = value_result_type(ctx, *flat) else {
+                continue;
+            };
+            let Some(index_def) = type_def_of(ctx, index_ty) else {
+                continue;
+            };
+            if index_def.class.opcode != Op::TypeInt
+                || !matches!(index_def.operands.get(1), Some(Operand::LiteralBit32(0)))
+            {
+                continue;
+            }
+            plans.push(Plan {
+                bi,
+                ii,
+                base: *base,
+                flat: *flat,
+                index_ty,
+                lanes: *lanes,
+                result_ty,
+                result,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return;
+    }
+    let by_site = plans
+        .into_iter()
+        .map(|plan| ((plan.bi, plan.ii), plan))
+        .collect::<HashMap<_, _>>();
+    let member_zero = ctx.const_uint(0);
+    for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len());
+        for (ii, instruction) in old.into_iter().enumerate() {
+            let Some(plan) = by_site.get(&(bi, ii)).copied() else {
+                rewritten.push(instruction);
+                continue;
+            };
+            let (vector_index, lane) = if let Some(flat) = const_u32(ctx, plan.flat) {
+                (
+                    ctx.const_int_of(plan.index_ty, i64::from(flat / plan.lanes)),
+                    ctx.const_int_of(plan.index_ty, i64::from(flat % plan.lanes)),
+                )
+            } else {
+                let lanes = ctx.const_int_of(plan.index_ty, i64::from(plan.lanes));
+                let vector_index = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::UDiv,
+                    Some(plan.index_ty),
+                    Some(vector_index),
+                    vec![Operand::IdRef(plan.flat), Operand::IdRef(lanes)],
+                ));
+                let lane = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::UMod,
+                    Some(plan.index_ty),
+                    Some(lane),
+                    vec![Operand::IdRef(plan.flat), Operand::IdRef(lanes)],
+                ));
+                (vector_index, lane)
+            };
+            rewritten.push(Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(plan.result_ty),
+                Some(plan.result),
+                vec![
+                    Operand::IdRef(plan.base),
+                    Operand::IdRef(member_zero),
+                    Operand::IdRef(vector_index),
+                    Operand::IdRef(lane),
+                ],
+            ));
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
+    }
+}
+
 /// Repair a `OpLoad %vecN <p>` whose pointer `<p>` is a SCALAR-pointee access chain that the emitter
 /// produced by accumulating a chain of element-strided geps (`gep <N x scalar>, ptr, idx`) into a single
 /// index off a VECTOR-pointer base, but emitted with the wrong opcode/type: it used
@@ -138,12 +364,375 @@ pub(in crate::passes) fn repair_vector_load_through_scalar_stride(ctx: &mut Ctx,
             edits.push((pbi, pii, base_ty));
         }
     }
-
     for (bi, ii, new_ty) in edits {
         let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
         let result_id = inst.result_id;
         let operands = inst.operands.clone();
         *inst = Instruction::new(Op::PtrAccessChain, Some(new_ty), result_id, operands);
+    }
+}
+
+/// Expand an invalid vector load through one word of a raw `{ RuntimeArray<uint> }` buffer into
+/// consecutive scalar-word loads. The chain's final index names the first word; lane `n` reads
+/// `index + n`, bitcasts that word to the declared 32-bit component, and reconstructs the vector.
+pub(in crate::passes) fn repair_vector_load_through_raw_word_pointer(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) {
+    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    for inst in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if inst.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
+                (inst.result_id, inst.operands.first(), inst.operands.get(1))
+            {
+                ptr_info.insert(id, (*storage, *pointee));
+            }
+        }
+    }
+
+    #[derive(Clone)]
+    struct Plan {
+        chain_block: usize,
+        chain_inst: usize,
+        chain_id: Word,
+        chain: Instruction,
+        vector_ty: Word,
+        component_ty: Word,
+        lanes: u32,
+        strided_tail: bool,
+        last_index: Word,
+        index_ty: Word,
+        word_offset: u32,
+    }
+
+    let mut definitions = HashMap::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, inst) in block.instructions.iter().enumerate() {
+            if let Some(id) = inst.result_id {
+                definitions.insert(id, (bi, ii));
+            }
+        }
+    }
+    let uint = ctx.ty_uint();
+    let mut plans = HashMap::new();
+    for block in &ctx.module.functions[entry_idx].blocks {
+        for load in &block.instructions {
+            if load.class.opcode != Op::Load || load.operands.len() != 1 {
+                continue;
+            }
+            let Some(vector_ty) = load.result_type else {
+                continue;
+            };
+            let Some(vector_def) = type_def_of(ctx, vector_ty) else {
+                continue;
+            };
+            let (Some(Operand::IdRef(component_ty)), Some(Operand::LiteralBit32(lanes))) =
+                (vector_def.operands.first(), vector_def.operands.get(1))
+            else {
+                continue;
+            };
+            if vector_def.class.opcode != Op::TypeVector
+                || *lanes < 2
+                || direct_scalar_width(ctx, *component_ty) != Some(32)
+            {
+                continue;
+            }
+            let Some(Operand::IdRef(chain_id)) = load.operands.first() else {
+                continue;
+            };
+            let Some(&(chain_block, chain_inst)) = definitions.get(chain_id) else {
+                continue;
+            };
+            let chain =
+                &ctx.module.functions[entry_idx].blocks[chain_block].instructions[chain_inst];
+            if !matches!(
+                chain.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain
+            ) || chain.operands.len() < 3
+            {
+                continue;
+            }
+            let Some(result_ptr_ty) = chain.result_type else {
+                continue;
+            };
+            let Some((StorageClass::StorageBuffer, result_pointee)) =
+                ptr_info.get(&result_ptr_ty).copied()
+            else {
+                continue;
+            };
+            let Some(Operand::IdRef(base)) = chain.operands.first() else {
+                continue;
+            };
+            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+                continue;
+            };
+            let Some((StorageClass::StorageBuffer, base_pointee)) =
+                ptr_info.get(&base_ptr_ty).copied()
+            else {
+                continue;
+            };
+            if single_member_array_scalar_elem(ctx, base_pointee) != Some(uint) {
+                continue;
+            }
+            // Composed opaque-pointer GEPs can leave one or more zero-stride scalar tails after the
+            // meaningful vector stride (`..., vector_index, 0, 0`). Once the type walk has reached a
+            // scalar, each such trailing zero is an address-neutral `gep T, ptr, 0`; retain no more
+            // than the canonical `[base, member, word, vector_stride]` form before recognizing it.
+            // This normalization is local to the already-invalid vector-load shape, so it cannot
+            // alter a valid aggregate descent.
+            let mut effective_chain = chain.clone();
+            let mut word_offset = 0;
+            // A composed `gep vecN, ptr, trailing_vector` can follow the dynamic vector stride as
+            // `..., vector_index, 0, trailing_vector`. Once the raw interface has erased the vector
+            // type, recover that constant vector offset in raw words and canonicalize the chain.
+            if effective_chain.operands.len() == 6
+                && walk_into_type(ctx, base_pointee, &effective_chain.operands[1..3]) == Some(uint)
+                && effective_chain
+                    .operands
+                    .get(4)
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(id) => const_u32(ctx, *id),
+                        _ => None,
+                    })
+                    == Some(0)
+            {
+                let trailing_vector =
+                    effective_chain
+                        .operands
+                        .get(5)
+                        .and_then(|operand| match operand {
+                            Operand::IdRef(id) => const_u32(ctx, *id),
+                            _ => None,
+                        });
+                if let Some(trailing_vector) = trailing_vector {
+                    word_offset = trailing_vector.saturating_mul(*lanes);
+                    effective_chain.operands.truncate(4);
+                }
+            }
+            while effective_chain.operands.len() > 4
+                && effective_chain
+                    .operands
+                    .last()
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(id) => const_u32(ctx, *id),
+                        _ => None,
+                    })
+                    == Some(0)
+            {
+                effective_chain.operands.pop();
+            }
+            let strided_tail = if walk_into_type(ctx, base_pointee, &effective_chain.operands[1..])
+                == Some(uint)
+                && result_pointee == uint
+            {
+                false
+            } else if effective_chain.operands.len() == 4
+                && walk_into_type(ctx, base_pointee, &effective_chain.operands[1..3]) == Some(uint)
+                && result_pointee == vector_ty
+            {
+                true
+            } else {
+                continue;
+            };
+            let Some(Operand::IdRef(last_index)) = effective_chain.operands.last() else {
+                continue;
+            };
+            let last_index = *last_index;
+            let Some(index_ty) = value_result_type(ctx, last_index) else {
+                continue;
+            };
+            plans.entry(*chain_id).or_insert_with(|| Plan {
+                chain_block,
+                chain_inst,
+                chain_id: *chain_id,
+                chain: effective_chain,
+                vector_ty,
+                component_ty: *component_ty,
+                lanes: *lanes,
+                strided_tail,
+                last_index,
+                index_ty,
+                word_offset,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return;
+    }
+
+    // Every use of the scalar pointer must be the same exact plain vector load.
+    plans.retain(|chain_id, plan| {
+        let mut uses = 0;
+        for inst in ctx.module.functions[entry_idx]
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+        {
+            if inst.result_id == Some(*chain_id) {
+                continue;
+            }
+            if !inst
+                .operands
+                .iter()
+                .any(|operand| operand == &Operand::IdRef(*chain_id))
+            {
+                continue;
+            }
+            if inst.class.opcode != Op::Load
+                || inst.operands.as_slice() != [Operand::IdRef(*chain_id)]
+                || inst.result_type != Some(plan.vector_ty)
+            {
+                return false;
+            }
+            uses += 1;
+        }
+        uses > 0
+    });
+    if plans.is_empty() {
+        return;
+    }
+
+    let chain_sites = plans
+        .values()
+        .map(|plan| ((plan.chain_block, plan.chain_inst), plan.chain_id))
+        .collect::<HashMap<_, _>>();
+    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
+    for bi in 0..n_blocks {
+        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let mut rewritten = Vec::with_capacity(old.len() + 16);
+        for (ii, inst) in old.into_iter().enumerate() {
+            if chain_sites.contains_key(&(bi, ii)) {
+                continue;
+            }
+            let Some(chain_id) = inst.operands.first().and_then(|operand| match operand {
+                Operand::IdRef(id) if plans.contains_key(id) => Some(*id),
+                _ => None,
+            }) else {
+                rewritten.push(inst);
+                continue;
+            };
+            let plan = &plans[&chain_id];
+            let Some(result) = inst.result_id else {
+                rewritten.push(inst);
+                continue;
+            };
+            let original_last_index = plan.last_index;
+            let index_ty = plan.index_ty;
+            let first_word = if plan.strided_tail {
+                let scaled = ctx.module.fresh_id();
+                let lanes = ctx.const_int_of(index_ty, i64::from(plan.lanes));
+                rewritten.push(Instruction::new(
+                    Op::IMul,
+                    Some(index_ty),
+                    Some(scaled),
+                    vec![Operand::IdRef(original_last_index), Operand::IdRef(lanes)],
+                ));
+                let Some(Operand::IdRef(base_word)) = plan
+                    .chain
+                    .operands
+                    .get(plan.chain.operands.len().saturating_sub(2))
+                else {
+                    rewritten.push(inst);
+                    continue;
+                };
+                let base_word = if value_result_type(ctx, *base_word) == Some(index_ty) {
+                    *base_word
+                } else if let Some(value) = const_u32(ctx, *base_word) {
+                    ctx.const_int_of(index_ty, i64::from(value))
+                } else {
+                    let converted = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::UConvert,
+                        Some(index_ty),
+                        Some(converted),
+                        vec![Operand::IdRef(*base_word)],
+                    ));
+                    converted
+                };
+                let first = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::IAdd,
+                    Some(index_ty),
+                    Some(first),
+                    vec![Operand::IdRef(base_word), Operand::IdRef(scaled)],
+                ));
+                if plan.word_offset == 0 {
+                    first
+                } else {
+                    let offset_first = ctx.module.fresh_id();
+                    let offset = ctx.const_int_of(index_ty, i64::from(plan.word_offset));
+                    rewritten.push(Instruction::new(
+                        Op::IAdd,
+                        Some(index_ty),
+                        Some(offset_first),
+                        vec![Operand::IdRef(first), Operand::IdRef(offset)],
+                    ));
+                    offset_first
+                }
+            } else {
+                original_last_index
+            };
+            let mut components = Vec::with_capacity(plan.lanes as usize);
+            for lane in 0..plan.lanes {
+                let lane_index = if lane == 0 {
+                    first_word
+                } else {
+                    let index = ctx.module.fresh_id();
+                    let offset = ctx.const_int_of(index_ty, i64::from(lane));
+                    rewritten.push(Instruction::new(
+                        Op::IAdd,
+                        Some(index_ty),
+                        Some(index),
+                        vec![Operand::IdRef(first_word), Operand::IdRef(offset)],
+                    ));
+                    index
+                };
+                let pointer = ctx.module.fresh_id();
+                let mut operands = plan.chain.operands.clone();
+                if plan.strided_tail {
+                    operands.pop();
+                }
+                *operands.last_mut().expect("raw word chain has an index") =
+                    Operand::IdRef(lane_index);
+                rewritten.push(Instruction::new(
+                    plan.chain.class.opcode,
+                    Some(ctx.ty_ptr(StorageClass::StorageBuffer, uint)),
+                    Some(pointer),
+                    operands,
+                ));
+                let word = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::Load,
+                    Some(uint),
+                    Some(word),
+                    vec![Operand::IdRef(pointer)],
+                ));
+                let component = if plan.component_ty == uint {
+                    word
+                } else {
+                    let component = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(plan.component_ty),
+                        Some(component),
+                        vec![Operand::IdRef(word)],
+                    ));
+                    component
+                };
+                components.push(Operand::IdRef(component));
+            }
+            rewritten.push(Instruction::new(
+                Op::CompositeConstruct,
+                Some(plan.vector_ty),
+                Some(result),
+                components,
+            ));
+        }
+        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
     }
 }
 
@@ -450,11 +1039,15 @@ pub(in crate::passes) fn drop_writeonly_dead_local_array_stores(ctx: &mut Ctx, e
 /// one dead chain can orphan another it fed.
 pub(in crate::passes) fn drop_dead_invalid_access_chains(ctx: &mut Ctx, entry_idx: usize) {
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
+    let mut value_types = HashMap::new();
     for inst in ctx
         .new_globals
         .iter()
         .chain(ctx.module.types_global_values.iter())
     {
+        if let (Some(id), Some(ty)) = (inst.result_id, inst.result_type) {
+            value_types.insert(id, ty);
+        }
         if inst.class.opcode == Op::TypePointer {
             if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
                 (inst.result_id, inst.operands.first(), inst.operands.get(1))
@@ -463,76 +1056,146 @@ pub(in crate::passes) fn drop_dead_invalid_access_chains(ctx: &mut Ctx, entry_id
             }
         }
     }
-    loop {
-        // Every id referenced as an operand anywhere in the entry function (+ annotations).
-        let mut referenced: HashSet<Word> = HashSet::new();
-        for block in &ctx.module.functions[entry_idx].blocks {
-            for inst in &block.instructions {
-                for op in &inst.operands {
-                    if let Operand::IdRef(id) = op {
-                        referenced.insert(*id);
-                    }
-                }
-            }
-        }
-        for inst in &ctx.module.annotations {
-            for op in &inst.operands {
-                if let Operand::IdRef(id) = op {
-                    referenced.insert(*id);
-                }
-            }
-        }
-        let mut victims: HashSet<Word> = HashSet::new();
-        for block in &ctx.module.functions[entry_idx].blocks {
-            for inst in &block.instructions {
-                if !matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
-                    continue;
-                }
-                let Some(result) = inst.result_id else {
-                    continue;
-                };
-                if referenced.contains(&result) {
-                    continue; // still used
-                }
-                let (Some(result_type), Some(Operand::IdRef(base))) =
-                    (inst.result_type, inst.operands.first())
-                else {
-                    continue;
-                };
-                let Some(&(_, result_pointee)) = ptr_info.get(&result_type) else {
-                    continue;
-                };
-                let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
-                    continue;
-                };
-                let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
-                    continue;
-                };
-                let indices: Vec<Operand> = inst.operands[1..].to_vec();
-                if indices.is_empty() {
-                    continue;
-                }
-                // Only drop a chain that is currently INVALID — a valid chain walks every index and
-                // reaches exactly its declared pointee, so a banked module is never touched.
-                let (reached, consumed) = walk_into_type_partial(ctx, base_pointee, &indices);
-                if consumed == indices.len() && reached == result_pointee {
-                    continue;
-                }
-                victims.insert(result);
-            }
-        }
-        if victims.is_empty() {
-            return;
-        }
-        for block in &mut ctx.module.functions[entry_idx].blocks {
-            block.instructions.retain(|inst| {
-                !inst
-                    .result_id
-                    .map(|r| victims.contains(&r))
-                    .unwrap_or(false)
-            });
+    for parameter in &ctx.module.functions[entry_idx].parameters {
+        if let (Some(id), Some(ty)) = (parameter.result_id, parameter.result_type) {
+            value_types.insert(id, ty);
         }
     }
+    for block in &ctx.module.functions[entry_idx].blocks {
+        for instruction in &block.instructions {
+            if let (Some(id), Some(ty)) = (instruction.result_id, instruction.result_type) {
+                value_types.insert(id, ty);
+            }
+        }
+    }
+    let chain_definitions = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+            )
+            .then_some((inst.result_id?, inst.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    // Build operand reference counts once, then peel newly dead parent chains with a worklist.
+    // The former fixpoint rescanned the complete function after every ancestry layer, which became
+    // quadratic when raw-byte replay expanded a large shader by tens of thousands of instructions.
+    let mut references: HashMap<Word, usize> = HashMap::new();
+    for block in &ctx.module.functions[entry_idx].blocks {
+        for instruction in &block.instructions {
+            for operand in &instruction.operands {
+                if let Operand::IdRef(id) = operand {
+                    *references.entry(*id).or_default() += 1;
+                }
+            }
+        }
+    }
+    for instruction in &ctx.module.annotations {
+        for operand in &instruction.operands {
+            if let Operand::IdRef(id) = operand {
+                *references.entry(*id).or_default() += 1;
+            }
+        }
+    }
+    let mut pending = chain_definitions
+        .keys()
+        .copied()
+        .filter(|id| references.get(id).copied().unwrap_or(0) == 0)
+        .collect::<Vec<_>>();
+    let mut victims = HashSet::new();
+    while let Some(result) = pending.pop() {
+        if victims.contains(&result) || references.get(&result).copied().unwrap_or(0) != 0 {
+            continue;
+        }
+        let Some(instruction) = chain_definitions.get(&result) else {
+            continue;
+        };
+        // A dead, otherwise-valid PtrAccessChain may be the only remaining use of an invalid parent
+        // after its load/store was rewritten. Remove that suffix too, but only when its ancestry
+        // proves the invalidity; an unrelated valid dead chain is deliberately left byte-identical.
+        if !invalid_access_chain_or_ancestor(
+            ctx,
+            &ptr_info,
+            &value_types,
+            &chain_definitions,
+            instruction,
+            &mut HashSet::new(),
+        ) {
+            continue;
+        }
+        victims.insert(result);
+        for operand in &instruction.operands {
+            let Operand::IdRef(id) = operand else {
+                continue;
+            };
+            let Some(count) = references.get_mut(id) else {
+                continue;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 && chain_definitions.contains_key(id) {
+                pending.push(*id);
+            }
+        }
+    }
+    if victims.is_empty() {
+        return;
+    }
+    for block in &mut ctx.module.functions[entry_idx].blocks {
+        block.instructions.retain(|instruction| {
+            !instruction
+                .result_id
+                .is_some_and(|result| victims.contains(&result))
+        });
+    }
+}
+
+fn invalid_access_chain_or_ancestor(
+    ctx: &Ctx,
+    ptr_info: &HashMap<Word, (StorageClass, Word)>,
+    value_types: &HashMap<Word, Word>,
+    definitions: &HashMap<Word, Instruction>,
+    inst: &Instruction,
+    seen: &mut HashSet<Word>,
+) -> bool {
+    let Some(result) = inst.result_id else {
+        return false;
+    };
+    if !seen.insert(result) {
+        return false;
+    }
+    let Some(result_type) = inst.result_type else {
+        return false;
+    };
+    let Some(&(result_storage, result_pointee)) = ptr_info.get(&result_type) else {
+        return false;
+    };
+    let Some(Operand::IdRef(base)) = inst.operands.first() else {
+        return false;
+    };
+    let Some(base_ptr_ty) = value_types.get(base).copied() else {
+        return false;
+    };
+    let Some(&(base_storage, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
+        return false;
+    };
+    let index_start = if inst.class.opcode == Op::PtrAccessChain {
+        // Operand 1 is the pointer-arithmetic element; it preserves the base pointee. Only later
+        // operands descend through composites.
+        2
+    } else {
+        1
+    };
+    let indices = inst.operands.get(index_start..).unwrap_or_default();
+    let (reached, consumed) = walk_into_type_partial(ctx, base_pointee, indices);
+    if result_storage != base_storage || consumed != indices.len() || reached != result_pointee {
+        return true;
+    }
+    definitions.get(base).is_some_and(|parent| {
+        invalid_access_chain_or_ancestor(ctx, ptr_info, value_types, definitions, parent, seen)
+    })
 }
 
 /// Store-side analogue of [`lower_cross_member_subword_load`]: lower an `OpStore` of a wider scalar
@@ -1148,6 +1811,7 @@ pub(in crate::passes) fn uint_type_of_width(ctx: &mut Ctx, bits: u32) -> Word {
 /// scalars/Words computed in the read-only scan, so the mutating apply phase is mechanical.
 pub(in crate::passes) struct SubwordPart {
     pub(in crate::passes) member_index: u32,
+    pub(in crate::passes) member_offset: u32,
     pub(in crate::passes) member_ty: Word,
     pub(in crate::passes) member_bits: u32,
     pub(in crate::passes) shift_right: u32, // bits to drop off the bottom of the member before taking our bytes
@@ -1166,6 +1830,8 @@ pub(in crate::passes) struct SubwordPlan {
     pub(in crate::passes) prefix: Vec<Operand>,
     pub(in crate::passes) storage: StorageClass,
     pub(in crate::passes) parts: Vec<SubwordPart>,
+    pub(in crate::passes) exact_buffer_offset: Option<(Word, u64)>,
+    pub(in crate::passes) addressed_member_offset: u32,
 }
 
 /// Lower a width-mismatched `OpLoad` of a wider scalar through a struct-MEMBER pointer into a
@@ -1234,6 +1900,14 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
             }
         }
     }
+    let types = crate::passes::resources::rewrites::combined_type_defs(ctx, &HashMap::new());
+    let value_types = crate::passes::resources::rewrites::combined_value_types(ctx, entry_idx);
+    let exact_offsets = ctx
+        .emit_sidecar
+        .buffer_access_offsets
+        .iter()
+        .map(|fact| (fact.id, (fact.root, fact.byte_offset)))
+        .collect::<HashMap<_, _>>();
 
     let mut plans: Vec<SubwordPlan> = Vec::new();
     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
@@ -1353,6 +2027,7 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
                 let hi = read_hi.min(off + msize);
                 parts.push(SubwordPart {
                     member_index: m,
+                    member_offset: off,
                     member_ty: mty,
                     member_bits: msize * 8,
                     shift_right: (lo - off) * 8,
@@ -1370,6 +2045,15 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
                 prefix: prefix.to_vec(),
                 storage,
                 parts,
+                exact_buffer_offset: inherited_exact_byte_offset(
+                    *ptr,
+                    &exact_offsets,
+                    &chain_defs,
+                    &types,
+                    &value_types,
+                    &mut HashSet::new(),
+                ),
+                addressed_member_offset: read_lo,
             });
         }
     }
@@ -1428,6 +2112,18 @@ pub(in crate::passes) fn emit_subword_assembly(
             Some(ptr),
             ops,
         ));
+        if let Some((root, addressed_offset)) = plan.exact_buffer_offset {
+            let relative = i64::from(part.member_offset) - i64::from(plan.addressed_member_offset);
+            if let Some(byte_offset) = addressed_offset.checked_add_signed(relative) {
+                ctx.emit_sidecar.buffer_access_offsets.push(
+                    crate::emit_sidecar::BufferAccessOffset {
+                        id: ptr,
+                        root,
+                        byte_offset,
+                    },
+                );
+            }
+        }
         // Load and reinterpret to the member's same-width unsigned int.
         let loaded = ctx.module.fresh_id();
         out.push(Instruction::new(

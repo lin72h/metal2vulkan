@@ -156,7 +156,7 @@ pub(in crate::passes) fn rewrite_workgroup_root_access(
     }
 }
 
-/// Rewrite the uses of a buffer param the backend collapsed into a bare element pointer. `block_ty`
+/// Rewrite uses of a buffer param emitted as a bare element pointer. `block_ty`
 /// is the StorageBuffer Block we point the var at (a `{ RuntimeArray<T> }` for a genuine array, or the
 /// reconstructed struct). Each access chain rooted at the param is re-rooted at the var (with a
 /// member-0 index prepended iff `prepend_member0`, for the runtime-array case); each direct OpLoad of
@@ -214,6 +214,22 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
                 continue;
             }
 
+            // Some opaque-pointer paths already retain the synthetic block-member selector
+            // (`[0, element]`). Classify each use against the chosen block rather than relying only
+            // on the parameter-wide prepend hint: mixed direct/indirect uses can make that hint
+            // conservative. A complete type walk proves the existing path needs only a new root.
+            if prepend_member0 {
+                if let Some(pointee) =
+                    type_after_spirv_access_operands(&types, block_ty, &old_indices)
+                {
+                    let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, pointee);
+                    let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
+                    inst.operands[0] = Operand::IdRef(var);
+                    inst.result_type = Some(ptr_ty);
+                    continue;
+                }
+            }
+
             let direct_root = if prepend_member0 {
                 runtime_array_block_element_type(&types, block_ty)
             } else {
@@ -246,7 +262,17 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
                 let mut operands = vec![Operand::IdRef(var)];
                 if prepend_member0 {
                     operands.push(Operand::IdRef(u0));
-                    operands.push(Operand::IdRef(u0));
+                    // A compact metadata STRUCT is one record in the RuntimeArray and needs its
+                    // record-0 selector before member descent. A scalar/vector runtime element is
+                    // already the indexed object: inserting another zero would descend into that
+                    // scalar and leave the real dynamic index over-indexing it.
+                    if direct_root.is_some_and(|root| {
+                        types
+                            .get(&root)
+                            .is_some_and(|def| def.class.opcode == Op::TypeStruct)
+                    }) {
+                        operands.push(Operand::IdRef(u0));
+                    }
                 }
                 operands.extend(indices);
                 let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, pointee);
@@ -347,7 +373,12 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
                 .any(|o| matches!(o, Operand::IdRef(r) if *r == pid))
         })
     });
-    if still_used {
+    let sidecar_used = ctx
+        .emit_sidecar
+        .local_pointer_field_stores
+        .iter()
+        .any(|fact| fact.source == pid);
+    if still_used || sidecar_used {
         // Descend to the first non-aggregate leaf.
         let mut cur = block_ty;
         let mut path = vec![];
@@ -362,12 +393,23 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
             ops.push(Operand::IdRef(u0));
         }
         if let Some(first) = ctx.module.functions[entry_idx].blocks.first_mut() {
+            let at = first
+                .instructions
+                .iter()
+                .position(|instruction| instruction.class.opcode != Op::Variable)
+                .unwrap_or(first.instructions.len());
             first.instructions.insert(
-                0,
+                at,
                 Instruction::new(Op::AccessChain, Some(ptr_ty), Some(id), ops),
             );
         }
-        replace_id_in_function(&mut ctx.module.functions[entry_idx], pid, id);
+        if still_used {
+            replace_id_in_function(&mut ctx.module.functions[entry_idx], pid, id);
+        }
+        if sidecar_used {
+            ctx.emit_sidecar
+                .remap_local_pointer_field_store_sources(&HashMap::from([(pid, id)]));
+        }
     }
 }
 
@@ -456,7 +498,30 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                     }
                 }
                 if let Some(old_ty) = rty {
-                    let pointee = if let Some(pointee) = rewritten_rooted_pointer_pointee(
+                    let old_pointee =
+                        pointer_pointee_including_new(ctx, defs, old_ty).ok_or_else(|| {
+                            format!("buffer access-chain result type {old_ty} not a pointer")
+                        })?;
+                    // A raw scalar PtrAccessChain can be rooted at an opaque byte pointer before
+                    // interface binding. Once its parameter is replaced by a typed Block struct,
+                    // keep the scalar result and expose the flat index as an AccessChain; the
+                    // offset-to-member pass can then map that exact byte address to the reflected
+                    // struct member. Retyping the result to the Block itself would discard the
+                    // scalar access contract and make the element operand illegal.
+                    let rerooted_flat_struct_scalar = op == Op::PtrAccessChain
+                        && operands.len() == 2
+                        && base.is_some_and(|base| direct_roots.contains(&base))
+                        && base
+                            .and_then(|base| value_types.get(&base))
+                            .and_then(|ty| pointer_pointee_including_new(ctx, &types, *ty))
+                            .and_then(|pointee| types.get(&pointee))
+                            .is_some_and(|def| def.class.opcode == Op::TypeStruct)
+                        && types.get(&old_pointee).is_some_and(|def| {
+                            matches!(def.class.opcode, Op::TypeInt | Op::TypeFloat | Op::TypeBool)
+                        });
+                    let pointee = if rerooted_flat_struct_scalar {
+                        old_pointee
+                    } else if let Some(pointee) = rewritten_rooted_pointer_pointee(
                         ctx,
                         &types,
                         &value_types,
@@ -467,10 +532,6 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                     ) {
                         pointee
                     } else {
-                        let old_pointee = pointer_pointee_including_new(ctx, defs, old_ty)
-                            .ok_or_else(|| {
-                                format!("buffer access-chain result type {old_ty} not a pointer")
-                            })?;
                         canonical_rooted_access_pointee(
                             ctx,
                             &types,
@@ -528,6 +589,11 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                     }
                     ctx.module.functions[entry_idx].blocks[bi].instructions[ii].result_type =
                         Some(new_ty);
+                    if rerooted_flat_struct_scalar {
+                        ctx.module.functions[entry_idx].blocks[bi].instructions[ii]
+                            .class
+                            .opcode = Op::InBoundsAccessChain;
+                    }
                 }
                 if target_sc == StorageClass::Workgroup
                     && op == Op::PtrAccessChain

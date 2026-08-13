@@ -1,80 +1,162 @@
-//! Iterative dominator-set analysis over an emitted SPIR-V function's CFG.
+//! Compact dominance over an emitted SPIR-V function CFG.
 //!
-//! Shared by [`super::ssa_demote`] and [`super::loop_split`], which both need emitted-CFG dominance
-//! (`dominates(a, b)` == `doms[b].contains(a)`) over the reachable subgraph.
+//! Shared by late native rewrites and the emitter's phi-materialization repair. The immediate-
+//! dominator tree uses O(V + E) storage and answers dominance with DFS intervals; the former
+//! `label -> HashSet<all dominators>` representation was O(V²) and drove large translations far
+//! beyond their resident-memory budget even after those temporary sets were freed.
 
-use super::graph::spirv_predecessor_ids_by_label;
 use spirv::Word;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-/// Iterative dominator-set computation (`node -> set of blocks that dominate it`) over the reachable
-/// subgraph. Standard fixpoint intersection of predecessors' dominators; unreachable blocks are left
-/// out (they carry no structured-exit meaning). Shared with [`super::ssa_demote`], which needs the same
-/// emitted-CFG dominance to find defs that no longer dominate their uses.
-pub(super) fn dominator_sets(
-    entry: Word,
-    labels: &[Word],
-    successors: &HashMap<Word, Vec<Word>>,
-) -> HashMap<Word, HashSet<Word>> {
-    let preds = spirv_predecessor_ids_by_label(successors);
-    let reachable = reachable_from(entry, successors);
-    let all: HashSet<Word> = labels
-        .iter()
-        .copied()
-        .filter(|l| reachable.contains(l))
-        .collect();
-
-    let mut dom: HashMap<Word, HashSet<Word>> = HashMap::new();
-    for &l in labels {
-        if !reachable.contains(&l) {
-            continue;
-        }
-        if l == entry {
-            dom.insert(l, HashSet::from([l]));
-        } else {
-            dom.insert(l, all.clone());
-        }
-    }
-    loop {
-        let mut changed = false;
-        for &l in labels {
-            if l == entry || !reachable.contains(&l) {
-                continue;
-            }
-            let mut acc: Option<HashSet<Word>> = None;
-            for &p in preds.get(&l).into_iter().flatten() {
-                if !reachable.contains(&p) {
-                    continue;
-                }
-                match &mut acc {
-                    None => acc = Some(dom[&p].clone()),
-                    Some(a) => a.retain(|x| dom[&p].contains(x)),
-                }
-            }
-            let mut next = acc.unwrap_or_default();
-            next.insert(l);
-            if dom.get(&l) != Some(&next) {
-                dom.insert(l, next);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    dom
+pub(in crate::native) struct EmittedDominators {
+    index: HashMap<Word, usize>,
+    preorder: Vec<usize>,
+    postorder: Vec<usize>,
+    depth: Vec<usize>,
 }
 
-fn reachable_from(entry: Word, successors: &HashMap<Word, Vec<Word>>) -> HashSet<Word> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![entry];
-    while let Some(n) = stack.pop() {
-        if !seen.insert(n) {
-            continue;
+impl EmittedDominators {
+    pub(in crate::native) fn new(
+        entry: Word,
+        labels: &[Word],
+        successors_by_label: &HashMap<Word, Vec<Word>>,
+    ) -> Self {
+        let index = labels
+            .iter()
+            .enumerate()
+            .map(|(idx, label)| (*label, idx))
+            .collect::<HashMap<_, _>>();
+        let mut successors = vec![Vec::new(); labels.len()];
+        let mut predecessors = vec![Vec::new(); labels.len()];
+        for (&label, targets) in successors_by_label {
+            let Some(&from) = index.get(&label) else {
+                continue;
+            };
+            for target in targets {
+                let Some(&to) = index.get(target) else {
+                    continue;
+                };
+                successors[from].push(to);
+                predecessors[to].push(from);
+            }
         }
-        for &s in successors.get(&n).into_iter().flatten() {
-            stack.push(s);
+
+        let mut rpo = Vec::new();
+        if let Some(&entry) = index.get(&entry) {
+            let mut seen = vec![false; labels.len()];
+            let mut stack = vec![(entry, 0usize)];
+            seen[entry] = true;
+            while let Some((node, next)) = stack.last_mut() {
+                if *next < successors[*node].len() {
+                    let successor = successors[*node][*next];
+                    *next += 1;
+                    if !seen[successor] {
+                        seen[successor] = true;
+                        stack.push((successor, 0));
+                    }
+                } else {
+                    rpo.push(*node);
+                    stack.pop();
+                }
+            }
+            rpo.reverse();
+        }
+        let mut rpo_rank = vec![usize::MAX; labels.len()];
+        for (rank, node) in rpo.iter().copied().enumerate() {
+            rpo_rank[node] = rank;
+        }
+        let mut idom = vec![None; labels.len()];
+        if let Some(&entry) = rpo.first() {
+            idom[entry] = Some(entry);
+            loop {
+                let mut changed = false;
+                for node in rpo.iter().copied().skip(1) {
+                    let mut defined = predecessors[node]
+                        .iter()
+                        .copied()
+                        .filter(|pred| idom[*pred].is_some());
+                    let Some(mut next_idom) = defined.next() else {
+                        continue;
+                    };
+                    for pred in defined {
+                        next_idom = intersect(pred, next_idom, &idom, &rpo_rank);
+                    }
+                    if idom[node] != Some(next_idom) {
+                        idom[node] = Some(next_idom);
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+        }
+
+        let mut children = vec![Vec::new(); labels.len()];
+        for (node, parent) in idom.iter().copied().enumerate() {
+            if let Some(parent) = parent.filter(|parent| *parent != node) {
+                children[parent].push(node);
+            }
+        }
+        let mut preorder = vec![usize::MAX; labels.len()];
+        let mut postorder = vec![usize::MAX; labels.len()];
+        let mut depth = vec![0; labels.len()];
+        if let Some(&entry) = rpo.first() {
+            let mut clock = 0usize;
+            let mut stack = vec![(entry, 0usize)];
+            preorder[entry] = clock;
+            depth[entry] = 1;
+            clock += 1;
+            while let Some((node, next)) = stack.last_mut() {
+                if *next < children[*node].len() {
+                    let child = children[*node][*next];
+                    *next += 1;
+                    preorder[child] = clock;
+                    depth[child] = depth[*node] + 1;
+                    clock += 1;
+                    stack.push((child, 0));
+                } else {
+                    postorder[*node] = clock;
+                    stack.pop();
+                }
+            }
+        }
+        Self {
+            index,
+            preorder,
+            postorder,
+            depth,
         }
     }
-    seen
+
+    pub(in crate::native) fn dominates(&self, dominator: Word, node: Word) -> bool {
+        let (Some(&dominator), Some(&node)) = (self.index.get(&dominator), self.index.get(&node))
+        else {
+            return false;
+        };
+        self.preorder[dominator] != usize::MAX
+            && self.preorder[dominator] <= self.preorder[node]
+            && self.preorder[node] < self.postorder[dominator]
+    }
+
+    pub(in crate::native) fn depth(&self, label: Word) -> usize {
+        self.index.get(&label).map_or(0, |index| self.depth[*index])
+    }
+}
+
+fn intersect(
+    mut left: usize,
+    mut right: usize,
+    idom: &[Option<usize>],
+    rpo_rank: &[usize],
+) -> usize {
+    while left != right {
+        while rpo_rank[left] > rpo_rank[right] {
+            left = idom[left].expect("defined dominator chain");
+        }
+        while rpo_rank[right] > rpo_rank[left] {
+            right = idom[right].expect("defined dominator chain");
+        }
+    }
+    left
 }

@@ -66,6 +66,20 @@ impl LoopForest {
     /// restructuring (node-splitting) first. This is the planning layer of R2; it does not change
     /// emission on its own.
     pub(in crate::native) fn structured_plan(&self) -> Vec<LoopPlan> {
+        self.structured_plan_ignoring_exits(&HashSet::new())
+    }
+
+    /// Build the same loop plan while excluding proven terminal targets from merge selection.
+    ///
+    /// A branch to a bare `unreachable` terminates that invocation inside the construct; it is not a
+    /// continuation destination that needs to compete for `OpLoopMerge`. Callers retain the raw exit
+    /// inventory on [`NaturalLoop`] and opt into this projection only after proving the ignored block
+    /// is terminal. If every raw exit is ignored, keep the raw set: a loop with only terminal exits is
+    /// not the same thing as a genuinely non-terminating loop and needs separate construction.
+    pub(in crate::native) fn structured_plan_ignoring_exits(
+        &self,
+        ignored: &HashSet<String>,
+    ) -> Vec<LoopPlan> {
         // Every block that is some loop's latch (a continue target).
         let all_latches: HashSet<&str> = self
             .loops
@@ -75,27 +89,38 @@ impl LoopForest {
         self.loops
             .iter()
             .map(|l| {
+                let live_exits = l
+                    .exits
+                    .iter()
+                    .filter(|exit| !ignored.contains(*exit))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let exits = if live_exits.is_empty() {
+                    &l.exits
+                } else {
+                    &live_exits
+                };
                 let mut restructure = Vec::new();
                 if l.latches.len() > 1 {
                     restructure.push(Restructure::MultipleLatches);
                 }
-                if l.exits.len() > 1 {
+                if exits.len() > 1 {
                     restructure.push(Restructure::MultipleExits);
                 }
                 // A single exit that is also another loop's continue (the 2647a6f3 overlap): the
                 // structured merge can't be that block; it must be split.
-                if let [exit] = l.exits.as_slice() {
+                if let [exit] = exits.as_slice() {
                     if all_latches.contains(exit.as_str()) {
                         restructure.push(Restructure::MergeIsEnclosingContinue);
                     }
                 }
-                if l.exits.is_empty() {
+                if exits.is_empty() {
                     restructure.push(Restructure::NoExit);
                 }
                 LoopPlan {
                     header: l.header.clone(),
                     continue_block: l.latches.first().cloned(),
-                    merge_block: l.exits.first().cloned(),
+                    merge_block: exits.first().cloned(),
                     restructure,
                 }
             })
@@ -219,6 +244,25 @@ pub(in crate::native) fn analyze(blocks: &[BodyBlock]) -> LoopForest {
     loops.sort_by(|a, b| a.header.cmp(&b.header));
     forest.loops = loops;
     forest
+}
+
+/// Recompute dominance while retaining a previously proven natural-loop forest.
+///
+/// This is for edge-splitting rewrites that only redirect terminal destinations and append acyclic
+/// leaf/pass-through blocks. Such rewrites cannot create or remove a back-edge, change a loop body,
+/// or change loop nesting, but their new blocks still need current dominance. Avoiding natural-loop
+/// rediscovery is material for generated functions with hundreds of nested/overlapping loop records.
+pub(in crate::native) fn analyze_reusing_natural_loops(
+    blocks: &[BodyBlock],
+    loops: &[NaturalLoop],
+) -> LoopForest {
+    let Some(cfg) = Cfg::from_blocks(blocks) else {
+        return LoopForest::default();
+    };
+    LoopForest {
+        loops: loops.to_vec(),
+        doms: cfg.dominators(),
+    }
 }
 
 /// Natural loop of a back-edge set: header plus every block that can reach a latch without passing
@@ -497,7 +541,46 @@ pub(in crate::native) fn selection_merges(
     blocks: &[BodyBlock],
     forest: &LoopForest,
 ) -> HashMap<String, String> {
-    selection_merges_from_pidom(blocks, forest, &post_idom(blocks))
+    // A switch's terminal `unreachable` case is a structured exit from the selection, not a second
+    // reconvergence path. Switch lowering already applies this rule through `infer_switch_merges`;
+    // apply the same contract to the source-CFG post-dominator analysis so the two planners cannot
+    // disagree and strand an otherwise ordinary switch without an `OpSelectionMerge`.
+    let unreachable_targets: HashSet<&str> = blocks
+        .iter()
+        .filter(|block| {
+            block.typed.as_ref().is_some_and(|typed| {
+                typed.insts.is_empty()
+                    && matches!(
+                        typed.terminator,
+                        crate::native::tir::TirTerminator::Unreachable
+                    )
+            })
+        })
+        .map(|block| block.name.as_str())
+        .collect();
+    let mut terminal_switch_edges = HashSet::new();
+    for block in blocks {
+        let is_switch = block.typed.as_ref().is_some_and(|typed| {
+            matches!(
+                typed.terminator,
+                crate::native::tir::TirTerminator::Switch { .. }
+            )
+        });
+        if !is_switch {
+            continue;
+        }
+        for target in block_successors(block) {
+            if unreachable_targets.contains(target.as_str()) {
+                terminal_switch_edges.insert((block.name.clone(), target));
+            }
+        }
+    }
+    let pidom = if terminal_switch_edges.is_empty() {
+        post_idom(blocks)
+    } else {
+        post_idom_cut(blocks, &terminal_switch_edges)
+    };
+    selection_merges_from_pidom(blocks, forest, &pidom)
 }
 
 /// Break-aware [`selection_merges`]: computes each selection header's merge on a post-dominator graph
@@ -601,7 +684,7 @@ mod tests {
         BodyBlock {
             name,
             role: crate::native::cfg::BlockRole::Normal,
-            typed,
+            typed: typed.map(Into::into),
         }
     }
 
@@ -880,6 +963,25 @@ mod tests {
         let merges = selection_merges(&blocks, &forest);
         assert_eq!(merges.get("%H").map(String::as_str), Some("%m"));
         assert_eq!(merges.get("%G").map(String::as_str), Some("%gm"));
+    }
+
+    #[test]
+    fn switch_merge_ignores_terminal_unreachable_arm() {
+        // The default arm terminates the invocation and therefore exits the switch construct. The two
+        // live cases still reconverge at m, which is the switch's structured selection merge.
+        let blocks = vec![
+            blk(
+                "sw",
+                "switch i32 %s, label %dead [ i32 0, label %a i32 1, label %b ]",
+            ),
+            blk("a", "br label %m"),
+            blk("b", "br label %m"),
+            blk("dead", "unreachable"),
+            blk("m", "ret void"),
+        ];
+        let forest = analyze(&blocks);
+        let merges = selection_merges(&blocks, &forest);
+        assert_eq!(merges.get("%sw").map(String::as_str), Some("%m"));
     }
 
     #[test]

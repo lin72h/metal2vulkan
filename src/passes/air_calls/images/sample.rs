@@ -52,14 +52,14 @@ pub(in crate::passes) fn lower_sample(
     {
         // Pixel-coordinate linear float sampling is emulated in-shader (per-tap fetch + lerp) for
         // 2D AND 3D: Vulkan forbids an unnormalized-coordinates sampler on a Dim3d image view, so
-        // a plain OpImageSample with raw pixel coords can never be the 3D lowering (vulkano rejects
+        // a plain OpImageSample with raw pixel coords can never be the 3D lowering (Vulkan consumers reject
         // the pipeline/descriptor pairing at dispatch).
         let pixel_linear = comp == crate::passes::ImageComp::Float
             && sampler_state.uses_linear_filter()
             && matches!(dim, Dim::Dim2D | Dim::Dim3D);
         let pixel_bicubic = comp == crate::passes::ImageComp::Float
             && sampler_state.uses_bicubic_filter()
-            && dim == Dim::Dim2D;
+            && matches!(dim, Dim::Dim1D | Dim::Dim2D);
         let pixel_fetch = comp != crate::passes::ImageComp::Float
             || sampler_state.uses_pixel_nearest()
             || arrayed;
@@ -88,6 +88,7 @@ pub(in crate::passes) fn lower_sample(
                     ctx,
                     sampler_state,
                     img,
+                    dim,
                     arrayed,
                     coord,
                     args,
@@ -135,7 +136,7 @@ pub(in crate::passes) fn lower_sample(
         .copied()
         .filter(|state| state.uses_bicubic_filter())
     {
-        if comp == crate::passes::ImageComp::Float && dim == Dim::Dim2D {
+        if comp == crate::passes::ImageComp::Float && matches!(dim, Dim::Dim1D | Dim::Dim2D) {
             let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
                 Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
                 None => ctx.const_uint(0),
@@ -144,6 +145,7 @@ pub(in crate::passes) fn lower_sample(
                 ctx,
                 sampler_state,
                 img,
+                dim,
                 arrayed,
                 coord,
                 args,
@@ -155,7 +157,8 @@ pub(in crate::passes) fn lower_sample(
             return finish_sample_result(ctx, res, rty, color, sample_v4, out);
         }
         return Err(
-            "air.sample_texture bicubic filtering is supported only for 2D float textures".into(),
+            "air.sample_texture bicubic filtering is supported only for 1D/2D float textures"
+                .into(),
         );
     }
     if is_int_tex {
@@ -269,6 +272,7 @@ fn lower_pixel_bicubic_sample(
     ctx: &mut Ctx,
     sampler_state: StaticSamplerState,
     img: Word,
+    dim: Dim,
     arrayed: bool,
     coord: Word,
     args: &[Word],
@@ -277,9 +281,15 @@ fn lower_pixel_bicubic_sample(
     normalized_coordinates: bool,
     out: &mut Vec<Instruction>,
 ) -> Result<Word, String> {
-    let (offset, dynamic_offset) = sample_const_or_dynamic_offset(ctx, arrayed, args, 2)?;
+    let spatial = match dim {
+        Dim::Dim1D => 1,
+        Dim::Dim2D => 2,
+        _ => return Err("air.sample_texture bicubic sample unsupported dimension".into()),
+    };
+    let (offset, dynamic_offset) =
+        sample_const_or_dynamic_offset(ctx, arrayed, args, spatial as u32)?;
     let dynamic_offset = dynamic_offset
-        .map(|offset| dynamic_i32_integer_offset_components(ctx, offset, 2, out))
+        .map(|offset| dynamic_i32_integer_offset_components(ctx, offset, spatial, out))
         .transpose()?;
     let layer = if arrayed {
         Some(
@@ -290,16 +300,16 @@ fn lower_pixel_bicubic_sample(
     } else {
         None
     };
-    let size = query_image_size(ctx, img, 2, arrayed, lod, out);
+    let size = query_image_size(ctx, img, spatial, arrayed, lod, out);
     let float_ty = ctx.ty_float();
     let sint = ctx.ty_sint();
     let bool_ty = ctx.ty_bool();
     let glsl = ctx.glsl();
     let zero_f = ctx.const_float(0.0);
     let half_f = ctx.const_float(0.5);
-    let mut base = Vec::with_capacity(2);
-    let mut axis_weights = Vec::with_capacity(2);
-    for (axis, component) in sample_coord_components(ctx, coord, 2, out)?
+    let mut base = Vec::with_capacity(spatial);
+    let mut axis_weights = Vec::with_capacity(spatial);
+    for (axis, component) in sample_coord_components(ctx, coord, spatial as u32, out)?
         .into_iter()
         .enumerate()
     {
@@ -307,13 +317,18 @@ fn lower_pixel_bicubic_sample(
             return Err("air.sample_texture bicubic coord component is not an id".into());
         };
         let component = if normalized_coordinates {
-            let extent = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::CompositeExtract,
-                Some(ctx.ty_uint()),
-                Some(extent),
-                vec![Operand::IdRef(size), Operand::LiteralBit32(axis as u32)],
-            ));
+            let extent = if spatial == 1 {
+                size
+            } else {
+                let extent = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::CompositeExtract,
+                    Some(ctx.ty_uint()),
+                    Some(extent),
+                    vec![Operand::IdRef(size), Operand::LiteralBit32(axis as u32)],
+                ));
+                extent
+            };
             let extent_f = ctx.module.fresh_id();
             out.push(Instruction::new(
                 Op::ConvertUToF,
@@ -333,7 +348,7 @@ fn lower_pixel_bicubic_sample(
             component
         };
         let component =
-            clamp_pixel_coord_component_finite(ctx, component, size, true, axis as u32, out);
+            clamp_pixel_coord_component_finite(ctx, component, size, spatial > 1, axis as u32, out);
         let biased = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::FSub,
@@ -394,89 +409,98 @@ fn lower_pixel_bicubic_sample(
 
     let zero_color = const_null_of(ctx, sample_v4);
     let mut acc = zero_color;
-    for tap_y in 0..4 {
-        for tap_x in 0..4 {
-            let tap_coord = pixel_linear_tap_coord(
-                ctx,
-                sampler_state,
-                Dim::Dim2D,
-                arrayed,
-                &base,
-                &[tap_x - 1, tap_y - 1],
-                layer,
-                size,
-                out,
-            )?;
-            let fetched = ctx.module.fresh_id();
-            push_image_read_or_fetch(
-                ctx,
-                out,
-                img,
-                tap_coord.coord,
-                Some(lod),
-                sample_v4,
-                fetched,
-            );
-            let color = if let Some(in_bounds) = tap_coord.in_bounds {
-                let guarded = ctx.module.fresh_id();
-                out.push(Instruction::new(
-                    Op::Select,
-                    Some(sample_v4),
-                    Some(guarded),
-                    vec![
-                        Operand::IdRef(in_bounds),
-                        Operand::IdRef(fetched),
-                        Operand::IdRef(zero_color),
-                    ],
-                ));
-                guarded
-            } else {
-                fetched
-            };
-            let weight = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::FMul,
-                Some(float_ty),
-                Some(weight),
-                vec![
-                    Operand::IdRef(axis_weights[0][tap_x as usize]),
-                    Operand::IdRef(axis_weights[1][tap_y as usize]),
-                ],
-            ));
-            let weighted = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::VectorTimesScalar,
-                Some(sample_v4),
-                Some(weighted),
-                vec![Operand::IdRef(color), Operand::IdRef(weight)],
-            ));
-            let weight_is_zero = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::FOrdEqual,
-                Some(bool_ty),
-                Some(weight_is_zero),
-                vec![Operand::IdRef(weight), Operand::IdRef(zero_f)],
-            ));
-            let contribution = ctx.module.fresh_id();
+    for tap in 0..4usize.pow(spatial as u32) {
+        let tap_indices = (0..spatial)
+            .map(|axis| (tap / 4usize.pow(axis as u32)) % 4)
+            .collect::<Vec<_>>();
+        let tap_offsets = tap_indices
+            .iter()
+            .map(|index| *index as i32 - 1)
+            .collect::<Vec<_>>();
+        let tap_coord = pixel_linear_tap_coord(
+            ctx,
+            sampler_state,
+            dim,
+            arrayed,
+            &base,
+            &tap_offsets,
+            layer,
+            size,
+            out,
+        )?;
+        let fetched = ctx.module.fresh_id();
+        push_image_read_or_fetch(
+            ctx,
+            out,
+            img,
+            tap_coord.coord,
+            Some(lod),
+            sample_v4,
+            fetched,
+        );
+        let color = if let Some(in_bounds) = tap_coord.in_bounds {
+            let guarded = ctx.module.fresh_id();
             out.push(Instruction::new(
                 Op::Select,
                 Some(sample_v4),
-                Some(contribution),
+                Some(guarded),
                 vec![
-                    Operand::IdRef(weight_is_zero),
+                    Operand::IdRef(in_bounds),
+                    Operand::IdRef(fetched),
                     Operand::IdRef(zero_color),
-                    Operand::IdRef(weighted),
                 ],
             ));
-            let sum = ctx.module.fresh_id();
+            guarded
+        } else {
+            fetched
+        };
+        let mut weight = axis_weights[0][tap_indices[0]];
+        for (axis, weights) in axis_weights.iter().enumerate().skip(1) {
+            let combined = ctx.module.fresh_id();
             out.push(Instruction::new(
-                Op::FAdd,
-                Some(sample_v4),
-                Some(sum),
-                vec![Operand::IdRef(acc), Operand::IdRef(contribution)],
+                Op::FMul,
+                Some(float_ty),
+                Some(combined),
+                vec![
+                    Operand::IdRef(weight),
+                    Operand::IdRef(weights[tap_indices[axis]]),
+                ],
             ));
-            acc = sum;
+            weight = combined;
         }
+        let weighted = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::VectorTimesScalar,
+            Some(sample_v4),
+            Some(weighted),
+            vec![Operand::IdRef(color), Operand::IdRef(weight)],
+        ));
+        let weight_is_zero = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(weight_is_zero),
+            vec![Operand::IdRef(weight), Operand::IdRef(zero_f)],
+        ));
+        let contribution = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::Select,
+            Some(sample_v4),
+            Some(contribution),
+            vec![
+                Operand::IdRef(weight_is_zero),
+                Operand::IdRef(zero_color),
+                Operand::IdRef(weighted),
+            ],
+        ));
+        let sum = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::FAdd,
+            Some(sample_v4),
+            Some(sum),
+            vec![Operand::IdRef(acc), Operand::IdRef(contribution)],
+        ));
+        acc = sum;
     }
     Ok(acc)
 }
@@ -929,6 +953,7 @@ mod tests {
             &mut ctx,
             sampler_state,
             image,
+            Dim::Dim2D,
             false,
             coord,
             &[image, 0, coord],
@@ -978,5 +1003,44 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(scaled_extent_ids.len(), 2);
+    }
+
+    #[test]
+    fn normalized_bicubic_1d_emits_four_fetches() {
+        let mut ctx = Ctx::new(Module::new());
+        let image_ty = ctx.ty_image(Dim::Dim1D, false, crate::passes::ImageComp::Float);
+        let image = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Undef,
+            Some(image_ty),
+            Some(image),
+            vec![],
+        ));
+        let coord = ctx.const_float(0.25);
+        let sample_v4 = ctx.ty_vech(4);
+        let lod = ctx.const_uint(0);
+        let sampler_state = StaticSamplerState::from_air_words([34901797601023049, 0])
+            .expect("normalized bicubic AIR sampler state");
+        let mut out = Vec::new();
+        lower_pixel_bicubic_sample(
+            &mut ctx,
+            sampler_state,
+            image,
+            Dim::Dim1D,
+            false,
+            coord,
+            &[image, 0, coord],
+            lod,
+            sample_v4,
+            true,
+            &mut out,
+        )
+        .expect("normalized 1D bicubic lowering");
+        assert_eq!(
+            out.iter()
+                .filter(|inst| inst.class.opcode == Op::ImageFetch)
+                .count(),
+            4
+        );
     }
 }

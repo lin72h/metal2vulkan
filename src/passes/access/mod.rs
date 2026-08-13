@@ -62,6 +62,19 @@ mod byte_reinterpret_tests {
         id
     }
 
+    fn decorate_array_stride(ctx: &mut Ctx, array: Word, stride: u32) {
+        ctx.module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(array),
+                Operand::Decoration(Decoration::ArrayStride),
+                Operand::LiteralBit32(stride),
+            ],
+        ));
+    }
+
     fn only_inst(ctx: &Ctx) -> &Instruction {
         &ctx.module.functions[0].blocks[0].instructions[0]
     }
@@ -336,6 +349,84 @@ mod byte_reinterpret_tests {
             .iter()
             .find(|i| i.result_id == Some(id))
             .expect("instruction with the given result id")
+    }
+
+    #[test]
+    fn array_pointer_element_load_descends_through_zero() {
+        let mut ctx = Ctx::new(Module::new());
+        let float4 = ctx.ty_vecf(4);
+        let array = ctx.ty_runtime_array(float4);
+        let ptr_array = ctx.ty_ptr(StorageClass::StorageBuffer, array);
+        let pointer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_array), Some(pointer), vec![]),
+                Instruction::new(
+                    Op::Load,
+                    Some(float4),
+                    Some(loaded),
+                    vec![Operand::IdRef(pointer)],
+                ),
+            ],
+        );
+
+        repair_load_through_array_pointer(&mut ctx, 0);
+
+        let load = find_inst(&ctx, loaded);
+        let Operand::IdRef(element_pointer) = load.operands[0] else {
+            panic!("load has an element pointer");
+        };
+        let descent = find_inst(&ctx, element_pointer);
+        assert_eq!(descent.class.opcode, Op::InBoundsAccessChain);
+        assert_eq!(descent.operands.first(), Some(&Operand::IdRef(pointer)));
+        assert!(matches!(
+            descent.operands.get(1),
+            Some(Operand::IdRef(id)) if const_u32(&ctx, *id) == Some(0)
+        ));
+    }
+
+    #[test]
+    fn flat_scalar_offset_through_vector_array_splits_index_and_lane() {
+        let mut ctx = Ctx::new(Module::new());
+        let float = ctx.ty_float();
+        let float4 = ctx.ty_vecf(4);
+        let array = ctx.ty_runtime_array(float4);
+        let wrapper = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(array)]);
+        let ptr_wrapper = ctx.ty_ptr(StorageClass::StorageBuffer, wrapper);
+        let ptr_float = ctx.ty_ptr(StorageClass::StorageBuffer, float);
+        let base = storage_buffer_var(&mut ctx, ptr_wrapper);
+        let zero = ctx.const_uint(0);
+        let flat = ctx.const_uint(5);
+        let pointer = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![Instruction::new(
+                Op::PtrAccessChain,
+                Some(ptr_float),
+                Some(pointer),
+                vec![
+                    Operand::IdRef(base),
+                    Operand::IdRef(zero),
+                    Operand::IdRef(flat),
+                ],
+            )],
+        );
+
+        rewrite_flat_scalar_ptr_access_through_vector_array(&mut ctx, 0);
+
+        let rewritten = find_inst(&ctx, pointer);
+        assert_eq!(rewritten.class.opcode, Op::InBoundsAccessChain);
+        let indices = rewritten.operands[1..]
+            .iter()
+            .map(|operand| match operand {
+                Operand::IdRef(id) => const_u32(&ctx, *id),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .expect("constant typed indices");
+        assert_eq!(indices, vec![0, 1, 1]);
     }
 
     #[test]
@@ -1215,6 +1306,7 @@ mod byte_reinterpret_tests {
         let u16 = ty_int16(ctx);
         let u32 = ctx.ty_uint();
         let rt = ctx.ty_runtime_array(u16);
+        decorate_array_stride(ctx, rt, 2);
         let struct_id = ctx.module.fresh_id();
         ctx.new_globals.push(Instruction::new(
             Op::TypeStruct,
@@ -1267,6 +1359,83 @@ mod byte_reinterpret_tests {
             u16,
             u32,
         }
+    }
+
+    #[test]
+    fn half_array_chained_reinterpret_widens_through_nested_member() {
+        let mut ctx = Ctx::new(Module::new());
+        let half = ctx.ty_half();
+        let uint = ctx.ty_uint();
+        let array = ctx.ty_array(half, 8);
+        decorate_array_stride(&mut ctx, array, 2);
+        let pair = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(pair),
+            vec![Operand::IdRef(array), Operand::IdRef(array)],
+        ));
+        let ptr_pair = ctx.ty_ptr(StorageClass::StorageBuffer, pair);
+        let ptr_half = ctx.ty_ptr(StorageClass::StorageBuffer, half);
+        let ptr_uint = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+        let buffer = storage_buffer_var(&mut ctx, ptr_pair);
+        let zero = ctx.const_uint(0);
+        let element = ctx.const_uint(1);
+        let outer_index = ctx.module.fresh_id();
+        let inner = ctx.module.fresh_id();
+        let outer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(uint), Some(outer_index), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_half),
+                    Some(inner),
+                    vec![
+                        Operand::IdRef(buffer),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(element),
+                    ],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_uint),
+                    Some(outer),
+                    vec![
+                        Operand::IdRef(inner),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(outer_index),
+                    ],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(uint),
+                    Some(loaded),
+                    vec![Operand::IdRef(outer)],
+                ),
+            ],
+        );
+
+        rewrite_byte_buffer_chained_reinterpret(&mut ctx, 0).unwrap();
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::BitwiseOr);
+        assert_eq!(
+            body.iter()
+                .filter(|inst| inst.class.opcode == Op::Load && inst.result_type == Some(half))
+                .count(),
+            2
+        );
+        assert_eq!(
+            body.iter()
+                .filter(|inst| inst.class.opcode == Op::Bitcast)
+                .count(),
+            2,
+            "each half slot is reinterpreted as its 16-bit integer payload"
+        );
+        assert!(body.iter().all(|inst| inst.result_id != Some(outer)));
     }
 
     /// The invalid widening chain is replaced by byte-offset arithmetic (`out_idx*ratio + byteIdx`)
@@ -1465,6 +1634,557 @@ mod byte_reinterpret_tests {
         );
     }
 
+    #[test]
+    fn raw_byte_pointer_half_load_replays_two_bytes() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ty_uint8(&mut ctx);
+        let half = ctx.ty_half();
+        let ulong = ctx.ty_ulong();
+        let ptr_byte = ctx.ty_ptr(StorageClass::StorageBuffer, byte);
+        let ptr_half = ctx.ty_ptr(StorageClass::StorageBuffer, half);
+        let base = ctx.module.fresh_id();
+        let index = ctx.module.fresh_id();
+        let chain = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_byte), Some(base), vec![]),
+                Instruction::new(Op::Undef, Some(ulong), Some(index), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_half),
+                    Some(chain),
+                    vec![Operand::IdRef(base), Operand::IdRef(index)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(half),
+                    Some(loaded),
+                    vec![Operand::IdRef(chain)],
+                ),
+            ],
+        );
+
+        rewrite_raw_byte_pointer_wide_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(body
+            .iter()
+            .all(|instruction| instruction.result_id != Some(chain)));
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::CopyObject);
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
+                .count(),
+            2
+        );
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == Op::Load && instruction.result_type == Some(byte)
+                })
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn raw_byte_block_half_load_descends_through_member_zero() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ty_uint8(&mut ctx);
+        let half = ctx.ty_half();
+        let ulong = ctx.ty_ulong();
+        let byte_array = ctx.get_or_create(Op::TypeRuntimeArray, None, vec![Operand::IdRef(byte)]);
+        let byte_block = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(byte_array)]);
+        let ptr_block = ctx.ty_ptr(StorageClass::StorageBuffer, byte_block);
+        let ptr_half = ctx.ty_ptr(StorageClass::StorageBuffer, half);
+        let base = ctx.module.fresh_id();
+        let index = ctx.module.fresh_id();
+        let chain = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_block), Some(base), vec![]),
+                Instruction::new(Op::Undef, Some(ulong), Some(index), vec![]),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_half),
+                    Some(chain),
+                    vec![Operand::IdRef(base), Operand::IdRef(index)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(half),
+                    Some(loaded),
+                    vec![Operand::IdRef(chain)],
+                ),
+            ],
+        );
+
+        rewrite_raw_byte_pointer_wide_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(body
+            .iter()
+            .all(|instruction| instruction.result_id != Some(chain)));
+        let byte_base = body
+            .iter()
+            .find(|instruction| {
+                instruction.class.opcode == Op::InBoundsAccessChain
+                    && instruction.operands.len() == 3
+                    && instruction.operands.first() == Some(&Operand::IdRef(base))
+            })
+            .and_then(|instruction| instruction.result_id)
+            .expect("member-zero byte base");
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::CopyObject);
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
+                .count(),
+            2
+        );
+        assert!(body
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
+            .all(|instruction| {
+                instruction.operands.first() == Some(&Operand::IdRef(byte_base))
+            }));
+    }
+
+    #[test]
+    fn exact_raw_byte_block_fact_replays_typed_leaf_load() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ty_uint8(&mut ctx);
+        let half = ctx.ty_half();
+        let half2 = ctx.ty_vech(2);
+        let typed_struct = ctx.get_or_create(
+            Op::TypeStruct,
+            None,
+            vec![Operand::IdRef(half), Operand::IdRef(half2)],
+        );
+        let byte_array = ctx.get_or_create(Op::TypeRuntimeArray, None, vec![Operand::IdRef(byte)]);
+        let byte_block = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(byte_array)]);
+        let ptr_block = ctx.ty_ptr(StorageClass::StorageBuffer, byte_block);
+        let ptr_typed_struct = ctx.ty_ptr(StorageClass::StorageBuffer, typed_struct);
+        let ptr_half2 = ctx.ty_ptr(StorageClass::StorageBuffer, half2);
+        let root = storage_buffer_var(&mut ctx, ptr_block);
+        let stale_aggregate = ctx.module.fresh_id();
+        let leaf_pointer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        let offset10 = ctx.const_uint(10);
+        let member1 = ctx.const_uint(1);
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_typed_struct),
+                    Some(stale_aggregate),
+                    vec![Operand::IdRef(root), Operand::IdRef(offset10)],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_half2),
+                    Some(leaf_pointer),
+                    vec![Operand::IdRef(stale_aggregate), Operand::IdRef(member1)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(half2),
+                    Some(loaded),
+                    vec![Operand::IdRef(leaf_pointer)],
+                ),
+            ],
+        );
+        ctx.emit_sidecar
+            .buffer_access_offsets
+            .push(crate::emit_sidecar::BufferAccessOffset {
+                id: stale_aggregate,
+                root,
+                byte_offset: 10,
+            });
+
+        rewrite_exact_raw_byte_block_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::CompositeConstruct);
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| instruction.class.opcode == Op::Load)
+                .count(),
+            4,
+            "two half lanes are reconstructed from four exact bytes"
+        );
+        let byte_offsets = body
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
+            .filter_map(|instruction| match instruction.operands.get(1) {
+                Some(Operand::IdRef(id)) => const_u32(&ctx, *id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            byte_offsets,
+            vec![14, 16],
+            "each half lane starts at its exact two-byte boundary"
+        );
+    }
+
+    #[test]
+    fn exact_raw_word_fact_replays_stale_byte_load() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ctx.ty_int8();
+        let uint = ctx.ty_uint();
+        let words = ctx.get_or_create(Op::TypeRuntimeArray, None, vec![Operand::IdRef(uint)]);
+        let block = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(words)]);
+        let ptr_block = ctx.ty_ptr(StorageClass::StorageBuffer, block);
+        let ptr_uint = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+        let ptr_byte = ctx.ty_ptr(StorageClass::StorageBuffer, byte);
+        let float = ctx.ty_float();
+        let float4 = ctx.ty_vecf(4);
+        let root = storage_buffer_var(&mut ctx, ptr_block);
+        let remapped_root = ctx.module.fresh_id();
+        let stale_pointer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        let stale_vector_pointer = ctx.module.fresh_id();
+        let loaded_vector = ctx.module.fresh_id();
+        let stale_float_pointer = ctx.module.fresh_id();
+        let loaded_float = ctx.module.fresh_id();
+        let zero = ctx.const_uint(0);
+        let one = ctx.const_uint(1);
+        let offset16 = ctx.const_uint(16);
+        let offset149 = ctx.const_uint(149);
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(
+                    Op::AccessChain,
+                    Some(ptr_uint),
+                    Some(remapped_root),
+                    vec![
+                        Operand::IdRef(root),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(zero),
+                    ],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_byte),
+                    Some(stale_pointer),
+                    vec![
+                        Operand::IdRef(remapped_root),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(one),
+                        Operand::IdRef(offset149),
+                    ],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(byte),
+                    Some(loaded),
+                    vec![Operand::IdRef(stale_pointer)],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_byte),
+                    Some(stale_vector_pointer),
+                    vec![
+                        Operand::IdRef(remapped_root),
+                        Operand::IdRef(zero),
+                        Operand::IdRef(one),
+                        Operand::IdRef(offset16),
+                    ],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(float4),
+                    Some(loaded_vector),
+                    vec![Operand::IdRef(stale_vector_pointer)],
+                ),
+                Instruction::new(Op::Undef, Some(ptr_byte), Some(stale_float_pointer), vec![]),
+                Instruction::new(
+                    Op::Load,
+                    Some(float),
+                    Some(loaded_float),
+                    vec![Operand::IdRef(stale_float_pointer)],
+                ),
+            ],
+        );
+        ctx.emit_sidecar.buffer_access_offsets.extend([
+            crate::emit_sidecar::BufferAccessOffset {
+                id: stale_pointer,
+                root: remapped_root,
+                byte_offset: 149,
+            },
+            crate::emit_sidecar::BufferAccessOffset {
+                id: stale_vector_pointer,
+                root: remapped_root,
+                byte_offset: 16,
+            },
+            crate::emit_sidecar::BufferAccessOffset {
+                id: stale_float_pointer,
+                root: remapped_root,
+                byte_offset: 20,
+            },
+        ]);
+        ctx.module.types_global_values.append(&mut ctx.new_globals);
+
+        crate::passes::resources::rewrites::rewrite_exact_raw_word_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        let uint_load = body
+            .iter()
+            .find(|instruction| {
+                instruction.class.opcode == Op::Load && instruction.result_type == Some(uint)
+            })
+            .expect("containing uint word load");
+        let word_pointer = uint_load
+            .operands
+            .first()
+            .and_then(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .expect("word pointer");
+        let word_chain = body
+            .iter()
+            .find(|instruction| instruction.result_id == Some(word_pointer))
+            .expect("word access chain");
+        assert_eq!(word_chain.class.opcode, Op::AccessChain);
+        assert_eq!(
+            word_chain
+                .operands
+                .get(2)
+                .and_then(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                })
+                .and_then(|id| const_u32(&ctx, id)),
+            Some(37)
+        );
+        let shift = body
+            .iter()
+            .find(|instruction| instruction.class.opcode == Op::ShiftRightLogical)
+            .expect("byte lane shift");
+        assert_eq!(
+            shift
+                .operands
+                .get(1)
+                .and_then(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                })
+                .and_then(|id| const_u32(&ctx, id)),
+            Some(8)
+        );
+        let reconstructed = body
+            .iter()
+            .find(|instruction| instruction.result_id == Some(loaded))
+            .expect("preserved byte result");
+        assert_eq!(reconstructed.class.opcode, Op::UConvert);
+        assert_eq!(reconstructed.result_type, Some(byte));
+        let reconstructed_vector = body
+            .iter()
+            .find(|instruction| instruction.result_id == Some(loaded_vector))
+            .expect("preserved vector result");
+        assert_eq!(reconstructed_vector.class.opcode, Op::CompositeConstruct);
+        assert_eq!(reconstructed_vector.result_type, Some(float4));
+        assert_eq!(reconstructed_vector.operands.len(), 4);
+        let reconstructed_float = body
+            .iter()
+            .find(|instruction| instruction.result_id == Some(loaded_float))
+            .expect("preserved float result");
+        assert_eq!(reconstructed_float.class.opcode, Op::Bitcast);
+        assert_eq!(reconstructed_float.result_type, Some(float));
+    }
+
+    #[test]
+    fn affine_raw_word_fact_replays_dynamic_float_vector_load() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let byte = ty_uint8(&mut ctx);
+        let float3 = ctx.ty_vecf(3);
+        let words = ctx.ty_runtime_array(uint);
+        let block = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(words)]);
+        let ptr_block = ctx.ty_ptr(StorageClass::StorageBuffer, block);
+        let ptr_float3 = ctx.ty_ptr(StorageClass::StorageBuffer, float3);
+        let ptr_byte = ctx.ty_ptr(StorageClass::StorageBuffer, byte);
+        let root = storage_buffer_var(&mut ctx, ptr_block);
+        let carrier = ctx.module.fresh_id();
+        let index = ctx.module.fresh_id();
+        let stale_pointer = ctx.module.fresh_id();
+        let stale_byte_pointer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        let loaded_byte = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_block), Some(carrier), vec![]),
+                Instruction::new(Op::Undef, Some(uint), Some(index), vec![]),
+                Instruction::new(Op::Undef, Some(ptr_float3), Some(stale_pointer), vec![]),
+                Instruction::new(Op::Undef, Some(ptr_byte), Some(stale_byte_pointer), vec![]),
+                Instruction::new(
+                    Op::Load,
+                    Some(float3),
+                    Some(loaded),
+                    vec![Operand::IdRef(stale_pointer)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(byte),
+                    Some(loaded_byte),
+                    vec![Operand::IdRef(stale_byte_pointer)],
+                ),
+            ],
+        );
+        ctx.emit_sidecar.buffer_access_affine_offsets.push(
+            crate::emit_sidecar::BufferAccessAffineOffset {
+                id: stale_byte_pointer,
+                root: carrier,
+                constant: 11,
+                terms: vec![(index, 16)],
+            },
+        );
+        ctx.emit_sidecar.buffer_access_affine_offsets.push(
+            crate::emit_sidecar::BufferAccessAffineOffset {
+                id: stale_pointer,
+                root: carrier,
+                constant: 8,
+                terms: vec![(index, 16)],
+            },
+        );
+        ctx.emit_sidecar
+            .buffer_access_offsets
+            .push(crate::emit_sidecar::BufferAccessOffset {
+                id: carrier,
+                root,
+                byte_offset: 16,
+            });
+        ctx.module.types_global_values.append(&mut ctx.new_globals);
+
+        crate::passes::resources::rewrites::rewrite_affine_raw_word_loads(&mut ctx, 0);
+
+        let reconstructed = find_inst(&ctx, loaded);
+        assert_eq!(reconstructed.class.opcode, Op::CompositeConstruct);
+        assert_eq!(reconstructed.result_type, Some(float3));
+        assert_eq!(reconstructed.operands.len(), 3);
+        let reconstructed_byte = find_inst(&ctx, loaded_byte);
+        assert_eq!(reconstructed_byte.class.opcode, Op::UConvert);
+        assert_eq!(reconstructed_byte.result_type, Some(byte));
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(body
+            .iter()
+            .any(|instruction| instruction.class.opcode == Op::IMul));
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == Op::Load && instruction.result_type == Some(uint)
+                })
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn direct_float_load_from_raw_byte_pointer_phi_replays_four_bytes() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ty_uint8(&mut ctx);
+        let float = ctx.ty_float();
+        let ptr_byte = ctx.ty_ptr(StorageClass::StorageBuffer, byte);
+        let left = ctx.module.fresh_id();
+        let right = ctx.module.fresh_id();
+        let pred_left = ctx.module.fresh_id();
+        let pred_right = ctx.module.fresh_id();
+        let pointer_phi = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_byte), Some(left), vec![]),
+                Instruction::new(Op::Undef, Some(ptr_byte), Some(right), vec![]),
+                Instruction::new(
+                    Op::Phi,
+                    Some(ptr_byte),
+                    Some(pointer_phi),
+                    vec![
+                        Operand::IdRef(left),
+                        Operand::IdRef(pred_left),
+                        Operand::IdRef(right),
+                        Operand::IdRef(pred_right),
+                    ],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(float),
+                    Some(loaded),
+                    vec![Operand::IdRef(pointer_phi)],
+                ),
+            ],
+        );
+
+        rewrite_raw_byte_pointer_direct_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::CopyObject);
+        assert!(body.iter().all(|instruction| {
+            instruction.class.opcode != Op::Load || instruction.result_type == Some(byte)
+        }));
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
+                .count(),
+            4
+        );
+        assert!(body
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
+            .all(|instruction| {
+                instruction.operands.first() == Some(&Operand::IdRef(pointer_phi))
+            }));
+    }
+
+    #[test]
+    fn direct_float_load_from_raw_byte_array_pointer_descends_to_byte_zero() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ty_uint8(&mut ctx);
+        let float = ctx.ty_float();
+        let byte_array = ctx.get_or_create(Op::TypeRuntimeArray, None, vec![Operand::IdRef(byte)]);
+        let ptr_array = ctx.ty_ptr(StorageClass::StorageBuffer, byte_array);
+        let pointer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_array), Some(pointer), vec![]),
+                Instruction::new(
+                    Op::Load,
+                    Some(float),
+                    Some(loaded),
+                    vec![Operand::IdRef(pointer)],
+                ),
+            ],
+        );
+
+        rewrite_raw_byte_pointer_direct_loads(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::CopyObject);
+        assert!(body.iter().any(|instruction| {
+            instruction.class.opcode == Op::InBoundsAccessChain
+                && instruction.operands.first() == Some(&Operand::IdRef(pointer))
+        }));
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == Op::Load && instruction.result_type == Some(byte)
+                })
+                .count(),
+            4
+        );
+    }
+
     /// Once the invalid pointer and its load have been replaced, no `AccessChain` candidate remains,
     /// so a second application is structurally a no-op.
     #[test]
@@ -1509,6 +2229,73 @@ mod byte_reinterpret_tests {
             find_inst(&ctx, fx.load_id).class.opcode,
             Op::Load,
             "the original load remains paired with the untouched pointer"
+        );
+    }
+
+    #[test]
+    fn workgroup_byte_pointer_half_load_and_store_replay_two_bytes() {
+        let mut ctx = Ctx::new(Module::new());
+        let byte = ty_uint8(&mut ctx);
+        let half = ctx.ty_half();
+        let bytes = ctx.ty_array(byte, 8);
+        let ptr_bytes = ctx.ty_ptr(StorageClass::Workgroup, bytes);
+        let ptr_byte = ctx.ty_ptr(StorageClass::Workgroup, byte);
+        let base = ctx.module.fresh_id();
+        let index = ctx.const_uint(3);
+        let pointer = ctx.module.fresh_id();
+        let loaded = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(ptr_bytes), Some(base), vec![]),
+                Instruction::new(
+                    Op::AccessChain,
+                    Some(ptr_byte),
+                    Some(pointer),
+                    vec![Operand::IdRef(base), Operand::IdRef(index)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(half),
+                    Some(loaded),
+                    vec![Operand::IdRef(pointer)],
+                ),
+                Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(pointer), Operand::IdRef(loaded)],
+                ),
+            ],
+        );
+
+        rewrite_reinterpret_scalar_loads(&mut ctx, 0);
+        rewrite_raw_byte_pointer_wide_stores(&mut ctx, 0);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        assert_eq!(find_inst(&ctx, loaded).class.opcode, Op::Bitcast);
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == Op::Load && instruction.result_type == Some(byte)
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            body.iter()
+                .filter(|instruction| instruction.class.opcode == Op::Store)
+                .count(),
+            2
+        );
+        assert!(
+            body.iter()
+                .filter(|instruction| {
+                    instruction.class.opcode == Op::Store
+                        && instruction.operands.first() == Some(&Operand::IdRef(pointer))
+                })
+                .count()
+                == 1
         );
     }
 
@@ -1682,6 +2469,36 @@ mod byte_reinterpret_tests {
         );
     }
 
+    /// Equal pointer types do not prove scalar arithmetic: an aggregate pointer may carry a
+    /// provisional flat index that a later layout-remap pass converts into a member path.
+    #[test]
+    fn scalar_pointer_arithmetic_leaves_same_typed_struct_chain_untouched() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let structure = ctx.get_or_create(Op::TypeStruct, None, vec![Operand::IdRef(uint)]);
+        let ptr_structure = ctx.ty_ptr(StorageClass::StorageBuffer, structure);
+        let base = storage_buffer_var(&mut ctx, ptr_structure);
+        let provisional_index = ctx.const_uint(4096);
+        let chain_id = ctx.module.fresh_id();
+        install_entry(
+            &mut ctx,
+            vec![Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(ptr_structure),
+                Some(chain_id),
+                vec![Operand::IdRef(base), Operand::IdRef(provisional_index)],
+            )],
+        );
+
+        rewrite_scalar_pointer_arithmetic_access_chains(&mut ctx, 0);
+
+        assert_eq!(
+            only_inst(&ctx).class.opcode,
+            Op::InBoundsAccessChain,
+            "aggregate indexing must remain available to later layout remapping"
+        );
+    }
+
     /// Same scalar-pointer-arithmetic shape but in a storage class `OpPtrAccessChain` does NOT allow as
     /// a base (Private). The storage gate declines it — a Private scalar chain must be composed back to
     /// an aggregate root, not turned into pointer arithmetic (the floor guard for the storage check).
@@ -1715,6 +2532,55 @@ mod byte_reinterpret_tests {
             only_inst(&ctx).class.opcode,
             Op::InBoundsAccessChain,
             "a Private-storage scalar chain is not turned into OpPtrAccessChain"
+        );
+    }
+
+    #[test]
+    fn nullable_select_access_chain_uses_concrete_arm() {
+        let mut ctx = Ctx::new(Module::new());
+        let uint = ctx.ty_uint();
+        let ptr = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
+        let concrete = storage_buffer_var(&mut ctx, ptr);
+        let null = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::ConstantNull,
+            Some(ptr),
+            Some(null),
+            vec![],
+        ));
+        let cond = ctx.module.fresh_id();
+        let selected = ctx.module.fresh_id();
+        let chain = ctx.module.fresh_id();
+        let index = ctx.const_uint(2);
+        let bool_ty = ctx.ty_bool();
+        install_entry(
+            &mut ctx,
+            vec![
+                Instruction::new(Op::Undef, Some(bool_ty), Some(cond), vec![]),
+                Instruction::new(
+                    Op::Select,
+                    Some(ptr),
+                    Some(selected),
+                    vec![
+                        Operand::IdRef(cond),
+                        Operand::IdRef(null),
+                        Operand::IdRef(concrete),
+                    ],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr),
+                    Some(chain),
+                    vec![Operand::IdRef(selected), Operand::IdRef(index)],
+                ),
+            ],
+        );
+
+        expose_nullable_access_chain_bases(&mut ctx, 0);
+
+        assert_eq!(
+            find_inst(&ctx, chain).operands.first(),
+            Some(&Operand::IdRef(concrete))
         );
     }
 }

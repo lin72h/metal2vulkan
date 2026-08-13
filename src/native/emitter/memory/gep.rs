@@ -142,14 +142,36 @@ impl Emitter {
 
         let lhs_ty = self.resolve_type(&lhs.ty)?;
         let rhs_ty = self.resolve_type(&rhs.ty)?;
-        if lhs_ty != rhs_ty || !matches!(lhs_ty, LlType::Int(_)) {
+        let (LlType::Int(lhs_bits), LlType::Int(rhs_bits)) = (&lhs_ty, &rhs_ty) else {
             return Err(format!(
                 "native emitter: cannot compose GEP indices with types {lhs_ty:?} and {rhs_ty:?}"
             ));
-        }
-        let result_type = self.type_id(&lhs_ty)?;
-        let lhs_id = self.value_id(&lhs.value, &lhs.ty)?;
-        let rhs_id = self.value_id(&rhs.value, &rhs.ty)?;
+        };
+        // LLVM permits each GEP index to choose its own integer width. Once two successive GEPs are
+        // linearized into one index, perform their addition at the wider width. GEP indices are
+        // signed offsets, so a narrower dynamic term is sign-extended exactly as it is in the BDA
+        // byte-address materializer. Rejecting i64+i32 here stranded otherwise representable device
+        // pointer walks before the BDA retry could validate them.
+        let result_bits = (*lhs_bits).max(*rhs_bits);
+        let result_ty = LlType::Int(result_bits);
+        let result_type = self.type_id(&result_ty)?;
+        let lhs_original = self.value_id(&lhs.value, &lhs.ty)?;
+        let rhs_original = self.value_id(&rhs.value, &rhs.ty)?;
+        let mut widen = |id, bits| {
+            if bits == result_bits {
+                return id;
+            }
+            let widened = self.fresh();
+            instructions.push(Self::inst(
+                Op::SConvert,
+                Some(result_type),
+                Some(widened),
+                vec![Operand::IdRef(id)],
+            ));
+            widened
+        };
+        let lhs_id = widen(lhs_original, *lhs_bits);
+        let rhs_id = widen(rhs_original, *rhs_bits);
         let result = self.fresh();
         instructions.push(Self::inst(
             Op::IAdd,
@@ -158,17 +180,18 @@ impl Emitter {
             vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
         ));
         let name = format!("%air.gepidx.{result}");
-        self.values.insert(name.clone(), (result, lhs_ty.clone()));
+        self.values
+            .insert(name.clone(), (result, result_ty.clone()));
         self.record_int_alignment(
             &name,
-            &lhs_ty,
+            &result_ty,
             add_int_alignment(
                 self.int_value_alignment(&lhs.value),
                 self.int_value_alignment(&rhs.value),
             ),
         );
         Ok(TypedValue {
-            ty: lhs_ty,
+            ty: result_ty,
             value: LlValue::Local(name),
         })
     }

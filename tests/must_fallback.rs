@@ -101,15 +101,6 @@ fn texture_atomic_fallbacks() {
 }
 
 #[test]
-fn vector_u16_simd_prefix_scan_fallbacks() {
-    let ll = kernel_with(
-        "  %scan = call <4 x i16> @air.simd_prefix_exclusive_sum.u.v4i16(<4 x i16> zeroinitializer)\n\
-         %r = add i32 %a0, %a0\n",
-    );
-    assert_fallback(&ll, "u16x4 SIMD exclusive prefix scan");
-}
-
-#[test]
 fn no_function_definitions_fallbacks() {
     assert_fallback(
         "target triple = \"air64_v28-apple-macosx26.5.0\"\n",

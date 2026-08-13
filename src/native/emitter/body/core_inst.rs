@@ -198,6 +198,7 @@ impl Emitter {
                 ) {
                     if !ops.is_empty() {
                         let gep = LlGep {
+                            inbounds: inst.gep.as_ref().is_some_and(|gep| gep.inbounds),
                             source_ty: source_ty.clone(),
                             base: ops[0].clone(),
                             indices: ops[1..].to_vec(),
@@ -375,7 +376,7 @@ impl Emitter {
                 // exactly as before — no side-table ownership move needed. Reaches the fail-visible
                 // unmigrated-opcode `Err` below only when the carrier is absent (a malformed bitcast —
                 // unreachable in well-formed AIR).
-                if let Some((src, dst_text)) = &inst.bitcast {
+                if let Some((src, dst_text)) = inst.bitcast.as_deref() {
                     let (name, src, dst_text) = (name.clone(), src.clone(), dst_text.clone());
                     return self.emit_bitcast_resolved(src, &dst_text, name, instructions);
                 }
@@ -387,7 +388,7 @@ impl Emitter {
                 // Reaches the fail-visible unmigrated-opcode `Err` below only when the carrier is absent
                 // (an indirect call, which `parse_call` rejects — unreachable in well-formed AIR for a value call).
                 if let Some(call) = &inst.call {
-                    let (name, call) = (name.clone(), call.clone());
+                    let (name, call) = (name.clone(), (**call).clone());
                     return self.emit_value_call_resolved(name, call, instructions);
                 }
                 if let Some(err) = &inst.value_call_error {
@@ -405,7 +406,7 @@ impl Emitter {
                     return self.emit_store_resolved(object, ptr, inst.mem_align, instructions);
                 }
             }
-            if let Some((object, ptr)) = &inst.store {
+            if let Some((object, ptr)) = inst.store.as_deref() {
                 let (object, ptr) = (object.clone(), ptr.clone());
                 return self.emit_store_resolved(object, ptr, inst.mem_align, instructions);
             }
@@ -426,7 +427,7 @@ impl Emitter {
                 }
             }
             if let Some(call) = &inst.call {
-                let (mut call, line) = (call.clone(), line.clone());
+                let (mut call, line) = ((**call).clone(), line.clone());
                 self.apply_tir_inst_void_call_args(inst, &mut call);
                 return self.emit_void_call_body(call, &line, instructions);
             }
@@ -451,6 +452,29 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let resolved_ty = self.resolve_type(&argument.ty)?;
+        // A cross-storage pointer select deliberately has no single Logical-SPIR-V pointer value or
+        // storage class. Typed helper inlining must therefore forward its deferred carrier, not ask
+        // `pointer_storage_for` to fabricate one for the synthetic parameter. The cloned helper's
+        // GEP/load consumers replay the two concrete arms in the value domain exactly as direct
+        // caller uses do. No placeholder substitution is needed because every supported use is
+        // intercepted by the selected-pointer machinery; an escaping use still fails visibly.
+        if let (LlType::Ptr(_), LlValue::Local(source)) = (&resolved_ty, &argument.value) {
+            if let Some(selected) = self.selected_pointers.get(source).cloned() {
+                self.selected_pointers.insert(name.to_string(), selected);
+                self.direct_param_values.insert(name.to_string());
+                self.param_values.insert(name.to_string());
+                return Ok(());
+            }
+            if let Some(selected) = self.selected_load_pointers.get(source).cloned() {
+                self.pointer_pointees
+                    .insert(name.to_string(), selected.pointee.clone());
+                self.selected_load_pointers
+                    .insert(name.to_string(), selected);
+                self.direct_param_values.insert(name.to_string());
+                self.param_values.insert(name.to_string());
+                return Ok(());
+            }
+        }
         // Preserve a descriptor-backed raw buffer's byte cursor across helper inlining.  A non-zero
         // GEP of a raw device buffer has a Private placeholder as its ordinary SSA value, while its
         // real descriptor root and byte offset live in `raw_offsets`.  Binding the helper parameter
@@ -459,9 +483,11 @@ impl Emitter {
         // callee's existing raw load/store lowering then reapplies the offset structurally.
         let inline_raw = if self.raw_buffer_params.contains(name) {
             match &argument.value {
-                LlValue::Local(source) => self.raw_offsets.get(source).cloned().filter(|raw| {
-                    raw.addrspace == 1 && !raw.unmodelable && raw.device_addr_base.is_none()
-                }),
+                LlValue::Local(source) => self
+                    .raw_offsets
+                    .get(source)
+                    .cloned()
+                    .filter(|raw| raw.addrspace == 1 && !raw.unmodelable),
                 _ => None,
             }
         } else {
@@ -503,6 +529,19 @@ impl Emitter {
         self.param_values.insert(name.to_string());
 
         if let Some((addrspace, storage, pointee, nullness)) = pointer_facts {
+            if self.bda_device_pointers {
+                if let LlValue::Local(source) = &argument.value {
+                    let address = self.bda_direct_addresses.get(source).copied().or_else(|| {
+                        self.raw_offsets.get(source).and_then(|raw| {
+                            raw.device_addr_base
+                                .or_else(|| self.bda_direct_addresses.get(&raw.root).copied())
+                        })
+                    });
+                    if let Some(address) = address {
+                        self.bda_direct_addresses.insert(name.to_string(), address);
+                    }
+                }
+            }
             self.pointer_storage.insert(name.to_string(), storage);
             if let Some(pointee) = pointee {
                 self.pointer_pointees.insert(name.to_string(), pointee);
@@ -1063,6 +1102,16 @@ impl Emitter {
         let src_id = self.value_id(&src.value, &src.ty)?;
         if self.bda_device_pointers && addrspace == 1 {
             self.used_device_address = true;
+            let bool_ty = self.type_id(&LlType::Bool)?;
+            let zero = self.const_signed_int(64, 0)?;
+            let is_null = self.result_id(&pointer_null_name(&name), &LlType::Bool)?;
+            _instructions.push(Self::inst(
+                Op::IEqual,
+                Some(bool_ty),
+                Some(is_null),
+                vec![Operand::IdRef(src_id), Operand::IdRef(zero)],
+            ));
+            self.pointer_nullness.insert(name.clone(), is_null);
             let mut dev = RawBufferOffset::root(format!(".bda_inttoptr_{src_id}"), 1);
             dev.device_addr_base = Some(src_id);
             self.raw_offsets.insert(name.clone(), dev);
@@ -1076,6 +1125,46 @@ impl Emitter {
         // semantics.
         self.define_unmodeled_pointer_value(&name, addrspace, &LlType::Int(8))?;
         Ok(())
+    }
+
+    pub(in crate::native::emitter) fn combine_pointer_payload_words(
+        &mut self,
+        low: Word,
+        high: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let i64_ty = LlType::Int(64);
+        let result_type = self.type_id(&i64_ty)?;
+        let low64 = self.fresh();
+        instructions.push(Self::inst(
+            Op::UConvert,
+            Some(result_type),
+            Some(low64),
+            vec![Operand::IdRef(low)],
+        ));
+        let high64 = self.fresh();
+        instructions.push(Self::inst(
+            Op::UConvert,
+            Some(result_type),
+            Some(high64),
+            vec![Operand::IdRef(high)],
+        ));
+        let shifted_high = self.fresh();
+        let shift = self.const_signed_int(64, 32)?;
+        instructions.push(Self::inst(
+            Op::ShiftLeftLogical,
+            Some(result_type),
+            Some(shifted_high),
+            vec![Operand::IdRef(high64), Operand::IdRef(shift)],
+        ));
+        let address = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitwiseOr,
+            Some(result_type),
+            Some(address),
+            vec![Operand::IdRef(low64), Operand::IdRef(shifted_high)],
+        ));
+        Ok(address)
     }
 
     /// The operand-resolved core of the `ptrtoint` handler (see `emit_inttoptr_resolved`). Driven from
@@ -1260,6 +1349,16 @@ impl Emitter {
                 return Ok(());
             }
         }
+        // A local pointer field uses an integer placeholder in Logical SPIR-V, but its typed source
+        // must survive in the sidecar for post-interface recovery. Give that exact structural case
+        // first refusal: generic raw-byte reinterpretation can represent the placeholder store, but
+        // cannot preserve which bound buffer/image pointer was stored there.
+        if let Some(pointee) = self.pointer_pointee_for_value(&ptr.value)? {
+            let pointee = self.resolve_type(&pointee)?;
+            if self.emit_pointer_to_local_field_store(&object, &ptr, &pointee, instructions)? {
+                return Ok(());
+            }
+        }
         if let Some(raw) = self.byte_array_reinterpret_raw_pointer(&ptr.value)? {
             let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
             self.emit_raw_store(&object.ty, object_id, &raw, align, instructions)?;
@@ -1274,11 +1373,6 @@ impl Emitter {
         if let Some(pointee) = self.pointer_pointee_for_value(&ptr.value)? {
             let pointee = self.resolve_type(&pointee)?;
             let object_ty = self.resolve_type(&object.ty)?;
-            if !types_compatible(&pointee, &object_ty)
-                && self.emit_pointer_to_local_field_store(&object, &ptr, &pointee, instructions)?
-            {
-                return Ok(());
-            }
             if !types_compatible(&pointee, &object_ty)
                 && self.emit_i64_to_i32_pair_struct_store(&object, &ptr, &pointee, instructions)?
             {
@@ -1325,6 +1419,11 @@ impl Emitter {
                     &pointee,
                     instructions,
                 )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_vector_as_scalar_array_store(&object, &ptr, &pointee, instructions)?
             {
                 return Ok(());
             }
@@ -1730,6 +1829,47 @@ impl Emitter {
                 }
                 self.emit_raw_load(result, &result_ty, &raw, load.align, instructions)?;
                 if let LlType::Ptr(_) = result_ty {
+                    let parameter_root = self
+                        .direct_param_values
+                        .contains(&raw.root)
+                        .then(|| self.values.get(&raw.root).map(|(id, _)| *id))
+                        .flatten();
+                    if raw.device_addr_base.is_none()
+                        && raw.dyn_terms.is_empty()
+                        && raw.const_off >= 0
+                    {
+                        // Keep the emitted parameter id, including for internal helpers. The
+                        // emitted-function inliner substitutes that id with the caller argument
+                        // (recursively up to the entry parameter), and remaps this sidecar fact by
+                        // the same map. A parameter ordinal is only meaningful in its defining
+                        // function and therefore cannot survive nested helper inlining.
+                        if let Some(root) = parameter_root {
+                            self.emit_sidecar.buffer_pointer_field_loads.push(
+                                crate::emit_sidecar::BufferPointerFieldLoad {
+                                    id: result,
+                                    root,
+                                    byte_offset: raw.const_off as u64,
+                                },
+                            );
+                        }
+                    } else if raw.device_addr_base.is_none() && raw.const_off >= 0 {
+                        if let (Some(root), [(index, 8)]) =
+                            (parameter_root, raw.dyn_terms.as_slice())
+                        {
+                            // AIR's opaque texture handle is one 64-bit element. Preserve the
+                            // logical GEP element selector rather than its byte-scaled raw offset so
+                            // the final descriptor-array binding can materialize exactly that image.
+                            let index = self.value_id_in(&index.value, &index.ty, instructions)?;
+                            self.emit_sidecar.buffer_pointer_dynamic_field_loads.push(
+                                crate::emit_sidecar::BufferPointerDynamicFieldLoad {
+                                    id: result,
+                                    root,
+                                    byte_offset: raw.const_off as u64,
+                                    index,
+                                },
+                            );
+                        }
+                    }
                     self.pointer_storage
                         .insert(name.clone(), StorageClass::Private);
                     self.pointer_pointees.insert(name.clone(), LlType::Int(8));
@@ -1819,6 +1959,15 @@ impl Emitter {
                     &pointee,
                     &result_ty,
                     &load.ptr,
+                    ptr,
+                    instructions,
+                )? {
+                    return Ok(());
+                }
+                if self.emit_scalar_array_as_vector_load(
+                    result,
+                    &pointee,
+                    &result_ty,
                     ptr,
                     instructions,
                 )? {

@@ -100,7 +100,8 @@ impl Cfg {
             .map(|(i, n)| (n.as_str(), i))
             .collect();
         let idom = compute_idom(&self.entry, &self.predecessors, &rpo, &rpo_num);
-        Dominators { idom }
+        let intervals = dominance_intervals(&self.entry, &idom);
+        Dominators { idom, intervals }
     }
 }
 
@@ -109,21 +110,23 @@ impl Cfg {
 pub(in crate::native) struct Dominators {
     /// Immediate dominator of each block (entry maps to itself).
     idom: HashMap<String, String>,
+    /// Euler intervals of the immediate-dominator tree. Dominance is interval containment, avoiding
+    /// an O(tree depth) parent walk at every query in large generated CFGs.
+    intervals: HashMap<String, (usize, usize)>,
 }
 
 impl Dominators {
     /// `true` if `dominator` dominates `node` (walking the idom chain).
     pub(in crate::native) fn dominates(&self, dominator: &str, node: &str) -> bool {
-        let mut cur = node;
-        loop {
-            if cur == dominator {
-                return true;
-            }
-            match self.idom.get(cur) {
-                Some(next) if next != cur => cur = next,
-                _ => return false,
-            }
+        if dominator == node {
+            return true;
         }
+        let (Some(&(dom_in, dom_out)), Some(&(node_in, node_out))) =
+            (self.intervals.get(dominator), self.intervals.get(node))
+        else {
+            return false;
+        };
+        dom_in <= node_in && node_out <= dom_out
     }
 
     /// Immediate dominator of `node` (the entry, and any node mapping to itself, returns `None`).
@@ -133,6 +136,40 @@ impl Dominators {
             .map(String::as_str)
             .filter(|d| *d != node)
     }
+}
+
+fn dominance_intervals(
+    entry: &str,
+    idom: &HashMap<String, String>,
+) -> HashMap<String, (usize, usize)> {
+    let mut children = HashMap::<&str, Vec<&str>>::new();
+    for (node, parent) in idom {
+        if node != parent {
+            children.entry(parent).or_default().push(node);
+        }
+    }
+    for descendants in children.values_mut() {
+        descendants.sort_unstable();
+    }
+    let mut entered = HashMap::<String, usize>::new();
+    let mut intervals = HashMap::new();
+    let mut clock = 0usize;
+    let mut stack = vec![(entry, false)];
+    while let Some((node, exiting)) = stack.pop() {
+        if exiting {
+            let start = entered[node];
+            intervals.insert(node.to_string(), (start, clock));
+            clock += 1;
+            continue;
+        }
+        entered.insert(node.to_string(), clock);
+        clock += 1;
+        stack.push((node, true));
+        if let Some(descendants) = children.get(node) {
+            stack.extend(descendants.iter().rev().map(|child| (*child, false)));
+        }
+    }
+    intervals
 }
 
 /// Reverse postorder of the blocks reachable from `entry`, restricted to `names`.
@@ -269,46 +306,6 @@ pub(super) fn reachable_from(
     seen
 }
 
-/// Blocks reachable from `start` (inclusive) without expanding through `forbidden` — the
-/// `forbidden` node is treated as a sink (visited but never traversed past).
-pub(super) fn reachable_from_without_revisiting(
-    start: &str,
-    forbidden: &str,
-    successors: &HashMap<String, Vec<String>>,
-) -> HashSet<String> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![start.to_string()];
-    while let Some(block) = stack.pop() {
-        if block == forbidden || !seen.insert(block.clone()) {
-            continue;
-        }
-        if let Some(next) = successors.get(&block) {
-            stack.extend(next.iter().cloned());
-        }
-    }
-    seen
-}
-
-/// Blocks reachable from `start` without crossing `target` — `target` is excluded from the
-/// result and never expanded, so the walk stays strictly before the merge point.
-pub(super) fn reachable_before_target(
-    start: &str,
-    target: &str,
-    successors: &HashMap<String, Vec<String>>,
-) -> HashSet<String> {
-    let mut seen = HashSet::new();
-    let mut stack = vec![start.to_string()];
-    while let Some(node) = stack.pop() {
-        if node == target || !seen.insert(node.clone()) {
-            continue;
-        }
-        if let Some(next) = successors.get(&node) {
-            stack.extend(next.iter().filter(|succ| succ.as_str() != target).cloned());
-        }
-    }
-    seen
-}
-
 // --- Owned SPIR-V (`Block`) CFG primitives -------------------------------------------------
 //
 // The above operate on the `BodyBlock` source CFG (String labels). The emitter's control-flow
@@ -394,47 +391,6 @@ pub(in crate::native) fn spirv_predecessor_ids_by_label(
     predecessors
 }
 
-/// Whether `dominator` dominates `label` in a precomputed Word-keyed dominator-set map
-/// (`label -> {blocks that dominate it}`).
-pub(in crate::native) fn spirv_label_dominates(
-    dominators: &HashMap<Word, HashSet<Word>>,
-    dominator: Word,
-    label: Word,
-) -> bool {
-    dominators
-        .get(&label)
-        .is_some_and(|labels| labels.contains(&dominator))
-}
-
-// Dense `[u64]` bitset helpers for the native Word-layer CFG analyses (the dominator-set
-// fixpoint in the emitter, the reachability walks in cfg/repair). One home so the two former
-// copies of `set_bit`/`bit_is_set` cannot drift. `bit_is_set` is bounds-checked (out-of-range
-// index reads as unset) — a no-op for callers whose words always cover the queried index.
-pub(in crate::native) fn set_bit(bits: &mut [u64], idx: usize) {
-    bits[idx / 64] |= 1 << (idx % 64);
-}
-
-pub(in crate::native) fn bit_is_set(bits: &[u64], idx: usize) -> bool {
-    bits.get(idx / 64)
-        .is_some_and(|word| (word & (1 << (idx % 64))) != 0)
-}
-
-/// Clear the bits above `valid_bits` in the last word so a full-ones bitset has no stray
-/// high bits set beyond the valid range.
-pub(in crate::native) fn clear_unused_bits(words: &mut [u64], valid_bits: usize) {
-    if valid_bits == 0 {
-        return;
-    }
-    let used_in_last = valid_bits % u64::BITS as usize;
-    if used_in_last == 0 {
-        return;
-    }
-    let mask = (1u64 << used_in_last) - 1;
-    if let Some(last) = words.last_mut() {
-        *last &= mask;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,7 +405,7 @@ mod tests {
         BodyBlock {
             name,
             role: crate::native::cfg::BlockRole::Normal,
-            typed,
+            typed: typed.map(Into::into),
         }
     }
 

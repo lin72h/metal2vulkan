@@ -37,6 +37,7 @@ fn substitute_value(value: &mut LlValue, substitutions: &Substitutions) {
         }
         LlValue::Splat(value) => substitute_typed_value(value, substitutions),
         LlValue::Gep(gep) => substitute_gep(gep, substitutions),
+        LlValue::IntToPtr { source, .. } => substitute_typed_value(source, substitutions),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -86,6 +87,7 @@ fn local_uses(value: &LlValue, uses: &mut Vec<String>) {
                 local_uses(&index.value, uses);
             }
         }
+        LlValue::IntToPtr { source, .. } => local_uses(&source.value, uses),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -118,6 +120,7 @@ fn replacement_token(value: &TypedValue) -> String {
             "zeroinitializer".to_string()
         }
         LlValue::Gep(_) => "null".to_string(),
+        LlValue::IntToPtr { .. } => "null".to_string(),
         LlValue::Local(_)
         | LlValue::Global(_)
         | LlValue::Bool(_)
@@ -162,7 +165,7 @@ fn substitute_inst(
             substitute_value(value, substitutions);
         }
     }
-    if let Some((value, _)) = &mut inst.bitcast {
+    if let Some((value, _)) = inst.bitcast.as_deref_mut() {
         substitute_typed_value(value, substitutions);
     }
     if let Some((result, base)) = &mut inst.identity_ptr_bitcast {
@@ -178,21 +181,21 @@ fn substitute_inst(
             substitute_value(value, substitutions);
         }
     }
-    if let Some((true_value, false_value)) = &mut inst.select_arms {
+    if let Some((true_value, false_value)) = inst.select_arms.as_deref_mut() {
         substitute_typed_value(true_value, substitutions);
         substitute_typed_value(false_value, substitutions);
     }
     if let Some(load) = &mut inst.load {
         substitute_typed_value(&mut load.ptr, substitutions);
     }
-    if let Some((object, pointer)) = &mut inst.store {
+    if let Some((object, pointer)) = inst.store.as_deref_mut() {
         substitute_typed_value(object, substitutions);
         substitute_typed_value(pointer, substitutions);
     }
     if let Some(call) = &mut inst.alias_call {
         substitute_call(call, substitutions);
     }
-    if let Some(Ok(call)) = &mut inst.emit_scan_call {
+    if let Some(Ok(call)) = inst.emit_scan_call.as_deref_mut() {
         substitute_call(call, substitutions);
     }
     for text in [

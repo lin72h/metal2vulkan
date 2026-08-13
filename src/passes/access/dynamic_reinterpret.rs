@@ -2082,9 +2082,9 @@ pub(in crate::passes) fn rewrite_chained_element_reinterpret(
     Ok(())
 }
 
-/// Rewrite an INVALID *nested-chained* element reinterpret over a NARROW (byte/short) buffer-block array
-/// where the reinterpret WIDENS — a `device uchar*`/`device ushort*` element pointer reinterpret-cast to
-/// a WIDER scalar (`ushort`/`uint`/`ulong`) and GEP'd:
+/// Rewrite an INVALID *nested-chained* element reinterpret over a NARROW scalar buffer array where
+/// the reinterpret WIDENS — a `device uchar*`/`device ushort*`/`device half*` element pointer
+/// reinterpret-cast to a WIDER integer scalar (`ushort`/`uint`/`ulong`) and GEP'd:
 ///
 /// ```text
 ///   %inner = OpInBoundsAccessChain %_ptr_StorageBuffer_uchar  %buf   %uint_0 %byteIdx   ; byte #byteIdx (VALID)
@@ -2108,11 +2108,11 @@ pub(in crate::passes) fn rewrite_chained_element_reinterpret(
 /// may have other valid uses); only `%out` is re-rooted and its loads/stores expanded.
 ///
 /// Byte-safe / floor-safe by construction — only chains CURRENTLY INVALID are touched, gated on:
-/// (1) `%out` is a single-index chain `[%inner, %k]` whose result pointee P is a DIRECT INT scalar;
-/// (2) its base `%inner` is a two-index chain `[%uint_0, %byteIdx]` into a SINGLE-member struct
-///     `{ array/runtime-array<E> }` whose element E is a DIRECT INT scalar with `width(P) = R*width(E)`,
-///     `R >= 2` (a genuine widen — the narrow direction is the existing same-width/narrow passes), and
-///     whose result pointee equals E;
+/// (1) `%out` is `[%inner, %k]`, optionally retaining an identity leading zero, and its result
+///     pointee P is a DIRECT INT scalar;
+/// (2) its base `%inner` ends in an element selection from an array/runtime-array<E> at any proven
+///     aggregate path; E is a DIRECT INT/FLOAT scalar with an explicit tightly-packed `ArrayStride`,
+///     `width(P) = R*width(E)`, `R >= 2`, and `%inner`'s result pointee equals E;
 /// (3) the base storage class is StorageBuffer (member-access descent over a real SSBO);
 /// (4) `%out` is CURRENTLY INVALID (the index walk over `%inner`'s scalar pointee fails — always true for
 ///     a scalar, so a banked/valid module never matches and the floor is provably untouched);
@@ -2142,6 +2142,22 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
             .map(|d| d.class.opcode == Op::TypeInt)
             .unwrap_or(false)
     };
+    let is_float = |ctx: &Ctx, ty: Word| -> bool {
+        type_def_of(ctx, ty).is_some_and(|def| def.class.opcode == Op::TypeFloat)
+    };
+    let array_stride: HashMap<Word, u32> = ctx
+        .module
+        .annotations
+        .iter()
+        .filter_map(|inst| match inst.operands.as_slice() {
+            [
+                Operand::IdRef(ty),
+                Operand::Decoration(Decoration::ArrayStride),
+                Operand::LiteralBit32(stride),
+            ] if inst.class.opcode == Op::Decorate => Some((*ty, *stride)),
+            _ => None,
+        })
+        .collect();
 
     // The defining chain instruction of every access-chain result (for resolving `%inner`).
     let mut chain_def: HashMap<Word, Instruction> = HashMap::new();
@@ -2160,9 +2176,11 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
         ii: usize,
         ac_id: Word,
         buf: Word,
+        prefix: Vec<Operand>,
         inner_idx: Word,
         elem_ty: Word,
         result_pointee: Word,
+        out_idx: Word,
         ratio: u32,
         slot_w: u32,
     }
@@ -2175,13 +2193,18 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
             let (Some(ac_id), Some(result_type)) = (inst.result_id, inst.result_type) else {
                 continue;
             };
-            // `%out = AC %inner %k` — base + exactly one index.
-            if inst.operands.len() != 2 {
-                continue;
-            }
-            let (Operand::IdRef(inner), Operand::IdRef(_out_idx)) =
-                (&inst.operands[0], &inst.operands[1])
-            else {
+            // `%out = AC %inner %k`, optionally with LLVM GEP's identity leading zero retained as
+            // `%out = AC %inner %uint_0 %k`.
+            let (Operand::IdRef(inner), Some(Operand::IdRef(out_idx))) = (
+                &inst.operands[0],
+                match inst.operands.as_slice() {
+                    [_, index] => Some(index),
+                    [_, Operand::IdRef(zero), index] if const_u32(ctx, *zero) == Some(0) => {
+                        Some(index)
+                    }
+                    _ => None,
+                },
+            ) else {
                 continue;
             };
             let Some(&(sc, result_pointee)) = ptr_info.get(&result_type) else {
@@ -2196,23 +2219,19 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
             if !is_int(ctx, result_pointee) {
                 continue;
             }
-            // `%inner` must itself be a `[base, %uint_0, %byteIdx]` chain into a single-member byte array.
+            // `%inner` must itself end in an element selection from a narrow scalar array.
             let Some(inner_inst) = chain_def.get(inner) else {
                 continue;
             };
-            if inner_inst.operands.len() != 3 {
+            if inner_inst.operands.len() < 2 {
                 continue;
             }
-            let (Operand::IdRef(buf), Operand::IdRef(i0), Operand::IdRef(inner_idx)) = (
-                &inner_inst.operands[0],
-                &inner_inst.operands[1],
-                &inner_inst.operands[2],
-            ) else {
+            let (Some(Operand::IdRef(buf)), Some(Operand::IdRef(inner_idx))) =
+                (inner_inst.operands.first(), inner_inst.operands.last())
+            else {
                 continue;
             };
-            if const_u32(ctx, *i0) != Some(0) {
-                continue;
-            }
+            let prefix = inner_inst.operands[1..inner_inst.operands.len() - 1].to_vec();
             let Some(inner_result_type) = inner_inst.result_type else {
                 continue;
             };
@@ -2225,15 +2244,30 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
             let Some(&(_, buf_pointee)) = ptr_info.get(&buf_ptr_ty) else {
                 continue;
             };
-            let Some(elem_ty) = single_member_array_scalar_elem(ctx, buf_pointee) else {
+            let Some(parent_ty) = walk_into_type(ctx, buf_pointee, &prefix) else {
                 continue;
             };
-            if inner_pointee != elem_ty || !is_int(ctx, elem_ty) {
+            let Some(parent_def) = type_def_of(ctx, parent_ty) else {
+                continue;
+            };
+            if !matches!(
+                parent_def.class.opcode,
+                Op::TypeArray | Op::TypeRuntimeArray
+            ) {
                 continue;
             }
-            let Some(v) = direct_scalar_width(ctx, elem_ty) else {
+            let Some(Operand::IdRef(elem_ty)) = parent_def.operands.first() else {
                 continue;
             };
+            if inner_pointee != *elem_ty || (!is_int(ctx, *elem_ty) && !is_float(ctx, *elem_ty)) {
+                continue;
+            }
+            let Some(v) = direct_scalar_width(ctx, *elem_ty) else {
+                continue;
+            };
+            if array_stride.get(&parent_ty).copied() != Some(v / 8) {
+                continue;
+            }
             // Genuine WIDEN only: P is R whole narrow slots, R >= 2 (same-width/narrow are other passes).
             if v == 0 || w % v != 0 {
                 continue;
@@ -2251,9 +2285,11 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
                 ii,
                 ac_id,
                 buf: *buf,
+                prefix,
                 inner_idx: *inner_idx,
-                elem_ty,
+                elem_ty: *elem_ty,
                 result_pointee,
+                out_idx: *out_idx,
                 ratio,
                 slot_w: v,
             });
@@ -2324,7 +2360,6 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
     }
 
     // Phase 2: the byte-index `sum = inner_idx + out_idx*ratio` per plan, shared by every use.
-    let member0 = ctx.const_uint(0);
     let uint_ty = ctx.ty_uint();
     let mut elem_ptr_ty: HashMap<Word, Word> = HashMap::new();
     let mut sum_id: HashMap<Word, Word> = HashMap::new();
@@ -2341,22 +2376,7 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
 
     let ac_at: HashMap<(usize, usize), Word> =
         plans.iter().map(|p| ((p.bi, p.ii), p.ac_id)).collect();
-    let plan_by_id: HashMap<Word, (Word, Word, Word, Word, u32, u32)> = plans
-        .iter()
-        .map(|p| {
-            (
-                p.ac_id,
-                (
-                    p.buf,
-                    p.elem_ty,
-                    p.result_pointee,
-                    p.inner_idx,
-                    p.ratio,
-                    p.slot_w,
-                ),
-            )
-        })
-        .collect();
+    let plan_by_id: HashMap<Word, &Plan> = plans.iter().map(|p| (p.ac_id, p)).collect();
     let use_at: HashMap<(usize, usize), Word> = plans
         .iter()
         .flat_map(|p| {
@@ -2375,36 +2395,47 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
         for (ii, inst) in old.into_iter().enumerate() {
             // The original `%out` chain becomes the `sum = inner_idx + out_idx*ratio` computation.
             if let Some(&ac_id) = ac_at.get(&(bi, ii)) {
-                let (_buf, _e, _p, inner_idx, ratio, _v) = plan_by_id[&ac_id];
+                let plan = plan_by_id[&ac_id];
                 let sum = sum_id[&ac_id];
-                let out_idx = match inst.operands.get(1) {
-                    Some(Operand::IdRef(o)) => *o,
-                    _ => {
-                        return Err(
-                            "byte-buffer reinterpret chain lost its index operand".to_string()
-                        )
-                    }
-                };
                 let mul = ctx.module.fresh_id();
                 newv.push(Instruction::new(
                     Op::IMul,
                     Some(uint_ty),
                     Some(mul),
-                    vec![Operand::IdRef(out_idx), Operand::IdRef(ratio_const[&ratio])],
+                    vec![
+                        Operand::IdRef(plan.out_idx),
+                        Operand::IdRef(ratio_const[&plan.ratio]),
+                    ],
                 ));
                 newv.push(Instruction::new(
                     Op::IAdd,
                     Some(uint_ty),
                     Some(sum),
-                    vec![Operand::IdRef(inner_idx), Operand::IdRef(mul)],
+                    vec![Operand::IdRef(plan.inner_idx), Operand::IdRef(mul)],
                 ));
                 continue;
             }
             // A load/store through `%out` expands into `ratio` little-endian narrow slot accesses.
             if let Some(&ac_id) = use_at.get(&(bi, ii)) {
-                let (buf, elem_ty, result_pointee, _ii, ratio, slot_w) = plan_by_id[&ac_id];
+                let plan = plan_by_id[&ac_id];
+                let (buf, elem_ty, result_pointee, ratio, slot_w) = (
+                    plan.buf,
+                    plan.elem_ty,
+                    plan.result_pointee,
+                    plan.ratio,
+                    plan.slot_w,
+                );
                 let sum = sum_id[&ac_id];
                 let eptr = elem_ptr_ty[&elem_ty];
+                let slot_int_ty = if is_float(ctx, elem_ty) {
+                    ctx.get_or_create(
+                        Op::TypeInt,
+                        None,
+                        vec![Operand::LiteralBit32(slot_w), Operand::LiteralBit32(0)],
+                    )
+                } else {
+                    elem_ty
+                };
                 // Per-slot element pointers: `AC %buf %uint_0 (sum + j)`.
                 let mut slot_ptr = Vec::with_capacity(ratio as usize);
                 for j in 0..ratio {
@@ -2422,15 +2453,14 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
                         id
                     };
                     let pid = ctx.module.fresh_id();
+                    let mut operands = vec![Operand::IdRef(buf)];
+                    operands.extend(plan.prefix.iter().cloned());
+                    operands.push(Operand::IdRef(idx));
                     newv.push(Instruction::new(
                         Op::InBoundsAccessChain,
                         Some(eptr),
                         Some(pid),
-                        vec![
-                            Operand::IdRef(buf),
-                            Operand::IdRef(member0),
-                            Operand::IdRef(idx),
-                        ],
+                        operands,
                     ));
                     slot_ptr.push(pid);
                 }
@@ -2446,12 +2476,24 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
                             Some(raw),
                             vec![Operand::IdRef(pid)],
                         ));
+                        let raw_bits = if slot_int_ty == elem_ty {
+                            raw
+                        } else {
+                            let bits = ctx.module.fresh_id();
+                            newv.push(Instruction::new(
+                                Op::Bitcast,
+                                Some(slot_int_ty),
+                                Some(bits),
+                                vec![Operand::IdRef(raw)],
+                            ));
+                            bits
+                        };
                         let wide = ctx.module.fresh_id();
                         newv.push(Instruction::new(
                             Op::UConvert,
                             Some(result_pointee),
                             Some(wide),
-                            vec![Operand::IdRef(raw)],
+                            vec![Operand::IdRef(raw_bits)],
                         ));
                         let shifted = if j == 0 {
                             wide
@@ -2507,13 +2549,25 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
                             ));
                             sid
                         };
-                        let narrow = ctx.module.fresh_id();
+                        let narrow_bits = ctx.module.fresh_id();
                         newv.push(Instruction::new(
                             Op::UConvert,
-                            Some(elem_ty),
-                            Some(narrow),
+                            Some(slot_int_ty),
+                            Some(narrow_bits),
                             vec![Operand::IdRef(shifted)],
                         ));
+                        let narrow = if slot_int_ty == elem_ty {
+                            narrow_bits
+                        } else {
+                            let value = ctx.module.fresh_id();
+                            newv.push(Instruction::new(
+                                Op::Bitcast,
+                                Some(elem_ty),
+                                Some(value),
+                                vec![Operand::IdRef(narrow_bits)],
+                            ));
+                            value
+                        };
                         newv.push(Instruction::new(
                             Op::Store,
                             None,

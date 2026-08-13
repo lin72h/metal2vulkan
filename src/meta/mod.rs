@@ -1,24 +1,28 @@
-//! AIR stage-interface metadata, parsed from the ORIGINAL `.ll` text BEFORE llc runs (llc drops the
-//! `!air.fragment` / `!air.vertex` metadata nodes). Each entry-function parameter, in SPIR-V
-//! `OpFunctionParameter` order (which llc preserves), gets a role telling the interface pass what
-//! Vulkan binding to synthesize for it. Ported faithfully from `metal2vulkanspirv::parse_air_fragment_meta`,
-//! plus a sibling `!air.vertex` parser the old crate handled structurally rather than from metadata.
+//! AIR stage-interface metadata parsed from sanitized `.ll` before SPIR-V emission. The parser maps
+//! each entry-function parameter to the role that the interface pass uses to synthesize Vulkan
+//! bindings, stage inputs, and stage outputs.
 
 use std::collections::{HashMap, HashSet};
 
 mod embedded;
 mod function_constants;
 mod globals;
+mod intersections;
 mod textures;
 mod types;
-use embedded::{body_uses_texture_read_or_write, detect_embedded_textures};
-pub use embedded::{embedded_synthetic_texture_index, EmbeddedTexture};
+use embedded::{body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_textures};
+pub use embedded::{embedded_synthetic_texture_index, EmbeddedArgument, EmbeddedTexture};
 pub use function_constants::{parse_function_constants, FunctionConstant};
+pub(crate) use globals::static_init_foldable_int_global_values;
 use globals::{location_index_with_static, static_init_int_global_values};
+pub use intersections::{
+    AirIntersectionFamily, AirIntersectionInstancing, AirIntersectionResultField,
+};
 pub use textures::{
     texture_shape_from_name, TextureComponent, TextureDimension, TextureFormat, TextureShape,
+    TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT,
 };
-use types::{parse_struct_info, struct_info_ref};
+use types::{parse_struct_info, struct_info_ref, tokenize, Tok};
 pub use types::{primitive_air_type_from_name, AirMember, AirScalar, AirType};
 
 /// Role of a single fragment-shader entry parameter, keyed by its parameter index.
@@ -42,10 +46,17 @@ pub enum FragRole {
     Texture(u32),
     /// `[[sampler(n)]]` -> UniformConstant sampler.
     Sampler(u32),
+    /// A Metal visible-function table resolved during authored dependency linking.
+    VisibleFunctionTable(u32),
+    /// A Metal intersection-function table resolved during authored dependency linking.
+    IntersectionFunctionTable(u32),
     /// `[[buffer(n)]]` -> Uniform/StorageBuffer block.
     Buffer(u32),
     /// `[[color(n)]]` framebuffer-fetch input -> Vulkan input attachment (out of scope this milestone).
     ColorInput(u32),
+    /// A custom fragment `[[imageblock_data]]` projection. Its fields are mapped to the master
+    /// imageblock layout by AIR user semantic, never by the source struct or argument name.
+    ImageblockData,
     /// Anything we don't model.
     Other,
 }
@@ -84,13 +95,18 @@ pub struct FragMeta {
     pub render_target_type_names: HashMap<u32, String>,
     /// Return-struct member indices tagged as `air.depth` (`[[depth(...)]]`).
     pub depth_members: Vec<u32>,
+    /// Conservative depth-test relation declared by `[[depth(...)]]`.
+    pub depth_qualifier: Option<DepthQualifier>,
     /// Return-struct member indices tagged as `air.stencil` (`[[stencil]]`).
     pub stencil_members: Vec<u32>,
+    /// Custom per-pixel fragment imageblock master plus the input/output projections that expose
+    /// subsets of its fields. `None` when the fragment carries no `air.imageblock_master` contract.
+    pub fragment_imageblock: Option<FragmentImageblock>,
     /// Render-target locations in AIR output metadata order. A single-output fragment can legally
     /// write a nonzero MRT slot, e.g. coverage shaders writing `[[color(1)]]`.
     pub render_target_indices: Vec<u32>,
     /// `param_idx -> reconstructed struct layout` for buffer args that carry `air.struct_type_info`.
-    /// Used to rebuild the real struct when the backend collapsed the buffer into a bare pointer.
+    /// Used to rebuild the real struct when native emission represents the buffer as a bare pointer.
     pub buffer_layouts: HashMap<u32, AirType>,
     /// `param_idx -> AIR address space` for buffer args, when the AIR node carries it (device=1,
     /// constant=2). Populated only from `air.address_space` / the function param pointer address
@@ -112,6 +128,54 @@ pub struct FragMeta {
     pub texture_type_names: HashMap<u32, String>,
     /// Framebuffer-fetch color input Location -> AIR render-target type name, e.g. `float4`.
     pub color_input_type_names: HashMap<u32, String>,
+    pub embedded_textures: Vec<EmbeddedTexture>,
+    pub embedded_arguments: Vec<EmbeddedArgument>,
+}
+
+/// One field in AIR's custom fragment-imageblock master layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FragmentImageblockMember {
+    pub offset: u32,
+    pub size: u32,
+    pub type_name: String,
+    pub semantic: String,
+    pub raster_order_group: u32,
+}
+
+/// One field exposed by an entry input or return-value imageblock projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FragmentImageblockProjectionMember {
+    pub projection_member: u32,
+    pub master_member: u32,
+}
+
+/// A partial struct view of a custom fragment imageblock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FragmentImageblockProjection {
+    /// Entry parameter index for an input projection, or return-struct member index for an output.
+    pub interface_index: u32,
+    pub members: Vec<FragmentImageblockProjectionMember>,
+}
+
+/// AIR's exact custom fragment-imageblock ABI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FragmentImageblock {
+    pub sample_size: u32,
+    pub members: Vec<FragmentImageblockMember>,
+    pub inputs: Vec<FragmentImageblockProjection>,
+    pub outputs: Vec<FragmentImageblockProjection>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DepthQualifier {
+    Any,
+    Less,
+    Greater,
 }
 
 impl FragMeta {
@@ -171,11 +235,49 @@ pub enum VertRole {
     Texture(u32),
     /// `[[sampler(n)]]` -> sampler.
     Sampler(u32),
+    /// A Metal visible-function table resolved during authored dependency linking.
+    VisibleFunctionTable(u32),
+    /// A Metal intersection-function table resolved during authored dependency linking.
+    IntersectionFunctionTable(u32),
     /// `[[vertex_id]]` -> Input BuiltIn VertexIndex (32-bit uint).
     VertexId,
     /// `[[instance_id]]` -> Input BuiltIn InstanceIndex (32-bit uint).
     InstanceId,
+    /// Opaque Metal patch handle consumed only by the metadata-named control-point accessor.
+    PatchControlPoints,
+    /// Per-patch user input at the AIR location.
+    PatchInput(u32),
+    /// `[[position_in_patch]]` -> the leading components of Vulkan `TessCoord`.
+    PositionInPatch,
+    /// `[[patch_id]]` -> Vulkan `PrimitiveId` in tessellation evaluation.
+    PatchId,
+    /// Metal vertex-amplification identifiers have no Vulkan tessellation builtin and are exposed
+    /// through the translator's per-patch system-input locations.
+    AmplificationId,
+    AmplificationCount,
     Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum PatchDomain {
+    Triangle,
+    Quad,
+    Isoline,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PatchControlPointField {
+    pub location: u32,
+    pub type_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TessellationMeta {
+    pub domain: PatchDomain,
+    pub control_point_count: u32,
+    pub control_point_function: Option<String>,
+    pub control_point_fields: Vec<PatchControlPointField>,
 }
 
 /// Role of a single vertex return-struct member.
@@ -203,12 +305,25 @@ pub enum VertOutRole {
 #[derive(Clone, Debug, Default)]
 pub struct VertMeta {
     pub roles: Vec<(u32, VertRole)>,
+    /// Entry parameter index -> AIR type name. Tessellation system values use this to expose the
+    /// exact cross-stage scalar type instead of forcing executors to infer it from a location.
+    pub parameter_type_names: HashMap<u32, String>,
     pub output_roles: Vec<VertOutRole>,
+    /// User-varying output Location -> AIR type name.
+    pub output_varying_types: HashMap<u32, String>,
+    /// User-varying output Location -> Metal field name.
+    pub output_varying_names: HashMap<u32, String>,
+    /// User-varying output Location -> Metal linker semantic.
+    pub output_varying_user_semantics: HashMap<u32, String>,
     /// Vertex input Location -> AIR type name (`float2`, `float4`, ...). Used by conformance
     /// oracles that must synthesize a Metal vertex descriptor before pipeline reflection exists.
     pub vertex_input_types: HashMap<u32, String>,
     /// Vertex input Location -> Metal argument name, when AIR metadata carries one.
     pub vertex_input_names: HashMap<u32, String>,
+    /// Per-patch tessellation input Location -> AIR type name.
+    pub patch_input_types: HashMap<u32, String>,
+    /// Per-patch tessellation input Location -> Metal argument name.
+    pub patch_input_names: HashMap<u32, String>,
     /// `param_idx -> reconstructed struct layout` for buffer args (see `FragMeta::buffer_layouts`).
     pub buffer_layouts: HashMap<u32, AirType>,
     /// `param_idx -> AIR address space` for buffer args, when the AIR carries it (see
@@ -222,6 +337,38 @@ pub struct VertMeta {
     pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
+    pub embedded_textures: Vec<EmbeddedTexture>,
+    pub embedded_arguments: Vec<EmbeddedArgument>,
+    pub tessellation: Option<TessellationMeta>,
+}
+
+impl VertMeta {
+    pub fn is_tessellation_evaluation(&self) -> bool {
+        self.tessellation.is_some()
+    }
+
+    pub fn tessellation_system_input_location(&self, role: &VertRole) -> Option<u32> {
+        let base = self
+            .roles
+            .iter()
+            .filter_map(|(_, role)| match role {
+                VertRole::PatchInput(location) => Some(*location),
+                _ => None,
+            })
+            .chain(
+                self.tessellation
+                    .iter()
+                    .flat_map(|meta| meta.control_point_fields.iter().map(|field| field.location)),
+            )
+            .max()
+            .map_or(0, |location| location + 1);
+        match role {
+            VertRole::InstanceId => Some(base),
+            VertRole::AmplificationId => Some(base + 1),
+            VertRole::AmplificationCount => Some(base + 2),
+            _ => None,
+        }
+    }
 }
 
 impl VertMeta {
@@ -236,6 +383,17 @@ impl VertMeta {
     }
     pub fn output_role_of(&self, idx: u32) -> Option<&VertOutRole> {
         self.output_roles.get(idx as usize)
+    }
+    pub fn output_varying_type(&self, loc: u32) -> Option<&str> {
+        self.output_varying_types.get(&loc).map(String::as_str)
+    }
+    pub fn output_varying_name(&self, loc: u32) -> Option<&str> {
+        self.output_varying_names.get(&loc).map(String::as_str)
+    }
+    pub fn output_varying_user_semantic(&self, loc: u32) -> Option<&str> {
+        self.output_varying_user_semantics
+            .get(&loc)
+            .map(String::as_str)
     }
     pub fn vertex_input_type(&self, loc: u32) -> Option<&str> {
         self.vertex_input_types.get(&loc).map(String::as_str)
@@ -258,6 +416,18 @@ pub enum KernRole {
     /// Host-populated StorageBuffer shadow for an opaque Metal acceleration structure used by AIR
     /// introspection intrinsics. Bound at the resource's `air.location_index`; see `as_shadow`.
     AccelerationStructureShadow(u32),
+    /// An AIR primitive acceleration structure that is not consumed by an AIR intersection
+    /// intrinsic. Metal still binds the native object; Vulkan needs no descriptor.
+    PrimitiveAccelerationStructure(u32),
+    /// An AIR primitive acceleration structure consumed by AIR intersection lowering. Metal binds
+    /// the native object and Vulkan exposes authored triangle geometry through a StorageBuffer.
+    PrimitiveAccelerationStructureShadow(u32),
+    /// A Metal visible-function table. Logical SPIR-V has no descriptor for the opaque table;
+    /// authored linking resolves its entries before ordinary interface lowering.
+    VisibleFunctionTable(u32),
+    /// A Metal intersection-function table. Like visible tables, this is a link-time authored
+    /// resource rather than a Vulkan descriptor.
+    IntersectionFunctionTable(u32),
     /// `[[threads_per_threadgroup]]` (`uint` or `uint3`) -> the execution local size.
     /// Scalar params receive `64`; vector params receive `(64, 1, 1)` for the current harness.
     ThreadsPerThreadgroup,
@@ -306,6 +476,8 @@ pub struct KernMeta {
     pub buffer_layouts: HashMap<u32, AirType>,
     /// `param_idx -> reconstructed air.imageblock_data layout` for imageblock args.
     pub imageblock_layouts: HashMap<u32, AirType>,
+    /// Descriptor-backed render-target planes used by implicit imageblock load/store intrinsics.
+    pub implicit_imageblock_attachments: Vec<ImplicitImageblockAttachment>,
     /// `param_idx -> AIR address space` for buffer args. Address space 3 is threadgroup memory.
     pub buffer_address_spaces: HashMap<u32, u32>,
     /// `param_idx -> declared AIR buffer argument byte size`, from `air.arg_type_size` or
@@ -319,11 +491,26 @@ pub struct KernMeta {
     pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
+    /// `param_idx -> AIR kernel stage-input scalar/vector type name`.
+    pub stage_input_type_names: HashMap<u32, String>,
     /// Textures EMBEDDED inside an `air.indirect_buffer` argument buffer (via `air.indirect_argument`
     /// → nested `air.texture`) that the kernel body reads/writes with AIR texture intrinsics. Each is
     /// surfaced as a standalone image resource so the read/write lowers to a real descriptor instead of a
     /// private placeholder. See [`EmbeddedTexture`].
     pub embedded_textures: Vec<EmbeddedTexture>,
+    /// Every resource-handle member carried by an `air.indirect_buffer`, including handles whose
+    /// concrete kind is supplied by an authored manifest and verified from its AIR use.
+    pub embedded_arguments: Vec<EmbeddedArgument>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImplicitImageblockAttachment {
+    pub attachment: u32,
+    pub data_rate: u32,
+    pub max_index: Option<u32>,
+    pub format: TextureFormat,
+    pub reads: bool,
+    pub writes: bool,
 }
 
 impl KernMeta {
@@ -348,6 +535,40 @@ impl KernMeta {
     pub fn texture_type_name(&self, idx: u32) -> Option<&str> {
         self.texture_type_names.get(&idx).map(String::as_str)
     }
+
+    /// Synthetic buffer slots used for kernel `[[stage_in]]` attributes.
+    ///
+    /// Metal supplies stage-input data through ordinary buffer-table slots selected by the pipeline
+    /// descriptor. Vulkan exposes the same arrays as read-only storage buffers. Keeping allocation
+    /// here makes reflection and lowering consume one ABI decision instead of duplicating it.
+    pub fn stage_input_bindings(&self) -> HashMap<u32, u32> {
+        let mut occupied = self
+            .roles
+            .iter()
+            .filter_map(|(_, role)| match role {
+                KernRole::Buffer(binding)
+                | KernRole::AccelerationStructureShadow(binding)
+                | KernRole::PrimitiveAccelerationStructure(binding)
+                | KernRole::PrimitiveAccelerationStructureShadow(binding)
+                | KernRole::VisibleFunctionTable(binding)
+                | KernRole::IntersectionFunctionTable(binding) => Some(*binding),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut next = 0u32;
+        let mut bindings = HashMap::new();
+        for (param_index, role) in &self.roles {
+            if !matches!(role, KernRole::StageInput(_)) {
+                continue;
+            }
+            while occupied.contains(&next) {
+                next = next.saturating_add(1);
+            }
+            occupied.insert(next);
+            bindings.insert(*param_index, next);
+        }
+        bindings
+    }
 }
 
 /// Parse `!air.kernel` into a `KernMeta`. Structure (RE'd from the compute fixtures):
@@ -361,7 +582,8 @@ pub fn parse_air_kernel_meta(ll: &str) -> Option<KernMeta> {
 /// `[[function_constant]]`-gated `air.buffer` param is classified as a REAL StorageBuffer binding
 /// (`true`) or left as the default possibly-absent Private placeholder (`false`). Every production
 /// entry point uses `false`; only the adopt-if-validates `fc_promote_psb` retry passes `true` (see
-/// [`fc_promoted_role`]). Standalone callers can request either projection; production parses both
+/// the internal `fc_promoted_role` classifier). Standalone callers can request either projection;
+/// production parses both
 /// projections from one shared metadata-node table before the transform pipeline runs.
 pub fn parse_air_kernel_meta_with(ll: &str, promote_fc_buffers: bool) -> Option<KernMeta> {
     let nodes = collect_nodes(ll);
@@ -407,12 +629,13 @@ fn parse_air_kernel_meta_with_nodes(
     let mut buffer_type_names = HashMap::new();
     let mut buffer_accesses = HashMap::new();
     let mut texture_type_names = HashMap::new();
+    let mut stage_input_type_names = HashMap::new();
     // `air.location_index` of every top-level `air.texture` arg — the basis for the synthetic
     // embedded-texture index K (see `embedded_synthetic_texture_index`).
     let mut top_level_texture_locations: Vec<u32> = vec![];
     // `(buffer_param_index, struct_type_info_node_ref)` for each `air.indirect_buffer` arg, so
     // embedded-texture detection can run once K is known (after the whole arg list is scanned).
-    let mut indirect_buffer_struct_refs: Vec<(u32, u32)> = vec![];
+    let mut indirect_buffer_struct_refs: Vec<(u32, u32, u32)> = vec![];
     for r in refs_in(nodes.get(&in_ref)?) {
         let Some(node) = nodes.get(&r) else { continue };
         let Some(idx) = first_i32(node) else { continue };
@@ -428,7 +651,7 @@ fn parse_air_kernel_meta_with_nodes(
                         // Key by the buffer's `air.location_index` (the Metal `[[buffer(N)]]` slot the
                         // harness binds), NOT the AIR argument position — they differ (e.g. arg 2 but
                         // buffer(0)). The oracle/runner both index buffers by location.
-                        indirect_buffer_struct_refs.push((location_index(node, idx), sref));
+                        indirect_buffer_struct_refs.push((idx, location_index(node, idx), sref));
                     }
                 }
                 if let Some(t) = layout.clone() {
@@ -464,10 +687,20 @@ fn parse_air_kernel_meta_with_nodes(
                 top_level_texture_locations.push(loc);
                 KernRole::Texture(loc)
             }
-            "instance_acceleration_structure" | "primitive_acceleration_structure"
-                if body_uses_acceleration_structure_shadow(ll) =>
-            {
+            "instance_acceleration_structure" if body_uses_acceleration_structure_shadow(ll) => {
                 KernRole::AccelerationStructureShadow(location_index(node, idx))
+            }
+            "primitive_acceleration_structure" => {
+                let binding = location_index(node, idx);
+                if ll.contains("@air.intersect.") {
+                    KernRole::PrimitiveAccelerationStructureShadow(binding)
+                } else {
+                    KernRole::PrimitiveAccelerationStructure(binding)
+                }
+            }
+            "visible_function_table" => KernRole::VisibleFunctionTable(location_index(node, idx)),
+            "intersection_function_table" => {
+                KernRole::IntersectionFunctionTable(location_index(node, idx))
             }
             "imageblock" => {
                 if let Some(t) = layout {
@@ -489,16 +722,21 @@ fn parse_air_kernel_meta_with_nodes(
             "threads_per_simdgroup" => KernRole::ThreadsPerSimdgroup,
             "simdgroups_per_threadgroup" => KernRole::SimdgroupsPerThreadgroup,
             "thread_position_in_grid" => KernRole::ThreadPositionInGrid,
-            "stage_in" => KernRole::StageInput(location_index(node, idx)),
+            "stage_in" => {
+                if let Some(name) = arg_type_name(node) {
+                    stage_input_type_names.insert(idx, name);
+                }
+                KernRole::StageInput(location_index(node, idx))
+            }
             _ => KernRole::Other,
         };
         roles.push((idx, role));
     }
-    // Detect argument-buffer-embedded textures that the body reads/writes through AIR texture
+    // Detect argument-buffer-embedded textures that the body uses through AIR texture
     // intrinsics. Gated purely on AIR structure/semantics — the `air.indirect_argument` →
     // `air.texture` marker chain plus stable AIR intrinsic families — so it cannot key on any shader
-    // name. The body must actually use a read/write texture intrinsic for us to surface it.
-    let embedded_textures = if body_uses_texture_read_or_write(ll) {
+    // name. The body must actually use a texture intrinsic for us to surface it.
+    let embedded_textures = if body_uses_texture_intrinsic(ll) {
         detect_embedded_textures(
             nodes,
             &indirect_buffer_struct_refs,
@@ -507,23 +745,137 @@ fn parse_air_kernel_meta_with_nodes(
     } else {
         vec![]
     };
+    let embedded_arguments = detect_embedded_arguments(nodes, &indirect_buffer_struct_refs);
+    let implicit_imageblock_attachments = detect_implicit_imageblock_attachments(ll)?;
     Some(KernMeta {
         roles,
         buffer_layouts,
         imageblock_layouts,
+        implicit_imageblock_attachments,
         buffer_address_spaces,
         buffer_type_sizes,
         buffer_object_sizes,
         buffer_type_names,
         buffer_accesses,
         texture_type_names,
+        stage_input_type_names,
         embedded_textures,
+        embedded_arguments,
     })
+}
+
+/// Decode the stable AIR implicit-imageblock intrinsic suffix to its exact storage plane format.
+/// `Ok(None)` means the symbol is not in this intrinsic family; an unknown family suffix is an
+/// explicit error so reflection and corpus capability audits cannot silently omit a new ABI shape.
+pub fn implicit_imageblock_texture_format(name: &str) -> Result<Option<TextureFormat>, String> {
+    let suffix = name
+        .strip_prefix("air.load.implicit_imageblock.")
+        .or_else(|| name.strip_prefix("air.store.implicit_imageblock."));
+    let Some(suffix) = suffix else {
+        return Ok(None);
+    };
+    let format = match suffix {
+        "f16" => TextureFormat::R16f,
+        "v2f16" => TextureFormat::Rg16f,
+        "v4f16" => TextureFormat::Rgba16f,
+        "f32" => TextureFormat::R32f,
+        "v4f32" => TextureFormat::Rgba32f,
+        "i32" => TextureFormat::R32ui,
+        _ => {
+            return Err(format!(
+                "{name} has unsupported implicit imageblock texel type"
+            ))
+        }
+    };
+    Ok(Some(format))
+}
+
+fn detect_implicit_imageblock_attachments(ll: &str) -> Option<Vec<ImplicitImageblockAttachment>> {
+    let mut attachments =
+        std::collections::BTreeMap::<(u32, u32, TextureFormat), ImplicitImageblockAttachment>::new(
+        );
+    for line in ll.lines() {
+        let Some(at) = line.find("@air.") else {
+            continue;
+        };
+        let call = &line[at + 1..];
+        let Some(open) = call.find('(') else { continue };
+        let name = &call[..open];
+        let (reads, writes, value_prefix) = if name.starts_with("air.load.implicit_imageblock.") {
+            (true, false, 0usize)
+        } else if name.starts_with("air.store.implicit_imageblock.") {
+            (false, true, 1usize)
+        } else {
+            continue;
+        };
+        let Some(close) = call[open + 1..].find(')') else {
+            continue;
+        };
+        let args = split_top_level_commas(&call[open + 1..open + 1 + close]);
+        let Some(attachment) = args
+            .get(value_prefix)
+            .and_then(|arg| typed_u32_constant(arg))
+        else {
+            continue;
+        };
+        let index = args
+            .get(value_prefix + 2)
+            .and_then(|arg| typed_u32_constant(arg));
+        let Some(data_rate) = args
+            .get(value_prefix + 3)
+            .and_then(|arg| typed_u32_constant(arg))
+        else {
+            continue;
+        };
+        let format = implicit_imageblock_texture_format(name).ok().flatten()?;
+        let entry = attachments
+            .entry((attachment, data_rate, format))
+            .or_insert(ImplicitImageblockAttachment {
+                attachment,
+                data_rate,
+                max_index: index,
+                format,
+                reads: false,
+                writes: false,
+            });
+        entry.reads |= reads;
+        entry.writes |= writes;
+        entry.max_index = match (entry.max_index, index) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            _ => None,
+        };
+    }
+    Some(attachments.into_values().collect())
+}
+
+fn typed_u32_constant(value: &str) -> Option<u32> {
+    value.split_whitespace().last()?.parse().ok()
 }
 
 fn body_uses_acceleration_structure_shadow(ll: &str) -> bool {
     ll.contains("@air.get_instance_count_instance_acceleration_structure")
         || ll.contains("@air.get_primitive_acceleration_structure_instance_acceleration_structure")
+        || ll.lines().any(|line| {
+            let Some(start) = line.find("@air.intersect.") else {
+                return false;
+            };
+            let Some(end) = line[start + 1..].find('(') else {
+                return false;
+            };
+            let callee = &line[start + 1..start + 1 + end];
+            AirIntersectionFamily::parse(callee)
+                .ok()
+                .flatten()
+                .is_some_and(|family| family.instancing != AirIntersectionInstancing::None)
+        })
+}
+
+/// Whether every AIR intersection call in this module has an implemented structural lowering.
+///
+/// Validation tooling uses the same product-owned decision as translation so its authorability
+/// inventory cannot drift into a second, independently maintained intrinsic allowlist.
+pub fn air_intersection_calls_are_supported(ll: &str) -> bool {
+    crate::native::ray_intersection::all_air_intersection_calls_are_lowerable(ll)
 }
 
 /// Collect every `!N = !{...}` metadata node body, keyed by N. Shared by both stage parsers.
@@ -598,6 +950,20 @@ fn entry_name_from_nodes(ll: &str, stage: &str, nodes: &HashMap<u32, String>) ->
     } else {
         Some(name)
     }
+}
+
+fn pointer_symbol(body: &str) -> Option<String> {
+    let at = body.find('@')?;
+    let after = &body[at + 1..];
+    let name = if let Some(quoted) = after.strip_prefix('"') {
+        quoted_symbol_name(quoted)?
+    } else {
+        after
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(*c, '_' | '.' | '$'))
+            .collect()
+    };
+    (!name.is_empty()).then_some(name)
 }
 
 fn quoted_symbol_name(s: &str) -> Option<String> {
@@ -892,6 +1258,166 @@ fn arg_name(body: &str) -> Option<String> {
     string_after_marker(body, "air.arg_name")
 }
 
+fn ref_after_marker(body: &str, marker: &str) -> Option<u32> {
+    let marker = format!("!\"{marker}\"");
+    let after = body.get(body.find(&marker)? + marker.len()..)?;
+    let bang = after.find('!')?;
+    let digits = after[bang + 1..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn parse_fragment_imageblock_master(body: &str) -> Option<Vec<FragmentImageblockMember>> {
+    let toks = tokenize(body);
+    let mut members = Vec::new();
+    let mut i = 0;
+    while i + 4 < toks.len() {
+        let (offset, size, type_name, semantic) = match (
+            toks.get(i),
+            toks.get(i + 1),
+            toks.get(i + 2),
+            toks.get(i + 3),
+            toks.get(i + 4),
+        ) {
+            (
+                Some(Tok::Int(offset)),
+                Some(Tok::Int(size)),
+                Some(Tok::Int(_array_len)),
+                Some(Tok::Str(type_name)),
+                Some(Tok::Str(semantic)),
+            ) => (*offset, *size, type_name.clone(), semantic.clone()),
+            _ => return None,
+        };
+        i += 5;
+        let raster_order_group = match (toks.get(i), toks.get(i + 1)) {
+            (Some(Tok::Str(marker)), Some(Tok::Int(group)))
+                if marker == "air.raster_order_group" =>
+            {
+                i += 2;
+                *group
+            }
+            _ => return None,
+        };
+        members.push(FragmentImageblockMember {
+            offset,
+            size,
+            type_name,
+            semantic,
+            raster_order_group,
+        });
+    }
+    (!members.is_empty() && i == toks.len()).then_some(members)
+}
+
+fn parse_fragment_imageblock_projection(
+    nodes: &HashMap<u32, String>,
+    node: &str,
+    interface_index: u32,
+    master_members: &[FragmentImageblockMember],
+) -> Option<FragmentImageblockProjection> {
+    let projection_ref = struct_info_ref(node)?;
+    let projection = nodes.get(&projection_ref)?;
+    let toks = tokenize(projection);
+    let mut members = Vec::new();
+    let mut i = 0;
+    let mut projection_member = 0;
+    while i + 4 < toks.len() {
+        let semantic = match (
+            toks.get(i),
+            toks.get(i + 1),
+            toks.get(i + 2),
+            toks.get(i + 3),
+            toks.get(i + 4),
+        ) {
+            (
+                Some(Tok::Int(_)),
+                Some(Tok::Int(_)),
+                Some(Tok::Int(_)),
+                Some(Tok::Str(_)),
+                Some(Tok::Str(semantic)),
+            ) => semantic,
+            _ => return None,
+        };
+        let master_member = master_members
+            .iter()
+            .position(|member| member.semantic == *semantic)? as u32;
+        members.push(FragmentImageblockProjectionMember {
+            projection_member,
+            master_member,
+        });
+        projection_member += 1;
+        i += 5;
+        if matches!(toks.get(i), Some(Tok::Str(marker)) if marker == "air.raster_order_group")
+            && matches!(toks.get(i + 1), Some(Tok::Int(_)))
+        {
+            i += 2;
+        }
+    }
+    (!members.is_empty() && i == toks.len()).then_some(FragmentImageblockProjection {
+        interface_index,
+        members,
+    })
+}
+
+fn parse_fragment_imageblock(
+    nodes: &HashMap<u32, String>,
+    out_ref: u32,
+    in_ref: u32,
+) -> Option<FragmentImageblock> {
+    let output_nodes = nodes
+        .get(&out_ref)
+        .map(|body| refs_in(body))
+        .unwrap_or_default();
+    let input_nodes = nodes
+        .get(&in_ref)
+        .map(|body| refs_in(body))
+        .unwrap_or_default();
+    let imageblock_node = output_nodes
+        .iter()
+        .chain(input_nodes.iter())
+        .filter_map(|id| nodes.get(id))
+        .find(|body| primary_role(&role_strings(body)) == Some("imageblock_data"))?;
+    // Some AIR producers attach an explicit `air.imageblock_master` to a narrow projection. Others
+    // pass the complete imageblock-data struct directly, in which case its own struct metadata is
+    // the master layout. Both contracts carry the same offset/size/type/semantic/ROG tuple stream;
+    // use that structure rather than requiring the optional indirection.
+    let master_ref = ref_after_marker(imageblock_node, "air.imageblock_master")
+        .or_else(|| struct_info_ref(imageblock_node))?;
+    let master_members = parse_fragment_imageblock_master(nodes.get(&master_ref)?)?;
+    let sample_size = i32_after_marker(imageblock_node, "air.imageblock_data_size")?;
+
+    let outputs = output_nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| {
+            let node = nodes.get(id)?;
+            (primary_role(&role_strings(node)) == Some("imageblock_data"))
+                .then(|| {
+                    parse_fragment_imageblock_projection(nodes, node, index as u32, &master_members)
+                })
+                .flatten()
+        })
+        .collect();
+    let inputs = input_nodes
+        .iter()
+        .filter_map(|id| {
+            let node = nodes.get(id)?;
+            let index = first_i32(node)?;
+            (primary_role(&role_strings(node)) == Some("imageblock_data"))
+                .then(|| parse_fragment_imageblock_projection(nodes, node, index, &master_members))
+                .flatten()
+        })
+        .collect();
+    Some(FragmentImageblock {
+        sample_size,
+        members: master_members,
+        inputs,
+        outputs,
+    })
+}
+
 /// Parse `!air.fragment` into a `FragMeta`. Structure (RE'd Phase 5.11):
 ///   `!air.fragment = !{!N}`; `!N = !{ptr @func, !OUT, !IN}`;
 ///   `!IN = !{!a, !b, ...}` each `!{i32 idx, !"air.<role>", ...}`; `!OUT = list of render targets`.
@@ -916,6 +1442,7 @@ fn parse_air_fragment_meta_with_nodes(
     let rootc = nodes.get(&root)?;
     let refs = refs_in(rootc);
     let (out_ref, in_ref) = (*refs.first()?, *refs.get(1)?);
+    let fragment_imageblock = parse_fragment_imageblock(nodes, out_ref, in_ref);
     let render_target_members: Vec<(u32, u32)> = nodes
         .get(&out_ref)
         .map(|c| {
@@ -955,6 +1482,20 @@ fn parse_air_fragment_meta_with_nodes(
                 .collect()
         })
         .unwrap_or_default();
+    let depth_qualifier = nodes.get(&out_ref).and_then(|c| {
+        refs_in(c).into_iter().find_map(|r| {
+            let node = nodes.get(&r)?;
+            (primary_role(&role_strings(node)) == Some("depth"))
+                .then(|| string_after_marker(node, "air.depth_qualifier"))
+                .flatten()
+                .and_then(|qualifier| match qualifier.as_str() {
+                    "air.any" => Some(DepthQualifier::Any),
+                    "air.less" => Some(DepthQualifier::Less),
+                    "air.greater" => Some(DepthQualifier::Greater),
+                    _ => None,
+                })
+        })
+    });
     let stencil_members: Vec<u32> = nodes
         .get(&out_ref)
         .map(|c| {
@@ -1013,6 +1554,7 @@ fn parse_air_fragment_meta_with_nodes(
     let mut buffer_object_sizes = HashMap::new();
     let mut buffer_type_names = HashMap::new();
     let mut buffer_accesses = HashMap::new();
+    let mut indirect_buffer_struct_refs: Vec<(u32, u32, u32)> = Vec::new();
     // AIR function-param pointer address spaces for the fragment entry, the fallback the kernel
     // parser uses when a buffer arg node omits `air.address_space`.
     let param_address_spaces = entry
@@ -1021,7 +1563,7 @@ fn parse_air_fragment_meta_with_nodes(
     for r in refs_in(nodes.get(&in_ref)?) {
         let Some(node) = nodes.get(&r) else { continue };
         let Some(idx) = first_i32(node) else { continue };
-        // Reconstruct any buffer struct layout (used when the backend collapsed the buffer pointer).
+        // Reconstruct any buffer struct layout used when native emission produces a bare pointer.
         if let Some(sref) = struct_info_ref(node) {
             if let Some(t) = parse_struct_info(nodes, sref, 0) {
                 buffer_layouts.insert(idx, t);
@@ -1031,75 +1573,99 @@ fn parse_air_fragment_meta_with_nodes(
         let Some(role_str) = primary_role(&strs) else {
             continue;
         };
-        let role = match role_str {
-            "position" => FragRole::Position,
-            "point_coord" => FragRole::PointCoord,
-            "front_facing" => FragRole::FrontFacing,
-            "primitive_id" => FragRole::PrimitiveId,
-            "sample_id" => FragRole::SampleId,
-            "viewport_array_index" => FragRole::ViewportArrayIndex,
-            "fragment_input" => {
-                let l = varying_loc;
-                varying_loc += 1;
-                if let Some(name) = arg_type_name(node) {
-                    varying_types.insert(l, name);
+        let role =
+            match role_str {
+                "position" => FragRole::Position,
+                "point_coord" => FragRole::PointCoord,
+                "front_facing" => FragRole::FrontFacing,
+                "primitive_id" => FragRole::PrimitiveId,
+                "sample_id" => FragRole::SampleId,
+                "viewport_array_index" => FragRole::ViewportArrayIndex,
+                "fragment_input" => {
+                    let l = varying_loc;
+                    varying_loc += 1;
+                    if let Some(name) = arg_type_name(node) {
+                        varying_types.insert(l, name);
+                    }
+                    if let Some(name) = arg_name(node) {
+                        varying_names.insert(l, name);
+                    }
+                    if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
+                        varying_user_semantics.insert(l, semantic);
+                    }
+                    if strs.iter().any(|s| s == "flat") {
+                        flat_varyings.insert(l);
+                    }
+                    FragRole::Varying(l)
                 }
-                if let Some(name) = arg_name(node) {
-                    varying_names.insert(l, name);
+                "texture" => {
+                    if let Some(name) = arg_type_name(node) {
+                        texture_type_names.insert(idx, name);
+                    }
+                    FragRole::Texture(location_index_with_static(node, idx, &static_int_globals))
                 }
-                if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
-                    varying_user_semantics.insert(l, semantic);
+                "sampler" => {
+                    FragRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
                 }
-                if strs.iter().any(|s| s == "flat") {
-                    flat_varyings.insert(l);
+                "visible_function_table" => FragRole::VisibleFunctionTable(
+                    location_index_with_static(node, idx, &static_int_globals),
+                ),
+                "intersection_function_table" => FragRole::IntersectionFunctionTable(
+                    location_index_with_static(node, idx, &static_int_globals),
+                ),
+                "buffer" | "indirect_buffer" => {
+                    if role_str == "indirect_buffer" {
+                        if let Some(sref) = struct_info_ref(node) {
+                            indirect_buffer_struct_refs.push((
+                                idx,
+                                location_index_with_static(node, idx, &static_int_globals),
+                                sref,
+                            ));
+                        }
+                    }
+                    // Populate address space / declared size ONLY when the IR actually carries them
+                    // (no invented default), so reflection never reports a guessed value.
+                    if let Some(space) =
+                        address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
+                    {
+                        buffer_address_spaces.insert(idx, space);
+                    }
+                    if let Some(size) = i32_after_marker(node, "air.arg_type_size")
+                        .or_else(|| i32_after_marker(node, "air.buffer_size"))
+                    {
+                        buffer_type_sizes.insert(idx, size);
+                    }
+                    if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                        buffer_object_sizes.insert(idx, size);
+                    }
+                    if let Some(name) = arg_type_name(node) {
+                        buffer_type_names.insert(idx, name);
+                    }
+                    if let Some(access) = declared_buffer_access(node) {
+                        buffer_accesses.insert(idx, access);
+                    }
+                    FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
                 }
-                FragRole::Varying(l)
-            }
-            "texture" => {
-                if let Some(name) = arg_type_name(node) {
-                    texture_type_names.insert(idx, name);
+                // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
+                "render_target" => {
+                    let location = render_target_location(node, idx, &static_int_globals);
+                    if let Some(name) = arg_type_name(node) {
+                        color_input_type_names.insert(location, name);
+                    }
+                    FragRole::ColorInput(location)
                 }
-                FragRole::Texture(location_index_with_static(node, idx, &static_int_globals))
-            }
-            "sampler" => {
-                FragRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
-            }
-            "buffer" | "indirect_buffer" => {
-                // Populate address space / declared size ONLY when the IR actually carries them
-                // (no invented default), so reflection never reports a guessed value.
-                if let Some(space) =
-                    address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
-                {
-                    buffer_address_spaces.insert(idx, space);
-                }
-                if let Some(size) = i32_after_marker(node, "air.arg_type_size")
-                    .or_else(|| i32_after_marker(node, "air.buffer_size"))
-                {
-                    buffer_type_sizes.insert(idx, size);
-                }
-                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
-                    buffer_object_sizes.insert(idx, size);
-                }
-                if let Some(name) = arg_type_name(node) {
-                    buffer_type_names.insert(idx, name);
-                }
-                if let Some(access) = declared_buffer_access(node) {
-                    buffer_accesses.insert(idx, access);
-                }
-                FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
-            }
-            // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
-            "render_target" => {
-                let location = render_target_location(node, idx, &static_int_globals);
-                if let Some(name) = arg_type_name(node) {
-                    color_input_type_names.insert(location, name);
-                }
-                FragRole::ColorInput(location)
-            }
-            _ => FragRole::Other,
-        };
+                "imageblock_data" => FragRole::ImageblockData,
+                _ => FragRole::Other,
+            };
         roles.push((idx, role));
     }
+    let top_level_texture_locations = roles
+        .iter()
+        .filter_map(|(_, role)| match role {
+            FragRole::Texture(location) => Some(*location),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     Some(FragMeta {
         roles,
         varying_types,
@@ -1110,7 +1676,9 @@ fn parse_air_fragment_meta_with_nodes(
         render_target_members,
         render_target_type_names,
         depth_members,
+        depth_qualifier,
         stencil_members,
+        fragment_imageblock,
         render_target_indices,
         buffer_layouts,
         buffer_address_spaces,
@@ -1120,6 +1688,16 @@ fn parse_air_fragment_meta_with_nodes(
         buffer_accesses,
         texture_type_names,
         color_input_type_names,
+        embedded_textures: if body_uses_texture_intrinsic(ll) {
+            detect_embedded_textures(
+                nodes,
+                &indirect_buffer_struct_refs,
+                &top_level_texture_locations,
+            )
+        } else {
+            Vec::new()
+        },
+        embedded_arguments: detect_embedded_arguments(nodes, &indirect_buffer_struct_refs),
     })
 }
 
@@ -1147,8 +1725,25 @@ fn parse_air_vertex_meta_with_nodes(
     let refs = refs_in(rootc);
     let out_ref = *refs.first()?;
     let in_ref = *refs.get(1)?;
+    let patch_shape = refs.get(2).and_then(|patch_ref| {
+        let node = nodes.get(patch_ref)?;
+        let domain = if node.contains("!\"quad\"") {
+            PatchDomain::Quad
+        } else if node.contains("!\"triangle\"") {
+            PatchDomain::Triangle
+        } else if node.contains("!\"isoline\"") {
+            PatchDomain::Isoline
+        } else {
+            return None;
+        };
+        let count = i32_after_marker(node, "air.patch_control_point")?;
+        Some((domain, count))
+    });
 
     let mut output_roles = vec![];
+    let mut output_varying_types = HashMap::new();
+    let mut output_varying_names = HashMap::new();
+    let mut output_varying_user_semantics = HashMap::new();
     let mut out_loc = 0u32;
     for r in refs_in(nodes.get(&out_ref)?) {
         let Some(node) = nodes.get(&r) else { continue };
@@ -1166,6 +1761,15 @@ fn parse_air_vertex_meta_with_nodes(
             "vertex_output" => {
                 let l = location_index_with_static(node, out_loc, &static_int_globals);
                 out_loc += 1;
+                if let Some(name) = arg_type_name(node) {
+                    output_varying_types.insert(l, name);
+                }
+                if let Some(name) = arg_name(node) {
+                    output_varying_names.insert(l, name);
+                }
+                if let Some(semantic) = string_after_marker(node, "air.vertex_output") {
+                    output_varying_user_semantics.insert(l, semantic);
+                }
                 VertOutRole::Varying(l)
             }
             _ => VertOutRole::Other,
@@ -1174,8 +1778,11 @@ fn parse_air_vertex_meta_with_nodes(
     }
 
     let mut roles = vec![];
+    let mut parameter_type_names = HashMap::new();
     let mut vertex_input_types = HashMap::new();
     let mut vertex_input_names = HashMap::new();
+    let mut patch_input_types = HashMap::new();
+    let mut patch_input_names = HashMap::new();
     let mut buffer_layouts = HashMap::new();
     let mut buffer_address_spaces = HashMap::new();
     let mut buffer_type_sizes = HashMap::new();
@@ -1183,6 +1790,8 @@ fn parse_air_vertex_meta_with_nodes(
     let mut buffer_type_names = HashMap::new();
     let mut buffer_accesses = HashMap::new();
     let mut texture_type_names = HashMap::new();
+    let mut indirect_buffer_struct_refs = Vec::new();
+    let mut patch_control_point = None;
     let param_address_spaces = entry
         .and_then(|name| function_param_pointer_address_spaces(ll, name))
         .unwrap_or_default();
@@ -1190,69 +1799,138 @@ fn parse_air_vertex_meta_with_nodes(
     for r in refs_in(nodes.get(&in_ref)?) {
         let Some(node) = nodes.get(&r) else { continue };
         let Some(idx) = first_i32(node) else { continue };
+        if let Some(name) = arg_type_name(node) {
+            parameter_type_names.insert(idx, name);
+        }
         if let Some(sref) = struct_info_ref(node) {
             if let Some(t) = parse_struct_info(nodes, sref, 0) {
                 buffer_layouts.insert(idx, t);
             }
         }
         let strs = role_strings(node);
-        let Some(first) = fc_promoted_role(&strs, false) else {
+        let Some(mut first) = fc_promoted_role(&strs, false) else {
             continue;
         };
-        let role = match first {
-            "vertex_input" => {
-                let l = location_index_with_static(node, vin_loc, &static_int_globals);
-                vin_loc += 1;
-                if let Some(name) = arg_type_name(node) {
-                    vertex_input_types.insert(l, name);
+        if primary_role(&strs) == Some("patch_input") {
+            first = "patch_input";
+        }
+        let role =
+            match first {
+                "vertex_input" => {
+                    let l = location_index_with_static(node, vin_loc, &static_int_globals);
+                    vin_loc += 1;
+                    if let Some(name) = arg_type_name(node) {
+                        vertex_input_types.insert(l, name);
+                    }
+                    if let Some(name) = arg_name(node) {
+                        vertex_input_names.insert(l, name);
+                    }
+                    VertRole::VertexInput(l)
                 }
-                if let Some(name) = arg_name(node) {
-                    vertex_input_names.insert(l, name);
+                "buffer" | "indirect_buffer" => {
+                    if first == "indirect_buffer" {
+                        if let Some(sref) = struct_info_ref(node) {
+                            indirect_buffer_struct_refs.push((
+                                idx,
+                                location_index_with_static(node, idx, &static_int_globals),
+                                sref,
+                            ));
+                        }
+                    }
+                    if let Some(space) =
+                        address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
+                    {
+                        buffer_address_spaces.insert(idx, space);
+                    }
+                    if let Some(size) = i32_after_marker(node, "air.arg_type_size")
+                        .or_else(|| i32_after_marker(node, "air.buffer_size"))
+                    {
+                        buffer_type_sizes.insert(idx, size);
+                    }
+                    if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                        buffer_object_sizes.insert(idx, size);
+                    }
+                    if let Some(name) = arg_type_name(node) {
+                        buffer_type_names.insert(idx, name);
+                    }
+                    if let Some(access) = declared_buffer_access(node) {
+                        buffer_accesses.insert(idx, access);
+                    }
+                    VertRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
                 }
-                VertRole::VertexInput(l)
-            }
-            "buffer" | "indirect_buffer" => {
-                if let Some(space) =
-                    address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
-                {
-                    buffer_address_spaces.insert(idx, space);
+                "texture" => {
+                    if let Some(name) = arg_type_name(node) {
+                        texture_type_names.insert(idx, name);
+                    }
+                    VertRole::Texture(location_index_with_static(node, idx, &static_int_globals))
                 }
-                if let Some(size) = i32_after_marker(node, "air.arg_type_size")
-                    .or_else(|| i32_after_marker(node, "air.buffer_size"))
-                {
-                    buffer_type_sizes.insert(idx, size);
+                "sampler" => {
+                    VertRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
                 }
-                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
-                    buffer_object_sizes.insert(idx, size);
+                "visible_function_table" => VertRole::VisibleFunctionTable(
+                    location_index_with_static(node, idx, &static_int_globals),
+                ),
+                "intersection_function_table" => VertRole::IntersectionFunctionTable(
+                    location_index_with_static(node, idx, &static_int_globals),
+                ),
+                "vertex_id" => VertRole::VertexId,
+                "instance_id" => VertRole::InstanceId,
+                "patch_control_point_input" => {
+                    let refs = refs_in(node);
+                    let function = refs
+                        .first()
+                        .and_then(|reference| nodes.get(reference))
+                        .and_then(|body| pointer_symbol(body));
+                    let fields = refs
+                        .iter()
+                        .skip(1)
+                        .filter_map(|reference| nodes.get(reference))
+                        .map(|field| PatchControlPointField {
+                            location: location_index_with_static(field, 0, &static_int_globals),
+                            type_name: arg_type_name(field),
+                        })
+                        .collect::<Vec<_>>();
+                    if let Some(function) = function {
+                        patch_control_point = Some((function, fields));
+                    }
+                    VertRole::PatchControlPoints
                 }
-                if let Some(name) = arg_type_name(node) {
-                    buffer_type_names.insert(idx, name);
+                "patch_input" => {
+                    let location = location_index_with_static(node, idx, &static_int_globals);
+                    if let Some(name) = arg_type_name(node) {
+                        patch_input_types.insert(location, name);
+                    }
+                    if let Some(name) = arg_name(node) {
+                        patch_input_names.insert(location, name);
+                    }
+                    VertRole::PatchInput(location)
                 }
-                if let Some(access) = declared_buffer_access(node) {
-                    buffer_accesses.insert(idx, access);
-                }
-                VertRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
-            }
-            "texture" => {
-                if let Some(name) = arg_type_name(node) {
-                    texture_type_names.insert(idx, name);
-                }
-                VertRole::Texture(location_index_with_static(node, idx, &static_int_globals))
-            }
-            "sampler" => {
-                VertRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
-            }
-            "vertex_id" => VertRole::VertexId,
-            "instance_id" => VertRole::InstanceId,
-            _ => VertRole::Other,
-        };
+                "position_in_patch" => VertRole::PositionInPatch,
+                "patch_id" => VertRole::PatchId,
+                "amplification_id" => VertRole::AmplificationId,
+                "amplification_count" => VertRole::AmplificationCount,
+                _ => VertRole::Other,
+            };
         roles.push((idx, role));
     }
+    let top_level_texture_locations = roles
+        .iter()
+        .filter_map(|(_, role)| match role {
+            VertRole::Texture(location) => Some(*location),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     Some(VertMeta {
         roles,
+        parameter_type_names,
         output_roles,
+        output_varying_types,
+        output_varying_names,
+        output_varying_user_semantics,
         vertex_input_types,
         vertex_input_names,
+        patch_input_types,
+        patch_input_names,
         buffer_layouts,
         buffer_address_spaces,
         buffer_type_sizes,
@@ -1260,6 +1938,27 @@ fn parse_air_vertex_meta_with_nodes(
         buffer_type_names,
         buffer_accesses,
         texture_type_names,
+        embedded_textures: if body_uses_texture_intrinsic(ll) {
+            detect_embedded_textures(
+                nodes,
+                &indirect_buffer_struct_refs,
+                &top_level_texture_locations,
+            )
+        } else {
+            Vec::new()
+        },
+        embedded_arguments: detect_embedded_arguments(nodes, &indirect_buffer_struct_refs),
+        tessellation: patch_shape.map(|(domain, control_point_count)| {
+            let (control_point_function, control_point_fields) = patch_control_point
+                .map(|(function, fields)| (Some(function), fields))
+                .unwrap_or_default();
+            TessellationMeta {
+                domain,
+                control_point_count,
+                control_point_function,
+                control_point_fields,
+            }
+        }),
     })
 }
 

@@ -19,9 +19,14 @@ pub(in crate::passes) fn lower_buffer_address_facts(
     let kern = kern.ok_or("buffer-address facts require kernel metadata")?;
     let mut locations = HashMap::new();
     for (id, (param_index, component)) in &address_words {
-        let Some(KernRole::Buffer(location)) = kern.role_of(*param_index) else {
+        let Some(
+            KernRole::Buffer(location)
+            | KernRole::AccelerationStructureShadow(location)
+            | KernRole::PrimitiveAccelerationStructureShadow(location),
+        ) = kern.role_of(*param_index)
+        else {
             return Err(format!(
-                "buffer-address fact {id} references non-buffer kernel parameter {param_index}"
+                "buffer-address fact {id} references a kernel parameter without a buffer-backed resource {param_index}"
             ));
         };
         locations.insert(*id, (*location, *component));

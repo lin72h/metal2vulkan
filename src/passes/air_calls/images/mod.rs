@@ -10,6 +10,8 @@ mod sample_depth;
 pub(in crate::passes) use sample_depth::*;
 mod write_read;
 pub(in crate::passes) use write_read::*;
+mod atomic;
+pub(in crate::passes) use atomic::*;
 mod fetch_coord;
 pub(in crate::passes) use fetch_coord::*;
 mod query_offset;

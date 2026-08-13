@@ -41,7 +41,7 @@ impl Emitter {
                         .as_ref()
                         .and_then(|block| self.branch_merges_by_header.get(block))
                         .cloned();
-                    let merge = if self.construct_tree {
+                    let merge = if self.branch_merges_header_only {
                         header_merge
                     } else {
                         header_merge.or_else(|| {

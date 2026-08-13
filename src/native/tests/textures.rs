@@ -17,9 +17,48 @@ use spirv::{Decoration, Op, Scope, SelectionControl, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn native_unsigned_texture_fetch_max_uses_scalar_atomic_image_format() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define void @textureAtomic(<2 x i16> %coord, ptr addrspace(1) %image) {
+entry:
+  %old = call <4 x i32> @air.atomic_fetch_max_explicit_texture_2d.i16.u.v4i32(ptr addrspace(1) %image, <2 x i16> %coord, <2 x i16> <i16 1, i16 0>, <4 x i32> <i32 7, i32 7, i32 7, i32 7>, i32 0, i32 3)
+  ret void
+}
+
+declare <4 x i32> @air.atomic_fetch_max_explicit_texture_2d.i16.u.v4i32(ptr addrspace(1), <2 x i16>, <2 x i16>, <4 x i32>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @textureAtomic, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"coord"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d<uint, read_write>", !"air.arg_name", !"image"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_texture_atomic_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("R32ui"), "{asm}");
+    assert!(asm.contains("OpImageTexelPointer"), "{asm}");
+    assert!(asm.contains("OpAtomicUMax"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_array_ref_texture_lowers_to_descriptor_array() {
     // A runtime-indexed `array_ref<texture2d>` argument is a descriptor array, not a single image.
-    // The backend emits real per-element handle loads (`load ptr addrspace(1), ptr %texarg`) that a
+    // Native emission produces real per-element handle loads (`load ptr addrspace(1), ptr %texarg`) that a
     // single-image binding turns into an illegal `OpLoad` of a pointer FROM an image value
     // ("not a logical pointer"). The interface `ImageArray` binding + `materialize_texture_array_loads`
     // declare `OpTypeArray %image N` in UniformConstant and rewrite each element handle load to
@@ -127,6 +166,52 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
 }
 
 #[test]
+fn native_dynamic_array_ref_write_uses_runtime_descriptor_element() {
+    let ll = r#"
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @writeTexArray(ptr readonly captures(none) %textures, i32 %index) local_unnamed_addr #0 {
+  %wide = zext i32 %index to i64
+  %field = getelementptr inbounds %"struct.metal::texture2d", ptr %textures, i64 %wide, i32 0
+  %texture = load ptr addrspace(1), ptr %field, align 8
+  tail call void @air.write_texture_2d.i16.v4f32(ptr addrspace(1) %texture, <2 x i16> zeroinitializer, <4 x float> zeroinitializer, i16 0, i32 2) #1
+  ret void
+}
+
+declare void @air.write_texture_2d.i16.v4f32(ptr addrspace(1), <2 x i16>, <4 x float>, i16, i32) local_unnamed_addr #1
+
+attributes #0 = { convergent nounwind }
+attributes #1 = { convergent nounwind memory(argmem: write) }
+
+!air.kernel = !{!0}
+!0 = !{ptr @writeTexArray, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"array_ref<texture2d<float, write>>", !"air.arg_name", !"textures"}
+!4 = !{i32 1, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"index"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_dynamic_array_ref_write_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpTypeArray"), "{asm}");
+    assert!(asm.contains("OpAccessChain"), "{asm}");
+    assert!(asm.contains("OpImageWrite"), "{asm}");
+    assert!(asm.contains("BuiltIn LocalInvocationIndex"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_byval_fixed_write_texture_array_uses_fixed_descriptor_elements() {
     // Fixed `array<texture2d<..., write>, N>` kernel parameters can arrive as byval local pointer
     // fields. Even after placeholder cleanup severs the concrete GEP root, the sidecar preserves the
@@ -175,6 +260,50 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_dead_byval_texture_array_copy_is_removed_after_descriptor_binding() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::array" = type { [3 x %"struct.metal::texture2d"] }
+%Context = type { i32, %"struct.metal::array" }
+
+define <4 x float> @frag(ptr readonly byval([3 x ptr addrspace(1)]) %textures) {
+entry:
+  %context = alloca %Context, align 8
+  %field = getelementptr inbounds %Context, ptr %context, i64 0, i32 1
+  call void @llvm.memcpy.p0.p0.i64(ptr align 8 dereferenceable(24) %field, ptr align 8 dereferenceable(24) %textures, i64 24, i1 false)
+  ret <4 x float> zeroinitializer
+}
+
+declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 5, i32 3, !"air.sample", !"air.arg_type_name", !"array<texture2d<half, sample>, 3>", !"air.arg_name", !"textures"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_dead_byval_texture_array_copy_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("llvm.memcpy"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -238,6 +367,180 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
 }
 
 #[test]
+fn native_embedded_fixed_texture_array_materializes_dynamic_placeholder_use() {
+    // Argument-buffer fixed arrays are descriptor arrays too. The opaque handle load is emitted as
+    // a Private placeholder variable, while the sidecar retains its buffer root and runtime element
+    // selector. Materialize the image load at the intrinsic use so the selector's original dominance
+    // is sufficient and no pointer-typed placeholder reaches image lowering.
+    let ll = r#"
+%Args = type <{ i64, [2 x %"struct.metal::texture2d"] }>
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args, i32 %index) local_unnamed_addr #0 {
+entry:
+  %field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 1, i32 %index, i32 0
+  %tex = load ptr addrspace(1), ptr addrspace(2) %field, align 8
+  tail call void @air.write_texture_2d.i16.v4f16(ptr addrspace(1) %tex, <2 x i16> zeroinitializer, <4 x half> zeroinitializer, i16 0, i32 2) #1
+  ret void
+}
+
+declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x half>, i16, i32) local_unnamed_addr #1
+
+attributes #0 = { convergent nounwind }
+attributes #1 = { convergent nounwind memory(argmem: write) }
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !6}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 24, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 8, i32 16, i32 0, !"array<texture2d<half, write>, 2>", !"outputs", !"air.indirect_argument", !5}
+!5 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 2, !"air.write", !"air.arg_type_name", !"array<texture2d<half, write>, 2>", !"air.arg_name", !"outputs"}
+!6 = !{i32 1, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"index"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_embedded_fixed_texture_array_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpTypeArray"), "{asm}");
+    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Rgba16f"), "{asm}");
+    assert!(asm.contains("OpAccessChain"), "{asm}");
+    assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_embedded_argument_buffer_routes_multiple_write_texture_shapes_by_field() {
+    let ll = r#"
+%Args = type <{ %"struct.metal::texture2d_array", %"struct.metal::texture2d" }>
+%"struct.metal::texture2d_array" = type { ptr addrspace(1) }
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args, <2 x i32> %coord) local_unnamed_addr #0 {
+entry:
+  %array_field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0, i32 0
+  %array_tex = load ptr addrspace(1), ptr addrspace(2) %array_field, align 8
+  %plain_field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 1, i32 0
+  %plain_tex = load ptr addrspace(1), ptr addrspace(2) %plain_field, align 8
+  tail call void @air.write_texture_2d_array.v4f32(ptr addrspace(1) %array_tex, <2 x i32> %coord, i32 0, <4 x float> zeroinitializer, i32 0, i32 2) #1
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %plain_tex, <2 x i32> %coord, <4 x float> zeroinitializer, i32 0, i32 2) #1
+  ret void
+}
+
+declare void @air.write_texture_2d_array.v4f32(ptr addrspace(1), <2 x i32>, i32, <4 x float>, i32, i32) local_unnamed_addr #1
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32) local_unnamed_addr #1
+
+attributes #0 = { convergent nounwind }
+attributes #1 = { convergent nounwind memory(argmem: write) }
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !7}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 0, i32 8, i32 0, !"texture2d_array<float, write>", !"array_output", !"air.indirect_argument", !5, i32 8, i32 8, i32 0, !"texture2d<float, write>", !"plain_output", !"air.indirect_argument", !6}
+!5 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d_array<float, write>", !"air.arg_name", !"array_output"}
+!6 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"plain_output"}
+!7 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"coord"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_embedded_multi_write_texture_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Binding 33"), "{asm}");
+    assert_eq!(asm.matches("OpImageWrite").count(), 2, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_embedded_argument_buffer_field_survives_nested_helper_inlining() {
+    // The texture field is loaded two helpers below the entry point. The sidecar must follow the
+    // actual pointer root through both parameter substitutions; a callee-local parameter ordinal
+    // cannot identify which entry argument-buffer field supplied the handle.
+    let ll = r#"
+%Args = type <{ %"struct.metal::texture2d", %"struct.metal::texture2d" }>
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args, <2 x i32> %coord) local_unnamed_addr #0 {
+entry:
+  tail call fastcc void @outer(ptr addrspace(2) %args, <2 x i32> %coord) #2
+  ret void
+}
+
+define internal fastcc void @outer(ptr addrspace(2) %buffer, <2 x i32> %coord) unnamed_addr #1 {
+entry:
+  tail call fastcc void @inner(ptr addrspace(2) %buffer, <2 x i32> %coord) #2
+  ret void
+}
+
+define internal fastcc void @inner(ptr addrspace(2) %buffer, <2 x i32> %coord) unnamed_addr #1 {
+entry:
+  %field = getelementptr inbounds %Args, ptr addrspace(2) %buffer, i64 0, i32 0, i32 0
+  %tex = load ptr addrspace(1), ptr addrspace(2) %field, align 8
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %tex, <2 x i32> %coord, <4 x float> zeroinitializer, i32 0, i32 2) #3
+  ret void
+}
+
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32) local_unnamed_addr #3
+
+attributes #0 = { convergent nounwind }
+attributes #1 = { convergent nounwind }
+attributes #2 = { convergent nounwind }
+attributes #3 = { convergent nounwind memory(argmem: write) }
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !7}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 0, i32 8, i32 0, !"texture2d<float, write>", !"output", !"air.indirect_argument", !5, i32 8, i32 8, i32 0, !"texture2d<float, write>", !"other", !"air.indirect_argument", !6}
+!5 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"output"}
+!6 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"other"}
+!7 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"coord"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_embedded_nested_write_texture_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Binding 33"), "{asm}");
+    assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_get_null_texture_models_unmodeled_placeholder() {
     // `air.get_null_texture_2d()` yields a synthesized image in the texture descriptor band. Even a
     // kernel that only stores the opaque handle must remain valid, and the translator-owned resource
@@ -270,6 +573,90 @@ declare ptr addrspace(1) @air.get_null_texture_2d()
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpFunction"), "{asm}");
     assert!(asm.contains("Binding 32"), "{asm}");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_late_null_texture_does_not_poison_disjoint_aggregate_fields() {
+    let ll = r#"
+%Holder = type { i32, ptr addrspace(1) }
+
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %tex = call ptr addrspace(1) @air.get_null_texture_2d()
+  %with_value = insertvalue %Holder poison, i32 7, 0
+  %with_texture = insertvalue %Holder %with_value, ptr addrspace(1) %tex, 1
+  %value = extractvalue %Holder %with_texture, 0
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare ptr addrspace(1) @air.get_null_texture_2d()
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_late_null_texture_aggregate_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("late null texture must not invalidate a disjoint aggregate field");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_texture_parameter_round_trips_through_private_aggregate_field() {
+    let ll = r#"
+%Holder = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
+entry:
+  %holder = alloca %Holder, align 8
+  %slot = getelementptr inbounds %Holder, ptr %holder, i64 0, i32 0
+  store ptr addrspace(1) %tex, ptr %slot, align 8
+  %loaded = load ptr addrspace(1), ptr %slot, align 8
+  %width = call i32 @air.get_width_texture_2d(ptr addrspace(1) %loaded, i32 0)
+  store i32 %width, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_private_texture_field_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("private texture field must preserve its resource identity");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
     let _ = std::fs::remove_dir_all(tmp);
 }
 
@@ -544,6 +931,90 @@ declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2
 }
 
 #[test]
+fn native_kernel_pixel_linear_depth_sample_uses_four_addressed_fetches() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601053184, i64 0], align 8
+define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out) {
+entry:
+  %sample = tail call { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> <float 2.500000e-01, float 7.500000e-01>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value = extractvalue { float, i8 } %sample, 0
+  store float %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+!air.kernel = !{!0}
+!air.sampler_states = !{!5}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_pixel_linear_depth_sample_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpImageFetch").count(), 4, "{asm}");
+    assert!(!asm.contains("OpSampledImage"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_depth_2d_array_sample_appends_the_air_layer_operand() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
+entry:
+  %sample = tail call { float, i8 } @air.sample_depth_2d_array.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 1, <2 x float> <float 2.500000e-01, float 7.500000e-01>, i32 3, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value = extractvalue { float, i8 } %sample, 0
+  store float %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { float, i8 } @air.sample_depth_2d_array.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i32, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d_array<float, sample>", !"air.arg_name", !"depth"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_depth_2d_array_sample_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageSampleExplicitLod"), "{asm}");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpTypeVector") && line.ends_with(" 3")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_fragment_selected_static_sampler_uses_valid_sampler_operand() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -639,6 +1110,55 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
     for line in asm.lines().filter(|line| line.contains("OpSampledImage")) {
         assert!(!line.contains("Private"), "{line}");
     }
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_fragment_compare_depth_2d_array_appends_layer_before_comparison() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+@__air_sampler_state = internal addrspace(2) constant i64 -9188470239254151095, align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, i32 %layer, float %reference, ptr addrspace(1) %depth) {
+entry:
+  %sample = tail call { float, i8 } @air.sample_compare_depth_2d_array.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 1, <2 x float> %coord, i32 %layer, float %reference, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %shadow = extractvalue { float, i8 } %sample, 0
+  %out = insertelement <4 x float> zeroinitializer, float %shadow, i32 0
+  ret <4 x float> %out
+}
+
+declare { float, i8 } @air.sample_compare_depth_2d_array.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i32, float, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!8}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7, !9}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
+!6 = !{i32 2, !"air.fragment_input", !"generated(layer)", !"air.center", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"layer"}
+!7 = !{i32 3, !"air.fragment_input", !"generated(reference)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float", !"air.arg_name", !"reference"}
+!9 = !{i32 4, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d_array<float, sample>", !"air.arg_name", !"depth"}
+!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_compare_depth_2d_array_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageSampleImplicitLod"), "{asm}");
+    assert!(asm.contains("OpConvertUToF"), "{asm}");
+    assert!(asm.contains("OpFOrdLessThanEqual"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -747,6 +1267,109 @@ declare float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly 
     assert!(
         asm.lines()
             .any(|line| line.contains("OpCompositeExtract") && line.ends_with(" 1")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_fragment_calculate_clamped_lod_uses_selected_mipmap_level() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601036873, i64 0], align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
+entry:
+  %lod = tail call fast float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1) readonly captures(none) %tex, ptr addrspace(2) readonly captures(none) @__air_sampler_state, <2 x float> %coord, i32 0)
+  %out0 = insertelement <4 x float> zeroinitializer, float %lod, i32 0
+  ret <4 x float> %out0
+}
+
+declare float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!7}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<uint, sample>", !"air.arg_name", !"tex"}
+!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_query_clamped_lod_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCapability ImageQuery"), "{asm}");
+    assert!(asm.contains("OpImageQueryLod"), "{asm}");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpCompositeExtract") && line.ends_with(" 0")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_fragment_raster_sample_count_requires_pipeline_contract() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define <4 x float> @frag(<4 x float> %position) {
+entry:
+  %samples = tail call i32 @air.get_num_samples.i32(i32 0)
+  %bits = bitcast i32 %samples to float
+  %out0 = insertelement <4 x float> zeroinitializer, float %bits, i32 0
+  ret <4 x float> %out0
+}
+
+declare i32 @air.get_num_samples.i32(i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_raster_samples_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let error = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
+        .expect_err("unknown pipeline state must remain unsupported");
+    assert!(error.contains("raster_sample_count"), "{error}");
+
+    let options = crate::passes::TransformOptions {
+        raster_sample_count: Some(4),
+        ..crate::passes::TransformOptions::default()
+    };
+    let spv = crate::translate_sanitized_native_with_options(ll, Stage::Fragment, &tmp, options)
+        .expect("translate with pipeline contract");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("air.get_num_samples.i32"), "{asm}");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpConstant") && line.ends_with(" 4")),
         "{asm}"
     );
     if std::process::Command::new("spirv-val")
@@ -2050,6 +2673,129 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_implicit_imageblock_uses_indexed_storage_attachment_planes() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
+
+define void @k(%"struct.metal::_imageblock_base" %block, <2 x i16> %tid) {
+entry:
+  %color = call <4 x half> @air.load.implicit_imageblock.v4f16(i32 0, <2 x i16> %tid, i32 1, i16 0)
+  call void @air.store.implicit_imageblock.v4f16(<4 x half> %color, i32 0, <2 x i16> %tid, i32 1, i16 0)
+  %other = call <4 x float> @air.load.implicit_imageblock.v4f32(i32 2, <2 x i16> %tid, i32 0, i16 0)
+  call void @air.store.implicit_imageblock.v4f32(<4 x float> %other, i32 2, <2 x i16> %tid, i32 0, i16 0)
+  %scalar = call half @air.load.implicit_imageblock.f16(i32 1, <2 x i16> %tid, i32 0, i16 0)
+  call void @air.store.implicit_imageblock.f16(half %scalar, i32 1, <2 x i16> %tid, i32 0, i16 0)
+  %integer = call i32 @air.load.implicit_imageblock.i32(i32 3, <2 x i16> %tid, i32 0, i16 0)
+  call void @air.store.implicit_imageblock.i32(i32 %integer, i32 3, <2 x i16> %tid, i32 0, i16 0)
+  %pair = call <2 x half> @air.load.implicit_imageblock.v2f16(i32 4, <2 x i16> %tid, i32 0, i16 0)
+  call void @air.store.implicit_imageblock.v2f16(<2 x half> %pair, i32 4, <2 x i16> %tid, i32 0, i16 0)
+  ret void
+}
+
+declare <4 x half> @air.load.implicit_imageblock.v4f16(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i32, i16)
+declare <4 x float> @air.load.implicit_imageblock.v4f32(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.v4f32(<4 x float>, i32, <2 x i16>, i32, i16)
+declare half @air.load.implicit_imageblock.f16(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.f16(half, i32, <2 x i16>, i32, i16)
+declare i32 @air.load.implicit_imageblock.i32(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.i32(i32, i32, <2 x i16>, i32, i16)
+declare <2 x half> @air.load.implicit_imageblock.v2f16(i32, <2 x i16>, i32, i16)
+declare void @air.store.implicit_imageblock.v2f16(<2 x half>, i32, <2 x i16>, i32, i16)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !5}
+!3 = !{i32 0, !"air.imageblock", !"implicit", !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"imageblock<ColorData, layout_implicit>", !"air.arg_name", !"block"}
+!4 = !{i32 0, i32 8, i32 0, !"half4", !"color", !"air.render_target", i32 0, i32 16, i32 16, i32 0, !"float4", !"other", !"air.render_target", i32 2, i32 32, i32 4, i32 0, !"uint", !"integer", !"air.render_target", i32 3}
+!5 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_implicit_imageblock_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageRead"), "{asm}");
+    assert!(asm.contains("OpImageWrite"), "{asm}");
+    assert!(asm.contains("Rgba16f"), "{asm}");
+    assert!(asm.contains("Rgba32f"), "{asm}");
+    assert!(asm.contains("R16f"), "{asm}");
+    assert!(asm.contains("R32ui"), "{asm}");
+    assert!(asm.contains("Rg16f"), "{asm}");
+    assert!(asm.contains("OpBitcast"), "{asm}");
+    assert!(asm.contains("Binding 128"), "{asm}");
+    assert!(asm.contains("Binding 134"), "{asm}");
+    assert!(!asm.contains("air.load.implicit_imageblock"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_embedded_array_imageblock_write_routes_field_and_slice() {
+    let ll = r#"
+%Args = type <{ %"struct.metal::texture2d_array" }>
+%"struct.metal::texture2d_array" = type { ptr addrspace(1) }
+%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
+
+define void @k(ptr addrspace(2) %args, %"struct.metal::_imageblock_base" %block, <2 x i16> %gid, <2 x i16> %tid) {
+entry:
+  %field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0, i32 0
+  %dst = load ptr addrspace(1), ptr addrspace(2) %field, align 8
+  %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
+  store <4 x half> zeroinitializer, ptr addrspace(4) %ptr, align 8
+  tail call void @air.write_imageblock_slice_to_texture_2d_array.i16.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %ptr, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 3, i16 0, i1 false, i32 3)
+  ret void
+}
+
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+declare void @air.write_imageblock_slice_to_texture_2d_array.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i16, i1, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !6, !8, !9}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 0, i32 8, i32 0, !"texture2d_array<half, write>", !"dst", !"air.indirect_argument", !5}
+!5 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d_array<half, write>", !"air.arg_name", !"dst"}
+!6 = !{i32 1, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !7, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"block"}
+!7 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
+!8 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
+!9 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_embedded_array_imageblock_write_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("Rgba16f"), "{asm}");
+    assert!(asm.contains("OpImageWrite"), "{asm}");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpTypeImage") && line.contains("2D 0 1 0 2 Rgba16f")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -3775,6 +4521,115 @@ declare i32 @air.get_height_texture_2d_ms(ptr addrspace(1))
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_dynamic_texture_matrix_read_selects_texel_values() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, ptr addrspace(1) %d, ptr addrspace(1) %out, <2 x i32> %tid) {
+entry:
+  %table = alloca [2 x [2 x ptr addrspace(1)]], align 8
+  %slot00 = getelementptr inbounds [2 x [2 x ptr addrspace(1)]], ptr %table, i64 0, i64 0, i64 0
+  store ptr addrspace(1) %a, ptr %slot00, align 8
+  %slot01 = getelementptr inbounds [2 x [2 x ptr addrspace(1)]], ptr %table, i64 0, i64 0, i64 1
+  store ptr addrspace(1) %b, ptr %slot01, align 8
+  %slot10 = getelementptr inbounds [2 x [2 x ptr addrspace(1)]], ptr %table, i64 0, i64 1, i64 0
+  store ptr addrspace(1) %c, ptr %slot10, align 8
+  %slot11 = getelementptr inbounds [2 x [2 x ptr addrspace(1)]], ptr %table, i64 0, i64 1, i64 1
+  store ptr addrspace(1) %d, ptr %slot11, align 8
+  %row32 = extractelement <2 x i32> %tid, i64 0
+  %column32 = extractelement <2 x i32> %tid, i64 1
+  %row = zext i32 %row32 to i64
+  %column = zext i32 %column32 to i64
+  %slot = getelementptr inbounds [2 x [2 x ptr addrspace(1)]], ptr %table, i64 0, i64 %row, i64 %column
+  %texture = load ptr addrspace(1), ptr %slot, align 8
+  %sample = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %texture, <2 x i32> %tid, i32 0, i32 3)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7, !8}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"c"}
+!6 = !{i32 3, !"air.texture", !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"d"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
+!8 = !{i32 5, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_dynamic_texture_matrix_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpImageFetch").count(), 4, "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_dynamic_texture_table_sample_drops_stale_pointer_selects() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(2) %sampler, ptr addrspace(1) %out, i32 %index) {
+entry:
+  %table = alloca [2 x ptr addrspace(1)], align 8
+  %slot0 = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 0
+  store ptr addrspace(1) %a, ptr %slot0, align 8
+  %slot1 = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 1
+  store ptr addrspace(1) %b, ptr %slot1, align 8
+  %wide = zext i32 %index to i64
+  %slot = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 %wide
+  %texture = load ptr addrspace(1), ptr %slot, align 8
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
+!7 = !{i32 4, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"index"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_dynamic_texture_table_sample_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpImageSampleExplicitLod").count(), 2, "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]

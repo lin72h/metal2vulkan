@@ -3,6 +3,106 @@
 use super::*;
 
 impl Emitter {
+    /// Lower an addrspace(1) pointer phi as a phi of 64-bit byte addresses when every arm has an
+    /// exact address-domain representation: either a direct Metal buffer root supplied by the
+    /// reflected address sidecar, or an `inttoptr`/BDA raw value. This is the structural shape used
+    /// by device-address hierarchies: the root arm starts at a bound acceleration-structure buffer
+    /// and loop backedges follow child addresses loaded from that buffer.
+    pub(in crate::native::emitter) fn emit_bda_address_phi(
+        &mut self,
+        name: &str,
+        incoming: &[(LlValue, String)],
+        result_ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !self.bda_device_pointers || *result_ty != LlType::Ptr(1) {
+            return Ok(false);
+        }
+        if !incoming
+            .iter()
+            .all(|(value, _)| self.bda_phi_value_is_addressable(value))
+        {
+            return Ok(false);
+        }
+
+        let address_ty = LlType::Int(64);
+        let result_type = self.type_id(&address_ty)?;
+        let result_name = bda_address_name(name);
+        let result = self.result_id(&result_name, &address_ty)?;
+        let mut ops = Vec::new();
+        let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
+        for (value, label) in incoming {
+            let value_id = self.bda_phi_address_id(value)?;
+            let label_id = self.label_id(label)?;
+            if let Some(existing) = seen_incoming.insert(label_id, value_id) {
+                if existing != value_id {
+                    return Err(format!(
+                        "native emitter: BDA address phi has multiple values from predecessor {label}"
+                    ));
+                }
+                continue;
+            }
+            ops.push(Operand::IdRef(value_id));
+            ops.push(Operand::IdRef(label_id));
+        }
+        instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
+        self.emit_pointer_nullness_phi(name, incoming, result_ty, instructions)?;
+        self.used_device_address = true;
+        let mut raw = RawBufferOffset::root(format!(".bda_phi_{name}"), 1);
+        raw.device_addr_base = Some(result);
+        self.raw_offsets.insert(name.to_string(), raw);
+        self.pointer_storage
+            .insert(name.to_string(), StorageClass::PhysicalStorageBuffer);
+        self.pointer_pointees
+            .insert(name.to_string(), LlType::Int(8));
+        Ok(true)
+    }
+
+    fn bda_phi_value_is_addressable(&self, value: &LlValue) -> bool {
+        match value {
+            LlValue::Zero => true,
+            LlValue::Local(name) => {
+                self.bda_inttoptr_sources.contains_key(name)
+                    || self.bda_direct_addresses.contains_key(name)
+                    || self.raw_offsets.get(name).is_some_and(|raw| {
+                        raw.const_off == 0
+                            && raw.dyn_terms.is_empty()
+                            && (raw.device_addr_base.is_some()
+                                || self.bda_direct_addresses.contains_key(&raw.root))
+                    })
+            }
+            _ => false,
+        }
+    }
+
+    fn bda_phi_address_id(&mut self, value: &LlValue) -> Result<Word, String> {
+        match value {
+            LlValue::Zero => self.const_signed_int(64, 0),
+            LlValue::Local(name) => {
+                if let Some(address) = self.bda_direct_addresses.get(name).copied() {
+                    return Ok(address);
+                }
+                if let Some(raw) = self.raw_offsets.get(name) {
+                    if raw.const_off == 0 && raw.dyn_terms.is_empty() {
+                        if let Some(address) = raw.device_addr_base {
+                            return Ok(address);
+                        }
+                        if let Some(address) = self.bda_direct_addresses.get(&raw.root).copied() {
+                            return Ok(address);
+                        }
+                    }
+                }
+                if let Some(source) = self.bda_inttoptr_sources.get(name).cloned() {
+                    return self.phi_value_id(&source.value, &source.ty, &mut Vec::new());
+                }
+                Err(format!(
+                    "native emitter: pointer {name} has no exact BDA address representation"
+                ))
+            }
+            _ => Err("native emitter: unsupported BDA address phi value".to_string()),
+        }
+    }
+
     pub(in crate::native::emitter) fn pointer_aware_type_id(
         &mut self,
         ty: &LlType,
@@ -556,4 +656,8 @@ impl Emitter {
             root_is_indexed_container: template.root_is_indexed_container,
         }))
     }
+}
+
+fn bda_address_name(name: &str) -> String {
+    format!("{name}.metal2vulkan.bda_address")
 }

@@ -269,7 +269,20 @@ fn discover_value_select(module: &Module) -> Option<Discovery> {
                 match inst.class.opcode {
                     Op::Load => {
                         // A load off a closure pointer is the read we lower; other operands of a load
-                        // never reference a pointer, so no further check is needed for this inst.
+                        // never reference a pointer. Value replay loads the pointer's declared
+                        // pointee, so a reinterpret load (for example `half` through a raw `uchar*`)
+                        // is not exact-typed and must remain available to the byte/PSB retries.
+                        if let Some(Operand::IdRef(pointer)) = inst.operands.first() {
+                            if closure.contains(pointer) {
+                                let pointee = value_type
+                                    .get(pointer)
+                                    .and_then(|pointer_type| ptr_info(*pointer_type))
+                                    .map(|(_, pointee)| pointee)?;
+                                if inst.result_type != Some(pointee) {
+                                    return None;
+                                }
+                            }
+                        }
                         continue;
                     }
                     Op::Store
@@ -2389,6 +2402,21 @@ mod tests {
             "spirv-val failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    fn reinterpret_load_through_buffer_select_stays_for_byte_or_psb_retry() {
+        let mut module = build_two_buffer_select();
+        let load = module.functions[0].blocks[0]
+            .instructions
+            .iter_mut()
+            .find(|instruction| instruction.result_id == Some(43))
+            .expect("fixture load");
+        load.result_type = Some(3);
+        let before = module.assemble();
+
+        assert!(!rewrite_cross_binding_pointer_merges_to_values(&mut module));
+        assert_eq!(module.assemble(), before);
     }
 
     #[test]

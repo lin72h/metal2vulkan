@@ -1,238 +1,132 @@
-# Optional private metallib corpus + metal2vulkan ledgers
+# Authored validation corpus
 
-This directory holds **JSONL ledgers** (plans, digests, and execution `output_b64` payloads) and a
-gitignored private tree for harvested AIR shard rows. Full execution design: repo-root
-[`plan.md`](../../plan.md).
-
-| Path | Tracked? | Purpose |
-|---|---|---|
-| `metal2vulkan-ledger.jsonl` | **yes** | Translate pins (`corpus-mint` / `corpus-remint`) — hashes only |
-| `metal2vulkan-ledger-metal.jsonl` | optional | Metal oracle plan + deterministic digests + golden `output_b64` (`corpus-run-metal`) |
-| `metal2vulkan-ledger-vulkan.jsonl` | optional | Linux Vulkan vs metal + deterministic digests + candidate `output_b64` (`corpus-run-vulkan`) |
-| `metal2vulkan-ledger-moltenvk.jsonl` | optional | MoltenVK vs metal + deterministic digests + candidate `output_b64` (`corpus-run-moltenvk`) |
-| `local/` | **gitignored** | Private shard JSONL rows (`air_ll` + optional AIR `blob_b64`) |
-| `../fixtures/public/` | **yes** | Tiny owned synthetic `.ll` samples for CI / demos |
-
-CI and a clean clone never need `local/`. Default `cargo test` stays synthetic-only.
-
-## Layout for a private corpus
+Canonical state is plain, deterministically ordered JSONL. The generated `.index.sqlite` is
+gitignored and may be deleted at any time.
 
 ```text
-validation/corpus/local/
-  shards/
-    shard_00.jsonl    # … shard_15.jsonl  (embedded air_ll + metadata)
+validation/corpus/
+  local/sources/shard_000.jsonl ... shard_063.jsonl  # private, gitignored
+  local/library-modules/shard_000.jsonl ...          # non-entry AIR dependencies, private
+  reviews/shard_000.jsonl ...                       # non-evidence queue notes
+  cases/shard_000.jsonl ...                         # authored, no AIR bodies
+  observations/metal/shard_000.jsonl ...
+  observations/moltenvk/shard_000.jsonl ...
+  observations/vulkan/shard_000.jsonl ...
+  .index.sqlite                                     # generated, gitignored
 ```
 
-`corpus-harvest` removes old `local/{air,metallib,ledger,tmp}` directories when it runs. JSONL rows
-are the private source of truth.
+All paths with the same shard number cover the same bucket. The bucket is the first six bits of
+lowercase `air_sha256`. This is a permanent storage contract: do not change the bucket count or
+mapping to rebalance the corpus.
 
-JSONL row shape:
+The 64-bucket choice is based on a 2026-08-10 measurement of 43,656 private source rows. The
+measured 32-, 64-, and 128-bucket layouts averaged 1,364.25, 682.12, and 341.06 rows per bucket,
+respectively; their largest buckets held 1,451, 740, and 401 rows. Sixty-four was the smallest
+layout with an average below 1,000 rows while retaining reasonably large sequential JSONL shards.
 
-```json
-{
-  "id": "…",
-  "hash": "0002abf7",
-  "shard": "shard_03.jsonl",
-  "label": "local/<air_sha256>.ll",
-  "lib": "/System/Library/…/default.metallib",
-  "lib_sha256": "…",
-  "fn": "kernel_name",
-  "stage": "Kernel",
-  "air_ll": "… sanitized LLVM text …",
-  "blob_b64": "… optional …"
-}
-```
+## Sources
 
-Harvest keeps only AIR with real `!air.kernel` / `!air.vertex` / `!air.fragment` metadata.
-Helpers without stage meta are dropped.
+Private source rows contain the SHA-256 of the exact sanitized text, stable AIR stage/entry
+metadata, sanitized `air_ll`, optional `blob_b64`, source-library hash, and a non-semantic label.
+Harvest output is sorted by AIR hash and byte-identical for the same extracted inputs. Metallibs,
+AIR bodies, and source shards must never be committed.
 
-## Harvest Shards
+Harvest retains non-entry AIR modules separately instead of discarding them. These modules carry
+visible/intersection function implementations and other linkable helpers, along with the set of
+parent metallib hashes in which each sanitized module appeared. They are not shader queue rows and
+cannot be authored as standalone cases; later function-table linking resolves them as dependencies
+of a stage entry from the same library provenance.
 
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-harvest
-```
+## Cases
 
-Set `METAL2VULKAN_CORPUS_DIR` if shards live outside `validation/corpus/local`. Ledger tools
-(`corpus-mint`, `corpus-remint`, `corpus-run-*`, `corpus-why`) resolve harvested cases directly
-from shard JSONL.
+One AIR can have several named cases. A case explicitly records buffers, threadgroup memory,
+acceleration structures, top-level/array/argument-buffer textures, samplers, color render targets,
+an optional depth/stencil attachment, vertex
+inputs, kernel stage inputs, function constants, dispatch or draw parameters, selected output,
+comparison, and execution-safety contract. Missing bytes, sizes, formats, dimensions, constants, or
+output choices are errors. Cyclic AIR uses `execution_safety: authored_bounded`; its rationale must
+identify the authored input or function-constant value that makes every reachable loop finite.
 
-`corpus-harvest --metallib PATH` works with explicit metallibs. Without `--metallib`, system
-enumeration is macOS-only. It keeps no `.air` / `.ll` mirror; `llvm-dis` temp files are removed as
-soon as each row is built.
+Fragment cases declare every reflected color output in `render_targets`, every reflected depth or
+stencil aspect in `depth_stencil`, and provide a `draw`.
+Both executors derive a matching fullscreen vertex interface from AIR metadata, preserve the
+authored initial attachment bytes with load semantics, execute the draw, and compare the selected
+color, depth, or stencil region. The AIR depth qualifier (`any`, `less`, or `greater`) determines
+the pipeline depth comparison on both APIs. This is the same observation/evidence path used by
+kernel cases.
 
-Do **not** commit metallibs, shard rows, or private AIR bodies.
+Custom `air.imageblock_master` fragments additionally declare `fragment_imageblock` planes keyed
+by exact AIR user semantic and product-supported member format; a fragment-imageblock output
+selects that semantic and a 2D region.
 
----
+Vertex cases declare `vertex_inputs`, exactly one render target at index zero, and a
+`vertex_observation` selecting position or a reflected user-varying location. The generated
+fragment observer makes that vertex result an exact render-target observation on both APIs.
 
-## Corpus CLIs
+An instance `acceleration_structures` entry represents a literal instance acceleration structure. Its
+`child_references` length is the instance count. The Metal oracle builds that many identity
+instances of a canonical triangle and binds the resulting opaque object. Candidate runners bind
+the translator's documented shadow ABI at the same Metal buffer index: little-endian `u32`
+instance count, reserved zero `u32`, then the listed little-endian `u64` host pointer payloads.
+Those pointer payloads are deliberately explicit; raw child-pointer identities are not portable
+Metal-versus-Vulkan comparison values.
 
-All from the repo root:
+A primitive entry sets `kind: "primitive"` and supplies `primitive_triangles_b64` as tightly packed
+little-endian `float3` vertices (36 bytes per triangle). The Metal oracle builds the BLAS from those
+vertices; the Vulkan candidate uses the identical bytes in the primitive geometry shadow.
 
-```sh
-cargo run -p metal2vulkan-validation --release --bin <name> -- [flags]
-```
+Direct Metal visible-function references are authored under `visible_function_references` as the
+logical metadata function name plus the SHA-256 of its retained AIR module. The module may belong
+to a separately harvested library because Metal's linked-functions contract is explicitly
+cross-library; both the Metal oracle and Vulkan candidate consume that same exact module. Visible
+and intersection function tables explicitly list their Metal buffer binding and populated slots.
+A visible slot names an exact function plus the SHA-256 of a retained non-entry AIR module from the
+same parent metallib. An intersection slot is tagged either `linked` with that same exact
+dependency contract, or `opaque_triangle` with the sorted Metal intersection-signature flags.
+Opaque triangle is a populated native sentinel, not a null slot and not a synthetic AIR function.
+Case checking resolves linked dependencies once. Metal binds the corresponding native table entry;
+the Vulkan candidate statically replaces visible calls and fully opaque-triangle ray queries only
+when their authored signatures match. Unresolved modules, cross-metallib functions, missing
+symbols, unauthored slots, and signature mismatches are errors or honest translation fallback.
+Tables carried inside an `air.indirect_buffer` use
+`argument_buffer_intersection_function_tables`; their identity is the owning buffer binding plus
+field byte offset. Reflection supplies the owner parameter, field ordinal, and Metal argument index,
+so Metal encoding and Vulkan static specialization consume the same AIR-derived coordinate.
 
-### `corpus-mint` — additive translate ledger
+`case_id` is SHA-256 over a canonical semantic JSON encoding. It includes everything capable of
+changing execution or comparison and excludes the name, rationale, author, JSON key order, shard,
+and storage details. `input_sha256` independently binds observations to the exact literal inputs.
 
-Scans **public fixtures** + **local shards**, unique by content `air_sha256`. Translates only hashes
-**not** already in `metal2vulkan-ledger.jsonl` and **appends** rows.
+An AIR that is not ready for a case may have one aligned review note containing an explicit reason
+and reviewer identity. Review notes remain `unplanned`, are indexed for the queue, and are never
+semantic or execution evidence. Authoring the first case for that AIR removes its review note.
 
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-mint -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-mint
-```
+Within an AIR, `name` is a unique conceptual slot. Replacing it removes the old case identity and
+only its Metal/MoltenVK/Vulkan observations through a recoverable aligned-shard transaction.
+Explicit deletion uses `corpus-case-check --delete-air HASH --delete-name NAME` and performs the
+same targeted cascade without installing a replacement.
 
-Flags: `--jobs N`, `--quiet`, `--ledger PATH`, `--dry-run`.
+## Observations
 
-### `corpus-remint` — refresh existing translate rows
+A Metal slot is `(case_id, environment_id)`. A candidate slot is
+`(case_id, backend, environment_id)`. Requalification replaces the exact slot; duplicate active
+slots are rejected.
 
-Re-translates rows already in the ledger (source in public fixtures or local shards) and rewrites
-them.
+Metal evidence carries case, AIR, input, output, environment, and oracle-ABI hashes. Candidate
+evidence additionally carries the exact Metal output hash, SPIR-V hash, backend environment, and
+executor ABI. Reuse requires every dependency to match.
 
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-remint
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --failed-only --status fallback --limit 50
-cargo run -p metal2vulkan-validation --release --bin corpus-remint -- --status timeout --skip 50 --limit 50 --case-timeout-secs 60
-```
+Metal qualification runs a checked literal case three times. All selected outputs must be
+identical, and the result must differ from the exact initial bytes across the entire selected
+region. A returned poison region is a qualification failure, not a golden. Candidates require an
+exact usable Metal observation and compare only against that observation's selected bytes.
 
-Flags: `--jobs N`, `--quiet`, `--ledger PATH`, `--dry-run`, `--failed-only`, `--status STATUS`,
-`--contains TEXT`, `--skip N`, `--limit N`, `--case-timeout-secs N` (`0` keeps the legacy
-in-process path).
+## Safety and privacy
 
-### `corpus-why` — diagnose one translate failure
+The checker accepts acyclic AIR as `loop_free` and cyclic AIR only as `authored_bounded` with an
+explicit finite-bound rationale. The latter is an auditable semantic assertion about the literal
+inputs, not a claim that a CPU timeout can cancel already committed GPU work.
 
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-why -- <air_sha256>
-```
-
-Locates the source, runs stage auto + translate, prints `why: …` (or ok + `spv_sha256`). No write.
-
-### `corpus-run-metal` — Metal oracle (macOS)
-
-For each translate row with `status=ok` **or** `fallback` missing from
-`metal2vulkan-ledger-metal.jsonl` (or selected by `--force`, `--failed-only`, `--status`,
-`--bucket`, or `--contains`): infer or reuse plan, seed non-zero inputs, run Metal, append a
-per-run delta row, then merge once into the ledger. The final row carries plan + full golden
-`output_b64` + digests. Translator FALLBACK does **not** skip Metal (oracle is independent of
-SPIR-V emit).
-
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-run-metal
-cargo run -p metal2vulkan-validation --release --bin corpus-run-metal -- --air-sha256 <hex>
-```
-
-Needs real AIR bitcode for many kernels (`blob_b64` in harvested shard rows); hand-written public
-`.ll` alone may fail assembly.
-
-**Infinite-loop safety (structural).** A committed Metal command buffer cannot be cancelled — an
-unbounded compute loop pins the GPU until the machine is rebooted (killing the CPU worker does not
-stop it), and no seed choice can guarantee an arbitrary kernel halts (halting problem). So the
-oracle bounds GPU work **before** submitting, classifying every case (`oracle_macos` →
-[`loop_budget`](../src/loop_budget.rs)):
-
-- **loop-free** → provably bounded; runs unchanged; `compare=full`.
-- **has loops, instrumentable** → a per-thread back-edge budget is injected into the AIR so every
-  loop is forced to exit after a fixed cap; the golden is byte-identical for any run that stays
-  under budget. These rows are `compare=none`: the vulkan/moltenvk candidates apply the same
-  loop-budget transform to the harvested LL before translating and executing SPIR-V.
-- **cannot instrument + verify** (switch back-edges, unparseable control flow, a loop that calls a
-  loopy callee, or IR `metal-as` rejects) → `status=quarantine`, never dispatched.
-
-### `corpus-run-vulkan` — Linux Vulkan candidate
-
-Only translate **`status=ok`** rows (need SPIR-V). Reuses the **metal** plan/golden when present.
-Writes compare status (+ optional tolerance fields) on each `metal2vulkan-ledger-vulkan.jsonl` line.
-
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan -- --dry-run
-cargo run -p metal2vulkan-validation --release --bin corpus-run-vulkan
-```
-
-Without a metal golden for a hash → candidate status `missing`.
-`status=tolerance` is an accepted candidate success; it records the policy and observed margins on
-the candidate row.
-`status=smoke` is also an accepted candidate success; it means the candidate executed and captured
-bytes, but the Metal row was `compare=none` and is not a semantic golden.
-
-### `corpus-run-moltenvk` — MoltenVK candidate (macOS)
-
-Same as vulkan (`status=ok` only), separate ledger `metal2vulkan-ledger-moltenvk.jsonl`. Configure
-the Vulkan loader / `VK_ICD_FILENAMES` for MoltenVK when needed.
-
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-run-moltenvk
-```
-
-### Shared runner flags
-
-`--force` (re-run even if tech row exists), `--failed-only` (re-run existing non-success tech rows),
-`--status STATUS` (existing tech rows with that status), `--bucket TEXT` (existing tech rows whose
-failure bucket contains that text), `--contains TEXT` (existing tech rows whose label, error,
-status, bucket, or hash contains that text), `--quiet`, `--jobs N` (default **min(CPU cores, 4)**
-parallel workers).
-Per-case worker timeout defaults to **60s** and can be overridden with
-`METAL2VULKAN_CORPUS_TIMEOUT_SECS=N`; there is no timeout CLI flag. On expiry, the runner SIGKILLs
-the worker and banks `status=timeout`.
-The timeout frees the CPU worker but **cannot** cancel an in-flight GPU kernel (reboot is the only
-recovery) — infinite-loop safety comes from the pre-submission loop-budget guard above, not from
-this timeout; with that guard bounded GPU work finishes well under a second, so a case still running
-at the bound means a CPU-side tool hang, not a GPU loop.
-`--air-sha256 HEX`, `--ledger-dir DIR`, `--dry-run`.
-Writes one append-only delta per runner execution, then rewrites the target ledger once with
-`air_sha256` dedupe (last row for a hash wins).
-
-### `corpus-triage` — failure queue view
-
-Read-only helper for agent-style iteration over existing ledgers:
-
-```sh
-cargo run -p metal2vulkan-validation --release --bin corpus-triage
-cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
-  --backend moltenvk --status fallback --contains pipeline --commands
-```
-
-It prints status counts, non-success buckets sorted by count, selected rows, and optional
-`corpus-why` / `corpus-run-* --air-sha256 ... --force --jobs 1` commands. Candidate rows print
-`metal-if-needed` unless the candidate status is `missing`. Use `--limit 0` for summary only.
-
-### Pipeline
-
-```text
-corpus-harvest → corpus-mint → metal2vulkan-ledger.jsonl
-       → corpus-run-metal → metal2vulkan-ledger-metal.jsonl
-       → corpus-run-vulkan / corpus-run-moltenvk → compare ledgers
-```
-
-Run gate: source in public fixtures or local shards; metal accepts translate `ok|fallback`,
-vulkan/moltenvk require translate `ok`. Eligibility is **not** driven by a separate skip file.
-`--force` ignores existing backend rows; `--failed-only`, `--status`, `--bucket`, and `--contains`
-select existing backend rows.
-
----
-
-## Translate ledger schema (`metal2vulkan-ledger.jsonl`)
-
-| Field | Meaning |
-|---|---|
-| `air_sha256` | SHA-256 of source file bytes (`.ll` / `.air`) |
-| `shard` | Private shard file name when row came from `corpus/local/shards` |
-| `spv_sha256` | SHA-256 of SPIR-V when `status=ok` |
-| `status` | `ok` \| `fallback` \| `timeout` \| … |
-| `stage` | CLI stage used (`auto` recommended) |
-| `label` | Short non-proprietary tag |
-| `kind` | `synthetic` (public) or `private` (local) |
-
-### Execution ledgers (metal / vulkan / moltenvk)
-
-See [`plan.md`](../../plan.md): metal row owns harness **plan** + golden `output_b64`; candidate rows
-record `status` (`ok` / `tolerance` / `smoke` / `failure` / `missing` / `fallback` /
-`quarantine`) and may embed `tolerance` / `observed` on the same line. A metal row may also be
-`quarantine` (unbounded / uninstrumentable loop — not dispatched); candidates record
-`status=quarantine` for that hash.
-
-## Byte A/B
-
-[`scripts/metal2vulkan-ab/`](../../scripts/metal2vulkan-ab/) walks public fixtures and
-`local/shards` when present for binary-to-binary SPIR-V compares (no execution goldens required).
+Committed cases and observations may contain authored input/output bytes but no AIR bodies or
+Apple-owned binaries. Git history is the audit trail for replaced cases; active shards retain no
+superseded case identities.

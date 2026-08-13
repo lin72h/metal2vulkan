@@ -18,6 +18,54 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[test]
+fn fragment_quad_active_mask_and_narrow_popcount_are_vulkan_valid() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+
+define <4 x half> @frag() {
+entry:
+  %mask = call i16 @air.quad_active_threads_mask()
+  %quad = and i16 %mask, 15
+  %count = call i16 @air.popcount.i16(i16 %quad)
+  %value = uitofp i16 %count to half
+  %v0 = insertelement <4 x half> poison, half %value, i32 0
+  %v1 = shufflevector <4 x half> %v0, <4 x half> poison, <4 x i32> zeroinitializer
+  ret <4 x half> %v1
+}
+
+declare i16 @air.quad_active_threads_mask()
+declare i16 @air.popcount.i16(i16)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!3 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_quad_active_mask_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpGroupNonUniformBallot"), "{asm}");
+    let bitcount = asm
+        .lines()
+        .find(|line| line.contains("OpBitCount"))
+        .expect("OpBitCount");
+    assert!(bitcount.contains(&uint32_type_id(&asm)), "{asm}");
+    assert!(asm.contains("Flat"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_workgroup_array_vector_load_uses_first_element() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -184,6 +232,51 @@ declare float @air.quad_sum.f32(float)
 }
 
 #[test]
+fn native_air_quad_integer_extrema_stay_inside_aligned_quad() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(i32 %v, ptr addrspace(1) %out) {
+entry:
+  %max = tail call i32 @air.quad_max.u.i32(i32 %v)
+  %min = tail call i32 @air.quad_min.u.i32(i32 %v)
+  %sum = add i32 %max, %min
+  store i32 %sum, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.quad_max.u.i32(i32)
+declare i32 @air.quad_min.u.i32(i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_quad_integer_extrema_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(
+        asm.matches("OpGroupNonUniformShuffleXor").count(),
+        4,
+        "{asm}"
+    );
+    assert_eq!(asm.matches("OpUGreaterThan").count(), 2, "{asm}");
+    assert_eq!(asm.matches("OpULessThan").count(), 2, "{asm}");
+    assert!(!asm.contains("OpGroupNonUniformUMax"), "{asm}");
+    assert!(!asm.contains("OpGroupNonUniformUMin"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_simd_sum_uses_metal_32_lane_cluster() {
     // AIR simd operations structurally select Metal's 32-lane simdgroup semantics. This cannot be
     // left to a driver's native subgroup width: MoltenVK may expose a 64-lane subgroup.
@@ -256,7 +349,53 @@ declare i1 @air.simd_is_first()
 }
 
 #[test]
-fn native_air_quad_all_lowers_to_subgroup_vote() {
+fn native_air_quad_is_first_selects_each_four_lane_partition() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %first = tail call i1 @air.quad_is_first()
+  %word = select i1 %first, i32 1, i32 0
+  store i32 %word, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i1 @air.quad_is_first()
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_quad_is_first_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert!(asm.contains("BuiltIn SubgroupLocalInvocationId"), "{asm}");
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
+    assert!(asm.contains("OpIEqual"), "{asm}");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpConstant") && line.trim_end().ends_with(" 3")),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_air_quad_all_lowers_to_four_lane_xor_butterfly() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
 define void @k(i32 %v, ptr addrspace(1) %out) {
@@ -284,8 +423,14 @@ declare i1 @air.quad_all(i1)
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
-    assert!(asm.contains("OpCapability GroupNonUniformVote"), "{asm}");
-    assert!(asm.contains("OpGroupNonUniformAll"), "{asm}");
+    assert!(asm.contains("OpCapability GroupNonUniformShuffle"), "{asm}");
+    assert!(!asm.contains("OpCapability GroupNonUniformVote"), "{asm}");
+    assert_eq!(
+        asm.matches("OpGroupNonUniformShuffleXor").count(),
+        2,
+        "{asm}"
+    );
+    assert!(asm.contains("OpBitwiseAnd"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -293,6 +438,53 @@ declare i1 @air.quad_all(i1)
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_air_quad_any_lowers_to_four_lane_xor_butterfly() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(i32 %v, ptr addrspace(1) %out) {
+entry:
+  %ok = icmp ne i32 %v, 0
+  %any = tail call i1 @air.quad_any(i1 %ok)
+  %word = select i1 %any, i32 1, i32 0
+  store i32 %word, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i1 @air.quad_any(i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_quad_any_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
+    assert!(asm.contains("OpCapability GroupNonUniformShuffle"), "{asm}");
+    assert!(!asm.contains("OpCapability GroupNonUniformVote"), "{asm}");
+    assert_eq!(
+        asm.matches("OpGroupNonUniformShuffleXor").count(),
+        2,
+        "{asm}"
+    );
+    assert!(asm.contains("OpBitwiseOr"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -825,6 +1017,46 @@ declare float @air.simd_prefix_exclusive_sum.f32(float)
 }
 
 #[test]
+fn native_air_vector_u16_prefix_exclusive_sum_lowers_componentwise() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(2) %input, ptr addrspace(1) %out) {
+entry:
+  %x = load <4 x i16>, ptr addrspace(2) %input, align 8
+  %sum = tail call <4 x i16> @air.simd_prefix_exclusive_sum.u.v4i16(<4 x i16> %x)
+  store <4 x i16> %sum, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+declare <4 x i16> @air.simd_prefix_exclusive_sum.u.v4i16(<4 x i16>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"ushort4", !"air.arg_name", !"input"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"ushort4", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_vector_u16_prefix_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCapability Int16"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformIAdd"), "{asm}");
+    assert!(asm.contains("ExclusiveScan"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_air_simd_sum_lowers_to_subgroup_reduce() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -1253,6 +1485,7 @@ entry:
   tail call void @air.wg.barrier(i32 2, i32 1)
   %v = tail call i32 @air.atomic.local.load.i32(ptr addrspace(3) %p, i32 0, i32 1, i1 true)
   %old = tail call i32 @air.atomic.local.add.u.i32(ptr addrspace(3) %p, i32 1, i32 0, i32 1, i1 true)
+  %sub_old = tail call i32 @air.atomic.local.sub.u.i32(ptr addrspace(3) nonnull captures(none) inttoptr (i64 1024 to ptr addrspace(3)), i32 1, i32 0, i32 1, i1 true)
   %signed_old = tail call i32 @air.atomic.local.add.s.i32(ptr addrspace(3) %p, i32 -1, i32 0, i32 1, i1 true)
   %signed_max_old = tail call i32 @air.atomic.local.max.s.i32(ptr addrspace(3) %p, i32 -3, i32 0, i32 1, i1 true)
   %max_old = tail call i32 @air.atomic.local.max.u.i32(ptr addrspace(3) %p, i32 9, i32 0, i32 1, i1 true)
@@ -1267,6 +1500,7 @@ declare void @air.atomic.local.store.i32(ptr addrspace(3), i32, i32, i32, i1)
 declare void @air.wg.barrier(i32, i32)
 declare i32 @air.atomic.local.load.i32(ptr addrspace(3), i32, i32, i1)
 declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
+declare i32 @air.atomic.local.sub.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 declare i32 @air.atomic.local.add.s.i32(ptr addrspace(3), i32, i32, i32, i1)
 declare i32 @air.atomic.local.max.s.i32(ptr addrspace(3), i32, i32, i32, i1)
 declare i32 @air.atomic.local.max.u.i32(ptr addrspace(3), i32, i32, i32, i1)
@@ -1291,6 +1525,7 @@ declare i32 @air.atomic.local.or.u.i32(ptr addrspace(3), i32, i32, i32, i1)
     assert!(asm.contains("OpAtomicStore"), "{asm}");
     assert!(asm.contains("OpAtomicLoad"), "{asm}");
     assert!(asm.matches("OpAtomicIAdd").count() >= 2, "{asm}");
+    assert!(asm.contains("OpAtomicISub"), "{asm}");
     assert!(asm.contains("OpAtomicSMax"), "{asm}");
     assert!(asm.contains("OpAtomicUMax"), "{asm}");
     assert!(asm.contains("OpAtomicSMin"), "{asm}");
@@ -1401,13 +1636,178 @@ declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32
     {
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
     }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn native_agx2_distributed_matmad_lowers_to_partitioned_subgroup_shuffles() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(ptr addrspace(1) %out_f, ptr addrspace(1) %out_h) {
+entry:
+  %f8 = call <2 x float> @llvm.agx2.f32matmad8x8.v2f32(<2 x float> zeroinitializer, <2 x float> zeroinitializer, <2 x float> zeroinitializer)
+  %f4 = call <2 x float> @llvm.agx2.f32matmad4x4.v2f32(<2 x float> %f8, <2 x float> %f8, <2 x float> %f8)
+  %h8 = call <2 x half> @llvm.agx2.f16matmad8x8.v2f16(<2 x half> zeroinitializer, <2 x half> zeroinitializer, <2 x half> zeroinitializer)
+  %h4 = call <2 x half> @llvm.agx2.f16matmad4x4.v2f16(<2 x half> %h8, <2 x half> %h8, <2 x half> %h8)
+  store <2 x float> %f4, ptr addrspace(1) %out_f, align 8
+  store <2 x half> %h4, ptr addrspace(1) %out_h, align 4
+  ret void
+}
+
+declare <2 x float> @llvm.agx2.f32matmad8x8.v2f32(<2 x float>, <2 x float>, <2 x float>)
+declare <2 x float> @llvm.agx2.f32matmad4x4.v2f32(<2 x float>, <2 x float>, <2 x float>)
+declare <2 x half> @llvm.agx2.f16matmad8x8.v2f16(<2 x half>, <2 x half>, <2 x half>)
+declare <2 x half> @llvm.agx2.f16matmad4x4.v2f16(<2 x half>, <2 x half>, <2 x half>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float2*", !"air.arg_name", !"out_f"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"half2*", !"air.arg_name", !"out_h"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_agx2_distributed_matmad_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("llvm.agx2."), "{asm}");
+    assert!(
+        asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
+        "{asm}"
+    );
+    assert!(asm.contains("BuiltIn SubgroupLocalInvocationId"), "{asm}");
+    assert_eq!(
+        asm.lines()
+            .filter(|line| line.contains("= OpGroupNonUniformShuffle "))
+            .count(),
+        72,
+        "{asm}"
+    );
+    assert_eq!(asm.matches(" Fma ").count(), 48, "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn native_simdgroup_matrix_16x16_distributed_mac_lowers_and_validates() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(i16 %lane, ptr addrspace(1) %out_f, ptr addrspace(1) %out_i) {
+entry:
+  %transpose = icmp eq i16 %lane, 0
+  %f = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f16.v8f16.v8f32(<8 x half> zeroinitializer, i1 %transpose, <8 x half> zeroinitializer, i1 true, <8 x float> zeroinitializer)
+  %i = call <8 x i32> @air.simdgroup_matrix_16x16x16_widening_multiply_accumulate.s.u.v8i32.v8i8.v8i8.v8i32(<8 x i8> zeroinitializer, i1 false, <8 x i8> zeroinitializer, i1 %transpose, <8 x i32> zeroinitializer)
+  store <8 x float> %f, ptr addrspace(1) %out_f, align 32
+  store <8 x i32> %i, ptr addrspace(1) %out_i, align 32
+  ret void
+}
+
+declare <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f16.v8f16.v8f32(<8 x half>, i1, <8 x half>, i1, <8 x float>)
+declare <8 x i32> @air.simdgroup_matrix_16x16x16_widening_multiply_accumulate.s.u.v8i32.v8i8.v8i8.v8i32(<8 x i8>, i1, <8 x i8>, i1, <8 x i32>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.thread_index_in_simdgroup", !"air.arg_type_name", !"ushort", !"air.arg_name", !"lane"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float8*", !"air.arg_name", !"out_f"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"int8*", !"air.arg_name", !"out_i"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_simdgroup_matrix_16x16_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("simdgroup_matrix_16x16x16"), "{asm}");
+    assert!(
+        asm_has_line(&asm, "OpCapability GroupNonUniformShuffle"),
+        "{asm}"
+    );
+    assert!(asm.contains("BuiltIn SubgroupLocalInvocationId"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(asm.contains("OpSConvert"), "{asm}");
+    assert!(asm.contains("OpUConvert"), "{asm}");
+    assert!(asm.contains("OpIMul"), "{asm}");
+    assert!(asm.contains(" Fma "), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn native_simdgroup_matrix_16x16_all_observed_float_encodings_validate() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @main(ptr addrspace(1) %out) {
+entry:
+  %f32 = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f32.v8f32.v8f32(<8 x float> zeroinitializer, i1 false, <8 x float> zeroinitializer, i1 false, <8 x float> zeroinitializer)
+  store <8 x float> %f32, ptr addrspace(1) %out, align 32
+  %bf16 = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8bf16.v8bf16.v8f32(<8 x bfloat> zeroinitializer, i1 false, <8 x bfloat> zeroinitializer, i1 false, <8 x float> zeroinitializer)
+  store <8 x float> %bf16, ptr addrspace(1) %out, align 32
+  %e4m3 = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f8e4m3.v8f16.v8f32(<8 x i8> zeroinitializer, i1 false, <8 x half> zeroinitializer, i1 false, <8 x float> zeroinitializer)
+  store <8 x float> %e4m3, ptr addrspace(1) %out, align 32
+  %e4m3fn = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f8e4m3fn.v8f8e4m3fn.v8f32(<8 x i8> zeroinitializer, i1 false, <8 x i8> zeroinitializer, i1 false, <8 x float> zeroinitializer)
+  store <8 x float> %e4m3fn, ptr addrspace(1) %out, align 32
+  %e5m2 = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f8e5m2.v8f8e5m2.v8f32(<8 x i8> zeroinitializer, i1 false, <8 x i8> zeroinitializer, i1 false, <8 x float> zeroinitializer)
+  store <8 x float> %e5m2, ptr addrspace(1) %out, align 32
+  ret void
+}
+
+declare <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f32.v8f32.v8f32(<8 x float>, i1, <8 x float>, i1, <8 x float>)
+declare <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8bf16.v8bf16.v8f32(<8 x bfloat>, i1, <8 x bfloat>, i1, <8 x float>)
+declare <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f8e4m3.v8f16.v8f32(<8 x i8>, i1, <8 x half>, i1, <8 x float>)
+declare <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f8e4m3fn.v8f8e4m3fn.v8f32(<8 x i8>, i1, <8 x i8>, i1, <8 x float>)
+declare <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f8e5m2.v8f8e5m2.v8f32(<8 x i8>, i1, <8 x i8>, i1, <8 x float>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float8*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_simdgroup_matrix_16x16_float_types_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("simdgroup_matrix_16x16x16"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
+    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
+    assert!(asm.contains(" Ldexp "), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[test]
 fn native_simdgroup_matrix_8x8_full_pipeline_lowers_and_validates() {
     // Exercises all four simdgroup_matrix 8x8 lowerings end to end: load (f16 and f32) from device
-    // buffers, init_diag, the mixed-precision multiply_accumulate (v64f32 A, v64f16 B), and store to a
-    // device buffer. The descriptor vectors carry the documented `<elements_per_row, 8>` / `<1,
+    // buffers, init_diag, mixed-precision multiply_accumulate with both f32 and f16 results, and store
+    // to a device buffer. The descriptor vectors carry the documented `<elements_per_row, 8>` / `<1,
     // elements_per_row>` shape (leading dimension = component 0 of the first descriptor vector).
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -1422,6 +1822,10 @@ entry:
   %B = call <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p1f32(ptr addrspace(1) %pf, <2 x i64> %pv1, <2 x i64> %pv2, <2 x i64> zeroinitializer)
   %C = call <64 x float> @air.simdgroup_matrix_8x8_init_diag.v64f32.f32(float 1.000000e+00)
   %D = call <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f16.v64f32(<64 x float> %B, <64 x half> %A, <64 x float> %C)
+  %Dh = call <64 x half> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f16.v64f32.v64f16.v64f32(<64 x float> %B, <64 x half> %A, <64 x float> %C)
+  %dh0 = extractelement <64 x half> %Dh, i64 0
+  %dhf = fpext half %dh0 to float
+  store float %dhf, ptr addrspace(1) %po
   %scaled = fmul fast <64 x float> %D, %D
   call void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float> %scaled, ptr addrspace(1) %po, <2 x i64> %pv1, <2 x i64> %pv2, <2 x i64> zeroinitializer)
   ret void
@@ -1431,6 +1835,7 @@ declare <64 x half> @air.simdgroup_matrix_8x8_load.v64f16.p1f16(ptr addrspace(1)
 declare <64 x float> @air.simdgroup_matrix_8x8_load.v64f32.p1f32(ptr addrspace(1), <2 x i64>, <2 x i64>, <2 x i64>)
 declare <64 x float> @air.simdgroup_matrix_8x8_init_diag.v64f32.f32(float)
 declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32.v64f16.v64f32(<64 x float>, <64 x half>, <64 x float>)
+declare <64 x half> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f16.v64f32.v64f16.v64f32(<64 x float>, <64 x half>, <64 x float>)
 declare void @air.simdgroup_matrix_8x8_store.v64f32.p1f32(<64 x float>, ptr addrspace(1), <2 x i64>, <2 x i64>, <2 x i64>)
 
 !air.kernel = !{!0}

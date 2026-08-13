@@ -12,6 +12,10 @@ pub struct FunctionConstant {
     pub name: String,
     /// The LLVM-IR type of the constant (`i32`, `i1`, `<4 x i32>`, `float`, …).
     pub type_name: String,
+    /// Itanium ABI type encoding carried after `MTL_FC_INIT_<index>_` (`j`, `Dv4_j`, `Dh`, …).
+    /// Unlike LLVM's signless integer type, this preserves the Metal scalar signedness and lanes
+    /// needed to bind an exact `MTLFunctionConstantValues` value.
+    pub abi_type_encoding: String,
 }
 
 /// Scan LLVM-IR for `[[function_constant]]` initializer globals — module-scope declarations named
@@ -35,6 +39,11 @@ pub fn parse_function_constants(ll: &str) -> Vec<FunctionConstant> {
         let Ok(index) = digits.parse::<u32>() else {
             continue;
         };
+        let abi_type_encoding = marker
+            .strip_prefix(&digits)
+            .and_then(|suffix| suffix.strip_prefix('_'))
+            .unwrap_or_default()
+            .to_string();
         if out.iter().any(|f| f.index == index) {
             continue;
         }
@@ -42,6 +51,7 @@ pub fn parse_function_constants(ll: &str) -> Vec<FunctionConstant> {
             index,
             name: base.to_string(),
             type_name: fc_global_decl_type(&t[eq + 3..]).unwrap_or_default(),
+            abi_type_encoding,
         });
     }
     out.sort_by_key(|f| f.index);

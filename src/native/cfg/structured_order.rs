@@ -1,12 +1,9 @@
 //! R2 relooper — structured block ordering (module 1 of the structured-by-construction emitter).
 //!
-//! The clean rewrite of CFG handling replaces the order-heuristic merges + the 14-pass post-hoc
-//! `repair_structured_merges` fixpoint with a structured-by-construction emitter. Four measured
-//! disproofs (journal 2026-06-25, AIR2VK-R2-INCR3/4/5 + the bf16 finding) established that the repair
-//! cannot be bypassed incrementally: it is entangled with block ordering, single-predecessor cleanup,
-//! and merge placement, so any partial wiring regresses the `--banked` floor. The emitter must
-//! therefore produce SPIR-V that is *already* structured-valid — which begins with emitting blocks in
-//! a structured order.
+//! Primary CFG emission is structured by construction. Block ordering, single-predecessor cleanup,
+//! and merge placement are coupled, so the planner produces a complete plan rather than incrementally
+//! bypassing individual retained-module repairs. This begins with emitting blocks in a structured
+//! order.
 //!
 //! This module is that ordering. SPIR-V's structured CFG requires every block to appear after its
 //! dominator and every construct's merge block to appear after the whole construct. [`structured_order`]
@@ -16,15 +13,10 @@
 //! calls it (module 1 of the structured-by-construction consumer), so the order it returns is the order
 //! blocks are emitted in.
 //!
-//! Known gap (2026-06-27): on a few MPS kernels a loop body's inner `OpSelectionMerge` block is ordered
-//! BEFORE the loop header that dominates it, so a use precedes its def ("ID has not been defined", 9
-//! frontier cases — `02/ab4c2598`, `04/37318cb2`). The merge is deferred at `idom(merge)`, which here
-//! lands on a pre-loop block. This is NOT fixable by changing the deferral node: `idom(merge)` does not
-//! dominate the construct header (the extra predecessor is a genuine non-dominating pre-loop edge into
-//! the merge), the legacy repair path mis-orders it identically, and forcing the merge into the loop
-//! only surfaces the real blocker — the merge is reachable from inside AND outside the loop, so it
-//! cannot be that selection's merge without node duplication / splitting. The fix is the structurizer
-//! node-split rewrite, not a reorder. (See `kb/metal2vulkan-conformance.md`, frontier invalid-spirv clusters.)
+//! A merge reachable from both inside and outside a loop cannot legally serve as an inner
+//! selection's merge without node duplication or splitting. In that shape `idom(merge)` can lie
+//! before the loop, and changing only the deferral node cannot restore dominance. The planner must
+//! reject it for a structural retry rather than pretending an ordering change is sufficient.
 
 use super::loopforest::LoopForest;
 use super::BodyBlock;
@@ -45,9 +37,8 @@ use std::collections::{HashMap, HashSet};
 /// merge's idom IS its header (so this is unchanged for selections), but a loop's exit (merge) is
 /// frequently dominated by an in-body exit guard rather than the header. Deferring only at the header
 /// would leave such a merge as an ordinary child of the guard, where it can be emitted before later
-/// body blocks dominated by that guard — the `OpLoopMerge`-merge-before-dominating-body class
-/// (journal `00/f927b9f7`). Deferring at the guard (its idom) makes the merge that guard's last child,
-/// after the rest of the loop body.
+/// body blocks dominated by that guard. Deferring at the guard (its idom) makes the merge that
+/// guard's last child, after the rest of the loop body.
 ///
 /// Iterative (explicit stack) to bound stack depth on the thousand-block MPS kernels.
 pub(in crate::native) fn structured_order(
@@ -182,7 +173,7 @@ mod tests {
         BodyBlock {
             name,
             role: crate::native::cfg::BlockRole::Normal,
-            typed,
+            typed: typed.map(Into::into),
         }
     }
 

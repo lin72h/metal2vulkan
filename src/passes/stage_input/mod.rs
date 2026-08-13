@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::meta::primitive_air_type_from_name;
+use crate::passes::access::{is_unsigned_byte_scalar, single_member_array_scalar_elem};
 use crate::passes::stage_output::handle_static_sampler;
 mod decorations;
 mod kernel_values;
@@ -26,6 +27,43 @@ pub(in crate::passes) use air_layout::*;
 const WORKGROUP_MEMORY_ELEMENTS: u32 = 512;
 
 /// What an entry parameter became, so the body can be patched to read from it.
+pub(in crate::passes) fn fragment_imageblock_projection_type_matches(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    format: FragmentImageblockFormat,
+) -> bool {
+    let scalar = if format.lanes == 1 {
+        ty
+    } else {
+        let Some(definition) = defs.get(&ty) else {
+            return false;
+        };
+        match definition.operands.as_slice() {
+            [Operand::IdRef(scalar), Operand::LiteralBit32(lanes)]
+                if definition.class.opcode == Op::TypeVector && *lanes == format.lanes =>
+            {
+                *scalar
+            }
+            _ => return false,
+        }
+    };
+    let Some(definition) = defs.get(&scalar) else {
+        return false;
+    };
+    match format.component {
+        ImageComp::Float => {
+            definition.class.opcode == Op::TypeFloat
+                && definition.operands.as_slice() == [Operand::LiteralBit32(format.bits)]
+        }
+        ImageComp::Uint => {
+            definition.class.opcode == Op::TypeInt
+                && definition.operands.as_slice()
+                    == [Operand::LiteralBit32(format.bits), Operand::LiteralBit32(0)]
+        }
+        ImageComp::Sint => false,
+    }
+}
+
 pub(in crate::passes) enum ParamBinding {
     /// A loadable interface var (Input varying / vertex attribute): replace param uses with an
     /// OpLoad of `var` (type = the param's value type) inserted at function start.
@@ -78,6 +116,8 @@ pub(in crate::passes) enum ParamBinding {
     LoadVarVectorPrefix {
         var: Word,
         vec_ty: Word,
+        scalar_ty: Word,
+        prefix_ty: Word,
         out_ty: Word,
         lanes: u32,
     },
@@ -128,6 +168,12 @@ pub(in crate::passes) enum ParamBinding {
         read_ty: Word,
         param_ty: Word,
     },
+    /// A custom fragment-imageblock projection reconstructed by storage-image reads at FragCoord.
+    FragmentImageblockProjection {
+        coord_var: Word,
+        param_ty: Word,
+        members: Vec<(Word, Word, Word, FragmentImageblockFormat)>,
+    },
     /// A sampler variable: replace param uses with an OpLoad of the sampler.
     Sampler { var: Word },
     /// A buffer block variable, with the lowering of the body's param uses (see `BufWrap`).
@@ -167,15 +213,15 @@ fn texture_type_is_handle_array(name: &str) -> bool {
 
 /// How a buffer param's body uses are lowered.
 pub(in crate::passes) enum BufWrap {
-    /// The AIR pointee was a (heterogeneous) struct the backend kept as a struct pointer. The body's
+    /// The AIR pointee is a heterogeneous struct emitted as a struct pointer. The body's
     /// access chains already index struct members off the param — just splice the var id.
     Direct,
-    /// The backend kept a struct pointer, but at least one AIR use indexes an implicit array of those
+    /// Native emission kept a struct pointer, but at least one AIR use indexes an implicit array of those
     /// structs (`buffer[N].field`). The StorageBuffer is `{ RuntimeArray<Struct> }`; direct struct
     /// member paths are routed to record 0, and non-direct paths keep their original first operand as
     /// the record index.
     RecordArray { block_ty: Word, elem_ty: Word },
-    /// The backend collapsed the buffer into a bare element pointer (`T*`) and emits physical access
+    /// Native emission represents the buffer as a bare element pointer (`T*`) with physical access
     /// chains against it (illegal in Logical SPIR-V). `block_ty` is the StorageBuffer Block we point
     /// the var at; we re-root the body's access chains at the var and route direct loads through the
     /// offset-0 leaf. `prepend_member0` is true for a genuine `device T*` array wrapped as
@@ -187,9 +233,8 @@ pub(in crate::passes) enum BufWrap {
     },
 }
 
-/// Rewrite the entry function's parameters into Vulkan interface variables (Input/UniformConstant/
-/// Uniform) by AIR role, and its return value into Output variable(s). The bridge from the raw llc
-/// module to a Vulkan-pointed entry.
+/// Rewrite the native emitter's entry parameters into Vulkan interface variables by AIR role, and
+/// its return value into Output variables.
 pub(super) fn build_stage_input(
     ctx: &mut Ctx,
     entry_idx: usize,
@@ -216,7 +261,13 @@ pub(super) fn build_stage_input(
     // resource is a storage-image `OpImageRead` and can share this binding.
     let mut wtex_candidates = texture_storage_hints(&params, stage, frag, vert, kern);
     for (pid, shape) in write_texture_dims(ctx, entry_idx) {
-        wtex_candidates.entry(pid).or_insert(shape);
+        if shape.2 == ImageFormat::R32ui {
+            // Image atomics require one of Vulkan's scalar atomic storage formats; the call-site ABI
+            // is more specific than the broad metadata `texture2d<uint, read_write>` spelling.
+            wtex_candidates.insert(pid, shape);
+        } else {
+            wtex_candidates.entry(pid).or_insert(shape);
+        }
     }
     let wtex_dims: HashMap<Word, (Dim, bool, ImageFormat, ImageComp)> = wtex_candidates
         .into_iter()
@@ -236,10 +287,11 @@ pub(super) fn build_stage_input(
     let mut front_facing_var: Option<Word> = None;
     let mut primitive_id_var: Option<Word> = None;
     let mut sample_id_var: Option<Word> = None;
+    let mut tess_coord_var: Option<Word> = None;
     let mut local_invocation_index_var: Option<Word> = None;
     let mut num_workgroups_var: Option<Word> = None;
     let mut global_invocation_id_var: Option<Word> = None;
-    let stage_input_bindings = kernel_stage_input_bindings(kern);
+    let stage_input_bindings = kern.map(KernMeta::stage_input_bindings).unwrap_or_default();
 
     for (i, (pid, pty)) in params.iter().enumerate() {
         let idx = i as u32;
@@ -256,6 +308,7 @@ pub(super) fn build_stage_input(
                 Some(FragRole::Sampler(_)) => s == "sampler",
                 Some(FragRole::Buffer(_)) => s == "buffer",
                 Some(FragRole::ColorInput(_)) => s == "color_input",
+                Some(FragRole::ImageblockData) => s == "imageblock_data",
                 _ => s == "other",
             },
             Stage::Vertex => match vert.and_then(|m| m.role_of(idx)) {
@@ -265,12 +318,20 @@ pub(super) fn build_stage_input(
                 Some(VertRole::Sampler(_)) => s == "sampler",
                 Some(VertRole::VertexId) => s == "vertex_id",
                 Some(VertRole::InstanceId) => s == "instance_id",
+                Some(VertRole::PatchControlPoints) => s == "patch_control_points",
+                Some(VertRole::PatchInput(_)) => s == "patch_input",
+                Some(VertRole::PositionInPatch) => s == "position_in_patch",
+                Some(VertRole::PatchId) => s == "patch_id",
+                Some(VertRole::AmplificationId) => s == "amplification_id",
+                Some(VertRole::AmplificationCount) => s == "amplification_count",
                 _ => s == "other",
             },
             Stage::Kernel => match kern.and_then(|m| m.role_of(idx)) {
-                Some(KernRole::Buffer(_) | KernRole::AccelerationStructureShadow(_)) => {
-                    s == "buffer"
-                }
+                Some(
+                    KernRole::Buffer(_)
+                    | KernRole::AccelerationStructureShadow(_)
+                    | KernRole::PrimitiveAccelerationStructureShadow(_),
+                ) => s == "buffer",
                 Some(KernRole::Texture(_)) => s == "texture",
                 Some(KernRole::Sampler(_)) => s == "sampler",
                 Some(KernRole::ThreadsPerThreadgroup) => s == "threads_per_threadgroup",
@@ -322,7 +383,11 @@ pub(super) fn build_stage_input(
                 _ => None,
             },
             Stage::Kernel => match kern.and_then(|m| m.role_of(idx)) {
-                Some(KernRole::Buffer(b) | KernRole::AccelerationStructureShadow(b)) => Some(*b),
+                Some(
+                    KernRole::Buffer(b)
+                    | KernRole::AccelerationStructureShadow(b)
+                    | KernRole::PrimitiveAccelerationStructureShadow(b),
+                ) => Some(*b),
                 Some(KernRole::Texture(b)) => Some(texture_resource_binding(*b)),
                 Some(KernRole::Sampler(b)) => Some(sampler_resource_binding(*b)),
                 _ => None,
@@ -336,7 +401,7 @@ pub(super) fn build_stage_input(
 
         // Runtime-indexed texture arrays are declared as `array_ref<texture...>` or fixed
         // `array<texture...>` in AIR metadata. Both are descriptor ARRAYs, not single images: the
-        // backend emits per-element handle loads (`load ptr addrspace(1), gep %argbuf, %idx`) that
+        // native emission produces per-element handle loads (`load ptr addrspace(1), gep %argbuf, %idx`) that
         // must become `OpAccessChain` into a UniformConstant image array.
         let texture_type_name = match stage {
             Stage::Fragment => frag.and_then(|m| m.texture_type_name(idx)),
@@ -416,7 +481,10 @@ pub(super) fn build_stage_input(
             // be over-sized; only accessed descriptors need be valid, and spirv-val does not bounds-check
             // a dynamic `OpAccessChain` index. A fixed `OpTypeArray` avoids the RuntimeDescriptorArray
             // capability; the index is `air.is_uniform`-marked, so no ShaderNonUniform is needed either.
-            let array_ty = ctx.ty_array(elem_image_ty, 128);
+            let array_ty = ctx.ty_array(
+                elem_image_ty,
+                crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT,
+            );
             let pptr = ctx.ty_ptr(StorageClass::UniformConstant, array_ty);
             let var = ctx.module.fresh_id();
             ctx.new_globals.push(Instruction::new(
@@ -559,9 +627,9 @@ pub(super) fn build_stage_input(
             bindings.push((*pid, ParamBinding::WorkgroupMemory { var }));
         } else if role_is("buffer") {
             // pty is OpTypePointer UniformConstant %pointee. If pointee is a (heterogeneous) struct,
-            // the backend kept it as a struct pointer — make a StorageBuffer var pointing at it and the
+            // native emission kept it as a struct pointer — make a StorageBuffer var pointing at it and the
             // body's member access chains just work. If pointee is a bare scalar/vector (a genuine
-            // `device float4*` array, OR a homogeneous struct the backend collapsed into a `T*` that it
+            // `device float4*` array, or a homogeneous struct emitted as a `T*` that the body
             // indexes `[i]`), physical array-stride access is illegal in Logical SPIR-V: wrap it as a
             // Block `{ RuntimeArray<pointee> }` and remember the element type so the body's param uses
             // get rewritten (member-0 prepend on chains; &buf[0] for direct loads).
@@ -570,10 +638,10 @@ pub(super) fn build_stage_input(
             let pointee_op = defs.get(&pointee).map(|d| d.class.opcode);
             let is_struct = pointee_op == Some(Op::TypeStruct);
             let is_raw_uint_block = is_raw_uint_buffer_block(&defs, pointee);
-            // A SCALAR pointee means the backend FLATTENED the buffer to a flat scalar array and the
+            // A scalar pointee means native emission flattened the buffer to a flat scalar array and the
             // access chain indices are flat element offsets, NOT struct-navigation indices — so it must
             // use the RuntimeArray wrapping, not struct reconstruction (which would mis-index). A vector
-            // pointee means the backend preserved the struct shape (multi-level nav), so reconstruct.
+            // pointee means native emission preserved the struct shape (multi-level nav), so reconstruct.
             let pointee_is_scalar =
                 matches!(pointee_op, Some(Op::TypeFloat | Op::TypeInt | Op::TypeBool));
             // The AIR struct layout for this buffer (present iff it carries `air.struct_type_info`).
@@ -589,7 +657,18 @@ pub(super) fn build_stage_input(
                 Stage::Fragment | Stage::Vertex => None,
             };
             let (struct_ty, wrap) = if is_raw_uint_block {
-                if let Some(at) = layout
+                let carries_indirect_arguments = kern.is_some_and(|meta| {
+                    meta.embedded_arguments
+                        .iter()
+                        .any(|argument| argument.buffer_param_index == idx)
+                });
+                if carries_indirect_arguments {
+                    // An AIR indirect buffer physically contains opaque 64-bit resource handles.
+                    // When the emitter selected its raw-word transport, retain that representation:
+                    // rebuilding the source struct would replace handle slots with their pointee
+                    // types, making the two payload words impossible to address or populate.
+                    (pointee, BufWrap::Direct)
+                } else if let Some(at) = layout
                     .filter(|_| buffer_has_access_chains(&ctx.module.functions[entry_idx], *pid))
                 {
                     let st = ctx.build_air_type(at);
@@ -640,7 +719,7 @@ pub(super) fn build_stage_input(
                     pointee,
                 )
             {
-                // Backend kept the real struct type, but AIR uses the first GEP index as an implicit
+                // Native emission kept the real struct type, but AIR uses the first GEP index as an implicit
                 // record index (`buffer[N].field`). Wrap the struct in a runtime array so nonzero or
                 // dynamic record indices stay legal under Logical SPIR-V.
                 let elem = ctx.clone_type_for_record_array_element(pointee, &defs);
@@ -656,11 +735,11 @@ pub(super) fn build_stage_input(
                     },
                 )
             } else if is_struct {
-                // Backend kept the real struct and AIR only indexes record 0; index it off the var
+                // Native emission kept the real struct and AIR only indexes record 0; index it off the var
                 // directly.
                 (pointee, BufWrap::Direct)
             } else if let Some(at) = layout {
-                // Backend collapsed a structured AIR buffer into a bare pointer. If the body has
+                // Native emission represents a structured AIR buffer as a bare pointer. If the body has
                 // access chains that type-check against the original AIR struct layout, preserve that
                 // layout. This includes scalar first fields (`buf.field0`) whose SPIR-V shape is also a
                 // single-index chain. Only fall back to RuntimeArray when the chains do not match the
@@ -705,15 +784,18 @@ pub(super) fn build_stage_input(
                                 prepend_member0: false,
                             },
                         )
-                    } else if buffer_has_multi_index_access_chains(
-                        &ctx.module.functions[entry_idx],
-                        *pid,
-                    ) && struct_buffer_needs_record_array(
-                        &layout_defs,
-                        &ctx.module.functions[entry_idx],
-                        *pid,
-                        st,
-                    ) {
+                    } else if !pointee_is_scalar
+                        && buffer_has_multi_index_access_chains(
+                            &ctx.module.functions[entry_idx],
+                            *pid,
+                        )
+                        && struct_buffer_needs_record_array(
+                            &layout_defs,
+                            &ctx.module.functions[entry_idx],
+                            *pid,
+                            st,
+                        )
+                    {
                         let rta = ctx.ty_runtime_array(st);
                         let block = ctx.module.fresh_id();
                         ctx.new_globals.push(type_inst(
@@ -759,9 +841,9 @@ pub(super) fn build_stage_input(
                     }
                 }
             } else {
-                // Genuine `device T*` array (no struct info): wrap as `{ RuntimeArray<T> }`. When
-                // pre-llc canonicalization wrapped this buffer (`{[0 x T]}`), llc can collapse it back
-                // to `T*` but keep the wrapper's member-0 index, so accesses already read
+                // Genuine `device T*` array (no struct info): wrap as `{ RuntimeArray<T> }`. Source
+                // canonicalization can represent this as `{[0 x T]}` while the emitted parameter is
+                // `T*`; accesses may therefore retain the wrapper's member-0 index as
                 // `%p %uint_0 %i`. Re-root those without prepending; all other array/vector element
                 // chains still need the StorageBuffer block member inserted.
                 if let Some(air_ty) = primitive_buffer_air_type.as_ref().filter(|air_ty| {
@@ -789,8 +871,8 @@ pub(super) fn build_stage_input(
                         &ctx.module.functions[entry_idx],
                         *pid,
                     );
-                    // llc can type the entry buffer param as a bare `uchar*` (opaque-pointer default)
-                    // even though the inlined body indexes it as a `float`/`v2float` array — the
+                    // An entry buffer parameter can be a bare `uchar*` even though the inlined body
+                    // indexes it as a `float`/`v2float` array — the
                     // RuntimeArray element must match what the body READS, not the mistyped pointee
                     // (else the chain indexes a uchar array but loads a float). Prefer the body's
                     // single-index element type.
@@ -809,6 +891,7 @@ pub(super) fn build_stage_input(
                     )
                 }
             };
+            let source_layout_ty = layout.map(|air_layout| ctx.build_air_type(air_layout));
             let uptr = ctx.ty_ptr(StorageClass::StorageBuffer, struct_ty);
             let var = ctx.module.fresh_id();
             ctx.new_globals.push(Instruction::new(
@@ -817,6 +900,14 @@ pub(super) fn build_stage_input(
                 Some(var),
                 vec![Operand::StorageClass(StorageClass::StorageBuffer)],
             ));
+            if let Some(source_layout_ty) = source_layout_ty.filter(|_| {
+                single_member_array_scalar_elem(ctx, struct_ty)
+                    .is_some_and(|element| is_unsigned_byte_scalar(ctx, element))
+            }) {
+                ctx.emit_sidecar
+                    .buffer_root_source_types
+                    .insert(var, source_layout_ty);
+            }
             let binding = allocate_resource_binding(&mut binding_ctr, resource_binding);
             decorate_binding(&mut ctx.module, var, binding);
             bindings.push((*pid, ParamBinding::Buffer { var, wrap }));
@@ -845,10 +936,10 @@ pub(super) fn build_stage_input(
                      Input/Output interfaces cannot use OpTypeBool"
                 ));
             } else {
-                let interface_ty = if matches!(stage, Stage::Fragment) {
-                    fragment_varying_interface_type(ctx, frag, loc, *pty, &defs)
-                } else {
-                    *pty
+                let interface_ty = match stage {
+                    Stage::Fragment => fragment_varying_interface_type(ctx, frag, loc, *pty, &defs),
+                    Stage::Vertex => vertex_attribute_interface_type(ctx, vert, loc, *pty, &defs),
+                    Stage::Kernel => *pty,
                 };
                 // Input var of the param value type at Location loc; load at entry.
                 let pptr = ctx.ty_ptr(StorageClass::Input, interface_ty);
@@ -873,6 +964,28 @@ pub(super) fn build_stage_input(
                 ctx.interface.push(var);
                 if interface_ty == *pty {
                     bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
+                } else if matches!(stage, Stage::Vertex)
+                    && (type_int_shape(&defs, *pty).is_some()
+                        || defs.get(pty).is_some_and(|definition| {
+                            definition.class.opcode == Op::TypeVector
+                                && definition
+                                    .operands
+                                    .first()
+                                    .and_then(|operand| match operand {
+                                        Operand::IdRef(element) => Some(*element),
+                                        _ => None,
+                                    })
+                                    .is_some_and(|element| type_int_shape(&defs, element).is_some())
+                        }))
+                {
+                    bindings.push((
+                        *pid,
+                        ParamBinding::LoadVarConverted {
+                            var,
+                            load_ty: interface_ty,
+                            param_ty: *pty,
+                        },
+                    ));
                 } else {
                     bindings.push((
                         *pid,
@@ -909,6 +1022,93 @@ pub(super) fn build_stage_input(
                     },
                 ));
             }
+        } else if role_is("patch_input") {
+            let location = match vert.and_then(|meta| meta.role_of(idx)) {
+                Some(VertRole::PatchInput(location)) => *location,
+                _ => unreachable!("patch_input role has a location"),
+            };
+            let pptr = ctx.ty_ptr(StorageClass::Input, *pty);
+            let var = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::Variable,
+                Some(pptr),
+                Some(var),
+                vec![Operand::StorageClass(StorageClass::Input)],
+            ));
+            decorate_location(&mut ctx.module, var, location);
+            decorate_patch(&mut ctx.module, var);
+            ctx.interface.push(var);
+            bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
+        } else if role_is("position_in_patch") {
+            let vec_ty = ctx.ty_vecf(3);
+            let var = if let Some(var) = tess_coord_var {
+                var
+            } else {
+                let pptr = ctx.ty_ptr(StorageClass::Input, vec_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_builtin(&mut ctx.module, var, BuiltIn::TessCoord);
+                ctx.interface.push(var);
+                tess_coord_var = Some(var);
+                var
+            };
+            let binding = match tess_coord_prefix_lanes(&defs, *pty, ctx.ty_float())? {
+                None => ParamBinding::LoadVar { var, ty: vec_ty },
+                Some(lanes) => ParamBinding::LoadVarVectorPrefix {
+                    var,
+                    vec_ty,
+                    scalar_ty: ctx.ty_float(),
+                    prefix_ty: *pty,
+                    out_ty: *pty,
+                    lanes,
+                },
+            };
+            bindings.push((*pid, binding));
+        } else if role_is("patch_id") {
+            let uint_ty = ctx.ty_uint();
+            let var =
+                bind_kernel_uint_builtin_once(ctx, &mut primitive_id_var, BuiltIn::PrimitiveId);
+            if *pty == uint_ty {
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
+            } else {
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadVarConverted {
+                        var,
+                        load_ty: uint_ty,
+                        param_ty: *pty,
+                    },
+                ));
+            }
+        } else if matches!(stage, Stage::Vertex)
+            && vert.is_some_and(VertMeta::is_tessellation_evaluation)
+            && (role_is("instance_id")
+                || role_is("amplification_id")
+                || role_is("amplification_count"))
+        {
+            let role = vert
+                .and_then(|meta| meta.role_of(idx))
+                .expect("decoded role");
+            let location = vert
+                .and_then(|meta| meta.tessellation_system_input_location(role))
+                .expect("tessellation system input location");
+            let pptr = ctx.ty_ptr(StorageClass::Input, *pty);
+            let var = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::Variable,
+                Some(pptr),
+                Some(var),
+                vec![Operand::StorageClass(StorageClass::Input)],
+            ));
+            decorate_location(&mut ctx.module, var, location);
+            decorate_patch(&mut ctx.module, var);
+            ctx.interface.push(var);
+            bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
         } else if role_is("vertex_id") || role_is("instance_id") {
             // `[[vertex_id]]`/`[[instance_id]]` -> Input BuiltIn VertexIndex/InstanceIndex. Vulkan
             // requires this builtin to be a 32-bit int Input; the AIR `uint` param lowers to `%uint`,
@@ -1187,6 +1387,94 @@ pub(super) fn build_stage_input(
                     },
                 ));
             }
+        } else if role_is("imageblock_data") {
+            let imageblock = frag
+                .and_then(|meta| meta.fragment_imageblock.as_ref())
+                .ok_or_else(|| {
+                    format!(
+                        "fragment imageblock parameter {idx} has no decoded AIR layout contract"
+                    )
+                })?;
+            let projection = imageblock
+                .inputs
+                .iter()
+                .find(|projection| projection.interface_index == idx)
+                .ok_or_else(|| format!("fragment imageblock parameter {idx} has no projection"))?;
+            let projected_types = defs
+                .get(pty)
+                .filter(|definition| definition.class.opcode == Op::TypeStruct)
+                .ok_or_else(|| {
+                    format!("fragment imageblock parameter {idx} is not a struct value")
+                })?
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::IdRef(ty) => Some(*ty),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if projected_types.len() != projection.members.len() {
+                return Err(format!(
+                    "fragment imageblock parameter {idx} exposes {} fields but AIR projects {}",
+                    projected_types.len(),
+                    projection.members.len()
+                ));
+            }
+            let coord_var = if let Some(var) = fragcoord_var {
+                var
+            } else {
+                let coord_ty = ctx.ty_vecf(4);
+                let pointer_ty = ctx.ty_ptr(StorageClass::Input, coord_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pointer_ty),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_builtin(&mut ctx.module, var, BuiltIn::FragCoord);
+                ctx.interface.push(var);
+                fragcoord_var = Some(var);
+                ctx.fragment_imageblock_coord_var = Some(var);
+                var
+            };
+            let mut members = Vec::with_capacity(projection.members.len());
+            for (projected_ty, projected) in
+                projected_types.into_iter().zip(projection.members.iter())
+            {
+                let master = imageblock
+                    .members
+                    .get(projected.master_member as usize)
+                    .ok_or_else(|| {
+                        format!(
+                            "fragment imageblock parameter {idx} references missing master member {}",
+                            projected.master_member
+                        )
+                    })?;
+                let format = fragment_imageblock_format(&master.type_name).ok_or_else(|| {
+                    format!(
+                        "fragment imageblock parameter {idx} member {} has unsupported master type {}",
+                        projected.projection_member, master.type_name
+                    )
+                })?;
+                if !fragment_imageblock_projection_type_matches(&defs, projected_ty, format) {
+                    return Err(format!(
+                        "fragment imageblock parameter {idx} member {} does not match AIR master type {}",
+                        projected.projection_member, master.type_name
+                    ));
+                }
+                let (image_var, image_ty) =
+                    ctx.fragment_imageblock_var(projected.master_member, &master.type_name)?;
+                members.push((image_var, image_ty, projected_ty, format));
+            }
+            bindings.push((
+                *pid,
+                ParamBinding::FragmentImageblockProjection {
+                    coord_var,
+                    param_ty: *pty,
+                    members,
+                },
+            ));
         } else if let Some(pointee) = data_pointer_pointee(&defs, *pty) {
             // Unmodeled *pointer* param (an unbound `constant T&`/buffer that no role recognized). An
             // OpUndef of a data-pointer type would be dereferenced by the body's OpAccessChain/OpLoad —
@@ -1211,7 +1499,7 @@ pub(super) fn build_stage_input(
             all_defs.entry(id).or_insert_with(|| g.clone());
         }
     }
-    split_workgroup_block_type_aliases(ctx, &buffer_structs, &mut all_defs);
+    split_explicit_layout_type_aliases(ctx, &buffer_structs, &mut all_defs);
     for g in &ctx.new_globals {
         if let Some(id) = g.result_id {
             all_defs.entry(id).or_insert_with(|| g.clone());
@@ -1238,13 +1526,188 @@ pub(super) fn build_stage_input(
     // read/written by AIR texture intrinsics) as standalone images BEFORE applying param bindings. This
     // lands them in `ctx.image_dims`/`ctx.image_comp` and, for writable fields, `ctx.image_storage`, so
     // private-placeholder helper operands can recover the real descriptor.
-    register_embedded_textures(ctx, entry_idx, kern, &mut binding_ctr);
+    let embedded_textures = match stage {
+        Stage::Fragment => frag.map(|meta| meta.embedded_textures.as_slice()),
+        Stage::Vertex => vert.map(|meta| meta.embedded_textures.as_slice()),
+        Stage::Kernel => kern.map(|meta| meta.embedded_textures.as_slice()),
+    };
+    register_embedded_textures(ctx, entry_idx, embedded_textures, &mut binding_ctr);
 
     // Apply param bindings to the body: drop params, then splice replacements.
     apply_bindings(ctx, entry_idx, bindings, &buffer_structs, &all_defs)?;
+    if frag
+        .and_then(|meta| meta.fragment_imageblock.as_ref())
+        .is_some()
+    {
+        ctx.uses_fragment_imageblock = true;
+        ctx.fragment_imageblock_coord_var = fragcoord_var;
+        let block = ctx.module.functions[entry_idx]
+            .blocks
+            .first_mut()
+            .ok_or_else(|| "fragment imageblock entry has no block".to_string())?;
+        let insert_at = block
+            .instructions
+            .iter()
+            .position(|instruction| instruction.class.opcode != Op::Variable)
+            .unwrap_or(block.instructions.len());
+        block.instructions.insert(
+            insert_at,
+            Instruction::new(Op::BeginInvocationInterlockEXT, None, None, vec![]),
+        );
+    }
+    lower_patch_control_point_calls(ctx, entry_idx, vert, &all_defs)?;
     lower_buffer_address_facts(ctx, entry_idx, kern)?;
 
     Ok(defs)
+}
+
+fn tess_coord_prefix_lanes(
+    defs: &HashMap<Word, Instruction>,
+    param_ty: Word,
+    float_ty: Word,
+) -> Result<Option<u32>, String> {
+    match scalar_or_vector_component(defs, param_ty) {
+        Some((component, Some(3))) if component == float_ty => Ok(None),
+        Some((component, Some(2))) if component == float_ty => Ok(Some(2)),
+        _ => Err("position_in_patch parameter must be float2 or float3".to_string()),
+    }
+}
+
+fn lower_patch_control_point_calls(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    vert: Option<&VertMeta>,
+    defs: &HashMap<Word, Instruction>,
+) -> Result<(), String> {
+    let Some(tessellation) = vert.and_then(|meta| meta.tessellation.as_ref()) else {
+        return Ok(());
+    };
+    let Some(control_point_function) = tessellation.control_point_function.as_ref() else {
+        return Ok(());
+    };
+    let function_id = ctx.module.debug_names.iter().find_map(|instruction| {
+        let [Operand::IdRef(id), Operand::LiteralString(name)] = instruction.operands.as_slice()
+        else {
+            return None;
+        };
+        (instruction.class.opcode == Op::Name && name == control_point_function).then_some(*id)
+    });
+    let Some(function_id) = function_id else {
+        return Err(format!(
+            "tessellation control-point function {:?} has no emitted declaration",
+            control_point_function
+        ));
+    };
+    let call_result_type = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| {
+            instruction.class.opcode == Op::FunctionCall
+                && instruction.operands.first() == Some(&Operand::IdRef(function_id))
+        })
+        .and_then(|instruction| instruction.result_type);
+    let Some(call_result_type) = call_result_type else {
+        return Ok(());
+    };
+    let member_types = defs
+        .get(&call_result_type)
+        .filter(|definition| definition.class.opcode == Op::TypeStruct)
+        .map(|definition| {
+            definition
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .ok_or("tessellation control-point accessor must return a struct")?;
+    if member_types.len() != tessellation.control_point_fields.len() {
+        return Err(format!(
+            "tessellation control-point metadata has {} fields but accessor returns {}",
+            tessellation.control_point_fields.len(),
+            member_types.len()
+        ));
+    }
+
+    let mut inputs = Vec::with_capacity(member_types.len());
+    for (member_ty, field) in member_types
+        .iter()
+        .copied()
+        .zip(&tessellation.control_point_fields)
+    {
+        let array_ty = ctx.ty_array(member_ty, tessellation.control_point_count);
+        let pointer_ty = ctx.ty_ptr(StorageClass::Input, array_ty);
+        let var = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pointer_ty),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::Input)],
+        ));
+        decorate_location(&mut ctx.module, var, field.location);
+        ctx.interface.push(var);
+        inputs.push((var, member_ty));
+    }
+
+    for block_idx in 0..ctx.module.functions[entry_idx].blocks.len() {
+        let old =
+            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[block_idx].instructions);
+        let mut rewritten = Vec::with_capacity(old.len());
+        for instruction in old {
+            if instruction.class.opcode != Op::FunctionCall
+                || instruction.operands.first() != Some(&Operand::IdRef(function_id))
+            {
+                rewritten.push(instruction);
+                continue;
+            }
+            let result = instruction
+                .result_id
+                .ok_or("tessellation control-point call has no result")?;
+            let result_type = instruction
+                .result_type
+                .ok_or("tessellation control-point call has no result type")?;
+            if result_type != call_result_type {
+                return Err(
+                    "tessellation control-point accessor has inconsistent return types".into(),
+                );
+            }
+            let index = instruction
+                .operands
+                .get(1)
+                .cloned()
+                .ok_or("tessellation control-point call has no index")?;
+            let mut members = Vec::with_capacity(inputs.len());
+            for (var, member_ty) in &inputs {
+                let member_pointer_ty = ctx.ty_ptr(StorageClass::Input, *member_ty);
+                let pointer = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::AccessChain,
+                    Some(member_pointer_ty),
+                    Some(pointer),
+                    vec![Operand::IdRef(*var), index.clone()],
+                ));
+                let member = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::Load,
+                    Some(*member_ty),
+                    Some(member),
+                    vec![Operand::IdRef(pointer)],
+                ));
+                members.push(Operand::IdRef(member));
+            }
+            rewritten.push(Instruction::new(
+                Op::CompositeConstruct,
+                Some(result_type),
+                Some(result),
+                members,
+            ));
+        }
+        ctx.module.functions[entry_idx].blocks[block_idx].instructions = rewritten;
+    }
+    Ok(())
 }
 
 /// Materialize a UniformConstant image for each argument-buffer-embedded texture the meta
@@ -1260,22 +1723,36 @@ pub(super) fn build_stage_input(
 fn register_embedded_textures(
     ctx: &mut Ctx,
     entry_idx: usize,
-    kern: Option<&KernMeta>,
+    embedded: Option<&[crate::meta::EmbeddedTexture]>,
     binding_ctr: &mut u32,
 ) {
-    let Some(kern) = kern else { return };
-    if kern.embedded_textures.is_empty() {
+    let Some(embedded) = embedded else { return };
+    if embedded.is_empty() {
         return;
     }
-    let embedded = kern.embedded_textures.clone();
     let mut loads: Vec<Instruction> = vec![];
-    for tex in embedded {
-        let image_ty = if let Some(format) = tex.storage_format {
-            ctx.ty_storage_image(tex.dim, false, format.to_spirv_format(), tex.comp)
-        } else {
-            ctx.ty_image(tex.dim, false, tex.comp)
+    let mut replacements = Vec::new();
+    for tex in embedded.iter().copied() {
+        if tex.array_length == Some(0) {
+            continue;
+        }
+        let Some(buffer_root) = ctx.module.functions[entry_idx]
+            .parameters
+            .get(tex.buffer_param_index as usize)
+            .and_then(|parameter| parameter.result_id)
+        else {
+            continue;
         };
-        let pptr = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
+        let image_ty = if let Some(format) = tex.storage_format {
+            ctx.ty_storage_image(tex.dim, tex.arrayed, format.to_spirv_format(), tex.comp)
+        } else {
+            ctx.ty_image(tex.dim, tex.arrayed, tex.comp)
+        };
+        let binding_ty = tex
+            .array_length
+            .map(|length| ctx.ty_array(image_ty, length))
+            .unwrap_or(image_ty);
+        let pptr = ctx.ty_ptr(StorageClass::UniformConstant, binding_ty);
         let var = ctx.module.fresh_id();
         ctx.new_globals.push(Instruction::new(
             Op::Variable,
@@ -1291,6 +1768,28 @@ fn register_embedded_textures(
         );
         decorate_binding(&mut ctx.module, var, binding);
         ctx.interface_buffer_var(var); // SPIR-V 1.4+ lists every resource on the entry interface.
+        if let Some(length) = tex.array_length {
+            ctx.image_array_vars
+                .insert(var, (image_ty, (tex.dim, tex.arrayed), tex.comp, false));
+            for fact in &mut ctx.emit_sidecar.buffer_pointer_field_loads {
+                let end = u64::from(tex.field_offset) + u64::from(length) * 8;
+                if fact.root == buffer_root
+                    && fact.byte_offset >= u64::from(tex.field_offset)
+                    && fact.byte_offset < end
+                    && (fact.byte_offset - u64::from(tex.field_offset)) % 8 == 0
+                {
+                    fact.root = var;
+                    fact.byte_offset -= u64::from(tex.field_offset);
+                }
+            }
+            for fact in &mut ctx.emit_sidecar.buffer_pointer_dynamic_field_loads {
+                if fact.root == buffer_root && fact.byte_offset == u64::from(tex.field_offset) {
+                    fact.root = var;
+                    fact.byte_offset = 0;
+                }
+            }
+            continue;
+        }
         let lid = ctx.module.fresh_id();
         loads.push(Instruction::new(
             Op::Load,
@@ -1298,11 +1797,23 @@ fn register_embedded_textures(
             Some(lid),
             vec![Operand::IdRef(var)],
         ));
-        ctx.image_dims.insert(lid, (tex.dim, false));
+        ctx.image_dims.insert(lid, (tex.dim, tex.arrayed));
         ctx.image_comp.insert(lid, tex.comp);
         if tex.storage_format.is_some() {
             ctx.image_storage.insert(lid);
         }
+        replacements.extend(
+            ctx.emit_sidecar
+                .buffer_pointer_field_loads
+                .iter()
+                .filter(|fact| {
+                    fact.root == buffer_root && fact.byte_offset == u64::from(tex.field_offset)
+                })
+                .map(|fact| (fact.id, lid)),
+        );
+    }
+    for (placeholder, image) in replacements {
+        replace_id_in_function(&mut ctx.module.functions[entry_idx], placeholder, image);
     }
     // Insert the loads at the top of the entry block, AFTER any leading OpVariables (SPIR-V requires
     // function-local OpVariables to be the first instructions of the entry block). apply_bindings
@@ -1317,35 +1828,6 @@ fn register_embedded_textures(
             first.instructions.insert(at + k, ld);
         }
     }
-}
-
-fn kernel_stage_input_bindings(kern: Option<&KernMeta>) -> HashMap<u32, u32> {
-    let Some(kern) = kern else {
-        return HashMap::new();
-    };
-    let mut occupied = kern
-        .roles
-        .iter()
-        .filter_map(|(_, role)| match role {
-            KernRole::Buffer(binding) | KernRole::AccelerationStructureShadow(binding) => {
-                Some(*binding)
-            }
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
-    let mut next = 0u32;
-    let mut out = HashMap::new();
-    for (idx, role) in &kern.roles {
-        if !matches!(role, KernRole::StageInput(_)) {
-            continue;
-        }
-        while occupied.contains(&next) {
-            next = next.saturating_add(1);
-        }
-        occupied.insert(next);
-        out.insert(*idx, next);
-    }
-    out
 }
 
 impl Ctx {
@@ -1422,6 +1904,40 @@ mod tests {
 
     fn ty(op: Op, id: u32, operands: Vec<Operand>) -> Instruction {
         Instruction::new(op, None, Some(id), operands)
+    }
+
+    #[test]
+    fn tess_coord_binding_preserves_float3_and_only_truncates_float2() {
+        let mut defs = HashMap::new();
+        defs.insert(1, ty(Op::TypeFloat, 1, vec![Operand::LiteralBit32(32)]));
+        defs.insert(
+            2,
+            ty(
+                Op::TypeVector,
+                2,
+                vec![Operand::IdRef(1), Operand::LiteralBit32(2)],
+            ),
+        );
+        defs.insert(
+            3,
+            ty(
+                Op::TypeVector,
+                3,
+                vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
+            ),
+        );
+        defs.insert(
+            4,
+            ty(
+                Op::TypeVector,
+                4,
+                vec![Operand::IdRef(1), Operand::LiteralBit32(4)],
+            ),
+        );
+
+        assert_eq!(tess_coord_prefix_lanes(&defs, 3, 1), Ok(None));
+        assert_eq!(tess_coord_prefix_lanes(&defs, 2, 1), Ok(Some(2)));
+        assert!(tess_coord_prefix_lanes(&defs, 4, 1).is_err());
     }
 
     // A fragment Input of integer (or 64-bit float) component type cannot be interpolated and needs a
@@ -1619,7 +2135,7 @@ mod tests {
             .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
             .collect::<HashMap<_, _>>();
         let mut ctx = Ctx::new(module);
-        split_workgroup_block_type_aliases(&mut ctx, &[(13, 5)], &mut defs);
+        split_explicit_layout_type_aliases(&mut ctx, &[(13, 5)], &mut defs);
 
         let pointer_pointee = |id| {
             defs.get(&id)
@@ -1662,5 +2178,126 @@ mod tests {
         assert!(root_pos < pointer_pos, "clone defined before pointer use");
         assert_eq!(ctx.ty_ptr(StorageClass::Workgroup, workgroup_root), 8);
         assert_ne!(ctx.ty_ptr(StorageClass::Workgroup, 7), 8);
+    }
+
+    #[test]
+    fn split_explicit_layout_aliases_isolates_function_only_structs() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20));
+        module.types_global_values = vec![
+            ty(
+                Op::TypeInt,
+                1,
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            ty(Op::TypeStruct, 2, vec![Operand::IdRef(1)]),
+            ty(
+                Op::TypePointer,
+                3,
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(2),
+                ],
+            ),
+            ty(
+                Op::TypePointer,
+                4,
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(2),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(4),
+                Some(5),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+        ];
+
+        let mut defs = module
+            .types_global_values
+            .iter()
+            .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+            .collect::<HashMap<_, _>>();
+        let mut ctx = Ctx::new(module);
+        split_explicit_layout_type_aliases(&mut ctx, &[(5, 2)], &mut defs);
+
+        let pointee = |id| match defs.get(&id).and_then(|inst| inst.operands.get(1)) {
+            Some(Operand::IdRef(pointee)) => *pointee,
+            _ => panic!("pointer pointee"),
+        };
+        assert_ne!(pointee(3), 2, "Function pointer receives undecorated clone");
+        assert_eq!(pointee(4), 2, "StorageBuffer keeps laid-out type");
+    }
+
+    #[test]
+    fn split_explicit_layout_aliases_isolates_nested_block_root() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20));
+        module.types_global_values = vec![
+            ty(
+                Op::TypeInt,
+                1,
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            ty(Op::TypeStruct, 2, vec![Operand::IdRef(1)]),
+            ty(Op::TypeStruct, 3, vec![Operand::IdRef(2)]),
+            ty(
+                Op::TypePointer,
+                4,
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(2),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(4),
+                Some(5),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            ty(
+                Op::TypePointer,
+                6,
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(6),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+        ];
+        let mut defs = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+            .collect::<HashMap<_, _>>();
+        let mut ctx = Ctx::new(module);
+
+        split_explicit_layout_type_aliases(&mut ctx, &[(5, 2), (7, 3)], &mut defs);
+
+        let nested = match defs
+            .get(&3)
+            .and_then(|definition| definition.operands.first())
+        {
+            Some(Operand::IdRef(member)) => *member,
+            _ => panic!("outer block member"),
+        };
+        assert_ne!(nested, 2, "nested occurrence receives a non-Block clone");
+        assert_eq!(
+            defs.get(&nested).map(|definition| definition.class.opcode),
+            Some(Op::TypeStruct)
+        );
+        assert_eq!(
+            defs.get(&2)
+                .and_then(|definition| definition.operands.first()),
+            Some(&Operand::IdRef(1)),
+            "independently bound root remains unchanged"
+        );
     }
 }

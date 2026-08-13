@@ -106,14 +106,11 @@ fn emit_vulkan_spirv_inner(
     buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
     // Lower `air.simdgroup_async_copy_2d` (+ its event/wait pair) to an explicit strided tile copy
-    // before parse. Unconditional and byte-VERIFIED: the only regression case
-    // (12/6ed53a6a `structuredSparse_2_4_1d`) now translates and runs byte-EXACT against Apple's golden
-    // on this Mac's GPU via MoltenVK. Its SECOND wall (a Private-demoted pointer arm over-indexed as an
-    // array) is fixed by the FC-promote/prune/PSB retry tiers, which see this lowering because the
-    // production entry (`translate_sanitized_native_with_options`) applies it up front to `san_ll`
-    // before the retries re-emit. This entry's own copy is retained for direct callers; already-lowered
-    // text is a no-op guard. See `async_copy` + journal AIR2VK-ASYNC-COPY-CLEAR. floor-safe: only fires
-    // on async-copy modules, which fail the emitter outright otherwise.
+    // before parse. Modules that also need pointer cleanup are handled by the ordinary retry tiers,
+    // which see this lowering because the production entry applies it before re-emission. This
+    // entry's copy is retained for direct callers; already-lowered text is a no-op guard. See
+    // `async_copy` and its structural regression tests. Floor-safe: only fires on async-copy modules,
+    // which fail the emitter outright otherwise.
     let san_ll = async_copy::lower_simdgroup_async_copy(san_ll);
     // Scalarize any scalar/vector pointer-merge before parse (floor-safe: a no-op unless the module
     // carries a `<N x T>*`/`T*` merge the emitter rejects outright). See `vec_scalar_merge`.
@@ -144,7 +141,7 @@ fn finalize_emission(
 /// SROA store-forwards the staging away, leaving the device buffer pointer used directly — a shape the
 /// emitter accepts. Byte-neutral (inlining + store-forwarding preserve semantics exactly) and
 /// floor-safe (an adopt-if-validates retry tier; both passes are no-ops on a module lacking the shape).
-/// See [`inline`] and [`sroa`].
+/// See the internal `inline` and `sroa` modules.
 pub fn emit_vulkan_spirv_inline_sroa(san_ll: &str) -> Result<Vec<u8>, String> {
     let kern = meta::parse_air_kernel_meta(san_ll);
     let entry_name = meta::entry_name(san_ll, "kernel");
@@ -168,6 +165,21 @@ pub(crate) fn emit_vulkan_spirv_inline_sroa_with_sidecar(
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&sroad);
     let parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
     finalize_emission(Emitter::new(parsed), buffer_layouts)
+}
+
+pub(crate) fn emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
+    san_ll: &str,
+    selected_pointer: &str,
+    kern: Option<&meta::KernMeta>,
+    entry_name: Option<&str>,
+    buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
+) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
+    let inlined = inline::inline_pointer_select_consumer(san_ll, entry_name, selected_pointer);
+    let parsed = LlModule::parse_with_stage_meta(&inlined, kern, entry_name)?;
+    // Inserting a multiblock helper at a callsite can make the ordinary structurizer's local clone
+    // heuristics expand a large entry CFG. Emit the exact rewritten blocks as a bounded relooper feed;
+    // the retry owns the whole-module structurization and adopts only validating output.
+    finalize_emission(Emitter::new(parsed).with_relooper_feed(), buffer_layouts)
 }
 
 /// Like [`emit_vulkan_spirv_inline_sroa`], but ALSO models every device/constant buffer raw (the
@@ -351,7 +363,8 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
 /// emit gap). Byte-correct by construction: the stored bytes are the exact loaded address, the deref
 /// is `address + offset` with no tag-bit manipulation (verified across the cluster), and the address
 /// is a real Vulkan device address under `buffer_device_address`. The default Logical emit is never
-/// altered (this is an adopt-if-validates retry tier). See [`Emitter::with_bda_device_pointers`].
+/// altered (this is an adopt-if-validates retry tier). The internal emitter's
+/// `with_bda_device_pointers` mode owns the address conversion.
 pub fn emit_vulkan_spirv_all_buffers_raw_bda(san_ll: &str) -> Result<Vec<u8>, String> {
     let kern = meta::parse_air_kernel_meta(san_ll);
     let entry_name = meta::entry_name(san_ll, "kernel");

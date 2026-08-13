@@ -22,8 +22,8 @@
 //! the floor, no regression). Decides purely from IR structure (block edges, dominance, value
 //! def/use), never a shader name.
 
-use super::exit_check::dominator_sets;
 use super::graph::spirv_block_successors_by_label;
+use super::EmittedDominators;
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Function, Instruction, Module};
 use spirv::{Op, StorageClass, Word};
@@ -141,12 +141,10 @@ fn demote_in_function(
         }
     }
     let successors = spirv_block_successors_by_label(&function.blocks);
-    let doms = dominator_sets(entry, &labels, &successors);
+    let dominators = EmittedDominators::new(entry, &labels, &successors);
     // A block whose dominators were not computed (unreachable) dominates nothing reachable and is
     // dominated by nothing — treat as non-dominating so its dead uses are left alone.
-    let dominates = |a_label: Word, b_label: Word| -> bool {
-        doms.get(&b_label).is_some_and(|s| s.contains(&a_label))
-    };
+    let dominates = |a_label: Word, b_label: Word| dominators.dominates(a_label, b_label);
 
     // value id -> (def block index, result type), for every value defined in the function body.
     let mut def_block: HashMap<Word, usize> = HashMap::new();

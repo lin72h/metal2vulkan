@@ -108,7 +108,7 @@ impl LlModule {
                         }
                     }
 
-                    if let Some((object, ptr)) = &inst.store {
+                    if let Some((object, ptr)) = inst.store.as_deref() {
                         if let LlValue::Local(base) = &ptr.value {
                             if self.resolve_known_type(&object.ty) != LlType::Int(8) {
                                 if let Some(root) = byte_gep_aliases.get(base).cloned() {
@@ -233,7 +233,7 @@ impl LlModule {
                         }
                         continue;
                     }
-                    if let Some((true_value, false_value)) = &inst.select_arms {
+                    if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
                         if !matches!(true_value.ty, LlType::Ptr(_))
                             || !matches!(false_value.ty, LlType::Ptr(_))
                         {

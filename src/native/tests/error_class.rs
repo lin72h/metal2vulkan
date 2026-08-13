@@ -1,18 +1,19 @@
 //! S1: the typed error classifiers (`classify_validation_error` / `classify_emit_error`) must be
-//! arm-for-arm equivalent to the legacy `Err(e) if is_*(e)` guard chains in `lib.rs`. These tests
+//! arm-for-arm equivalent to the prior `Err(e) if is_*(e)` guard chains in `lib.rs`. These tests
 //! feed captured/representative spirv-val and native-emitter messages — including the exact
 //! substrings each matcher keys on — and assert the classifier both (a) picks the expected class and
-//! (b) equals the legacy guard chain computed in the same precedence. Pure-static (no external tools).
+//! (b) equals that guard chain computed in the same precedence. Pure-static (no external tools).
 
 use super::super::{
     classify_emit_error, classify_validation_error, is_cfg_structurization_error,
-    is_cross_binding_pointer_merge_error, is_graph_walk_unmigrated_emit_error,
-    is_logical_pointer_phi_error, is_pointer_typing_emit_error, is_pointer_typing_validation_error,
-    EmitErrorClass, ValidationClass,
+    is_cross_binding_pointer_merge_error, is_deferred_pointer_materialization_emit_error,
+    is_graph_walk_unmigrated_emit_error, is_logical_pointer_phi_error,
+    is_pointer_typing_emit_error, is_pointer_typing_validation_error, EmitErrorClass,
+    ValidationClass,
 };
 
-/// The legacy validation guard chain, in lib.rs precedence order — what the classifier must match.
-fn legacy_validation(err: &str) -> ValidationClass {
+/// The prior validation guard chain, in lib.rs precedence order — what the classifier must match.
+fn guard_chain_validation(err: &str) -> ValidationClass {
     if is_pointer_typing_validation_error(err) {
         ValidationClass::PointerTyping
     } else if is_cfg_structurization_error(err) {
@@ -26,8 +27,10 @@ fn legacy_validation(err: &str) -> ValidationClass {
     }
 }
 
-fn legacy_emit(err: &str) -> EmitErrorClass {
-    if is_pointer_typing_emit_error(err) {
+fn guard_chain_emit(err: &str) -> EmitErrorClass {
+    if is_deferred_pointer_materialization_emit_error(err) {
+        EmitErrorClass::DeferredPointerMaterialization
+    } else if is_pointer_typing_emit_error(err) {
         EmitErrorClass::PointerTyping
     } else {
         EmitErrorClass::Other
@@ -94,6 +97,10 @@ const VALIDATION_CASES: &[(&str, ValidationClass)] = &[
 
 const EMIT_CASES: &[(&str, EmitErrorClass)] = &[
     (
+        "native emitter: selected pointer %1557 missing metadata",
+        EmitErrorClass::DeferredPointerMaterialization,
+    ),
+    (
         "native emitter: reinterpret bit width mismatch: buffer pointee 4 vs load 8",
         EmitErrorClass::PointerTyping,
     ),
@@ -136,27 +143,27 @@ const EMIT_CASES: &[(&str, EmitErrorClass)] = &[
 ];
 
 #[test]
-fn validation_classifier_matches_expected_and_legacy_chain() {
+fn validation_classifier_matches_expected_and_guard_chain() {
     for (msg, expected) in VALIDATION_CASES {
         let got = classify_validation_error(msg);
         assert_eq!(got, *expected, "classify_validation_error({msg:?})");
         assert_eq!(
             got,
-            legacy_validation(msg),
-            "classifier diverged from the legacy guard chain for {msg:?}"
+            guard_chain_validation(msg),
+            "classifier diverged from the prior guard chain for {msg:?}"
         );
     }
 }
 
 #[test]
-fn emit_classifier_matches_expected_and_legacy_chain() {
+fn emit_classifier_matches_expected_and_guard_chain() {
     for (msg, expected) in EMIT_CASES {
         let got = classify_emit_error(msg);
         assert_eq!(got, *expected, "classify_emit_error({msg:?})");
         assert_eq!(
             got,
-            legacy_emit(msg),
-            "classifier diverged from the legacy guard chain for {msg:?}"
+            guard_chain_emit(msg),
+            "classifier diverged from the prior guard chain for {msg:?}"
         );
     }
 }
@@ -172,6 +179,16 @@ fn graph_walk_unmigrated_emit_error_is_detected_for_retry_feed_budgeting() {
     ));
 }
 
+#[test]
+fn deferred_pointer_witness_maps_cfg_clone_back_to_source_ssa() {
+    assert_eq!(
+        super::super::deferred_pointer_materialization_name(
+            "native emitter: selected pointer %xa4000000_1557 missing metadata"
+        ),
+        Some("%1557".to_string())
+    );
+}
+
 // The precedence is load-bearing: a message matching BOTH pointer-typing and cfg families must
 // classify as pointer-typing (the first guard arm), exactly as the old chain did.
 #[test]
@@ -183,5 +200,5 @@ fn precedence_prefers_pointer_typing_over_cfg() {
         classify_validation_error(both),
         ValidationClass::PointerTyping
     );
-    assert_eq!(legacy_validation(both), ValidationClass::PointerTyping);
+    assert_eq!(guard_chain_validation(both), ValidationClass::PointerTyping);
 }

@@ -147,9 +147,8 @@ impl Emitter {
         pointee: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if !local_pointer_field_pointee(pointee)
-            || !matches!(self.resolve_type(&object.ty)?, LlType::Ptr(_))
-        {
+        let object_ty = self.resolve_type(&object.ty)?;
+        if !local_pointer_field_pointee(pointee) || !matches!(object_ty, LlType::Ptr(_)) {
             return Ok(false);
         }
         let Some(key) = self.local_pointer_field_key(ptr)? else {
@@ -170,6 +169,8 @@ impl Emitter {
             crate::emit_sidecar::LocalPointerFieldStore {
                 id: zero,
                 source: object_id,
+                root: key.root,
+                indices: key.indices.clone(),
             },
         );
         instructions.push(Self::inst(
@@ -247,6 +248,19 @@ impl Emitter {
             Some(result),
             vec![Operand::IdRef(source)],
         ));
+        // This is only a pointer-typed copy until interface binding gives an opaque AIR resource
+        // parameter its final SPIR-V image/sampler type. Preserve the field identity even on the
+        // emitter's fast path so `recover_inlined_local_pointer_fields` can replace the copy with
+        // its stored source before that retyping. Without this fact, binding a texture held in a
+        // private aggregate rewrites only the operand to an OpTypeImage and leaves an invalid
+        // pointer-typed OpCopyObject behind.
+        self.emit_sidecar.local_pointer_field_loads.push(
+            crate::emit_sidecar::LocalPointerFieldLoad {
+                id: result,
+                root: key.root,
+                indices: key.indices.clone(),
+            },
+        );
         self.pointer_storage
             .insert(result_name.to_string(), storage);
         self.pointer_pointees
@@ -275,7 +289,13 @@ impl Emitter {
         };
         let Some((root, prefix, index, suffix)) = self.local_pointer_dynamic_field_index(ptr)?
         else {
-            return Ok(false);
+            return self.emit_pointer_from_local_multidynamic_field_load(
+                result_name,
+                result,
+                result_ty,
+                ptr,
+                instructions,
+            );
         };
         let values = self
             .local_pointer_fields
@@ -289,21 +309,21 @@ impl Emitter {
                 .then(|| (key.indices[prefix.len()], value.clone()))
             })
             .collect::<Vec<_>>();
+        let index_id = self.value_id_in(&index.value, &index.ty, instructions)?;
+        self.emit_sidecar.local_pointer_dynamic_field_loads.push(
+            crate::emit_sidecar::LocalPointerDynamicFieldLoad {
+                id: result,
+                root,
+                prefix: prefix.clone(),
+                index: index_id,
+                suffix: suffix.clone(),
+            },
+        );
         if values.is_empty() {
             let LlType::Ptr(addrspace) = result_ty else {
                 return Ok(false);
             };
-            let index_id = self.value_id_in(&index.value, &index.ty, instructions)?;
             self.emit_unmodeled_byte_pointer_copy(result_name, result, *addrspace, instructions)?;
-            self.emit_sidecar.local_pointer_dynamic_field_loads.push(
-                crate::emit_sidecar::LocalPointerDynamicFieldLoad {
-                    id: result,
-                    root,
-                    prefix,
-                    index: index_id,
-                    suffix,
-                },
-            );
             return Ok(true);
         }
         let mut values = values;
@@ -327,7 +347,6 @@ impl Emitter {
         let LlType::Int(index_bits) = index_ty else {
             return Ok(false);
         };
-        let index_id = self.value_id_in(&index.value, &index.ty, instructions)?;
         let result_type = self.pointer_aware_type_id(result_ty, Some(&pointer_meta))?;
         let bool_type = self.type_id(&LlType::Bool)?;
 
@@ -374,8 +393,186 @@ impl Emitter {
         self.dynamic_pointer_tables.insert(
             result_name.to_string(),
             DynamicPointerTable {
-                index: index.clone(),
+                selector: index_id,
+                selector_bits: index_bits,
                 entries: values,
+            },
+        );
+        if !self.pointer_phi_values.is_empty() && !self.pointer_nullness.contains_key(result_name) {
+            let is_null = self.const_bool(false)?;
+            self.record_pointer_nullness(result_name.to_string(), is_null);
+        }
+        Ok(true)
+    }
+
+    /// Load from a local pointer table addressed by two or more dynamic aggregate indices. Each
+    /// concrete stored field is selected by the conjunction of its per-dimension index comparisons.
+    /// This is the multidimensional counterpart of `emit_pointer_from_local_dynamic_field_load`:
+    /// it uses only exact store facts for the same aggregate root and never infers an unstored arm.
+    pub(in crate::native::emitter) fn emit_pointer_from_local_multidynamic_field_load(
+        &mut self,
+        result_name: &str,
+        result: Word,
+        result_ty: &LlType,
+        ptr: &TypedValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let LlType::Ptr(_) = result_ty else {
+            return Ok(false);
+        };
+        let LlValue::Local(pointer_name) = &ptr.value else {
+            return Ok(false);
+        };
+        let Some(provenance) = self.gep_provenance.get(pointer_name).cloned() else {
+            return Ok(false);
+        };
+        let LlType::Ptr(addrspace) = self.resolve_type(&ptr.ty)? else {
+            return Ok(false);
+        };
+        if self.pointer_storage_for(&ptr.value, addrspace)? != StorageClass::Function {
+            return Ok(false);
+        }
+        let mut indices = provenance.indices;
+        if indices.len() > 1 && const_index(indices.first()) == Some(0) {
+            indices.remove(0);
+        }
+        let dynamic_positions = indices
+            .iter()
+            .enumerate()
+            .filter_map(|(position, index)| const_index(Some(index)).is_none().then_some(position))
+            .collect::<Vec<_>>();
+        if dynamic_positions.len() < 2 {
+            return Ok(false);
+        }
+
+        let mut values = self
+            .local_pointer_fields
+            .iter()
+            .filter_map(|(key, value)| {
+                if key.root != provenance.root || key.indices.len() != indices.len() {
+                    return None;
+                }
+                let matches_constants = indices.iter().enumerate().all(|(position, index)| {
+                    const_index(Some(index)).is_none()
+                        || const_index(Some(index)) == Some(key.indices[position])
+                });
+                matches_constants.then(|| (key.indices.clone(), value.clone()))
+            })
+            .collect::<Vec<_>>();
+        if values.is_empty() {
+            return Ok(false);
+        }
+        values.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let value_refs = values
+            .iter()
+            .map(|(_, value)| &value.value)
+            .collect::<Vec<_>>();
+        let Some(pointer_meta) = self.pointer_merge_meta(&value_refs, result_ty)? else {
+            return Ok(false);
+        };
+        if !matches!(
+            pointer_meta.storage,
+            StorageClass::StorageBuffer | StorageClass::UniformConstant | StorageClass::Workgroup
+        ) {
+            return Ok(false);
+        }
+
+        let mut dynamic_ids = Vec::with_capacity(dynamic_positions.len());
+        for &position in &dynamic_positions {
+            let index = &indices[position];
+            let LlType::Int(bits) = self.resolve_type(&index.ty)? else {
+                return Ok(false);
+            };
+            let id = self.value_id_in(&index.value, &index.ty, instructions)?;
+            dynamic_ids.push((position, id, bits));
+        }
+        let result_type = self.pointer_aware_type_id(result_ty, Some(&pointer_meta))?;
+        let bool_type = self.type_id(&LlType::Bool)?;
+        let selector_bits = 32;
+        let selector_type = self.type_id(&LlType::Int(selector_bits))?;
+        let mut current = self.value_id_in(&values[0].1.value, &values[0].1.ty, instructions)?;
+        let mut selector = self.const_int(selector_bits, 0)?;
+
+        for (ordinal, (stored_key, stored_value)) in values.iter().enumerate().skip(1) {
+            let stored_id =
+                self.value_id_in(&stored_value.value, &stored_value.ty, instructions)?;
+            let mut condition = None;
+            for &(position, index_id, index_bits) in &dynamic_ids {
+                let expected = self.const_int(index_bits, stored_key[position] as u64)?;
+                let equal = self.fresh();
+                instructions.push(Self::inst(
+                    Op::IEqual,
+                    Some(bool_type),
+                    Some(equal),
+                    vec![Operand::IdRef(index_id), Operand::IdRef(expected)],
+                ));
+                condition = Some(match condition {
+                    None => equal,
+                    Some(previous) => {
+                        let both = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::LogicalAnd,
+                            Some(bool_type),
+                            Some(both),
+                            vec![Operand::IdRef(previous), Operand::IdRef(equal)],
+                        ));
+                        both
+                    }
+                });
+            }
+            let condition = condition.expect("multidynamic field load has at least two indices");
+            let selected = if ordinal + 1 == values.len() {
+                result
+            } else {
+                self.fresh()
+            };
+            instructions.push(Self::inst(
+                Op::Select,
+                Some(result_type),
+                Some(selected),
+                vec![
+                    Operand::IdRef(condition),
+                    Operand::IdRef(stored_id),
+                    Operand::IdRef(current),
+                ],
+            ));
+            current = selected;
+
+            let ordinal_id = self.const_int(selector_bits, ordinal as u64)?;
+            let selected_ordinal = self.fresh();
+            instructions.push(Self::inst(
+                Op::Select,
+                Some(selector_type),
+                Some(selected_ordinal),
+                vec![
+                    Operand::IdRef(condition),
+                    Operand::IdRef(ordinal_id),
+                    Operand::IdRef(selector),
+                ],
+            ));
+            selector = selected_ordinal;
+        }
+        if values.len() == 1 {
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(current)],
+            ));
+        }
+
+        self.record_pointer_meta(result_name.to_string(), pointer_meta);
+        self.dynamic_pointer_tables.insert(
+            result_name.to_string(),
+            DynamicPointerTable {
+                selector,
+                selector_bits,
+                entries: values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ordinal, (_, value))| (ordinal as u32, value))
+                    .collect(),
             },
         );
         if !self.pointer_phi_values.is_empty() && !self.pointer_nullness.contains_key(result_name) {
@@ -431,11 +628,6 @@ impl Emitter {
             return Ok(false);
         };
 
-        let index_ty = self.resolve_type(&table.index.ty)?;
-        let LlType::Int(index_bits) = index_ty else {
-            return Ok(false);
-        };
-        let index_id = self.value_id_in(&table.index.value, &table.index.ty, instructions)?;
         let result_type = self.ptr_type_id(storage, &pointee)?;
         let bool_type = self.type_id(&LlType::Bool)?;
         let result = self.result_id(name, &LlType::Ptr(addrspace))?;
@@ -461,13 +653,13 @@ impl Emitter {
                     indices,
                     instructions,
                 )?;
-                let index_const = self.const_int(index_bits, *stored_index as u64)?;
+                let index_const = self.const_int(table.selector_bits, *stored_index as u64)?;
                 let is_entry = self.fresh();
                 instructions.push(Self::inst(
                     Op::IEqual,
                     Some(bool_type),
                     Some(is_entry),
-                    vec![Operand::IdRef(index_id), Operand::IdRef(index_const)],
+                    vec![Operand::IdRef(table.selector), Operand::IdRef(index_const)],
                 ));
                 let selected = if entry_idx + 1 == table.entries.len() {
                     result

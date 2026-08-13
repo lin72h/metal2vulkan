@@ -62,7 +62,7 @@ pub(in crate::native) fn collect_forward_geps(blocks: &[TirBlock]) -> HashMap<St
     for block in blocks {
         for inst in &block.insts {
             if let (Some(name), Some(gep)) = (&inst.result, &inst.gep) {
-                geps.insert(name.clone(), gep.clone());
+                geps.insert(name.clone(), (**gep).clone());
             }
         }
     }
@@ -245,7 +245,7 @@ pub(in crate::native) fn build_from_blocks(
                 pointer_pointees.insert(name.clone(), pointee.clone());
             }
         }
-        tir_blocks.push(carrier.clone());
+        tir_blocks.push((**carrier).clone());
     }
 
     let (use_pointees, _, byte_view_pointers) = infer_use_pointees(&tir_blocks);
@@ -446,9 +446,9 @@ pub(in crate::native) fn push_inst_line(
     let operands = resolve_operands(line);
     let cmp_predicate = resolve_cmp_predicate(line);
     let mem_align = resolve_mem_align(line);
-    let gep = resolve_gep(line);
+    let gep = resolve_gep(line).map(Box::new);
     let gep_source_ty = gep.as_ref().map(|g| g.source_ty.clone());
-    let call = resolve_call(line);
+    let call = resolve_call(line).map(Box::new);
     let opcode = rhs_of(line)
         .split_whitespace()
         .next()
@@ -480,18 +480,18 @@ pub(in crate::native) fn push_inst_line(
     } else {
         None
     };
-    let bitcast = resolve_bitcast(line, &opcode);
+    let bitcast = resolve_bitcast(line, &opcode).map(Box::new);
     let icmp_rest = resolve_icmp_rest(line, &opcode);
     // Precomputed parse-time views the parse-time pointer-alias / raw-buffer / pointee inferences read
     // off the carrier instead of re-lexing the body text (F-track / T5). Each mirrors the exact expression
     // the inference used, computed once here at lower time; byte-identical by construction, BC-refereed.
     let identity_ptr_bitcast = resolve_identity_ptr_bitcast(line);
     let phi_incoming_values = resolve_phi_incoming_values(line, &opcode);
-    let select_arms = resolve_select_arms(line, &opcode);
-    let load = resolve_load_inst(line, &opcode);
-    let store = resolve_store(line, &opcode);
-    let alias_call = resolve_alias_call(line);
-    let emit_scan_call = resolve_emit_scan_call(line);
+    let select_arms = resolve_select_arms(line, &opcode).map(Box::new);
+    let load = resolve_load_inst(line, &opcode).map(Box::new);
+    let store = resolve_store(line, &opcode).map(Box::new);
+    let alias_call = resolve_alias_call(line).map(Box::new);
+    let emit_scan_call = resolve_emit_scan_call(line).map(Box::new);
     // For a result-LESS call/tail (a VOID call), the strip-commented line the void-call emitter needs for
     // the is_ignored gate + the non-void diagnostic (a value call carries a result and rides `call`).
     let void_call_line = if matches!(opcode.as_str(), "call" | "tail") && result.is_none() {

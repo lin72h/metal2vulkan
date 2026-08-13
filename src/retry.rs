@@ -65,21 +65,31 @@ pub(crate) struct RetryCtx<'a> {
     /// meaningful when `METAL2VULKAN_TIER_CENSUS` is set; the census wrapping is a pure passthrough so
     /// emitted bytes are unchanged whether or not it is on.
     adopted_tier: std::cell::Cell<Option<&'static str>>,
+    /// Whether the large-CFG feed's last validation failure is a control-flow shape the global
+    /// construct tree can change. A pointer/type failure survives CFG-only re-emission, so skipping
+    /// that second full-module candidate avoids a guaranteed-futile memory spike.
+    large_cfg_construct_tree_eligible: std::cell::Cell<bool>,
     /// M-C2 raw re-emit cache. The "every device/constant buffer modeled raw" re-emission
-    /// (`llc_vulkan_spirv_all_buffers_raw` + `finish`) is the shared front of `raw_retry`,
+    /// (`emit_vulkan_spirv_all_buffers_raw` + `finish`) is the shared front of `raw_retry`,
     /// `raw_psb`, and `raw_then_relooper` — up to three cascade sites, each also escalating to the
-    /// `_with_workgroup` variant, so a single cascade recomputed the same expensive llc+emit up to
-    /// ~6×. Memoize each variant's finished `Result` once per translate; every site reuses it.
+    /// `_with_workgroup` variant, so a single cascade recomputed the same expensive native emit up to
+    /// ~6×. Memoize each variant's serialized `Result` once per translate; every site reuses it.
     /// Byte-neutral on the deterministic majority (identical input → identical `finish`), and for a
     /// byte-nondeterministic row it merely makes the three sites agree on ONE valid raw form instead
     /// of drawing three independent samples — both forms are adopt-if-VALIDATES, so pass/fail (hence
     /// G4/G5) is unchanged. `None` = not computed yet; `Some(Err)` caches an emit failure too.
-    raw_reemit_cache: std::cell::RefCell<Option<Result<FinishedModule, String>>>,
-    raw_reemit_wg_cache: std::cell::RefCell<Option<Result<FinishedModule, String>>>,
+    raw_reemit_cache: std::cell::RefCell<Option<Result<Vec<u8>, String>>>,
+    raw_reemit_wg_cache: std::cell::RefCell<Option<Result<Vec<u8>, String>>>,
     /// M-C2 counterpart for BDA re-emission. `bda_retry` runs before `bda_then_relooper`; caching lets
     /// the second tier skip a full BDA feed when the ordinary BDA emit already failed in the
     /// straight-line graph walk.
-    bda_reemit_cache: std::cell::RefCell<Option<Result<FinishedModule, String>>>,
+    bda_reemit_cache: std::cell::RefCell<Option<Result<Vec<u8>, String>>>,
+    /// The construct-tree tier can be reached once by the large-CFG pre-route and again after the
+    /// ordinary primary identifies the same CFG validation class. Its source re-emission, finish,
+    /// and internal retry chain are deterministic for this translation, so retain the final
+    /// adopt/decline verdict and never repeat that work. A declined tier caches only `None`; a
+    /// successful tier retains its serialized bytes, not an owned module graph.
+    construct_tree_retry_cache: std::cell::RefCell<Option<Option<Vec<u8>>>>,
 }
 
 impl<'a> RetryCtx<'a> {
@@ -116,86 +126,88 @@ impl<'a> RetryCtx<'a> {
             retry_debug_on: crate::env_vars::retry_debug(),
             psb_retry_enabled,
             adopted_tier: std::cell::Cell::new(None),
+            large_cfg_construct_tree_eligible: std::cell::Cell::new(true),
             raw_reemit_cache: std::cell::RefCell::new(None),
             raw_reemit_wg_cache: std::cell::RefCell::new(None),
             bda_reemit_cache: std::cell::RefCell::new(None),
+            construct_tree_retry_cache: std::cell::RefCell::new(None),
         }
     }
 
-    /// Memoized "all device/constant buffers raw" re-emission (`llc_vulkan_spirv_all_buffers_raw` +
+    /// Memoized "all device/constant buffers raw" re-emission (`emit_vulkan_spirv_all_buffers_raw` +
     /// `finish`), computed once per translate and shared by `raw_retry`/`raw_psb`/`raw_then_relooper`.
-    /// Returns a clone of the cached `Result` (both the finished carrier and the `Err` emit-failure
-    /// string are preserved so each site's debug logging is unchanged). See `raw_reemit_cache`.
-    fn raw_reemit_finished(&self) -> Result<FinishedModule, String> {
+    /// Retain only serialized bytes, not the much larger owned module graph, so later retry tiers can
+    /// build one candidate at a time within the per-translation memory ceiling.
+    fn raw_reemit_finished(&self) -> Result<Vec<u8>, String> {
         let mut cache = self.raw_reemit_cache.borrow_mut();
         if cache.is_none() {
             *cache = Some(
-                tools::llc_vulkan_spirv_all_buffers_raw_with_sidecar(
+                tools::emit_vulkan_spirv_all_buffers_raw_with_sidecar(
                     self.san_ll,
                     self.tmp,
                     self.kern,
                     self.entry_name,
                     self.buffer_layouts(),
                 )
-                .and_then(|b| self.finish_carrier(b)),
+                .and_then(|b| self.finish(b)),
             );
         }
         cache.as_ref().unwrap().clone()
     }
 
     fn raw_reemit(&self) -> Result<Vec<u8>, String> {
-        self.raw_reemit_finished().map(|finished| finished.bytes)
+        self.raw_reemit_finished()
     }
 
     /// Memoized `_with_workgroup` escalation of [`Self::raw_reemit_finished`] (threadgroup buffers
     /// modeled raw too). Shared by the same three sites' `or_else` fallbacks.
-    fn raw_reemit_wg_finished(&self) -> Result<FinishedModule, String> {
+    fn raw_reemit_wg_finished(&self) -> Result<Vec<u8>, String> {
         let mut cache = self.raw_reemit_wg_cache.borrow_mut();
         if cache.is_none() {
             *cache = Some(
-                tools::llc_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
+                tools::emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
                     self.san_ll,
                     self.tmp,
                     self.kern,
                     self.entry_name,
                     self.buffer_layouts(),
                 )
-                .and_then(|b| self.finish_carrier(b)),
+                .and_then(|b| self.finish(b)),
             );
         }
         cache.as_ref().unwrap().clone()
     }
 
     fn raw_reemit_wg(&self) -> Result<Vec<u8>, String> {
-        self.raw_reemit_wg_finished().map(|finished| finished.bytes)
+        self.raw_reemit_wg_finished()
     }
 
-    fn bda_reemit_finished(&self) -> Result<FinishedModule, String> {
+    fn bda_reemit_finished(&self) -> Result<Vec<u8>, String> {
         let mut cache = self.bda_reemit_cache.borrow_mut();
         if cache.is_none() {
             *cache = Some(
-                tools::llc_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
+                tools::emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
                     self.san_ll,
                     self.tmp,
                     self.kern,
                     self.entry_name,
                     self.buffer_layouts(),
                 )
-                .and_then(|b| self.finish_carrier(b)),
+                .and_then(|b| self.finish(b)),
             );
         }
         cache.as_ref().unwrap().clone()
     }
 
     fn bda_reemit(&self) -> Result<Vec<u8>, String> {
-        self.bda_reemit_finished().map(|finished| finished.bytes)
+        self.bda_reemit_finished()
     }
 
     /// Raw re-emission whose rejected-CFG repair is intentionally skipped because this caller feeds
     /// the bytes straight to the relooper. This is a fallback only after both normal raw emissions
     /// exhausted their repair budget, so existing raw retry output remains byte-identical.
     fn raw_reemit_relooper_feed(&self) -> Result<Vec<u8>, String> {
-        tools::llc_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
+        tools::emit_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
@@ -203,6 +215,75 @@ impl<'a> RetryCtx<'a> {
             self.buffer_layouts(),
         )
         .and_then(|b| self.finish(b))
+    }
+
+    /// Fast composition for a validator-proven raw-buffer typing failure that also needs CFG
+    /// structurization. The feed emitter deliberately omits the native structured-plan search: its
+    /// output is consumed immediately by the relooper, which reconstructs structured control flow
+    /// from the same reachable CFG. As with every retry, no bytes are adopted unless the resulting
+    /// module independently validates.
+    pub(crate) fn raw_feed_then_relooper(&self) -> Option<Vec<u8>> {
+        let raw_feed = self.raw_reemit_relooper_feed();
+        if self.retry_debug_on {
+            if let Err(e) = &raw_feed {
+                eprintln!("[retry-debug] raw_feed_then_relooper: raw feed emit failed: {e}");
+            }
+        }
+        raw_feed.ok().and_then(|mut bytes| {
+            if self.record_large_cfg_feed_validation("raw_feed_then_relooper(feed)", &bytes) {
+                return Some(bytes);
+            }
+            // Source-level block counts can fit the relooper while interface/CFG legalization
+            // expands the emitted function beyond its hard cap. A non-CFG validator error from
+            // that feed must not suppress construct-tree: the relooper cannot consume this graph,
+            // and construct-tree is still the sole owner of its source-level control flow.
+            if emitted_graph_exceeds_relooper_cap(&bytes) {
+                self.large_cfg_construct_tree_eligible.set(true);
+            }
+            // Interface lowering can turn an AIR pointer phi over texture parameters into an
+            // image-object phi while retaining the stale pointer result type. Lower that proven
+            // image-only closure into value-domain reads before the relooper analyzes pointer SSA;
+            // otherwise it may rematerialize an already-invalid pointer carrier.
+            if let Ok(mut module) = load_bytes(&bytes) {
+                if native::rewrite_opaque_image_selects_module(&mut module).is_ok() {
+                    bytes = module_bytes(&module);
+                    if self.record_large_cfg_feed_validation(
+                        "raw_feed_then_relooper(feed+opaque_image)",
+                        &bytes,
+                    ) {
+                        return Some(bytes);
+                    }
+                    if emitted_graph_exceeds_relooper_cap(&bytes) {
+                        self.large_cfg_construct_tree_eligible.set(true);
+                    }
+                }
+            }
+            self.adopt_relooped_raw(&bytes)
+        })
+    }
+
+    fn record_large_cfg_feed_validation(&self, label: &str, bytes: &[u8]) -> bool {
+        match tools::spirv_val_bytes(bytes, self.tmp) {
+            Ok(()) => {
+                self.large_cfg_construct_tree_eligible.set(false);
+                true
+            }
+            Err(error) => {
+                self.large_cfg_construct_tree_eligible.set(
+                    native::classify_validation_error(&error)
+                        == native::ValidationClass::CfgStructurization,
+                );
+                if self.retry_debug_on {
+                    let head = error.lines().take(4).collect::<Vec<_>>().join(" | ");
+                    eprintln!("[retry-debug] {label}: emitted, spirv-val failed: {head}");
+                }
+                false
+            }
+        }
+    }
+
+    pub(crate) fn large_cfg_construct_tree_eligible(&self) -> bool {
+        self.large_cfg_construct_tree_eligible.get()
     }
 
     /// M-C1 census passthrough: tag `r` with the invocation-site label `tier` when it is `Some` (a
@@ -308,7 +389,8 @@ impl<'a> RetryCtx<'a> {
         self.raw_reemit_finished()
             .ok()
             .or_else(|| self.raw_reemit_wg_finished().ok())
-            .is_some_and(|finished| native::module_has_wide_raw_store_guard(&finished.module))
+            .and_then(|bytes| load_bytes(&bytes).ok())
+            .is_some_and(|module| native::module_has_wide_raw_store_guard(&module))
     }
 
     // M4 phi-the-index retry — an illegal logical-pointer `OpPhi` (a pointer phi in Private/
@@ -437,11 +519,11 @@ impl<'a> RetryCtx<'a> {
             return Some(valid);
         }
         // The raw model can expose a large but reducible CFG to the PSB rewrite. When the rewrite
-        // adds physical-address setup inside that graph, legacy merge repair can leave an invalid
+        // adds physical-address setup inside that graph, retained merge repair can leave an invalid
         // back-edge even though the same raw traffic is otherwise sound. Structure the raw module
         // first, then apply the identical whole-buffer PSB lowering to the rebuilt graph. This is
         // the same generic raw → relooper → PSB composition used by `raw_then_relooper`; it runs
-        // only after the existing raw-PSB result failed validation, so successful legacy output is
+        // only after the existing raw-PSB result failed validation, so successful pre-relooper output is
         // byte-identical.
         let relooped = native::rewrite_to_relooper_module(&mut raw_module);
         if self.retry_debug_on {
@@ -529,7 +611,7 @@ impl<'a> RetryCtx<'a> {
             return None;
         }
         let kern_p = self.promoted_kern?;
-        let emit = tools::llc_vulkan_spirv_with_sidecar(
+        let emit = tools::emit_vulkan_spirv_with_sidecar(
             self.san_ll,
             self.tmp,
             Some(kern_p),
@@ -572,7 +654,7 @@ impl<'a> RetryCtx<'a> {
             return None;
         }
         let kern_p = self.promoted_kern?;
-        let emitted = tools::llc_vulkan_spirv_with_sidecar(
+        let emitted = tools::emit_vulkan_spirv_with_sidecar(
             self.san_ll,
             self.tmp,
             Some(kern_p),
@@ -611,12 +693,21 @@ impl<'a> RetryCtx<'a> {
     // construction (exact loaded address bits, no tag-bit manipulation across the cluster); `synth=false`
     // so byte-axis [M]/pending like the other PSB-tier clears.
     pub(crate) fn bda_retry(&self) -> Option<Vec<u8>> {
-        self.bda_reemit().ok().filter(|b| self.validates(b))
+        let bytes = match self.bda_reemit() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                if self.retry_debug_on {
+                    eprintln!("[retry-debug] bda emit/finish failed: {error}");
+                }
+                return None;
+            }
+        };
+        self.validates_dbg("bda", &bytes).then_some(bytes)
     }
 
     /// BDA + relooper retry: the BDA physical-address model clears raw `store ptr addrspace(1)`
-    /// shapes, but loop-budget instrumentation can leave the emitted CFG needing the same relooper
-    /// repair as the raw retry path. Emit a BDA relooper-feed intermediate, rebuild the CFG, and adopt
+    /// shapes, but the resulting CFG can still need the same relooper repair as the raw retry path.
+    /// Emit a BDA relooper-feed intermediate, rebuild the CFG, and adopt
     /// only if the final module validates. Plain [`Self::bda_retry`] stays first so existing BDA wins
     /// keep their bytes. If the ordinary BDA emit already failed in the straight-line typed graph
     /// walk, skip the feed because CFG repair cannot make the missing body opcode emit.
@@ -631,7 +722,7 @@ impl<'a> RetryCtx<'a> {
                 return None;
             }
         }
-        let fed = tools::llc_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
+        let fed = tools::emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
@@ -664,7 +755,7 @@ impl<'a> RetryCtx<'a> {
     // store-forwarding preserve semantics), adopt-if-validates so floor-safe.
     pub(crate) fn inline_sroa_retry(&self) -> Option<Vec<u8>> {
         let debug = crate::env_vars::retry_debug();
-        let emitted = tools::llc_vulkan_spirv_inline_sroa_with_sidecar(
+        let emitted = tools::emit_vulkan_spirv_inline_sroa_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
@@ -691,7 +782,7 @@ impl<'a> RetryCtx<'a> {
             return Some(bytes);
         }
         // Relooper escalation on the SAME emitted bytes (no re-emit): the collapsed module can be
-        // right in every way EXCEPT its control flow — the legacy repair mishandles the collapsed
+        // right in every way EXCEPT its control flow — retained merge repair can mishandle the collapsed
         // loops' merge nesting (the astc class: a loop's declared merge stranded outside its
         // enclosing selection). The relooper structures any reducible CFG byte-neutrally.
         let r = load_relooper_module(&bytes).map(|module| module_bytes(&module));
@@ -704,6 +795,52 @@ impl<'a> RetryCtx<'a> {
             .filter(|b| self.validates_dbg("inline_sroa_relooped", b))
     }
 
+    /// Remove only call boundaries that consume pointer-select results. Unlike the broad historical
+    /// inline+SROA tier, this has work proportional to the diagnosed helper bodies rather than the
+    /// complete internal call graph.
+    pub(crate) fn pointer_select_consumer_inline_retry(
+        &self,
+        selected_pointer: &str,
+    ) -> Option<Vec<u8>> {
+        let emitted = tools::emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
+            self.san_ll,
+            selected_pointer,
+            self.tmp,
+            self.kern,
+            self.entry_name,
+            self.buffer_layouts(),
+        )
+        .and_then(|module| self.finish(module));
+        if self.retry_debug_on {
+            if let Err(error) = &emitted {
+                eprintln!("[retry-debug] pointer-select consumer inline failed: {error}");
+            }
+        }
+        let feed = emitted.ok()?;
+        if self.validates_dbg("pointer_select_consumer_inline", &feed) {
+            return Some(feed);
+        }
+        if self.retry_debug_on {
+            if let Some(path) = crate::env_vars::retry_dump() {
+                let path = std::path::PathBuf::from(path).with_extension("consumer-inline.spv");
+                if std::fs::write(&path, &feed).is_ok() {
+                    eprintln!(
+                        "[retry-debug] wrote failing pointer-select consumer module to {path:?}"
+                    );
+                }
+            }
+        }
+        let relooped = load_relooper_module(&feed).map(|module| module_bytes(&module));
+        if self.retry_debug_on {
+            if let Err(error) = &relooped {
+                eprintln!("[retry-debug] pointer-select consumer relooper failed: {error}");
+            }
+        }
+        let bytes = relooped.ok()?;
+        self.validates_dbg("pointer_select_consumer_inline_relooped", &bytes)
+            .then_some(bytes)
+    }
+
     // Escalation of `inline_sroa_retry`: after the inline+SROA collapse, the surviving device buffers
     // are byte-addressed and the kernel loads/stores typed values (float/uint) at byte offsets — a
     // reinterpret Logical typed emit cannot express (invalid `OpLoad %float` from a `uchar*`, or an
@@ -712,7 +849,7 @@ impl<'a> RetryCtx<'a> {
     // lower the `%10` pointer array to a direct select over byte buffers, and raw to make the typed
     // byte-offset access on them legal. Adopt-if-validates, so floor-safe.
     pub(crate) fn inline_sroa_raw_retry(&self) -> Option<Vec<u8>> {
-        let r = tools::llc_vulkan_spirv_inline_sroa_raw_with_sidecar(
+        let r = tools::emit_vulkan_spirv_inline_sroa_raw_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
@@ -785,7 +922,7 @@ impl<'a> RetryCtx<'a> {
     // phi into 64-bit addresses. Adopt ONLY if it independently validates — floor-safe by construction
     // (a case that emits+validates on the default path never reaches here).
     pub(crate) fn inline_sroa_raw_cfg_restructure_retry(&self) -> Option<Vec<u8>> {
-        let r = tools::llc_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
+        let r = tools::emit_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
@@ -841,22 +978,118 @@ impl<'a> RetryCtx<'a> {
     /// R2 construct-tree own-arm retry. Re-emits the normal Logical model with only the bounded
     /// construct-tree candidate enabled, and adopts it only if the finished module validates.
     pub(crate) fn construct_tree_retry(&self) -> Option<Vec<u8>> {
-        let r = tools::llc_vulkan_spirv_construct_tree_with_sidecar(
+        if let Some(cached) = self.construct_tree_retry_cache.borrow().as_ref() {
+            if self.retry_debug_on {
+                eprintln!("[retry-debug] construct_tree: reused cached verdict");
+            }
+            return cached.clone();
+        }
+        let result = self.construct_tree_retry_uncached();
+        *self.construct_tree_retry_cache.borrow_mut() = Some(result.clone());
+        result
+    }
+
+    fn construct_tree_retry_uncached(&self) -> Option<Vec<u8>> {
+        if self.retry_debug_on {
+            eprintln!("[retry-debug] construct_tree: emit start");
+        }
+        let emitted = tools::emit_vulkan_spirv_construct_tree_with_sidecar(
             self.san_ll,
             self.tmp,
             self.kern,
             self.entry_name,
             self.buffer_layouts(),
-        )
-        .and_then(|b| self.finish(b));
+        );
+        if self.retry_debug_on {
+            if let Ok(emitted) = &emitted {
+                let blocks = emitted
+                    .module
+                    .functions
+                    .iter()
+                    .map(|function| function.blocks.len())
+                    .sum::<usize>();
+                let instructions = emitted
+                    .module
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.blocks)
+                    .map(|block| block.instructions.len())
+                    .sum::<usize>();
+                let operands = emitted
+                    .module
+                    .functions
+                    .iter()
+                    .flat_map(|function| &function.blocks)
+                    .flat_map(|block| &block.instructions)
+                    .map(|instruction| instruction.operands.len())
+                    .sum::<usize>();
+                let global_instructions = emitted.module.global_inst_iter().count();
+                let global_operands = emitted
+                    .module
+                    .global_inst_iter()
+                    .map(|instruction| instruction.operands.len())
+                    .sum::<usize>();
+                let sidecar = &emitted.sidecar;
+                eprintln!(
+                    "[retry-debug] construct_tree: emit complete blocks={blocks} instructions={instructions} operands={operands} globals={global_instructions} global-operands={global_operands} sidecar-address={} sidecar-buffer-fields={} sidecar-local-stores={} sidecar-local-loads={} sidecar-local-dynamic={}",
+                    sidecar.buffer_address_words.len(),
+                    sidecar.buffer_pointer_field_loads.len()
+                        + sidecar.buffer_pointer_dynamic_field_loads.len(),
+                    sidecar.local_pointer_field_stores.len(),
+                    sidecar.local_pointer_field_loads.len(),
+                    sidecar.local_pointer_dynamic_field_loads.len(),
+                );
+            } else {
+                eprintln!("[retry-debug] construct_tree: emit failed");
+            }
+        }
+        let r = emitted.and_then(|emitted| {
+            if self.retry_debug_on {
+                eprintln!("[retry-debug] construct_tree: finish start");
+            }
+            self.finish(emitted)
+        });
         if self.retry_debug_on {
             if let Err(e) = &r {
                 eprintln!("[retry-debug] construct_tree emit failed: {e}");
             }
         }
         let finished = r.ok()?;
+        // Keep the retry dump contract useful when the primary emitter cannot produce bytes: the
+        // construct-tree candidate is then the first complete module available for inspecting a
+        // finish-time validation failure. Diagnostics remain best-effort and never affect routing.
+        if let Some(path) = crate::env_vars::retry_dump() {
+            let _ = std::fs::write(path, &finished);
+        }
         if self.validates_dbg("construct_tree", &finished) {
             return Some(finished);
+        }
+        // Structuring and emitted-helper inlining can expose pure pointer phis whose values are
+        // unused (for example opaque callback fields that are structurally always null). Their dead
+        // `OpConstantNull %_ptr_UniformConstant_*` producer is independently invalid under Vulkan's
+        // Logical addressing rules even though neither the phi nor the producer has a semantic use.
+        // Reuse the module-wide transitive DCE from the constant-prune retry before trying
+        // representation-changing pointer rewrites. The retry is adopt-if-validates and the pass
+        // removes only values unreachable from side effects/module roots.
+        if let Some(pruned) = self.prune_retry(&finished) {
+            if self.retry_debug_on {
+                eprintln!("[retry-debug] construct_tree+dead_value_prune: VALIDATES");
+            }
+            return Some(pruned);
+        }
+        // A construct-tree candidate can still exceed the relooper cap only because statically dead
+        // function-constant arms survived into the finished graph. Prune those exact constant arms
+        // before handing the smaller residual CFG to the existing capped relooper; do not rescan or
+        // re-emit the AIR source, and adopt only after independent validation.
+        if let Some(pruned_relooped) = self.prune_then_relooper(&finished) {
+            return Some(pruned_relooped);
+        }
+        // The construct-tree candidate may clear the source-level ownership problem yet retain a
+        // smaller reducible cross-arm exit after interface/value legalization. Hand that finished
+        // module directly to the general relooper before representation-changing pointer retries.
+        // This composition was previously reachable only as an accidental tail of value-select.
+        if let Some(relooped) = self.relooper_retry(&finished) {
+            return Some(relooped);
         }
         if let Some(value_selected) = self.value_select_rewrite(&finished) {
             match tools::spirv_val_bytes(&value_selected, self.tmp) {
@@ -1037,6 +1270,10 @@ impl<'a> RetryCtx<'a> {
                 }
             }
         };
+        self.adopt_relooped_raw(&raw_bytes)
+    }
+
+    fn adopt_relooped_raw(&self, raw_bytes: &[u8]) -> Option<Vec<u8>> {
         // Adopt a relooped raw module if it validates as-is, OR — when it still carries a WHOLE-buffer
         // cross-binding select (the pointer mistyping's real shape, e.g. the `createBVHNodesKernelMotion`
         // BVH builders: a ~1340-block unstructured switch that, once structured, selects among distinct
@@ -1064,14 +1301,14 @@ impl<'a> RetryCtx<'a> {
                 "raw_then_relooper(relooped+psb+wg)",
             )
         };
-        let relooped = load_relooper_module(&raw_bytes);
+        let relooped = load_relooper_module(raw_bytes);
         if self.retry_debug_on {
             if let Err(e) = &relooped {
                 eprintln!("[retry-debug] raw_then_relooper: relooper rewrite failed: {e}");
             }
         }
         relooped.ok().and_then(adopt).or_else(|| {
-            let mut pruned_module = load_bytes(&raw_bytes).ok()?;
+            let mut pruned_module = load_bytes(raw_bytes).ok()?;
             native::prune_constant_branches_module(&mut pruned_module).ok()?;
             native::rewrite_to_relooper_module_capped(
                 &mut pruned_module,
@@ -1080,5 +1317,40 @@ impl<'a> RetryCtx<'a> {
             .ok()
             .and_then(|()| adopt(pruned_module))
         })
+    }
+}
+
+fn emitted_graph_exceeds_relooper_cap(bytes: &[u8]) -> bool {
+    load_bytes(bytes).is_ok_and(|module| module_exceeds_relooper_cap(&module))
+}
+
+fn module_exceeds_relooper_cap(module: &Module) -> bool {
+    module
+        .functions
+        .iter()
+        .any(|function| function.blocks.len() > native::CFG_EMIT_RELOOPER_MAX_BLOCKS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function};
+
+    fn module_with_blocks(blocks: usize) -> Module {
+        let mut module = Module::new();
+        let mut function = Function::new();
+        function.blocks.resize_with(blocks, Block::new);
+        module.functions.push(function);
+        module
+    }
+
+    #[test]
+    fn post_finish_graph_over_relooper_cap_keeps_construct_tree_eligible() {
+        assert!(!module_exceeds_relooper_cap(&module_with_blocks(
+            native::CFG_EMIT_RELOOPER_MAX_BLOCKS
+        )));
+        assert!(module_exceeds_relooper_cap(&module_with_blocks(
+            native::CFG_EMIT_RELOOPER_MAX_BLOCKS + 1
+        )));
     }
 }

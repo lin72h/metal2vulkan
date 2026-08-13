@@ -87,6 +87,30 @@ pub(in crate::native) fn structured_plan_inner6(
 pub(in crate::native) fn structured_plan_construct_tree(
     blocks: &[BodyBlock],
 ) -> Option<StructuredPlan> {
+    // Prefer the immutable whole-CFG ownership proof. It can close ordinary, loop-exit, and terminal
+    // switch constructs without duplicating their regions. Direct cross-arm privatization is a last
+    // resort: on generated CFGs it can clone several nested copies before discovering that the raw
+    // tree already owned the route, multiplying both planner work and live carrier memory.
+    if let Some(plan) =
+        structured_plan_inner7(blocks, false, false, false, true, false, false, true)
+    {
+        return Some(plan);
+    }
+    for (converge_inloop, break_aware) in [(true, false), (true, true), (false, false)] {
+        if let Some(plan) = structured_plan_inner7(
+            blocks,
+            converge_inloop,
+            break_aware,
+            false,
+            true,
+            true,
+            false,
+            true,
+        ) {
+            return Some(plan);
+        }
+    }
+
     if let Some(cloned) = privatize_direct_construct_tree_cross_arm(blocks) {
         let shared_private =
             privatize_direct_construct_tree_shared_continuations(&cloned).unwrap_or(cloned);
@@ -104,11 +128,6 @@ pub(in crate::native) fn structured_plan_construct_tree(
                 return Some(plan);
             }
         }
-    }
-    if let Some(plan) =
-        structured_plan_inner7(blocks, false, false, false, true, false, false, true)
-    {
-        return Some(plan);
     }
     None
 }
@@ -245,6 +264,31 @@ fn structured_plan_inner7(
     terminal_exit_selection: bool,
     construct_tree_owned: bool,
 ) -> Option<StructuredPlan> {
+    structured_plan_inner8(
+        blocks,
+        converge_inloop,
+        break_aware,
+        multi_exit_clone,
+        allow_bare_exit,
+        loop_exit_selection,
+        terminal_exit_selection,
+        construct_tree_owned,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::native) fn structured_plan_inner8(
+    blocks: &[BodyBlock],
+    converge_inloop: bool,
+    break_aware: bool,
+    multi_exit_clone: bool,
+    allow_bare_exit: bool,
+    loop_exit_selection: bool,
+    terminal_exit_selection: bool,
+    construct_tree_owned: bool,
+    prepared_terminal: Option<&TerminalExitSelectionPlan>,
+) -> Option<StructuredPlan> {
     let spi = crate::env_vars::spi_why();
     let tag = blocks.first().map(|b| b.name.clone()).unwrap_or_default();
     macro_rules! spi_reject {
@@ -266,22 +310,22 @@ fn structured_plan_inner7(
     // loop. Give that loop a private return first: the prefix can then structure its own early
     // exits without claiming the loop's merge, and the loop retains a private, ordinary merge.
     // This is only a seed for the terminal retry; a seed with no terminal plan is discarded below.
-    let terminal_seed = if terminal_exit_selection {
+    let terminal_seed = if terminal_exit_selection && prepared_terminal.is_none() {
         privatize_single_loop_return_exit(blocks)
     } else {
         None
     };
     let terminal_input = terminal_seed.as_deref().unwrap_or(blocks);
-    let terminal = if terminal_exit_selection {
+    let computed_terminal = if terminal_exit_selection && prepared_terminal.is_none() {
         terminal_exit_selection_merges(terminal_input)
     } else {
         None
     };
+    let terminal = prepared_terminal.or(computed_terminal.as_ref());
     let terminal_blocks = terminal
-        .as_ref()
         .map(|plan| plan.blocks.as_slice())
         .unwrap_or(terminal_input);
-    let (base_lblocks, loop_merges) =
+    let (base_lblocks, mut loop_merges) =
         forest_loop_merges(terminal_blocks, converge_inloop, multi_exit_clone);
     let terminal_dispatch = if terminal_exit_selection {
         terminal_unreachable_selection_merges(&base_lblocks)
@@ -292,16 +336,31 @@ fn structured_plan_inner7(
         spi_reject!("terminal-exit-no-candidate");
         return None;
     }
-    let lblocks = terminal_dispatch
+    let mut lblocks = terminal_dispatch
         .as_ref()
         .map(|plan| plan.blocks.clone())
         .unwrap_or(base_lblocks);
     let mut terminal_merges = HashMap::new();
-    if let Some(plan) = &terminal {
+    if let Some(plan) = terminal {
         terminal_merges.extend(plan.merges.clone());
     }
     if let Some(plan) = &terminal_dispatch {
         terminal_merges.extend(plan.merges.clone());
+    }
+    // The general terminal planner is intentionally bounded to modest CFGs, but a direct
+    // `guard -> {continuation, ret}` is a local ownership relation. Compose those guards into the
+    // construct-tree candidate with two edge splits each, so large generated functions do not fall
+    // through to the enclosing-region repair and mistake the shared return for an ordinary merge.
+    if construct_tree_owned {
+        if let Some(plan) = direct_terminal_exit_selection_merges(&lblocks, &terminal_merges) {
+            lblocks = plan.blocks;
+            terminal_merges.extend(plan.merges);
+        }
+        coalesce_sibling_conditional_dispatches(&mut lblocks);
+        // Regional ownership can add an enclosing predecessor to a loop's former exit after the
+        // loop forest first selected it. Privatize that merge before selection synthesis so every
+        // downstream role/collision map sees the final loop edge and cannot retain a stale key.
+        privatize_nondominated_loop_merges(&mut lblocks, &mut loop_merges);
     }
     // Completeness: every natural loop must be covered by the forest loop-merge map (directly-
     // structurable, merge==continue split, or the narrow pure-self-latch NoExit split); every other
@@ -309,6 +368,12 @@ fn structured_plan_inner7(
     let lforest = analyze(&lblocks);
     for l in &lforest.loops {
         if !loop_merges.contains_key(&l.header) {
+            if crate::env_vars::spi_why() {
+                eprintln!(
+                    "[spi-why]   uncovered-loop header={} latches={:?} exits={:?} parent={:?}",
+                    l.header, l.latches, l.exits, l.parent,
+                );
+            }
             spi_reject!(format!("loop-uncovered header={}", l.header));
             return None;
         }
@@ -397,14 +462,26 @@ fn structured_plan_inner7(
         };
         if construct_tree_owned
             && allow_bare_exit
-            && bare_loop_exit_branch_with_passthroughs(
+            && (bare_loop_exit_branch_with_passthroughs(
                 &sblocks,
                 &forest,
                 &loop_merges,
                 &b.name,
                 &t,
                 &f,
-            )
+            ) || bare_enclosing_selection_region_escape(
+                &sblocks,
+                &forest,
+                &branch_merges_by_header,
+                &b.name,
+                &t,
+            ) || bare_enclosing_selection_region_escape(
+                &sblocks,
+                &forest,
+                &branch_merges_by_header,
+                &b.name,
+                &f,
+            ))
         {
             // The construct-tree candidate already owns inter-construct routes. A branch whose arm is
             // an enclosing loop role (merge/continue), or a sibling arm of an enclosing construct-tree
@@ -431,18 +508,38 @@ fn structured_plan_inner7(
                 {
                     cont
                 } else if allow_bare_exit
-                    && bare_loop_exit_branch_with_passthroughs(
+                    && (bare_loop_exit_branch_with_passthroughs(
                         &sblocks,
                         &forest,
                         &loop_merges,
                         &b.name,
                         &t,
                         &f,
-                    )
+                    ) || bare_enclosing_selection_region_escape(
+                        &sblocks,
+                        &forest,
+                        &branch_merges_by_header,
+                        &b.name,
+                        &t,
+                    ) || bare_enclosing_selection_region_escape(
+                        &sblocks,
+                        &forest,
+                        &branch_merges_by_header,
+                        &b.name,
+                        &f,
+                    ))
                 {
                     // A bare structured break/continue or enclosing-selection sibling exit: no
                     // OpSelectionMerge is needed. Skip the block (leave it out of `header_merge` → the
                     // emitter writes a bare OpBranchConditional; self-checks 2/3 also skip it).
+                    skipped_bare_exit = true;
+                    continue;
+                } else if construct_tree_owned && allow_bare_exit {
+                    // The construct tree is the ownership proof for inter-construct divergent
+                    // routes. A conditional left without an ordinary post-dominator after all
+                    // local merge/loop-role checks is a tree exit, not an incomplete local
+                    // selection. Emit it bare; this retry-only candidate is adopted only after the
+                    // finished module independently passes spirv-val.
                     skipped_bare_exit = true;
                     continue;
                 } else {
@@ -450,7 +547,7 @@ fn structured_plan_inner7(
                         "branch-no-merge header={} arms=({},{})",
                         b.name, t, f
                     ));
-                    if spi {
+                    if spi && sblocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
                         eprintln!("[spi-why]   --- sblocks skeleton (name -> terminator) ---");
                         for sb in &sblocks {
                             // Diagnostics-only skeleton print: source the phi count + terminator from the
@@ -1300,6 +1397,7 @@ fn collect_llvalue_locals(value: &crate::native::ir::LlValue, out: &mut Vec<Stri
                 collect_llvalue_locals(&index.value, out);
             }
         }
+        LlValue::IntToPtr { source, .. } => collect_llvalue_locals(&source.value, out),
         LlValue::Global(_)
         | LlValue::Bool(_)
         | LlValue::Int(_)
@@ -1500,7 +1598,20 @@ pub(in crate::native) fn privatize_synthesized_cross_arm_shared(
     let mut cur: Vec<BodyBlock> = blocks.to_vec();
     let mut counter = 2_000_000usize;
     const ROUNDS: usize = 16;
-    let cap = blocks.len() + 512;
+    // The ladder can only consume candidates within CROSS_ARM_EDGE_MAX_BLOCKS. Do not build (and,
+    // critically, do not re-derive dominators/loop forests for) a larger candidate that the caller
+    // will immediately discard. The former `blocks.len() + 512` private cap let a 20-block helper
+    // grow beyond 500 blocks for another expensive detection round even though the public ladder's
+    // 300-block gate made that work unobservable.
+    let cap = (blocks.len() + 512).min(CROSS_ARM_EDGE_MAX_BLOCKS);
+    // A block-count cap alone does not bound cloning cost: optimized AIR commonly has a few dozen
+    // very large blocks, and duplicating their typed instruction payload several times can turn a
+    // 25-block helper into hundreds of megabytes while every candidate still remains below 300
+    // blocks. A successful dominated-region privatization needs at most a bounded number of copies
+    // of the source payload; stop the reject-only attempt if compound cloning exceeds four source
+    // payloads plus room for small synthesized blocks.
+    let source_instructions = typed_instruction_count(blocks);
+    let instruction_cap = source_instructions.saturating_mul(4).saturating_add(256);
     for _ in 0..ROUNDS {
         if cur.len() > cap {
             break;
@@ -1516,8 +1627,29 @@ pub(in crate::native) fn privatize_synthesized_cross_arm_shared(
             break;
         };
         cur = next;
+        if typed_instruction_count(&cur) > instruction_cap {
+            // Return the source graph, not a partially cloned candidate: equality is the caller's
+            // established signal that this optional ladder attempt made no consumable change.
+            return blocks.to_vec();
+        }
+        if cur.len() > cap {
+            // Preserve the oversized result so the caller's existing size check rejects it, but
+            // avoid feeding it through another synthesis/forest round first.
+            break;
+        }
     }
     cur
+}
+
+fn typed_instruction_count(blocks: &[BodyBlock]) -> usize {
+    blocks.iter().fold(0usize, |count, block| {
+        count.saturating_add(
+            block
+                .typed
+                .as_ref()
+                .map_or(1, |typed| typed.insts.len().saturating_add(1)),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -1532,7 +1664,8 @@ mod tests {
         BodyBlock {
             name: name.to_string(),
             role: BlockRole::Normal,
-            typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new()),
+            typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new())
+                .map(Into::into),
         }
     }
 

@@ -17,6 +17,68 @@ use spirv::{BuiltIn, Capability, Decoration, Op, Scope, SelectionControl, Storag
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn native_vertex_narrow_integer_attributes_use_32_bit_fetch_interface() {
+    let ll = include_str!("../../../validation/fixtures/public/vertex_narrow_attributes.ll");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_narrow_attributes_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Vertex, &tmp).expect("translate");
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("OpCapability Int8"), "{asm}");
+    assert!(asm.contains("OpCapability Int16"), "{asm}");
+    assert!(asm.contains("OpUConvert"), "{asm}");
+    let module = load_bytes(&out).expect("parse transformed");
+    let definitions = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
+    for location in [0, 1] {
+        let variable = module
+            .annotations
+            .iter()
+            .find_map(|instruction| match instruction.operands.as_slice() {
+                [
+                    Operand::IdRef(variable),
+                    Operand::Decoration(Decoration::Location),
+                    Operand::LiteralBit32(found),
+                ] if *found == location => Some(*variable),
+                _ => None,
+            })
+            .expect("vertex attribute location");
+        let pointer = definitions[&variable]
+            .result_type
+            .expect("variable pointer type");
+        let pointee = match definitions[&pointer].operands.get(1) {
+            Some(Operand::IdRef(pointee)) => *pointee,
+            _ => panic!("vertex attribute is not an Input pointer"),
+        };
+        let scalar = if definitions[&pointee].class.opcode == Op::TypeVector {
+            match definitions[&pointee].operands.first() {
+                Some(Operand::IdRef(scalar)) => *scalar,
+                _ => panic!("vector attribute has no scalar type"),
+            }
+        } else {
+            pointee
+        };
+        assert_eq!(
+            definitions[&scalar].operands.first(),
+            Some(&Operand::LiteralBit32(32)),
+            "{asm}"
+        );
+    }
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_fragment_depth_return_maps_to_frag_depth() {
     let ll = r#"
 source_filename = "synth_depth"
@@ -1612,6 +1674,101 @@ entry:
         }),
         "{asm}"
     );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+#[test]
+fn native_fragment_custom_imageblock_reads_and_writes_ordered_half_plane() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%Depth = type { half }
+
+define { <4 x half>, %Depth } @f(%Depth %input) {
+entry:
+  %depth = extractvalue %Depth %input, 0
+  %color = insertelement <4 x half> zeroinitializer, half %depth, i32 0
+  %out0 = insertvalue { <4 x half>, %Depth } poison, <4 x half> %color, 0
+  %out1 = insertvalue { <4 x half>, %Depth } %out0, %Depth %input, 1
+  ret { <4 x half>, %Depth } %out1
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !2}
+!1 = !{!3, !4}
+!2 = !{!5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{!"air.imageblock_data", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !6, !"air.imageblock_master", !7}
+!5 = !{i32 0, !"air.imageblock_data", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !6, !"air.imageblock_master", !7}
+!6 = !{i32 0, i32 2, i32 0, !"half", !"user(depth)"}
+!7 = !{i32 0, i32 2, i32 0, !"half", !"user(other)", !"air.raster_order_group", i32 0, i32 2, i32 2, i32 0, !"half", !"user(depth)", !"air.raster_order_group", i32 0, i32 4, i32 2, i32 0, !"half", !"user(weight)", !"air.raster_order_group", i32 0, i32 6, i32 2, i32 0, !"half", !"user(buffer)", !"air.raster_order_group", i32 0}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_custom_imageblock_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("SPV_EXT_fragment_shader_interlock"), "{asm}");
+    assert!(asm.contains("PixelInterlockOrderedEXT"), "{asm}");
+    assert!(asm.contains("OpBeginInvocationInterlockEXT"), "{asm}");
+    assert!(asm.contains("OpEndInvocationInterlockEXT"), "{asm}");
+    assert!(asm.contains("OpImageRead"), "{asm}");
+    assert!(asm.contains("OpImageWrite"), "{asm}");
+    assert!(asm.contains("R16f"), "{asm}");
+    assert!(asm.contains("Binding 161"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_fragment_direct_imageblock_layout_preserves_vector_and_integer_planes() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+%Tile = type { half, <4 x half>, <4 x i8>, i16 }
+
+define { %Tile } @f(%Tile %input) {
+entry:
+  %out = insertvalue { %Tile } poison, %Tile %input, 0
+  ret { %Tile } %out
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{!"air.imageblock_data", !"air.imageblock_data_size", i32 16, !"air.struct_type_info", !5}
+!4 = !{i32 0, !"air.imageblock_data", !"air.imageblock_data_size", i32 16, !"air.struct_type_info", !5}
+!5 = !{i32 0, i32 2, i32 0, !"half", !"scalar", !"air.raster_order_group", i32 0, i32 2, i32 8, i32 0, !"half4", !"color", !"air.raster_order_group", i32 0, i32 10, i32 4, i32 0, !"uchar4", !"mask", !"air.raster_order_group", i32 0, i32 14, i32 2, i32 0, !"ushort", !"depth", !"air.raster_order_group", i32 1}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_direct_imageblock_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    for format in ["R16f", "Rgba16f", "Rgba8ui", "R16ui"] {
+        assert!(asm.contains(format), "missing {format}: {asm}");
+    }
+    for binding in 160..164 {
+        assert!(
+            asm.contains(&format!("Binding {binding}")),
+            "missing binding {binding}: {asm}"
+        );
+    }
+    assert!(asm.contains("OpFConvert"), "{asm}");
+    assert!(asm.contains("OpUConvert"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
