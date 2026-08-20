@@ -267,26 +267,8 @@ pub(in crate::passes) fn decorate_raw_uint_block(ctx: &mut Ctx, block: Word, run
 }
 
 pub(in crate::passes) fn decorate_descriptor_binding(ctx: &mut Ctx, var: Word, binding: u32) {
-    ctx.module.annotations.push(Instruction::new(
-        Op::Decorate,
-        None,
-        None,
-        vec![
-            Operand::IdRef(var),
-            Operand::Decoration(Decoration::DescriptorSet),
-            Operand::LiteralBit32(0),
-        ],
-    ));
-    ctx.module.annotations.push(Instruction::new(
-        Op::Decorate,
-        None,
-        None,
-        vec![
-            Operand::IdRef(var),
-            Operand::Decoration(Decoration::Binding),
-            Operand::LiteralBit32(binding),
-        ],
-    ));
+    let set = ctx.descriptor_layout.set;
+    decorate_binding(&mut ctx.module, var, set, binding);
 }
 
 pub(in crate::passes) fn descriptor_binding(ctx: &Ctx, var: Word) -> Option<u32> {

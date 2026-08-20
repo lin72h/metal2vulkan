@@ -252,6 +252,7 @@ pub(super) fn build_stage_input(
     vert: Option<&VertMeta>,
     kern: Option<&KernMeta>,
 ) -> Result<HashMap<Word, Instruction>, String> {
+    let descriptor_layout = ctx.descriptor_layout;
     let defs = type_defs(&ctx.module);
     let params: Vec<(Word, Word)> = ctx.module.functions[entry_idx]
         .parameters
@@ -379,16 +380,26 @@ pub(super) fn build_stage_input(
         };
         let resource_binding = match stage {
             Stage::Fragment => match frag.and_then(|m| m.role_of(idx)) {
-                Some(FragRole::Texture(b)) => Some(texture_resource_binding(*b)?),
-                Some(FragRole::Sampler(b)) => Some(sampler_resource_binding(*b)?),
-                Some(FragRole::Buffer(b)) => Some(buffer_resource_binding(*b)?),
-                Some(FragRole::ColorInput(b)) => Some(color_input_resource_binding(*b)?),
+                Some(FragRole::Texture(b)) => {
+                    Some(texture_resource_binding(descriptor_layout, *b)?)
+                }
+                Some(FragRole::Sampler(b)) => {
+                    Some(sampler_resource_binding(descriptor_layout, *b)?)
+                }
+                Some(FragRole::Buffer(b)) => Some(buffer_resource_binding(descriptor_layout, *b)?),
+                Some(FragRole::ColorInput(b)) => {
+                    Some(color_input_resource_binding(descriptor_layout, *b)?)
+                }
                 _ => None,
             },
             Stage::Vertex => match vert.and_then(|m| m.role_of(idx)) {
-                Some(VertRole::Buffer(b)) => Some(buffer_resource_binding(*b)?),
-                Some(VertRole::Texture(b)) => Some(texture_resource_binding(*b)?),
-                Some(VertRole::Sampler(b)) => Some(sampler_resource_binding(*b)?),
+                Some(VertRole::Buffer(b)) => Some(buffer_resource_binding(descriptor_layout, *b)?),
+                Some(VertRole::Texture(b)) => {
+                    Some(texture_resource_binding(descriptor_layout, *b)?)
+                }
+                Some(VertRole::Sampler(b)) => {
+                    Some(sampler_resource_binding(descriptor_layout, *b)?)
+                }
                 _ => None,
             },
             Stage::Kernel => match kern.and_then(|m| m.role_of(idx)) {
@@ -396,29 +407,36 @@ pub(super) fn build_stage_input(
                     KernRole::Buffer(b)
                     | KernRole::AccelerationStructureShadow(b)
                     | KernRole::PrimitiveAccelerationStructureShadow(b),
-                ) => Some(buffer_resource_binding(*b)?),
-                Some(KernRole::Texture(b)) => Some(texture_resource_binding(*b)?),
-                Some(KernRole::Sampler(b)) => Some(sampler_resource_binding(*b)?),
+                ) => Some(buffer_resource_binding(descriptor_layout, *b)?),
+                Some(KernRole::Texture(b)) => {
+                    Some(texture_resource_binding(descriptor_layout, *b)?)
+                }
+                Some(KernRole::Sampler(b)) => {
+                    Some(sampler_resource_binding(descriptor_layout, *b)?)
+                }
                 _ => None,
             },
         };
         let storage_resource_binding = match stage {
             Stage::Fragment => match frag.and_then(|m| m.role_of(idx)) {
-                Some(FragRole::Texture(binding)) => {
-                    Some(storage_texture_resource_binding(*binding)?)
-                }
+                Some(FragRole::Texture(binding)) => Some(storage_texture_resource_binding(
+                    descriptor_layout,
+                    *binding,
+                )?),
                 _ => None,
             },
             Stage::Vertex => match vert.and_then(|m| m.role_of(idx)) {
-                Some(VertRole::Texture(binding)) => {
-                    Some(storage_texture_resource_binding(*binding)?)
-                }
+                Some(VertRole::Texture(binding)) => Some(storage_texture_resource_binding(
+                    descriptor_layout,
+                    *binding,
+                )?),
                 _ => None,
             },
             Stage::Kernel => match kern.and_then(|m| m.role_of(idx)) {
-                Some(KernRole::Texture(binding)) => {
-                    Some(storage_texture_resource_binding(*binding)?)
-                }
+                Some(KernRole::Texture(binding)) => Some(storage_texture_resource_binding(
+                    descriptor_layout,
+                    *binding,
+                )?),
                 _ => None,
             },
         };
@@ -475,8 +493,8 @@ pub(super) fn build_stage_input(
                 .get(&idx)
                 .copied()
                 .ok_or_else(|| format!("kernel stage_in parameter {idx} missing binding"))?;
-            let binding = buffer_resource_binding(binding)?;
-            decorate_binding(&mut ctx.module, var, binding);
+            let binding = buffer_resource_binding(descriptor_layout, binding)?;
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             let index_var = bind_kernel_v3uint_builtin_once(
                 ctx,
                 &mut global_invocation_id_var,
@@ -551,7 +569,7 @@ pub(super) fn build_stage_input(
                     resource_binding
                 },
             )?;
-            decorate_binding(&mut ctx.module, var, binding);
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             ctx.interface_buffer_var(var);
             bindings.push((
                 *pid,
@@ -584,7 +602,7 @@ pub(super) fn build_stage_input(
                 vec![Operand::StorageClass(StorageClass::UniformConstant)],
             ));
             let binding = required_resource_binding(*pid, storage_resource_binding)?;
-            decorate_binding(&mut ctx.module, var, binding);
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             ctx.interface_buffer_var(var);
             bindings.push((
                 *pid,
@@ -618,7 +636,7 @@ pub(super) fn build_stage_input(
                 vec![Operand::StorageClass(StorageClass::UniformConstant)],
             ));
             let binding = required_resource_binding(*pid, resource_binding)?;
-            decorate_binding(&mut ctx.module, var, binding);
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             ctx.interface_buffer_var(var); // SPIR-V 1.4+ lists every resource on the entry interface.
             bindings.push((
                 *pid,
@@ -642,7 +660,7 @@ pub(super) fn build_stage_input(
                 vec![Operand::StorageClass(StorageClass::UniformConstant)],
             ));
             let binding = required_resource_binding(*pid, resource_binding)?;
-            decorate_binding(&mut ctx.module, var, binding);
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             decorate_input_attachment_index(&mut ctx.module, var, color_index);
             ctx.interface_buffer_var(var);
             bindings.push((
@@ -665,7 +683,7 @@ pub(super) fn build_stage_input(
                 vec![Operand::StorageClass(StorageClass::UniformConstant)],
             ));
             let binding = required_resource_binding(*pid, resource_binding)?;
-            decorate_binding(&mut ctx.module, var, binding);
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             ctx.interface_buffer_var(var);
             let metal_index = match stage {
                 Stage::Fragment => frag.and_then(|meta| match meta.role_of(idx) {
@@ -999,7 +1017,7 @@ pub(super) fn build_stage_input(
                     .insert(var, source_layout_ty);
             }
             let binding = required_resource_binding(*pid, resource_binding)?;
-            decorate_binding(&mut ctx.module, var, binding);
+            decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
             bindings.push((*pid, ParamBinding::Buffer { var, wrap }));
             buffer_structs.push((var, struct_ty));
         } else if role_is("varying") {
@@ -1816,6 +1834,7 @@ fn register_embedded_textures(
     entry_idx: usize,
     embedded: Option<&[crate::meta::EmbeddedTexture]>,
 ) -> Result<(), String> {
+    let descriptor_layout = ctx.descriptor_layout;
     let Some(embedded) = embedded else {
         return Ok(());
     };
@@ -1862,11 +1881,11 @@ fn register_embedded_textures(
         ));
         // ABI: bind in the sampled- or storage-texture band at index K.
         let binding = if tex.storage_format.is_some() {
-            storage_texture_resource_binding(tex.synthetic_texture_index)?
+            storage_texture_resource_binding(descriptor_layout, tex.synthetic_texture_index)?
         } else {
-            texture_resource_binding(tex.synthetic_texture_index)?
+            texture_resource_binding(descriptor_layout, tex.synthetic_texture_index)?
         };
-        decorate_binding(&mut ctx.module, var, binding);
+        decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
         ctx.interface_buffer_var(var); // SPIR-V 1.4+ lists every resource on the entry interface.
         if let Some(length) = tex.array_length {
             ctx.image_array_vars

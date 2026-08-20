@@ -517,6 +517,39 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
 
+    let custom_layout = crate::reflect::DescriptorLayout {
+        set: 4,
+        storage_textures: crate::reflect::DescriptorBindingRange {
+            start: 800,
+            end: 928,
+        },
+        ..Default::default()
+    };
+    let (custom_spv, custom_reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_descriptor_layout(custom_layout)
+            .expect("custom embedded-texture layout"),
+    )
+    .expect("custom embedded-texture translation");
+    let custom_asm = disassemble(&custom_spv).expect("disassemble custom embedded texture");
+    assert!(custom_asm.contains("DescriptorSet 4"), "{custom_asm}");
+    assert!(custom_asm.contains("Binding 800"), "{custom_asm}");
+    assert_eq!(custom_reflection.descriptor_layout, custom_layout);
+    assert_eq!(
+        custom_reflection
+            .binding_at(crate::reflect::ResourceKind::EmbeddedArgBufferTexture, 0,)
+            .and_then(|binding| binding.descriptor),
+        Some(crate::reflect::DescriptorLocation {
+            set: 4,
+            binding: 800,
+            count: 1,
+        })
+    );
+    tools::spirv_val_bytes(&custom_spv, &tmp).expect("custom embedded texture spirv-val");
+
     let state = runtime_storage_image_state(
         crate::reflect::RuntimeStorageImageFormat::Rgba8Unorm,
         false,
@@ -1065,8 +1098,11 @@ entry:
             decoration.operands[2] = Operand::LiteralBit32(72);
         }
     }
-    let error = passes::validate_descriptor_bindings(&collided)
-        .expect_err("a sampler moved into the texture band must be rejected");
+    let error = passes::validate_descriptor_bindings(
+        &collided,
+        crate::reflect::DescriptorLayout::default(),
+    )
+    .expect_err("a sampler moved into the texture band must be rejected");
     assert!(error.contains("outside its ABI band"), "{error}");
 
     if std::process::Command::new("spirv-val")

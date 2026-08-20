@@ -8507,6 +8507,24 @@ entry:
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+
+    let layout = crate::reflect::DescriptorLayout {
+        set: 5,
+        ..Default::default()
+    };
+    let custom = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_descriptor_layout(layout)
+            .expect("custom raw-alias layout"),
+    )
+    .expect("custom raw-alias translation");
+    let custom_asm = disassemble(&custom).expect("disassemble custom raw alias");
+    assert!(custom_asm.contains("DescriptorSet 5"), "{custom_asm}");
+    assert!(!custom_asm.contains("DescriptorSet 0"), "{custom_asm}");
+    tools::spirv_val_bytes(&custom, &tmp).expect("custom raw-alias spirv-val");
 }
 
 #[test]

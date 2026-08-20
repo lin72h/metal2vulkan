@@ -764,7 +764,8 @@ pub(in crate::passes) fn create_raw_alias_buffer(
         Some(var),
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
-    decorate_binding(&mut ctx.module, var, binding);
+    let set = ctx.descriptor_layout.set;
+    decorate_binding(&mut ctx.module, var, set, binding);
     ctx.interface.push(var);
     var
 }

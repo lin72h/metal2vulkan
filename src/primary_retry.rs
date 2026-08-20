@@ -111,9 +111,14 @@ pub(super) fn emit_finish_primary_module(
 /// [`apply_primary_emit_rewrites_module`].
 /// This pass is deliberately kept OUT of `finish_module`, so it touches only the primary candidate
 /// and never a retry re-emit.
-pub(crate) fn apply_xbind_phi_psb(module: &Module, spv: &[u8]) -> Vec<u8> {
+pub(crate) fn apply_xbind_phi_psb(
+    module: &Module,
+    spv: &[u8],
+    descriptor_layout: crate::reflect::DescriptorLayout,
+) -> Vec<u8> {
     let mut candidate = module.clone();
-    if native::rewrite_cross_binding_pointer_phis_module(&mut candidate).is_err() {
+    if native::rewrite_cross_binding_pointer_phis_module(&mut candidate, descriptor_layout).is_err()
+    {
         return spv.to_vec();
     }
     candidate
@@ -145,6 +150,7 @@ pub(crate) fn primary_xbind_phi_psb_for_validation_error(
     spv: &[u8],
     validation_error: &str,
     tmp: &Path,
+    descriptor_layout: crate::reflect::DescriptorLayout,
 ) -> Option<Vec<u8>> {
     if native::classify_validation_error(validation_error)
         != native::ValidationClass::CrossBindingPointerMerge
@@ -154,7 +160,7 @@ pub(crate) fn primary_xbind_phi_psb_for_validation_error(
     if !native::has_cross_binding_pointer_phi_module(module) {
         return None;
     }
-    let primary = apply_xbind_phi_psb(module, spv);
+    let primary = apply_xbind_phi_psb(module, spv, descriptor_layout);
     (primary != spv && tools::spirv_val_bytes(&primary, tmp).is_ok()).then_some(primary)
 }
 
@@ -202,9 +208,13 @@ pub(crate) fn primary_primitive_phi_metadata_if_needed(
     let primary = finished.bytes;
     match tools::spirv_val_bytes(&primary, tmp) {
         Ok(()) => Some(primary),
-        Err(error) => {
-            primary_xbind_phi_psb_for_validation_error(&primary_module, &primary, &error, tmp)
-        }
+        Err(error) => primary_xbind_phi_psb_for_validation_error(
+            &primary_module,
+            &primary,
+            &error,
+            tmp,
+            options.descriptor_layout,
+        ),
     }
 }
 

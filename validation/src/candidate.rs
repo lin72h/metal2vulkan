@@ -13,7 +13,7 @@ use base64::Engine as _;
 use metal2vulkan::reflect::ShaderReflection;
 use std::path::Path;
 
-pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v30";
+pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v31";
 
 pub fn execute_case(
     root: &Path,
@@ -1088,21 +1088,48 @@ mod platform {
             .iter()
             .any(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::ColorInput);
         let descriptor_bindings = descriptor_bindings(reflection)?;
-        let set_layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings);
-        let set_layout = unsafe {
-            context
-                .device
-                .create_descriptor_set_layout(&set_layout_info, None)
-        }
-        .map_err(|error| format!("create descriptor-set layout: {error}"))?;
         let mut objects = DeviceObjects::new(&context.device);
-        objects.set_layout = set_layout;
+        objects.descriptor_set_index = reflection.descriptor_layout.set;
+        let max_bound_descriptor_sets = unsafe {
+            context
+                .instance
+                .get_physical_device_properties(context.physical)
+        }
+        .limits
+        .max_bound_descriptor_sets;
+        if reflection.descriptor_layout.set >= max_bound_descriptor_sets {
+            return Err(format!(
+                "effective descriptor set {} exceeds device maxBoundDescriptorSets {}",
+                reflection.descriptor_layout.set, max_bound_descriptor_sets
+            ));
+        }
+        let set_count = reflection
+            .descriptor_layout
+            .set
+            .checked_add(1)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| {
+                "descriptor set index cannot be represented by the executor".to_string()
+            })?;
+        for set in 0..set_count {
+            let set_layout_info = if set == reflection.descriptor_layout.set as usize {
+                vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings)
+            } else {
+                vk::DescriptorSetLayoutCreateInfo::default()
+            };
+            let layout = unsafe {
+                context
+                    .device
+                    .create_descriptor_set_layout(&set_layout_info, None)
+            }
+            .map_err(|error| format!("create descriptor-set layout {set}: {error}"))?;
+            objects.set_layouts.push(layout);
+        }
+        let set_layout = objects.set_layouts[reflection.descriptor_layout.set as usize];
         objects.framebuffer_fetch = framebuffer_fetch;
 
-        let set_layouts = [set_layout];
         let pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&objects.set_layouts);
         objects.pipeline_layout = unsafe {
             context
                 .device
@@ -1781,7 +1808,7 @@ mod platform {
                 command,
                 vk::PipelineBindPoint::COMPUTE,
                 objects.pipeline_layout,
-                0,
+                objects.descriptor_set_index,
                 &[descriptor_set],
                 &[],
             );
@@ -1957,7 +1984,7 @@ mod platform {
                 command,
                 vk::PipelineBindPoint::GRAPHICS,
                 objects.pipeline_layout,
-                0,
+                objects.descriptor_set_index,
                 &[descriptor_set],
                 &[],
             );
@@ -2695,7 +2722,8 @@ mod platform {
 
     struct DeviceObjects {
         device: Device,
-        set_layout: vk::DescriptorSetLayout,
+        set_layouts: Vec<vk::DescriptorSetLayout>,
+        descriptor_set_index: u32,
         pipeline_layout: vk::PipelineLayout,
         shader: vk::ShaderModule,
         companion_shader: vk::ShaderModule,
@@ -2714,7 +2742,8 @@ mod platform {
         fn new(device: &Device) -> Self {
             Self {
                 device: device.clone(),
-                set_layout: vk::DescriptorSetLayout::null(),
+                set_layouts: Vec::new(),
+                descriptor_set_index: 0,
                 pipeline_layout: vk::PipelineLayout::null(),
                 shader: vk::ShaderModule::null(),
                 companion_shader: vk::ShaderModule::null(),
@@ -2768,9 +2797,8 @@ mod platform {
                     self.device
                         .destroy_pipeline_layout(self.pipeline_layout, None);
                 }
-                if self.set_layout != vk::DescriptorSetLayout::null() {
-                    self.device
-                        .destroy_descriptor_set_layout(self.set_layout, None);
+                for set_layout in self.set_layouts.drain(..) {
+                    self.device.destroy_descriptor_set_layout(set_layout, None);
                 }
             }
         }
@@ -2779,6 +2807,18 @@ mod platform {
     fn descriptor_bindings(
         reflection: &ShaderReflection,
     ) -> Result<Vec<vk::DescriptorSetLayoutBinding<'static>>, String> {
+        reflection.validate_descriptor_abi()?;
+        if let Some(descriptor) = reflection
+            .bindings
+            .iter()
+            .filter_map(|binding| binding.descriptor)
+            .find(|descriptor| descriptor.set != reflection.descriptor_layout.set)
+        {
+            return Err(format!(
+                "reflection descriptor set {} does not match effective set {}",
+                descriptor.set, reflection.descriptor_layout.set
+            ));
+        }
         let stage_flags = match reflection.stage {
             metal2vulkan::reflect::ShaderStage::Kernel => vk::ShaderStageFlags::COMPUTE,
             metal2vulkan::reflect::ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,

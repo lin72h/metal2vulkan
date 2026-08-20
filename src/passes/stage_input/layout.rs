@@ -40,7 +40,8 @@ impl Ctx {
         if let Some(v) = self.default_sampler_var {
             return Ok(v);
         }
-        let binding = allocate_static_sampler_binding(&self.module)
+        let layout = self.descriptor_layout;
+        let binding = allocate_static_sampler_binding(&self.module, layout)
             .ok_or_else(|| "no free sampler binding for synthesized read sampler".to_string())?;
         let sty = self.ty_sampler();
         let pptr = self.ty_ptr(StorageClass::UniformConstant, sty);
@@ -51,7 +52,7 @@ impl Ctx {
             Some(var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        decorate_binding(&mut self.module, var, binding);
+        decorate_binding(&mut self.module, var, layout.set, binding);
         self.interface_buffer_var(var);
         self.default_sampler_var = Some(var);
         Ok(var)
@@ -71,7 +72,8 @@ impl Ctx {
         if let Some(&v) = self.default_null_image_vars.get(&(dim, arrayed)) {
             return Ok(v);
         }
-        let binding = allocate_default_texture_binding(&self.module)
+        let layout = self.descriptor_layout;
+        let binding = allocate_default_texture_binding(&self.module, layout)
             .ok_or_else(|| "no free texture binding for synthesized null image".to_string())?;
         let img_ty = self.ty_image(dim, arrayed, ImageComp::Float);
         let pptr = self.ty_ptr(StorageClass::UniformConstant, img_ty);
@@ -82,7 +84,7 @@ impl Ctx {
             Some(var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        decorate_binding(&mut self.module, var, binding);
+        decorate_binding(&mut self.module, var, layout.set, binding);
         self.interface_buffer_var(var);
         self.default_null_image_vars.insert((dim, arrayed), var);
         Ok(var)
@@ -113,7 +115,8 @@ impl Ctx {
             }
             return Ok((var, image_ty));
         }
-        let binding = crate::reflect::imageblock_resource_binding(attachment, data_rate)
+        let layout = self.descriptor_layout;
+        let binding = layout.imageblock_binding(attachment, data_rate)
             .ok_or_else(|| {
                 format!(
                     "implicit imageblock attachment {attachment} rate {data_rate} exceeds the descriptor ABI band"
@@ -128,7 +131,7 @@ impl Ctx {
             Some(var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        decorate_binding(&mut self.module, var, binding);
+        decorate_binding(&mut self.module, var, layout.set, binding);
         self.interface_buffer_var(var);
         self.implicit_imageblock_vars
             .insert((attachment, data_rate), (var, image_ty, format));
@@ -175,13 +178,14 @@ impl Ctx {
             Some(var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        let binding = crate::reflect::fragment_imageblock_resource_binding(master_member)
+        let layout = self.descriptor_layout;
+        let binding = layout.fragment_imageblock_binding(master_member)
             .ok_or_else(|| {
                 format!(
                     "fragment imageblock master member {master_member} exceeds the descriptor ABI band"
                 )
             })?;
-        decorate_binding(&mut self.module, var, binding);
+        decorate_binding(&mut self.module, var, layout.set, binding);
         self.interface_buffer_var(var);
         self.fragment_imageblock_vars
             .insert(master_member, (var, image_ty));

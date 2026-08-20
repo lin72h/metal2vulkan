@@ -98,14 +98,15 @@ useful only as an independent deployment check or when bytes have changed after 
 
 ## 4. Create the descriptor-set layout
 
-All reflected descriptors use set `0`, but descriptors come from three top-level places. A complete
+Reflected descriptors use `reflection.descriptor_layout.set` (set `0` in the default layout), and
+come from three top-level places. A complete
 consumer must inspect all three:
 
 1. `bindings[*].descriptor`
 2. `implicit_imageblock_attachments[*].binding`
 3. `fragment_imageblock.members[*].binding` when non-null
 
-The latter two are single storage-image descriptors in set `0`. For an entry in `bindings`, use
+The latter two are single storage-image descriptors in the effective set. For an entry in `bindings`, use
 `descriptor.set`, `descriptor.binding`, and `descriptor.count` exactly as reported:
 
 | `ResourceBinding.kind` | Vulkan descriptor type |
@@ -141,6 +142,32 @@ read/write-without-format features. Use the returned `runtime_storage_image_spec
 to create the matching image view. The reflected `spirv_format` and
 `texture_shape.storage_format` are `None` only when translation proved that the shader's exact
 operations are covered by the supplied formatless features.
+
+When independently translated graphics stages would otherwise reuse the same Metal indices, give
+each stage a complete layout whose resource bands do not collide in the pipeline layout:
+
+```rust
+use metal2vulkan::passes::TransformOptions;
+use metal2vulkan::reflect::{DescriptorBindingRange, DescriptorLayout};
+
+let fragment_layout = DescriptorLayout {
+    set: 1,
+    buffers: DescriptorBindingRange::from_base_count(1000, 32)?,
+    sampled_textures: DescriptorBindingRange::from_base_count(1032, 128)?,
+    samplers: DescriptorBindingRange::from_base_count(1160, 32)?,
+    color_inputs: DescriptorBindingRange::from_base_count(1192, 8)?,
+    imageblocks: DescriptorBindingRange::from_base_count(1200, 24)?,
+    fragment_imageblocks: DescriptorBindingRange::from_base_count(1224, 256)?,
+    storage_textures: DescriptorBindingRange::from_base_count(1480, 128)?,
+    synthetic: DescriptorBindingRange::from_base_count(1640, 32)?,
+    ..DescriptorLayout::default()
+};
+let options = TransformOptions::default().with_descriptor_layout(fragment_layout)?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Keep the same `set` for stages sharing one Vulkan descriptor-set layout, choose disjoint bands where
+their resources are unrelated, and use the returned effective layout rather than recomputing it.
 
 ## 5. Stage only the buffer bytes the shader can reach
 
@@ -204,6 +231,7 @@ Cache SPIR-V and reflection as one atomic result. A practical cache key includes
 - stage and every `TransformOptions` value;
 - the metal2vulkan crate/binary version; and
 - `reflection_version`.
+- `descriptor_layout.version` (also already covered when hashing every `TransformOptions` value).
 
 Invalidate both artifacts together when any key changes. Reflection is byte-neutral, but it is tied
 to the exact final module returned by the same call. Metadata-only `reflect_sanitized` deliberately

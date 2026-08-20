@@ -39,6 +39,8 @@ pub enum Stage {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransformOptions {
+    /// Complete descriptor-set and binding layout for this independently translated stage.
+    pub descriptor_layout: crate::reflect::DescriptorLayout,
     pub kernel_local_size: [u32; 3],
     /// Exact Metal `[[threads_per_grid]]` value when it is not derivable as
     /// Vulkan NumWorkgroups * LocalSize (non-uniform `dispatchThreads` tail regions).
@@ -72,6 +74,7 @@ pub struct TransformOptions {
 impl Default for TransformOptions {
     fn default() -> Self {
         Self {
+            descriptor_layout: crate::reflect::DescriptorLayout::default(),
             kernel_local_size: [64, 1, 1],
             kernel_threads_per_grid: None,
             simd_cluster32: false,
@@ -84,6 +87,15 @@ impl Default for TransformOptions {
 }
 
 impl TransformOptions {
+    pub fn with_descriptor_layout(
+        mut self,
+        layout: crate::reflect::DescriptorLayout,
+    ) -> Result<Self, crate::reflect::DescriptorLayoutError> {
+        layout.validate()?;
+        self.descriptor_layout = layout;
+        Ok(self)
+    }
+
     /// Specialize one dynamically bound Metal sampler. Indices outside the Metal sampler argument
     /// table and malformed numeric state fail before translation mutates the module.
     pub fn with_runtime_sampler(
@@ -298,6 +310,7 @@ struct Ctx {
     /// Struct type ids reconstructed from `air.struct_type_info`, with their exact AIR member offsets.
     air_struct_offsets: HashMap<Word, Vec<u32>>,
     air_data_layout: Option<crate::layout::AirDataLayout>,
+    descriptor_layout: crate::reflect::DescriptorLayout,
     /// GLCompute LocalSize and the value exposed to AIR `[[threads_per_threadgroup]]`.
     kernel_local_size: [u32; 3],
     /// Optional exact value exposed to AIR `[[threads_per_grid]]`.
@@ -384,6 +397,7 @@ impl Ctx {
             laid_out: HashSet::new(),
             air_struct_offsets,
             air_data_layout,
+            descriptor_layout: options.descriptor_layout,
             kernel_local_size: options.kernel_local_size,
             kernel_threads_per_grid: options.kernel_threads_per_grid,
             simd_cluster32: options.simd_cluster32,
@@ -2186,8 +2200,11 @@ pub(crate) fn transform_with_options(
     })
 }
 
-pub(crate) fn validate_descriptor_bindings(module: &Module) -> Result<(), String> {
-    resources::validate_descriptor_binding_classes(module)
+pub(crate) fn validate_descriptor_bindings(
+    module: &Module,
+    layout: crate::reflect::DescriptorLayout,
+) -> Result<(), String> {
+    resources::validate_descriptor_binding_classes(module, layout)
 }
 
 pub(crate) fn transform_with_options_and_sidecar(

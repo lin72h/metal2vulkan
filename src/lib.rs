@@ -125,6 +125,10 @@ fn options_for_air(
     san_ll: &str,
     mut options: passes::TransformOptions,
 ) -> Result<passes::TransformOptions, String> {
+    options
+        .descriptor_layout
+        .validate()
+        .map_err(|error| error.to_string())?;
     options.validate_runtime_samplers()?;
     options.validate_runtime_storage_images()?;
     if san_ll.contains("air.compile.denorms_disable") {
@@ -219,7 +223,7 @@ fn build_reflection(
     kern: Option<&meta::KernMeta>,
     entry_name: Option<&str>,
     options: &passes::TransformOptions,
-) -> reflect::ShaderReflection {
+) -> Result<reflect::ShaderReflection, String> {
     let mut reflection = match stage {
         passes::Stage::Fragment => {
             reflect::ShaderReflection::from_fragment(&frag.cloned().unwrap_or_default(), entry_name)
@@ -285,7 +289,8 @@ fn build_reflection(
             },
         );
     }
-    reflection
+    reflection.apply_descriptor_layout(options.descriptor_layout)?;
+    Ok(reflection)
 }
 
 fn validate_reflected_runtime_storage_images(
@@ -498,7 +503,7 @@ pub fn reflect_sanitized(
         stage_meta.kern.as_ref(),
         stage_meta.entry_name.as_deref(),
         &options,
-    );
+    )?;
     validate_reflected_runtime_storage_images(&reflection, &options)?;
     reflection.function_constants = meta::parse_function_constants(san_ll);
     reflection.refine_buffer_access_from_entry(san_ll);
@@ -540,7 +545,7 @@ fn translate_sanitized_native_reflected_with_layout(
         stage_meta.kern.as_ref(),
         stage_meta.entry_name.as_deref(),
         &options,
-    );
+    )?;
     validate_reflected_runtime_storage_images(&reflection, &options)?;
     reflection.function_constants = meta::parse_function_constants(san_ll);
     reflection.refine_buffer_access_from_entry(san_ll);
@@ -657,6 +662,7 @@ pub fn translate_native_primary_validated(
         &primary,
         &validation_error,
         tmp,
+        reflect::DescriptorLayout::default(),
     ) {
         return Ok(primary);
     }
@@ -961,7 +967,7 @@ fn finish_module(
     // the SPIR-V access-chain contract at the final module boundary: the result pointer keeps its
     // pointee but always inherits the actual base pointer's storage class.
     native::reconcile_access_chain_storage_classes_module(&mut out);
-    passes::validate_descriptor_bindings(&out)?;
+    passes::validate_descriptor_bindings(&out, options.descriptor_layout)?;
     let bytes = assemble_finished_module(&out);
     if retry_debug {
         eprintln!("[retry-debug] finish: assembly complete");
@@ -1201,6 +1207,7 @@ fn translate_sanitized_with_meta(
                     &primary,
                     &validation_error,
                     tmp,
+                    options.descriptor_layout,
                 ) {
                     Ok(primary)
                 } else if let Some(primary) =

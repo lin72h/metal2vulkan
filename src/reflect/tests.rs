@@ -562,6 +562,54 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     assert_eq!(repeat.address_mode_s, SamplerAddressMode::Repeat);
     assert_eq!(repeat.address_mode_t, SamplerAddressMode::Repeat);
     assert_eq!(repeat.address_mode_r, SamplerAddressMode::Repeat);
+
+    let layout = DescriptorLayout {
+        set: 3,
+        samplers: DescriptorBindingRange {
+            start: 800,
+            end: 832,
+        },
+        ..Default::default()
+    };
+    let (custom_spv, custom_reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        crate::passes::Stage::Fragment,
+        &tmp,
+        crate::passes::TransformOptions::default()
+            .with_descriptor_layout(layout)
+            .expect("custom sampler layout"),
+    )
+    .expect("translate custom sampler layout");
+    let custom_asm = crate::disassemble(&custom_spv).expect("disassemble custom sampler layout");
+    for binding in [800, 801, 802] {
+        assert!(
+            custom_asm.contains(&format!("Binding {binding}")),
+            "{custom_asm}"
+        );
+    }
+    assert!(custom_asm.contains("DescriptorSet 3"), "{custom_asm}");
+    assert_eq!(custom_reflection.descriptor_layout, layout);
+    assert_eq!(
+        custom_reflection
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+            .filter_map(|binding| binding.descriptor)
+            .collect::<Vec<_>>(),
+        vec![
+            DescriptorLocation {
+                set: 3,
+                binding: 801,
+                count: 1,
+            },
+            DescriptorLocation {
+                set: 3,
+                binding: 802,
+                count: 1,
+            },
+        ]
+    );
+    crate::tools::spirv_val_bytes(&custom_spv, &tmp).expect("custom sampler spirv-val");
 }
 
 #[test]
@@ -1229,6 +1277,7 @@ fn reflection_serde_covers_every_reflection_field() {
     assert!(storage_tex.writable && storage_tex.storage_format.is_some());
     let r = ShaderReflection {
         reflection_version: REFLECTION_VERSION,
+        descriptor_layout: DescriptorLayout::default(),
         stage: ShaderStage::Kernel,
         entry_point: Some("k".to_string()),
         bindings: vec![
@@ -1474,6 +1523,50 @@ fn abi_base_constants_are_the_contract() {
     assert_eq!(imageblock_resource_binding(0, 3), None);
     assert_eq!(fragment_imageblock_resource_binding(255), Some(479));
     assert_eq!(fragment_imageblock_resource_binding(256), None);
+}
+
+#[test]
+fn descriptor_layout_rejects_overlap_reversal_version_and_overflow_with_typed_errors() {
+    let default = DescriptorLayout::default();
+    let layout = DescriptorLayout {
+        sampled_textures: DescriptorBindingRange {
+            start: default.buffers.end - 1,
+            ..default.sampled_textures
+        },
+        ..default
+    };
+    assert!(matches!(
+        layout.validate(),
+        Err(DescriptorLayoutError::OverlappingRanges { .. })
+    ));
+
+    let layout = DescriptorLayout {
+        buffers: DescriptorBindingRange { start: 4, end: 3 },
+        ..Default::default()
+    };
+    assert!(matches!(
+        layout.validate(),
+        Err(DescriptorLayoutError::ReversedRange {
+            class: "buffers",
+            ..
+        })
+    ));
+
+    let layout = DescriptorLayout {
+        version: DESCRIPTOR_LAYOUT_VERSION + 1,
+        ..Default::default()
+    };
+    assert!(matches!(
+        layout.validate(),
+        Err(DescriptorLayoutError::UnsupportedVersion { .. })
+    ));
+    assert_eq!(
+        DescriptorBindingRange::from_base_count(u32::MAX, 1),
+        Err(DescriptorLayoutError::RangeOverflow {
+            base: u32::MAX,
+            count: 1,
+        })
+    );
 }
 
 #[test]

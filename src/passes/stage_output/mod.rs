@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::passes::stage_input::{decorate_builtin, decorate_location, scalar_or_vector_component};
-use crate::reflect::SAMPLER_BINDING_RANGE;
 
 fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
     match frag {
@@ -929,14 +928,15 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), Stri
             Some(new_var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        let binding = allocate_static_sampler_binding(&ctx.module).ok_or_else(|| {
+        let layout = ctx.descriptor_layout;
+        let binding = allocate_static_sampler_binding(&ctx.module, layout).ok_or_else(|| {
             format!(
                 "AIR constexpr sampler count exceeds descriptor band \
                  [{},{})",
-                SAMPLER_BINDING_RANGE.start, SAMPLER_BINDING_RANGE.end
+                layout.samplers.start, layout.samplers.end
             )
         })?;
-        decorate_binding(&mut ctx.module, new_var, binding);
+        decorate_binding(&mut ctx.module, new_var, layout.set, binding);
         ctx.interface_buffer_var(new_var);
 
         // Drop the old global variable + its OpName/decorations (a dangling reference to its id would

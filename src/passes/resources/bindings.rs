@@ -1,10 +1,10 @@
 //! Descriptor-set decoration and ABI binding-number allocation.
 
 use super::*;
-use crate::reflect::{RESOURCE_DESCRIPTOR_SET, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE};
+use crate::reflect::DescriptorLayout;
 
-/// Add `DescriptorSet 0` and `Binding` decorations to one resource variable.
-pub(in crate::passes) fn decorate_binding(module: &mut Module, id: Word, binding: u32) {
+/// Add the selected `DescriptorSet` and `Binding` decorations to one resource variable.
+pub(in crate::passes) fn decorate_binding(module: &mut Module, id: Word, set: u32, binding: u32) {
     module.annotations.push(Instruction::new(
         Op::Decorate,
         None,
@@ -12,7 +12,7 @@ pub(in crate::passes) fn decorate_binding(module: &mut Module, id: Word, binding
         vec![
             Operand::IdRef(id),
             Operand::Decoration(Decoration::DescriptorSet),
-            Operand::LiteralBit32(0),
+            Operand::LiteralBit32(set),
         ],
     ));
     module.annotations.push(Instruction::new(
@@ -48,7 +48,10 @@ pub(in crate::passes) fn decorate_input_attachment_index(
 /// high-water allocator, this cannot escape into the color-input/buffer ranges when a shader also
 /// declares `[[color(n)]]`; it fills the first sampler slot not already claimed by a runtime
 /// `[[sampler(n)]]`.
-pub(in crate::passes) fn allocate_static_sampler_binding(module: &Module) -> Option<u32> {
+pub(in crate::passes) fn allocate_static_sampler_binding(
+    module: &Module,
+    layout: DescriptorLayout,
+) -> Option<u32> {
     let occupied = module
         .annotations
         .iter()
@@ -61,13 +64,15 @@ pub(in crate::passes) fn allocate_static_sampler_binding(module: &Module) -> Opt
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
-    (SAMPLER_BINDING_RANGE.start..SAMPLER_BINDING_RANGE.end)
-        .find(|binding| !occupied.contains(binding))
+    (layout.samplers.start..layout.samplers.end).find(|binding| !occupied.contains(binding))
 }
 
 /// Allocate one translator-owned null-image descriptor inside the texture ABI band. It must never
 /// use a sampler/color-input binding merely because those bands contain the global high-water mark.
-pub(in crate::passes) fn allocate_default_texture_binding(module: &Module) -> Option<u32> {
+pub(in crate::passes) fn allocate_default_texture_binding(
+    module: &Module,
+    layout: DescriptorLayout,
+) -> Option<u32> {
     let occupied = module
         .annotations
         .iter()
@@ -80,33 +85,52 @@ pub(in crate::passes) fn allocate_default_texture_binding(module: &Module) -> Op
             _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
-    (TEXTURE_BINDING_RANGE.start..TEXTURE_BINDING_RANGE.end)
+    (layout.sampled_textures.start..layout.sampled_textures.end)
         .find(|binding| !occupied.contains(binding))
 }
 
-pub(in crate::passes) fn texture_resource_binding(index: u32) -> Result<u32, String> {
-    crate::reflect::texture_resource_binding(index)
+pub(in crate::passes) fn texture_resource_binding(
+    layout: DescriptorLayout,
+    index: u32,
+) -> Result<u32, String> {
+    layout
+        .sampled_texture_binding(index)
         .ok_or_else(|| format!("Metal texture index {index} exceeds the descriptor ABI band"))
 }
 
-pub(in crate::passes) fn storage_texture_resource_binding(index: u32) -> Result<u32, String> {
-    crate::reflect::storage_texture_resource_binding(index).ok_or_else(|| {
+pub(in crate::passes) fn storage_texture_resource_binding(
+    layout: DescriptorLayout,
+    index: u32,
+) -> Result<u32, String> {
+    layout.storage_texture_binding(index).ok_or_else(|| {
         format!("Metal storage-texture index {index} exceeds the descriptor ABI band")
     })
 }
 
-pub(in crate::passes) fn buffer_resource_binding(index: u32) -> Result<u32, String> {
-    crate::reflect::buffer_resource_binding(index)
+pub(in crate::passes) fn buffer_resource_binding(
+    layout: DescriptorLayout,
+    index: u32,
+) -> Result<u32, String> {
+    layout
+        .buffer_binding(index)
         .ok_or_else(|| format!("Metal buffer index {index} exceeds the descriptor ABI band"))
 }
 
-pub(in crate::passes) fn sampler_resource_binding(index: u32) -> Result<u32, String> {
-    crate::reflect::sampler_resource_binding(index)
+pub(in crate::passes) fn sampler_resource_binding(
+    layout: DescriptorLayout,
+    index: u32,
+) -> Result<u32, String> {
+    layout
+        .sampler_binding(index)
         .ok_or_else(|| format!("Metal sampler index {index} exceeds the descriptor ABI band"))
 }
 
-pub(in crate::passes) fn color_input_resource_binding(index: u32) -> Result<u32, String> {
-    crate::reflect::color_input_resource_binding(index)
+pub(in crate::passes) fn color_input_resource_binding(
+    layout: DescriptorLayout,
+    index: u32,
+) -> Result<u32, String> {
+    layout
+        .color_input_binding(index)
         .ok_or_else(|| format!("Metal color-input index {index} exceeds the descriptor ABI band"))
 }
 
@@ -127,6 +151,7 @@ enum DescriptorClass {
 /// intentional same-buffer typed aliases legal while catching cross-class band collisions.
 pub(in crate::passes) fn validate_descriptor_binding_classes(
     module: &Module,
+    layout: DescriptorLayout,
 ) -> Result<(), String> {
     let names = module
         .debug_names
@@ -266,23 +291,20 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
             DescriptorClass::StorageBuffer
             | DescriptorClass::UniformBuffer
             | DescriptorClass::AccelerationStructure => {
-                crate::reflect::BUFFER_BINDING_RANGE.contains(binding)
-                    || binding >= crate::reflect::SYNTHETIC_BINDING_BASE
+                layout.buffers.contains(binding) || layout.synthetic.contains(binding)
             }
-            DescriptorClass::Sampler => crate::reflect::SAMPLER_BINDING_RANGE.contains(binding),
+            DescriptorClass::Sampler => layout.samplers.contains(binding),
             DescriptorClass::SampledImage | DescriptorClass::CombinedImageSampler => {
-                crate::reflect::TEXTURE_BINDING_RANGE.contains(binding)
+                layout.sampled_textures.contains(binding)
             }
             DescriptorClass::StorageImage => {
-                crate::reflect::STORAGE_TEXTURE_BINDING_RANGE.contains(binding)
-                    || crate::reflect::IMAGEBLOCK_BINDING_RANGE.contains(binding)
-                    || crate::reflect::FRAGMENT_IMAGEBLOCK_BINDING_RANGE.contains(binding)
+                layout.storage_textures.contains(binding)
+                    || layout.imageblocks.contains(binding)
+                    || layout.fragment_imageblocks.contains(binding)
             }
-            DescriptorClass::InputAttachment => {
-                crate::reflect::COLOR_INPUT_BINDING_RANGE.contains(binding)
-            }
+            DescriptorClass::InputAttachment => layout.color_inputs.contains(binding),
         };
-        if set != RESOURCE_DESCRIPTOR_SET || !allowed {
+        if set != layout.set || !allowed {
             return Err(format!(
                 "descriptor variable {} has class {class:?} at set {set} binding {binding}, outside its ABI band",
                 label(id)
@@ -307,39 +329,40 @@ mod tests {
     #[test]
     fn static_sampler_allocator_is_bounded_by_its_descriptor_band() {
         let mut module = Module::new();
-        decorate_binding(&mut module, 1, TEXTURE_BINDING_RANGE.end - 1);
+        let layout = DescriptorLayout::default();
+        decorate_binding(&mut module, 1, layout.set, layout.sampled_textures.end - 1);
         decorate_binding(
             &mut module,
             2,
+            layout.set,
             crate::reflect::COLOR_INPUT_BINDING_RANGE.start,
         );
         assert_eq!(
-            allocate_static_sampler_binding(&module),
-            Some(SAMPLER_BINDING_RANGE.start)
+            allocate_static_sampler_binding(&module, layout),
+            Some(layout.samplers.start)
         );
 
-        for (offset, binding) in
-            (SAMPLER_BINDING_RANGE.start..SAMPLER_BINDING_RANGE.end).enumerate()
-        {
-            decorate_binding(&mut module, 100 + offset as u32, binding);
+        for (offset, binding) in (layout.samplers.start..layout.samplers.end).enumerate() {
+            decorate_binding(&mut module, 100 + offset as u32, layout.set, binding);
         }
-        assert_eq!(allocate_static_sampler_binding(&module), None);
+        assert_eq!(allocate_static_sampler_binding(&module, layout), None);
     }
 
     #[test]
     fn null_texture_allocator_is_bounded_by_its_descriptor_band() {
         let mut module = Module::new();
-        decorate_binding(&mut module, 1, SAMPLER_BINDING_RANGE.start);
+        let layout = DescriptorLayout::default();
+        decorate_binding(&mut module, 1, layout.set, layout.samplers.start);
         assert_eq!(
-            allocate_default_texture_binding(&module),
-            Some(TEXTURE_BINDING_RANGE.start)
+            allocate_default_texture_binding(&module, layout),
+            Some(layout.sampled_textures.start)
         );
 
         for (offset, binding) in
-            (TEXTURE_BINDING_RANGE.start..TEXTURE_BINDING_RANGE.end).enumerate()
+            (layout.sampled_textures.start..layout.sampled_textures.end).enumerate()
         {
-            decorate_binding(&mut module, 100 + offset as u32, binding);
+            decorate_binding(&mut module, 100 + offset as u32, layout.set, binding);
         }
-        assert_eq!(allocate_default_texture_binding(&module), None);
+        assert_eq!(allocate_default_texture_binding(&module, layout), None);
     }
 }

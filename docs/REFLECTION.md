@@ -69,7 +69,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `26`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `27`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -80,8 +80,8 @@ field can make old JSON fail deserialization.
 
 ## Descriptor ABI (binding map)
 
-Every descriptor-backed Metal-facing resource uses **descriptor set 0**
-(`RESOURCE_DESCRIPTOR_SET`). Most bindings are a fixed base plus Metal resource index `n`:
+By default, every descriptor-backed Metal-facing resource uses **descriptor set 0**
+(`RESOURCE_DESCRIPTOR_SET`). Most default bindings are a fixed base plus Metal resource index `n`:
 
 | Metal resource | Kind | SPIR-V binding |
 |---|---|---|
@@ -117,7 +117,15 @@ STORAGE_TEXTURE_BINDING_BASE = 480
 SYNTHETIC_BINDING_BASE = 640
 ```
 
-The stage-input / stage-output passes decorate the module with **exactly these** numbers. Use
+`DEFAULT_DESCRIPTOR_LAYOUT` explicitly versions that map with `DESCRIPTOR_LAYOUT_VERSION`. A caller
+can pass a complete non-overlapping `DescriptorLayout` through
+`TransformOptions::with_descriptor_layout`; this selects the set and every resource-class range for
+one independently translated stage. Construct base/count ranges with
+`DescriptorBindingRange::from_base_count` so overflow is a typed `DescriptorLayoutError`.
+The effective layout is returned in `ShaderReflection::descriptor_layout`, including for the
+default, so persisted modules remain self-describing.
+
+The stage-input / stage-output passes decorate the module with **exactly the selected** numbers. Use
 reflection—not list positions or recomputed synthetic indices—to allocate descriptor sets and write
 descriptor updates. Multiple AIR parameters may intentionally alias one Metal index. When building
 a Vulkan descriptor-set layout, group reflected entries by `(set, binding, descriptor type)` and use
@@ -137,7 +145,8 @@ Descriptor types for `bindings`:
 | `ColorInput` | Input attachment |
 
 `implicit_imageblock_attachments` and projected `fragment_imageblock.members` are additional
-single storage-image descriptors in set 0; they are not duplicated in `bindings`. Entries whose
+single storage-image descriptors in the effective layout's set; they are not duplicated in
+`bindings`. Entries whose
 `descriptor` is `None` consume no descriptor.
 
 AIR address spaces (on buffer bindings when present):
@@ -155,6 +164,7 @@ Top-level fields:
 | Field | Meaning |
 |---|---|
 | `reflection_version` | Schema version for cache invalidation |
+| `descriptor_layout` | Versioned effective set and resource-class binding ranges used by the SPIR-V |
 | `stage` | `Vertex`, `TessellationEvaluation`, `Fragment`, or `Kernel` |
 | `entry_point` | **Original Metal entry name** (SPIR-V `OpEntryPoint` is always `"main"`) |
 | `bindings` | AIR entry resources followed by translator-synthesized resources |

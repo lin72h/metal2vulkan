@@ -85,7 +85,8 @@ pub(in crate::passes) fn lower_buffer_address_facts(
         Some(table),
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
-    let binding = ctx
+    let layout = ctx.descriptor_layout;
+    let occupied = ctx
         .module
         .annotations
         .iter()
@@ -97,12 +98,11 @@ pub(in crate::passes) fn lower_buffer_address_facts(
             Some(Operand::LiteralBit32(binding)) => Some(*binding),
             _ => None,
         })
-        .max()
-        .unwrap_or(crate::reflect::SYNTHETIC_BINDING_BASE - 1)
-        .max(crate::reflect::SYNTHETIC_BINDING_BASE - 1)
-        .checked_add(1)
+        .collect::<HashSet<_>>();
+    let binding = (layout.synthetic.start..layout.synthetic.end)
+        .find(|binding| !occupied.contains(binding))
         .ok_or_else(|| "descriptor binding space exhausted for buffer-address table".to_string())?;
-    decorate_binding(&mut ctx.module, table, binding);
+    decorate_binding(&mut ctx.module, table, layout.set, binding);
     ctx.interface_buffer_var(table);
 
     let zero = ctx.const_uint(0);

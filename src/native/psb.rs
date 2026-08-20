@@ -571,16 +571,38 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
 /// PhysicalStorageBuffer64 device-address lowering. Returns true if any rewrite was applied. Two
 /// stages: discover the lowerable closure (pure), then synthesize the address table + physical
 /// element pointers and rewrite the merges (mutating).
+#[cfg(test)]
 pub(super) fn rewrite_cross_binding_pointer_merges(module: &mut Module) -> bool {
-    rewrite_cross_binding_pointer_merges_inner(module, false)
+    rewrite_cross_binding_pointer_merges_with_layout(
+        module,
+        crate::reflect::DescriptorLayout::default(),
+    )
+}
+
+pub(super) fn rewrite_cross_binding_pointer_merges_with_layout(
+    module: &mut Module,
+    layout: crate::reflect::DescriptorLayout,
+) -> bool {
+    rewrite_cross_binding_pointer_merges_inner(module, false, layout)
 }
 
 /// Like [`rewrite_cross_binding_pointer_merges`], but declines a closure that has no cross-binding
 /// pointer phi. This lets the primary path retain its portable value-domain lowering for ordinary
 /// `OpSelect`s while using the address-table form only for the phi family whose post-merge dynamic
 /// accesses cannot be replayed at predecessor edges.
+#[cfg(test)]
 pub(super) fn rewrite_cross_binding_pointer_phis(module: &mut Module) -> bool {
-    rewrite_cross_binding_pointer_merges_inner(module, true)
+    rewrite_cross_binding_pointer_phis_with_layout(
+        module,
+        crate::reflect::DescriptorLayout::default(),
+    )
+}
+
+pub(super) fn rewrite_cross_binding_pointer_phis_with_layout(
+    module: &mut Module,
+    layout: crate::reflect::DescriptorLayout,
+) -> bool {
+    rewrite_cross_binding_pointer_merges_inner(module, true, layout)
 }
 
 /// True when the module contains a lowerable cross-binding pointer closure with an `OpPhi`.
@@ -594,6 +616,7 @@ pub(super) fn has_cross_binding_pointer_phi(module: &Module) -> bool {
 fn rewrite_cross_binding_pointer_merges_inner(
     module: &mut Module,
     require_cross_binding_phi: bool,
+    layout: crate::reflect::DescriptorLayout,
 ) -> bool {
     let Some(discovery) = discover_cross_binding_psb(module) else {
         return false;
@@ -876,8 +899,8 @@ fn rewrite_cross_binding_pointer_merges_inner(
         Some(addr_var),
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
-    // Fresh binding = max existing binding in set 0 + 1.
-    let Some(address_table_binding) = module
+    // Allocate the translator-owned address table within the selected synthetic band.
+    let occupied = module
         .annotations
         .iter()
         .filter(|i| {
@@ -891,10 +914,9 @@ fn rewrite_cross_binding_pointer_merges_inner(
             Some(Operand::LiteralBit32(b)) => Some(*b),
             _ => None,
         })
-        .max()
-        .unwrap_or(crate::reflect::SYNTHETIC_BINDING_BASE - 1)
-        .max(crate::reflect::SYNTHETIC_BINDING_BASE - 1)
-        .checked_add(1)
+        .collect::<HashSet<_>>();
+    let Some(address_table_binding) =
+        (layout.synthetic.start..layout.synthetic.end).find(|binding| !occupied.contains(binding))
     else {
         return false;
     };
@@ -905,7 +927,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         vec![
             Operand::IdRef(addr_var),
             Operand::Decoration(Decoration::DescriptorSet),
-            Operand::LiteralBit32(0),
+            Operand::LiteralBit32(layout.set),
         ],
     ));
     module.annotations.push(Instruction::new(

@@ -16,6 +16,188 @@ use crate::{disassemble, meta, tools};
 use spirv::{BuiltIn, Capability, Decoration, Op, Scope, SelectionControl, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
+fn shifted_descriptor_layout(set: u32, shift: u32) -> crate::reflect::DescriptorLayout {
+    let shift_range =
+        |range: crate::reflect::DescriptorBindingRange| crate::reflect::DescriptorBindingRange {
+            start: range.start.checked_add(shift).expect("test range start"),
+            end: range.end.checked_add(shift).expect("test range end"),
+        };
+    let default = crate::reflect::DescriptorLayout::default();
+    crate::reflect::DescriptorLayout {
+        set,
+        buffers: shift_range(default.buffers),
+        sampled_textures: shift_range(default.sampled_textures),
+        samplers: shift_range(default.samplers),
+        color_inputs: shift_range(default.color_inputs),
+        imageblocks: shift_range(default.imageblocks),
+        fragment_imageblocks: shift_range(default.fragment_imageblocks),
+        storage_textures: shift_range(default.storage_textures),
+        synthetic: shift_range(default.synthetic),
+        ..default
+    }
+}
+
+fn descriptor_locations(module: &crate::spirv_module::Module) -> HashSet<(u32, u32)> {
+    let decorations =
+        module
+            .annotations
+            .iter()
+            .filter_map(|instruction| match instruction.operands.as_slice() {
+                [Operand::IdRef(id), Operand::Decoration(
+                    decoration @ (Decoration::DescriptorSet | Decoration::Binding),
+                ), Operand::LiteralBit32(value)] => Some(((*id, *decoration), *value)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+    module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id)
+        .filter_map(|id| {
+            Some((
+                *decorations.get(&(id, Decoration::DescriptorSet))?,
+                *decorations.get(&(id, Decoration::Binding))?,
+            ))
+        })
+        .collect()
+}
+
+#[test]
+fn caller_selected_layout_separates_independently_translated_vertex_and_fragment_resources() {
+    let vertex = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <{ <4 x float> }> @v(ptr addrspace(1) %buffer) {
+entry:
+  %value = load <4 x float>, ptr addrspace(1) %buffer, align 16
+  %out = insertvalue <{ <4 x float> }> undef, <4 x float> %value, 0
+  ret <{ <4 x float> }> %out
+}
+!air.vertex = !{!0}
+!0 = !{ptr @v, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"buffer"}
+"#;
+    let fragment = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <{ <4 x float> }> @f(ptr addrspace(1) %buffer) {
+entry:
+  %value = load <4 x float>, ptr addrspace(1) %buffer, align 16
+  %out = insertvalue <{ <4 x float> }> undef, <4 x float> %value, 0
+  ret <{ <4 x float> }> %out
+}
+!air.fragment = !{!0}
+!0 = !{ptr @f, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"buffer"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_configurable_descriptor_layout_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (implicit_default_spv, implicit_default_reflection) =
+        crate::translate_sanitized_native_reflected(
+            vertex,
+            Stage::Vertex,
+            &tmp,
+            passes::TransformOptions::default(),
+        )
+        .expect("implicit default layout");
+    let (explicit_default_spv, explicit_default_reflection) =
+        crate::translate_sanitized_native_reflected(
+            vertex,
+            Stage::Vertex,
+            &tmp,
+            passes::TransformOptions::default()
+                .with_descriptor_layout(crate::reflect::DEFAULT_DESCRIPTOR_LAYOUT)
+                .expect("explicit default layout"),
+        )
+        .expect("explicit default translation");
+    assert_eq!(implicit_default_spv, explicit_default_spv);
+    assert_eq!(implicit_default_reflection, explicit_default_reflection);
+    assert_eq!(
+        explicit_default_reflection.descriptor_layout,
+        crate::reflect::DEFAULT_DESCRIPTOR_LAYOUT
+    );
+    let vertex_layout = shifted_descriptor_layout(2, 0);
+    let fragment_layout = shifted_descriptor_layout(2, 1000);
+    let vertex_options = passes::TransformOptions::default()
+        .with_descriptor_layout(vertex_layout)
+        .expect("vertex layout");
+    let fragment_options = passes::TransformOptions::default()
+        .with_descriptor_layout(fragment_layout)
+        .expect("fragment layout");
+    let (vertex_spv, vertex_reflection) =
+        crate::translate_sanitized_native_reflected(vertex, Stage::Vertex, &tmp, vertex_options)
+            .expect("vertex translation");
+    let (fragment_spv, fragment_reflection) = crate::translate_sanitized_native_reflected(
+        fragment,
+        Stage::Fragment,
+        &tmp,
+        fragment_options,
+    )
+    .expect("fragment translation");
+
+    assert_eq!(vertex_reflection.descriptor_layout, vertex_layout);
+    assert_eq!(fragment_reflection.descriptor_layout, fragment_layout);
+    assert_eq!(
+        vertex_reflection.bindings[0].descriptor,
+        Some(crate::reflect::DescriptorLocation {
+            set: 2,
+            binding: 0,
+            count: 1,
+        })
+    );
+    assert_eq!(
+        fragment_reflection.bindings[0].descriptor,
+        Some(crate::reflect::DescriptorLocation {
+            set: 2,
+            binding: 1000,
+            count: 1,
+        })
+    );
+    let vertex_locations = descriptor_locations(&load_bytes(&vertex_spv).expect("vertex SPIR-V"));
+    let fragment_locations =
+        descriptor_locations(&load_bytes(&fragment_spv).expect("fragment SPIR-V"));
+    assert_eq!(vertex_locations, HashSet::from([(2, 0)]));
+    assert_eq!(fragment_locations, HashSet::from([(2, 1000)]));
+    assert!(vertex_locations.is_disjoint(&fragment_locations));
+
+    let (shifted_vertex_spv, shifted_vertex_reflection) =
+        crate::translate_sanitized_native_reflected(
+            vertex,
+            Stage::Vertex,
+            &tmp,
+            passes::TransformOptions::default()
+                .with_descriptor_layout(fragment_layout)
+                .expect("shifted vertex layout"),
+        )
+        .expect("shifted vertex translation");
+    assert_ne!(vertex_spv, shifted_vertex_spv);
+    assert_eq!(
+        shifted_vertex_reflection.bindings[0]
+            .descriptor
+            .expect("shifted descriptor")
+            .binding,
+        1000
+    );
+
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&vertex_spv, &tmp).expect("vertex spirv-val");
+        tools::spirv_val_bytes(&fragment_spv, &tmp).expect("fragment spirv-val");
+        tools::spirv_val_bytes(&shifted_vertex_spv, &tmp).expect("shifted vertex spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn native_vertex_narrow_integer_attributes_use_32_bit_fetch_interface() {
     let ll = include_str!("../../../validation/fixtures/public/vertex_narrow_attributes.ll");

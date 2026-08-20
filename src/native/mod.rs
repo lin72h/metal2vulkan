@@ -120,7 +120,10 @@ use std::collections::{HashMap, HashSet};
 /// without serializing and reparsing between them.
 pub fn rewrite_cross_binding_pointer_merges_bytes(spv: &[u8]) -> Result<Vec<u8>, String> {
     let mut module = load_bytes(spv).map_err(|e| format!("SPIR-V load: {e:?}"))?;
-    rewrite_cross_binding_pointer_merges_module(&mut module)?;
+    rewrite_cross_binding_pointer_merges_module(
+        &mut module,
+        crate::reflect::DescriptorLayout::default(),
+    )?;
     Ok(module
         .assemble()
         .iter()

@@ -464,7 +464,11 @@ impl<'a> RetryCtx<'a> {
             return None;
         }
         let mut candidate = load_bytes(out).ok()?;
-        native::rewrite_cross_binding_pointer_merges_module(&mut candidate).ok()?;
+        native::rewrite_cross_binding_pointer_merges_module(
+            &mut candidate,
+            self.options.descriptor_layout,
+        )
+        .ok()?;
         let bytes = candidate
             .assemble()
             .iter()
@@ -571,7 +575,11 @@ impl<'a> RetryCtx<'a> {
         label_psb: &str,
         label_wg: &str,
     ) -> Option<Vec<u8>> {
-        native::rewrite_cross_binding_pointer_merges_module(&mut candidate).ok()?;
+        native::rewrite_cross_binding_pointer_merges_module(
+            &mut candidate,
+            self.options.descriptor_layout,
+        )
+        .ok()?;
         let psb = candidate
             .assemble()
             .iter()
@@ -637,7 +645,11 @@ impl<'a> RetryCtx<'a> {
         .ok()?;
         native::prune_constant_branches_module(&mut finished.module).ok()?;
         native::reconcile_whole_buffer_scalar_arms_module(&mut finished.module).ok()?;
-        native::rewrite_cross_binding_pointer_merges_module(&mut finished.module).ok()?;
+        native::rewrite_cross_binding_pointer_merges_module(
+            &mut finished.module,
+            self.options.descriptor_layout,
+        )
+        .ok()?;
         let psb = finished
             .module
             .assemble()

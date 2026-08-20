@@ -549,8 +549,9 @@ pub(crate) fn repair_sampled_image_result_types_module(module: &mut Module) -> b
 /// independently validates, so this is floor-safe by construction.
 pub(crate) fn rewrite_cross_binding_pointer_merges_module(
     module: &mut Module,
+    layout: crate::reflect::DescriptorLayout,
 ) -> Result<(), String> {
-    if !psb::rewrite_cross_binding_pointer_merges(module) {
+    if !psb::rewrite_cross_binding_pointer_merges_with_layout(module, layout) {
         return Err("native emitter: no cross-binding pointer merge to rewrite".to_string());
     }
     add_native_module_capabilities(module);
@@ -568,8 +569,11 @@ pub(crate) fn has_cross_binding_pointer_phi_module(module: &Module) -> bool {
 /// an `OpPhi`. Ordinary cross-binding selects stay available to the Logical value-domain lowering;
 /// a phi with post-merge dynamic accesses needs the address-table representation instead of
 /// replaying values on predecessor edges. The caller still validates before adopting the module.
-pub(crate) fn rewrite_cross_binding_pointer_phis_module(module: &mut Module) -> Result<(), String> {
-    if !psb::rewrite_cross_binding_pointer_phis(module) {
+pub(crate) fn rewrite_cross_binding_pointer_phis_module(
+    module: &mut Module,
+    layout: crate::reflect::DescriptorLayout,
+) -> Result<(), String> {
+    if !psb::rewrite_cross_binding_pointer_phis_with_layout(module, layout) {
         return Err("native emitter: no cross-binding pointer phi to rewrite".to_string());
     }
     add_native_module_capabilities(module);
