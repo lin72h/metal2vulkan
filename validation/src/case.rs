@@ -3005,6 +3005,14 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
             specialized.runtime_storage_image_specializations[0].spirv_format,
             Some(metal2vulkan::meta::TextureFormat::Rgba8)
         );
+
+        case.argument_buffer_textures[0].format = TextureFormat::Rgba8Uint;
+        let incompatible = product_transform_options_with_reflection(&case, &unspecialized)
+            .expect("construct incompatible reflected specialization");
+        let error =
+            metal2vulkan::reflect_sanitized(air, metal2vulkan::passes::Stage::Kernel, incompatible)
+                .expect_err("authored integer format cannot satisfy float AIR texels");
+        assert!(error.contains("AIR texels are Float"), "{error}");
     }
 
     #[test]

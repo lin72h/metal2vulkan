@@ -58,7 +58,9 @@ mod footprint;
 /// SPIR-V format (or formatless `Unknown`) emitted for each Metal texture index.
 /// v25 extends that runtime specialization contract to writable textures embedded in argument
 /// buffers, keyed by their reflected synthetic resource index.
-pub const REFLECTION_VERSION: u32 = 25;
+/// v26 rejects component-incompatible runtime formats at the metadata-only reflection boundary,
+/// matching executable translation's specialization contract.
+pub const REFLECTION_VERSION: u32 = 26;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).

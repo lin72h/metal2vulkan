@@ -199,6 +199,16 @@ fn stage_buffer_layouts<'a>(
     }
 }
 
+fn is_runtime_storage_image_binding(binding: &reflect::ResourceBinding, metal_index: u32) -> bool {
+    binding.metal_index == metal_index
+        && (binding.kind == reflect::ResourceKind::StorageImage
+            || matches!(
+                binding.kind,
+                reflect::ResourceKind::TextureArray
+                    | reflect::ResourceKind::EmbeddedArgBufferTexture
+            ) && binding.access == Some(reflect::ResourceAccess::Storage))
+}
+
 /// Build the [`reflect::ShaderReflection`] facade from the already-parsed stage metadata. Pure
 /// re-shaping of parsed data — never touches the emitted SPIR-V, so the reflected translate paths
 /// produce byte-identical bytes to their non-reflected siblings.
@@ -252,21 +262,20 @@ fn build_reflection(
         .enumerate()
         .filter_map(|(metal_index, state)| Some((u32::try_from(metal_index).ok()?, state?)))
     {
-        let binding = reflection.bindings.iter_mut().find(|binding| {
-            binding.metal_index == metal_index
-                && (binding.kind == reflect::ResourceKind::StorageImage
-                    || matches!(
-                        binding.kind,
-                        reflect::ResourceKind::TextureArray
-                            | reflect::ResourceKind::EmbeddedArgBufferTexture
-                    ) && binding.access == Some(reflect::ResourceAccess::Storage))
-        });
-        let Some(binding) = binding else {
-            continue;
-        };
+        let mut applied = false;
         let spirv_format = state.format.explicit_format();
-        if let Some(shape) = binding.texture_shape.as_mut() {
-            shape.storage_format = spirv_format;
+        for binding in reflection
+            .bindings
+            .iter_mut()
+            .filter(|binding| is_runtime_storage_image_binding(binding, metal_index))
+        {
+            applied = true;
+            if let Some(shape) = binding.texture_shape.as_mut() {
+                shape.storage_format = spirv_format;
+            }
+        }
+        if !applied {
+            continue;
         }
         reflection.runtime_storage_image_specializations.push(
             reflect::RuntimeStorageImageSpecialization {
@@ -290,15 +299,33 @@ fn validate_reflected_runtime_storage_images(
         .enumerate()
         .filter_map(|(metal_index, state)| Some((u32::try_from(metal_index).ok()?, state?)))
     {
-        if !reflection
+        let specialized = reflection
             .runtime_storage_image_specializations
             .iter()
-            .any(|specialization| specialization.metal_index == metal_index)
-        {
+            .any(|specialization| specialization.metal_index == metal_index);
+        if !specialized {
             return Err(format!(
                 "runtime storage image {metal_index}: no reflected storage-image binding exists for runtime format {:?}",
                 state.format
             ));
+        }
+        let runtime_component = state.format.component();
+        for binding in reflection
+            .bindings
+            .iter()
+            .filter(|binding| is_runtime_storage_image_binding(binding, metal_index))
+        {
+            let Some(shape) = binding.texture_shape else {
+                return Err(format!(
+                    "runtime storage image {metal_index}: reflected storage-image binding has no texture shape"
+                ));
+            };
+            if shape.component != runtime_component {
+                return Err(format!(
+                    "runtime storage image {metal_index}: AIR texels are {:?}, but runtime format {:?} is {runtime_component:?}",
+                    shape.component, state.format
+                ));
+            }
         }
     }
     Ok(())

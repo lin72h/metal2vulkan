@@ -3526,6 +3526,18 @@ fn runtime_storage_image_specialization_refuses_incompatible_or_missing_contract
         incompatible.contains("AIR texels are Float"),
         "{incompatible}"
     );
+    let reflected_incompatible = crate::reflect_sanitized(
+        RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL,
+        Stage::Kernel,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, uint_state)
+            .unwrap(),
+    )
+    .expect_err("metadata-only reflection must enforce the executable component contract");
+    assert!(
+        reflected_incompatible.contains("AIR texels are Float"),
+        "{reflected_incompatible}"
+    );
 
     let bgra_missing_write = runtime_storage_image_state(
         crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,

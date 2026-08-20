@@ -13,7 +13,7 @@ use base64::Engine as _;
 use metal2vulkan::reflect::ShaderReflection;
 use std::path::Path;
 
-pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v29";
+pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v30";
 
 pub fn execute_case(
     root: &Path,
