@@ -8739,3 +8739,166 @@ rhs:
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
     }
 }
+
+/// An AIR vector whose store size is smaller than its datalayout allocation size (`<3 x i8>` under
+/// `v24:32:32`, `<3 x i16>` under `v48:64:64`, `<3 x float>` under `v96:128:128`) must push the
+/// member that follows it to the next allocation boundary, exactly as LLVM's `StructLayout`
+/// consumes `alignTo(storeSize, abiAlign)` per member. Emitting the store-size boundary instead
+/// leaves every later member one lane early, so Vulkan reads the wrong bytes even though the
+/// module is structurally valid SPIR-V.
+const VECTOR_ALLOCATION_STRIDE_LL: &str = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-n8:16:32"
+target triple = "air64-apple-macosx10.15.0"
+
+%struct.Image = type <{ i8, i8, i8, i8, <3 x i8>, i8, i8, [2 x i8] }>
+
+define void @k(ptr addrspace(2) noalias readonly dereferenceable(12) %cfg, ptr addrspace(1) %out) {
+entry:
+  %vp = getelementptr inbounds %struct.Image, ptr addrspace(2) %cfg, i64 0, i32 4
+  %v = load <3 x i8>, ptr addrspace(2) %vp, align 4
+  %tp = getelementptr inbounds %struct.Image, ptr addrspace(2) %cfg, i64 0, i32 5
+  %t = load i8, ptr addrspace(2) %tp, align 4
+  %up = getelementptr inbounds %struct.Image, ptr addrspace(2) %cfg, i64 0, i32 6
+  %u = load i8, ptr addrspace(2) %up, align 1
+  %lane = extractelement <3 x i8> %v, i32 2
+  %s0 = add i8 %lane, %t
+  %s1 = add i8 %s0, %u
+  %z = zext i8 %s1 to i32
+  store i32 %z, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Image", !"air.arg_name", !"cfg"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+"#;
+
+/// Member offsets of the one emitted struct that holds a three-lane 8-bit vector, found
+/// structurally through the type graph (`OpTypeInt 8` -> `OpTypeVector .. 3` -> `OpTypeStruct`).
+fn three_lane_byte_vector_struct_offsets(asm: &str) -> Vec<(u32, u32)> {
+    let result_id = |line: &str| -> Option<String> {
+        let name = line.split_whitespace().next()?;
+        name.starts_with('%').then(|| name.to_string())
+    };
+    let defines = |line: &str, opcode: &str, operands: &[&str]| -> Option<String> {
+        let (lhs, rhs) = line.split_once('=')?;
+        let mut words = rhs.split_whitespace();
+        (words.next()? == opcode).then_some(())?;
+        let rest = words.collect::<Vec<_>>();
+        (rest == operands).then(|| lhs.trim().to_string())
+    };
+    let byte_ty = asm
+        .lines()
+        .map(str::trim)
+        .find_map(|line| defines(line, "OpTypeInt", &["8", "0"]))
+        .unwrap_or_else(|| panic!("no 8-bit integer type was emitted:\n{asm}"));
+    let vector_ty = asm
+        .lines()
+        .map(str::trim)
+        .find_map(|line| defines(line, "OpTypeVector", &[byte_ty.as_str(), "3"]))
+        .unwrap_or_else(|| panic!("no <3 x i8> type was emitted:\n{asm}"));
+    let struct_ty = asm
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains("OpTypeStruct"))
+        .find(|line| line.split_whitespace().any(|word| word == vector_ty))
+        .and_then(result_id)
+        .unwrap_or_else(|| panic!("no struct with a <3 x i8> member was emitted:\n{asm}"));
+    let mut offsets = asm
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let rest = line.strip_prefix("OpMemberDecorate ")?;
+            let mut parts = rest.split_whitespace();
+            (parts.next()? == struct_ty).then_some(())?;
+            let member: u32 = parts.next()?.parse().ok()?;
+            (parts.next()? == "Offset").then_some(())?;
+            Some((member, parts.next()?.parse().ok()?))
+        })
+        .collect::<Vec<(u32, u32)>>();
+    offsets.sort_unstable();
+    offsets
+}
+
+#[test]
+fn native_three_lane_vector_member_advances_by_its_allocation_size() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_vector_allocation_stride_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(VECTOR_ALLOCATION_STRIDE_LL, Stage::Kernel, &tmp)
+        .expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    // `<3 x i8>` sits at 4 and allocates four bytes, so member 5 starts at 8 — not at the
+    // store-size boundary 7 — and the trailing padding array lands at 10.
+    assert_eq!(
+        three_lane_byte_vector_struct_offsets(&asm),
+        vec![
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 8),
+            (6, 9),
+            (7, 10)
+        ],
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn construct_tree_retry_three_lane_vector_member_advances_by_its_allocation_size() {
+    // The layout contract belongs to every candidate the retry cascade can adopt, not only the
+    // primary emit. `construct_tree` is the validation-gated tier the reproducing compositor
+    // fragment shader actually lands on.
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_vector_allocation_stride_retry_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let kern = meta::parse_air_kernel_meta(VECTOR_ALLOCATION_STRIDE_LL);
+    let retry = crate::retry::RetryCtx::new(
+        VECTOR_ALLOCATION_STRIDE_LL,
+        Stage::Kernel,
+        None,
+        None,
+        kern.as_ref(),
+        None,
+        Some("k"),
+        &tmp,
+        passes::TransformOptions::default(),
+        true,
+    );
+    let spv = retry
+        .construct_tree_retry()
+        .expect("construct_tree candidate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(
+        three_lane_byte_vector_struct_offsets(&asm),
+        vec![
+            (0, 0),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 8),
+            (6, 9),
+            (7, 10)
+        ],
+        "{asm}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}

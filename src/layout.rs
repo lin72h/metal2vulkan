@@ -272,11 +272,16 @@ pub(crate) fn spirv_size_align(
                     continue;
                 };
                 let (size, align) = spirv_size_align(*member, defs, rule);
+                // A member consumes its allocation size — `alignTo(storeSize, abiAlign)`, the same
+                // rule LLVM's `StructLayout` applies. Only three-lane vectors differ (store 3/6/12
+                // bytes, allocate 4/8/16); every other emitted type already has a size that is a
+                // multiple of its alignment.
+                let alloc = round_up_u32(size, align);
                 let member_offset = explicit_offsets
                     .and_then(|offsets| offsets.get(index).copied())
                     .unwrap_or_else(|| round_up_u32(cursor, align));
-                end = end.max(member_offset + size);
-                cursor = member_offset + size;
+                end = end.max(member_offset + alloc);
+                cursor = member_offset + alloc;
                 max_align = max_align.max(align);
             }
             (round_up_u32(end, max_align), max_align)
@@ -438,5 +443,53 @@ mod tests {
         assert_eq!(spirv_size_align(float_array_ty, &defs, rule), (12, 4));
         assert_eq!(spirv_size_align(vec3_array_ty, &defs, rule), (32, 16));
         assert_eq!(spirv_size_align(999, &defs, rule), (4, 4));
+    }
+
+    #[test]
+    fn spirv_natural_struct_consumes_vector_allocation_size() {
+        // A three-lane vector stores 3/6/12 bytes but allocates 4/8/16 under the AIR datalayout
+        // (`v24:32:32`, `v48:64:64`, `v96:128:128`), so the member after it starts at the
+        // allocation boundary and the struct extends past the vector's store size.
+        let uchar_ty = 1u32;
+        let v3uchar_ty = 2u32;
+        let struct_ty = 3u32;
+        let mut defs = HashMap::new();
+        defs.insert(
+            uchar_ty,
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(uchar_ty),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+        );
+        defs.insert(
+            v3uchar_ty,
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(v3uchar_ty),
+                vec![Operand::IdRef(uchar_ty), Operand::LiteralBit32(3)],
+            ),
+        );
+        defs.insert(
+            struct_ty,
+            Instruction::new(
+                Op::TypeStruct,
+                None,
+                Some(struct_ty),
+                vec![
+                    Operand::IdRef(uchar_ty),
+                    Operand::IdRef(v3uchar_ty),
+                    Operand::IdRef(uchar_ty),
+                ],
+            ),
+        );
+
+        let rule = SpirvLayout::Natural;
+        assert_eq!(spirv_size_align(v3uchar_ty, &defs, rule), (3, 4));
+        // Members at 0, 4, 8: the trailing byte follows the vector's four-byte allocation, not its
+        // three-byte store size, so the struct is 12 bytes rather than 8.
+        assert_eq!(spirv_size_align(struct_ty, &defs, rule), (12, 4));
     }
 }

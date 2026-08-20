@@ -356,7 +356,11 @@ fn decorate_layout_recursive(ctx: &mut Ctx, ty: Word, defs: &HashMap<Word, Instr
                     ],
                 ));
                 decorate_layout_recursive(ctx, *mty, defs);
-                off += s;
+                // Advance by the member's allocation size, not its store size. LLVM's struct
+                // layout consumes `alignTo(storeSize, abiAlign)` per member, so a three-lane
+                // vector (store 3/6/12 bytes under an AIR `v24:32:32` / `v48:64:64` /
+                // `v96:128:128` rule) pushes the next member to its four-lane boundary.
+                off += round_up(s, a);
             }
         }
         _ => {}
