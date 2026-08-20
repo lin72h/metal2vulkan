@@ -255,8 +255,11 @@ fn build_reflection(
         let binding = reflection.bindings.iter_mut().find(|binding| {
             binding.metal_index == metal_index
                 && (binding.kind == reflect::ResourceKind::StorageImage
-                    || binding.kind == reflect::ResourceKind::TextureArray
-                        && binding.access == Some(reflect::ResourceAccess::Storage))
+                    || matches!(
+                        binding.kind,
+                        reflect::ResourceKind::TextureArray
+                            | reflect::ResourceKind::EmbeddedArgBufferTexture
+                    ) && binding.access == Some(reflect::ResourceAccess::Storage))
         });
         let Some(binding) = binding else {
             continue;

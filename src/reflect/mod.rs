@@ -56,7 +56,9 @@ mod footprint;
 /// bands and reserves a separate high range for translator-owned descriptors.
 /// v24 records caller-provided runtime storage-image format specialization and the exact explicit
 /// SPIR-V format (or formatless `Unknown`) emitted for each Metal texture index.
-pub const REFLECTION_VERSION: u32 = 24;
+/// v25 extends that runtime specialization contract to writable textures embedded in argument
+/// buffers, keyed by their reflected synthetic resource index.
+pub const REFLECTION_VERSION: u32 = 25;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
@@ -707,6 +709,8 @@ impl RuntimeStorageImageState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RuntimeStorageImageSpecialization {
+    /// Metal texture index for a top-level binding, or the translator-assigned synthetic index
+    /// reported by the matching `EmbeddedArgBufferTexture` binding.
     pub metal_index: u32,
     pub state: RuntimeStorageImageState,
     /// Exact explicit SPIR-V format, or `None` when the emitted `OpTypeImage` uses `Unknown`.

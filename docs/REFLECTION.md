@@ -69,7 +69,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `24`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `25`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -349,14 +349,16 @@ let options = TransformOptions::default().with_runtime_storage_image(
 )?;
 ```
 
-The index is the Metal `[[texture(n)]]` index, not the Vulkan binding (`480 + n`). Translation
-selects the compatible explicit SPIR-V image format and independently specializes bindings that
-previously shared an AIR image type. When the runtime format has no exact SPIR-V token, translation
-uses `Unknown` only if the supplied device features cover every operation the final shader
-performs; it declares only the required read-without-format and/or write-without-format
-capabilities. Atomics require a scalar 32-bit integer format and storage-image atomic support.
-Component-class mismatches, absent bindings, missing format features, and unsupported atomic
-formats fail visibly.
+For a top-level binding, the index is the Metal `[[texture(n)]]` index, not the Vulkan binding
+(`480 + n`). For an `EmbeddedArgBufferTexture`, pass that binding's reflected `metal_index`; this is
+a translator-assigned synthetic index, so consumers must not reconstruct it from argument-buffer
+field positions. Translation selects the compatible explicit SPIR-V image format and independently
+specializes bindings that previously shared an AIR image type. When the runtime format has no exact
+SPIR-V token, translation uses `Unknown` only if the supplied device features cover every operation
+the final shader performs; it declares only the required read-without-format and/or
+write-without-format capabilities. Atomics require a scalar 32-bit integer format and storage-image
+atomic support. Component-class mismatches, absent bindings, missing format features, and
+unsupported atomic formats fail visibly.
 
 Successful reflected translation records the applied states in
 `runtime_storage_image_specializations`. Its `spirv_format` is `Some` for an explicit format and

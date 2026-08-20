@@ -62,8 +62,9 @@ pub struct TransformOptions {
     /// sampler state, but pixel-coordinate samplers require operation-aware shader specialization
     /// to remain legal in Vulkan. Unspecified slots retain ordinary runtime sampling.
     pub runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
-    /// Runtime surface format and host features by Metal `[[texture(n)]]` index. Only storage-image
-    /// bindings consume these entries; sampled textures retain their AIR-derived image type.
+    /// Runtime surface format and host features by top-level Metal `[[texture(n)]]` index or
+    /// reflected synthetic embedded-texture index. Only storage-image bindings consume these
+    /// entries; sampled textures retain their AIR-derived image type.
     pub runtime_storage_image_states:
         [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
 }
@@ -115,8 +116,10 @@ impl TransformOptions {
         Ok(())
     }
 
-    /// Specialize one dynamically bound Metal storage texture. The runtime format and host feature
-    /// facts are validated before translation mutates the module.
+    /// Specialize one dynamically bound Metal storage texture. Use the Metal texture index for a
+    /// top-level binding, or the reflected synthetic `metal_index` for an embedded argument-buffer
+    /// texture. The runtime format and host feature facts are validated before translation mutates
+    /// the module.
     pub fn with_runtime_storage_image(
         mut self,
         metal_index: u32,
@@ -128,7 +131,7 @@ impl TransformOptions {
             .filter(|slot| *slot < TEXTURE_ARGUMENT_COUNT_USIZE)
             .ok_or_else(|| {
                 format!(
-                    "Metal texture index {metal_index} exceeds runtime storage-image specialization range 0..{}",
+                    "storage-image resource index {metal_index} exceeds runtime specialization range 0..{}",
                     TEXTURE_ARGUMENT_COUNT_USIZE
                 )
             })?;

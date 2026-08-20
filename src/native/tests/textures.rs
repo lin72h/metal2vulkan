@@ -359,6 +359,7 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+
     let _ = std::fs::remove_dir_all(tmp);
 }
 
@@ -515,6 +516,89 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+
+    let state = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Rgba8Unorm,
+        false,
+        false,
+    );
+    let (specialized, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, state)
+            .unwrap(),
+    )
+    .expect("specialize embedded storage texture");
+    let specialized_asm = disassemble(&specialized).expect("disassemble specialized texture");
+    assert!(specialized_asm.contains("Rgba8"), "{specialized_asm}");
+    assert!(!specialized_asm.contains("R32f"), "{specialized_asm}");
+    let binding = reflection
+        .binding_at(crate::reflect::ResourceKind::EmbeddedArgBufferTexture, 0)
+        .expect("reflected embedded storage texture");
+    assert_eq!(
+        binding.texture_shape.and_then(|shape| shape.storage_format),
+        Some(crate::meta::TextureFormat::Rgba8)
+    );
+    assert_eq!(
+        reflection.runtime_storage_image_specializations,
+        [crate::reflect::RuntimeStorageImageSpecialization {
+            metal_index: 0,
+            state,
+            spirv_format: Some(crate::meta::TextureFormat::Rgba8),
+        }]
+    );
+    tools::spirv_val_bytes(&specialized, &tmp).expect("specialized spirv-val");
+
+    let error = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                0,
+                runtime_storage_image_state(
+                    crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+                    false,
+                    false,
+                ),
+            )
+            .unwrap(),
+    )
+    .expect_err("embedded formatless write requires the host feature");
+    assert!(error.contains("write-without-format"), "{error}");
+
+    let formatless_state = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+        false,
+        true,
+    );
+    let (formatless, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, formatless_state)
+            .unwrap(),
+    )
+    .expect("embedded formatless write uses the supplied host feature");
+    let formatless_asm = disassemble(&formatless).expect("disassemble formatless texture");
+    assert!(
+        formatless_asm.contains("OpCapability StorageImageWriteWithoutFormat"),
+        "{formatless_asm}"
+    );
+    assert!(formatless_asm.contains("2 Unknown"), "{formatless_asm}");
+    assert_eq!(
+        reflection.runtime_storage_image_specializations,
+        [crate::reflect::RuntimeStorageImageSpecialization {
+            metal_index: 0,
+            state: formatless_state,
+            spirv_format: None,
+        }]
+    );
+    tools::spirv_val_bytes(&formatless, &tmp).expect("formatless embedded spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -568,6 +652,31 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+    let specialized = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                0,
+                runtime_storage_image_state(
+                    crate::reflect::RuntimeStorageImageFormat::R16Float,
+                    false,
+                    false,
+                ),
+            )
+            .unwrap(),
+    )
+    .expect("specialize embedded storage texture array");
+    let specialized_asm = disassemble(&specialized).expect("disassemble specialized array");
+    assert!(specialized_asm.contains("R16f"), "{specialized_asm}");
+    assert!(!specialized_asm.contains("Rgba16f"), "{specialized_asm}");
+    assert_eq!(
+        specialized_asm.matches("OpImageWrite").count(),
+        1,
+        "{specialized_asm}"
+    );
+    tools::spirv_val_bytes(&specialized, &tmp).expect("specialized array spirv-val");
     let _ = std::fs::remove_dir_all(tmp);
 }
 

@@ -175,10 +175,15 @@ fn validate_execution_safety(safety: ExecutionSafety, ll: &str, errors: &mut Vec
 }
 
 fn reflect(air_ll: &str, case: &AuthoredCase) -> Result<ShaderReflection, String> {
-    metal2vulkan::reflect_sanitized(
+    let unspecialized = metal2vulkan::reflect_sanitized(
         air_ll,
         case.stage.product(),
         crate::case::product_transform_options(case)?,
+    )?;
+    metal2vulkan::reflect_sanitized(
+        air_ll,
+        case.stage.product(),
+        crate::case::product_transform_options_with_reflection(case, &unspecialized)?,
     )
 }
 

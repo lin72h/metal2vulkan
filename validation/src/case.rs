@@ -849,6 +849,58 @@ pub(crate) fn product_transform_options(
     Ok(options)
 }
 
+pub(crate) fn product_transform_options_with_reflection(
+    case: &AuthoredCase,
+    reflection: &metal2vulkan::reflect::ShaderReflection,
+) -> Result<metal2vulkan::passes::TransformOptions, String> {
+    let mut options = product_transform_options(case)?;
+    for texture in &case.argument_buffer_textures {
+        if texture.role == ResourceRole::Input {
+            continue;
+        }
+        let indices = reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.kind == metal2vulkan::reflect::ResourceKind::EmbeddedArgBufferTexture
+            })
+            .filter_map(|binding| {
+                let source = binding.embedded_source?;
+                let count = binding.descriptor.map_or(1, |descriptor| descriptor.count);
+                let delta = texture.field_offset.checked_sub(source.field_offset)?;
+                (source.buffer_index == texture.buffer_binding
+                    && delta % 8 == 0
+                    && delta / 8 < count)
+                    .then_some(binding.metal_index)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if indices.is_empty() {
+            return Err(format!(
+                "argument-buffer storage texture {}+{} has no reflected embedded binding",
+                texture.buffer_binding, texture.field_offset
+            ));
+        }
+        let state = texture.format.runtime_storage_specialization()?;
+        for index in indices {
+            if let Some(existing) = usize::try_from(index)
+                .ok()
+                .and_then(|index| options.runtime_storage_image_states.get(index))
+                .copied()
+                .flatten()
+            {
+                if existing != state {
+                    return Err(format!(
+                        "argument-buffer storage texture {}+{} conflicts with runtime format {:?} already assigned to reflected resource index {index}",
+                        texture.buffer_binding, texture.field_offset, existing.format
+                    ));
+                }
+            }
+            options = options.with_runtime_storage_image(index, state)?;
+        }
+    }
+    Ok(options)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplerAddressMode {
@@ -2889,6 +2941,70 @@ mod tests {
             metal2vulkan::reflect::RuntimeStorageImageFormat::R32Uint
         );
         assert!(array.capabilities.storage_image_atomic);
+    }
+
+    #[test]
+    fn authored_argument_buffer_storage_format_uses_reflected_synthetic_identity() {
+        let air = r#"
+%Args = type <{ %"struct.metal::texture2d" }>
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args) {
+entry:
+  %field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0, i32 0
+  %tex = load ptr addrspace(1), ptr addrspace(2) %field, align 8
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %tex, <2 x i32> zeroinitializer, <4 x float> zeroinitializer, i32 0, i32 2)
+  ret void
+}
+
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.indirect_buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !4, !"air.arg_type_name", !"Args", !"air.arg_name", !"args"}
+!4 = !{i32 0, i32 8, i32 0, !"texture2d<float, write>", !"output", !"air.indirect_argument", !5}
+!5 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"output"}
+"#;
+        let mut case = example();
+        case.argument_buffer_textures
+            .push(ArgumentBufferTextureResource {
+                buffer_binding: 0,
+                field_offset: 0,
+                role: ResourceRole::Output,
+                texture_type: TextureType::D2,
+                format: TextureFormat::Rgba8Unorm,
+                dimensions: [1, 1, 1],
+                sample_count: 1,
+                bytes_b64: None,
+                initial_bytes_b64: None,
+            });
+        let unspecialized = metal2vulkan::reflect_sanitized(
+            air,
+            metal2vulkan::passes::Stage::Kernel,
+            product_transform_options(&case).unwrap(),
+        )
+        .expect("unspecialized embedded reflection");
+        let options = product_transform_options_with_reflection(&case, &unspecialized)
+            .expect("reflected embedded specialization");
+        assert_eq!(
+            options.runtime_storage_image_states[0]
+                .expect("synthetic embedded resource")
+                .format,
+            metal2vulkan::reflect::RuntimeStorageImageFormat::Rgba8Unorm
+        );
+        let specialized =
+            metal2vulkan::reflect_sanitized(air, metal2vulkan::passes::Stage::Kernel, options)
+                .expect("specialized embedded reflection");
+        assert_eq!(
+            specialized.runtime_storage_image_specializations[0].metal_index,
+            0
+        );
+        assert_eq!(
+            specialized.runtime_storage_image_specializations[0].spirv_format,
+            Some(metal2vulkan::meta::TextureFormat::Rgba8)
+        );
     }
 
     #[test]

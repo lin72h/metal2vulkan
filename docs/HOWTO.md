@@ -133,11 +133,14 @@ Embedded buffers use matching entries in `argument_buffer_fields`; write the Vul
 into the reflected owner field rather than allocating a separate descriptor.
 
 Writable runtime textures must likewise be translated with
-`TransformOptions::with_runtime_storage_image`, keyed by Metal texture index. Pass the bound format
-and the device's per-format storage/atomic support plus enabled read/write-without-format features.
-Use the returned `runtime_storage_image_specializations` entry to create the matching image view.
-The reflected `spirv_format` and `texture_shape.storage_format` are `None` only when translation
-proved that the shader's exact operations are covered by the supplied formatless features.
+`TransformOptions::with_runtime_storage_image`, keyed by the Metal texture index for a top-level
+binding or by the reflected `metal_index` for an `EmbeddedArgBufferTexture`. Embedded indices are
+translator-assigned; use reflection instead of recomputing them from field positions. Pass the
+bound format and the device's per-format storage/atomic support plus enabled
+read/write-without-format features. Use the returned `runtime_storage_image_specializations` entry
+to create the matching image view. The reflected `spirv_format` and
+`texture_shape.storage_format` are `None` only when translation proved that the shader's exact
+operations are covered by the supplied formatless features.
 
 ## 5. Stage only the buffer bytes the shader can reach
 

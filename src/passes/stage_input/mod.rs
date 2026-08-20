@@ -1835,10 +1835,18 @@ fn register_embedded_textures(
         else {
             continue;
         };
-        let image_ty = if let Some(format) = tex.storage_format {
-            ctx.ty_storage_image(tex.dim, tex.arrayed, format.to_spirv_format(), tex.comp)
+        let (image_ty, runtime_specialization) = if let Some(format) = tex.storage_format {
+            let (format, state) = ctx.specialize_storage_image_format(
+                tex.synthetic_texture_index,
+                format.to_spirv_format(),
+                tex.comp,
+            )?;
+            (
+                ctx.ty_storage_image(tex.dim, tex.arrayed, format, tex.comp),
+                state,
+            )
         } else {
-            ctx.ty_image(tex.dim, tex.arrayed, tex.comp)
+            (ctx.ty_image(tex.dim, tex.arrayed, tex.comp), None)
         };
         let binding_ty = tex
             .array_length
@@ -1863,6 +1871,11 @@ fn register_embedded_textures(
         if let Some(length) = tex.array_length {
             ctx.image_array_vars
                 .insert(var, (image_ty, (tex.dim, tex.arrayed), tex.comp, false));
+            ctx.register_runtime_storage_image_value(
+                var,
+                tex.synthetic_texture_index,
+                runtime_specialization,
+            );
             for fact in &mut ctx.emit_sidecar.buffer_pointer_field_loads {
                 let end = u64::from(tex.field_offset) + u64::from(length) * 8;
                 if fact.root == buffer_root
@@ -1893,6 +1906,16 @@ fn register_embedded_textures(
         ctx.image_comp.insert(lid, tex.comp);
         if tex.storage_format.is_some() {
             ctx.image_storage.insert(lid);
+            ctx.register_runtime_storage_image_value(
+                var,
+                tex.synthetic_texture_index,
+                runtime_specialization,
+            );
+            ctx.register_runtime_storage_image_value(
+                lid,
+                tex.synthetic_texture_index,
+                runtime_specialization,
+            );
         }
         replacements.extend(
             ctx.emit_sidecar

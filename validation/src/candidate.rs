@@ -13,7 +13,7 @@ use base64::Engine as _;
 use metal2vulkan::reflect::ShaderReflection;
 use std::path::Path;
 
-pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v28";
+pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v29";
 
 pub fn execute_case(
     root: &Path,
@@ -48,7 +48,8 @@ pub fn execute_case(
         );
     }
     let scratch = ScratchDir::new("candidate-translate")?;
-    let options = crate::case::product_transform_options(&checked.case)?;
+    let options =
+        crate::case::product_transform_options_with_reflection(&checked.case, &checked.reflection)?;
     let linked_functions = candidate_linkage(&checked)?;
     let mut spv = if linked_functions.is_empty() {
         metal2vulkan::translate_sanitized_native_with_options(
