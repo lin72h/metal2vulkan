@@ -537,12 +537,95 @@ pub(in crate::passes) fn build_pixel_fetch_coord_from_signed_components(
                 Operand::IdRef(nonnegative),
             ],
         ));
+        let addressed = match sampler_state
+            .spatial_address_mode(idx)
+            .ok_or("pixel sampler address dimension is missing")?
+        {
+            crate::reflect::SamplerAddressMode::ClampToZero
+            | crate::reflect::SamplerAddressMode::ClampToEdge
+            | crate::reflect::SamplerAddressMode::ClampToBorder => clamped,
+            crate::reflect::SamplerAddressMode::Repeat => {
+                let size_s = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::Bitcast,
+                    Some(sint),
+                    Some(size_s),
+                    vec![Operand::IdRef(max_coord_u)],
+                ));
+                let wrapped = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::SMod,
+                    Some(sint),
+                    Some(wrapped),
+                    vec![Operand::IdRef(converted), Operand::IdRef(size_s)],
+                ));
+                wrapped
+            }
+            crate::reflect::SamplerAddressMode::MirroredRepeat => {
+                let size_s = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::Bitcast,
+                    Some(sint),
+                    Some(size_s),
+                    vec![Operand::IdRef(max_coord_u)],
+                ));
+                let two = ctx.const_int_of(sint, 2);
+                let period = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::IMul,
+                    Some(sint),
+                    Some(period),
+                    vec![Operand::IdRef(size_s), Operand::IdRef(two)],
+                ));
+                let phase = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::SMod,
+                    Some(sint),
+                    Some(phase),
+                    vec![Operand::IdRef(converted), Operand::IdRef(period)],
+                ));
+                let one_s = ctx.const_int_of(sint, 1);
+                let period_minus_one = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::ISub,
+                    Some(sint),
+                    Some(period_minus_one),
+                    vec![Operand::IdRef(period), Operand::IdRef(one_s)],
+                ));
+                let mirrored = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::ISub,
+                    Some(sint),
+                    Some(mirrored),
+                    vec![Operand::IdRef(period_minus_one), Operand::IdRef(phase)],
+                ));
+                let second_half = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::SGreaterThanEqual,
+                    Some(bool_ty),
+                    Some(second_half),
+                    vec![Operand::IdRef(phase), Operand::IdRef(size_s)],
+                ));
+                let wrapped = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::Select,
+                    Some(sint),
+                    Some(wrapped),
+                    vec![
+                        Operand::IdRef(second_half),
+                        Operand::IdRef(mirrored),
+                        Operand::IdRef(phase),
+                    ],
+                ));
+                wrapped
+            }
+        };
         let fetch_comp = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::Bitcast,
             Some(uint),
             Some(fetch_comp),
-            vec![Operand::IdRef(clamped)],
+            vec![Operand::IdRef(addressed)],
         ));
         comps.push(Operand::IdRef(fetch_comp));
         if sampler_state.spatial_clamps_to_zero(idx) {
@@ -624,6 +707,15 @@ pub(in crate::passes) fn cube_fetch_as_center_sample(
     color: Word,
     sampler_arg: Option<Word>,
 ) -> Result<(), String> {
+    if sampler_arg.is_some_and(|sampler| {
+        ctx.sampler_states
+            .get(&sampler)
+            .is_some_and(|state| state.uses_pixel_coordinates())
+    }) {
+        return Err(
+            "air.read_texture cube reads do not support pixel-coordinate runtime samplers".into(),
+        );
+    }
     let img = load_image_if_pointer(ctx, img, out);
     let float = ctx.ty_float();
     let v3f = ctx.ty_vecf(3);

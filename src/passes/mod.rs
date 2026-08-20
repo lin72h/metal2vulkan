@@ -17,7 +17,7 @@
 use crate::meta::{
     AirScalar, AirType, FragMeta, FragRole, KernMeta, KernRole, VertMeta, VertOutRole, VertRole,
 };
-use crate::reflect::StaticSamplerState;
+use crate::reflect::{RuntimeSamplerState, StaticSamplerState, SAMPLER_ARGUMENT_COUNT_USIZE};
 use crate::spirv_module::{is_block_terminator, Block, Function, Instruction, Module, Operand};
 use spirv::{
     BuiltIn, Decoration, Dim, FunctionControl, ImageFormat, MemorySemantics, Op, Scope,
@@ -34,7 +34,7 @@ pub enum Stage {
     Kernel,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TransformOptions {
     pub kernel_local_size: [u32; 3],
     /// Exact Metal `[[threads_per_grid]]` value when it is not derivable as
@@ -55,6 +55,10 @@ pub struct TransformOptions {
     /// state. Supply the exact pipeline value when translating such a module; leaving it `None`
     /// keeps unknown state honest and makes the intrinsic fail visibly.
     pub raster_sample_count: Option<u32>,
+    /// Pipeline sampler state by Metal `[[sampler(n)]]` index. AIR does not carry dynamically bound
+    /// sampler state, but pixel-coordinate samplers require operation-aware shader specialization
+    /// to remain legal in Vulkan. Unspecified slots retain ordinary runtime sampling.
+    pub runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
 }
 
 impl Default for TransformOptions {
@@ -65,7 +69,42 @@ impl Default for TransformOptions {
             simd_cluster32: false,
             denorm_flush_to_zero_f32: false,
             raster_sample_count: None,
+            runtime_sampler_states: [None; SAMPLER_ARGUMENT_COUNT_USIZE],
         }
+    }
+}
+
+impl TransformOptions {
+    /// Specialize one dynamically bound Metal sampler. Indices outside the Metal sampler argument
+    /// table and malformed numeric state fail before translation mutates the module.
+    pub fn with_runtime_sampler(
+        mut self,
+        metal_index: u32,
+        state: RuntimeSamplerState,
+    ) -> Result<Self, String> {
+        state.validate()?;
+        let slot = usize::try_from(metal_index)
+            .ok()
+            .filter(|slot| *slot < SAMPLER_ARGUMENT_COUNT_USIZE)
+            .ok_or_else(|| {
+                format!(
+                    "Metal sampler index {metal_index} exceeds runtime specialization range 0..{}",
+                    SAMPLER_ARGUMENT_COUNT_USIZE
+                )
+            })?;
+        self.runtime_sampler_states[slot] = Some(state);
+        Ok(self)
+    }
+
+    pub(crate) fn validate_runtime_samplers(self) -> Result<(), String> {
+        for (index, state) in self.runtime_sampler_states.iter().copied().enumerate() {
+            if let Some(state) = state {
+                state
+                    .validate()
+                    .map_err(|error| format!("runtime sampler {index}: {error}"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -212,6 +251,7 @@ struct Ctx {
     simd_cluster32: bool,
     /// Exact graphics-pipeline sample count used to lower `air.get_num_samples.i32`.
     raster_sample_count: Option<u32>,
+    runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
@@ -282,6 +322,7 @@ impl Ctx {
             kernel_threads_per_grid: options.kernel_threads_per_grid,
             simd_cluster32: options.simd_cluster32,
             raster_sample_count: options.raster_sample_count,
+            runtime_sampler_states: options.runtime_sampler_states,
             default_sampler_var: None,
             sampler_states: HashMap::new(),
             default_null_image_vars: HashMap::new(),

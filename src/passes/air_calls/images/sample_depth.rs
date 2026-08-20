@@ -48,25 +48,63 @@ pub(in crate::passes) fn lower_sample_depth(
     } else {
         sample_args.extend_from_slice(&args[4..]);
     }
-    let emulated = ctx.sampler_states.get(&samp).copied().filter(|state| {
-        state.uses_pixel_coordinates()
-            && state.uses_linear_filter()
-            && matches!(dim, Dim::Dim2D | Dim::Dim3D)
-    });
-    let color = if let Some(state) = emulated {
+    let pixel_state = ctx
+        .sampler_states
+        .get(&samp)
+        .copied()
+        .filter(|state| state.uses_pixel_coordinates());
+    let color = if let Some(state) = pixel_state {
         let lod = ctx.const_uint(0);
-        lower_pixel_linear_sample(
-            ctx,
-            state,
-            img,
-            dim,
-            arrayed,
-            coord,
-            &sample_args,
-            lod,
-            v4,
-            &mut out,
-        )?
+        if state.uses_linear_filter() && matches!(dim, Dim::Dim2D | Dim::Dim3D) {
+            lower_pixel_linear_sample(
+                ctx,
+                state,
+                img,
+                dim,
+                arrayed,
+                coord,
+                &sample_args,
+                lod,
+                v4,
+                &mut out,
+            )?
+        } else if state.uses_pixel_nearest() {
+            let fetch = build_pixel_fetch_coord(
+                ctx,
+                state,
+                img,
+                dim,
+                arrayed,
+                coord,
+                &sample_args,
+                lod,
+                &mut out,
+            )?;
+            let fetched = ctx.module.fresh_id();
+            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched);
+            if let Some(in_bounds) = fetch.in_bounds {
+                let guarded = ctx.module.fresh_id();
+                let zero = const_null_of(ctx, v4);
+                out.push(Instruction::new(
+                    Op::Select,
+                    Some(v4),
+                    Some(guarded),
+                    vec![
+                        Operand::IdRef(in_bounds),
+                        Operand::IdRef(fetched),
+                        Operand::IdRef(zero),
+                    ],
+                ));
+                guarded
+            } else {
+                fetched
+            }
+        } else {
+            return Err(format!(
+                "pixel-coordinate depth sampling does not support {dim:?} with {:?} filtering",
+                state.min_filter
+            ));
+        }
     } else {
         let si_ty = ctx.ty_sampled_image(img_ty);
         let si = ctx.module.fresh_id();
@@ -199,45 +237,113 @@ pub(in crate::passes) fn lower_sample_compare_depth(
     } else {
         (coord, args[4])
     };
-    let si_ty = ctx.ty_sampled_image(img_ty);
     let float_ty = ctx.ty_float();
     let bool_ty = ctx.ty_bool();
-    let si = ctx.module.fresh_id();
-    let color = ctx.module.fresh_id();
     let depth = ctx.module.fresh_id();
     let shadow = ctx.module.fresh_id();
     let one = ctx.const_float(1.0);
     let zero = ctx.const_float(0.0);
-    let samp = valid_sampler_value(ctx, samp, &mut out)?;
-    out.push(Instruction::new(
-        Op::SampledImage,
-        Some(si_ty),
-        Some(si),
-        vec![Operand::IdRef(img), Operand::IdRef(samp)],
-    ));
-    push_image_sample(
-        ctx,
-        &mut out,
-        v4,
-        color,
-        si,
-        coord_for_sample,
-        None,
-        false,
-        None,
-    );
+    let sampler_state = ctx.sampler_states.get(&samp).copied();
+    if sampler_state
+        .map(|state| state.compare_function == crate::reflect::SamplerCompareFunction::None)
+        .unwrap_or(false)
+    {
+        return Err("air.sample_compare_depth requires a sampler with comparison enabled".into());
+    }
+    let color = if let Some(state) = sampler_state.filter(|state| state.uses_pixel_coordinates()) {
+        let mut sample_args = vec![args[0], args[1], coord];
+        let trailing = if arrayed {
+            sample_args.push(args[4]);
+            args.get(6..).unwrap_or_default()
+        } else {
+            args.get(5..).unwrap_or_default()
+        };
+        sample_args.extend_from_slice(trailing);
+        let lod = ctx.const_uint(0);
+        if state.uses_linear_filter() && matches!(dim, Dim::Dim2D | Dim::Dim3D) {
+            lower_pixel_linear_sample(
+                ctx,
+                state,
+                img,
+                dim,
+                arrayed,
+                coord,
+                &sample_args,
+                lod,
+                v4,
+                &mut out,
+            )?
+        } else if state.uses_pixel_nearest() {
+            let fetch = build_pixel_fetch_coord(
+                ctx,
+                state,
+                img,
+                dim,
+                arrayed,
+                coord,
+                &sample_args,
+                lod,
+                &mut out,
+            )?;
+            let fetched = ctx.module.fresh_id();
+            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched);
+            if let Some(in_bounds) = fetch.in_bounds {
+                let guarded = ctx.module.fresh_id();
+                let zero_color = const_null_of(ctx, v4);
+                out.push(Instruction::new(
+                    Op::Select,
+                    Some(v4),
+                    Some(guarded),
+                    vec![
+                        Operand::IdRef(in_bounds),
+                        Operand::IdRef(fetched),
+                        Operand::IdRef(zero_color),
+                    ],
+                ));
+                guarded
+            } else {
+                fetched
+            }
+        } else {
+            return Err(format!(
+                "pixel-coordinate depth comparison does not support {dim:?} with {:?} filtering",
+                state.min_filter
+            ));
+        }
+    } else {
+        let si_ty = ctx.ty_sampled_image(img_ty);
+        let si = ctx.module.fresh_id();
+        let color = ctx.module.fresh_id();
+        let valid_sampler = valid_sampler_value(ctx, samp, &mut out)?;
+        out.push(Instruction::new(
+            Op::SampledImage,
+            Some(si_ty),
+            Some(si),
+            vec![Operand::IdRef(img), Operand::IdRef(valid_sampler)],
+        ));
+        push_image_sample(
+            ctx,
+            &mut out,
+            v4,
+            color,
+            si,
+            coord_for_sample,
+            None,
+            false,
+            None,
+        );
+        color
+    };
     out.push(Instruction::new(
         Op::CompositeExtract,
         Some(float_ty),
         Some(depth),
         vec![Operand::IdRef(color), Operand::LiteralBit32(0)],
     ));
-    let compare = ctx
-        .sampler_states
-        .get(&samp)
+    let compare = sampler_state
         .map(|state| state.compare_function)
-        // Runtime/selected samplers do not currently carry one exact constexpr state through the
-        // AIR value graph; preserve the pre-existing depth <= reference relation for that path.
+        // Unspecialized runtime/selected samplers do not carry exact state through the AIR value
+        // graph; preserve the pre-existing depth <= reference relation for that path.
         .unwrap_or(crate::reflect::SamplerCompareFunction::GreaterEqual);
     let passed = match compare {
         crate::reflect::SamplerCompareFunction::None

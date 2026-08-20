@@ -89,7 +89,7 @@ pub fn check_case(root: &Path, case: AuthoredCase) -> Result<CheckedCase, Vec<St
         };
     validate_visible_reference_closure(&source.air_ll, &linked_functions, &mut errors);
 
-    let reflection = match reflect(&source.air_ll, case.stage) {
+    let reflection = match reflect(&source.air_ll, &case) {
         Ok(reflection) => reflection,
         Err(error) => {
             errors.push(format!("product reflection failed: {error}"));
@@ -174,11 +174,11 @@ fn validate_execution_safety(safety: ExecutionSafety, ll: &str, errors: &mut Vec
     }
 }
 
-fn reflect(air_ll: &str, stage: Stage) -> Result<ShaderReflection, String> {
+fn reflect(air_ll: &str, case: &AuthoredCase) -> Result<ShaderReflection, String> {
     metal2vulkan::reflect_sanitized(
         air_ll,
-        stage.product(),
-        metal2vulkan::passes::TransformOptions::default(),
+        case.stage.product(),
+        crate::case::product_transform_options(case)?,
     )
 }
 

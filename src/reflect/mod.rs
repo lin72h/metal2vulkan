@@ -54,7 +54,7 @@ mod footprint;
 ///
 /// v22 replaces the overlapping 32-wide descriptor bases with checked, non-overlapping resource
 /// bands and reserves a separate high range for translator-owned descriptors.
-pub const REFLECTION_VERSION: u32 = 22;
+pub const REFLECTION_VERSION: u32 = 23;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
@@ -106,6 +106,7 @@ pub const SAMPLER_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange
 /// Number of sampler argument-table entries exposed by the Metal ABI. The remainder of
 /// [`SAMPLER_BINDING_RANGE`] is reserved for synthesized static samplers.
 pub const SAMPLER_ARGUMENT_COUNT: u32 = 16;
+pub const SAMPLER_ARGUMENT_COUNT_USIZE: usize = SAMPLER_ARGUMENT_COUNT as usize;
 /// Descriptor binding base for `[[color(n)]]` framebuffer-fetch inputs (Vulkan input attachments):
 /// binding = `COLOR_INPUT_BINDING_BASE + n`.
 pub const COLOR_INPUT_BINDING_BASE: u32 = SAMPLER_BINDING_RANGE.end;
@@ -470,6 +471,125 @@ pub struct StaticSamplerState {
     pub raw_words: [u64; 2],
 }
 
+/// Pipeline-provided state for one dynamically bound Metal sampler.
+///
+/// AIR carries the sampler's Metal index but not the state selected when the pipeline is created.
+/// Supplying this state lets translation replace operations that Vulkan forbids with an
+/// unnormalized-coordinate sampler by equivalent shader-side image fetches. Unlike
+/// [`StaticSamplerState`], this has no AIR-encoded raw words because it comes from the caller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RuntimeSamplerState {
+    pub min_filter: SamplerFilter,
+    pub mag_filter: SamplerFilter,
+    pub mip_filter: SamplerMipFilter,
+    pub address_mode_s: SamplerAddressMode,
+    pub address_mode_t: SamplerAddressMode,
+    pub address_mode_r: SamplerAddressMode,
+    pub coordinates: SamplerCoordinates,
+    pub compare_function: SamplerCompareFunction,
+    pub max_anisotropy: u32,
+    pub lod_min_clamp: f32,
+    pub lod_max_clamp: f32,
+    pub border_color: SamplerBorderColor,
+    pub reduction: SamplerReduction,
+    pub lod_bias: f32,
+}
+
+impl RuntimeSamplerState {
+    pub(crate) fn validate(self) -> Result<(), String> {
+        if self.max_anisotropy == 0 {
+            return Err("runtime sampler max_anisotropy must be at least 1".into());
+        }
+        if !self.lod_min_clamp.is_finite()
+            || !self.lod_max_clamp.is_finite()
+            || !self.lod_bias.is_finite()
+        {
+            return Err("runtime sampler LOD bounds and bias must be finite".into());
+        }
+        if self.lod_min_clamp > self.lod_max_clamp {
+            return Err(format!(
+                "runtime sampler minimum LOD {} exceeds maximum LOD {}",
+                self.lod_min_clamp, self.lod_max_clamp
+            ));
+        }
+        if self.coordinates == SamplerCoordinates::Pixel {
+            if self.min_filter != self.mag_filter {
+                return Err(
+                    "pixel-coordinate runtime samplers with mixed min/mag filters are unsupported because AIR does not expose the pipeline derivative state needed to select the filter"
+                        .into(),
+                );
+            }
+            if self.mip_filter == SamplerMipFilter::Linear {
+                return Err(
+                    "pixel-coordinate runtime samplers with linear mip filtering are unsupported"
+                        .into(),
+                );
+            }
+            if self.max_anisotropy > 1 {
+                return Err(
+                    "pixel-coordinate runtime sampler anisotropy cannot be emulated exactly".into(),
+                );
+            }
+            if self.lod_bias != 0.0 {
+                return Err(
+                    "pixel-coordinate runtime sampler LOD bias cannot be emulated exactly".into(),
+                );
+            }
+            if self.lod_min_clamp != 0.0 || self.lod_max_clamp != 0.0 {
+                return Err("pixel-coordinate runtime sampler LOD clamps must both be zero".into());
+            }
+            if self.reduction != SamplerReduction::WeightedAverage {
+                return Err(
+                    "pixel-coordinate runtime sampler min/max reduction is unsupported".into(),
+                );
+            }
+            if self.border_color != SamplerBorderColor::TransparentBlack
+                && [
+                    self.address_mode_s,
+                    self.address_mode_t,
+                    self.address_mode_r,
+                ]
+                .contains(&SamplerAddressMode::ClampToBorder)
+            {
+                return Err(
+                    "pixel-coordinate runtime samplers support only transparent-black border emulation"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lowering_state(self) -> StaticSamplerState {
+        StaticSamplerState {
+            min_filter: self.min_filter,
+            mag_filter: self.mag_filter,
+            mip_filter: self.mip_filter,
+            address_mode_s: self.address_mode_s,
+            address_mode_t: self.address_mode_t,
+            address_mode_r: self.address_mode_r,
+            coordinates: self.coordinates,
+            compare_function: self.compare_function,
+            max_anisotropy: self.max_anisotropy,
+            lod_min_clamp: self.lod_min_clamp,
+            lod_max_clamp: self.lod_max_clamp,
+            border_color: self.border_color,
+            reduction: self.reduction,
+            lod_bias: self.lod_bias,
+            raw_words: [0; 2],
+        }
+    }
+}
+
+/// One runtime sampler state applied to every AIR sampler parameter at the same Metal index.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RuntimeSamplerSpecialization {
+    pub metal_index: u32,
+    pub state: RuntimeSamplerState,
+}
+
 impl StaticSamplerState {
     pub(crate) fn from_air_words(words: [u64; 2]) -> Result<Self, String> {
         let word = words[0];
@@ -568,15 +688,23 @@ impl StaticSamplerState {
     }
 
     pub(crate) fn spatial_clamps_to_zero(self, dimension: usize) -> bool {
-        matches!(
-            [
-                self.address_mode_s,
-                self.address_mode_t,
-                self.address_mode_r
-            ]
-            .get(dimension),
-            Some(SamplerAddressMode::ClampToZero)
-        )
+        match self.spatial_address_mode(dimension) {
+            Some(SamplerAddressMode::ClampToZero) => true,
+            Some(SamplerAddressMode::ClampToBorder) => {
+                self.border_color == SamplerBorderColor::TransparentBlack
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn spatial_address_mode(self, dimension: usize) -> Option<SamplerAddressMode> {
+        [
+            self.address_mode_s,
+            self.address_mode_t,
+            self.address_mode_r,
+        ]
+        .get(dimension)
+        .copied()
     }
 }
 
@@ -859,6 +987,11 @@ pub struct ShaderReflection {
     /// unsanitized module (sanitization strips it). A consumer uses it to lay out struct members
     /// without re-reading the source `.ll`. `None` when translated from already-sanitized IR.
     pub datalayout: Option<String>,
+    /// Pipeline-provided sampler states used to specialize dynamically bound Metal samplers.
+    /// Entries are sorted by `metal_index`; each state applies to every runtime sampler binding at
+    /// that index and describes the executable SPIR-V returned with this reflection.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub runtime_sampler_specializations: Vec<RuntimeSamplerSpecialization>,
     /// Metal `[[function_constant(N)]]` inventory (index/name/type), so a consumer can discover the
     /// module's spec-ids without scanning SPIR-V. Populated by the reflected translate paths; empty
     /// when reflection is built directly from meta (the `from_*` builders do not scan IR).
@@ -1050,6 +1183,36 @@ impl ShaderReflection {
                     owner,
                     DescriptorClass::StorageImage,
                 )?;
+            }
+        }
+        let mut specialized_sampler_indices = std::collections::BTreeSet::new();
+        for specialization in &self.runtime_sampler_specializations {
+            specialization.state.validate().map_err(|error| {
+                format!(
+                    "runtime sampler {} specialization is invalid: {error}",
+                    specialization.metal_index
+                )
+            })?;
+            if specialization.metal_index >= SAMPLER_ARGUMENT_COUNT {
+                return Err(format!(
+                    "runtime sampler specialization index {} exceeds Metal sampler range 0..{SAMPLER_ARGUMENT_COUNT}",
+                    specialization.metal_index
+                ));
+            }
+            if !specialized_sampler_indices.insert(specialization.metal_index) {
+                return Err(format!(
+                    "runtime sampler {} is specialized more than once",
+                    specialization.metal_index
+                ));
+            }
+            if !self.bindings.iter().any(|binding| {
+                binding.kind == ResourceKind::Sampler
+                    && binding.metal_index == specialization.metal_index
+            }) {
+                return Err(format!(
+                    "runtime sampler {} specialization has no matching AIR sampler binding",
+                    specialization.metal_index
+                ));
             }
         }
         Ok(())
@@ -1278,6 +1441,7 @@ impl ShaderReflection {
                 }
             }),
             datalayout: None,
+            runtime_sampler_specializations: Vec::new(),
             function_constants: Vec::new(),
         }
     }
@@ -1434,6 +1598,7 @@ impl ShaderReflection {
             implicit_imageblock_attachments: Vec::new(),
             fragment_imageblock: None,
             datalayout: None,
+            runtime_sampler_specializations: Vec::new(),
             function_constants: Vec::new(),
         }
     }
@@ -1625,6 +1790,7 @@ impl ShaderReflection {
                 .collect(),
             fragment_imageblock: None,
             datalayout: None,
+            runtime_sampler_specializations: Vec::new(),
             function_constants: Vec::new(),
         }
     }

@@ -173,7 +173,10 @@ pub(in crate::passes) enum ParamBinding {
         members: Vec<(Word, Word, Word, FragmentImageblockFormat)>,
     },
     /// A sampler variable: replace param uses with an OpLoad of the sampler.
-    Sampler { var: Word },
+    Sampler {
+        var: Word,
+        specialized_state: Option<StaticSamplerState>,
+    },
     /// A buffer block variable, with the lowering of the body's param uses (see `BufWrap`).
     Buffer { var: Word, wrap: BufWrap },
     /// A compute `[[stage_in]]` value. Vulkan has no compute-stage attribute stream, so the
@@ -635,7 +638,34 @@ pub(super) fn build_stage_input(
             let binding = required_resource_binding(*pid, resource_binding)?;
             decorate_binding(&mut ctx.module, var, binding);
             ctx.interface_buffer_var(var);
-            bindings.push((*pid, ParamBinding::Sampler { var }));
+            let metal_index = match stage {
+                Stage::Fragment => frag.and_then(|meta| match meta.role_of(idx) {
+                    Some(FragRole::Sampler(index)) => Some(*index),
+                    _ => None,
+                }),
+                Stage::Vertex => vert.and_then(|meta| match meta.role_of(idx) {
+                    Some(VertRole::Sampler(index)) => Some(*index),
+                    _ => None,
+                }),
+                Stage::Kernel => kern.and_then(|meta| match meta.role_of(idx) {
+                    Some(KernRole::Sampler(index)) => Some(*index),
+                    _ => None,
+                }),
+            }
+            .ok_or_else(|| format!("sampler parameter {pid} has no Metal sampler index"))?;
+            let specialized_state = usize::try_from(metal_index)
+                .ok()
+                .and_then(|index| ctx.runtime_sampler_states.get(index))
+                .copied()
+                .flatten()
+                .map(RuntimeSamplerState::lowering_state);
+            bindings.push((
+                *pid,
+                ParamBinding::Sampler {
+                    var,
+                    specialized_state,
+                },
+            ));
         } else if is_threadgroup_buffer {
             let pointee = ptr_pointee(&defs, *pty)
                 .ok_or_else(|| format!("threadgroup param {pid} type {pty} is not a pointer"))?;

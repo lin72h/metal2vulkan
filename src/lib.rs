@@ -124,7 +124,8 @@ fn reject_unsupported_metal_linked_functions(san_ll: &str) -> Result<(), String>
 fn options_for_air(
     san_ll: &str,
     mut options: passes::TransformOptions,
-) -> passes::TransformOptions {
+) -> Result<passes::TransformOptions, String> {
+    options.validate_runtime_samplers()?;
     if san_ll.contains("air.compile.denorms_disable") {
         options.denorm_flush_to_zero_f32 = true;
     }
@@ -134,7 +135,7 @@ fn options_for_air(
     if san_ll.contains("@air.simd_") {
         options.simd_cluster32 = true;
     }
-    options
+    Ok(options)
 }
 
 /// Per-stage interface metadata parsed once from sanitized AIR and shared by emission, passes,
@@ -208,7 +209,7 @@ fn build_reflection(
     entry_name: Option<&str>,
     options: &passes::TransformOptions,
 ) -> reflect::ShaderReflection {
-    match stage {
+    let mut reflection = match stage {
         passes::Stage::Fragment => {
             reflect::ShaderReflection::from_fragment(&frag.cloned().unwrap_or_default(), entry_name)
         }
@@ -220,7 +221,30 @@ fn build_reflection(
             entry_name,
             options.kernel_local_size,
         ),
-    }
+    };
+    let runtime_sampler_indices = reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == reflect::ResourceKind::Sampler)
+        .map(|binding| binding.metal_index)
+        .collect::<std::collections::BTreeSet<_>>();
+    reflection.runtime_sampler_specializations = options
+        .runtime_sampler_states
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(metal_index, state)| {
+            let metal_index = u32::try_from(metal_index).ok()?;
+            if !runtime_sampler_indices.contains(&metal_index) {
+                return None;
+            }
+            Some(reflect::RuntimeSamplerSpecialization {
+                metal_index,
+                state: state?,
+            })
+        })
+        .collect();
+    reflection
 }
 
 /// Diagnostic probe (used by `historical PSB dump probes`): run the exact production
@@ -237,7 +261,7 @@ pub fn translate_pre_psb_probe(
     let san_ll = lowered.as_str();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
-    let options = options_for_air(san_ll, passes::TransformOptions::default());
+    let options = options_for_air(san_ll, passes::TransformOptions::default())?;
     let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
     translate_sanitized_with_meta(
         san_ll,
@@ -283,7 +307,7 @@ fn translate_sanitized_native_with_options_and_layout(
     let san_ll = lowered.as_str();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
-    let options = options_for_air(san_ll, options);
+    let options = options_for_air(san_ll, options)?;
     translate_sanitized_with_meta(
         san_ll,
         stage,
@@ -382,7 +406,7 @@ pub fn reflect_sanitized(
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
     let stage_meta = parse_stage_meta(san_ll, stage);
-    let options = options_for_air(san_ll, options);
+    let options = options_for_air(san_ll, options)?;
     let mut reflection = build_reflection(
         stage,
         stage_meta.frag.as_ref(),
@@ -423,7 +447,7 @@ fn translate_sanitized_native_reflected_with_layout(
     let san_ll = lowered.as_str();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
-    let options = options_for_air(san_ll, options);
+    let options = options_for_air(san_ll, options)?;
     let mut reflection = build_reflection(
         stage,
         stage_meta.frag.as_ref(),

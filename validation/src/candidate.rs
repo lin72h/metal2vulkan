@@ -13,7 +13,7 @@ use base64::Engine as _;
 use metal2vulkan::reflect::ShaderReflection;
 use std::path::Path;
 
-pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v26";
+pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v27";
 
 pub fn execute_case(
     root: &Path,
@@ -48,19 +48,7 @@ pub fn execute_case(
         );
     }
     let scratch = ScratchDir::new("candidate-translate")?;
-    let mut options = match checked.case.dispatch.as_ref() {
-        Some(dispatch) => metal2vulkan::passes::TransformOptions {
-            kernel_local_size: dispatch.threads_per_threadgroup,
-            kernel_threads_per_grid: Some(dispatch.grid),
-            ..metal2vulkan::passes::TransformOptions::default()
-        },
-        None => metal2vulkan::passes::TransformOptions::default(),
-    };
-    if matches!(checked.case.stage, Stage::Fragment) {
-        // Both candidate graphics paths create single-sample attachments and pipelines. AIR's
-        // pipeline-state query must observe that same authored executor contract.
-        options.raster_sample_count = Some(1);
-    }
+    let options = crate::case::product_transform_options(&checked.case)?;
     let linked_functions = candidate_linkage(&checked)?;
     let mut spv = if linked_functions.is_empty() {
         metal2vulkan::translate_sanitized_native_with_options(
@@ -4548,7 +4536,27 @@ mod platform {
                         .iter()
                         .find(|resource| resource.binding == binding.metal_index)
                         .ok_or_else(|| format!("missing sampler {}", binding.metal_index))?;
-                    sampler_info_from_case(resource)
+                    let specialization = reflection
+                        .runtime_sampler_specializations
+                        .iter()
+                        .find(|specialization| specialization.metal_index == binding.metal_index)
+                        .ok_or_else(|| {
+                            format!(
+                                "runtime sampler {} has no reflected specialization",
+                                binding.metal_index
+                            )
+                        })?;
+                    if specialization.state != resource.runtime_specialization() {
+                        return Err(format!(
+                            "runtime sampler {} reflection does not match the authored pipeline state",
+                            binding.metal_index
+                        ));
+                    }
+                    sampler_info_from_runtime(
+                        &specialization.state,
+                        context.sampler_anisotropy,
+                        context.max_sampler_anisotropy,
+                    )?
                 }
                 metal2vulkan::reflect::ResourceKind::StaticSampler => sampler_info_from_static(
                     binding.static_sampler.as_ref().ok_or_else(|| {
@@ -4573,20 +4581,32 @@ mod platform {
         Ok(samplers)
     }
 
-    fn sampler_info_from_case(
-        resource: &crate::case::SamplerResource,
-    ) -> vk::SamplerCreateInfo<'static> {
-        vk::SamplerCreateInfo::default()
-            .mag_filter(vulkan_case_filter(resource.mag_filter))
-            .min_filter(vulkan_case_filter(resource.min_filter))
-            .mipmap_mode(vulkan_case_mip_filter(resource.mip_filter))
-            .address_mode_u(vulkan_case_address_mode(resource.address_mode))
-            .address_mode_v(vulkan_case_address_mode(resource.address_mode))
-            .address_mode_w(vulkan_case_address_mode(resource.address_mode))
-            .unnormalized_coordinates(!resource.normalized_coordinates)
-            .border_color(vk::BorderColor::FLOAT_TRANSPARENT_BLACK)
-            .min_lod(0.0)
-            .max_lod(vk::LOD_CLAMP_NONE)
+    fn sampler_info_from_runtime(
+        state: &metal2vulkan::reflect::RuntimeSamplerState,
+        sampler_anisotropy: bool,
+        max_sampler_anisotropy: f32,
+    ) -> Result<vk::SamplerCreateInfo<'static>, String> {
+        sampler_info_from_static(
+            &metal2vulkan::reflect::StaticSamplerState {
+                min_filter: state.min_filter,
+                mag_filter: state.mag_filter,
+                mip_filter: state.mip_filter,
+                address_mode_s: state.address_mode_s,
+                address_mode_t: state.address_mode_t,
+                address_mode_r: state.address_mode_r,
+                coordinates: state.coordinates,
+                compare_function: state.compare_function,
+                max_anisotropy: state.max_anisotropy,
+                lod_min_clamp: state.lod_min_clamp,
+                lod_max_clamp: state.lod_max_clamp,
+                border_color: state.border_color,
+                reduction: state.reduction,
+                lod_bias: state.lod_bias,
+                raw_words: [0; 2],
+            },
+            sampler_anisotropy,
+            max_sampler_anisotropy,
+        )
     }
 
     pub(super) fn sampler_info_from_static(
@@ -4675,32 +4695,6 @@ mod platform {
                 state.coordinates,
                 metal2vulkan::reflect::SamplerCoordinates::Pixel
             )))
-    }
-
-    fn vulkan_case_filter(filter: crate::case::SamplerFilter) -> vk::Filter {
-        match filter {
-            crate::case::SamplerFilter::Nearest => vk::Filter::NEAREST,
-            crate::case::SamplerFilter::Linear => vk::Filter::LINEAR,
-        }
-    }
-
-    fn vulkan_case_mip_filter(filter: crate::case::SamplerMipFilter) -> vk::SamplerMipmapMode {
-        match filter {
-            crate::case::SamplerMipFilter::NotMipmapped
-            | crate::case::SamplerMipFilter::Nearest => vk::SamplerMipmapMode::NEAREST,
-            crate::case::SamplerMipFilter::Linear => vk::SamplerMipmapMode::LINEAR,
-        }
-    }
-
-    fn vulkan_case_address_mode(mode: crate::case::SamplerAddressMode) -> vk::SamplerAddressMode {
-        match mode {
-            crate::case::SamplerAddressMode::ClampToEdge => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-            crate::case::SamplerAddressMode::ClampToZero => vk::SamplerAddressMode::CLAMP_TO_BORDER,
-            crate::case::SamplerAddressMode::Repeat => vk::SamplerAddressMode::REPEAT,
-            crate::case::SamplerAddressMode::MirroredRepeat => {
-                vk::SamplerAddressMode::MIRRORED_REPEAT
-            }
-        }
     }
 
     fn vulkan_static_address_mode(

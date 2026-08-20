@@ -1003,6 +1003,15 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
     }
     let (img_ty, _, _, _) = sampled_operand_image_info(ctx, img, dim, false, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
+    if ctx
+        .sampler_states
+        .get(&args[1])
+        .is_some_and(|state| state.uses_pixel_coordinates())
+    {
+        return Err(format!(
+            "{name} with a pixel-coordinate sampler is unsupported because Vulkan LOD queries require normalized sampling coordinates"
+        ));
+    }
     let samp = if comp == crate::passes::ImageComp::Float {
         valid_sampler_value(ctx, args[1], &mut out)?
     } else {

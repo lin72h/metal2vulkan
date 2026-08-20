@@ -129,6 +129,10 @@ pub(in crate::passes) fn lower_sample(
             }
             return finish_sample_result(ctx, res, rty, color, sample_v4, out);
         }
+        return Err(format!(
+            "pixel-coordinate sampling does not support {dim:?} with {:?} filtering",
+            sampler_state.min_filter
+        ));
     }
     if let Some(sampler_state) = ctx
         .sampler_states

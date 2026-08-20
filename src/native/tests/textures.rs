@@ -16,6 +16,29 @@ use crate::{disassemble, meta, tools};
 use spirv::{Decoration, Op, Scope, SelectionControl, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
+fn runtime_sampler_state(
+    coordinates: crate::reflect::SamplerCoordinates,
+    filter: crate::reflect::SamplerFilter,
+    address: crate::reflect::SamplerAddressMode,
+) -> crate::reflect::RuntimeSamplerState {
+    crate::reflect::RuntimeSamplerState {
+        min_filter: filter,
+        mag_filter: filter,
+        mip_filter: crate::reflect::SamplerMipFilter::None,
+        address_mode_s: address,
+        address_mode_t: address,
+        address_mode_r: address,
+        coordinates,
+        compare_function: crate::reflect::SamplerCompareFunction::None,
+        max_anisotropy: 1,
+        lod_min_clamp: 0.0,
+        lod_max_clamp: 0.0,
+        border_color: crate::reflect::SamplerBorderColor::TransparentBlack,
+        reduction: crate::reflect::SamplerReduction::WeightedAverage,
+        lod_bias: 0.0,
+    }
+}
+
 #[test]
 fn native_unsigned_texture_fetch_max_uses_scalar_atomic_image_format() {
     let ll = r#"
@@ -965,6 +988,366 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn runtime_sampler_specialization_switches_the_same_air_between_native_and_pixel_sampling() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
+entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> <i32 1, i32 -1>, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_sampler_specialization_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let normalized_state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Normalized,
+        crate::reflect::SamplerFilter::Linear,
+        crate::reflect::SamplerAddressMode::ClampToZero,
+    );
+    let normalized_options = passes::TransformOptions::default()
+        .with_runtime_sampler(0, normalized_state)
+        .unwrap();
+    let (normalized_spv, normalized_reflection) =
+        crate::translate_sanitized_native_reflected(ll, Stage::Kernel, &tmp, normalized_options)
+            .expect("normalized specialization");
+    let normalized_asm = disassemble(&normalized_spv).expect("disassemble normalized");
+    assert!(normalized_asm.contains("OpImageSampleExplicitLod"));
+    assert!(normalized_asm.contains("ConstOffset"));
+    assert_eq!(
+        normalized_reflection.runtime_sampler_specializations,
+        vec![crate::reflect::RuntimeSamplerSpecialization {
+            metal_index: 0,
+            state: normalized_state,
+        }]
+    );
+
+    let pixel_state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Linear,
+        crate::reflect::SamplerAddressMode::ClampToZero,
+    );
+    let pixel_options = passes::TransformOptions::default()
+        .with_runtime_sampler(0, pixel_state)
+        .unwrap();
+    let (pixel_spv, pixel_reflection) =
+        crate::translate_sanitized_native_reflected(ll, Stage::Kernel, &tmp, pixel_options)
+            .expect("pixel specialization");
+    let pixel_asm = disassemble(&pixel_spv).expect("disassemble pixel");
+    assert!(pixel_asm.contains("OpImageFetch"), "{pixel_asm}");
+    assert!(pixel_asm.contains("OpIAdd"), "{pixel_asm}");
+    assert!(pixel_asm.contains("OpLogicalAnd"), "{pixel_asm}");
+    assert!(!pixel_asm.contains("OpSampledImage"), "{pixel_asm}");
+    assert!(!pixel_asm.contains("OpImageSample"), "{pixel_asm}");
+    assert_eq!(
+        pixel_reflection.runtime_sampler_specializations,
+        vec![crate::reflect::RuntimeSamplerSpecialization {
+            metal_index: 0,
+            state: pixel_state,
+        }]
+    );
+    tools::spirv_val_bytes(&pixel_spv, &tmp).expect("pixel spirv-val");
+
+    for (address, required, forbidden) in [
+        (
+            crate::reflect::SamplerAddressMode::ClampToEdge,
+            "OpImageFetch",
+            "OpLogicalAnd",
+        ),
+        (
+            crate::reflect::SamplerAddressMode::Repeat,
+            "OpSMod",
+            "OpLogicalAnd",
+        ),
+        (
+            crate::reflect::SamplerAddressMode::MirroredRepeat,
+            "OpSGreaterThanEqual",
+            "OpLogicalAnd",
+        ),
+    ] {
+        let state = runtime_sampler_state(
+            crate::reflect::SamplerCoordinates::Pixel,
+            crate::reflect::SamplerFilter::Nearest,
+            address,
+        );
+        let options = passes::TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .unwrap();
+        let spv = crate::translate_sanitized_native_with_options(ll, Stage::Kernel, &tmp, options)
+            .expect("pixel address-mode specialization");
+        let asm = disassemble(&spv).expect("disassemble pixel address mode");
+        assert!(
+            asm.contains(required),
+            "missing {required} for {address:?}\n{asm}"
+        );
+        assert!(
+            !asm.contains(forbidden),
+            "unexpected {forbidden} for {address:?}\n{asm}"
+        );
+        assert!(!asm.contains("OpSampledImage"), "{address:?}\n{asm}");
+        assert!(!asm.contains("OpImageSample"), "{address:?}\n{asm}");
+        tools::spirv_val_bytes(&spv, &tmp).expect("address-mode spirv-val");
+    }
+
+    let border_state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::ClampToBorder,
+    );
+    let border_spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_sampler(0, border_state)
+            .unwrap(),
+    )
+    .expect("transparent border specialization");
+    let border_asm = disassemble(&border_spv).expect("disassemble border mode");
+    assert!(border_asm.contains("OpLogicalAnd"), "{border_asm}");
+    assert!(!border_asm.contains("OpSampledImage"), "{border_asm}");
+    tools::spirv_val_bytes(&border_spv, &tmp).expect("border-mode spirv-val");
+}
+
+#[test]
+fn runtime_pixel_sampler_rejects_unmodeled_pipeline_state() {
+    let base = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::ClampToEdge,
+    );
+    let cases = [
+        (
+            crate::reflect::RuntimeSamplerState {
+                mag_filter: crate::reflect::SamplerFilter::Linear,
+                ..base
+            },
+            "mixed min/mag",
+        ),
+        (
+            crate::reflect::RuntimeSamplerState {
+                mip_filter: crate::reflect::SamplerMipFilter::Linear,
+                ..base
+            },
+            "linear mip",
+        ),
+        (
+            crate::reflect::RuntimeSamplerState {
+                max_anisotropy: 2,
+                ..base
+            },
+            "anisotropy",
+        ),
+        (
+            crate::reflect::RuntimeSamplerState {
+                lod_bias: 1.0,
+                ..base
+            },
+            "LOD bias",
+        ),
+        (
+            crate::reflect::RuntimeSamplerState {
+                lod_max_clamp: 1.0,
+                ..base
+            },
+            "LOD clamps",
+        ),
+        (
+            crate::reflect::RuntimeSamplerState {
+                address_mode_s: crate::reflect::SamplerAddressMode::ClampToBorder,
+                border_color: crate::reflect::SamplerBorderColor::OpaqueWhite,
+                ..base
+            },
+            "transparent-black border",
+        ),
+    ];
+    for (state, expected) in cases {
+        let error = passes::TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .expect_err("unsupported state must be refused");
+        assert!(error.contains(expected), "{error}");
+    }
+    let error = passes::TransformOptions::default()
+        .with_runtime_sampler(16, base)
+        .expect_err("out-of-range sampler index");
+    assert!(error.contains("range 0..16"), "{error}");
+}
+
+#[test]
+fn runtime_sampler_specialization_uses_fragment_metal_index_not_descriptor_binding() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <4 x float> @frag(ptr addrspace(1) %tex, ptr addrspace(2) %sampler) {
+entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  ret <4 x float> %color
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!5 = !{i32 1, !"air.sampler", !"air.location_index", i32 3, i32 1}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_runtime_sampler_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::Repeat,
+    );
+    let options = passes::TransformOptions::default()
+        .with_runtime_sampler(3, state)
+        .unwrap()
+        .with_runtime_sampler(7, state)
+        .unwrap();
+    let (spv, reflection) =
+        crate::translate_sanitized_native_reflected(ll, Stage::Fragment, &tmp, options)
+            .expect("fragment specialization");
+    let asm = disassemble(&spv).expect("disassemble fragment specialization");
+    assert!(asm.contains("Binding 163"), "{asm}");
+    assert!(asm.contains("OpSMod"), "{asm}");
+    assert!(!asm.contains("OpSampledImage"), "{asm}");
+    assert_eq!(
+        reflection.runtime_sampler_specializations,
+        [crate::reflect::RuntimeSamplerSpecialization {
+            metal_index: 3,
+            state,
+        }]
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("fragment spirv-val");
+}
+
+#[test]
+fn runtime_pixel_sampler_refuses_unsupported_sample_dimension() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
+entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, float 2.500000e+00, i1 true, i32 1, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1), ptr addrspace(2), float, i1, i32, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture1d<float, sample>"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_sampler_dimension_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Linear,
+        crate::reflect::SamplerAddressMode::ClampToEdge,
+    );
+    let error = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .unwrap(),
+    )
+    .expect_err("unsupported pixel-coordinate dimension must be refused");
+    assert!(error.contains("Dim1D"), "{error}");
+}
+
+#[test]
+fn runtime_pixel_comparison_sampler_fetches_then_compares() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
+entry:
+  %sample = tail call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 0, <2 x float> <float 2.500000e+00, float -5.000000e-01>, float 5.000000e-01, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value = extractvalue { float, i8 } %sample, 0
+  store float %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_sampler_compare_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let mut state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::ClampToZero,
+    );
+    state.compare_function = crate::reflect::SamplerCompareFunction::LessEqual;
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .unwrap(),
+    )
+    .expect("pixel comparison specialization");
+    let asm = disassemble(&spv).expect("disassemble pixel comparison");
+    assert!(asm.contains("OpImageFetch"), "{asm}");
+    assert!(asm.contains("OpFOrdLessThanEqual"), "{asm}");
+    assert!(!asm.contains("OpSampledImage"), "{asm}");
+    assert!(!asm.contains("OpImageSample"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("comparison spirv-val");
+
+    state.compare_function = crate::reflect::SamplerCompareFunction::None;
+    let error = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .unwrap(),
+    )
+    .expect_err("comparison-disabled sampler must be refused");
+    assert!(error.contains("comparison enabled"), "{error}");
 }
 
 #[test]

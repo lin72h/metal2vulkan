@@ -726,6 +726,76 @@ pub struct SamplerResource {
     pub normalized_coordinates: bool,
 }
 
+impl SamplerResource {
+    pub(crate) fn runtime_specialization(&self) -> metal2vulkan::reflect::RuntimeSamplerState {
+        use metal2vulkan::reflect::{
+            RuntimeSamplerState, SamplerAddressMode as ProductAddressMode, SamplerBorderColor,
+            SamplerCompareFunction, SamplerCoordinates, SamplerFilter as ProductFilter,
+            SamplerMipFilter as ProductMipFilter, SamplerReduction,
+        };
+        let address = match self.address_mode {
+            SamplerAddressMode::ClampToEdge => ProductAddressMode::ClampToEdge,
+            SamplerAddressMode::ClampToZero => ProductAddressMode::ClampToZero,
+            SamplerAddressMode::Repeat => ProductAddressMode::Repeat,
+            SamplerAddressMode::MirroredRepeat => ProductAddressMode::MirroredRepeat,
+        };
+        let filter = |filter| match filter {
+            SamplerFilter::Nearest => ProductFilter::Nearest,
+            SamplerFilter::Linear => ProductFilter::Linear,
+        };
+        let mip_filter = match self.mip_filter {
+            SamplerMipFilter::NotMipmapped => ProductMipFilter::None,
+            SamplerMipFilter::Nearest => ProductMipFilter::Nearest,
+            SamplerMipFilter::Linear => ProductMipFilter::Linear,
+        };
+        RuntimeSamplerState {
+            min_filter: filter(self.min_filter),
+            mag_filter: filter(self.mag_filter),
+            mip_filter,
+            address_mode_s: address,
+            address_mode_t: address,
+            address_mode_r: address,
+            coordinates: if self.normalized_coordinates {
+                SamplerCoordinates::Normalized
+            } else {
+                SamplerCoordinates::Pixel
+            },
+            compare_function: SamplerCompareFunction::None,
+            max_anisotropy: 1,
+            lod_min_clamp: 0.0,
+            lod_max_clamp: if self.normalized_coordinates {
+                65504.0
+            } else {
+                0.0
+            },
+            border_color: SamplerBorderColor::TransparentBlack,
+            reduction: SamplerReduction::WeightedAverage,
+            lod_bias: 0.0,
+        }
+    }
+}
+
+pub(crate) fn product_transform_options(
+    case: &AuthoredCase,
+) -> Result<metal2vulkan::passes::TransformOptions, String> {
+    let mut options = match case.dispatch.as_ref() {
+        Some(dispatch) => metal2vulkan::passes::TransformOptions {
+            kernel_local_size: dispatch.threads_per_threadgroup,
+            kernel_threads_per_grid: Some(dispatch.grid),
+            ..metal2vulkan::passes::TransformOptions::default()
+        },
+        None => metal2vulkan::passes::TransformOptions::default(),
+    };
+    if case.stage == Stage::Fragment {
+        options.raster_sample_count = Some(1);
+    }
+    for sampler in &case.samplers {
+        options =
+            options.with_runtime_sampler(sampler.binding, sampler.runtime_specialization())?;
+    }
+    Ok(options)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplerAddressMode {
@@ -2698,6 +2768,33 @@ mod tests {
             rationale: Some("documentation does not identify semantics".into()),
             authored_by: Some("test".into()),
         }
+    }
+
+    #[test]
+    fn authored_runtime_sampler_state_is_the_product_specialization_input() {
+        let mut case = example();
+        case.samplers.push(SamplerResource {
+            binding: 3,
+            address_mode: SamplerAddressMode::MirroredRepeat,
+            min_filter: SamplerFilter::Nearest,
+            mag_filter: SamplerFilter::Nearest,
+            mip_filter: SamplerMipFilter::NotMipmapped,
+            normalized_coordinates: false,
+        });
+        let options = product_transform_options(&case).expect("authored specialization");
+        assert_eq!(options.kernel_local_size, [1, 1, 1]);
+        assert_eq!(
+            options.runtime_sampler_states[3],
+            Some(case.samplers[0].runtime_specialization())
+        );
+        assert!(options.runtime_sampler_states[..3]
+            .iter()
+            .all(Option::is_none));
+
+        case.samplers[0].mag_filter = SamplerFilter::Linear;
+        let error = product_transform_options(&case)
+            .expect_err("mixed pixel filters must not reach a Vulkan executor");
+        assert!(error.contains("mixed min/mag"), "{error}");
     }
 
     #[test]

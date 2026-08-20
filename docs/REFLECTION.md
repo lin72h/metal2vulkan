@@ -69,7 +69,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `22`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `23`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -171,6 +171,7 @@ Top-level fields:
 | `implicit_imageblock_attachments` | Attachment/data-rate plane, maximum referenced index, format, access, and descriptor binding for implicit imageblock load/store calls |
 | `fragment_imageblock` | Custom fragment `[[imageblock_data]]` sample size, exact master fields (offset/type/semantic/raster-order group/access/binding), and semantic-matched input/output projections |
 | `datalayout` | Source LLVM `target datalayout` when path-based translation captured it during sanitization |
+| `runtime_sampler_specializations` | Pipeline-provided state, keyed by Metal sampler index, that was applied to the returned executable module |
 | `function_constants` | `[[function_constant(N)]]` index, name, LLVM type, and exact Metal ABI type encoding |
 
 Custom fragment imageblock fields currently lower exactly as `half` → R16f, `half4` → RGBA16f,
@@ -280,6 +281,48 @@ becomes unbounded instead of allowing reflection size to grow without limit.
   `!air.sampler_states`; direct `from_*` builders do not. The state includes typed filter, address,
   coordinate, compare, anisotropy, LOD, border, and reduction fields plus the original two AIR
   words.
+
+### Runtime sampler specialization
+
+AIR identifies dynamically bound samplers by Metal index but does not encode the state selected by
+the pipeline. Pass that state through `TransformOptions::with_runtime_sampler` when it affects
+shader legality or semantics, especially for pixel-coordinate samplers:
+
+```rust
+use metal2vulkan::passes::TransformOptions;
+use metal2vulkan::reflect::{
+    RuntimeSamplerState, SamplerAddressMode, SamplerBorderColor, SamplerCompareFunction,
+    SamplerCoordinates, SamplerFilter, SamplerMipFilter, SamplerReduction,
+};
+
+let options = TransformOptions::default().with_runtime_sampler(
+    0,
+    RuntimeSamplerState {
+        min_filter: SamplerFilter::Linear,
+        mag_filter: SamplerFilter::Linear,
+        mip_filter: SamplerMipFilter::None,
+        address_mode_s: SamplerAddressMode::ClampToZero,
+        address_mode_t: SamplerAddressMode::ClampToZero,
+        address_mode_r: SamplerAddressMode::ClampToZero,
+        coordinates: SamplerCoordinates::Pixel,
+        compare_function: SamplerCompareFunction::None,
+        max_anisotropy: 1,
+        lod_min_clamp: 0.0,
+        lod_max_clamp: 0.0,
+        border_color: SamplerBorderColor::TransparentBlack,
+        reduction: SamplerReduction::WeightedAverage,
+        lod_bias: 0.0,
+    },
+)?;
+```
+
+The index is the Metal `[[sampler(n)]]` index, not the Vulkan descriptor binding (`160 + n`). A
+successful reflected translation copies every applied state into
+`runtime_sampler_specializations`; consumers should create the descriptor sampler from that same
+state. Pixel-coordinate operations are rewritten to texel fetches and shader-side filtering and
+addressing where the translator has an exact model. State or operation combinations that need
+unknown derivative, mip, comparison, anisotropy, or dimensional behavior fail translation rather
+than emitting an invalid unnormalized-sampler instruction.
 
 ## Typical consumer flow
 

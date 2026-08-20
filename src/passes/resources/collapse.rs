@@ -454,7 +454,10 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 splices.push((pid, projection));
             }
-            ParamBinding::Sampler { var } => {
+            ParamBinding::Sampler {
+                var,
+                specialized_state,
+            } => {
                 let sty = ctx.ty_sampler();
                 let lid = ctx.module.fresh_id();
                 loads.push(Instruction::new(
@@ -463,6 +466,9 @@ pub(in crate::passes) fn apply_bindings(
                     Some(lid),
                     vec![Operand::IdRef(var)],
                 ));
+                if let Some(state) = specialized_state {
+                    ctx.sampler_states.insert(lid, state);
+                }
                 resource_values.insert(lid);
                 splices.push((pid, lid));
             }
