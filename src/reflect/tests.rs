@@ -1374,6 +1374,19 @@ fn reflection_serde_covers_every_reflection_field() {
                 lod_bias: 0.0,
             },
         }],
+        runtime_storage_image_specializations: vec![RuntimeStorageImageSpecialization {
+            metal_index: 1,
+            state: RuntimeStorageImageState {
+                format: RuntimeStorageImageFormat::Rgba8Unorm,
+                capabilities: RuntimeStorageImageCapabilities {
+                    storage_image: true,
+                    storage_image_atomic: false,
+                    read_without_format: false,
+                    write_without_format: false,
+                },
+            },
+            spirv_format: Some(crate::meta::TextureFormat::Rgba8),
+        }],
         function_constants: vec![FunctionConstant {
             index: 0,
             name: "myConst".to_string(),
@@ -1483,4 +1496,35 @@ fn function_tables_are_reflected_as_descriptor_free_link_resources() {
             && binding.metal_index == 9
             && binding.descriptor.is_none()
     }));
+}
+
+#[test]
+fn runtime_storage_formats_have_complete_component_and_spirv_mappings() {
+    use crate::meta::{TextureComponent as C, TextureFormat as F};
+    use RuntimeStorageImageFormat as R;
+
+    for (runtime, component, explicit) in [
+        (R::R8Unorm, C::Float, Some(F::R8)),
+        (R::Rgba8Unorm, C::Float, Some(F::Rgba8)),
+        (R::Bgra8Unorm, C::Float, None),
+        (R::R16Float, C::Float, Some(F::R16f)),
+        (R::Rg16Float, C::Float, Some(F::Rg16f)),
+        (R::Rgba16Float, C::Float, Some(F::Rgba16f)),
+        (R::R32Float, C::Float, Some(F::R32f)),
+        (R::Rgba32Float, C::Float, Some(F::Rgba32f)),
+        (R::R16Uint, C::Uint, Some(F::R16ui)),
+        (R::R32Uint, C::Uint, Some(F::R32ui)),
+        (R::Rgba8Uint, C::Uint, Some(F::Rgba8ui)),
+        (R::Rgba16Uint, C::Uint, Some(F::Rgba16ui)),
+        (R::Rgba32Uint, C::Uint, Some(F::Rgba32ui)),
+        (R::R32Sint, C::Sint, Some(F::R32i)),
+        (R::Rgba8Sint, C::Sint, Some(F::Rgba8i)),
+        (R::Rgba32Sint, C::Sint, Some(F::Rgba32i)),
+    ] {
+        assert_eq!(runtime.component(), component, "{runtime:?}");
+        assert_eq!(runtime.explicit_format(), explicit, "{runtime:?}");
+    }
+    assert!(R::R32Uint.supports_atomics());
+    assert!(R::R32Sint.supports_atomics());
+    assert!(!R::Rgba32Uint.supports_atomics());
 }

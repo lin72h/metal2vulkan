@@ -78,10 +78,16 @@ impl TextureComponent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TextureFormat {
+    R8,
+    Rgba8,
     R16f,
+    R16ui,
     Rg16f,
     R32f,
+    R32i,
     R32ui,
+    Rgba32i,
+    Rgba32ui,
     Rgba32f,
     Rgba16f,
     Rgba8ui,
@@ -93,10 +99,16 @@ impl TextureFormat {
     /// The SPIR-V `ImageFormat` the emitter decorates the storage image with.
     pub fn to_spirv_format(self) -> ImageFormat {
         match self {
+            TextureFormat::R8 => ImageFormat::R8,
+            TextureFormat::Rgba8 => ImageFormat::Rgba8,
             TextureFormat::R16f => ImageFormat::R16f,
+            TextureFormat::R16ui => ImageFormat::R16ui,
             TextureFormat::Rg16f => ImageFormat::Rg16f,
             TextureFormat::R32f => ImageFormat::R32f,
+            TextureFormat::R32i => ImageFormat::R32i,
             TextureFormat::R32ui => ImageFormat::R32ui,
+            TextureFormat::Rgba32i => ImageFormat::Rgba32i,
+            TextureFormat::Rgba32ui => ImageFormat::Rgba32ui,
             TextureFormat::Rgba32f => ImageFormat::Rgba32f,
             TextureFormat::Rgba16f => ImageFormat::Rgba16f,
             TextureFormat::Rgba8ui => ImageFormat::Rgba8ui,

@@ -54,7 +54,9 @@ mod footprint;
 ///
 /// v22 replaces the overlapping 32-wide descriptor bases with checked, non-overlapping resource
 /// bands and reserves a separate high range for translator-owned descriptors.
-pub const REFLECTION_VERSION: u32 = 23;
+/// v24 records caller-provided runtime storage-image format specialization and the exact explicit
+/// SPIR-V format (or formatless `Unknown`) emitted for each Metal texture index.
+pub const REFLECTION_VERSION: u32 = 24;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
@@ -138,6 +140,9 @@ pub const STORAGE_TEXTURE_BINDING_RANGE: DescriptorBindingRange = DescriptorBind
     start: STORAGE_TEXTURE_BINDING_BASE,
     end: 608,
 };
+/// Number of Metal texture argument-table entries that can be specialized independently.
+pub const TEXTURE_ARGUMENT_COUNT_USIZE: usize =
+    (TEXTURE_BINDING_RANGE.end - TEXTURE_BINDING_RANGE.start) as usize;
 /// Translator-owned descriptors (currently direct-buffer address tables) are allocated at or above
 /// this base, after every fixed Metal-facing band.
 pub const SYNTHETIC_BINDING_BASE: u32 = 640;
@@ -590,6 +595,124 @@ pub struct RuntimeSamplerSpecialization {
     pub state: RuntimeSamplerState,
 }
 
+/// Concrete storage-image format supplied by the pipeline for a dynamically bound Metal texture.
+///
+/// Most formats have an exact SPIR-V `ImageFormat`. `Bgra8Unorm` deliberately does not: SPIR-V has
+/// no BGRA storage-image format token, so it can be used only through `ImageFormat::Unknown` when the
+/// host exposes the operation-specific formatless storage-image features.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum RuntimeStorageImageFormat {
+    R8Unorm,
+    Rgba8Unorm,
+    Bgra8Unorm,
+    R16Float,
+    Rg16Float,
+    Rgba16Float,
+    R32Float,
+    Rgba32Float,
+    R16Uint,
+    R32Uint,
+    Rgba8Uint,
+    Rgba16Uint,
+    Rgba32Uint,
+    R32Sint,
+    Rgba8Sint,
+    Rgba32Sint,
+}
+
+impl RuntimeStorageImageFormat {
+    pub(crate) fn component(self) -> crate::meta::TextureComponent {
+        use crate::meta::TextureComponent;
+        match self {
+            Self::R8Unorm
+            | Self::Rgba8Unorm
+            | Self::Bgra8Unorm
+            | Self::R16Float
+            | Self::Rg16Float
+            | Self::Rgba16Float
+            | Self::R32Float
+            | Self::Rgba32Float => TextureComponent::Float,
+            Self::R16Uint
+            | Self::R32Uint
+            | Self::Rgba8Uint
+            | Self::Rgba16Uint
+            | Self::Rgba32Uint => TextureComponent::Uint,
+            Self::R32Sint | Self::Rgba8Sint | Self::Rgba32Sint => TextureComponent::Sint,
+        }
+    }
+
+    pub(crate) fn explicit_format(self) -> Option<crate::meta::TextureFormat> {
+        use crate::meta::TextureFormat;
+        match self {
+            Self::R8Unorm => Some(TextureFormat::R8),
+            Self::Rgba8Unorm => Some(TextureFormat::Rgba8),
+            Self::R16Float => Some(TextureFormat::R16f),
+            Self::Rg16Float => Some(TextureFormat::Rg16f),
+            Self::Rgba16Float => Some(TextureFormat::Rgba16f),
+            Self::R32Float => Some(TextureFormat::R32f),
+            Self::Rgba32Float => Some(TextureFormat::Rgba32f),
+            Self::R16Uint => Some(TextureFormat::R16ui),
+            Self::R32Uint => Some(TextureFormat::R32ui),
+            Self::Rgba8Uint => Some(TextureFormat::Rgba8ui),
+            Self::Rgba16Uint => Some(TextureFormat::Rgba16ui),
+            Self::Rgba32Uint => Some(TextureFormat::Rgba32ui),
+            Self::R32Sint => Some(TextureFormat::R32i),
+            Self::Rgba8Sint => Some(TextureFormat::Rgba8i),
+            Self::Rgba32Sint => Some(TextureFormat::Rgba32i),
+            Self::Bgra8Unorm => None,
+        }
+    }
+
+    pub(crate) fn supports_atomics(self) -> bool {
+        matches!(self, Self::R32Uint | Self::R32Sint)
+    }
+}
+
+/// Host features relevant to one runtime storage-image specialization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RuntimeStorageImageCapabilities {
+    /// The runtime format supports Vulkan storage-image usage.
+    pub storage_image: bool,
+    /// The runtime format supports storage-image atomics.
+    pub storage_image_atomic: bool,
+    /// `shaderStorageImageReadWithoutFormat` is enabled on the target device.
+    pub read_without_format: bool,
+    /// `shaderStorageImageWriteWithoutFormat` is enabled on the target device.
+    pub write_without_format: bool,
+}
+
+/// Pipeline-provided state for one dynamically bound Metal storage texture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RuntimeStorageImageState {
+    pub format: RuntimeStorageImageFormat,
+    pub capabilities: RuntimeStorageImageCapabilities,
+}
+
+impl RuntimeStorageImageState {
+    pub(crate) fn validate(self) -> Result<(), String> {
+        if !self.capabilities.storage_image {
+            return Err(format!(
+                "runtime format {:?} lacks storage-image format support",
+                self.format
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// One runtime storage-image specialization reflected alongside the executable SPIR-V.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RuntimeStorageImageSpecialization {
+    pub metal_index: u32,
+    pub state: RuntimeStorageImageState,
+    /// Exact explicit SPIR-V format, or `None` when the emitted `OpTypeImage` uses `Unknown`.
+    pub spirv_format: Option<crate::meta::TextureFormat>,
+}
+
 impl StaticSamplerState {
     pub(crate) fn from_air_words(words: [u64; 2]) -> Result<Self, String> {
         let word = words[0];
@@ -992,6 +1115,11 @@ pub struct ShaderReflection {
     /// that index and describes the executable SPIR-V returned with this reflection.
     #[cfg_attr(feature = "serde", serde(default))]
     pub runtime_sampler_specializations: Vec<RuntimeSamplerSpecialization>,
+    /// Pipeline-provided storage-image formats used to specialize dynamically bound Metal
+    /// textures. The explicit/formatless choice matches the executable SPIR-V returned alongside
+    /// this reflection.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub runtime_storage_image_specializations: Vec<RuntimeStorageImageSpecialization>,
     /// Metal `[[function_constant(N)]]` inventory (index/name/type), so a consumer can discover the
     /// module's spec-ids without scanning SPIR-V. Populated by the reflected translate paths; empty
     /// when reflection is built directly from meta (the `from_*` builders do not scan IR).
@@ -1442,6 +1570,7 @@ impl ShaderReflection {
             }),
             datalayout: None,
             runtime_sampler_specializations: Vec::new(),
+            runtime_storage_image_specializations: Vec::new(),
             function_constants: Vec::new(),
         }
     }
@@ -1599,6 +1728,7 @@ impl ShaderReflection {
             fragment_imageblock: None,
             datalayout: None,
             runtime_sampler_specializations: Vec::new(),
+            runtime_storage_image_specializations: Vec::new(),
             function_constants: Vec::new(),
         }
     }
@@ -1791,6 +1921,7 @@ impl ShaderReflection {
             fragment_imageblock: None,
             datalayout: None,
             runtime_sampler_specializations: Vec::new(),
+            runtime_storage_image_specializations: Vec::new(),
             function_constants: Vec::new(),
         }
     }

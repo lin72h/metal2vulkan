@@ -917,10 +917,16 @@ fn validate_texture_shape(
     }
 
     let exact_storage_format = shape.storage_format.map(|format| match format {
+        ReflectedFormat::R8 => TextureFormat::R8Unorm,
+        ReflectedFormat::Rgba8 => TextureFormat::Rgba8Unorm,
         ReflectedFormat::R16f => TextureFormat::R16Float,
+        ReflectedFormat::R16ui => TextureFormat::R16Uint,
         ReflectedFormat::Rg16f => TextureFormat::Rg16Float,
         ReflectedFormat::R32f => TextureFormat::R32Float,
+        ReflectedFormat::R32i => TextureFormat::R32Sint,
         ReflectedFormat::R32ui => TextureFormat::R32Uint,
+        ReflectedFormat::Rgba32i => TextureFormat::Rgba32Sint,
+        ReflectedFormat::Rgba32ui => TextureFormat::Rgba32Uint,
         ReflectedFormat::Rgba32f => TextureFormat::Rgba32Float,
         ReflectedFormat::Rgba16f => TextureFormat::Rgba16Float,
         ReflectedFormat::Rgba8ui => TextureFormat::Rgba8Uint,

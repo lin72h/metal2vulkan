@@ -81,7 +81,7 @@ pub(in crate::passes) fn lower_sample_depth(
                 &mut out,
             )?;
             let fetched = ctx.module.fresh_id();
-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched);
+            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched)?;
             if let Some(in_bounds) = fetch.in_bounds {
                 let guarded = ctx.module.fresh_id();
                 let zero = const_null_of(ctx, v4);
@@ -286,7 +286,7 @@ pub(in crate::passes) fn lower_sample_compare_depth(
                 &mut out,
             )?;
             let fetched = ctx.module.fresh_id();
-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched);
+            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), v4, fetched)?;
             if let Some(in_bounds) = fetch.in_bounds {
                 let guarded = ctx.module.fresh_id();
                 let zero_color = const_null_of(ctx, v4);

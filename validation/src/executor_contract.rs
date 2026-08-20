@@ -149,7 +149,16 @@ pub fn unsupported_reflection_requirements(
             if shape.storage_format.is_some_and(|format| {
                 !matches!(
                     format,
-                    ReflectedTextureFormat::R32f
+                    ReflectedTextureFormat::R8
+                        | ReflectedTextureFormat::Rgba8
+                        | ReflectedTextureFormat::R16f
+                        | ReflectedTextureFormat::R16ui
+                        | ReflectedTextureFormat::Rg16f
+                        | ReflectedTextureFormat::R32i
+                        | ReflectedTextureFormat::R32f
+                        | ReflectedTextureFormat::R32ui
+                        | ReflectedTextureFormat::Rgba32i
+                        | ReflectedTextureFormat::Rgba32ui
                         | ReflectedTextureFormat::Rgba32f
                         | ReflectedTextureFormat::Rgba16f
                         | ReflectedTextureFormat::Rgba8ui

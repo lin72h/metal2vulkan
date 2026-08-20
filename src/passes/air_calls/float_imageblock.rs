@@ -1151,6 +1151,7 @@ pub(in crate::passes) fn lower_imageblock_slice_write_texel(
             format!("air.write_imageblock_slice_to_texture on non-storage image id {img}")
         })?;
     }
+    ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Write)?;
     let (dim, arrayed) = ctx
         .image_dims
         .get(&img)

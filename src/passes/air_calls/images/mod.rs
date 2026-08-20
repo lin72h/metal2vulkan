@@ -122,6 +122,9 @@ pub(in crate::passes) fn load_image_if_pointer(
     }
     if ctx.image_storage.contains(&image) || image_type_is_storage(ctx, pointee) {
         ctx.image_storage.insert(loaded);
+        if let Some((metal_index, state)) = ctx.runtime_storage_image_values.get(&image).copied() {
+            ctx.register_runtime_storage_image_value(loaded, metal_index, Some(state));
+        }
     }
     loaded
 }

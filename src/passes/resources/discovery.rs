@@ -547,6 +547,45 @@ fn write_texture_operands(
     out
 }
 
+/// Metadata-declared storage textures used by direct texel reads, with any parameter also consumed
+/// by a sampled-image operation or query removed. This distinguishes `read_texture` (legal as
+/// `OpImageRead`) from the other calls that make `texture_dims` require a Sampled=1 binding.
+pub(in crate::passes) fn storage_texel_read_operands(ctx: &Ctx, entry_idx: usize) -> HashSet<Word> {
+    let names = air_names(&ctx.module);
+    let mut reads = HashSet::new();
+    let mut sampled_or_queried = HashSet::new();
+    for instruction in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == Op::FunctionCall)
+    {
+        let callee = match instruction.operands.first() {
+            Some(Operand::IdRef(callee)) => *callee,
+            _ => continue,
+        };
+        let Some(name) = names.get(&callee) else {
+            continue;
+        };
+        let Some(Operand::IdRef(texture)) = instruction.operands.get(1) else {
+            continue;
+        };
+        if name.starts_with("air.read_texture") || name.starts_with("air.read_depth") {
+            reads.insert(*texture);
+        } else if name.starts_with("air.sample_texture")
+            || name.starts_with("air.sample_depth")
+            || name.starts_with("air.is_null_texture")
+            || is_size_query(name)
+            || name.starts_with("air.get_num_mip_levels_")
+            || name.starts_with("air.get_num_samples_texture")
+        {
+            sampled_or_queried.insert(*texture);
+        }
+    }
+    reads.retain(|texture| !sampled_or_queried.contains(texture));
+    reads
+}
+
 fn is_size_query(name: &str) -> bool {
     name.starts_with("air.get_width_texture")
         || name.starts_with("air.get_height_texture")

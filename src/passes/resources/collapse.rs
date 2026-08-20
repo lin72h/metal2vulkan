@@ -501,12 +501,16 @@ pub(in crate::passes) fn apply_bindings(
                 dim,
                 comp,
                 multisampled,
+                runtime_specialization,
             } => {
                 // Splice the param to the array VARIABLE (a pointer to `array<image>`); the per-element
                 // image is materialized at each use by `materialize_texture_array_loads` reading
                 // `image_array_vars`. No function-top load: the array as a whole is never an operand.
                 ctx.image_array_vars
                     .insert(var, (elem_image_ty, dim, comp, multisampled));
+                if let Some((metal_index, state)) = runtime_specialization {
+                    ctx.register_runtime_storage_image_value(var, metal_index, Some(state));
+                }
                 remove_dead_local_image_array_memcpy(ctx, entry_idx, pid);
                 resource_values.insert(var);
                 splices.push((pid, var));
@@ -516,6 +520,7 @@ pub(in crate::passes) fn apply_bindings(
                 image_ty,
                 dim,
                 comp,
+                runtime_specialization,
             } => {
                 let lid = ctx.module.fresh_id();
                 loads.push(Instruction::new(
@@ -527,6 +532,10 @@ pub(in crate::passes) fn apply_bindings(
                 ctx.image_dims.insert(lid, dim);
                 ctx.image_comp.insert(lid, comp);
                 ctx.image_storage.insert(lid);
+                if let Some((metal_index, state)) = runtime_specialization {
+                    ctx.register_runtime_storage_image_value(var, metal_index, Some(state));
+                    ctx.register_runtime_storage_image_value(lid, metal_index, Some(state));
+                }
                 resource_values.insert(lid);
                 splices.push((pid, lid));
             }

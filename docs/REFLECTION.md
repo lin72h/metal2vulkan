@@ -69,7 +69,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `23`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `24`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -324,6 +324,45 @@ addressing where the translator has an exact model. State or operation combinati
 unknown derivative, mip, comparison, anisotropy, or dimensional behavior fail translation rather
 than emitting an invalid unnormalized-sampler instruction.
 
+### Runtime storage-image specialization
+
+AIR fixes a storage texture's texel component class, but the pipeline chooses the concrete format
+bound at runtime. Supply that format and the target device's format features before translation:
+
+```rust
+use metal2vulkan::passes::TransformOptions;
+use metal2vulkan::reflect::{
+    RuntimeStorageImageCapabilities, RuntimeStorageImageFormat, RuntimeStorageImageState,
+};
+
+let options = TransformOptions::default().with_runtime_storage_image(
+    0,
+    RuntimeStorageImageState {
+        format: RuntimeStorageImageFormat::Rgba8Unorm,
+        capabilities: RuntimeStorageImageCapabilities {
+            storage_image: true,
+            storage_image_atomic: false,
+            read_without_format: false,
+            write_without_format: false,
+        },
+    },
+)?;
+```
+
+The index is the Metal `[[texture(n)]]` index, not the Vulkan binding (`480 + n`). Translation
+selects the compatible explicit SPIR-V image format and independently specializes bindings that
+previously shared an AIR image type. When the runtime format has no exact SPIR-V token, translation
+uses `Unknown` only if the supplied device features cover every operation the final shader
+performs; it declares only the required read-without-format and/or write-without-format
+capabilities. Atomics require a scalar 32-bit integer format and storage-image atomic support.
+Component-class mismatches, absent bindings, missing format features, and unsupported atomic
+formats fail visibly.
+
+Successful reflected translation records the applied states in
+`runtime_storage_image_specializations`. Its `spirv_format` is `Some` for an explicit format and
+`None` for `Unknown`; the corresponding binding's `texture_shape.storage_format` reports the same
+choice. Create the image view and descriptor from the same runtime state used for translation.
+
 ## Typical consumer flow
 
 1. Call `translate_reflected` (or a serde-enabled CLI with `--emit-meta`).
@@ -337,8 +376,8 @@ than emitting an invalid unnormalized-sampler instruction.
      every strided term from the current draw/dispatch before taking the union.
 5. Add one set-0 storage-image descriptor for every `implicit_imageblock_attachments` entry and
    every projected `fragment_imageblock` member, using their reported `binding` values.
-6. Populate static samplers and argument-buffer fields from their reflected state/coordinates;
-   resources with `descriptor: None` require no descriptor write.
+6. Populate runtime storage images, static samplers, and argument-buffer fields from their
+   reflected state/coordinates; resources with `descriptor: None` require no descriptor write.
 7. For `ThreadgroupBuffer` / `imageblock_layouts`, allocate Workgroup / tile storage from
    `declared_size` / `type_layout` (no descriptor write).
 8. For vertex: bind attributes from `vertex_attributes` and respect `vertex_builtins`.

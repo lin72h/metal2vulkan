@@ -30,16 +30,17 @@ pub(in crate::passes) fn query_image_size(
 }
 
 pub(in crate::passes) fn push_image_read_or_fetch(
-    ctx: &Ctx,
+    ctx: &mut Ctx,
     out: &mut Vec<Instruction>,
     img: Word,
     coord: Word,
     lod: Option<Word>,
     result_ty: Word,
     result: Word,
-) {
+) -> Result<(), String> {
     let mut ops = vec![Operand::IdRef(img), Operand::IdRef(coord)];
     let op = if image_is_storage(ctx, img) {
+        ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Read)?;
         Op::ImageRead
     } else {
         if let Some(lod) = lod {
@@ -49,6 +50,7 @@ pub(in crate::passes) fn push_image_read_or_fetch(
         Op::ImageFetch
     };
     out.push(Instruction::new(op, Some(result_ty), Some(result), ops));
+    Ok(())
 }
 
 pub(in crate::passes) fn image_size_component(

@@ -148,6 +148,7 @@ pub(in crate::passes) enum ParamBinding {
         dim: (Dim, bool),
         comp: ImageComp,
         multisampled: bool,
+        runtime_specialization: Option<(u32, crate::reflect::RuntimeStorageImageState)>,
     },
     /// A write-only storage-image variable (`OpTypeImage Sampled=2` + ImageFormat): param uses are the
     /// `air.write_texture_*` texture operand; replace the param id with an OpLoad of the storage image.
@@ -157,6 +158,7 @@ pub(in crate::passes) enum ParamBinding {
         image_ty: Word,
         dim: (Dim, bool),
         comp: ImageComp,
+        runtime_specialization: Option<(u32, crate::reflect::RuntimeStorageImageState)>,
     },
     /// A framebuffer-fetch `[[color(n)]]` input. Vulkan exposes these as subpass input attachments,
     /// read with `OpImageRead` at the current fragment location.
@@ -276,9 +278,10 @@ pub(super) fn build_stage_input(
             wtex_candidates.entry(pid).or_insert(shape);
         }
     }
+    let storage_texel_reads = storage_texel_read_operands(ctx, entry_idx);
     let wtex_dims: HashMap<Word, (Dim, bool, ImageFormat, ImageComp)> = wtex_candidates
         .into_iter()
-        .filter(|(pid, _)| !tex_dims.contains_key(pid))
+        .filter(|(pid, _)| !tex_dims.contains_key(pid) || storage_texel_reads.contains(pid))
         .collect();
 
     // Plan a binding for each parameter, allocating descriptor bindings and locations in role order.
@@ -419,6 +422,20 @@ pub(super) fn build_stage_input(
                 _ => None,
             },
         };
+        let metal_texture_index = match stage {
+            Stage::Fragment => frag.and_then(|meta| match meta.role_of(idx) {
+                Some(FragRole::Texture(index)) => Some(*index),
+                _ => None,
+            }),
+            Stage::Vertex => vert.and_then(|meta| match meta.role_of(idx) {
+                Some(VertRole::Texture(index)) => Some(*index),
+                _ => None,
+            }),
+            Stage::Kernel => kern.and_then(|meta| match meta.role_of(idx) {
+                Some(KernRole::Texture(index)) => Some(*index),
+                _ => None,
+            }),
+        };
 
         let is_threadgroup_buffer = matches!(stage, Stage::Kernel)
             && role_is("buffer")
@@ -475,14 +492,19 @@ pub(super) fn build_stage_input(
             ));
             buffer_structs.push((var, block_ty));
         } else if role_is("texture") && is_array_texture {
-            let (elem_image_ty, dim, arrayed, comp, multisampled) =
+            let (elem_image_ty, dim, arrayed, comp, multisampled, runtime_specialization) =
                 if let Some((dim, arrayed, fmt, comp)) = wtex_dims.get(pid).copied() {
+                    let metal_index = metal_texture_index
+                        .ok_or("storage texture array has no Metal texture index")?;
+                    let (fmt, state) =
+                        ctx.specialize_storage_image_format(metal_index, fmt, comp)?;
                     (
                         ctx.ty_storage_image(dim, arrayed, fmt, comp),
                         dim,
                         arrayed,
                         comp,
                         false,
+                        state.map(|state| (metal_index, state)),
                     )
                 } else {
                     let shape = tex_dims
@@ -501,6 +523,7 @@ pub(super) fn build_stage_input(
                         shape.arrayed,
                         shape.comp,
                         shape.multisampled,
+                        None,
                     )
                 };
             // The array length is a runtime function constant (`nImagesFC`), not a compile-time value,
@@ -538,6 +561,7 @@ pub(super) fn build_stage_input(
                     dim: (dim, arrayed),
                     comp,
                     multisampled,
+                    runtime_specialization,
                 },
             ));
         } else if role_is("texture") && wtex_dims.contains_key(pid) {
@@ -546,6 +570,10 @@ pub(super) fn build_stage_input(
                 .get(pid)
                 .copied()
                 .ok_or("write-texture dims missing for bound param")?;
+            let metal_index =
+                metal_texture_index.ok_or("storage texture has no Metal texture index")?;
+            let (fmt, runtime_state) =
+                ctx.specialize_storage_image_format(metal_index, fmt, comp)?;
             let image_ty = ctx.ty_storage_image(dim, arrayed, fmt, comp);
             let pptr = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
             let var = ctx.module.fresh_id();
@@ -565,6 +593,7 @@ pub(super) fn build_stage_input(
                     image_ty,
                     dim: (dim, arrayed),
                     comp,
+                    runtime_specialization: runtime_state.map(|state| (metal_index, state)),
                 },
             ));
         } else if role_is("texture") {

@@ -126,6 +126,7 @@ fn options_for_air(
     mut options: passes::TransformOptions,
 ) -> Result<passes::TransformOptions, String> {
     options.validate_runtime_samplers()?;
+    options.validate_runtime_storage_images()?;
     if san_ll.contains("air.compile.denorms_disable") {
         options.denorm_flush_to_zero_f32 = true;
     }
@@ -244,7 +245,60 @@ fn build_reflection(
             })
         })
         .collect();
+    for (metal_index, state) in options
+        .runtime_storage_image_states
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(metal_index, state)| Some((u32::try_from(metal_index).ok()?, state?)))
+    {
+        let binding = reflection.bindings.iter_mut().find(|binding| {
+            binding.metal_index == metal_index
+                && (binding.kind == reflect::ResourceKind::StorageImage
+                    || binding.kind == reflect::ResourceKind::TextureArray
+                        && binding.access == Some(reflect::ResourceAccess::Storage))
+        });
+        let Some(binding) = binding else {
+            continue;
+        };
+        let spirv_format = state.format.explicit_format();
+        if let Some(shape) = binding.texture_shape.as_mut() {
+            shape.storage_format = spirv_format;
+        }
+        reflection.runtime_storage_image_specializations.push(
+            reflect::RuntimeStorageImageSpecialization {
+                metal_index,
+                state,
+                spirv_format,
+            },
+        );
+    }
     reflection
+}
+
+fn validate_reflected_runtime_storage_images(
+    reflection: &reflect::ShaderReflection,
+    options: &passes::TransformOptions,
+) -> Result<(), String> {
+    for (metal_index, state) in options
+        .runtime_storage_image_states
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(metal_index, state)| Some((u32::try_from(metal_index).ok()?, state?)))
+    {
+        if !reflection
+            .runtime_storage_image_specializations
+            .iter()
+            .any(|specialization| specialization.metal_index == metal_index)
+        {
+            return Err(format!(
+                "runtime storage image {metal_index}: no reflected storage-image binding exists for runtime format {:?}",
+                state.format
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Diagnostic probe (used by `historical PSB dump probes`): run the exact production
@@ -415,6 +469,7 @@ pub fn reflect_sanitized(
         stage_meta.entry_name.as_deref(),
         &options,
     );
+    validate_reflected_runtime_storage_images(&reflection, &options)?;
     reflection.function_constants = meta::parse_function_constants(san_ll);
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;
@@ -456,6 +511,7 @@ fn translate_sanitized_native_reflected_with_layout(
         stage_meta.entry_name.as_deref(),
         &options,
     );
+    validate_reflected_runtime_storage_images(&reflection, &options)?;
     reflection.function_constants = meta::parse_function_constants(san_ll);
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;

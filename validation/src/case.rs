@@ -713,6 +713,43 @@ impl TextureFormat {
             Self::Depth32Float => 4,
         }
     }
+
+    fn runtime_storage_specialization(
+        self,
+    ) -> Result<metal2vulkan::reflect::RuntimeStorageImageState, String> {
+        use metal2vulkan::reflect::{
+            RuntimeStorageImageCapabilities, RuntimeStorageImageFormat, RuntimeStorageImageState,
+        };
+        let format = match self {
+            Self::R8Unorm => RuntimeStorageImageFormat::R8Unorm,
+            Self::Rgba8Unorm => RuntimeStorageImageFormat::Rgba8Unorm,
+            Self::Rgba8Uint => RuntimeStorageImageFormat::Rgba8Uint,
+            Self::Rgba8Sint => RuntimeStorageImageFormat::Rgba8Sint,
+            Self::R16Float => RuntimeStorageImageFormat::R16Float,
+            Self::R16Uint => RuntimeStorageImageFormat::R16Uint,
+            Self::Rg16Float => RuntimeStorageImageFormat::Rg16Float,
+            Self::Rgba16Float => RuntimeStorageImageFormat::Rgba16Float,
+            Self::Rgba16Uint => RuntimeStorageImageFormat::Rgba16Uint,
+            Self::R32Uint => RuntimeStorageImageFormat::R32Uint,
+            Self::R32Sint => RuntimeStorageImageFormat::R32Sint,
+            Self::R32Float => RuntimeStorageImageFormat::R32Float,
+            Self::Rgba32Uint => RuntimeStorageImageFormat::Rgba32Uint,
+            Self::Rgba32Sint => RuntimeStorageImageFormat::Rgba32Sint,
+            Self::Rgba32Float => RuntimeStorageImageFormat::Rgba32Float,
+            Self::Depth32Float => {
+                return Err("depth formats cannot specialize a storage image".into());
+            }
+        };
+        Ok(RuntimeStorageImageState {
+            format,
+            capabilities: RuntimeStorageImageCapabilities {
+                storage_image: true,
+                storage_image_atomic: matches!(self, Self::R32Uint | Self::R32Sint),
+                read_without_format: false,
+                write_without_format: false,
+            },
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -792,6 +829,22 @@ pub(crate) fn product_transform_options(
     for sampler in &case.samplers {
         options =
             options.with_runtime_sampler(sampler.binding, sampler.runtime_specialization())?;
+    }
+    for texture in &case.textures {
+        if texture.role != ResourceRole::Input {
+            options = options.with_runtime_storage_image(
+                texture.binding,
+                texture.format.runtime_storage_specialization()?,
+            )?;
+        }
+    }
+    for texture in &case.texture_arrays {
+        if texture.role != ResourceRole::Input {
+            options = options.with_runtime_storage_image(
+                texture.binding,
+                texture.format.runtime_storage_specialization()?,
+            )?;
+        }
     }
     Ok(options)
 }
@@ -2795,6 +2848,47 @@ mod tests {
         let error = product_transform_options(&case)
             .expect_err("mixed pixel filters must not reach a Vulkan executor");
         assert!(error.contains("mixed min/mag"), "{error}");
+    }
+
+    #[test]
+    fn authored_storage_texture_format_is_the_product_specialization_input() {
+        let mut case = example();
+        case.textures.push(TextureResource {
+            binding: 4,
+            role: ResourceRole::Output,
+            texture_type: TextureType::D2,
+            format: TextureFormat::Rgba8Unorm,
+            dimensions: [2, 2, 1],
+            sample_count: 1,
+            bytes_b64: None,
+            initial_bytes_b64: None,
+        });
+        case.texture_arrays.push(TextureArrayResource {
+            binding: 6,
+            role: ResourceRole::InOut,
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            sample_count: 1,
+            elements: vec![TextureArrayElement {
+                dimensions: [1, 1, 1],
+                bytes_b64: None,
+                initial_bytes_b64: Some("AAAAAA==".into()),
+            }],
+        });
+
+        let options = product_transform_options(&case).expect("authored storage specialization");
+        assert_eq!(
+            options.runtime_storage_image_states[4]
+                .expect("single storage texture")
+                .format,
+            metal2vulkan::reflect::RuntimeStorageImageFormat::Rgba8Unorm
+        );
+        let array = options.runtime_storage_image_states[6].expect("storage texture array");
+        assert_eq!(
+            array.format,
+            metal2vulkan::reflect::RuntimeStorageImageFormat::R32Uint
+        );
+        assert!(array.capabilities.storage_image_atomic);
     }
 
     #[test]

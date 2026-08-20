@@ -30,6 +30,7 @@ pub(in crate::passes) fn lower_atomic_texture_fetch_max(
     if comp != crate::passes::ImageComp::Uint {
         return Err(format!("{name} requires an unsigned integer storage image"));
     }
+    ctx.require_runtime_storage_image_use(image, RuntimeStorageImageUse::Atomic)?;
     let image_pointer = if value_is_pointer(ctx, image) {
         image
     } else {

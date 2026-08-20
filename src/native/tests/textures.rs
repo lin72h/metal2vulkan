@@ -39,9 +39,64 @@ fn runtime_sampler_state(
     }
 }
 
-#[test]
-fn native_unsigned_texture_fetch_max_uses_scalar_atomic_image_format() {
-    let ll = r#"
+fn runtime_storage_image_state(
+    format: crate::reflect::RuntimeStorageImageFormat,
+    read_without_format: bool,
+    write_without_format: bool,
+) -> crate::reflect::RuntimeStorageImageState {
+    crate::reflect::RuntimeStorageImageState {
+        format,
+        capabilities: crate::reflect::RuntimeStorageImageCapabilities {
+            storage_image: true,
+            storage_image_atomic: false,
+            read_without_format,
+            write_without_format,
+        },
+    }
+}
+
+const RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL: &str = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %dst0, ptr addrspace(1) %dst1, <2 x i32> %tid) {
+entry:
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst0, <2 x i32> %tid, <4 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00>, i32 0, i32 2)
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst1, <2 x i32> %tid, <4 x float> <float 4.000000e+00, float 3.000000e+00, float 2.000000e+00, float 1.000000e+00>, i32 0, i32 2)
+  ret void
+}
+
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dst0"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dst1"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
+"#;
+
+const RUNTIME_STORAGE_IMAGE_READ_LL: &str = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i32> %tid) {
+entry:
+  %read = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %src, <2 x i32> %tid, i32 0, i32 3)
+  %color = extractvalue { <4 x float>, i8 } %read, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d<float, read_write>", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"tid"}
+"#;
+
+const UNSIGNED_TEXTURE_ATOMIC_LL: &str = r#"
 target triple = "spirv-unknown-vulkan1.3"
 
 define void @textureAtomic(<2 x i16> %coord, ptr addrspace(1) %image) {
@@ -59,12 +114,16 @@ declare <4 x i32> @air.atomic_fetch_max_explicit_texture_2d.i16.u.v4i32(ptr addr
 !3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"coord"}
 !4 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.arg_type_name", !"texture2d<uint, read_write>", !"air.arg_name", !"image"}
 "#;
+
+#[test]
+fn native_unsigned_texture_fetch_max_uses_scalar_atomic_image_format() {
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_texture_atomic_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(UNSIGNED_TEXTURE_ATOMIC_LL, Stage::Kernel, &tmp)
+        .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("R32ui"), "{asm}");
     assert!(asm.contains("OpImageTexelPointer"), "{asm}");
@@ -76,6 +135,75 @@ declare <4 x i32> @air.atomic_fetch_max_explicit_texture_2d.i16.u.v4i32(ptr addr
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn runtime_storage_image_atomic_requires_scalar_format_and_host_support() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_storage_atomic_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let state = |format, storage_image_atomic| crate::reflect::RuntimeStorageImageState {
+        format,
+        capabilities: crate::reflect::RuntimeStorageImageCapabilities {
+            storage_image: true,
+            storage_image_atomic,
+            read_without_format: false,
+            write_without_format: false,
+        },
+    };
+
+    let missing = crate::translate_sanitized_native_with_options(
+        UNSIGNED_TEXTURE_ATOMIC_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                0,
+                state(crate::reflect::RuntimeStorageImageFormat::R32Uint, false),
+            )
+            .unwrap(),
+    )
+    .expect_err("atomic format without host atomic support");
+    assert!(
+        missing.contains("lacks storage-image atomic support"),
+        "{missing}"
+    );
+
+    let vector = crate::translate_sanitized_native_with_options(
+        UNSIGNED_TEXTURE_ATOMIC_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                0,
+                state(crate::reflect::RuntimeStorageImageFormat::Rgba32Uint, true),
+            )
+            .unwrap(),
+    )
+    .expect_err("vector storage formats cannot implement image atomics");
+    assert!(
+        vector.contains("cannot implement storage-image atomics"),
+        "{vector}"
+    );
+
+    let spv = crate::translate_sanitized_native_with_options(
+        UNSIGNED_TEXTURE_ATOMIC_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                0,
+                state(crate::reflect::RuntimeStorageImageFormat::R32Uint, true),
+            )
+            .unwrap(),
+    )
+    .expect("scalar atomic specialization");
+    let asm = disassemble(&spv).expect("disassemble atomic specialization");
+    assert!(asm.contains("R32ui"), "{asm}");
+    assert!(asm.contains("OpAtomicUMax"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("atomic specialization spirv-val");
 }
 
 #[test]
@@ -2764,6 +2892,29 @@ declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr ad
     assert!(asm.contains("OpImageQuerySize "), "{asm}");
     assert!(!asm.contains("OpImageFetch"), "{asm}");
     assert!(!asm.contains("OpImageQuerySizeLod"), "{asm}");
+    let formatless = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                0,
+                runtime_storage_image_state(
+                    crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+                    true,
+                    false,
+                ),
+            )
+            .unwrap(),
+    )
+    .expect("pixel gather storage reads use the formatless read contract");
+    let formatless_asm = disassemble(&formatless).expect("disassemble formatless gather");
+    assert!(
+        formatless_asm.contains("OpCapability StorageImageReadWithoutFormat"),
+        "{formatless_asm}"
+    );
+    assert!(!formatless_asm.contains("StorageImageWriteWithoutFormat"));
+    tools::spirv_val_bytes(&formatless, &tmp).expect("formatless pixel gather spirv-val");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -3007,6 +3158,312 @@ declare void @air.write_texture_2d.u.v4i32(ptr addrspace(1), <2 x i32>, <4 x i32
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn runtime_storage_image_specialization_splits_shared_image_pointer_and_load_types() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_storage_split_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let rgba8 = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Rgba8Unorm,
+        false,
+        false,
+    );
+    let rgba32 = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Rgba32Float,
+        false,
+        false,
+    );
+    let options = passes::TransformOptions::default()
+        .with_runtime_storage_image(0, rgba8)
+        .unwrap()
+        .with_runtime_storage_image(1, rgba32)
+        .unwrap();
+    let (spv, reflection) = crate::translate_sanitized_native_reflected(
+        RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL,
+        Stage::Kernel,
+        &tmp,
+        options,
+    )
+    .expect("runtime storage-image specialization");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("Rgba8"), "{asm}");
+    assert!(asm.contains("Rgba32f"), "{asm}");
+    assert_eq!(asm.matches("OpImageWrite").count(), 2, "{asm}");
+
+    let module = load_bytes(&spv).expect("load specialized module");
+    let defs = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
+    let image_type_at_binding = |binding: u32| {
+        let variable = module
+            .annotations
+            .iter()
+            .find_map(|decoration| {
+                (decoration.class.opcode == Op::Decorate
+                    && decoration.operands.get(1)
+                        == Some(&Operand::Decoration(Decoration::Binding))
+                    && decoration.operands.get(2) == Some(&Operand::LiteralBit32(binding)))
+                .then(|| match decoration.operands.first() {
+                    Some(Operand::IdRef(id)) => Some(*id),
+                    _ => None,
+                })
+                .flatten()
+            })
+            .expect("storage-image variable");
+        let variable_type = defs[&variable].result_type.expect("variable pointer type");
+        let image_type = match defs[&variable_type].operands.get(1) {
+            Some(Operand::IdRef(image_type)) => *image_type,
+            other => panic!("storage-image pointer has no image pointee: {other:?}"),
+        };
+        let load = module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .find(|instruction| {
+                instruction.class.opcode == Op::Load
+                    && instruction.operands.first() == Some(&Operand::IdRef(variable))
+            })
+            .expect("storage-image load");
+        assert_eq!(load.result_type, Some(image_type));
+        (image_type, defs[&image_type].operands.get(6).cloned())
+    };
+    let (rgba8_type, rgba8_format) = image_type_at_binding(480);
+    let (rgba32_type, rgba32_format) = image_type_at_binding(481);
+    assert_ne!(rgba8_type, rgba32_type, "differently specialized bindings");
+    assert_eq!(
+        rgba8_format,
+        Some(Operand::ImageFormat(spirv::ImageFormat::Rgba8))
+    );
+    assert_eq!(
+        rgba32_format,
+        Some(Operand::ImageFormat(spirv::ImageFormat::Rgba32f))
+    );
+
+    for (index, state, format) in [
+        (0, rgba8, crate::meta::TextureFormat::Rgba8),
+        (1, rgba32, crate::meta::TextureFormat::Rgba32f),
+    ] {
+        let binding = reflection
+            .binding_at(crate::reflect::ResourceKind::StorageImage, index)
+            .expect("reflected storage image");
+        assert_eq!(
+            binding.texture_shape.and_then(|shape| shape.storage_format),
+            Some(format)
+        );
+        assert!(reflection.runtime_storage_image_specializations.contains(
+            &crate::reflect::RuntimeStorageImageSpecialization {
+                metal_index: index,
+                state,
+                spirv_format: Some(format),
+            }
+        ));
+    }
+    tools::spirv_val_bytes(&spv, &tmp).expect("specialized spirv-val");
+}
+
+#[test]
+fn runtime_storage_image_formatless_capabilities_follow_actual_access() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_storage_formatless_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let bgra_write = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+        false,
+        true,
+    );
+    let (write_spv, write_reflection) = crate::translate_sanitized_native_reflected(
+        RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, bgra_write)
+            .unwrap(),
+    )
+    .expect("formatless write specialization");
+    let write_asm = disassemble(&write_spv).expect("disassemble write");
+    assert!(write_asm.contains("OpCapability StorageImageWriteWithoutFormat"));
+    assert!(!write_asm.contains("OpCapability StorageImageReadWithoutFormat"));
+    assert!(write_asm.contains("Unknown"), "{write_asm}");
+    assert_eq!(
+        write_reflection.runtime_storage_image_specializations,
+        [crate::reflect::RuntimeStorageImageSpecialization {
+            metal_index: 0,
+            state: bgra_write,
+            spirv_format: None,
+        }]
+    );
+    assert_eq!(
+        write_reflection
+            .binding_at(crate::reflect::ResourceKind::StorageImage, 0)
+            .and_then(|binding| binding.texture_shape)
+            .and_then(|shape| shape.storage_format),
+        None
+    );
+    tools::spirv_val_bytes(&write_spv, &tmp).expect("formatless write spirv-val");
+
+    let bgra_read = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+        true,
+        false,
+    );
+    let read_spv = crate::translate_sanitized_native_with_options(
+        RUNTIME_STORAGE_IMAGE_READ_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, bgra_read)
+            .unwrap(),
+    )
+    .expect("formatless read specialization");
+    let read_asm = disassemble(&read_spv).expect("disassemble read");
+    assert!(read_asm.contains("OpCapability StorageImageReadWithoutFormat"));
+    assert!(!read_asm.contains("OpCapability StorageImageWriteWithoutFormat"));
+    assert!(read_asm.contains("OpImageRead"), "{read_asm}");
+    tools::spirv_val_bytes(&read_spv, &tmp).expect("formatless read spirv-val");
+}
+
+#[test]
+fn runtime_storage_image_formatless_partial_write_requires_read_and_write_features() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %dst, <2 x i32> %tid) {
+entry:
+  %texel = insertelement <4 x float> undef, float 1.000000e+00, i64 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst, <2 x i32> %tid, <4 x float> %texel, i32 0, i32 2)
+  ret void
+}
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_storage_formatless_rmw_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let both = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+        true,
+        true,
+    );
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, both)
+            .unwrap(),
+    )
+    .expect("formatless read-modify-write specialization");
+    let asm = disassemble(&spv).expect("disassemble read-modify-write");
+    assert!(asm.contains("OpCapability StorageImageReadWithoutFormat"));
+    assert!(asm.contains("OpCapability StorageImageWriteWithoutFormat"));
+    assert!(asm.contains("OpImageRead"), "{asm}");
+    assert!(asm.contains("OpImageWrite"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("formatless read-modify-write spirv-val");
+
+    let write_only = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+        false,
+        true,
+    );
+    let error = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, write_only)
+            .unwrap(),
+    )
+    .expect_err("hidden preservation read requires read-without-format");
+    assert!(error.contains("read-without-format"), "{error}");
+}
+
+#[test]
+fn runtime_storage_image_specialization_refuses_incompatible_or_missing_contracts() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_storage_refusals_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let uint_state = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Rgba8Uint,
+        false,
+        false,
+    );
+    let incompatible = crate::translate_sanitized_native_with_options(
+        RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, uint_state)
+            .unwrap(),
+    )
+    .expect_err("float AIR texels cannot target an integer runtime format");
+    assert!(
+        incompatible.contains("AIR texels are Float"),
+        "{incompatible}"
+    );
+
+    let bgra_missing_write = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+        true,
+        false,
+    );
+    let missing_feature = crate::translate_sanitized_native_with_options(
+        RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(0, bgra_missing_write)
+            .unwrap(),
+    )
+    .expect_err("formatless write without host feature");
+    assert!(
+        missing_feature.contains("write-without-format"),
+        "{missing_feature}"
+    );
+
+    let rgba8 = runtime_storage_image_state(
+        crate::reflect::RuntimeStorageImageFormat::Rgba8Unorm,
+        false,
+        false,
+    );
+    let missing_binding = crate::translate_sanitized_native_with_options(
+        RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(7, rgba8)
+            .unwrap(),
+    )
+    .expect_err("specialization index must name a storage binding");
+    assert!(
+        missing_binding.contains("no storage-image binding"),
+        "{missing_binding}"
+    );
+
+    let unsupported = crate::reflect::RuntimeStorageImageState {
+        format: crate::reflect::RuntimeStorageImageFormat::Rgba8Unorm,
+        capabilities: crate::reflect::RuntimeStorageImageCapabilities::default(),
+    };
+    let missing_storage = passes::TransformOptions::default()
+        .with_runtime_storage_image(0, unsupported)
+        .expect_err("format must support storage usage");
+    assert!(missing_storage.contains("lacks storage-image format support"));
 }
 
 #[test]
@@ -3324,6 +3781,49 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(!asm.contains("air.imageblock"), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    let missing_formatless = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                1,
+                runtime_storage_image_state(
+                    crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+                    false,
+                    false,
+                ),
+            )
+            .unwrap(),
+    )
+    .expect_err("imageblock slice write must require formatless write support");
+    assert!(
+        missing_formatless.contains("write-without-format"),
+        "{missing_formatless}"
+    );
+    let formatless = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_storage_image(
+                1,
+                runtime_storage_image_state(
+                    crate::reflect::RuntimeStorageImageFormat::Bgra8Unorm,
+                    false,
+                    true,
+                ),
+            )
+            .unwrap(),
+    )
+    .expect("formatless imageblock slice write");
+    let formatless_asm = disassemble(&formatless).expect("disassemble formatless imageblock write");
+    assert!(
+        formatless_asm.contains("OpCapability StorageImageWriteWithoutFormat"),
+        "{formatless_asm}"
+    );
+    assert!(formatless_asm.contains("Unknown"), "{formatless_asm}");
+    tools::spirv_val_bytes(&formatless, &tmp).expect("formatless imageblock write spirv-val");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

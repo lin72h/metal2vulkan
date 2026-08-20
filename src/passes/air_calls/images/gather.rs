@@ -311,7 +311,7 @@ pub(in crate::passes) fn lower_pixel_gather_2d(
             &mut out,
         )?;
         let color = ctx.module.fresh_id();
-        push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color);
+        push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color)?;
         let mut selected = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::CompositeExtract,

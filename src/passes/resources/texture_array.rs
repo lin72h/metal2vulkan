@@ -230,6 +230,11 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         }
         if image_type_is_storage(ctx, elem_image_ty) {
             ctx.image_storage.insert(handle);
+            if let Some((metal_index, state)) =
+                ctx.runtime_storage_image_values.get(&arrayvar).copied()
+            {
+                ctx.register_runtime_storage_image_value(handle, metal_index, Some(state));
+            }
         }
         // The original load's pointer operand becomes dead; record its id for the sweep.
         if let Some(load) = defs.get(&handle) {
@@ -290,6 +295,11 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         }
         if image_type_is_storage(ctx, image_ty) {
             ctx.image_storage.insert(image);
+            if let Some((metal_index, state)) =
+                ctx.runtime_storage_image_values.get(&arrayvar).copied()
+            {
+                ctx.register_runtime_storage_image_value(image, metal_index, Some(state));
+            }
         }
         placeholder_uses.insert((block_idx, inst_idx), (chain, load, image));
     }

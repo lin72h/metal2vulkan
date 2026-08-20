@@ -111,7 +111,7 @@ pub(in crate::passes) fn lower_sample(
                 &mut out,
             )?;
             let mut color = ctx.module.fresh_id();
-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color);
+            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color)?;
             if let Some(in_bounds) = fetch.in_bounds {
                 let guarded = ctx.module.fresh_id();
                 let zero_color = const_null_of(ctx, sample_v4);
@@ -192,7 +192,7 @@ pub(in crate::passes) fn lower_sample(
                     Some(lod),
                     sample_v4,
                     color,
-                );
+                )?;
                 if let Some(in_bounds) = fetch.in_bounds {
                     let guarded = ctx.module.fresh_id();
                     let zero_color = const_null_of(ctx, sample_v4);
@@ -441,7 +441,7 @@ fn lower_pixel_bicubic_sample(
             Some(lod),
             sample_v4,
             fetched,
-        );
+        )?;
         let color = if let Some(in_bounds) = tap_coord.in_bounds {
             let guarded = ctx.module.fresh_id();
             out.push(Instruction::new(
@@ -772,7 +772,7 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
             Some(lod),
             sample_v4,
             fetched,
-        );
+        )?;
         let color = if let Some(in_bounds) = tap_coord.in_bounds {
             let guarded = ctx.module.fresh_id();
             out.push(Instruction::new(

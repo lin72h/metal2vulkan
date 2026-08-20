@@ -17,7 +17,10 @@
 use crate::meta::{
     AirScalar, AirType, FragMeta, FragRole, KernMeta, KernRole, VertMeta, VertOutRole, VertRole,
 };
-use crate::reflect::{RuntimeSamplerState, StaticSamplerState, SAMPLER_ARGUMENT_COUNT_USIZE};
+use crate::reflect::{
+    RuntimeSamplerState, RuntimeStorageImageState, StaticSamplerState,
+    SAMPLER_ARGUMENT_COUNT_USIZE, TEXTURE_ARGUMENT_COUNT_USIZE,
+};
 use crate::spirv_module::{is_block_terminator, Block, Function, Instruction, Module, Operand};
 use spirv::{
     BuiltIn, Decoration, Dim, FunctionControl, ImageFormat, MemorySemantics, Op, Scope,
@@ -59,6 +62,10 @@ pub struct TransformOptions {
     /// sampler state, but pixel-coordinate samplers require operation-aware shader specialization
     /// to remain legal in Vulkan. Unspecified slots retain ordinary runtime sampling.
     pub runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
+    /// Runtime surface format and host features by Metal `[[texture(n)]]` index. Only storage-image
+    /// bindings consume these entries; sampled textures retain their AIR-derived image type.
+    pub runtime_storage_image_states:
+        [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
 }
 
 impl Default for TransformOptions {
@@ -70,6 +77,7 @@ impl Default for TransformOptions {
             denorm_flush_to_zero_f32: false,
             raster_sample_count: None,
             runtime_sampler_states: [None; SAMPLER_ARGUMENT_COUNT_USIZE],
+            runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
         }
     }
 }
@@ -106,6 +114,43 @@ impl TransformOptions {
         }
         Ok(())
     }
+
+    /// Specialize one dynamically bound Metal storage texture. The runtime format and host feature
+    /// facts are validated before translation mutates the module.
+    pub fn with_runtime_storage_image(
+        mut self,
+        metal_index: u32,
+        state: RuntimeStorageImageState,
+    ) -> Result<Self, String> {
+        state.validate()?;
+        let slot = usize::try_from(metal_index)
+            .ok()
+            .filter(|slot| *slot < TEXTURE_ARGUMENT_COUNT_USIZE)
+            .ok_or_else(|| {
+                format!(
+                    "Metal texture index {metal_index} exceeds runtime storage-image specialization range 0..{}",
+                    TEXTURE_ARGUMENT_COUNT_USIZE
+                )
+            })?;
+        self.runtime_storage_image_states[slot] = Some(state);
+        Ok(self)
+    }
+
+    pub(crate) fn validate_runtime_storage_images(self) -> Result<(), String> {
+        for (index, state) in self
+            .runtime_storage_image_states
+            .iter()
+            .copied()
+            .enumerate()
+        {
+            if let Some(state) = state {
+                state
+                    .validate()
+                    .map_err(|error| format!("runtime storage image {index}: {error}"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The sampled component type of a texture (the `OpTypeImage` "Sampled Type"). Metal integer
@@ -117,6 +162,13 @@ pub enum ImageComp {
     Float,
     Uint,
     Sint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeStorageImageUse {
+    Read,
+    Write,
+    Atomic,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -252,6 +304,11 @@ struct Ctx {
     /// Exact graphics-pipeline sample count used to lower `air.get_num_samples.i32`.
     raster_sample_count: Option<u32>,
     runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
+    runtime_storage_image_states: [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
+    /// Storage-image variable/load ids carrying caller-provided runtime format state.
+    runtime_storage_image_values: HashMap<Word, (u32, RuntimeStorageImageState)>,
+    /// Metal texture indices whose storage-image binding consumed its specialization entry.
+    applied_runtime_storage_image_indices: HashSet<u32>,
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
@@ -329,6 +386,9 @@ impl Ctx {
             simd_cluster32: options.simd_cluster32,
             raster_sample_count: options.raster_sample_count,
             runtime_sampler_states: options.runtime_sampler_states,
+            runtime_storage_image_states: options.runtime_storage_image_states,
+            runtime_storage_image_values: HashMap::new(),
+            applied_runtime_storage_image_indices: HashSet::new(),
             default_sampler_var: None,
             sampler_states: HashMap::new(),
             specialized_runtime_sampler_values: HashSet::new(),
@@ -341,6 +401,242 @@ impl Ctx {
             writes_frag_depth: false,
         }
     }
+
+    fn add_capability(&mut self, capability: spirv::Capability) {
+        if self.module.capabilities.iter().any(|instruction| {
+            instruction.operands.first() == Some(&Operand::Capability(capability))
+        }) {
+            return;
+        }
+        self.module.capabilities.push(Instruction::new(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(capability)],
+        ));
+    }
+
+    fn specialize_storage_image_format(
+        &mut self,
+        metal_index: u32,
+        air_format: ImageFormat,
+        component: ImageComp,
+    ) -> Result<(ImageFormat, Option<RuntimeStorageImageState>), String> {
+        let Some(state) = usize::try_from(metal_index)
+            .ok()
+            .and_then(|index| self.runtime_storage_image_states.get(index))
+            .copied()
+            .flatten()
+        else {
+            return Ok((air_format, None));
+        };
+        let air_component = crate::meta::TextureComponent::from_image_comp(component);
+        let runtime_component = state.format.component();
+        if air_component != runtime_component {
+            return Err(format!(
+                "runtime storage image {metal_index}: AIR texels are {air_component:?}, but runtime format {:?} is {runtime_component:?}",
+                state.format
+            ));
+        }
+        self.applied_runtime_storage_image_indices
+            .insert(metal_index);
+        let format = state
+            .format
+            .explicit_format()
+            .map(crate::meta::TextureFormat::to_spirv_format)
+            .unwrap_or(ImageFormat::Unknown);
+        if storage_image_format_needs_extended_capability(format) {
+            self.add_capability(spirv::Capability::StorageImageExtendedFormats);
+        }
+        Ok((format, Some(state)))
+    }
+
+    fn register_runtime_storage_image_value(
+        &mut self,
+        value: Word,
+        metal_index: u32,
+        state: Option<RuntimeStorageImageState>,
+    ) {
+        if let Some(state) = state {
+            self.runtime_storage_image_values
+                .insert(value, (metal_index, state));
+        }
+    }
+
+    fn require_runtime_storage_image_use(
+        &mut self,
+        image: Word,
+        usage: RuntimeStorageImageUse,
+    ) -> Result<(), String> {
+        let specializations = self.runtime_storage_image_origins(image);
+        if specializations.is_empty() {
+            return Ok(());
+        }
+        let first_format = specializations[0].1.format.explicit_format();
+        if specializations
+            .iter()
+            .any(|(_, state)| state.format.explicit_format() != first_format)
+        {
+            return Err(
+                "differently formatted runtime storage images cannot be selected into one image value"
+                    .into(),
+            );
+        }
+        for (metal_index, state) in specializations {
+            if usage == RuntimeStorageImageUse::Atomic {
+                if !state.format.supports_atomics() {
+                    return Err(format!(
+                        "runtime storage image {metal_index}: format {:?} cannot implement storage-image atomics",
+                        state.format
+                    ));
+                }
+                if !state.capabilities.storage_image_atomic {
+                    return Err(format!(
+                        "runtime storage image {metal_index}: format {:?} lacks storage-image atomic support",
+                        state.format
+                    ));
+                }
+            }
+            if state.format.explicit_format().is_some() {
+                continue;
+            }
+            let (supported, capability, operation) = match usage {
+                RuntimeStorageImageUse::Read => (
+                    state.capabilities.read_without_format,
+                    spirv::Capability::StorageImageReadWithoutFormat,
+                    "read",
+                ),
+                RuntimeStorageImageUse::Write => (
+                    state.capabilities.write_without_format,
+                    spirv::Capability::StorageImageWriteWithoutFormat,
+                    "write",
+                ),
+                RuntimeStorageImageUse::Atomic => {
+                    return Err(format!(
+                        "runtime storage image {metal_index}: formatless storage-image atomics are unsupported"
+                    ));
+                }
+            };
+            if !supported {
+                return Err(format!(
+                    "runtime storage image {metal_index}: format {:?} requires host {operation}-without-format support",
+                    state.format
+                ));
+            }
+            self.add_capability(capability);
+        }
+        Ok(())
+    }
+
+    fn runtime_storage_image_origins(&self, image: Word) -> Vec<(u32, RuntimeStorageImageState)> {
+        let mut pending = vec![image];
+        let mut visited = HashSet::new();
+        let mut origins = Vec::new();
+        while let Some(value) = pending.pop() {
+            if !visited.insert(value) {
+                continue;
+            }
+            if let Some(origin) = self.runtime_storage_image_values.get(&value).copied() {
+                if !origins.contains(&origin) {
+                    origins.push(origin);
+                }
+                continue;
+            }
+            let Some(instruction) = self
+                .module
+                .types_global_values
+                .iter()
+                .chain(self.new_globals.iter())
+                .chain(
+                    self.module
+                        .functions
+                        .iter()
+                        .flat_map(|function| function.blocks.iter())
+                        .flat_map(|block| block.instructions.iter()),
+                )
+                .find(|instruction| instruction.result_id == Some(value))
+            else {
+                continue;
+            };
+            match instruction.class.opcode {
+                Op::CopyObject | Op::Load => {
+                    if let Some(Operand::IdRef(source)) = instruction.operands.first() {
+                        pending.push(*source);
+                    }
+                }
+                Op::Select => {
+                    pending.extend(instruction.operands.iter().skip(1).filter_map(|operand| {
+                        match operand {
+                            Operand::IdRef(source) => Some(*source),
+                            _ => None,
+                        }
+                    }))
+                }
+                Op::Phi => pending.extend(instruction.operands.iter().enumerate().filter_map(
+                    |(index, operand)| match (index % 2, operand) {
+                        (0, Operand::IdRef(source)) => Some(*source),
+                        _ => None,
+                    },
+                )),
+                _ => {}
+            }
+        }
+        origins.sort_unstable_by_key(|(metal_index, _)| *metal_index);
+        origins
+    }
+
+    fn validate_runtime_storage_image_bindings(&self) -> Result<(), String> {
+        for (metal_index, state) in self
+            .runtime_storage_image_states
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, state)| Some((u32::try_from(index).ok()?, state?)))
+        {
+            if !self
+                .applied_runtime_storage_image_indices
+                .contains(&metal_index)
+            {
+                return Err(format!(
+                    "runtime storage image {metal_index}: no storage-image binding exists for runtime format {:?}",
+                    state.format
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn storage_image_format_needs_extended_capability(format: ImageFormat) -> bool {
+    matches!(
+        format,
+        ImageFormat::Rg32f
+            | ImageFormat::Rg16f
+            | ImageFormat::R11fG11fB10f
+            | ImageFormat::R16f
+            | ImageFormat::Rgba16
+            | ImageFormat::Rgb10A2
+            | ImageFormat::Rg16
+            | ImageFormat::Rg8
+            | ImageFormat::R16
+            | ImageFormat::R8
+            | ImageFormat::Rgba16Snorm
+            | ImageFormat::Rg16Snorm
+            | ImageFormat::Rg8Snorm
+            | ImageFormat::R16Snorm
+            | ImageFormat::R8Snorm
+            | ImageFormat::Rg32i
+            | ImageFormat::Rg16i
+            | ImageFormat::Rg8i
+            | ImageFormat::R16i
+            | ImageFormat::R8i
+            | ImageFormat::Rgb10a2ui
+            | ImageFormat::Rg32ui
+            | ImageFormat::Rg16ui
+            | ImageFormat::Rg8ui
+            | ImageFormat::R16ui
+            | ImageFormat::R8ui
+    )
 }
 
 /// A small helper to build a type/constant instruction and register it in the cache + new_globals.
@@ -1931,6 +2227,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     // 1a) decoded params -> stage-input/resource vars and entry-body replacements. Preserve the
     //     original type snapshot for the immediately-following return rewrite.
     let input_defs = build_stage_input(&mut ctx, entry_idx, &stage, frag, vert, kern)?;
+    ctx.validate_runtime_storage_image_bindings()?;
     // 1b) return -> output vars.
     rewrite_return(&mut ctx, entry_idx, &stage, frag, vert, &input_defs)?;
     // Turn each runtime-indexed texture-array element handle load into an OpAccessChain+OpLoad

@@ -32,6 +32,7 @@ pub(in crate::passes) fn lower_write(
             ));
         }
     }
+    ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Write)?;
     let mut out = vec![];
 
     let (dim, arrayed) = ctx
@@ -104,7 +105,7 @@ pub(in crate::passes) fn lower_write(
         }
     };
 
-    let texel32 = preserve_defined_texel_lanes(ctx, &mut out, img, coord32, texel, texel32);
+    let texel32 = preserve_defined_texel_lanes(ctx, &mut out, img, coord32, texel, texel32)?;
 
     out.push(Instruction::new(
         Op::ImageWrite,
@@ -126,19 +127,20 @@ fn preserve_defined_texel_lanes(
     coord32: Word,
     source_texel: Word,
     write_texel: Word,
-) -> Word {
+) -> Result<Word, String> {
     let undefined = (0..4)
         .map(|lane| texel_lane_is_statically_undef(ctx, out, source_texel, lane))
         .collect::<Vec<_>>();
     if undefined.iter().all(|is_undef| !*is_undef) {
-        return write_texel;
+        return Ok(write_texel);
     }
 
     let Some(write_ty) = pending_or_module_result_type(ctx, out, write_texel) else {
-        return write_texel;
+        return Ok(write_texel);
     };
     let lane_ty = element_type(ctx, write_ty);
     let current = ctx.module.fresh_id();
+    ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Read)?;
     out.push(Instruction::new(
         Op::ImageRead,
         Some(write_ty),
@@ -174,7 +176,7 @@ fn preserve_defined_texel_lanes(
         ));
         merged = next;
     }
-    merged
+    Ok(merged)
 }
 
 fn pending_or_module_result_type(ctx: &Ctx, pending: &[Instruction], value: Word) -> Option<Word> {
@@ -282,6 +284,9 @@ pub(in crate::passes) fn lower_read(
         } else {
             return lower_null_texture_result(ctx, res, rty);
         }
+    }
+    if image_is_storage(ctx, img) {
+        ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Read)?;
     }
     let (dim, arrayed) = ctx
         .image_dims
