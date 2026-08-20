@@ -1003,6 +1003,7 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
     }
     let (img_ty, _, _, _) = sampled_operand_image_info(ctx, img, dim, false, comp);
     let si_ty = ctx.ty_sampled_image(img_ty);
+    validate_runtime_sampler_specialization(ctx, args[1])?;
     if ctx
         .sampler_states
         .get(&args[1])

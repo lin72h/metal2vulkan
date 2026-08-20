@@ -434,23 +434,13 @@ pub(in crate::passes) fn valid_sampler_value(
     samp: Word,
     out: &mut Vec<Instruction>,
 ) -> Result<Word, String> {
-    if ctx.ambiguous_sampler_states.contains(&samp) {
-        return Err(
-            "runtime sampler specialization is ambiguous after an SSA select/phi join".into(),
-        );
-    }
+    validate_runtime_sampler_specialization(ctx, samp)?;
     let sty = ctx.ty_sampler();
     if value_result_type(ctx, samp) == Some(sty) {
         return Ok(samp);
     }
     if !value_is_pointer(ctx, samp) {
         return Err("air.sample_texture sampler operand is not a sampler".into());
-    }
-    if !ctx.specialized_runtime_sampler_values.is_empty() {
-        return Err(
-            "runtime sampler specialization cannot recover an exact state after pointer selection"
-                .into(),
-        );
     }
 
     // AIR can select between embedded `__air_sampler_state` globals before sampling. The native
@@ -467,4 +457,25 @@ pub(in crate::passes) fn valid_sampler_value(
         vec![Operand::IdRef(var)],
     ));
     Ok(loaded)
+}
+
+/// Refuse any path that would silently replace a specialized runtime sampler after its exact state
+/// was lost. Most callers subsequently need a real `OpTypeSampler`, but integer-image LOD queries
+/// intentionally substitute a nearest sampler and therefore need this check independently.
+pub(in crate::passes) fn validate_runtime_sampler_specialization(
+    ctx: &Ctx,
+    samp: Word,
+) -> Result<(), String> {
+    if ctx.ambiguous_sampler_states.contains(&samp) {
+        return Err(
+            "runtime sampler specialization is ambiguous after an SSA select/phi join".into(),
+        );
+    }
+    if value_is_pointer(ctx, samp) && !ctx.specialized_runtime_sampler_values.is_empty() {
+        return Err(
+            "runtime sampler specialization cannot recover an exact state after pointer selection"
+                .into(),
+        );
+    }
+    Ok(())
 }

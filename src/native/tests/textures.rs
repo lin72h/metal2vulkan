@@ -1397,6 +1397,103 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 }
 
 #[test]
+fn runtime_sampler_specialization_refuses_integer_lod_query_pointer_state_loss() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <4 x float> @frag(<4 x float> %position, ptr addrspace(1) %tex, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1) {
+entry:
+  %x = extractelement <4 x float> %position, i32 0
+  %condition = fcmp oge float %x, 0.000000e+00
+  %selected = select i1 %condition, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1
+  %lod = tail call fast float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly captures(none) %tex, ptr addrspace(2) readonly captures(none) %selected, <2 x float> <float 2.500000e-01, float 7.500000e-01>, i32 0)
+  %out = insertelement <4 x float> zeroinitializer, float %lod, i32 0
+  ret <4 x float> %out
+}
+
+declare float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly captures(none), ptr addrspace(2) readonly captures(none), <2 x float>, i32)
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5, !6, !7}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4"}
+!5 = !{i32 1, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<uint, sample>"}
+!6 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!7 = !{i32 3, !"air.sampler", !"air.location_index", i32 1, i32 1}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_sampler_integer_lod_select_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let mut state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Normalized,
+        crate::reflect::SamplerFilter::Linear,
+        crate::reflect::SamplerAddressMode::ClampToEdge,
+    );
+    state.lod_bias = 0.5;
+    state.lod_max_clamp = 8.0;
+    let options = passes::TransformOptions::default()
+        .with_runtime_sampler(0, state)
+        .unwrap()
+        .with_runtime_sampler(1, state)
+        .unwrap();
+    let error = crate::translate_sanitized_native_with_options(ll, Stage::Fragment, &tmp, options)
+        .expect_err("integer LOD query must not replace a lost runtime specialization");
+    assert!(error.contains("pointer selection"), "{error}");
+}
+
+#[test]
+fn runtime_pixel_sampler_specializes_texture_gather() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
+entry:
+  %gather = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> <i32 1, i32 -1>, i32 0, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %gather, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_sampler_gather_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::Repeat,
+    );
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default()
+            .with_runtime_sampler(0, state)
+            .unwrap(),
+    )
+    .expect("pixel gather specialization");
+    let asm = disassemble(&spv).expect("disassemble pixel gather");
+    assert_eq!(asm.matches("OpImageFetch").count(), 4, "{asm}");
+    assert!(asm.contains("OpSMod"), "{asm}");
+    assert!(!asm.contains("OpImageGather"), "{asm}");
+    assert!(!asm.contains("OpSampledImage"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("pixel gather spirv-val");
+}
+
+#[test]
 fn native_kernel_texture_sample_dynamic_offset_adjusts_coordinate() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

@@ -23,7 +23,7 @@ use spirv::{
     BuiltIn, Decoration, Dim, FunctionControl, ImageFormat, MemorySemantics, Op, Scope,
     StorageClass, Word,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stage {
@@ -450,21 +450,38 @@ fn propagate_sampler_state_aliases(ctx: &mut Ctx, entry_idx: usize) {
             (!sources.is_empty()).then_some((result, sources))
         })
         .collect::<Vec<_>>();
-    // SPIR-V's ordinary def-use order makes this one linear pass sufficient for CopyObject/Select
-    // chains. Phi backedges that do not already carry one exact state remain conservatively
-    // ambiguous; this keeps the specialization audit bounded instead of introducing a graph-sized
-    // fixpoint loop on the translation hot path.
-    for (result, sources) in aliases {
+    // Blocks need not be serialized in dominance order. Seed the aliases that directly consume a
+    // classified state, then visit their dependents once. This is bounded by the sampler-alias graph
+    // rather than a whole-module fixpoint. An unresolved sibling input is conservatively ambiguous,
+    // which is the same contract as an unspecialized input at a join.
+    let mut dependents = HashMap::<Word, Vec<usize>>::new();
+    for (index, (_, sources)) in aliases.iter().enumerate() {
+        for source in sources {
+            dependents.entry(*source).or_default().push(index);
+        }
+    }
+    let mut queued = vec![false; aliases.len()];
+    let mut queue = VecDeque::new();
+    for (index, (_, sources)) in aliases.iter().enumerate() {
+        if sources.iter().any(|source| {
+            ctx.sampler_states.contains_key(source) || ctx.ambiguous_sampler_states.contains(source)
+        }) {
+            queued[index] = true;
+            queue.push_back(index);
+        }
+    }
+    while let Some(index) = queue.pop_front() {
+        let (result, sources) = &aliases[index];
         let mut exact = None;
         let mut saw_known = false;
         let mut conflict = false;
         for source in sources {
-            if ctx.ambiguous_sampler_states.contains(&source) {
+            if ctx.ambiguous_sampler_states.contains(source) {
                 conflict = true;
                 saw_known = true;
                 continue;
             }
-            let Some(state) = ctx.sampler_states.get(&source).copied() else {
+            let Some(state) = ctx.sampler_states.get(source).copied() else {
                 conflict = true;
                 continue;
             };
@@ -479,10 +496,64 @@ fn propagate_sampler_state_aliases(ctx: &mut Ctx, entry_idx: usize) {
             continue;
         }
         if conflict {
-            ctx.ambiguous_sampler_states.insert(result);
+            ctx.ambiguous_sampler_states.insert(*result);
         } else if let Some(state) = exact {
-            ctx.sampler_states.insert(result, state);
+            ctx.sampler_states.insert(*result, state);
         }
+        for dependent in dependents.get(result).into_iter().flatten() {
+            if !queued[*dependent] {
+                queued[*dependent] = true;
+                queue.push_back(*dependent);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sampler_state_alias_tests {
+    use super::*;
+
+    #[test]
+    fn propagation_follows_alias_sources_in_later_blocks() {
+        let mut module = Module::new();
+        module
+            .types_global_values
+            .push(Instruction::new(Op::TypeSampler, None, Some(1), vec![]));
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![
+                Block {
+                    label: None,
+                    instructions: vec![Instruction::new(
+                        Op::CopyObject,
+                        Some(1),
+                        Some(5),
+                        vec![Operand::IdRef(4)],
+                    )],
+                },
+                Block {
+                    label: None,
+                    instructions: vec![Instruction::new(
+                        Op::CopyObject,
+                        Some(1),
+                        Some(4),
+                        vec![Operand::IdRef(3)],
+                    )],
+                },
+            ],
+            end: None,
+        });
+        let state = StaticSamplerState::from_air_words([34901797601020416, 0])
+            .expect("decode sampler state");
+        let mut ctx = Ctx::new(module);
+        ctx.sampler_states.insert(3, state);
+
+        propagate_sampler_state_aliases(&mut ctx, 0);
+
+        assert_eq!(ctx.sampler_states.get(&4), Some(&state));
+        assert_eq!(ctx.sampler_states.get(&5), Some(&state));
+        assert!(ctx.ambiguous_sampler_states.is_empty());
     }
 }
 
