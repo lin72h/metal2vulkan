@@ -83,8 +83,12 @@ pub fn translate_with_options(
     tmp: &Path,
     options: passes::TransformOptions,
 ) -> Result<Vec<u8>, String> {
-    let san_ll = tools::air_to_sanitized_ll(src, tmp)?;
-    translate_sanitized_native_with_options(&san_ll, stage, tmp, options)
+    let (san_ll, datalayout) = tools::air_to_sanitized_ll_with_datalayout(src, tmp)?;
+    let datalayout = datalayout
+        .as_deref()
+        .map(layout::AirDataLayout::parse)
+        .transpose()?;
+    translate_sanitized_native_with_options_and_layout(&san_ll, stage, tmp, options, datalayout)
 }
 
 /// Translate already-sanitized LLVM IR through the native emitter.
@@ -234,6 +238,7 @@ pub fn translate_pre_psb_probe(
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, passes::TransformOptions::default());
+    let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
     translate_sanitized_with_meta(
         san_ll,
         stage,
@@ -245,6 +250,7 @@ pub fn translate_pre_psb_probe(
         tmp,
         options,
         false,
+        datalayout,
     )
 }
 
@@ -253,6 +259,17 @@ pub fn translate_sanitized_native_with_options(
     stage: passes::Stage,
     tmp: &Path,
     options: passes::TransformOptions,
+) -> Result<Vec<u8>, String> {
+    let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
+    translate_sanitized_native_with_options_and_layout(san_ll, stage, tmp, options, datalayout)
+}
+
+fn translate_sanitized_native_with_options_and_layout(
+    san_ll: &str,
+    stage: passes::Stage,
+    tmp: &Path,
+    options: passes::TransformOptions,
+    datalayout: Option<layout::AirDataLayout>,
 ) -> Result<Vec<u8>, String> {
     // Lower `air.simdgroup_async_copy_2d` (+ its event/wait pair) to an explicit strided tile copy
     // BEFORE any meta parse or emit, so every path — the default emit AND every retry tier (which
@@ -278,6 +295,7 @@ pub fn translate_sanitized_native_with_options(
         tmp,
         options,
         true,
+        datalayout,
     )
 }
 
@@ -331,11 +349,21 @@ pub fn translate_reflected_with_options(
     tmp: &Path,
     options: passes::TransformOptions,
 ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
-    // Capture the `target datalayout` before sanitization drops it, so the reflection carries it and
-    // the consumer never re-reads the source `.ll` from disk. (The sanitized-entry sibling has no
-    // source datalayout to recover, so it leaves reflection.datalayout = None.)
+    // Capture the `target datalayout` while sanitizing so both executable layout and reflection use
+    // the same source contract without re-reading the source `.ll`. A sanitized-entry caller that
+    // supplies no datalayout still leaves reflection.datalayout = None.
     let (san_ll, datalayout) = tools::air_to_sanitized_ll_with_datalayout(src, tmp)?;
-    let (spv, mut reflection) = translate_sanitized_native_reflected(&san_ll, stage, tmp, options)?;
+    let parsed_datalayout = datalayout
+        .as_deref()
+        .map(layout::AirDataLayout::parse)
+        .transpose()?;
+    let (spv, mut reflection) = translate_sanitized_native_reflected_with_layout(
+        &san_ll,
+        stage,
+        tmp,
+        options,
+        parsed_datalayout,
+    )?;
     reflection.datalayout = datalayout;
     Ok((spv, reflection))
 }
@@ -379,6 +407,17 @@ pub fn translate_sanitized_native_reflected(
     tmp: &Path,
     options: passes::TransformOptions,
 ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
+    let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
+    translate_sanitized_native_reflected_with_layout(san_ll, stage, tmp, options, datalayout)
+}
+
+fn translate_sanitized_native_reflected_with_layout(
+    san_ll: &str,
+    stage: passes::Stage,
+    tmp: &Path,
+    options: passes::TransformOptions,
+    datalayout: Option<layout::AirDataLayout>,
+) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_str();
     reject_unsupported_metal_linked_functions(san_ll)?;
@@ -409,6 +448,7 @@ pub fn translate_sanitized_native_reflected(
         tmp,
         options,
         true,
+        datalayout,
     )?;
     reflection.add_buffer_footprints(&spv)?;
     Ok((spv, reflection))
@@ -519,6 +559,7 @@ pub fn translate_native_primary_validated(
         tmp,
         passes::TransformOptions::default(),
         true,
+        layout::AirDataLayout::from_ir(san_ll)?,
     );
     if let Some(primary) = primary_storage_buffer_raw_feed_if_needed(&validation_error, &retry) {
         return Ok(primary);
@@ -657,17 +698,32 @@ fn finish_assemble_count() -> usize {
 }
 
 fn finish_module(
-    emitted: emit_sidecar::EmittedSpirv,
+    mut emitted: emit_sidecar::EmittedSpirv,
     stage: passes::Stage,
     frag: Option<&meta::FragMeta>,
     vert: Option<&meta::VertMeta>,
     kern: Option<&meta::KernMeta>,
     entry_name: Option<&str>,
+    air_data_layout: Option<&layout::AirDataLayout>,
     options: passes::TransformOptions,
     rewrites: FinishRewrites,
 ) -> Result<FinishedModule, String> {
+    emitted.sidecar.air_data_layout = air_data_layout.cloned();
     let retry_debug = env_vars::retry_debug();
     if retry_debug {
+        for mapping in &emitted.sidecar.air_struct_layout_mappings {
+            match mapping.status {
+                emit_sidecar::AirStructLayoutMappingStatus::MappedNatural => {}
+                emit_sidecar::AirStructLayoutMappingStatus::MappedExplicit => eprintln!(
+                    "[retry-debug] AIR struct layout param={} type={:?}: exact metadata differs from natural layout; using exact offsets",
+                    mapping.param_index, mapping.struct_ty
+                ),
+                status => eprintln!(
+                    "[retry-debug] AIR struct layout param={} type={:?}: unmapped ({status:?}); using datalayout-derived natural layout",
+                    mapping.param_index, mapping.struct_ty
+                ),
+            }
+        }
         eprintln!("[retry-debug] finish: passes start");
     }
     let (mut out, mut sidecar) = passes::transform_with_options_and_sidecar(
@@ -823,7 +879,9 @@ pub fn translate_raw_tiers_probe(
     }
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
+    let air_data_layout = layout::AirDataLayout::from_ir(san_ll);
     let run = |emitted: Result<emit_sidecar::EmittedSpirv, String>| -> Result<Vec<u8>, String> {
+        let air_data_layout = air_data_layout.as_ref().map_err(Clone::clone)?;
         emitted.and_then(|b| {
             finish_module(
                 b,
@@ -832,6 +890,7 @@ pub fn translate_raw_tiers_probe(
                 stage_meta.vert.as_ref(),
                 stage_meta.kern.as_ref(),
                 stage_meta.entry_name.as_deref(),
+                air_data_layout.as_ref(),
                 opts,
                 FinishRewrites::Plain,
             )
@@ -882,6 +941,7 @@ pub fn translate_bda_probe(
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
+    let air_data_layout = layout::AirDataLayout::from_ir(san_ll)?;
     tools::emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
         san_ll,
         tmp,
@@ -902,6 +962,7 @@ pub fn translate_bda_probe(
             stage_meta.vert.as_ref(),
             stage_meta.kern.as_ref(),
             stage_meta.entry_name.as_deref(),
+            air_data_layout.as_ref(),
             opts,
             FinishRewrites::Plain,
         )
@@ -920,6 +981,7 @@ fn translate_sanitized_with_meta(
     tmp: &Path,
     options: passes::TransformOptions,
     psb_retry_enabled: bool,
+    datalayout: Option<layout::AirDataLayout>,
 ) -> Result<Vec<u8>, String> {
     // Build the retry cascade context (S2): the former per-tier closures are now methods on
     // `RetryCtx`, which captures the same locals (`san_ll`, `tmp`, the meta/stage/options `finish`
@@ -936,6 +998,7 @@ fn translate_sanitized_with_meta(
         tmp,
         options,
         psb_retry_enabled,
+        datalayout,
     );
     // Within the relooper's hard cap, a large source CFG is owned by the global structurizers.
     // Above that cap, speculative construct-tree pre-routing can consume the entire translation
@@ -971,6 +1034,7 @@ fn translate_sanitized_with_meta(
             rc.vert,
             rc.kern,
             rc.entry_name,
+            rc.air_data_layout.as_ref(),
             rc.options,
             FinishRewrites::Primary,
         )

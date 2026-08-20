@@ -375,7 +375,10 @@ pub(in crate::passes) fn layout_ty_size_align(
     crate::layout::spirv_size_align(
         ty,
         defs,
-        crate::layout::SpirvLayout::AirOffsets(&ctx.air_struct_offsets),
+        crate::layout::SpirvLayout::air_offsets(
+            &ctx.air_struct_offsets,
+            ctx.air_data_layout.as_ref(),
+        ),
     )
 }
 
@@ -384,5 +387,5 @@ pub(in crate::passes) use crate::layout::round_up_u32 as round_up;
 /// (size, align) in bytes for a SPIR-V type, MSL/std140 vector rules. Covers float/int scalars,
 /// vectors (align = 2x for vec2, 4x for vec3/4), arrays, and nested structs.
 pub(in crate::passes) fn ty_size_align(ty: Word, defs: &HashMap<Word, Instruction>) -> (u32, u32) {
-    crate::layout::spirv_size_align(ty, defs, crate::layout::SpirvLayout::Natural)
+    crate::layout::spirv_size_align(ty, defs, crate::layout::SpirvLayout::natural(None))
 }

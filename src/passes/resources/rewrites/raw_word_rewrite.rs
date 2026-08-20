@@ -166,7 +166,9 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
                             (index_ids, buffer_types.get(base).copied())
                         {
                             if let Some((byte_offset, leaf_ty)) =
-                                access_path_byte_offset_and_leaf_type(&types, block_ty, &indices)
+                                access_path_byte_offset_and_leaf_type(
+                                    ctx, &types, block_ty, &indices,
+                                )
                             {
                                 if byte_offset % 4 == 0
                                     && result_pointee.is_some_and(|pointee| pointee != leaf_ty)
@@ -214,6 +216,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
                             {
                                 if let Some(block_ty) = buffer_types.get(&base_path.root).copied() {
                                     if let Some(base_bytes) = access_path_byte_offset(
+                                        ctx,
                                         &types,
                                         block_ty,
                                         &base_path.indices,
@@ -234,6 +237,7 @@ pub(in crate::passes) fn rewrite_raw_word_alias_chains(
                                             (combined_indices, result_pointee)
                                         {
                                             if access_path_byte_offset_and_leaf_type(
+                                                ctx,
                                                 &types,
                                                 block_ty,
                                                 &combined_indices,
@@ -915,7 +919,7 @@ fn plan_aligned_structured_leaf_load_rewrite(
     let path = paths.get(&ptr)?;
     let block_ty = buffer_types.get(&path.root).copied()?;
     let (byte_offset, leaf_ty) =
-        access_path_byte_offset_and_leaf_type(types, block_ty, &path.indices)?;
+        access_path_byte_offset_and_leaf_type(ctx, types, block_ty, &path.indices)?;
     if byte_offset % 4 != 0 {
         return None;
     }
@@ -1150,7 +1154,7 @@ pub(in crate::passes) fn plan_structured_raw_word_store_rewrite(
 ) -> Option<RawStoreRewrite> {
     let path = paths.get(&ptr)?;
     let block_ty = buffer_types.get(&path.root).copied()?;
-    let byte_offset = access_path_byte_offset(types, block_ty, &path.indices)?;
+    let byte_offset = access_path_byte_offset(ctx, types, block_ty, &path.indices)?;
     if byte_offset % 4 == 0 {
         return None;
     }
@@ -1218,7 +1222,7 @@ pub(in crate::passes) fn structured_raw_word_access(
     }
     let path = paths.get(&ptr)?;
     let block_ty = buffer_types.get(&path.root).copied()?;
-    let byte_offset = access_path_byte_offset(types, block_ty, &path.indices)?;
+    let byte_offset = access_path_byte_offset(ctx, types, block_ty, &path.indices)?;
     let binding = descriptor_binding(&ctx.module, path.root)?;
     let raw_var = match raw_alias_vars.get(&path.root).copied() {
         Some(var) => var,
@@ -1362,8 +1366,9 @@ pub(in crate::passes) fn rewrite_exact_raw_word_loads(ctx: &mut Ctx, entry_idx: 
         .buffer_access_offsets
         .iter()
         .map(|fact| {
-            let root = zero_offset_raw_word_root(&types, &value_types, &definitions, fact.root)
-                .unwrap_or(fact.root);
+            let root =
+                zero_offset_raw_word_root(ctx, &types, &value_types, &definitions, fact.root)
+                    .unwrap_or(fact.root);
             (fact.id, (root, fact.byte_offset))
         })
         .collect::<HashMap<_, _>>();
@@ -1545,7 +1550,7 @@ pub(in crate::passes) fn rewrite_affine_raw_word_loads(ctx: &mut Ctx, entry_idx:
                 continue;
             }
             let Some(root) =
-                zero_offset_raw_word_root(&types, &value_types, &definitions, fact_root)
+                zero_offset_raw_word_root(ctx, &types, &value_types, &definitions, fact_root)
             else {
                 rewritten.push(instruction);
                 continue;
@@ -1827,6 +1832,7 @@ fn plan_exact_raw_word_typed_load(
 /// word descriptor. Sidecar offsets remain relative to the original buffer parameter, so a
 /// non-zero access path is deliberately rejected instead of being silently counted twice.
 fn zero_offset_raw_word_root(
+    ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     value_types: &HashMap<Word, Word>,
     definitions: &HashMap<Word, Instruction>,
@@ -1869,7 +1875,7 @@ fn zero_offset_raw_word_root(
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        if access_path_byte_offset(types, base_pointee, &indices) != Some(0) {
+        if access_path_byte_offset(ctx, types, base_pointee, &indices) != Some(0) {
             return None;
         }
         current = *base;

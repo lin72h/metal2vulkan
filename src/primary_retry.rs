@@ -77,6 +77,7 @@ pub(super) fn emit_finish_primary_module(
     entry_name: Option<&str>,
     options: passes::TransformOptions,
 ) -> Result<FinishedModule, String> {
+    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
     let structured = tools::emit_vulkan_spirv_with_sidecar(
         san_ll,
         Path::new(""),
@@ -92,6 +93,7 @@ pub(super) fn emit_finish_primary_module(
             vert,
             kern,
             entry_name,
+            air_data_layout.as_ref(),
             options,
             FinishRewrites::Primary,
         )
@@ -183,6 +185,7 @@ pub(crate) fn primary_primitive_phi_metadata_if_needed(
         stage_buffer_layouts(stage, frag, vert, kern),
     )
     .ok()?;
+    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll).ok().flatten();
     let finished = finish_module(
         emitted,
         stage,
@@ -190,6 +193,7 @@ pub(crate) fn primary_primitive_phi_metadata_if_needed(
         vert,
         kern,
         entry_name,
+        air_data_layout.as_ref(),
         options,
         FinishRewrites::Primary,
     )
@@ -456,6 +460,7 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
         stage_buffer_layouts(stage, frag, vert, kern),
     )
     .and_then(|spv| {
+        let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
         finish_module(
             spv,
             stage,
@@ -463,6 +468,7 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
             vert,
             kern,
             entry_name,
+            air_data_layout.as_ref(),
             options,
             FinishRewrites::Plain,
         )
@@ -511,6 +517,7 @@ pub(crate) fn primary_logical_pointer_inline_sroa_raw_if_needed(
         stage_buffer_layouts(stage, frag, vert, kern),
     )
     .and_then(|spv| {
+        let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
         finish_module(
             spv,
             stage,
@@ -518,6 +525,7 @@ pub(crate) fn primary_logical_pointer_inline_sroa_raw_if_needed(
             vert,
             kern,
             entry_name,
+            air_data_layout.as_ref(),
             options,
             FinishRewrites::Plain,
         )

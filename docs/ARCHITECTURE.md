@@ -31,6 +31,13 @@ IR, structured by construction where the CFG admits it.
 It is the pure primary emit used when you want “what the emitter produced first,” without rescue
 tiers.
 
+Sanitization preserves the source `target datalayout`. The layout module parses its LLVM
+`v<size>:<abi>` entries and carries the typed vector-alignment rules in `EmitSidecar` through
+the primary and every retry. Exact successfully mapped `air.struct_type_info` member offsets take
+precedence; otherwise all decoration and byte-address walkers share the same natural member cursor,
+including LLVM allocation-size advancement for three-lane vectors. Retry diagnostics report exact
+metadata layouts that map explicitly and metadata shapes that could not be mapped.
+
 ### Text vs typed IR
 
 The production body path is **parse once → typed IR → emit**. There is no mid-pipeline

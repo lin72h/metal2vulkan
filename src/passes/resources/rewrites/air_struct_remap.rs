@@ -906,7 +906,7 @@ pub(in crate::passes) fn types_match_with_elided_air_padding(
         if compact_def.class.opcode != Op::TypeStruct
             || padded_def.class.opcode != Op::TypeStruct
             || !ctx.air_struct_offsets.contains_key(&compact)
-            || ty_size_align(compact, types) != ty_size_align(padded, types)
+            || layout_ty_size_align(ctx, compact, types) != layout_ty_size_align(ctx, padded, types)
         {
             return false;
         }
@@ -974,8 +974,8 @@ pub(in crate::passes) fn remap_air_struct_member_index(
         if padded_index == index {
             return Some(compact_index as u32);
         }
-        let (size, _align) = ty_size_align(*member_ty, types);
-        cursor = offset.saturating_add(size);
+        let (size, align) = layout_ty_size_align(ctx, *member_ty, types);
+        cursor = offset.saturating_add(round_up(size, align));
         padded_index += 1;
     }
     None

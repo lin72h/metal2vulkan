@@ -213,7 +213,7 @@ impl Emitter {
         &self,
         ty: &LlType,
     ) -> Result<(u64, u64), String> {
-        crate::layout::raw_size_align(ty, &|t| self.resolve_type(t))
+        crate::layout::raw_size_align(ty, &|t| self.resolve_type(t), self.air_data_layout.as_ref())
     }
 
     /// Assemble a bitcastable scalar `T` (16/32/64-bit) from a concrete `uchar` (byte) pointer that

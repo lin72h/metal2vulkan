@@ -2749,6 +2749,10 @@ entry:
         "{:?}",
         emitted.sidecar.air_struct_offsets
     );
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings[0].status,
+        crate::emit_sidecar::AirStructLayoutMappingStatus::MappedNatural
+    );
     assert!(
         emitted
             .sidecar
@@ -8776,6 +8780,40 @@ entry:
 !4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
 "#;
 
+fn vector_allocation_stride_with_metadata() -> String {
+    let with_reference = VECTOR_ALLOCATION_STRIDE_LL.replacen(
+        "!\"air.arg_type_size\", i32 12",
+        "!\"air.struct_type_info\", !5, !\"air.arg_type_size\", i32 12",
+        1,
+    );
+    format!(
+        "{with_reference}\n!5 = !{{i32 0, i32 1, i32 0, !\"uchar\", !\"a\", i32 1, i32 1, i32 0, !\"uchar\", !\"b\", i32 2, i32 1, i32 0, !\"uchar\", !\"c\", i32 3, i32 1, i32 0, !\"uchar\", !\"d\", i32 4, i32 4, i32 0, !\"uchar3\", !\"v\", i32 8, i32 1, i32 0, !\"uchar\", !\"t\", i32 9, i32 1, i32 0, !\"uchar\", !\"u\"}}\n"
+    )
+}
+
+const NONCANONICAL_VECTOR_ALIGNMENT_LL: &str = r#"
+target datalayout = "e-p:64:64-v24:64:64-n8:16:32"
+target triple = "air64-apple-macosx10.15.0"
+
+%struct.Params = type <{ <3 x i8>, i8 }>
+
+define void @k(ptr addrspace(2) noalias readonly dereferenceable(16) %params, ptr addrspace(1) %out) {
+entry:
+  %field = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 1
+  %value = load i8, ptr addrspace(2) %field, align 8
+  %wide = zext i8 %value to i32
+  store i32 %wide, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+"#;
+
 /// Member offsets of the one emitted struct that holds a three-lane 8-bit vector, found
 /// structurally through the type graph (`OpTypeInt 8` -> `OpTypeVector .. 3` -> `OpTypeStruct`).
 fn three_lane_byte_vector_struct_offsets(asm: &str) -> Vec<(u32, u32)> {
@@ -8860,6 +8898,82 @@ fn native_three_lane_vector_member_advances_by_its_allocation_size() {
 }
 
 #[test]
+fn native_uchar3_struct_preserves_authoritative_air_offsets() {
+    let ll = vector_allocation_stride_with_metadata();
+    let kern = meta::parse_air_kernel_meta(&ll);
+    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
+        &ll,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("emit with AIR layout sidecar");
+
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings,
+        vec![crate::emit_sidecar::AirStructLayoutMapping {
+            param_index: 0,
+            struct_ty: emitted.sidecar.air_struct_layout_mappings[0].struct_ty,
+            status: crate::emit_sidecar::AirStructLayoutMappingStatus::MappedNatural,
+        }]
+    );
+    assert!(
+        emitted
+            .sidecar
+            .air_struct_offsets
+            .values()
+            .any(|offsets| offsets == &[0, 1, 2, 3, 4, 8, 9]),
+        "{:?}",
+        emitted.sidecar.air_struct_offsets
+    );
+}
+
+#[test]
+fn native_struct_layout_shape_mismatch_is_typed_sidecar_evidence() {
+    let ll = vector_allocation_stride_with_metadata().replace("!\"uchar3\"", "!\"float3\"");
+    let kern = meta::parse_air_kernel_meta(&ll);
+    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
+        &ll,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("emit mismatched AIR layout");
+
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings[0].status,
+        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
+    );
+    assert!(emitted.sidecar.air_struct_offsets.is_empty());
+}
+
+#[test]
+fn file_translation_threads_source_datalayout_into_emitted_offsets() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_source_datalayout_layout_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let source = tmp.join("vector-layout.ll");
+    std::fs::write(&source, NONCANONICAL_VECTOR_ALIGNMENT_LL).expect("write source fixture");
+    let spv = crate::translate(
+        source.to_str().expect("UTF-8 fixture path"),
+        Stage::Kernel,
+        &tmp,
+    )
+    .expect("translate source file");
+    let asm = disassemble(&spv).expect("disassemble");
+
+    assert_eq!(
+        three_lane_byte_vector_struct_offsets(&asm),
+        vec![(0, 0), (1, 8)],
+        "{asm}"
+    );
+    let _ = std::fs::remove_file(source);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn construct_tree_retry_three_lane_vector_member_advances_by_its_allocation_size() {
     // The layout contract belongs to every candidate the retry cascade can adopt, not only the
     // primary emit. `construct_tree` is the validation-gated tier the reproducing compositor
@@ -8881,6 +8995,8 @@ fn construct_tree_retry_three_lane_vector_member_advances_by_its_allocation_size
         &tmp,
         passes::TransformOptions::default(),
         true,
+        crate::layout::AirDataLayout::from_ir(VECTOR_ALLOCATION_STRIDE_LL)
+            .expect("parse datalayout"),
     );
     let spv = retry
         .construct_tree_retry()

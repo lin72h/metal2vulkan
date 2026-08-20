@@ -3,8 +3,9 @@
 //! emitter carries three more calculators that the `LlModule` table cannot reach — they need an
 //! `Emitter` (module context / `resolve_type`) rather than an `LlModule`:
 //!
-//! - `Emitter::raw_type_size_align` → the "Raw" `LayoutRule` (vec3 padded to 4 lanes = 16/16,
-//!   arrays floor align at 4; a `Result` that ERRORS — not `None` — on odd-width ints / `Void`).
+//! - `Emitter::raw_type_size_align` → the "Raw" `LayoutRule` (LLVM vector allocation size and
+//!   source ABI alignment, arrays floor align at 4; a `Result` that ERRORS — not `None` — on
+//!   odd-width ints / `Void`).
 //! - `bitcast_width` / `Emitter::vector_total_bits` → the bit-width helpers used to decide when
 //!   two types are a byte-identical `OpBitcast` reinterpret. These are NOT size/align calculators
 //!   (they return bit counts, not `(size, align)`), so they are pinned here but are not folded
@@ -67,6 +68,28 @@ fn raw_rule_errors_on_uncovered_types() {
     let e = emitter();
     assert!(e.raw_type_size_align(&LlType::Int(24)).is_err());
     assert!(e.raw_type_size_align(&LlType::Void).is_err());
+}
+
+#[test]
+fn raw_rule_uses_source_vector_abi_alignment() {
+    let mut e = emitter();
+    e.air_data_layout = Some(
+        crate::layout::AirDataLayout::parse("e-v24:64:64").expect("parse custom vector alignment"),
+    );
+
+    assert_eq!(
+        e.raw_type_size_align(&vec(LlType::Int(8), 3))
+            .expect("covered vector"),
+        (8, 8)
+    );
+    assert_eq!(
+        e.raw_type_size_align(&LlType::Struct(vec![
+            vec(LlType::Int(8), 3),
+            LlType::Int(8),
+        ]))
+        .expect("covered struct"),
+        (16, 8)
+    );
 }
 
 #[test]

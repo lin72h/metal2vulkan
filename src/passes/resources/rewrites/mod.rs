@@ -1402,4 +1402,53 @@ mod tests {
         assert_eq!(chain.operands[1], Operand::IdRef(14));
         assert_eq!(chain.result_type, Some(12));
     }
+
+    #[test]
+    fn raw_word_access_and_air_ordinal_remap_share_vector_allocation_stride() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(2),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
+            ),
+            Instruction::new(
+                Op::TypeStruct,
+                None,
+                Some(3),
+                vec![Operand::IdRef(2), Operand::IdRef(1)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(4),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(4),
+                Some(5),
+                vec![Operand::LiteralBit32(1)],
+            ),
+        ];
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        ctx.air_data_layout = Some(
+            crate::layout::AirDataLayout::parse("e-v24:64:64")
+                .expect("parse vector alignment override"),
+        );
+
+        assert_eq!(access_path_byte_offset(&ctx, &defs, 3, &[5]), Some(8));
+
+        ctx.air_struct_offsets.insert(3, vec![0, 8]);
+        assert_eq!(remap_air_struct_member_index(&ctx, &defs, 3, 5), Some(1));
+    }
 }

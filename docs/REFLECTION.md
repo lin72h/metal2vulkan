@@ -163,7 +163,7 @@ Top-level fields:
 | `imageblock_layouts` | Kernel `[[imageblock]]` tiles (param index + AIR struct layout; no descriptor) |
 | `implicit_imageblock_attachments` | Attachment/data-rate plane, maximum referenced index, format, access, and descriptor binding for implicit imageblock load/store calls |
 | `fragment_imageblock` | Custom fragment `[[imageblock_data]]` sample size, exact master fields (offset/type/semantic/raster-order group/access/binding), and semantic-matched input/output projections |
-| `datalayout` | Source LLVM `target datalayout` when path-based translation captured it before sanitization |
+| `datalayout` | Source LLVM `target datalayout` when path-based translation captured it during sanitization |
 | `function_constants` | `[[function_constant(N)]]` index, name, LLVM type, and exact Metal ABI type encoding |
 
 Custom fragment imageblock fields currently lower exactly as `half` → R16f, `half4` → RGBA16f,

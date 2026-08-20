@@ -43,6 +43,8 @@ pub(super) struct Emitter {
     module: Module,
     ir: LlModule,
     emit_sidecar: crate::emit_sidecar::EmitSidecar,
+    /// Source LLVM vector ABI alignment, installed before any raw byte/GEP layout is emitted.
+    air_data_layout: Option<crate::layout::AirDataLayout>,
     /// SPIR-V type/constant dedup caches (see `crate::types`). The builder methods that emit the
     /// instructions live on `Emitter`; the module owns result-id allocation.
     interner: TypeInterner,
@@ -440,6 +442,7 @@ impl Emitter {
             module,
             ir,
             emit_sidecar: crate::emit_sidecar::EmitSidecar::default(),
+            air_data_layout: None,
             interner: TypeInterner::new(),
             glsl_ext: None,
             values: HashMap::new(),
@@ -950,9 +953,12 @@ impl Emitter {
     pub(super) fn emit_with_sidecar(
         mut self,
         buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+        air_data_layout: Option<&crate::layout::AirDataLayout>,
     ) -> Result<(Module, crate::emit_sidecar::EmitSidecar), String> {
+        self.air_data_layout = air_data_layout.cloned();
         self.emit_inner()?;
-        self.record_air_struct_offsets(buffer_layouts);
+        self.record_air_struct_offsets(buffer_layouts, air_data_layout);
+        self.emit_sidecar.air_data_layout = air_data_layout.cloned();
         if self.used_device_address {
             self.lower_bda_null_aggregate_pointers()?;
             self.switch_to_physical_storage_buffer64();

@@ -203,6 +203,7 @@ struct Ctx {
     laid_out: HashSet<Word>,
     /// Struct type ids reconstructed from `air.struct_type_info`, with their exact AIR member offsets.
     air_struct_offsets: HashMap<Word, Vec<u32>>,
+    air_data_layout: Option<crate::layout::AirDataLayout>,
     /// GLCompute LocalSize and the value exposed to AIR `[[threads_per_threadgroup]]`.
     kernel_local_size: [u32; 3],
     /// Optional exact value exposed to AIR `[[threads_per_grid]]`.
@@ -257,6 +258,7 @@ impl Ctx {
         let mut module = module;
         module.sync_id_bound_from_header();
         let air_struct_offsets = emit_sidecar.air_struct_offsets.clone();
+        let air_data_layout = emit_sidecar.air_data_layout.clone();
         Ctx {
             module,
             emit_sidecar,
@@ -275,6 +277,7 @@ impl Ctx {
             null_image_values: HashSet::new(),
             laid_out: HashSet::new(),
             air_struct_offsets,
+            air_data_layout,
             kernel_local_size: options.kernel_local_size,
             kernel_threads_per_grid: options.kernel_threads_per_grid,
             simd_cluster32: options.simd_cluster32,

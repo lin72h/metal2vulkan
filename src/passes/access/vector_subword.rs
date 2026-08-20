@@ -2046,6 +2046,7 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
                 storage,
                 parts,
                 exact_buffer_offset: inherited_exact_byte_offset(
+                    ctx,
                     *ptr,
                     &exact_offsets,
                     &chain_defs,

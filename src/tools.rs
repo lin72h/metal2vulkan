@@ -167,16 +167,16 @@ fn tool_bin(cmd: &str) -> PathBuf {
 pub const VULKAN_TRIPLE: &str = "spirv-unknown-vulkan1.3";
 
 /// `src` (.air bitcode or .ll) -> sanitized `.ll` text ready for the native emitter.
-/// Rewrites the target triple to the Vulkan one and drops the AIR datalayout +
-/// LLVM metadata/runtime root globals.
+/// Rewrites the target triple to the Vulkan one, preserves the AIR datalayout for executable layout
+/// lowering, and drops LLVM metadata/runtime root globals.
 pub fn air_to_sanitized_ll(src: &str, tmp: &Path) -> Result<String, String> {
     Ok(air_to_sanitized_ll_with_datalayout(src, tmp)?.0)
 }
 
 /// Like [`air_to_sanitized_ll`] but also returns the AIR `target datalayout` string it strips. The
-/// sanitizer drops that line (SPIR-V has no datalayout), yet a downstream consumer needs it to lay
-/// out struct members, so the reflected translate path recovers it here instead of re-reading the
-/// source `.ll` from disk. The sanitized text is byte-identical to [`air_to_sanitized_ll`].
+/// sanitizer preserves that line as the executable source-layout contract and also returns its value
+/// for reflection, avoiding a second source read. The sanitized text is byte-identical to
+/// [`air_to_sanitized_ll`].
 pub fn air_to_sanitized_ll_with_datalayout(
     src: &str,
     tmp: &Path,
@@ -200,7 +200,7 @@ pub fn air_to_sanitized_ll_with_datalayout(
 /// Sanitize LLVM IR text that is already in `.ll` form.
 ///
 /// This is the text-only core used by [`air_to_sanitized_ll_with_datalayout`]: rewrite the target
-/// triple to Vulkan, drop the AIR datalayout and llvm-dis's input-path `ModuleID` comment, and
+/// triple to Vulkan, preserve the AIR datalayout, drop llvm-dis's input-path `ModuleID` comment, and
 /// remove LLVM metadata/runtime root globals that are not part of the shader entry body.
 pub fn sanitize_ll_text_with_datalayout(ll_text: &str) -> (String, Option<String>) {
     let mut out = String::with_capacity(ll_text.len());
@@ -213,6 +213,8 @@ pub fn sanitize_ll_text_with_datalayout(ll_text: &str) -> (String, Option<String
         }
         if t.starts_with("target datalayout") {
             datalayout = datalayout_value(t);
+            out.push_str(line);
+            out.push('\n');
             continue;
         }
         // llvm-dis derives this comment from its input filename. Validation disassembles through
@@ -530,7 +532,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sanitizer_captures_and_strips_target_datalayout() {
+    fn sanitizer_captures_and_preserves_target_datalayout() {
         // R4: the datalayout survives as a captured string even though it is stripped from the
         // sanitized text handed to the emitter.
         let tmp = std::env::temp_dir();
@@ -548,7 +550,7 @@ mod tests {
             datalayout.as_deref(),
             Some("e-m:o-i64:64-i128:128-n32:64-S128")
         );
-        assert!(!san.contains("target datalayout"));
+        assert!(san.contains("target datalayout = \"e-m:o-i64:64-i128:128-n32:64-S128\""));
         assert!(san.contains(&format!("target triple = \"{VULKAN_TRIPLE}\"")));
         // The plain wrapper returns byte-identical sanitized text.
         assert_eq!(
@@ -571,7 +573,7 @@ mod tests {
 
         assert_eq!(datalayout.as_deref(), Some("e-p:64:64"));
         assert!(san.contains(&format!("target triple = \"{VULKAN_TRIPLE}\"")));
-        assert!(!san.contains("target datalayout"));
+        assert!(san.contains("target datalayout = \"e-p:64:64\""));
         assert!(!san.contains("ModuleID"));
         assert!(!san.contains("@llvm.global_ctors"));
         assert!(!san.contains("@llvm.compiler.used"));

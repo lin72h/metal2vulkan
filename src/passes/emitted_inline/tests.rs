@@ -1003,3 +1003,37 @@ fn half_byte_view_uses_a_16_bit_accumulator_for_load_and_store() {
         .expect("store bitcast has a result type");
     assert_eq!(integer_width(&ctx, store_bits_ty), Some(16));
 }
+
+#[test]
+fn byte_view_struct_offset_uses_source_vector_allocation_stride() {
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(10));
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(1),
+            vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeVector,
+            None,
+            Some(2),
+            vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
+        ),
+        Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(3),
+            vec![Operand::IdRef(2), Operand::IdRef(1)],
+        ),
+    ];
+    let defs = type_defs(&module);
+    let mut ctx = Ctx::new(module);
+    ctx.air_data_layout = Some(
+        crate::layout::AirDataLayout::parse("e-v24:64:64")
+            .expect("parse vector alignment override"),
+    );
+
+    assert_eq!(struct_member_byte_offset(&ctx, &defs, 3, 1), Some(8));
+}

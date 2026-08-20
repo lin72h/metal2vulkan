@@ -218,7 +218,7 @@ pub(in crate::passes) fn plan_raw_byte_atomic_rewrite(
     let ptr_pointee = ptr_pointee(types, ptr_ty)?;
     let path = paths.get(ptr)?;
     let block_ty = buffer_types.get(&path.root).copied()?;
-    let leaf_ty = access_path_leaf_type(types, block_ty, &path.indices)?;
+    let leaf_ty = access_path_leaf_type(ctx, types, block_ty, &path.indices)?;
     if ptr_pointee == leaf_ty {
         return None;
     }
@@ -235,11 +235,12 @@ pub(in crate::passes) fn plan_raw_byte_atomic_rewrite(
 }
 
 pub(in crate::passes) fn access_path_leaf_type(
+    ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     root_ty: Word,
     indices: &[Word],
 ) -> Option<Word> {
-    access_path_byte_offset_and_leaf_type(types, root_ty, indices)
+    access_path_byte_offset_and_leaf_type(ctx, types, root_ty, indices)
         .map(|(_, leaf_ty)| leaf_ty)
         .or_else(|| {
             let operands = indices
@@ -332,7 +333,7 @@ pub(in crate::passes) fn plan_structured_raw_word_pointer_rewrite(
     let block_ty = buffer_types.get(&path.root).copied()?;
     let mut prefix = Vec::new();
     let word_index = if let Some(byte_offset) =
-        access_path_byte_offset(types, block_ty, &path.indices)
+        access_path_byte_offset(ctx, types, block_ty, &path.indices)
     {
         if byte_offset % 4 != 0 {
             return None;
@@ -503,14 +504,16 @@ pub(in crate::passes) fn raw_word_chain_offset(
 }
 
 pub(in crate::passes) fn access_path_byte_offset(
+    ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     root_ty: Word,
     indices: &[Word],
 ) -> Option<u32> {
-    access_path_byte_offset_and_leaf_type(types, root_ty, indices).map(|(offset, _)| offset)
+    access_path_byte_offset_and_leaf_type(ctx, types, root_ty, indices).map(|(offset, _)| offset)
 }
 
 pub(in crate::passes) fn access_path_byte_offset_and_leaf_type(
+    ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     root_ty: Word,
     indices: &[Word],
@@ -528,20 +531,14 @@ pub(in crate::passes) fn access_path_byte_offset_and_leaf_type(
                         return None;
                     }
                     if member < def.operands.len() {
-                        let mut member_offset = 0u32;
-                        for (idx, operand) in def.operands.iter().enumerate() {
-                            let Operand::IdRef(member_ty) = operand else {
-                                return None;
-                            };
-                            let (size, align) = ty_size_align(*member_ty, types);
-                            member_offset = round_up(member_offset, align);
-                            if idx == member {
-                                offset += member_offset;
-                                ty = *member_ty;
-                                break;
-                            }
-                            member_offset += size;
-                        }
+                        let (member_offset, member_ty) = crate::layout::spirv_struct_member(
+                            ty,
+                            member,
+                            types,
+                            crate::layout::SpirvLayout::natural(ctx.air_data_layout.as_ref()),
+                        )?;
+                        offset = offset.checked_add(member_offset)?;
+                        ty = member_ty;
                         break;
                     }
                     if def.operands.len() != 1 {
@@ -558,7 +555,11 @@ pub(in crate::passes) fn access_path_byte_offset_and_leaf_type(
                     Some(Operand::IdRef(elem)) => *elem,
                     _ => return None,
                 };
-                let (size, align) = ty_size_align(elem, types);
+                let (size, align) = crate::layout::spirv_size_align(
+                    elem,
+                    types,
+                    crate::layout::SpirvLayout::natural(ctx.air_data_layout.as_ref()),
+                );
                 offset += const_u32(types, *index)? * round_up(size, align);
                 ty = elem;
             }
@@ -567,7 +568,11 @@ pub(in crate::passes) fn access_path_byte_offset_and_leaf_type(
                     Some(Operand::IdRef(elem)) => *elem,
                     _ => return None,
                 };
-                let (size, _) = ty_size_align(elem, types);
+                let (size, _) = crate::layout::spirv_size_align(
+                    elem,
+                    types,
+                    crate::layout::SpirvLayout::natural(ctx.air_data_layout.as_ref()),
+                );
                 offset += const_u32(types, *index)? * size;
                 ty = elem;
             }

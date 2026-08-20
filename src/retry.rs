@@ -53,6 +53,7 @@ pub(crate) struct RetryCtx<'a> {
     pub(crate) entry_name: Option<&'a str>,
     pub(crate) tmp: &'a Path,
     pub(crate) options: passes::TransformOptions,
+    pub(crate) air_data_layout: Option<crate::layout::AirDataLayout>,
     /// `METAL2VULKAN_RETRY_DEBUG` present — trace each tier's emit/validate outcome to stderr.
     pub(crate) retry_debug_on: bool,
     /// Whether the W1 PhysicalStorageBuffer64 tiers are enabled. Always `true` on every production
@@ -112,6 +113,7 @@ impl<'a> RetryCtx<'a> {
         tmp: &'a Path,
         options: passes::TransformOptions,
         psb_retry_enabled: bool,
+        air_data_layout: Option<crate::layout::AirDataLayout>,
     ) -> Self {
         RetryCtx {
             san_ll,
@@ -123,6 +125,7 @@ impl<'a> RetryCtx<'a> {
             entry_name,
             tmp,
             options,
+            air_data_layout,
             retry_debug_on: crate::env_vars::retry_debug(),
             psb_retry_enabled,
             adopted_tier: std::cell::Cell::new(None),
@@ -323,6 +326,7 @@ impl<'a> RetryCtx<'a> {
             self.vert,
             self.kern,
             self.entry_name,
+            self.air_data_layout.as_ref(),
             self.options,
             FinishRewrites::Plain,
         )
@@ -626,6 +630,7 @@ impl<'a> RetryCtx<'a> {
             None,
             Some(kern_p),
             self.entry_name,
+            self.air_data_layout.as_ref(),
             self.options,
             FinishRewrites::Plain,
         )
@@ -669,6 +674,7 @@ impl<'a> RetryCtx<'a> {
                 None,
                 Some(kern_p),
                 self.entry_name,
+                self.air_data_layout.as_ref(),
                 self.options,
                 FinishRewrites::Plain,
             )
@@ -1030,8 +1036,20 @@ impl<'a> RetryCtx<'a> {
                     .map(|instruction| instruction.operands.len())
                     .sum::<usize>();
                 let sidecar = &emitted.sidecar;
+                let mapped_layouts = sidecar
+                    .air_struct_layout_mappings
+                    .iter()
+                    .filter(|mapping| {
+                        matches!(
+                            mapping.status,
+                            crate::emit_sidecar::AirStructLayoutMappingStatus::MappedNatural
+                                | crate::emit_sidecar::AirStructLayoutMappingStatus::MappedExplicit
+                        )
+                    })
+                    .count();
+                let unmapped_layouts = sidecar.air_struct_layout_mappings.len() - mapped_layouts;
                 eprintln!(
-                    "[retry-debug] construct_tree: emit complete blocks={blocks} instructions={instructions} operands={operands} globals={global_instructions} global-operands={global_operands} sidecar-address={} sidecar-buffer-fields={} sidecar-local-stores={} sidecar-local-loads={} sidecar-local-dynamic={}",
+                    "[retry-debug] construct_tree: emit complete blocks={blocks} instructions={instructions} operands={operands} globals={global_instructions} global-operands={global_operands} sidecar-address={} sidecar-buffer-fields={} sidecar-layout-mapped={mapped_layouts} sidecar-layout-unmapped={unmapped_layouts} sidecar-local-stores={} sidecar-local-loads={} sidecar-local-dynamic={}",
                     sidecar.buffer_address_words.len(),
                     sidecar.buffer_pointer_field_loads.len()
                         + sidecar.buffer_pointer_dynamic_field_loads.len(),

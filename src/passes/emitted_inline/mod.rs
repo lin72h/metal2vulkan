@@ -304,26 +304,16 @@ fn struct_member_byte_offset(
     struct_ty: Word,
     member: usize,
 ) -> Option<u32> {
-    let def = defs.get(&struct_ty)?;
-    if def.class.opcode != Op::TypeStruct {
-        return None;
-    }
-    let explicit = ctx.air_struct_offsets.get(&struct_ty);
-    let mut off: u32 = 0;
-    for (i, op) in def.operands.iter().enumerate() {
-        let Operand::IdRef(m) = op else {
-            return None;
-        };
-        let (s, a) = crate::passes::stage_input::layout_ty_size_align(ctx, *m, defs);
-        let member_off = explicit
-            .and_then(|o| o.get(i).copied())
-            .unwrap_or_else(|| crate::passes::stage_input::round_up(off, a));
-        if i == member {
-            return Some(member_off);
-        }
-        off = member_off + s;
-    }
-    None
+    crate::layout::spirv_struct_member(
+        struct_ty,
+        member,
+        defs,
+        crate::layout::SpirvLayout::air_offsets(
+            &ctx.air_struct_offsets,
+            ctx.air_data_layout.as_ref(),
+        ),
+    )
+    .map(|(offset, _)| offset)
 }
 
 /// Walk a composite aggregate through constant access-chain indices, returning the byte offset of the

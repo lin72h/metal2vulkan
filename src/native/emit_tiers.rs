@@ -36,7 +36,7 @@ pub(in crate::native) fn emit_vulkan_spirv_from_typed_blocks(
         ));
     };
     function.blocks = blocks;
-    Ok(finalize_emission(Emitter::new(parsed), None)?.into_bytes())
+    Ok(finalize_emission(Emitter::new(parsed), None, function_shell)?.into_bytes())
 }
 
 pub(crate) fn emit_vulkan_spirv_with_sidecar(
@@ -71,7 +71,11 @@ pub(crate) fn emit_vulkan_spirv_construct_tree_with_sidecar(
     let san_ll = async_copy::lower_simdgroup_async_copy(san_ll);
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&san_ll);
     let parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
-    finalize_emission(Emitter::new(parsed).with_construct_tree(), buffer_layouts)
+    finalize_emission(
+        Emitter::new(parsed).with_construct_tree(),
+        buffer_layouts,
+        &san_ll,
+    )
 }
 
 /// Re-emit with the narrowly scoped primitive metadata inference for a cross-buffer pointer phi.
@@ -120,14 +124,17 @@ fn emit_vulkan_spirv_inner(
     } else {
         LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?
     };
-    finalize_emission(Emitter::new(parsed), buffer_layouts)
+    finalize_emission(Emitter::new(parsed), buffer_layouts, &san_ll)
 }
 
 fn finalize_emission(
     emitter: Emitter,
     buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
+    san_ll: &str,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    let (mut module, sidecar) = emitter.emit_with_sidecar(buffer_layouts)?;
+    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
+    let (mut module, sidecar) =
+        emitter.emit_with_sidecar(buffer_layouts, air_data_layout.as_ref())?;
     add_native_module_capabilities(&mut module);
     Ok(crate::emit_sidecar::EmittedSpirv { module, sidecar })
 }
@@ -164,7 +171,7 @@ pub(crate) fn emit_vulkan_spirv_inline_sroa_with_sidecar(
     let sroad = sroa::promote_entry_allocas_and_fold_aggregates(&inlined);
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&sroad);
     let parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
-    finalize_emission(Emitter::new(parsed), buffer_layouts)
+    finalize_emission(Emitter::new(parsed), buffer_layouts, &san_ll)
 }
 
 pub(crate) fn emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
@@ -179,7 +186,11 @@ pub(crate) fn emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
     // Inserting a multiblock helper at a callsite can make the ordinary structurizer's local clone
     // heuristics expand a large entry CFG. Emit the exact rewritten blocks as a bounded relooper feed;
     // the retry owns the whole-module structurization and adopts only validating output.
-    finalize_emission(Emitter::new(parsed).with_relooper_feed(), buffer_layouts)
+    finalize_emission(
+        Emitter::new(parsed).with_relooper_feed(),
+        buffer_layouts,
+        &inlined,
+    )
 }
 
 /// Like [`emit_vulkan_spirv_inline_sroa`], but ALSO models every device/constant buffer raw (the
@@ -216,7 +227,7 @@ pub(crate) fn emit_vulkan_spirv_inline_sroa_raw_with_sidecar(
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&sroad);
     let mut parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
     mark_all_device_buffers_raw(&mut parsed, false);
-    finalize_emission(Emitter::new(parsed), buffer_layouts)
+    finalize_emission(Emitter::new(parsed), buffer_layouts, &san_ll)
 }
 
 /// Like [`emit_vulkan_spirv_inline_sroa_raw`], but ALSO enables the R2 cross-arm restructure
@@ -255,7 +266,11 @@ pub(crate) fn emit_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&sroad);
     let mut parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
     mark_all_device_buffers_raw(&mut parsed, false);
-    finalize_emission(Emitter::new(parsed).with_cfg_restructure(), buffer_layouts)
+    finalize_emission(
+        Emitter::new(parsed).with_cfg_restructure(),
+        buffer_layouts,
+        &san_ll,
+    )
 }
 
 /// Emit with every device/constant (`addrspace(1)`/`addrspace(2)`) buffer pointer param modeled raw
@@ -286,7 +301,7 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_sidecar(
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(san_ll);
     let mut parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
     mark_all_device_buffers_raw(&mut parsed, false);
-    finalize_emission(Emitter::new(parsed), buffer_layouts)
+    finalize_emission(Emitter::new(parsed), buffer_layouts, &san_ll)
 }
 
 /// Like [`emit_vulkan_spirv_all_buffers_raw`], but additionally models every threadgroup
@@ -320,7 +335,7 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(san_ll);
     let mut parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
     mark_all_device_buffers_raw(&mut parsed, true);
-    finalize_emission(Emitter::new(parsed), buffer_layouts)
+    finalize_emission(Emitter::new(parsed), buffer_layouts, &san_ll)
 }
 
 /// Emit the all-device/constant-buffer raw view with the structured-plan attempt forced off (the
@@ -351,7 +366,11 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_relooper_feed_with_sidecar(
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(san_ll);
     let mut parsed = LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)?;
     mark_all_device_buffers_raw(&mut parsed, false);
-    finalize_emission(Emitter::new(parsed).with_relooper_feed(), buffer_layouts)
+    finalize_emission(
+        Emitter::new(parsed).with_relooper_feed(),
+        buffer_layouts,
+        &san_ll,
+    )
 }
 
 /// Emit with every device/constant buffer modeled raw AND device-pointer (BDA) modeling enabled: a
@@ -389,6 +408,7 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
     finalize_emission(
         Emitter::new(parsed).with_bda_device_pointers(),
         buffer_layouts,
+        &san_ll,
     )
 }
 
@@ -409,6 +429,7 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
             .with_bda_device_pointers()
             .with_relooper_feed(),
         buffer_layouts,
+        &san_ll,
     )
 }
 

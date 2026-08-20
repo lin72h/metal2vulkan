@@ -4,7 +4,7 @@ use super::*;
 use crate::passes::resources::rewrites::{
     access_path_byte_offset, combined_type_defs, combined_value_types,
 };
-use crate::passes::stage_input::{round_up, ty_size_align};
+use crate::passes::stage_input::round_up;
 
 /// The byte width used by [`rewrite_raw_byte_pointer_wide_loads`].
 pub(in crate::passes) const RAW_BYTE_POINTER_ELEMENT_BITS: u32 = 8;
@@ -491,6 +491,7 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
     );
     let authored_exact_ids = exact_offsets.keys().copied().collect::<HashSet<_>>();
     propagate_exact_offsets_to_ancestors(
+        ctx,
         &mut exact_offsets,
         &authored_exact_ids,
         &definitions,
@@ -563,6 +564,7 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                 }
             }
             let inherited = inherited_exact_byte_offset(
+                ctx,
                 *pointer,
                 &exact_offsets,
                 &definitions,
@@ -775,20 +777,14 @@ fn source_access_affine(
                         return None;
                     }
                     if member < definition.operands.len() {
-                        let mut member_offset = 0u32;
-                        for (position, operand) in definition.operands.iter().enumerate() {
-                            let Operand::IdRef(member_ty) = operand else {
-                                return None;
-                            };
-                            let (size, align) = ty_size_align(*member_ty, types);
-                            member_offset = round_up(member_offset, align);
-                            if position == member {
-                                constant = constant.checked_add(member_offset)?;
-                                ty = *member_ty;
-                                break;
-                            }
-                            member_offset = member_offset.checked_add(size)?;
-                        }
+                        let (member_offset, member_ty) = crate::layout::spirv_struct_member(
+                            ty,
+                            member,
+                            types,
+                            crate::layout::SpirvLayout::natural(ctx.air_data_layout.as_ref()),
+                        )?;
+                        constant = constant.checked_add(member_offset)?;
+                        ty = member_ty;
                         break;
                     }
                     if definition.operands.len() != 1 {
@@ -804,7 +800,11 @@ fn source_access_affine(
                 let Operand::IdRef(element) = definition.operands.first()? else {
                     return None;
                 };
-                let (size, align) = ty_size_align(*element, types);
+                let (size, align) = crate::layout::spirv_size_align(
+                    *element,
+                    types,
+                    crate::layout::SpirvLayout::natural(ctx.air_data_layout.as_ref()),
+                );
                 let stride = if definition.class.opcode == Op::TypeVector {
                     size
                 } else {
@@ -1019,6 +1019,7 @@ fn pointer_has_invalid_raw_byte_block_ancestor(
 }
 
 fn propagate_exact_offsets_to_ancestors(
+    ctx: &Ctx,
     exact_offsets: &mut HashMap<Word, (Word, u64)>,
     authored_exact_ids: &HashSet<Word>,
     definitions: &HashMap<Word, Instruction>,
@@ -1063,7 +1064,7 @@ fn propagate_exact_offsets_to_ancestors(
             else {
                 continue;
             };
-            let Some(suffix) = access_path_byte_offset(types, *base_pointee, &indices) else {
+            let Some(suffix) = access_path_byte_offset(ctx, types, *base_pointee, &indices) else {
                 continue;
             };
             let Some(base_offset) = result_offset.checked_sub(u64::from(suffix)) else {
@@ -1090,6 +1091,7 @@ fn propagate_exact_offsets_to_ancestors(
 }
 
 pub(in crate::passes) fn inherited_exact_byte_offset(
+    ctx: &Ctx,
     pointer: Word,
     exact_offsets: &HashMap<Word, (Word, u64)>,
     definitions: &HashMap<Word, Instruction>,
@@ -1113,8 +1115,15 @@ pub(in crate::passes) fn inherited_exact_byte_offset(
     let Operand::IdRef(base) = definition.operands.first()? else {
         return None;
     };
-    let (root, base_offset) =
-        inherited_exact_byte_offset(*base, exact_offsets, definitions, types, value_types, seen)?;
+    let (root, base_offset) = inherited_exact_byte_offset(
+        ctx,
+        *base,
+        exact_offsets,
+        definitions,
+        types,
+        value_types,
+        seen,
+    )?;
     let base_pointer_ty = value_types.get(base)?;
     let base_pointer = types.get(base_pointer_ty)?;
     if base_pointer.class.opcode != Op::TypePointer {
@@ -1130,7 +1139,12 @@ pub(in crate::passes) fn inherited_exact_byte_offset(
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
-    let suffix = u64::from(access_path_byte_offset(types, *base_pointee, &indices)?);
+    let suffix = u64::from(access_path_byte_offset(
+        ctx,
+        types,
+        *base_pointee,
+        &indices,
+    )?);
     Some((root, base_offset.checked_add(suffix)?))
 }
 

@@ -8,8 +8,13 @@ use std::collections::HashMap;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EmitSidecar {
+    /// Parsed source vector ABI rules, threaded through every retry candidate into final layout.
+    pub(crate) air_data_layout: Option<crate::layout::AirDataLayout>,
     /// Emitted `OpTypeStruct` id -> exact AIR member offsets, including backend padding members.
     pub(crate) air_struct_offsets: HashMap<Word, Vec<u32>>,
+    /// One outcome for every entry buffer carrying `air.struct_type_info`. This keeps an exact AIR
+    /// layout that could not be associated with the emitted type graph from disappearing silently.
+    pub(crate) air_struct_layout_mappings: Vec<AirStructLayoutMapping>,
     pub(crate) buffer_address_words: Vec<BufferAddressWord>,
     /// Exact constant byte address of a GEP result relative to one buffer root. This preserves the
     /// source aggregate layout across the native-emitter → remodeled-interface seam, where an
@@ -36,6 +41,23 @@ pub(crate) struct EmitSidecar {
     /// The final interface pass replaces each sentinel with the AGX2 physical-cluster number derived
     /// from Vulkan `LocalInvocationId` and the caller-supplied kernel local size.
     pub(crate) agx2_cluster_numbers: Vec<Word>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AirStructLayoutMapping {
+    pub(crate) param_index: u32,
+    pub(crate) struct_ty: Option<Word>,
+    pub(crate) status: AirStructLayoutMappingStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AirStructLayoutMappingStatus {
+    MappedNatural,
+    MappedExplicit,
+    ParameterIsNotPointer,
+    MetadataIsNotStruct,
+    EmittedShapeMismatch,
+    NonIncreasingOffsets,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +172,11 @@ impl EmitSidecar {
         }
         for id in &mut self.agx2_cluster_numbers {
             replace(id);
+        }
+        for mapping in &mut self.air_struct_layout_mappings {
+            if let Some(struct_ty) = &mut mapping.struct_ty {
+                replace(struct_ty);
+            }
         }
         self.air_struct_offsets = std::mem::take(&mut self.air_struct_offsets)
             .into_iter()
@@ -462,7 +489,13 @@ mod tests {
     #[test]
     fn whole_module_substitution_remaps_every_sidecar_id_field() {
         let mut sidecar = EmitSidecar {
+            air_data_layout: None,
             air_struct_offsets: HashMap::from([(5, vec![0, 16])]),
+            air_struct_layout_mappings: vec![AirStructLayoutMapping {
+                param_index: 2,
+                struct_ty: Some(5),
+                status: AirStructLayoutMappingStatus::MappedNatural,
+            }],
             buffer_address_words: vec![BufferAddressWord {
                 id: 10,
                 param_index: 2,
@@ -545,6 +578,7 @@ mod tests {
 
         assert_eq!(sidecar.air_struct_offsets.get(&105), Some(&vec![0, 16]));
         assert!(!sidecar.air_struct_offsets.contains_key(&5));
+        assert_eq!(sidecar.air_struct_layout_mappings[0].struct_ty, Some(105));
         assert_eq!(sidecar.buffer_address_words[0].id, 110);
         assert_eq!(sidecar.buffer_access_offsets[0].id, 116);
         assert_eq!(sidecar.buffer_access_offsets[0].root, 117);
