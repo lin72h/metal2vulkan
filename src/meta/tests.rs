@@ -73,6 +73,29 @@ entry:
 }
 
 #[test]
+fn kernel_function_constant_resource_locations_use_static_defaults() {
+    let ll = r#"
+@texture_location = internal addrspace(2) global i32 40, align 4
+@sampler_location = internal addrspace(2) global i32 15, align 4
+
+define void @K(ptr addrspace(1) %texture, ptr addrspace(2) %sampler) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @K, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", ptr addrspace(2) @texture_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", ptr addrspace(2) @sampler_location, i32 1, !"air.arg_type_name", !"sampler"}
+!5 = !{ptr addrspace(2) @texture_enabled, !"bool", !"texture_enabled"}
+"#;
+    let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
+    assert_eq!(meta.role_of(0), Some(&KernRole::Texture(40)));
+    assert_eq!(meta.role_of(1), Some(&KernRole::Sampler(15)));
+}
+
+#[test]
 fn fragment_function_constant_render_target_disabled_by_default() {
     let ll = r#"
 !air.fragment = !{!0}
@@ -914,7 +937,7 @@ define { <4 x half>, { half } } @f({ half } %tile) { ret { <4 x half>, { half } 
         .fragment_imageblock
         .expect("reflected imageblock master");
     assert_eq!(reflected.members[0].binding, None);
-    assert_eq!(reflected.members[1].binding, Some(161));
+    assert_eq!(reflected.members[1].binding, Some(225));
     assert_eq!(
         reflected.members[1].access,
         crate::reflect::ResourceAccess::ReadWrite

@@ -36,22 +36,12 @@ impl Ctx {
     /// SSA value well-typed we materialize one real `OpTypeSampler` UniformConstant variable (binding
     /// past every binding already assigned by the interface pass) and load from it. Memoized so a
     /// shader with many reads shares a single sampler resource.
-    pub(in crate::passes) fn default_read_sampler(&mut self) -> Word {
+    pub(in crate::passes) fn default_read_sampler(&mut self) -> Result<Word, String> {
         if let Some(v) = self.default_sampler_var {
-            return v;
+            return Ok(v);
         }
-        // Pick a binding one past the maximum currently decorated (the interface pass already ran).
-        let mut max_binding: i64 = -1;
-        for ann in &self.module.annotations {
-            if ann.class.opcode == Op::Decorate
-                && ann.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
-            {
-                if let Some(Operand::LiteralBit32(b)) = ann.operands.get(2) {
-                    max_binding = max_binding.max(*b as i64);
-                }
-            }
-        }
-        let binding = (max_binding + 1) as u32;
+        let binding = allocate_static_sampler_binding(&self.module)
+            .ok_or_else(|| "no free sampler binding for synthesized read sampler".to_string())?;
         let sty = self.ty_sampler();
         let pptr = self.ty_ptr(StorageClass::UniformConstant, sty);
         let var = self.module.fresh_id();
@@ -64,7 +54,7 @@ impl Ctx {
         decorate_binding(&mut self.module, var, binding);
         self.interface_buffer_var(var);
         self.default_sampler_var = Some(var);
-        var
+        Ok(var)
     }
 
     /// Lazily create a default (null) 2D float texture resource for `air.get_null_texture_2d()`.
@@ -123,7 +113,12 @@ impl Ctx {
             }
             return Ok((var, image_ty));
         }
-        let binding = crate::reflect::imageblock_resource_binding(attachment, data_rate);
+        let binding = crate::reflect::imageblock_resource_binding(attachment, data_rate)
+            .ok_or_else(|| {
+                format!(
+                    "implicit imageblock attachment {attachment} rate {data_rate} exceeds the descriptor ABI band"
+                )
+            })?;
         let image_ty = self.ty_storage_image(Dim::Dim2D, true, format, comp);
         let pointer_ty = self.ty_ptr(StorageClass::UniformConstant, image_ty);
         let var = self.module.fresh_id();
@@ -180,11 +175,13 @@ impl Ctx {
             Some(var),
             vec![Operand::StorageClass(StorageClass::UniformConstant)],
         ));
-        decorate_binding(
-            &mut self.module,
-            var,
-            crate::reflect::fragment_imageblock_resource_binding(master_member),
-        );
+        let binding = crate::reflect::fragment_imageblock_resource_binding(master_member)
+            .ok_or_else(|| {
+                format!(
+                    "fragment imageblock master member {master_member} exceeds the descriptor ABI band"
+                )
+            })?;
+        decorate_binding(&mut self.module, var, binding);
         self.interface_buffer_var(var);
         self.fragment_imageblock_vars
             .insert(master_member, (var, image_ty));

@@ -61,9 +61,9 @@ pub struct EmbeddedArgument {
 ///
 /// **ABI convention:** `K = 1 + max(top-level air.texture air.location_index)`, or `0` when the
 /// kernel has no top-level textures. This guarantees `K` never collides with a real top-level
-/// texture's location index, so the synthetic sampled image binds at a free
-/// `TEXTURE_BINDING_BASE + K` slot. `texture_locations` is the set of `air.location_index` values of
-/// the kernel's top-level texture args.
+/// texture's location index, so the synthetic image binds at index `K` in the sampled- or
+/// storage-texture band. `texture_locations` is the set of `air.location_index` values of the
+/// kernel's top-level texture args.
 pub fn embedded_synthetic_texture_index(texture_locations: &[u32]) -> u32 {
     texture_locations.iter().copied().max().map_or(0, |m| m + 1)
 }

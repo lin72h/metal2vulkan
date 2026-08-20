@@ -447,7 +447,7 @@ pub(in crate::passes) fn valid_sampler_value(
     // `air.get_read_sampler()` replacement can still look pointer-typed to this query. Neither form is
     // a legal OpSampledImage sampler operand, so materialize the same default sampler resource used by
     // sampler-less reads.
-    let var = ctx.default_read_sampler();
+    let var = ctx.default_read_sampler()?;
     let loaded = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::Load,

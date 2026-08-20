@@ -13,7 +13,7 @@
 //!   ext `SPV_KHR_physical_storage_buffer`;
 //! - each leaf access chain (zero-offset into a buffer variable) → `OpConvertUToPtr` of the buffer's
 //!   64-bit device address, loaded from a synthesized address-table descriptor (`{ runtimearray u64 }`
-//!   at a fresh binding in set 0) indexed by the buffer's OWN descriptor Binding — so the executor
+//!   in the translator-owned binding range in set 0) indexed by the buffer's OWN descriptor Binding — so the executor
 //!   fills `table[binding] = vkGetBufferDeviceAddress(buffer_at_binding)` directly from the bound
 //!   resources, no side-channel slot→binding map needed (the consumer's
 //!   `buffer_device_address` ABI fills the same table);
@@ -804,7 +804,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         retype.insert(v, psb);
     }
 
-    // Address-table descriptor: struct { runtimearray u64 } at a fresh binding in set 0.
+    // Address-table descriptor: struct { runtimearray u64 } in the translator-owned binding range.
     let addr_rt = fresh();
     module.types_global_values.push(Instruction::new(
         Op::TypeRuntimeArray,
@@ -877,7 +877,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
     // Fresh binding = max existing binding in set 0 + 1.
-    let max_binding = module
+    let Some(address_table_binding) = module
         .annotations
         .iter()
         .filter(|i| {
@@ -892,7 +892,12 @@ fn rewrite_cross_binding_pointer_merges_inner(
             _ => None,
         })
         .max()
-        .unwrap_or(0);
+        .unwrap_or(crate::reflect::SYNTHETIC_BINDING_BASE - 1)
+        .max(crate::reflect::SYNTHETIC_BINDING_BASE - 1)
+        .checked_add(1)
+    else {
+        return false;
+    };
     module.annotations.push(Instruction::new(
         Op::Decorate,
         None,
@@ -910,7 +915,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         vec![
             Operand::IdRef(addr_var),
             Operand::Decoration(Decoration::Binding),
-            Operand::LiteralBit32(max_binding + 1),
+            Operand::LiteralBit32(address_table_binding),
         ],
     ));
     // SPIR-V >=1.4 lists every global variable in the entry-point interface.

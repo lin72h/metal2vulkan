@@ -154,8 +154,8 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
     assert!(asm.contains("OpTypeArray"), "{asm}");
     assert!(asm.contains("R32f"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 2, "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
-    assert!(asm.contains("Binding 33"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
+    assert!(asm.contains("Binding 481"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -355,7 +355,7 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("R32f"), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -406,7 +406,7 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpTypeArray"), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
     assert!(asm.contains("Rgba16f"), "{asm}");
     assert!(asm.contains("OpAccessChain"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
@@ -461,8 +461,8 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("Binding 32"), "{asm}");
-    assert!(asm.contains("Binding 33"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
+    assert!(asm.contains("Binding 481"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 2, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -527,8 +527,8 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("Binding 32"), "{asm}");
-    assert!(asm.contains("Binding 33"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
+    assert!(asm.contains("Binding 481"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -736,7 +736,7 @@ entry:
     );
     assert!(asm.contains("OpTypeSampler"), "{asm}");
     assert!(asm.contains("Binding 37"), "{asm}");
-    assert!(asm.contains("Binding 66"), "{asm}");
+    assert!(asm.contains("Binding 162"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -744,6 +744,138 @@ entry:
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_texture_and_sampler_binding_bands_cover_high_and_last_abi_indices() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %tex40, ptr addrspace(1) %tex127, ptr addrspace(2) %sampler8, ptr addrspace(2) %sampler15) {
+entry:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 40, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex40"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 127, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex127"}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 8, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler8"}
+!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 15, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler15"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_high_texture_sampler_bindings_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect("high-index resources must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+
+    for (kind, metal_index, binding) in [
+        (crate::reflect::ResourceKind::Texture, 40, 72),
+        (crate::reflect::ResourceKind::Texture, 127, 159),
+        (crate::reflect::ResourceKind::Sampler, 8, 168),
+        (crate::reflect::ResourceKind::Sampler, 15, 175),
+    ] {
+        let reflected = reflection
+            .binding_at(kind, metal_index)
+            .and_then(|resource| resource.descriptor)
+            .expect("reflected descriptor");
+        assert_eq!(reflected.set, 0);
+        assert_eq!(reflected.binding, binding);
+        assert!(asm.contains(&format!("Binding {binding}")), "{asm}");
+    }
+    reflection
+        .validate_descriptor_abi()
+        .expect("reflection descriptor ABI");
+
+    let mut collided = load_bytes(&spv).expect("load translated module");
+    for decoration in &mut collided.annotations {
+        if decoration.class.opcode == Op::Decorate
+            && decoration.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
+            && decoration.operands.get(2) == Some(&Operand::LiteralBit32(168))
+        {
+            decoration.operands[2] = Operand::LiteralBit32(72);
+        }
+    }
+    let error = passes::validate_descriptor_bindings(&collided)
+        .expect_err("a sampler moved into the texture band must be rejected");
+    assert!(error.contains("outside its ABI band"), "{error}");
+
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_sampled_and_storage_views_of_one_metal_texture_use_distinct_bands() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+@dest_location = internal addrspace(2) global i32 40, align 4
+@source_location = internal addrspace(2) global i32 40, align 4
+
+define void @k(ptr addrspace(1) %dest, ptr addrspace(1) %source) {
+entry:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", ptr addrspace(2) @dest_location, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dest"}
+!4 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", ptr addrspace(2) @source_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"source"}
+!5 = !{ptr addrspace(2) @dest_enabled, !"bool", !"dest_enabled"}
+!6 = !{ptr addrspace(2) @source_enabled, !"bool", !"source_enabled"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_sampled_storage_texture_bindings_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect("sampled and storage texture views must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let sampled = reflection
+        .binding_at(crate::reflect::ResourceKind::Texture, 40)
+        .and_then(|resource| resource.descriptor)
+        .expect("sampled descriptor");
+    let storage = reflection
+        .binding_at(crate::reflect::ResourceKind::StorageImage, 40)
+        .and_then(|resource| resource.descriptor)
+        .expect("storage descriptor");
+    assert_eq!(sampled.binding, 72);
+    assert_eq!(storage.binding, 520);
+    assert!(asm.contains("Binding 72"), "{asm}");
+    assert!(asm.contains("Binding 520"), "{asm}");
+    reflection
+        .validate_descriptor_abi()
+        .expect("reflection descriptor ABI");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -2341,7 +2473,7 @@ declare void @air.write_texture_2d.u.v4i32(ptr addrspace(1), <2 x i32>, <4 x i32
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Rgba8ui"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
-    assert!(asm.contains("Binding 39"), "{asm}");
+    assert!(asm.contains("Binding 487"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -2730,8 +2862,8 @@ declare void @air.store.implicit_imageblock.v2f16(<2 x half>, i32, <2 x i16>, i3
     assert!(asm.contains("R32ui"), "{asm}");
     assert!(asm.contains("Rg16f"), "{asm}");
     assert!(asm.contains("OpBitcast"), "{asm}");
-    assert!(asm.contains("Binding 128"), "{asm}");
-    assert!(asm.contains("Binding 134"), "{asm}");
+    assert!(asm.contains("Binding 200"), "{asm}");
+    assert!(asm.contains("Binding 206"), "{asm}");
     assert!(!asm.contains("air.load.implicit_imageblock"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -3638,7 +3770,7 @@ declare void @air.write_texture_2d_array.u.v4i32(ptr addrspace(1), <2 x i32>, i3
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Rgba8ui"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
-    assert!(asm.contains("Binding 34"), "{asm}");
+    assert!(asm.contains("Binding 482"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -3681,7 +3813,7 @@ declare void @air.write_texture_cube.v4f32(ptr addrspace(1), <2 x i32>, i32, <4 
     assert!(asm.contains("Cube 0 0 0 2 R32f"), "{asm}");
     assert!(asm.contains("OpCompositeConstruct"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -4215,7 +4347,7 @@ declare void @air.write_texture_buffer_1d.v4f32(ptr addrspace(1), i32, <4 x floa
     assert!(asm.contains("OpCapability ImageBuffer"), "{asm}");
     assert!(asm.contains("Buffer 0 0 0 2 R32f"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    assert!(asm.contains("Binding 480"), "{asm}");
     assert!(!asm.contains("OpCapability Sampled1D"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")

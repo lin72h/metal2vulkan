@@ -69,7 +69,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `21`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `22`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -88,18 +88,19 @@ Every descriptor-backed Metal-facing resource uses **descriptor set 0**
 | `[[buffer(n)]]` (device / constant) | `Buffer` | `BUFFER_BINDING_BASE + n` → **`n`** (buffer band `0`–`31`) |
 | `[[buffer(n)]]` (threadgroup) | `ThreadgroupBuffer` | **no descriptor** (`descriptor: None`) |
 | Kernel `[[stage_in]]` attribute | `KernelStageInput` | first free buffer binding; AIR location is `stage_input_location` |
-| `[[texture(n)]]` | `Texture` / `StorageImage` / `TextureArray` (`access` distinguishes sampled vs storage arrays) | `TEXTURE_BINDING_BASE + n` → **`32 + n`** |
-| `[[sampler(n)]]` | `Sampler` | `SAMPLER_BINDING_BASE + n` → **`64 + n`** |
-| AIR `constexpr sampler` | `StaticSampler` | first free binding in **`64..96`** |
-| `[[color(n)]]` (framebuffer fetch) | `ColorInput` | `COLOR_INPUT_BINDING_BASE + n` → **`96 + n`** |
-| Implicit imageblock attachment `n`, data rate `r` | `implicit_imageblock_attachments` | `IMAGEBLOCK_BINDING_BASE + 3*n + r` → **`128 + 3*n + r`** |
-| Custom fragment imageblock master member `n` | `fragment_imageblock.members[n]` | `FRAGMENT_IMAGEBLOCK_BINDING_BASE + n` → **`160 + n`** when projected |
+| sampled `[[texture(n)]]` | `Texture` / sampled `TextureArray` | `TEXTURE_BINDING_BASE + n` → **`32 + n`** (sampled-texture band `32`–`159`) |
+| writable `[[texture(n)]]` | `StorageImage` / storage `TextureArray` | `STORAGE_TEXTURE_BINDING_BASE + n` → **`480 + n`** (storage-texture band `480`–`607`) |
+| `[[sampler(n)]]` | `Sampler` | `SAMPLER_BINDING_BASE + n` → **`160 + n`** (runtime indices `0`–`15`) |
+| AIR `constexpr sampler` | `StaticSampler` | first free binding in **`160..192`** |
+| `[[color(n)]]` (framebuffer fetch) | `ColorInput` | `COLOR_INPUT_BINDING_BASE + n` → **`192 + n`** (color band `192`–`199`) |
+| Implicit imageblock attachment `n`, data rate `r` | `implicit_imageblock_attachments` | `IMAGEBLOCK_BINDING_BASE + 3*n + r` → **`200 + 3*n + r`** |
+| Custom fragment imageblock master member `n` | `fragment_imageblock.members[n]` | `FRAGMENT_IMAGEBLOCK_BINDING_BASE + n` → **`224 + n`** when projected |
 | Acceleration-structure shadow buffer | `AccelerationStructureShadow` | Metal buffer index `n` (set 0) |
 | Primitive acceleration structure | `PrimitiveAccelerationStructure` | Metal buffer index `n` (set 0); descriptor only when AIR intersection lowering consumes its geometry shadow |
 | Authored visible/intersection function table | `VisibleFunctionTable` / `IntersectionFunctionTable` | **no descriptor** (`descriptor: None`); `metal_index` and `param_index` identify static linkage |
 | Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | `32 + synthetic_index` |
 | Device buffer embedded in argument buffer | `EmbeddedArgBufferBuffer` | **no descriptor**; owner field contains its Vulkan device address |
-| Synthesized direct-buffer address table | `BufferAddressTable` | translator-selected free binding; one `u64` address per Metal buffer slot |
+| Synthesized direct-buffer address table | `BufferAddressTable` | translator-selected binding at or above `SYNTHETIC_BINDING_BASE` (`640`); one `u64` address per Metal buffer slot |
 
 Constants live in `metal2vulkan::reflect`:
 
@@ -107,23 +108,29 @@ Constants live in `metal2vulkan::reflect`:
 RESOURCE_DESCRIPTOR_SET = 0
 BUFFER_BINDING_BASE     = 0
 TEXTURE_BINDING_BASE    = 32
-SAMPLER_BINDING_BASE    = 64
-COLOR_INPUT_BINDING_BASE = 96
-IMAGEBLOCK_BINDING_BASE = 128
+SAMPLER_BINDING_BASE    = 160
+COLOR_INPUT_BINDING_BASE = 192
+IMAGEBLOCK_BINDING_BASE = 200
 IMAGEBLOCK_DATA_RATE_STRIDE = 3
-FRAGMENT_IMAGEBLOCK_BINDING_BASE = 160
+FRAGMENT_IMAGEBLOCK_BINDING_BASE = 224
+STORAGE_TEXTURE_BINDING_BASE = 480
+SYNTHETIC_BINDING_BASE = 640
 ```
 
 The stage-input / stage-output passes decorate the module with **exactly these** numbers. Use
 reflection—not list positions or recomputed synthetic indices—to allocate descriptor sets and write
-descriptor updates.
+descriptor updates. Multiple AIR parameters may intentionally alias one Metal index. When building
+a Vulkan descriptor-set layout, group reflected entries by `(set, binding, descriptor type)` and use
+the maximum reflected `count`; incompatible descriptor types are assigned different ABI bands and
+are rejected by translation if they ever collide.
 
 Descriptor types for `bindings`:
 
 | Kind | Vulkan descriptor type |
 |---|---|
 | `Buffer`, `KernelStageInput`, `AccelerationStructureShadow`, `PrimitiveAccelerationStructure`, `BufferAddressTable` | Storage buffer |
-| `Texture`, `EmbeddedArgBufferTexture` | Sampled image |
+| `Texture` | Sampled image |
+| `EmbeddedArgBufferTexture` | Sampled image or storage image according to `access` |
 | `TextureArray` | Sampled-image or storage-image array according to `access` |
 | `StorageImage` | Storage image |
 | `Sampler`, `StaticSampler` | Sampler |
@@ -309,7 +316,7 @@ becomes unbounded instead of allowing reflection size to grow without limit.
 | `metal2vulkan::specialize_function_constant_bytes` | Specialize exact-width scalar/vector FC payloads |
 
 Unit coverage for binding numbers lives in `src/reflect/tests.rs` (ABI contract: set 0, bases
-0/32/64/96/128/160).
+0/32/160/192/200/224/480, with translator-owned descriptors at 640 or above).
 
 ## What reflection is *not*
 

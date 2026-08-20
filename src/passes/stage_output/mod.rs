@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::passes::stage_input::{decorate_builtin, decorate_location, scalar_or_vector_component};
-use crate::reflect::{COLOR_INPUT_BINDING_BASE, SAMPLER_BINDING_BASE};
+use crate::reflect::SAMPLER_BINDING_RANGE;
 
 fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
     match frag {
@@ -932,7 +932,8 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), Stri
         let binding = allocate_static_sampler_binding(&ctx.module).ok_or_else(|| {
             format!(
                 "AIR constexpr sampler count exceeds descriptor band \
-                 [{SAMPLER_BINDING_BASE},{COLOR_INPUT_BINDING_BASE})"
+                 [{},{})",
+                SAMPLER_BINDING_RANGE.start, SAMPLER_BINDING_RANGE.end
             )
         })?;
         decorate_binding(&mut ctx.module, new_var, binding);

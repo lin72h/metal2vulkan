@@ -62,10 +62,12 @@ module, a read-only analyzer derives conservative buffer byte footprints from th
 Public `translate_*_reflected` entry points return `(Vec<u8>, reflect::ShaderReflection)` with
 **bytes identical** to the non-reflected call.
 
-Descriptor ABI bases (buffer = index, texture = 32+n, sampler = 64+n, color = 96+n, set 0) live in
+Descriptor ABI ranges (buffers `0..32`, sampled textures `32..160`, samplers `160..192`, colors
+`192..200`, and storage textures `480..608`, set 0) live in
 `reflect` and are consumed by the resource pass so decorated bindings and reported reflection share
-one contract. Start with the integration [how-to](HOWTO.md); the complete schema and ABI contract
-are in [`REFLECTION.md`](REFLECTION.md).
+one checked contract. A final module audit rejects descriptor classes outside their bands. Start
+with the integration [how-to](HOWTO.md); the complete schema and ABI contract is in
+[`REFLECTION.md`](REFLECTION.md).
 
 ### Retained module seam
 

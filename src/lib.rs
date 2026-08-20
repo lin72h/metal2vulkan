@@ -395,8 +395,9 @@ pub fn reflect_sanitized(
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;
     if stage == passes::Stage::Kernel && has_device_address_pointer_load(san_ll) {
-        reflection.add_buffer_address_table();
+        reflection.add_buffer_address_table()?;
     }
+    reflection.validate_descriptor_abi()?;
     Ok(reflection)
 }
 
@@ -435,8 +436,9 @@ fn translate_sanitized_native_reflected_with_layout(
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;
     if stage == passes::Stage::Kernel && has_device_address_pointer_load(san_ll) {
-        reflection.add_buffer_address_table();
+        reflection.add_buffer_address_table()?;
     }
+    reflection.validate_descriptor_abi()?;
     let spv = translate_sanitized_with_meta(
         san_ll,
         stage,
@@ -849,6 +851,7 @@ fn finish_module(
     // the SPIR-V access-chain contract at the final module boundary: the result pointer keeps its
     // pointee but always inherits the actual base pointer's storage class.
     native::reconcile_access_chain_storage_classes_module(&mut out);
+    passes::validate_descriptor_bindings(&out)?;
     let bytes = assemble_finished_module(&out);
     if retry_debug {
         eprintln!("[retry-debug] finish: assembly complete");
@@ -1734,7 +1737,7 @@ define void @k(ptr addrspace(1) %out, i64 %address) {
             .expect("buffer-address table reflection");
         assert_eq!(
             table.descriptor.map(|descriptor| descriptor.binding),
-            Some(1)
+            Some(reflect::SYNTHETIC_BINDING_BASE)
         );
     }
 

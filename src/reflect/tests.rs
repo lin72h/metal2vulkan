@@ -1,7 +1,8 @@
 //! Unit coverage for the reflection facade: parse a known AIR fixture into meta, build the
 //! [`ShaderReflection`], and assert the exported binding numbers match the ABI convention the
-//! interface pass decorates (buffers = index, textures = 32+n, samplers = 64+n, colors = 96+n,
-//! implicit imageblock attachment planes = 128+3*attachment+data-rate, all in descriptor set 0).
+//! interface pass decorates (buffers = index, sampled textures = 32+n, samplers = 160+n, colors =
+//! 192+n, implicit imageblock attachment planes = 200+3*attachment+data-rate, storage textures =
+//! 480+n, all in descriptor set 0).
 
 use super::*;
 use crate::meta::{
@@ -517,12 +518,12 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     )
     .expect("translate");
     let asm = crate::disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("Binding 64"), "{asm}");
-    assert!(asm.contains("Binding 65"), "{asm}");
-    assert!(asm.contains("Binding 66"), "{asm}");
-    assert!(asm.contains("Binding 96"), "{asm}");
-    assert!(!asm.contains("Binding 97"), "{asm}");
-    assert!(!asm.contains("Binding 98"), "{asm}");
+    assert!(asm.contains("Binding 160"), "{asm}");
+    assert!(asm.contains("Binding 161"), "{asm}");
+    assert!(asm.contains("Binding 162"), "{asm}");
+    assert!(asm.contains("Binding 192"), "{asm}");
+    assert!(!asm.contains("Binding 193"), "{asm}");
+    assert!(!asm.contains("Binding 194"), "{asm}");
     let color_input = reflection
         .binding_at(ResourceKind::ColorInput, 0)
         .expect("framebuffer-fetch input");
@@ -539,7 +540,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
             .iter()
             .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
             .collect::<Vec<_>>(),
-        vec![65, 66]
+        vec![161, 162]
     );
     let linear = static_samplers[0]
         .static_sampler
@@ -1234,7 +1235,7 @@ fn reflection_serde_covers_every_reflection_field() {
             ResourceBinding {
                 kind: ResourceKind::Buffer,
                 metal_index: 0,
-                descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, 0),
+                descriptor: ResourceBinding::descriptor_at(buffer_resource_binding(0)),
                 param_index: Some(0),
                 stage_input_location: None,
                 address_space: Some(2),
@@ -1268,7 +1269,7 @@ fn reflection_serde_covers_every_reflection_field() {
             ResourceBinding {
                 kind: ResourceKind::Texture,
                 metal_index: 0,
-                descriptor: ResourceBinding::descriptor_at(TEXTURE_BINDING_BASE, 0),
+                descriptor: ResourceBinding::descriptor_at(texture_resource_binding(0)),
                 param_index: None,
                 stage_input_location: None,
                 address_space: None,
@@ -1292,7 +1293,7 @@ fn reflection_serde_covers_every_reflection_field() {
             ResourceBinding {
                 kind: ResourceKind::StaticSampler,
                 metal_index: 1,
-                descriptor: ResourceBinding::descriptor_at(SAMPLER_BINDING_BASE, 1),
+                descriptor: ResourceBinding::descriptor_at(sampler_resource_binding(1)),
                 param_index: None,
                 stage_input_location: None,
                 address_space: None,
@@ -1416,11 +1417,31 @@ fn abi_base_constants_are_the_contract() {
     assert_eq!(RESOURCE_DESCRIPTOR_SET, 0);
     assert_eq!(BUFFER_BINDING_BASE, 0);
     assert_eq!(TEXTURE_BINDING_BASE, 32);
-    assert_eq!(SAMPLER_BINDING_BASE, 64);
-    assert_eq!(COLOR_INPUT_BINDING_BASE, 96);
-    assert_eq!(IMAGEBLOCK_BINDING_BASE, 128);
+    assert_eq!(SAMPLER_BINDING_BASE, 160);
+    assert_eq!(COLOR_INPUT_BINDING_BASE, 192);
+    assert_eq!(IMAGEBLOCK_BINDING_BASE, 200);
     assert_eq!(IMAGEBLOCK_DATA_RATE_STRIDE, 3);
-    assert_eq!(imageblock_resource_binding(2, 1), 135);
+    assert_eq!(FRAGMENT_IMAGEBLOCK_BINDING_BASE, 224);
+    assert_eq!(STORAGE_TEXTURE_BINDING_BASE, 480);
+    assert_eq!(SYNTHETIC_BINDING_BASE, 640);
+
+    assert_eq!(buffer_resource_binding(31), Some(31));
+    assert_eq!(buffer_resource_binding(32), None);
+    assert_eq!(texture_resource_binding(127), Some(159));
+    assert_eq!(texture_resource_binding(128), None);
+    assert_eq!(storage_texture_resource_binding(127), Some(607));
+    assert_eq!(storage_texture_resource_binding(128), None);
+    assert_eq!(sampler_resource_binding(15), Some(175));
+    assert_eq!(sampler_resource_binding(16), None);
+    assert_eq!(SAMPLER_BINDING_RANGE.binding(31), Some(191));
+    assert_eq!(SAMPLER_BINDING_RANGE.binding(32), None);
+    assert_eq!(color_input_resource_binding(7), Some(199));
+    assert_eq!(color_input_resource_binding(8), None);
+    assert_eq!(imageblock_resource_binding(7, 2), Some(223));
+    assert_eq!(imageblock_resource_binding(8, 0), None);
+    assert_eq!(imageblock_resource_binding(0, 3), None);
+    assert_eq!(fragment_imageblock_resource_binding(255), Some(479));
+    assert_eq!(fragment_imageblock_resource_binding(256), None);
 }
 
 #[test]

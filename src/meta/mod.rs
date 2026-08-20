@@ -613,6 +613,9 @@ fn parse_air_kernel_meta_with_nodes(
 ) -> Option<KernMeta> {
     let root = stage_root(ll, "kernel")?;
     let rootc = nodes.get(&root)?;
+    let static_int_globals = static_init_int_global_values(ll);
+    let resource_location =
+        |node: &str, fallback: u32| location_index_with_static(node, fallback, &static_int_globals);
     let param_address_spaces = entry
         .and_then(|name| function_param_pointer_address_spaces(ll, name))
         .unwrap_or_default();
@@ -651,7 +654,7 @@ fn parse_air_kernel_meta_with_nodes(
                         // Key by the buffer's `air.location_index` (the Metal `[[buffer(N)]]` slot the
                         // harness binds), NOT the AIR argument position — they differ (e.g. arg 2 but
                         // buffer(0)). The oracle/runner both index buffers by location.
-                        indirect_buffer_struct_refs.push((idx, location_index(node, idx), sref));
+                        indirect_buffer_struct_refs.push((idx, resource_location(node, idx), sref));
                     }
                 }
                 if let Some(t) = layout.clone() {
@@ -677,30 +680,32 @@ fn parse_air_kernel_meta_with_nodes(
                 if let Some(access) = declared_buffer_access(node) {
                     buffer_accesses.insert(idx, access);
                 }
-                KernRole::Buffer(location_index(node, idx))
+                KernRole::Buffer(resource_location(node, idx))
             }
             "texture" => {
                 if let Some(name) = arg_type_name(node) {
                     texture_type_names.insert(idx, name);
                 }
-                let loc = location_index(node, idx);
+                let loc = resource_location(node, idx);
                 top_level_texture_locations.push(loc);
                 KernRole::Texture(loc)
             }
             "instance_acceleration_structure" if body_uses_acceleration_structure_shadow(ll) => {
-                KernRole::AccelerationStructureShadow(location_index(node, idx))
+                KernRole::AccelerationStructureShadow(resource_location(node, idx))
             }
             "primitive_acceleration_structure" => {
-                let binding = location_index(node, idx);
+                let binding = resource_location(node, idx);
                 if ll.contains("@air.intersect.") {
                     KernRole::PrimitiveAccelerationStructureShadow(binding)
                 } else {
                     KernRole::PrimitiveAccelerationStructure(binding)
                 }
             }
-            "visible_function_table" => KernRole::VisibleFunctionTable(location_index(node, idx)),
+            "visible_function_table" => {
+                KernRole::VisibleFunctionTable(resource_location(node, idx))
+            }
             "intersection_function_table" => {
-                KernRole::IntersectionFunctionTable(location_index(node, idx))
+                KernRole::IntersectionFunctionTable(resource_location(node, idx))
             }
             "imageblock" => {
                 if let Some(t) = layout {
@@ -708,7 +713,7 @@ fn parse_air_kernel_meta_with_nodes(
                 }
                 KernRole::Other
             }
-            "sampler" => KernRole::Sampler(location_index(node, idx)),
+            "sampler" => KernRole::Sampler(resource_location(node, idx)),
             "threads_per_threadgroup" => KernRole::ThreadsPerThreadgroup,
             "thread_position_in_threadgroup" => KernRole::ThreadPositionInThreadgroup,
             "threadgroups_per_grid" => KernRole::ThreadgroupsPerGrid,
@@ -726,7 +731,7 @@ fn parse_air_kernel_meta_with_nodes(
                 if let Some(name) = arg_type_name(node) {
                     stage_input_type_names.insert(idx, name);
                 }
-                KernRole::StageInput(location_index(node, idx))
+                KernRole::StageInput(resource_location(node, idx))
             }
             _ => KernRole::Other,
         };

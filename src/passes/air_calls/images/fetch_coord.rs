@@ -774,7 +774,7 @@ pub(in crate::passes) fn cube_fetch_as_center_sample(
         Some(samp) => valid_sampler_value(ctx, samp, out)?,
         None => {
             let sty = ctx.ty_sampler();
-            let var = ctx.default_read_sampler();
+            let var = ctx.default_read_sampler()?;
             let loaded = ctx.module.fresh_id();
             out.push(Instruction::new(
                 Op::Load,

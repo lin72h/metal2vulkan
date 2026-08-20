@@ -2807,7 +2807,30 @@ mod platform {
                         .stage_flags(stage_flags)
                 }),
         );
-        Ok(bindings)
+        let mut by_binding =
+            std::collections::BTreeMap::<u32, vk::DescriptorSetLayoutBinding<'static>>::new();
+        for binding in bindings {
+            match by_binding.entry(binding.binding) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(binding);
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut();
+                    if existing.descriptor_type != binding.descriptor_type {
+                        return Err(format!(
+                            "reflection binding {} aliases descriptor types {} and {}",
+                            binding.binding,
+                            existing.descriptor_type.as_raw(),
+                            binding.descriptor_type.as_raw()
+                        ));
+                    }
+                    existing.descriptor_count =
+                        existing.descriptor_count.max(binding.descriptor_count);
+                    existing.stage_flags |= binding.stage_flags;
+                }
+            }
+        }
+        Ok(by_binding.into_values().collect())
     }
 
     pub(super) fn vulkan_texture_descriptor_type(

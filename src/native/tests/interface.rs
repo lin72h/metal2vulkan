@@ -661,7 +661,7 @@ entry:
     assert!(asm.contains("OpCapability InputAttachment"), "{asm}");
     assert!(asm.contains("SubpassData"), "{asm}");
     assert!(asm.contains("InputAttachmentIndex 0"), "{asm}");
-    assert!(asm.contains("Binding 96"), "{asm}");
+    assert!(asm.contains("Binding 192"), "{asm}");
     assert!(asm.contains("OpImageRead"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -699,7 +699,7 @@ entry:
     let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("InputAttachmentIndex 2"), "{asm}");
-    assert!(asm.contains("Binding 98"), "{asm}");
+    assert!(asm.contains("Binding 194"), "{asm}");
 }
 
 #[test]
@@ -1721,7 +1721,7 @@ entry:
     assert!(asm.contains("OpImageRead"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("R16f"), "{asm}");
-    assert!(asm.contains("Binding 161"), "{asm}");
+    assert!(asm.contains("Binding 225"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -1761,7 +1761,7 @@ entry:
     for format in ["R16f", "Rgba16f", "Rgba8ui", "R16ui"] {
         assert!(asm.contains(format), "missing {format}: {asm}");
     }
-    for binding in 160..164 {
+    for binding in 224..228 {
         assert!(
             asm.contains(&format!("Binding {binding}")),
             "missing binding {binding}: {asm}"

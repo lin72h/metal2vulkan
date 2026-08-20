@@ -1684,6 +1684,10 @@ pub(crate) fn transform_with_options(
     })
 }
 
+pub(crate) fn validate_descriptor_bindings(module: &Module) -> Result<(), String> {
+    resources::validate_descriptor_binding_classes(module)
+}
+
 pub(crate) fn transform_with_options_and_sidecar(
     module: Module,
     emit_sidecar: crate::emit_sidecar::EmitSidecar,

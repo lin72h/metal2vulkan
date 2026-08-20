@@ -1009,7 +1009,7 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
         // Vulkan rejects linear-filter samplers paired with integer sampled images even for LOD
         // queries. The query only needs a valid sampler/image pair, not the AIR filter mode, so use
         // the translator-owned nearest sampler for integer textures.
-        let var = ctx.default_read_sampler();
+        let var = ctx.default_read_sampler()?;
         let sty = ctx.ty_sampler();
         let id = ctx.module.fresh_id();
         out.push(Instruction::new(
@@ -1173,7 +1173,7 @@ pub(in crate::passes) fn lower_get_read_sampler(
     res: Option<Word>,
 ) -> Result<Vec<Instruction>, String> {
     let res = res.ok_or_else(|| "air.get_read_sampler has no result".to_string())?;
-    let var = ctx.default_read_sampler();
+    let var = ctx.default_read_sampler()?;
     let sty = ctx.ty_sampler();
     Ok(vec![Instruction::new(
         Op::Load,

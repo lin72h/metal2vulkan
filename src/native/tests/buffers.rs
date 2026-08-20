@@ -308,7 +308,7 @@ entry:
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("Binding 3"), "{asm}");
+    assert!(asm.contains("Binding 640"), "{asm}");
     assert!(asm.contains("ArrayStride 8"), "{asm}");
     assert!(asm.contains("OpAccessChain"), "{asm}");
     assert!(!asm.contains("metal2vulkan.buffer_address_word"), "{asm}");

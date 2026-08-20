@@ -51,40 +51,136 @@ mod footprint;
 /// v21 adds conservative static and invocation-strided buffer access footprints. The footprint is
 /// derived from the final adopted SPIR-V module, so retry-tier selection cannot leave reflection
 /// describing bytes other than those the consumer receives.
-pub const REFLECTION_VERSION: u32 = 21;
+///
+/// v22 replaces the overlapping 32-wide descriptor bases with checked, non-overlapping resource
+/// bands and reserves a separate high range for translator-owned descriptors.
+pub const REFLECTION_VERSION: u32 = 22;
 
 /// The single descriptor set every Metal-facing resource is bound in. The interface pass hardcodes
 /// `DescriptorSet 0` for every resource (buffers, textures, samplers, color inputs).
 pub const RESOURCE_DESCRIPTOR_SET: u32 = 0;
 
+/// One half-open descriptor-binding band in set 0. `binding(index)` is the only supported way to
+/// project a Metal resource index into a fixed ABI band; out-of-band indices remain unsupported
+/// instead of saturating into another resource class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DescriptorBindingRange {
+    pub start: u32,
+    pub end: u32,
+}
+
+impl DescriptorBindingRange {
+    pub const fn binding(self, index: u32) -> Option<u32> {
+        let Some(width) = self.end.checked_sub(self.start) else {
+            return None;
+        };
+        if index < width {
+            Some(self.start + index)
+        } else {
+            None
+        }
+    }
+
+    pub const fn contains(self, binding: u32) -> bool {
+        binding >= self.start && binding < self.end
+    }
+}
+
 /// Descriptor binding base for `[[buffer(n)]]` resources: the binding is the Metal buffer index `n`
 /// directly (range `0..32`).
 pub const BUFFER_BINDING_BASE: u32 = 0;
+pub const BUFFER_BINDING_RANGE: DescriptorBindingRange =
+    DescriptorBindingRange { start: 0, end: 32 };
 /// Descriptor binding base for `[[texture(n)]]` resources: binding = `TEXTURE_BINDING_BASE + n`.
 pub const TEXTURE_BINDING_BASE: u32 = 32;
+pub const TEXTURE_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
+    start: TEXTURE_BINDING_BASE,
+    end: 160,
+};
 /// Descriptor binding base for `[[sampler(n)]]` resources: binding = `SAMPLER_BINDING_BASE + n`.
-pub const SAMPLER_BINDING_BASE: u32 = 64;
+pub const SAMPLER_BINDING_BASE: u32 = TEXTURE_BINDING_RANGE.end;
+pub const SAMPLER_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
+    start: SAMPLER_BINDING_BASE,
+    end: 192,
+};
+/// Number of sampler argument-table entries exposed by the Metal ABI. The remainder of
+/// [`SAMPLER_BINDING_RANGE`] is reserved for synthesized static samplers.
+pub const SAMPLER_ARGUMENT_COUNT: u32 = 16;
 /// Descriptor binding base for `[[color(n)]]` framebuffer-fetch inputs (Vulkan input attachments):
 /// binding = `COLOR_INPUT_BINDING_BASE + n`.
-pub const COLOR_INPUT_BINDING_BASE: u32 = 96;
+pub const COLOR_INPUT_BINDING_BASE: u32 = SAMPLER_BINDING_RANGE.end;
+pub const COLOR_INPUT_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
+    start: COLOR_INPUT_BINDING_BASE,
+    end: 200,
+};
 /// Descriptor binding base for implicit imageblock render-target planes. Each attachment occupies
 /// three storage-image bindings, one for AIR data rates 0 (default), 1 (color), and 2 (sample).
-pub const IMAGEBLOCK_BINDING_BASE: u32 = 128;
+pub const IMAGEBLOCK_BINDING_BASE: u32 = COLOR_INPUT_BINDING_RANGE.end;
 pub const IMAGEBLOCK_DATA_RATE_STRIDE: u32 = 3;
+pub const IMAGEBLOCK_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
+    start: IMAGEBLOCK_BINDING_BASE,
+    end: 224,
+};
 /// Descriptor binding base for custom fragment `[[imageblock_data]]` master fields. Each master
 /// member occupies one storage-image binding, preserving independent formats and raster-order
 /// groups without conflating custom tile data with color-attachment imageblocks.
-pub const FRAGMENT_IMAGEBLOCK_BINDING_BASE: u32 = 160;
+pub const FRAGMENT_IMAGEBLOCK_BINDING_BASE: u32 = IMAGEBLOCK_BINDING_RANGE.end;
+pub const FRAGMENT_IMAGEBLOCK_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
+    start: FRAGMENT_IMAGEBLOCK_BINDING_BASE,
+    end: 480,
+};
+/// Descriptor band for Metal textures emitted as Vulkan storage images. Sampled and storage
+/// images are distinct Vulkan descriptor types, so even conditional AIR arguments cannot share the
+/// sampled-texture binding for the same Metal index.
+pub const STORAGE_TEXTURE_BINDING_BASE: u32 = FRAGMENT_IMAGEBLOCK_BINDING_RANGE.end;
+pub const STORAGE_TEXTURE_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
+    start: STORAGE_TEXTURE_BINDING_BASE,
+    end: 608,
+};
+/// Translator-owned descriptors (currently direct-buffer address tables) are allocated at or above
+/// this base, after every fixed Metal-facing band.
+pub const SYNTHETIC_BINDING_BASE: u32 = 640;
 
-/// Storage-image descriptor used to emulate one implicit imageblock render-target/data-rate plane.
-pub const fn imageblock_resource_binding(attachment: u32, data_rate: u32) -> u32 {
-    IMAGEBLOCK_BINDING_BASE
-        .saturating_add(attachment.saturating_mul(IMAGEBLOCK_DATA_RATE_STRIDE))
-        .saturating_add(data_rate)
+pub const fn buffer_resource_binding(index: u32) -> Option<u32> {
+    BUFFER_BINDING_RANGE.binding(index)
 }
 
-pub const fn fragment_imageblock_resource_binding(master_member: u32) -> u32 {
-    FRAGMENT_IMAGEBLOCK_BINDING_BASE.saturating_add(master_member)
+pub const fn texture_resource_binding(index: u32) -> Option<u32> {
+    TEXTURE_BINDING_RANGE.binding(index)
+}
+
+pub const fn storage_texture_resource_binding(index: u32) -> Option<u32> {
+    STORAGE_TEXTURE_BINDING_RANGE.binding(index)
+}
+
+pub const fn sampler_resource_binding(index: u32) -> Option<u32> {
+    if index < SAMPLER_ARGUMENT_COUNT {
+        SAMPLER_BINDING_RANGE.binding(index)
+    } else {
+        None
+    }
+}
+
+pub const fn color_input_resource_binding(index: u32) -> Option<u32> {
+    COLOR_INPUT_BINDING_RANGE.binding(index)
+}
+
+/// Storage-image descriptor used to emulate one implicit imageblock render-target/data-rate plane.
+pub const fn imageblock_resource_binding(attachment: u32, data_rate: u32) -> Option<u32> {
+    if data_rate >= IMAGEBLOCK_DATA_RATE_STRIDE {
+        return None;
+    }
+    let Some(offset) = attachment.checked_mul(IMAGEBLOCK_DATA_RATE_STRIDE) else {
+        return None;
+    };
+    let Some(offset) = offset.checked_add(data_rate) else {
+        return None;
+    };
+    IMAGEBLOCK_BINDING_RANGE.binding(offset)
+}
+
+pub const fn fragment_imageblock_resource_binding(master_member: u32) -> Option<u32> {
+    FRAGMENT_IMAGEBLOCK_BINDING_RANGE.binding(master_member)
 }
 
 /// AIR address space 1 = device memory (`device`) — a descriptor-backed storage buffer.
@@ -128,11 +224,11 @@ pub enum ResourceKind {
     KernelStageInput,
     /// A `[[texture(n)]]` sampled image. Bound at `TEXTURE_BINDING_BASE + n`.
     Texture,
-    /// A runtime-indexed texture descriptor array. Bound at `TEXTURE_BINDING_BASE + n`.
-    /// See `ResourceBinding::access` to distinguish sampled from storage arrays.
+    /// A runtime-indexed texture descriptor array. See [`ResourceBinding::access`] to select the
+    /// sampled- or storage-texture binding band.
     TextureArray,
     /// A write-capable storage image (`texture` with `access::write` or `access::read_write`). Bound
-    /// at `TEXTURE_BINDING_BASE + n`.
+    /// at `STORAGE_TEXTURE_BINDING_BASE + n`.
     StorageImage,
     /// A `[[sampler(n)]]`. Bound at `SAMPLER_BINDING_BASE + n`.
     Sampler,
@@ -154,7 +250,7 @@ pub enum ResourceKind {
     /// An authored Metal intersection-function table resolved during dependency linking.
     IntersectionFunctionTable,
     /// A texture embedded inside an `air.indirect_buffer` argument buffer, surfaced as a standalone
-    /// sampled image. Bound at `TEXTURE_BINDING_BASE + synthetic_index`.
+    /// sampled or storage image in the corresponding texture binding band.
     EmbeddedArgBufferTexture,
     /// A device buffer embedded inside an `air.indirect_buffer`. The Vulkan module dereferences the
     /// device address written into the owner field, so this consumes no descriptor of its own.
@@ -570,10 +666,10 @@ pub struct ResourceBinding {
 }
 
 impl ResourceBinding {
-    fn descriptor_at(base: u32, metal_index: u32) -> Option<DescriptorLocation> {
+    fn descriptor_at(binding: Option<u32>) -> Option<DescriptorLocation> {
         Some(DescriptorLocation {
             set: RESOURCE_DESCRIPTOR_SET,
-            binding: base.saturating_add(metal_index),
+            binding: binding?,
             count: 1,
         })
     }
@@ -770,18 +866,207 @@ pub struct ShaderReflection {
 }
 
 impl ShaderReflection {
+    /// Validate the public descriptor ABI as a closed, collision-free mapping. Translation calls
+    /// this before returning reflection; direct metadata-only users may call it after constructing
+    /// a `ShaderReflection` with the `from_*` helpers.
+    pub fn validate_descriptor_abi(&self) -> Result<(), String> {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum DescriptorClass {
+            StorageBuffer,
+            SampledImage,
+            StorageImage,
+            Sampler,
+            InputAttachment,
+        }
+
+        let mut occupied =
+            std::collections::BTreeMap::<(u32, u32), (String, DescriptorClass, u32)>::new();
+        let mut record = |location: DescriptorLocation,
+                          owner: String,
+                          class: DescriptorClass|
+         -> Result<(), String> {
+            if location.set != RESOURCE_DESCRIPTOR_SET {
+                return Err(format!(
+                    "{owner} uses descriptor set {}, expected {RESOURCE_DESCRIPTOR_SET}",
+                    location.set
+                ));
+            }
+            if location.count == 0 {
+                return Err(format!("{owner} has zero descriptor count"));
+            }
+            if let Some((previous, previous_class, previous_count)) = occupied.insert(
+                (location.set, location.binding),
+                (owner.clone(), class, location.count),
+            ) {
+                if previous_class != class {
+                    return Err(format!(
+                        "descriptor set {} binding {} is shared incompatibly by {previous} ({previous_class:?}, count {previous_count}) and {owner} ({class:?}, count {})",
+                        location.set, location.binding, location.count
+                    ));
+                }
+            }
+            Ok(())
+        };
+
+        for resource in &self.bindings {
+            let storage_texture = matches!(resource.kind, ResourceKind::StorageImage)
+                || matches!(
+                    resource.kind,
+                    ResourceKind::TextureArray | ResourceKind::EmbeddedArgBufferTexture
+                ) && resource.access == Some(ResourceAccess::Storage);
+            let class = match resource.kind {
+                ResourceKind::Buffer
+                | ResourceKind::KernelStageInput
+                | ResourceKind::AccelerationStructureShadow
+                | ResourceKind::PrimitiveAccelerationStructure
+                | ResourceKind::BufferAddressTable => DescriptorClass::StorageBuffer,
+                ResourceKind::Texture
+                | ResourceKind::TextureArray
+                | ResourceKind::StorageImage
+                | ResourceKind::EmbeddedArgBufferTexture => {
+                    if storage_texture {
+                        DescriptorClass::StorageImage
+                    } else {
+                        DescriptorClass::SampledImage
+                    }
+                }
+                ResourceKind::Sampler | ResourceKind::StaticSampler => DescriptorClass::Sampler,
+                ResourceKind::ColorInput => DescriptorClass::InputAttachment,
+                ResourceKind::ThreadgroupBuffer
+                | ResourceKind::VisibleFunctionTable
+                | ResourceKind::IntersectionFunctionTable
+                | ResourceKind::EmbeddedArgBufferBuffer => DescriptorClass::StorageBuffer,
+            };
+            let expected = match resource.kind {
+                ResourceKind::Buffer
+                | ResourceKind::KernelStageInput
+                | ResourceKind::AccelerationStructureShadow => {
+                    Some(buffer_resource_binding(resource.metal_index))
+                }
+                ResourceKind::PrimitiveAccelerationStructure if resource.descriptor.is_some() => {
+                    Some(buffer_resource_binding(resource.metal_index))
+                }
+                ResourceKind::Texture
+                | ResourceKind::TextureArray
+                | ResourceKind::StorageImage
+                | ResourceKind::EmbeddedArgBufferTexture => Some(if storage_texture {
+                    storage_texture_resource_binding(resource.metal_index)
+                } else {
+                    texture_resource_binding(resource.metal_index)
+                }),
+                ResourceKind::Sampler => Some(sampler_resource_binding(resource.metal_index)),
+                ResourceKind::StaticSampler => {
+                    Some(SAMPLER_BINDING_RANGE.binding(resource.metal_index))
+                }
+                ResourceKind::ColorInput => {
+                    Some(color_input_resource_binding(resource.metal_index))
+                }
+                ResourceKind::BufferAddressTable => None,
+                ResourceKind::ThreadgroupBuffer
+                | ResourceKind::PrimitiveAccelerationStructure
+                | ResourceKind::VisibleFunctionTable
+                | ResourceKind::IntersectionFunctionTable
+                | ResourceKind::EmbeddedArgBufferBuffer => {
+                    if resource.descriptor.is_some() {
+                        return Err(format!(
+                            "{:?} resource {} unexpectedly consumes a descriptor",
+                            resource.kind, resource.metal_index
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let owner = format!("{:?}({})", resource.kind, resource.metal_index);
+            if resource.kind == ResourceKind::BufferAddressTable {
+                let location = resource
+                    .descriptor
+                    .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
+                if location.binding < SYNTHETIC_BINDING_BASE {
+                    return Err(format!(
+                        "{owner} uses binding {}, below synthetic base {SYNTHETIC_BINDING_BASE}",
+                        location.binding
+                    ));
+                }
+                record(location, owner, class)?;
+                continue;
+            }
+            let expected = expected
+                .flatten()
+                .ok_or_else(|| format!("{owner} exceeds its descriptor ABI band"))?;
+            let location = resource
+                .descriptor
+                .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
+            if location.binding != expected {
+                return Err(format!(
+                    "{owner} uses binding {}, expected {expected}",
+                    location.binding
+                ));
+            }
+            record(location, owner, class)?;
+        }
+
+        for attachment in &self.implicit_imageblock_attachments {
+            let owner = format!(
+                "implicit imageblock attachment {} rate {}",
+                attachment.attachment, attachment.data_rate
+            );
+            let expected = imageblock_resource_binding(attachment.attachment, attachment.data_rate)
+                .ok_or_else(|| format!("{owner} exceeds its descriptor ABI band"))?;
+            if attachment.binding != expected {
+                return Err(format!(
+                    "{owner} uses binding {}, expected {expected}",
+                    attachment.binding
+                ));
+            }
+            record(
+                DescriptorLocation {
+                    set: RESOURCE_DESCRIPTOR_SET,
+                    binding: attachment.binding,
+                    count: 1,
+                },
+                owner,
+                DescriptorClass::StorageImage,
+            )?;
+        }
+        if let Some(imageblock) = &self.fragment_imageblock {
+            for (index, member) in imageblock.members.iter().enumerate() {
+                let Some(binding) = member.binding else {
+                    continue;
+                };
+                let owner = format!("fragment imageblock member {index}");
+                let expected = fragment_imageblock_resource_binding(index as u32)
+                    .ok_or_else(|| format!("{owner} exceeds its descriptor ABI band"))?;
+                if binding != expected {
+                    return Err(format!(
+                        "{owner} uses binding {binding}, expected {expected}"
+                    ));
+                }
+                record(
+                    DescriptorLocation {
+                        set: RESOURCE_DESCRIPTOR_SET,
+                        binding,
+                        count: 1,
+                    },
+                    owner,
+                    DescriptorClass::StorageImage,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Enrich descriptor-backed buffer bindings from the final adopted SPIR-V module.
     pub(crate) fn add_buffer_footprints(&mut self, spv: &[u8]) -> Result<(), String> {
         footprint::attach_buffer_footprints(self, spv)
     }
 
-    pub(crate) fn add_buffer_address_table(&mut self) {
+    pub(crate) fn add_buffer_address_table(&mut self) -> Result<(), String> {
         if self
             .bindings
             .iter()
             .any(|binding| binding.kind == ResourceKind::BufferAddressTable)
         {
-            return;
+            return Ok(());
         }
         let binding = self
             .bindings
@@ -799,8 +1084,12 @@ impl ShaderReflection {
                     .filter_map(|member| member.binding),
             )
             .max()
-            .unwrap_or(0)
-            .saturating_add(1);
+            .unwrap_or(SYNTHETIC_BINDING_BASE - 1)
+            .max(SYNTHETIC_BINDING_BASE - 1)
+            .checked_add(1)
+            .ok_or_else(|| {
+                "descriptor binding space exhausted for buffer-address table".to_string()
+            })?;
         self.bindings.push(ResourceBinding {
             kind: ResourceKind::BufferAddressTable,
             metal_index: 0,
@@ -822,6 +1111,7 @@ impl ShaderReflection {
             access: Some(ResourceAccess::ReadOnly),
             static_sampler: None,
         });
+        Ok(())
     }
 
     /// Build reflection for a fragment shader from its parsed meta and (optional) entry name.
@@ -833,7 +1123,7 @@ impl ShaderReflection {
                 FragRole::Buffer(n) => ResourceBinding {
                     kind: ResourceKind::Buffer,
                     metal_index: *n,
-                    descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
+                    descriptor: ResourceBinding::descriptor_at(buffer_resource_binding(*n)),
                     param_index: Some(idx),
                     stage_input_location: None,
                     address_space: meta.buffer_address_spaces.get(&idx).copied(),
@@ -865,7 +1155,7 @@ impl ShaderReflection {
                 FragRole::ColorInput(n) => ResourceBinding {
                     kind: ResourceKind::ColorInput,
                     metal_index: *n,
-                    descriptor: ResourceBinding::descriptor_at(COLOR_INPUT_BINDING_BASE, *n),
+                    descriptor: ResourceBinding::descriptor_at(color_input_resource_binding(*n)),
                     param_index: Some(idx),
                     stage_input_location: None,
                     address_space: None,
@@ -972,7 +1262,8 @@ impl ShaderReflection {
                                 semantic: member.semantic.clone(),
                                 raster_order_group: member.raster_order_group,
                                 binding: (reads || writes)
-                                    .then(|| fragment_imageblock_resource_binding(index)),
+                                    .then(|| fragment_imageblock_resource_binding(index))
+                                    .flatten(),
                                 access: match (reads, writes) {
                                     (true, true) => ResourceAccess::ReadWrite,
                                     (true, false) => ResourceAccess::ReadOnly,
@@ -1007,7 +1298,7 @@ impl ShaderReflection {
                 VertRole::Buffer(n) => ResourceBinding {
                     kind: ResourceKind::Buffer,
                     metal_index: *n,
-                    descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
+                    descriptor: ResourceBinding::descriptor_at(buffer_resource_binding(*n)),
                     param_index: Some(idx),
                     stage_input_location: None,
                     address_space: meta.buffer_address_spaces.get(&idx).copied(),
@@ -1168,7 +1459,7 @@ impl ShaderReflection {
                         descriptor: if threadgroup {
                             None
                         } else {
-                            ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n)
+                            ResourceBinding::descriptor_at(buffer_resource_binding(*n))
                         },
                         param_index: Some(idx),
                         stage_input_location: None,
@@ -1201,10 +1492,9 @@ impl ShaderReflection {
                     ResourceBinding {
                         kind: ResourceKind::KernelStageInput,
                         metal_index,
-                        descriptor: ResourceBinding::descriptor_at(
-                            BUFFER_BINDING_BASE,
+                        descriptor: ResourceBinding::descriptor_at(buffer_resource_binding(
                             metal_index,
-                        ),
+                        )),
                         param_index: Some(idx),
                         stage_input_location: Some(*location),
                         address_space: None,
@@ -1222,7 +1512,7 @@ impl ShaderReflection {
                 KernRole::AccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::AccelerationStructureShadow,
                     metal_index: *n,
-                    descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
+                    descriptor: ResourceBinding::descriptor_at(buffer_resource_binding(*n)),
                     param_index: Some(idx),
                     stage_input_location: None,
                     address_space: None,
@@ -1256,7 +1546,7 @@ impl ShaderReflection {
                 KernRole::PrimitiveAccelerationStructureShadow(n) => ResourceBinding {
                     kind: ResourceKind::PrimitiveAccelerationStructure,
                     metal_index: *n,
-                    descriptor: ResourceBinding::descriptor_at(BUFFER_BINDING_BASE, *n),
+                    descriptor: ResourceBinding::descriptor_at(buffer_resource_binding(*n)),
                     param_index: Some(idx),
                     stage_input_location: None,
                     address_space: None,
@@ -1322,7 +1612,8 @@ impl ShaderReflection {
                     binding: imageblock_resource_binding(
                         attachment.attachment,
                         attachment.data_rate,
-                    ),
+                    )
+                    .unwrap_or(IMAGEBLOCK_BINDING_RANGE.end),
                     format: attachment.format,
                     access: match (attachment.reads, attachment.writes) {
                         (true, true) => ResourceAccess::ReadWrite,
@@ -1396,18 +1687,19 @@ impl ShaderReflection {
             .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
             .collect::<std::collections::BTreeSet<_>>();
         for words in constants {
-            let binding = (SAMPLER_BINDING_BASE..COLOR_INPUT_BINDING_BASE)
+            let binding = (SAMPLER_BINDING_RANGE.start..SAMPLER_BINDING_RANGE.end)
                 .find(|binding| !occupied.contains(binding))
                 .ok_or_else(|| {
                     format!(
                         "AIR constexpr sampler count exceeds descriptor band \
-                         [{SAMPLER_BINDING_BASE},{COLOR_INPUT_BINDING_BASE})"
+                         [{},{})",
+                        SAMPLER_BINDING_RANGE.start, SAMPLER_BINDING_RANGE.end
                     )
                 })?;
             occupied.insert(binding);
             self.bindings.push(ResourceBinding {
                 kind: ResourceKind::StaticSampler,
-                metal_index: binding - SAMPLER_BINDING_BASE,
+                metal_index: binding - SAMPLER_BINDING_RANGE.start,
                 descriptor: Some(DescriptorLocation {
                     set: RESOURCE_DESCRIPTOR_SET,
                     binding,
@@ -1620,7 +1912,12 @@ fn texture_binding(
     let type_name = param_index.and_then(|idx| type_names.get(&idx).cloned());
     let texture_shape = type_name.as_deref().map(texture_shape_from_name);
     let (kind, access) = classify_texture(texture_shape.as_ref());
-    let mut descriptor = ResourceBinding::descriptor_at(TEXTURE_BINDING_BASE, n);
+    let descriptor_binding = if access == ResourceAccess::Storage {
+        storage_texture_resource_binding(n)
+    } else {
+        texture_resource_binding(n)
+    };
+    let mut descriptor = ResourceBinding::descriptor_at(descriptor_binding);
     if kind == ResourceKind::TextureArray {
         descriptor.as_mut().expect("texture descriptor").count =
             crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT;
@@ -1701,12 +1998,19 @@ fn append_embedded_resources(
     arguments: &[crate::meta::EmbeddedArgument],
 ) {
     for embedded in textures {
+        let descriptor_binding = if embedded.storage_format.is_some() {
+            storage_texture_resource_binding(embedded.synthetic_texture_index)
+                .unwrap_or(STORAGE_TEXTURE_BINDING_RANGE.end)
+        } else {
+            texture_resource_binding(embedded.synthetic_texture_index)
+                .unwrap_or(TEXTURE_BINDING_RANGE.end)
+        };
         bindings.push(ResourceBinding {
             kind: ResourceKind::EmbeddedArgBufferTexture,
             metal_index: embedded.synthetic_texture_index,
             descriptor: Some(DescriptorLocation {
                 set: RESOURCE_DESCRIPTOR_SET,
-                binding: TEXTURE_BINDING_BASE.saturating_add(embedded.synthetic_texture_index),
+                binding: descriptor_binding,
                 count: embedded.array_length.unwrap_or(1),
             }),
             param_index: None,
@@ -1792,7 +2096,7 @@ fn sampler_binding(n: u32, param_index: Option<u32>) -> ResourceBinding {
     ResourceBinding {
         kind: ResourceKind::Sampler,
         metal_index: n,
-        descriptor: ResourceBinding::descriptor_at(SAMPLER_BINDING_BASE, n),
+        descriptor: ResourceBinding::descriptor_at(sampler_resource_binding(n)),
         param_index,
         stage_input_location: None,
         address_space: None,
