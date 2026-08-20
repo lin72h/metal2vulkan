@@ -130,6 +130,7 @@ pub(super) struct LlGlobal {
 
 #[derive(Clone, Debug)]
 pub(super) struct LlModule {
+    pub(super) air_data_layout: Option<crate::layout::AirDataLayout>,
     pub(super) types: HashMap<String, LlType>,
     pub(super) functions: Vec<LlFunction>,
     pub(super) declarations: Vec<LlDeclaration>,
@@ -702,11 +703,11 @@ mod layout_abi_tests {
     //! are the contract that fold must preserve. Each calculator here is one `LayoutRule` variant:
     //!
     //! - `type_storage_size_align`         → "Native"     (packed-style: vec3 = 12/4)
-    //! - `native_memcpy_type_size_align`   → "Memcpy"     (vec3 padded to 4 lanes: 16/16)
+    //! - `native_memcpy_type_size_align`   → "Memcpy"     (source vector ABI allocation layout)
     //! - `air_metadata_type_size_align`    → "AirMetadata" (packed/unpacked distinguished by type)
     //!
-    //! The passes-layer std140 calculator (`stage_input::layout::ty_size_align`, a THIRD rule where
-    //! vec3 = 12/16) is pinned in that module's own tests.
+    //! The passes layer applies the same source ABI alignment to emitted SPIR-V types through its
+    //! sidecar-aware layout calculator.
     use super::*;
     use crate::meta::{AirMember, AirScalar, AirType};
 
@@ -805,6 +806,20 @@ mod layout_abi_tests {
         assert_eq!(
             m.native_memcpy_type_size_align(&LlType::Array(Box::new(LlType::Float), 3)),
             Some((12, 4))
+        );
+    }
+
+    #[test]
+    fn memcpy_rule_uses_parsed_source_vector_alignment() {
+        let m = LlModule::parse(concat!(
+            "target datalayout = \"e-v24:64:64\"\n",
+            "define void @k() {\nentry:\n  ret void\n}\n",
+        ))
+        .expect("module with custom datalayout parses");
+
+        assert_eq!(
+            m.native_memcpy_type_size_align(&vec(LlType::Int(8), 3)),
+            Some((8, 8))
         );
     }
 

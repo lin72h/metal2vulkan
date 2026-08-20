@@ -173,7 +173,7 @@ pub fn air_to_sanitized_ll(src: &str, tmp: &Path) -> Result<String, String> {
     Ok(air_to_sanitized_ll_with_datalayout(src, tmp)?.0)
 }
 
-/// Like [`air_to_sanitized_ll`] but also returns the AIR `target datalayout` string it strips. The
+/// Like [`air_to_sanitized_ll`] but also returns the AIR `target datalayout` string it preserves. The
 /// sanitizer preserves that line as the executable source-layout contract and also returns its value
 /// for reflection, avoiding a second source read. The sanitized text is byte-identical to
 /// [`air_to_sanitized_ll`].
@@ -533,8 +533,8 @@ mod tests {
 
     #[test]
     fn sanitizer_captures_and_preserves_target_datalayout() {
-        // R4: the datalayout survives as a captured string even though it is stripped from the
-        // sanitized text handed to the emitter.
+        // The same datalayout survives both as a captured reflection string and in the sanitized
+        // text handed to executable layout lowering.
         let tmp = std::env::temp_dir();
         let src = tmp.join("m2v_r4_datalayout_test.ll");
         std::fs::write(

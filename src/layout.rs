@@ -138,11 +138,13 @@ pub(super) fn native_size_align(
     }
 }
 
-/// The "Memcpy" rule: storage layout for a `memcpy` (a vec3 is padded to 4 lanes = 16/16, its
-/// size==align; arrays align to at least 4). Was `LlModule::native_memcpy_type_size_align`.
+/// The "Memcpy" rule: LLVM allocation layout for a `memcpy`, using the source vector ABI alignment
+/// (or LLVM's power-of-two default) and aligning arrays to at least four bytes. Was
+/// `LlModule::native_memcpy_type_size_align`.
 pub(super) fn memcpy_size_align(
     ty: &LlType,
     resolve: &impl Fn(&LlType) -> LlType,
+    data_layout: Option<&AirDataLayout>,
 ) -> Option<(u64, u64)> {
     match resolve(ty) {
         LlType::Bool => Some((1, 1)),
@@ -154,13 +156,18 @@ pub(super) fn memcpy_size_align(
         LlType::Float => Some((4, 4)),
         LlType::Ptr(_) => Some((8, 8)),
         LlType::Vector(elem, lanes) => {
-            let (elem_size, _elem_align) = memcpy_size_align(&elem, resolve)?;
-            let storage_lanes = if lanes == 3 { 4 } else { lanes };
-            let size = elem_size * storage_lanes as u64;
-            Some((size, size))
+            let (elem_size, _elem_align) = memcpy_size_align(&elem, resolve, data_layout)?;
+            let store_size = elem_size.checked_mul(u64::from(lanes))?;
+            let store_bits = u32::try_from(store_size.checked_mul(8)?).ok()?;
+            let align = u64::from(
+                data_layout
+                    .map(|layout| layout.vector_align_bytes(store_bits))
+                    .unwrap_or_else(|| store_bits.next_power_of_two() / 8),
+            );
+            Some((round_up_u64(store_size, align), align))
         }
         LlType::Array(elem, len) => {
-            let (elem_size, elem_align) = memcpy_size_align(&elem, resolve)?;
+            let (elem_size, elem_align) = memcpy_size_align(&elem, resolve, data_layout)?;
             Some((
                 round_up_u64(elem_size, elem_align) * len as u64,
                 elem_align.max(4),
@@ -170,7 +177,7 @@ pub(super) fn memcpy_size_align(
             let mut offset = 0u64;
             let mut max_align = 1u64;
             for field in fields {
-                let (size, align) = memcpy_size_align(&field, resolve)?;
+                let (size, align) = memcpy_size_align(&field, resolve, data_layout)?;
                 max_align = max_align.max(align);
                 offset = round_up_u64(offset, align);
                 offset += size;
@@ -241,19 +248,20 @@ pub(super) fn raw_size_align(
 pub(super) fn air_metadata_size_align(
     ty: &AirType,
     resolve: &impl Fn(&LlType) -> LlType,
+    data_layout: Option<&AirDataLayout>,
 ) -> Option<(u64, u64)> {
     match ty {
         AirType::Struct(members) => {
             let mut end = 0u64;
             let mut max_align = 1u64;
             for member in members {
-                let (size, align) = air_metadata_size_align(&member.ty, resolve)?;
+                let (size, align) = air_metadata_size_align(&member.ty, resolve, data_layout)?;
                 max_align = max_align.max(align);
                 end = end.max(u64::from(member.offset) + size);
             }
             Some((round_up_u64(end, max_align), max_align))
         }
-        _ => memcpy_size_align(&ll_type_from_air_type(ty), resolve),
+        _ => memcpy_size_align(&ll_type_from_air_type(ty), resolve, data_layout),
     }
 }
 

@@ -72,10 +72,12 @@ fn raw_rule_errors_on_uncovered_types() {
 
 #[test]
 fn raw_rule_uses_source_vector_abi_alignment() {
-    let mut e = emitter();
-    e.air_data_layout = Some(
-        crate::layout::AirDataLayout::parse("e-v24:64:64").expect("parse custom vector alignment"),
-    );
+    let ir = LlModule::parse(concat!(
+        "target datalayout = \"e-v24:64:64\"\n",
+        "define void @k() {\nentry:\n  ret void\n}\n",
+    ))
+    .expect("module with custom datalayout parses");
+    let e = Emitter::new(ir);
 
     assert_eq!(
         e.raw_type_size_align(&vec(LlType::Int(8), 3))

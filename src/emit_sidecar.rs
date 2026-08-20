@@ -54,6 +54,7 @@ pub(crate) struct AirStructLayoutMapping {
 pub(crate) enum AirStructLayoutMappingStatus {
     MappedNatural,
     MappedExplicit,
+    ParameterMissing,
     ParameterIsNotPointer,
     MetadataIsNotStruct,
     EmittedShapeMismatch,

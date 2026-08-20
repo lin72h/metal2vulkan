@@ -332,23 +332,23 @@ pub(in crate::passes) fn plan_structured_raw_word_pointer_rewrite(
     let path = paths.get(&ptr)?;
     let block_ty = buffer_types.get(&path.root).copied()?;
     let mut prefix = Vec::new();
-    let word_index = if let Some(byte_offset) =
-        access_path_byte_offset(ctx, types, block_ty, &path.indices)
-    {
-        if byte_offset % 4 != 0 {
-            return None;
-        }
-        ctx.const_uint(byte_offset / 4)
-    } else {
-        let dynamic_index = runtime_array_word_index(types, value_types, block_ty, &path.indices)?;
-        coerce_storage_buffer_word_index_to_uint(
-            ctx,
-            types,
-            value_types,
-            dynamic_index,
-            &mut prefix,
-        )?
-    };
+    let word_index =
+        if let Some(byte_offset) = access_path_byte_offset(ctx, types, block_ty, &path.indices) {
+            if byte_offset % 4 != 0 {
+                return None;
+            }
+            ctx.const_uint(byte_offset / 4)
+        } else {
+            let dynamic_index =
+                runtime_array_word_index(ctx, types, value_types, block_ty, &path.indices)?;
+            coerce_storage_buffer_word_index_to_uint(
+                ctx,
+                types,
+                value_types,
+                dynamic_index,
+                &mut prefix,
+            )?
+        };
     let binding = descriptor_binding(&ctx.module, path.root)?;
     let raw_var = match raw_alias_vars.get(&path.root).copied() {
         Some(var) => var,
@@ -381,6 +381,7 @@ pub(in crate::passes) fn plan_structured_raw_word_pointer_rewrite(
 }
 
 pub(in crate::passes) fn runtime_array_word_index(
+    ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     value_types: &HashMap<Word, Word>,
     block_ty: Word,
@@ -408,7 +409,7 @@ pub(in crate::passes) fn runtime_array_word_index(
         Some(Operand::IdRef(elem)) => *elem,
         _ => return None,
     };
-    let (size, align) = ty_size_align(elem, types);
+    let (size, align) = layout_ty_size_align(ctx, elem, types);
     if round_up(size, align) != 4 || !value_types.contains_key(index) {
         return None;
     }

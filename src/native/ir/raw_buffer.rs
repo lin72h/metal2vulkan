@@ -393,14 +393,22 @@ impl LlModule {
         &self,
         ty: &LlType,
     ) -> Option<(u64, u64)> {
-        crate::layout::memcpy_size_align(ty, &|t| self.resolve_known_type(t))
+        crate::layout::memcpy_size_align(
+            ty,
+            &|t| self.resolve_known_type(t),
+            self.air_data_layout.as_ref(),
+        )
     }
 
     pub(in crate::native) fn air_metadata_type_size_align(
         &self,
         ty: &AirType,
     ) -> Option<(u64, u64)> {
-        crate::layout::air_metadata_size_align(ty, &|t| self.resolve_known_type(t))
+        crate::layout::air_metadata_size_align(
+            ty,
+            &|t| self.resolve_known_type(t),
+            self.air_data_layout.as_ref(),
+        )
     }
 
     pub(in crate::native) fn propagate_raw_buffer_params(&mut self) {

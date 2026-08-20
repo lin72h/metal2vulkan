@@ -54,6 +54,7 @@ impl Emitter {
             .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
             .collect::<HashMap<_, _>>();
 
+        let param_count = param_types.len();
         for (index, param_type) in param_types.into_iter().enumerate() {
             let Some(layout) = buffer_layouts.get(&(index as u32)) else {
                 continue;
@@ -83,6 +84,23 @@ impl Emitter {
                     status,
                 });
         }
+        let mut missing_params = buffer_layouts
+            .keys()
+            .copied()
+            .filter(|index| *index as usize >= param_count)
+            .collect::<Vec<_>>();
+        missing_params.sort_unstable();
+        self.emit_sidecar
+            .air_struct_layout_mappings
+            .extend(
+                missing_params
+                    .into_iter()
+                    .map(|param_index| AirStructLayoutMapping {
+                        param_index,
+                        struct_ty: None,
+                        status: AirStructLayoutMappingStatus::ParameterMissing,
+                    }),
+            );
     }
 }
 
@@ -288,7 +306,8 @@ fn air_type_matches_existing(
                 return false;
             };
             def.class.opcode == Op::TypeStruct
-                && map_existing_air_struct_offsets(defs, def, members, air_data_layout).is_some()
+                && map_existing_air_struct_offsets(defs, def, members, air_data_layout)
+                    .is_some_and(|offsets| offsets.windows(2).all(|window| window[1] > window[0]))
         }
     }
 }
@@ -409,4 +428,60 @@ fn is_backend_padding_array(defs: &HashMap<Word, Instruction>, ty: Word) -> bool
         return false;
     };
     type_int_width(defs, elem) == Some(8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_nonincreasing_air_offsets_fail_the_top_level_mapping() {
+        let byte_ty = 1;
+        let inner_ty = 2;
+        let outer_ty = 3;
+        let defs = HashMap::from([
+            (
+                byte_ty,
+                Instruction::new(
+                    Op::TypeInt,
+                    None,
+                    Some(byte_ty),
+                    vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+                ),
+            ),
+            (
+                inner_ty,
+                Instruction::new(
+                    Op::TypeStruct,
+                    None,
+                    Some(inner_ty),
+                    vec![Operand::IdRef(byte_ty), Operand::IdRef(byte_ty)],
+                ),
+            ),
+            (
+                outer_ty,
+                Instruction::new(
+                    Op::TypeStruct,
+                    None,
+                    Some(outer_ty),
+                    vec![Operand::IdRef(inner_ty)],
+                ),
+            ),
+        ]);
+        let air_ty = AirType::Struct(vec![AirMember {
+            offset: 0,
+            ty: AirType::Struct(vec![
+                AirMember {
+                    offset: 0,
+                    ty: AirType::Scalar(AirScalar::UChar),
+                },
+                AirMember {
+                    offset: 0,
+                    ty: AirType::Scalar(AirScalar::UChar),
+                },
+            ]),
+        }]);
+
+        assert!(!air_type_matches_existing(&defs, outer_ty, &air_ty, None));
+    }
 }

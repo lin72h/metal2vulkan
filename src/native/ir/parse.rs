@@ -154,6 +154,7 @@ impl LlModule {
                 || imageblock_nonzero_byte_field,
         );
         let mut module = Self {
+            air_data_layout: crate::layout::AirDataLayout::from_ir(ll)?,
             types,
             functions,
             declarations,

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::passes::stage_input::{
-    decorate_block_struct, is_backend_padding_array, round_up, ty_size_align,
+    decorate_block_struct, is_backend_padding_array, layout_ty_size_align, round_up,
 };
 
 mod raw_word_rewrite;
@@ -53,6 +53,59 @@ mod tests {
             Operand::IdRef(id) => Some(*id),
             _ => None,
         }
+    }
+
+    #[test]
+    fn runtime_array_word_index_respects_source_vector_alignment() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(3),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
+            ),
+            Instruction::new(Op::TypeRuntimeArray, None, Some(4), vec![Operand::IdRef(3)]),
+            Instruction::new(Op::TypeStruct, None, Some(5), vec![Operand::IdRef(4)]),
+            Instruction::new(
+                Op::Constant,
+                Some(2),
+                Some(6),
+                vec![Operand::LiteralBit32(0)],
+            ),
+        ];
+        let defs = defs_from_module(&module);
+        let value_types = HashMap::from([(7, 2)]);
+
+        let default_ctx = Ctx::new(module.clone());
+        assert_eq!(
+            runtime_array_word_index(&default_ctx, &defs, &value_types, 5, &[6, 7]),
+            Some(7)
+        );
+
+        let mut custom_ctx = Ctx::new(module);
+        custom_ctx.air_data_layout = Some(
+            crate::layout::AirDataLayout::parse("e-v24:64:64")
+                .expect("parse vector alignment override"),
+        );
+        assert_eq!(
+            runtime_array_word_index(&custom_ctx, &defs, &value_types, 5, &[6, 7]),
+            None,
+            "an eight-byte vector allocation cannot be addressed as one raw word"
+        );
     }
 
     #[test]
