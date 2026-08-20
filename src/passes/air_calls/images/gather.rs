@@ -434,12 +434,23 @@ pub(in crate::passes) fn valid_sampler_value(
     samp: Word,
     out: &mut Vec<Instruction>,
 ) -> Result<Word, String> {
+    if ctx.ambiguous_sampler_states.contains(&samp) {
+        return Err(
+            "runtime sampler specialization is ambiguous after an SSA select/phi join".into(),
+        );
+    }
     let sty = ctx.ty_sampler();
     if value_result_type(ctx, samp) == Some(sty) {
         return Ok(samp);
     }
     if !value_is_pointer(ctx, samp) {
         return Err("air.sample_texture sampler operand is not a sampler".into());
+    }
+    if !ctx.specialized_runtime_sampler_values.is_empty() {
+        return Err(
+            "runtime sampler specialization cannot recover an exact state after pointer selection"
+                .into(),
+        );
     }
 
     // AIR can select between embedded `__air_sampler_state` globals before sampling. The native

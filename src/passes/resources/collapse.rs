@@ -468,6 +468,7 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 if let Some(state) = specialized_state {
                     ctx.sampler_states.insert(lid, state);
+                    ctx.specialized_runtime_sampler_values.insert(lid);
                 }
                 resource_values.insert(lid);
                 splices.push((pid, lid));

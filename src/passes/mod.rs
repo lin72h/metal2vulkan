@@ -255,8 +255,14 @@ struct Ctx {
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
-    /// Loaded sampler value ids that came from AIR-embedded `__air_sampler_state` globals.
+    /// Loaded sampler value ids with an exact static or pipeline-provided state.
     sampler_states: HashMap<Word, StaticSamplerState>,
+    /// Direct loads of runtime sampler bindings that were given pipeline state.
+    specialized_runtime_sampler_values: HashSet<Word>,
+    /// Sampler-typed aliases whose incoming values do not share one exact state. A sampling
+    /// operation cannot soundly specialize one of these values without cloning the operation per
+    /// incoming state, so it must fail visibly instead of falling back to native sampling.
+    ambiguous_sampler_states: HashSet<Word>,
     /// lazily-created default (null) float image variables for `air.get_null_texture_*()`, keyed by
     /// (Dim, arrayed) so a 2D and a 3D null texture get distinct bindings/types.
     default_null_image_vars: HashMap<(Dim, bool), Word>,
@@ -325,6 +331,8 @@ impl Ctx {
             runtime_sampler_states: options.runtime_sampler_states,
             default_sampler_var: None,
             sampler_states: HashMap::new(),
+            specialized_runtime_sampler_values: HashSet::new(),
+            ambiguous_sampler_states: HashSet::new(),
             default_null_image_vars: HashMap::new(),
             implicit_imageblock_vars: HashMap::new(),
             fragment_imageblock_vars: HashMap::new(),
@@ -393,6 +401,89 @@ fn find_entry_index(module: &Module, entry_name: Option<&str>) -> Option<usize> 
         }
     }
     module.functions.iter().position(|f| !f.blocks.is_empty())
+}
+
+/// Carry exact sampler state through the sampler-typed SSA joins that can remain after interface
+/// binding. A join is usable only when every incoming value has the same known state; mixing a
+/// specialized sampler with an unspecialized or differently specialized sampler is recorded as
+/// ambiguous and rejected by the image-call lowering.
+fn propagate_sampler_state_aliases(ctx: &mut Ctx, entry_idx: usize) {
+    let sampler_ty = ctx.ty_sampler();
+    let aliases = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            if instruction.result_type != Some(sampler_ty) {
+                return None;
+            }
+            let result = instruction.result_id?;
+            let sources = match instruction.class.opcode {
+                Op::CopyObject => instruction
+                    .operands
+                    .first()
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(source) => Some(vec![*source]),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                Op::Select => instruction
+                    .operands
+                    .iter()
+                    .skip(1)
+                    .filter_map(|operand| match operand {
+                        Operand::IdRef(source) => Some(*source),
+                        _ => None,
+                    })
+                    .collect(),
+                Op::Phi => instruction
+                    .operands
+                    .iter()
+                    .step_by(2)
+                    .filter_map(|operand| match operand {
+                        Operand::IdRef(source) => Some(*source),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return None,
+            };
+            (!sources.is_empty()).then_some((result, sources))
+        })
+        .collect::<Vec<_>>();
+    // SPIR-V's ordinary def-use order makes this one linear pass sufficient for CopyObject/Select
+    // chains. Phi backedges that do not already carry one exact state remain conservatively
+    // ambiguous; this keeps the specialization audit bounded instead of introducing a graph-sized
+    // fixpoint loop on the translation hot path.
+    for (result, sources) in aliases {
+        let mut exact = None;
+        let mut saw_known = false;
+        let mut conflict = false;
+        for source in sources {
+            if ctx.ambiguous_sampler_states.contains(&source) {
+                conflict = true;
+                saw_known = true;
+                continue;
+            }
+            let Some(state) = ctx.sampler_states.get(&source).copied() else {
+                conflict = true;
+                continue;
+            };
+            saw_known = true;
+            if exact.is_some_and(|existing| existing != state) {
+                conflict = true;
+            } else {
+                exact = Some(state);
+            }
+        }
+        if !saw_known {
+            continue;
+        }
+        if conflict {
+            ctx.ambiguous_sampler_states.insert(result);
+        } else if let Some(state) = exact {
+            ctx.sampler_states.insert(result, state);
+        }
+    }
 }
 
 /// Map every existing type id -> its defining instruction (clone), for type inspection.
@@ -1789,6 +1880,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     // single-image and descriptor-array roots have been materialized may remaining private
     // placeholders be neutralized as genuinely unmodeled memory.
     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
+    propagate_sampler_state_aliases(&mut ctx, entry_idx);
 
     debug_phase("air lowering start");
     // 2) lower residual air.* calls inside the entry function.

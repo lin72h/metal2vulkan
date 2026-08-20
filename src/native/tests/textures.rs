@@ -1351,6 +1351,52 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
 }
 
 #[test]
+fn runtime_sampler_specialization_refuses_pointer_selected_state_loss() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1, ptr addrspace(1) %out, i32 %lane) {
+entry:
+  %condition = icmp eq i32 %lane, 0
+  %selected = select i1 %condition, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %selected, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 1, i32 1}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*"}
+!7 = !{i32 4, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_runtime_sampler_select_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let state = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::ClampToEdge,
+    );
+    let options = passes::TransformOptions::default()
+        .with_runtime_sampler(0, state)
+        .unwrap()
+        .with_runtime_sampler(1, state)
+        .unwrap();
+    let error = crate::translate_sanitized_native_with_options(ll, Stage::Kernel, &tmp, options)
+        .expect_err("pointer-selected runtime sampler state must not silently disappear");
+    assert!(error.contains("pointer selection"), "{error}");
+}
+
+#[test]
 fn native_kernel_texture_sample_dynamic_offset_adjusts_coordinate() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

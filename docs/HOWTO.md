@@ -124,10 +124,13 @@ from list positions or Metal indices; synthesized resources are deliberately ass
 translator and reflection is authoritative.
 
 Static samplers are ordinary Vulkan sampler descriptors whose creation state comes from
-`static_sampler`. Embedded argument-buffer textures use `embedded_source` to identify their owner,
-field offset, and Metal argument-encoder index. Embedded buffers use matching entries in
-`argument_buffer_fields`; write the Vulkan device address into the reflected owner field rather than
-allocating a separate descriptor.
+`static_sampler`. Dynamically bound samplers whose pipeline state affects shader legality must be
+translated with `TransformOptions::with_runtime_sampler`; create their descriptors from the matching
+`runtime_sampler_specializations` entries returned with the executable module. Never substitute the
+Vulkan binding (`160 + n`) for the API's Metal sampler index `n`. Embedded argument-buffer textures
+use `embedded_source` to identify their owner, field offset, and Metal argument-encoder index.
+Embedded buffers use matching entries in `argument_buffer_fields`; write the Vulkan device address
+into the reflected owner field rather than allocating a separate descriptor.
 
 ## 5. Stage only the buffer bytes the shader can reach
 
