@@ -2,7 +2,7 @@
 //! [`ShaderReflection`], and assert the exported binding numbers match the ABI convention the
 //! interface pass decorates (buffers = index, sampled textures = 32+n, samplers = 160+n, colors =
 //! 192+n, implicit imageblock attachment planes = 200+3*attachment+data-rate, storage textures =
-//! 480+n, all in descriptor set 0).
+//! 480+n, all in descriptor set 0 under the default layout).
 
 use super::*;
 use crate::meta::{
@@ -64,7 +64,7 @@ fn fragment_reflection_matches_abi_convention() {
     // fixture) instead of being dropped, so a consumer never re-parses the AIR arg metadata.
     assert_eq!(buf.declared_size, Some(32));
 
-    // Sampler(2) -> set 0, binding 66.
+    // Sampler(2) -> set 0, binding 162.
     let smp = r.binding_at(ResourceKind::Sampler, 2).expect("sampler 2");
     assert_eq!(
         smp.descriptor,
@@ -1505,6 +1505,12 @@ fn abi_base_constants_are_the_contract() {
     assert_eq!(FRAGMENT_IMAGEBLOCK_BINDING_BASE, 224);
     assert_eq!(STORAGE_TEXTURE_BINDING_BASE, 480);
     assert_eq!(SYNTHETIC_BINDING_BASE, 640);
+    assert_eq!(TEXTURE_ARGUMENT_COUNT, 128);
+    assert_eq!(TEXTURE_BINDING_RANGE.len(), Some(TEXTURE_ARGUMENT_COUNT));
+    assert_eq!(
+        STORAGE_TEXTURE_BINDING_RANGE.len(),
+        Some(TEXTURE_ARGUMENT_COUNT)
+    );
 
     assert_eq!(buffer_resource_binding(31), Some(31));
     assert_eq!(buffer_resource_binding(32), None);
@@ -1567,6 +1573,27 @@ fn descriptor_layout_rejects_overlap_reversal_version_and_overflow_with_typed_er
             count: 1,
         })
     );
+}
+
+#[test]
+fn descriptor_abi_distinguishes_images_from_texel_buffers() {
+    for (ordinary, texel) in [
+        ("texture2d<float, sample>", "texture_buffer<float, sample>"),
+        ("texture2d<float, write>", "texture_buffer<float, write>"),
+    ] {
+        let mut meta = KernMeta {
+            roles: vec![(0, KernRole::Texture(0)), (1, KernRole::Texture(0))],
+            ..Default::default()
+        };
+        meta.texture_type_names.insert(0, ordinary.to_string());
+        meta.texture_type_names.insert(1, texel.to_string());
+        let reflection = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
+
+        let error = reflection
+            .validate_descriptor_abi()
+            .expect_err("image and texel-buffer descriptors cannot alias");
+        assert!(error.contains("shared incompatibly"), "{error}");
+    }
 }
 
 #[test]

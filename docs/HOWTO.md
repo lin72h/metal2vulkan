@@ -112,10 +112,10 @@ The latter two are single storage-image descriptors in the effective set. For an
 | `ResourceBinding.kind` | Vulkan descriptor type |
 |---|---|
 | `Buffer`, `KernelStageInput`, `AccelerationStructureShadow`, `PrimitiveAccelerationStructure`, `BufferAddressTable` | Storage buffer |
-| `Texture`, `EmbeddedArgBufferTexture` | Sampled image |
-| `TextureArray` with `access: Sampled` | Sampled-image array |
-| `TextureArray` with `access: Storage` | Storage-image array |
-| `StorageImage` | Storage image |
+| `Texture`, `EmbeddedArgBufferTexture` | Sampled image; a `Texture` whose reflected dimension is `Buffer` uses a uniform texel buffer |
+| `TextureArray` with `access: Sampled` | Sampled-image array; reflected dimension `Buffer` uses a uniform texel-buffer array |
+| `TextureArray` with `access: Storage` | Storage-image array; reflected dimension `Buffer` uses a storage texel-buffer array |
+| `StorageImage` | Storage image; reflected dimension `Buffer` uses a storage texel buffer |
 | `Sampler`, `StaticSampler` | Sampler |
 | `ColorInput` | Input attachment |
 
@@ -128,8 +128,8 @@ Static samplers are ordinary Vulkan sampler descriptors whose creation state com
 `static_sampler`. Dynamically bound samplers whose pipeline state affects shader legality must be
 translated with `TransformOptions::with_runtime_sampler`; create their descriptors from the matching
 `runtime_sampler_specializations` entries returned with the executable module. Never substitute the
-Vulkan binding (`160 + n`) for the API's Metal sampler index `n`. Embedded argument-buffer textures
-use `embedded_source` to identify their owner, field offset, and Metal argument-encoder index.
+default Vulkan binding (`160 + n`) for the API's Metal sampler index `n`. Embedded argument-buffer
+textures use `embedded_source` to identify their owner, field offset, and Metal argument-encoder index.
 Embedded buffers use matching entries in `argument_buffer_fields`; write the Vulkan device address
 into the reflected owner field rather than allocating a separate descriptor.
 

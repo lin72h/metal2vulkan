@@ -86,19 +86,7 @@ pub(in crate::passes) fn lower_buffer_address_facts(
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
     let layout = ctx.descriptor_layout;
-    let occupied = ctx
-        .module
-        .annotations
-        .iter()
-        .filter(|inst| {
-            inst.class.opcode == Op::Decorate
-                && inst.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
-        })
-        .filter_map(|inst| match inst.operands.get(2) {
-            Some(Operand::LiteralBit32(binding)) => Some(*binding),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
+    let occupied = crate::spirv_module::descriptor_bindings_in_set(&ctx.module, layout.set);
     let binding = (layout.synthetic.start..layout.synthetic.end)
         .find(|binding| !occupied.contains(binding))
         .ok_or_else(|| "descriptor binding space exhausted for buffer-address table".to_string())?;

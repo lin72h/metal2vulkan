@@ -319,6 +319,14 @@ impl<'a> RetryCtx<'a> {
         &self,
         emitted: crate::emit_sidecar::EmittedSpirv,
     ) -> Result<FinishedModule, String> {
+        self.finish_carrier_with_rewrites(emitted, FinishRewrites::Plain)
+    }
+
+    fn finish_carrier_with_rewrites(
+        &self,
+        emitted: crate::emit_sidecar::EmittedSpirv,
+        rewrites: FinishRewrites,
+    ) -> Result<FinishedModule, String> {
         finish_module(
             emitted,
             self.stage,
@@ -328,8 +336,15 @@ impl<'a> RetryCtx<'a> {
             self.entry_name,
             self.air_data_layout.as_ref(),
             self.options,
-            FinishRewrites::Plain,
+            rewrites,
         )
+    }
+
+    pub(crate) fn finish_primary_carrier(
+        &self,
+        emitted: crate::emit_sidecar::EmittedSpirv,
+    ) -> Result<FinishedModule, String> {
+        self.finish_carrier_with_rewrites(emitted, FinishRewrites::Primary)
     }
 
     /// True iff `bytes` independently passes spirv-val — the adopt-if-VALIDATES gate every tier uses.
@@ -1051,13 +1066,7 @@ impl<'a> RetryCtx<'a> {
                 let mapped_layouts = sidecar
                     .air_struct_layout_mappings
                     .iter()
-                    .filter(|mapping| {
-                        matches!(
-                            mapping.status,
-                            crate::emit_sidecar::AirStructLayoutMappingStatus::MappedNatural
-                                | crate::emit_sidecar::AirStructLayoutMappingStatus::MappedExplicit
-                        )
-                    })
+                    .filter(|mapping| mapping.status.is_mapped())
                     .count();
                 let unmapped_layouts = sidecar.air_struct_layout_mappings.len() - mapped_layouts;
                 eprintln!(

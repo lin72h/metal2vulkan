@@ -168,52 +168,32 @@ pub(crate) fn primary_xbind_phi_psb_for_validation_error(
 /// parser mode requires an exact primitive metadata type, a matching post-phi GEP source type, and
 /// the declared byte extent; the re-emission is still adopted only when it validates (or its
 /// cross-binding pointer phi validates after the physical address lowering).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn primary_primitive_phi_metadata_if_needed(
     validation_error: &str,
-    san_ll: &str,
-    stage: passes::Stage,
-    frag: Option<&meta::FragMeta>,
-    vert: Option<&meta::VertMeta>,
-    kern: Option<&meta::KernMeta>,
-    entry_name: Option<&str>,
-    tmp: &Path,
-    options: passes::TransformOptions,
+    retry: &retry::RetryCtx<'_>,
 ) -> Option<Vec<u8>> {
     if native::classify_validation_error(validation_error) != native::ValidationClass::PointerTyping
     {
         return None;
     }
     let emitted = native::emit_vulkan_spirv_with_primitive_phi_metadata_sidecar(
-        san_ll,
-        kern,
-        entry_name,
-        stage_buffer_layouts(stage, frag, vert, kern),
+        retry.san_ll,
+        retry.kern,
+        retry.entry_name,
+        stage_buffer_layouts(retry.stage, retry.frag, retry.vert, retry.kern),
     )
     .ok()?;
-    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll).ok().flatten();
-    let finished = finish_module(
-        emitted,
-        stage,
-        frag,
-        vert,
-        kern,
-        entry_name,
-        air_data_layout.as_ref(),
-        options,
-        FinishRewrites::Primary,
-    )
-    .ok()?;
-    let primary_module = finished.module;
-    let primary = finished.bytes;
-    match tools::spirv_val_bytes(&primary, tmp) {
+    let primary = retry.finish_primary_carrier(emitted).ok()?;
+    let primary_module = primary.module;
+    let primary = primary.bytes;
+    match tools::spirv_val_bytes(&primary, retry.tmp) {
         Ok(()) => Some(primary),
         Err(error) => primary_xbind_phi_psb_for_validation_error(
             &primary_module,
             &primary,
             &error,
-            tmp,
-            options.descriptor_layout,
+            retry.tmp,
+            retry.options.descriptor_layout,
         ),
     }
 }
@@ -445,17 +425,9 @@ pub(crate) fn primary_construct_tree_if_needed(
 /// existing inline pass removes the caller-owned local byte view, and the existing relooper
 /// restructures the resulting otherwise-valid CFG. Any other first or second validation class
 /// declines.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
     validation_error: &str,
-    san_ll: &str,
-    stage: passes::Stage,
-    frag: Option<&meta::FragMeta>,
-    vert: Option<&meta::VertMeta>,
-    kern: Option<&meta::KernMeta>,
-    entry_name: Option<&str>,
-    tmp: &Path,
-    options: passes::TransformOptions,
+    retry: &retry::RetryCtx<'_>,
 ) -> Option<Vec<u8>> {
     if native::classify_validation_error(validation_error) != native::ValidationClass::Other
         || !native::is_dynamic_struct_index_error(validation_error)
@@ -463,29 +435,15 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
         return None;
     }
     let inlined = tools::emit_vulkan_spirv_inline_sroa_with_sidecar(
-        san_ll,
-        tmp,
-        kern,
-        entry_name,
-        stage_buffer_layouts(stage, frag, vert, kern),
+        retry.san_ll,
+        retry.tmp,
+        retry.kern,
+        retry.entry_name,
+        stage_buffer_layouts(retry.stage, retry.frag, retry.vert, retry.kern),
     )
-    .and_then(|spv| {
-        let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
-        finish_module(
-            spv,
-            stage,
-            frag,
-            vert,
-            kern,
-            entry_name,
-            air_data_layout.as_ref(),
-            options,
-            FinishRewrites::Plain,
-        )
-    })
-    .map(|finished| finished.bytes)
+    .and_then(|spv| retry.finish(spv))
     .ok()?;
-    match tools::spirv_val_bytes(&inlined, tmp) {
+    match tools::spirv_val_bytes(&inlined, retry.tmp) {
         Ok(()) => return Some(inlined),
         Err(inline_error)
             if native::classify_validation_error(&inline_error)
@@ -493,7 +451,7 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
         Err(_) => return None,
     }
     let primary = relooper_candidate(&inlined)?;
-    tools::spirv_val_bytes(&primary, tmp)
+    tools::spirv_val_bytes(&primary, retry.tmp)
         .is_ok()
         .then_some(primary)
 }
@@ -502,17 +460,9 @@ pub(crate) fn primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
 /// illegal Logical pointer operand. Inlining exposes the float-CAS helper's pointer at the caller and
 /// raw addressing represents its `float`/`i32` reinterpret without `OpBitcast`; the candidate is
 /// adopted only after its own validation. The no-retry byte baseline remains on the original emission.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn primary_logical_pointer_inline_sroa_raw_if_needed(
     validation_error: &str,
-    san_ll: &str,
-    stage: passes::Stage,
-    frag: Option<&meta::FragMeta>,
-    vert: Option<&meta::VertMeta>,
-    kern: Option<&meta::KernMeta>,
-    entry_name: Option<&str>,
-    tmp: &Path,
-    options: passes::TransformOptions,
+    retry: &retry::RetryCtx<'_>,
 ) -> Option<Vec<u8>> {
     if native::classify_validation_error(validation_error) != native::ValidationClass::Other
         || !native::is_logical_pointer_operand_error(validation_error)
@@ -520,29 +470,15 @@ pub(crate) fn primary_logical_pointer_inline_sroa_raw_if_needed(
         return None;
     }
     let primary = tools::emit_vulkan_spirv_inline_sroa_raw_with_sidecar(
-        san_ll,
-        tmp,
-        kern,
-        entry_name,
-        stage_buffer_layouts(stage, frag, vert, kern),
+        retry.san_ll,
+        retry.tmp,
+        retry.kern,
+        retry.entry_name,
+        stage_buffer_layouts(retry.stage, retry.frag, retry.vert, retry.kern),
     )
-    .and_then(|spv| {
-        let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
-        finish_module(
-            spv,
-            stage,
-            frag,
-            vert,
-            kern,
-            entry_name,
-            air_data_layout.as_ref(),
-            options,
-            FinishRewrites::Plain,
-        )
-    })
-    .map(|finished| finished.bytes)
+    .and_then(|spv| retry.finish(spv))
     .ok()?;
-    tools::spirv_val_bytes(&primary, tmp)
+    tools::spirv_val_bytes(&primary, retry.tmp)
         .is_ok()
         .then_some(primary)
 }

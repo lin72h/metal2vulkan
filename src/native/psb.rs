@@ -13,7 +13,7 @@
 //!   ext `SPV_KHR_physical_storage_buffer`;
 //! - each leaf access chain (zero-offset into a buffer variable) → `OpConvertUToPtr` of the buffer's
 //!   64-bit device address, loaded from a synthesized address-table descriptor (`{ runtimearray u64 }`
-//!   in the translator-owned binding range in set 0) indexed by the buffer's OWN descriptor Binding — so the executor
+//!   in the selected translator-owned binding range and descriptor set) indexed by the buffer's OWN descriptor Binding — so the executor
 //!   fills `table[binding] = vkGetBufferDeviceAddress(buffer_at_binding)` directly from the bound
 //!   resources, no side-channel slot→binding map needed (the consumer's
 //!   `buffer_device_address` ABI fills the same table);
@@ -900,21 +900,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
     // Allocate the translator-owned address table within the selected synthetic band.
-    let occupied = module
-        .annotations
-        .iter()
-        .filter(|i| {
-            i.class.opcode == Op::Decorate
-                && matches!(
-                    i.operands.get(1),
-                    Some(Operand::Decoration(Decoration::Binding))
-                )
-        })
-        .filter_map(|i| match i.operands.get(2) {
-            Some(Operand::LiteralBit32(b)) => Some(*b),
-            _ => None,
-        })
-        .collect::<HashSet<_>>();
+    let occupied = crate::spirv_module::descriptor_bindings_in_set(module, layout.set);
     let Some(address_table_binding) =
         (layout.synthetic.start..layout.synthetic.end).find(|binding| !occupied.contains(binding))
     else {

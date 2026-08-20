@@ -61,6 +61,12 @@ pub(crate) enum AirStructLayoutMappingStatus {
     NonIncreasingOffsets,
 }
 
+impl AirStructLayoutMappingStatus {
+    pub(crate) const fn is_mapped(self) -> bool {
+        matches!(self, Self::MappedNatural | Self::MappedExplicit)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BufferAddressWord {
     pub(crate) id: Word,

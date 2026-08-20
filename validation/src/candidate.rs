@@ -4628,23 +4628,7 @@ mod platform {
         max_sampler_anisotropy: f32,
     ) -> Result<vk::SamplerCreateInfo<'static>, String> {
         sampler_info_from_static(
-            &metal2vulkan::reflect::StaticSamplerState {
-                min_filter: state.min_filter,
-                mag_filter: state.mag_filter,
-                mip_filter: state.mip_filter,
-                address_mode_s: state.address_mode_s,
-                address_mode_t: state.address_mode_t,
-                address_mode_r: state.address_mode_r,
-                coordinates: state.coordinates,
-                compare_function: state.compare_function,
-                max_anisotropy: state.max_anisotropy,
-                lod_min_clamp: state.lod_min_clamp,
-                lod_max_clamp: state.lod_max_clamp,
-                border_color: state.border_color,
-                reduction: state.reduction,
-                lod_bias: state.lod_bias,
-                raw_words: [0; 2],
-            },
+            &state.lowering_state(),
             sampler_anisotropy,
             max_sampler_anisotropy,
         )

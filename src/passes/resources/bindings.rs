@@ -52,18 +52,7 @@ pub(in crate::passes) fn allocate_static_sampler_binding(
     module: &Module,
     layout: DescriptorLayout,
 ) -> Option<u32> {
-    let occupied = module
-        .annotations
-        .iter()
-        .filter(|instruction| {
-            instruction.class.opcode == Op::Decorate
-                && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
-        })
-        .filter_map(|instruction| match instruction.operands.get(2) {
-            Some(Operand::LiteralBit32(binding)) => Some(*binding),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>();
+    let occupied = crate::spirv_module::descriptor_bindings_in_set(module, layout.set);
     (layout.samplers.start..layout.samplers.end).find(|binding| !occupied.contains(binding))
 }
 
@@ -73,18 +62,7 @@ pub(in crate::passes) fn allocate_default_texture_binding(
     module: &Module,
     layout: DescriptorLayout,
 ) -> Option<u32> {
-    let occupied = module
-        .annotations
-        .iter()
-        .filter(|instruction| {
-            instruction.class.opcode == Op::Decorate
-                && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::Binding))
-        })
-        .filter_map(|instruction| match instruction.operands.get(2) {
-            Some(Operand::LiteralBit32(binding)) => Some(*binding),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>();
+    let occupied = crate::spirv_module::descriptor_bindings_in_set(module, layout.set);
     (layout.sampled_textures.start..layout.sampled_textures.end)
         .find(|binding| !occupied.contains(binding))
 }
@@ -140,8 +118,10 @@ enum DescriptorClass {
     UniformBuffer,
     Sampler,
     SampledImage,
+    UniformTexelBuffer,
     CombinedImageSampler,
     StorageImage,
+    StorageTexelBuffer,
     InputAttachment,
     AccelerationStructure,
 }
@@ -245,9 +225,15 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
             Op::TypeSampler => Some(DescriptorClass::Sampler),
             Op::TypeSampledImage => Some(DescriptorClass::CombinedImageSampler),
             Op::TypeImage => {
-                if definition.operands.get(1) == Some(&Operand::Dim(spirv::Dim::DimSubpassData)) {
+                let dimension = definition.operands.get(1);
+                let storage = definition.operands.get(5) == Some(&Operand::LiteralBit32(2));
+                if dimension == Some(&Operand::Dim(spirv::Dim::DimSubpassData)) {
                     Some(DescriptorClass::InputAttachment)
-                } else if definition.operands.get(5) == Some(&Operand::LiteralBit32(2)) {
+                } else if dimension == Some(&Operand::Dim(spirv::Dim::DimBuffer)) && storage {
+                    Some(DescriptorClass::StorageTexelBuffer)
+                } else if dimension == Some(&Operand::Dim(spirv::Dim::DimBuffer)) {
+                    Some(DescriptorClass::UniformTexelBuffer)
+                } else if storage {
                     Some(DescriptorClass::StorageImage)
                 } else {
                     Some(DescriptorClass::SampledImage)
@@ -294,10 +280,10 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
                 layout.buffers.contains(binding) || layout.synthetic.contains(binding)
             }
             DescriptorClass::Sampler => layout.samplers.contains(binding),
-            DescriptorClass::SampledImage | DescriptorClass::CombinedImageSampler => {
-                layout.sampled_textures.contains(binding)
-            }
-            DescriptorClass::StorageImage => {
+            DescriptorClass::SampledImage
+            | DescriptorClass::UniformTexelBuffer
+            | DescriptorClass::CombinedImageSampler => layout.sampled_textures.contains(binding),
+            DescriptorClass::StorageImage | DescriptorClass::StorageTexelBuffer => {
                 layout.storage_textures.contains(binding)
                     || layout.imageblocks.contains(binding)
                     || layout.fragment_imageblocks.contains(binding)
@@ -325,6 +311,44 @@ pub(in crate::passes) fn validate_descriptor_binding_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn image_variable(module: &mut Module, id: Word, dimension: spirv::Dim, storage: bool) {
+        let scalar = id + 100;
+        let image = id + 200;
+        let pointer = id + 300;
+        module.types_global_values.push(type_inst(
+            Op::TypeFloat,
+            scalar,
+            vec![Operand::LiteralBit32(32)],
+        ));
+        module.types_global_values.push(type_inst(
+            Op::TypeImage,
+            image,
+            vec![
+                Operand::IdRef(scalar),
+                Operand::Dim(dimension),
+                Operand::LiteralBit32(0),
+                Operand::LiteralBit32(0),
+                Operand::LiteralBit32(0),
+                Operand::LiteralBit32(if storage { 2 } else { 1 }),
+                Operand::ImageFormat(spirv::ImageFormat::Unknown),
+            ],
+        ));
+        module.types_global_values.push(type_inst(
+            Op::TypePointer,
+            pointer,
+            vec![
+                Operand::StorageClass(StorageClass::UniformConstant),
+                Operand::IdRef(image),
+            ],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Variable,
+            Some(pointer),
+            Some(id),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+    }
 
     #[test]
     fn static_sampler_allocator_is_bounded_by_its_descriptor_band() {
@@ -364,5 +388,53 @@ mod tests {
             decorate_binding(&mut module, 100 + offset as u32, layout.set, binding);
         }
         assert_eq!(allocate_default_texture_binding(&module, layout), None);
+    }
+
+    #[test]
+    fn synthesized_allocators_scope_occupied_bindings_by_descriptor_set() {
+        let mut module = Module::new();
+        let layout = DescriptorLayout {
+            set: 3,
+            ..DescriptorLayout::default()
+        };
+        decorate_binding(&mut module, 1, 0, layout.samplers.start);
+        decorate_binding(&mut module, 2, layout.set, layout.samplers.start + 1);
+        decorate_binding(&mut module, 3, 0, layout.sampled_textures.start);
+        decorate_binding(
+            &mut module,
+            4,
+            layout.set,
+            layout.sampled_textures.start + 1,
+        );
+
+        assert_eq!(
+            allocate_static_sampler_binding(&module, layout),
+            Some(layout.samplers.start)
+        );
+        assert_eq!(
+            allocate_default_texture_binding(&module, layout),
+            Some(layout.sampled_textures.start)
+        );
+    }
+
+    #[test]
+    fn descriptor_collision_oracle_distinguishes_images_from_texel_buffers() {
+        for storage in [false, true] {
+            let mut module = Module::new();
+            image_variable(&mut module, 1, spirv::Dim::Dim2D, storage);
+            image_variable(&mut module, 2, spirv::Dim::DimBuffer, storage);
+            let layout = DescriptorLayout::default();
+            let binding = if storage {
+                layout.storage_textures.start
+            } else {
+                layout.sampled_textures.start
+            };
+            decorate_binding(&mut module, 1, layout.set, binding);
+            decorate_binding(&mut module, 2, layout.set, binding);
+
+            let error = validate_descriptor_binding_classes(&module, layout)
+                .expect_err("image and texel-buffer descriptors cannot alias");
+            assert!(error.contains("is shared by"), "{error}");
+        }
     }
 }

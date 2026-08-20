@@ -5,11 +5,57 @@
 //! tests.
 
 use crate::spirv_binary::{self, Error as ParseError};
-use spirv::{Op, Word};
-use std::collections::HashMap;
+use spirv::{Decoration, Op, Word};
+use std::collections::{HashMap, HashSet};
 
 pub(crate) use crate::spirv_operand::Operand;
 use crate::spirv_operand::{Assemble, Disassemble};
+
+/// Descriptor binding numbers occupied in one descriptor set.
+///
+/// Binding numbers are scoped by descriptor set. Synthesized-resource allocators must therefore
+/// pair the two decorations by target id instead of treating every `Binding` decoration in the
+/// module as global occupancy.
+pub(crate) fn descriptor_bindings_in_set(module: &Module, set: u32) -> HashSet<u32> {
+    let targets = module
+        .annotations
+        .iter()
+        .filter_map(|instruction| {
+            if instruction.class.opcode != Op::Decorate
+                || instruction.operands.get(1)
+                    != Some(&Operand::Decoration(Decoration::DescriptorSet))
+                || instruction.operands.get(2) != Some(&Operand::LiteralBit32(set))
+            {
+                return None;
+            }
+            match instruction.operands.first() {
+                Some(Operand::IdRef(target)) => Some(*target),
+                _ => None,
+            }
+        })
+        .collect::<HashSet<_>>();
+    module
+        .annotations
+        .iter()
+        .filter_map(|instruction| {
+            if instruction.class.opcode != Op::Decorate
+                || instruction.operands.get(1) != Some(&Operand::Decoration(Decoration::Binding))
+            {
+                return None;
+            }
+            let Some(Operand::IdRef(target)) = instruction.operands.first() else {
+                return None;
+            };
+            if !targets.contains(target) {
+                return None;
+            }
+            match instruction.operands.get(2) {
+                Some(Operand::LiteralBit32(binding)) => Some(*binding),
+                _ => None,
+            }
+        })
+        .collect()
+}
 
 fn is_location_debug(opcode: Op) -> bool {
     matches!(opcode, Op::Line | Op::NoLine)

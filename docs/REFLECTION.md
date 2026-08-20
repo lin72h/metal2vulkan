@@ -95,12 +95,12 @@ By default, every descriptor-backed Metal-facing resource uses **descriptor set 
 | `[[color(n)]]` (framebuffer fetch) | `ColorInput` | `COLOR_INPUT_BINDING_BASE + n` → **`192 + n`** (color band `192`–`199`) |
 | Implicit imageblock attachment `n`, data rate `r` | `implicit_imageblock_attachments` | `IMAGEBLOCK_BINDING_BASE + 3*n + r` → **`200 + 3*n + r`** |
 | Custom fragment imageblock master member `n` | `fragment_imageblock.members[n]` | `FRAGMENT_IMAGEBLOCK_BINDING_BASE + n` → **`224 + n`** when projected |
-| Acceleration-structure shadow buffer | `AccelerationStructureShadow` | Metal buffer index `n` (set 0) |
-| Primitive acceleration structure | `PrimitiveAccelerationStructure` | Metal buffer index `n` (set 0); descriptor only when AIR intersection lowering consumes its geometry shadow |
+| Acceleration-structure shadow buffer | `AccelerationStructureShadow` | selected buffer range at Metal index `n` |
+| Primitive acceleration structure | `PrimitiveAccelerationStructure` | selected buffer range at Metal index `n`; descriptor only when AIR intersection lowering consumes its geometry shadow |
 | Authored visible/intersection function table | `VisibleFunctionTable` / `IntersectionFunctionTable` | **no descriptor** (`descriptor: None`); `metal_index` and `param_index` identify static linkage |
-| Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | `32 + synthetic_index` |
+| Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | selected sampled- or storage-texture range at `synthetic_index` |
 | Device buffer embedded in argument buffer | `EmbeddedArgBufferBuffer` | **no descriptor**; owner field contains its Vulkan device address |
-| Synthesized direct-buffer address table | `BufferAddressTable` | translator-selected binding at or above `SYNTHETIC_BINDING_BASE` (`640`); one `u64` address per Metal buffer slot |
+| Synthesized direct-buffer address table | `BufferAddressTable` | first free binding in the selected synthetic range (default starts at `640`); one `u64` address per Metal buffer slot |
 
 Constants live in `metal2vulkan::reflect`:
 
@@ -137,10 +137,10 @@ Descriptor types for `bindings`:
 | Kind | Vulkan descriptor type |
 |---|---|
 | `Buffer`, `KernelStageInput`, `AccelerationStructureShadow`, `PrimitiveAccelerationStructure`, `BufferAddressTable` | Storage buffer |
-| `Texture` | Sampled image |
-| `EmbeddedArgBufferTexture` | Sampled image or storage image according to `access` |
-| `TextureArray` | Sampled-image or storage-image array according to `access` |
-| `StorageImage` | Storage image |
+| `Texture` | Sampled image, or uniform texel buffer when `texture_shape.dimension` is `Buffer` |
+| `EmbeddedArgBufferTexture` | Sampled image or storage image according to `access`; a reflected `Buffer` dimension uses the corresponding texel-buffer type |
+| `TextureArray` | Sampled-image or storage-image array according to `access`; a reflected `Buffer` dimension uses the corresponding texel-buffer type |
+| `StorageImage` | Storage image, or storage texel buffer when `texture_shape.dimension` is `Buffer` |
 | `Sampler`, `StaticSampler` | Sampler |
 | `ColorInput` | Input attachment |
 
@@ -326,7 +326,8 @@ let options = TransformOptions::default().with_runtime_sampler(
 )?;
 ```
 
-The index is the Metal `[[sampler(n)]]` index, not the Vulkan descriptor binding (`160 + n`). A
+The index is the Metal `[[sampler(n)]]` index, not the Vulkan descriptor binding (by default,
+`160 + n`). A
 successful reflected translation copies every applied state into
 `runtime_sampler_specializations`; consumers should create the descriptor sampler from that same
 state. Pixel-coordinate operations are rewritten to texel fetches and shader-side filtering and
@@ -359,8 +360,8 @@ let options = TransformOptions::default().with_runtime_storage_image(
 )?;
 ```
 
-For a top-level binding, the index is the Metal `[[texture(n)]]` index, not the Vulkan binding
-(`480 + n`). For an `EmbeddedArgBufferTexture`, pass that binding's reflected `metal_index`; this is
+For a top-level binding, the index is the Metal `[[texture(n)]]` index, not the default Vulkan
+binding (`480 + n`). For an `EmbeddedArgBufferTexture`, pass that binding's reflected `metal_index`; this is
 a translator-assigned synthetic index, so consumers must not reconstruct it from argument-buffer
 field positions. Translation selects the compatible explicit SPIR-V image format and independently
 specializes bindings that previously shared an AIR image type. When the runtime format has no exact
@@ -380,14 +381,16 @@ choice. Create the image view and descriptor from the same runtime state used fo
 1. Call `translate_reflected` (or a serde-enabled CLI with `--emit-meta`).
 2. Cache `(spv_bytes, reflection)` keyed by input hash + `reflection_version` + translator version.
 3. Create a Vulkan pipeline with entry point `"main"`.
-4. Build the ordinary portion of set 0 from every `bindings` entry with `Some(descriptor)`:
+4. Build the ordinary portion of the effective `descriptor_layout.set` from every `bindings` entry
+   with `Some(descriptor)`:
    - Map `kind` → descriptor type.
    - Write `set` / `binding` from `descriptor`.
    - Use `metal_index` to pick the host resource that was bound as Metal slot `n`.
    - For buffers, narrow staging from `footprint` only when `has_unbounded_access` is false; bound
      every strided term from the current draw/dispatch before taking the union.
-5. Add one set-0 storage-image descriptor for every `implicit_imageblock_attachments` entry and
-   every projected `fragment_imageblock` member, using their reported `binding` values.
+5. Add one storage-image descriptor in that same effective set for every
+   `implicit_imageblock_attachments` entry and every projected `fragment_imageblock` member, using
+   their reported `binding` values.
 6. Populate runtime storage images, static samplers, and argument-buffer fields from their
    reflected state/coordinates; resources with `descriptor: None` require no descriptor write.
 7. For `ThreadgroupBuffer` / `imageblock_layouts`, allocate Workgroup / tile storage from
@@ -409,8 +412,9 @@ choice. Create the image view and descriptor from the same runtime state used fo
 | `metal2vulkan::specialize_function_constants` | Specialize FC values on sanitized IR (when needed) |
 | `metal2vulkan::specialize_function_constant_bytes` | Specialize exact-width scalar/vector FC payloads |
 
-Unit coverage for binding numbers lives in `src/reflect/tests.rs` (ABI contract: set 0, bases
-0/32/160/192/200/224/480, with translator-owned descriptors at 640 or above).
+Unit coverage for binding numbers lives in `src/reflect/tests.rs` (the default ABI uses set 0, bases
+0/32/160/192/200/224/480, and a synthetic range beginning at 640; configurable layouts are covered
+separately).
 
 ## What reflection is *not*
 

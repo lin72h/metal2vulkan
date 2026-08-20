@@ -682,88 +682,63 @@ pub fn translate_native_primary_validated(
     if let Some(primary) = primary_storage_buffer_raw_feed_if_needed(&validation_error, &retry) {
         return Ok(primary);
     }
-    Ok(primary_primitive_phi_metadata_if_needed(
-        &validation_error,
-        san_ll,
-        stage,
-        stage_meta.frag.as_ref(),
-        stage_meta.vert.as_ref(),
-        stage_meta.kern.as_ref(),
-        stage_meta.entry_name.as_deref(),
-        tmp,
-        passes::TransformOptions::default(),
+    Ok(
+        primary_primitive_phi_metadata_if_needed(&validation_error, &retry)
+            .or_else(|| primary_pointer_typing_raw_if_needed(&validation_error, &retry))
+            .or_else(|| {
+                primary_pointer_typing_wide_raw_guard_chain_if_needed(
+                    &validation_error,
+                    &primary,
+                    &primary_module,
+                    &retry,
+                )
+            })
+            .or_else(|| primary_other_prune_if_needed(&validation_error, &primary, tmp))
+            .or_else(|| {
+                primary_wide_raw_store_guard_cfg_chain_if_needed(
+                    &validation_error,
+                    &primary,
+                    &primary_module,
+                    &retry,
+                )
+            })
+            .or_else(|| primary_construct_tree_if_needed(&validation_error, &retry))
+            // Plain relooper before prune-then-relooper: the latter deliberately declines when the ordinary
+            // relooper already validates (so the full retry cascade keeps the `val-cfg:relooper` tier label).
+            // Primary-validated has no later relooper step, so adopt it here for the residual CFG class
+            // production already ships via relooper (notably banked `09/de938adc`).
+            .or_else(|| primary_relooper_if_needed(&validation_error, &primary, tmp))
+            .or_else(|| primary_cfg_prune_then_relooper_if_needed(&validation_error, &primary, tmp))
+            // When the primary bytes are too broken for an in-place relooper rewrite (e.g. undefined-id SSA
+            // order after an over-admitted structured emit), re-emit through the production raw→relooper→PSB
+            // composition so primary-validated tracks the shipped cascade for frontier cross-arm residuals.
+            .or_else(|| {
+                let original = finished
+                    .original_module
+                    .as_ref()
+                    .map(assemble_finished_module)
+                    .unwrap_or_else(|| primary.clone());
+                primary_cfg_raw_then_relooper_if_needed(&validation_error, &original, &retry)
+            })
+            .or_else(|| {
+                primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
+                    &validation_error,
+                    &retry,
+                )
+            })
+            .or_else(|| {
+                primary_logical_pointer_inline_sroa_raw_if_needed(&validation_error, &retry)
+            })
+            .or_else(|| {
+                primary_opaque_image_select_module_if_needed(
+                    &validation_error,
+                    &primary_module,
+                    &primary,
+                    tmp,
+                )
+            })
+            .unwrap_or(primary),
     )
-    .or_else(|| primary_pointer_typing_raw_if_needed(&validation_error, &retry))
-    .or_else(|| {
-        primary_pointer_typing_wide_raw_guard_chain_if_needed(
-            &validation_error,
-            &primary,
-            &primary_module,
-            &retry,
-        )
-    })
-    .or_else(|| primary_other_prune_if_needed(&validation_error, &primary, tmp))
-    .or_else(|| {
-        primary_wide_raw_store_guard_cfg_chain_if_needed(
-            &validation_error,
-            &primary,
-            &primary_module,
-            &retry,
-        )
-    })
-    .or_else(|| primary_construct_tree_if_needed(&validation_error, &retry))
-    // Plain relooper before prune-then-relooper: the latter deliberately declines when the ordinary
-    // relooper already validates (so the full retry cascade keeps the `val-cfg:relooper` tier label).
-    // Primary-validated has no later relooper step, so adopt it here for the residual CFG class
-    // production already ships via relooper (notably banked `09/de938adc`).
-    .or_else(|| primary_relooper_if_needed(&validation_error, &primary, tmp))
-    .or_else(|| primary_cfg_prune_then_relooper_if_needed(&validation_error, &primary, tmp))
-    // When the primary bytes are too broken for an in-place relooper rewrite (e.g. undefined-id SSA
-    // order after an over-admitted structured emit), re-emit through the production raw→relooper→PSB
-    // composition so primary-validated tracks the shipped cascade for frontier cross-arm residuals.
-    .or_else(|| {
-        let original = finished
-            .original_module
-            .as_ref()
-            .map(assemble_finished_module)
-            .unwrap_or_else(|| primary.clone());
-        primary_cfg_raw_then_relooper_if_needed(&validation_error, &original, &retry)
-    })
-    .or_else(|| {
-        primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
-            &validation_error,
-            san_ll,
-            stage,
-            stage_meta.frag.as_ref(),
-            stage_meta.vert.as_ref(),
-            stage_meta.kern.as_ref(),
-            stage_meta.entry_name.as_deref(),
-            tmp,
-            passes::TransformOptions::default(),
-        )
-    })
-    .or_else(|| {
-        primary_logical_pointer_inline_sroa_raw_if_needed(
-            &validation_error,
-            san_ll,
-            stage,
-            stage_meta.frag.as_ref(),
-            stage_meta.vert.as_ref(),
-            stage_meta.kern.as_ref(),
-            stage_meta.entry_name.as_deref(),
-            tmp,
-            passes::TransformOptions::default(),
-        )
-    })
-    .or_else(|| {
-        primary_opaque_image_select_module_if_needed(
-            &validation_error,
-            &primary_module,
-            &primary,
-            tmp,
-        )
-    })
-    .unwrap_or(primary))
 }
 
 /// Run the interface+lowering passes on emitted SPIR-V bytes and assemble to a canonical byte
@@ -1138,26 +1113,15 @@ fn translate_sanitized_with_meta(
     }
     let retry_debug_on = rc.retry_debug_on;
     let has_device_address_pointer = has_device_address_pointer_load(san_ll);
-    let translated = match tools::emit_vulkan_spirv_with_sidecar(
+    let primary_finished = tools::emit_vulkan_spirv_with_sidecar(
         san_ll,
         tmp,
         rc.kern,
         rc.entry_name,
         stage_buffer_layouts(rc.stage, rc.frag, rc.vert, rc.kern),
     )
-    .and_then(|b| {
-        finish_module(
-            b,
-            rc.stage,
-            rc.frag,
-            rc.vert,
-            rc.kern,
-            rc.entry_name,
-            rc.air_data_layout.as_ref(),
-            rc.options,
-            FinishRewrites::Primary,
-        )
-    }) {
+    .and_then(|emitted| rc.finish_primary_carrier(emitted));
+    let translated = match primary_finished {
         Ok(finished) => {
             // `finish_module` applies the in-process primary rewrites before assembly. Try the
             // phi-only PSB candidate only if spirv-val identifies its cross-binding pointer rule.
@@ -1214,17 +1178,9 @@ fn translate_sanitized_with_meta(
                     primary_storage_buffer_raw_feed_if_needed(&validation_error, &rc)
                 {
                     Ok(primary)
-                } else if let Some(primary) = primary_primitive_phi_metadata_if_needed(
-                    &validation_error,
-                    san_ll,
-                    rc.stage,
-                    rc.frag,
-                    rc.vert,
-                    rc.kern,
-                    rc.entry_name,
-                    tmp,
-                    rc.options,
-                ) {
+                } else if let Some(primary) =
+                    primary_primitive_phi_metadata_if_needed(&validation_error, &rc)
+                {
                     Ok(primary)
                 } else if let Some(primary) =
                     primary_pointer_typing_raw_if_needed(&validation_error, &rc)
@@ -1263,28 +1219,13 @@ fn translate_sanitized_with_meta(
                 } else if let Some(primary) =
                     primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
                         &validation_error,
-                        san_ll,
-                        rc.stage,
-                        rc.frag,
-                        rc.vert,
-                        rc.kern,
-                        rc.entry_name,
-                        tmp,
-                        rc.options,
+                        &rc,
                     )
                 {
                     Ok(primary)
-                } else if let Some(primary) = primary_logical_pointer_inline_sroa_raw_if_needed(
-                    &validation_error,
-                    san_ll,
-                    rc.stage,
-                    rc.frag,
-                    rc.vert,
-                    rc.kern,
-                    rc.entry_name,
-                    tmp,
-                    rc.options,
-                ) {
+                } else if let Some(primary) =
+                    primary_logical_pointer_inline_sroa_raw_if_needed(&validation_error, &rc)
+                {
                     Ok(primary)
                 } else if let Some(primary) = primary_opaque_image_select_module_if_needed(
                     &validation_error,

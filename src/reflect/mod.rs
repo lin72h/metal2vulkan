@@ -119,9 +119,13 @@ pub const BUFFER_BINDING_RANGE: DescriptorBindingRange =
     DescriptorBindingRange { start: 0, end: 32 };
 /// Descriptor binding base for `[[texture(n)]]` resources: binding = `TEXTURE_BINDING_BASE + n`.
 pub const TEXTURE_BINDING_BASE: u32 = 32;
+/// Number of texture argument-table entries exposed by the Metal ABI. This source limit is
+/// independent of the selected descriptor layout's capacity.
+pub const TEXTURE_ARGUMENT_COUNT: u32 = 128;
+pub const TEXTURE_ARGUMENT_COUNT_USIZE: usize = TEXTURE_ARGUMENT_COUNT as usize;
 pub const TEXTURE_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
     start: TEXTURE_BINDING_BASE,
-    end: 160,
+    end: TEXTURE_BINDING_BASE + TEXTURE_ARGUMENT_COUNT,
 };
 /// Descriptor binding base for `[[sampler(n)]]` resources: binding = `SAMPLER_BINDING_BASE + n`.
 pub const SAMPLER_BINDING_BASE: u32 = TEXTURE_BINDING_RANGE.end;
@@ -162,13 +166,10 @@ pub const FRAGMENT_IMAGEBLOCK_BINDING_RANGE: DescriptorBindingRange = Descriptor
 pub const STORAGE_TEXTURE_BINDING_BASE: u32 = FRAGMENT_IMAGEBLOCK_BINDING_RANGE.end;
 pub const STORAGE_TEXTURE_BINDING_RANGE: DescriptorBindingRange = DescriptorBindingRange {
     start: STORAGE_TEXTURE_BINDING_BASE,
-    end: 608,
+    end: STORAGE_TEXTURE_BINDING_BASE + TEXTURE_ARGUMENT_COUNT,
 };
-/// Number of Metal texture argument-table entries that can be specialized independently.
-pub const TEXTURE_ARGUMENT_COUNT_USIZE: usize =
-    (TEXTURE_BINDING_RANGE.end - TEXTURE_BINDING_RANGE.start) as usize;
-/// Translator-owned descriptors (currently direct-buffer address tables) are allocated at or above
-/// this base, after every fixed Metal-facing band.
+/// Start of the default translator-owned descriptor range (currently direct-buffer address tables),
+/// after every fixed Metal-facing band.
 pub const SYNTHETIC_BINDING_BASE: u32 = 640;
 
 /// Complete descriptor layout selected for one independently translated stage.
@@ -769,7 +770,10 @@ impl RuntimeSamplerState {
         Ok(())
     }
 
-    pub(crate) fn lowering_state(self) -> StaticSamplerState {
+    /// Project pipeline-provided state into the sampler-lowering representation shared by the
+    /// translator and consumers that create the matching Vulkan sampler. `raw_words` is zeroed
+    /// because runtime state has no AIR constexpr encoding.
+    pub fn lowering_state(self) -> StaticSamplerState {
         StaticSamplerState {
             min_filter: self.min_filter,
             mag_filter: self.mag_filter,
@@ -1428,7 +1432,9 @@ impl ShaderReflection {
         enum DescriptorClass {
             StorageBuffer,
             SampledImage,
+            UniformTexelBuffer,
             StorageImage,
+            StorageTexelBuffer,
             Sampler,
             InputAttachment,
         }
@@ -1468,6 +1474,9 @@ impl ShaderReflection {
                     resource.kind,
                     ResourceKind::TextureArray | ResourceKind::EmbeddedArgBufferTexture
                 ) && resource.access == Some(ResourceAccess::Storage);
+            let texel_buffer = resource
+                .texture_shape
+                .is_some_and(|shape| shape.dimension == TextureDimension::Buffer);
             let class = match resource.kind {
                 ResourceKind::Buffer
                 | ResourceKind::KernelStageInput
@@ -1478,8 +1487,12 @@ impl ShaderReflection {
                 | ResourceKind::TextureArray
                 | ResourceKind::StorageImage
                 | ResourceKind::EmbeddedArgBufferTexture => {
-                    if storage_texture {
+                    if storage_texture && texel_buffer {
+                        DescriptorClass::StorageTexelBuffer
+                    } else if storage_texture {
                         DescriptorClass::StorageImage
+                    } else if texel_buffer {
+                        DescriptorClass::UniformTexelBuffer
                     } else {
                         DescriptorClass::SampledImage
                     }
