@@ -1189,32 +1189,49 @@ mod platform {
                     .buffer_info(info)
             })
             .collect::<Vec<_>>();
-        let mut image_groups = images
+        let image_targets = images
             .iter()
-            .filter(|image| image.descriptor_count == 1)
-            .map(|image| vec![image])
+            .flat_map(|image| {
+                image
+                    .descriptor_targets()
+                    .map(move |target| (image, target))
+            })
             .collect::<Vec<_>>();
-        let mut array_groups =
-            std::collections::BTreeMap::<u32, Vec<(u32, &ImageAllocation)>>::new();
+        let mut image_groups = image_targets
+            .iter()
+            .filter(|(_, target)| target.count == 1)
+            .map(|target| vec![*target])
+            .collect::<Vec<_>>();
+        let mut array_groups = std::collections::BTreeMap::<
+            (u32, i32),
+            Vec<(u32, &ImageAllocation, TextureDescriptorTarget)>,
+        >::new();
         for image in &images {
-            if image.descriptor_count > 1 {
-                array_groups
-                    .entry(image.descriptor_binding)
-                    .or_default()
-                    .push((image.descriptor_element, image));
+            for target in image.descriptor_targets() {
+                if target.count > 1 {
+                    array_groups
+                        .entry((target.binding, target.descriptor_type.as_raw()))
+                        .or_default()
+                        .push((target.element, image, target));
+                }
             }
         }
         for elements in array_groups.values_mut() {
-            elements.sort_by_key(|(element, _)| *element);
-            image_groups.push(elements.iter().map(|(_, image)| *image).collect());
+            elements.sort_by_key(|(element, _, _)| *element);
+            image_groups.push(
+                elements
+                    .iter()
+                    .map(|(_, image, target)| (*image, *target))
+                    .collect(),
+            );
         }
         let image_infos = image_groups
             .iter()
             .map(|group| {
-                let descriptor_count = group[0].descriptor_count as usize;
+                let descriptor_count = group[0].1.count as usize;
                 (0..descriptor_count)
                     .map(|index| {
-                        let image = group[index.min(group.len() - 1)];
+                        let image = group[index.min(group.len() - 1)].0;
                         vk::DescriptorImageInfo::default()
                             .image_view(image.view)
                             .image_layout(vk::ImageLayout::GENERAL)
@@ -1223,26 +1240,34 @@ mod platform {
             })
             .collect::<Vec<_>>();
         writes.extend(image_groups.iter().zip(&image_infos).map(|(group, info)| {
-            let image = group[0];
+            let target = group[0].1;
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
-                .dst_binding(image.descriptor_binding)
-                .descriptor_type(image.descriptor_type)
+                .dst_binding(target.binding)
+                .descriptor_type(target.descriptor_type)
                 .image_info(info)
         }));
-        let texel_views = texel_buffers
+        let texel_targets = texel_buffers
             .iter()
-            .map(|buffer| [buffer.view])
+            .flat_map(|buffer| {
+                buffer
+                    .descriptor_targets()
+                    .map(move |target| (buffer, target))
+            })
+            .collect::<Vec<_>>();
+        let texel_views = texel_targets
+            .iter()
+            .map(|(buffer, _)| [buffer.view])
             .collect::<Vec<_>>();
         writes.extend(
-            texel_buffers
+            texel_targets
                 .iter()
                 .zip(&texel_views)
-                .map(|(buffer, views)| {
+                .map(|((_, target), views)| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(descriptor_set)
-                        .dst_binding(buffer.descriptor_binding)
-                        .descriptor_type(buffer.descriptor_type)
+                        .dst_binding(target.binding)
+                        .descriptor_type(target.descriptor_type)
                         .texel_buffer_view(views)
                 }),
         );
@@ -2407,6 +2432,7 @@ mod platform {
         descriptor_type: vk::DescriptorType,
         descriptor_element: u32,
         descriptor_count: u32,
+        descriptor_aliases: Vec<TextureDescriptorTarget>,
         image: vk::Image,
         view: vk::ImageView,
         memory: vk::DeviceMemory,
@@ -2422,10 +2448,53 @@ mod platform {
         binding: u32,
         descriptor_binding: u32,
         descriptor_type: vk::DescriptorType,
+        descriptor_aliases: Vec<TextureDescriptorTarget>,
         format: crate::case::TextureFormat,
         dimensions: [u32; 3],
         buffer: HostBuffer,
         view: vk::BufferView,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) struct TextureDescriptorTarget {
+        pub(super) binding: u32,
+        pub(super) descriptor_type: vk::DescriptorType,
+        pub(super) element: u32,
+        pub(super) count: u32,
+    }
+
+    impl ImageAllocation {
+        fn descriptor_targets(&self) -> impl Iterator<Item = TextureDescriptorTarget> + '_ {
+            std::iter::once(TextureDescriptorTarget {
+                binding: self.descriptor_binding,
+                descriptor_type: self.descriptor_type,
+                element: self.descriptor_element,
+                count: self.descriptor_count,
+            })
+            .chain(self.descriptor_aliases.iter().copied())
+        }
+
+        fn uses_descriptor_type(&self, descriptor_type: vk::DescriptorType) -> bool {
+            self.descriptor_targets()
+                .any(|target| target.descriptor_type == descriptor_type)
+        }
+    }
+
+    impl TexelBufferAllocation {
+        fn descriptor_targets(&self) -> impl Iterator<Item = TextureDescriptorTarget> + '_ {
+            std::iter::once(TextureDescriptorTarget {
+                binding: self.descriptor_binding,
+                descriptor_type: self.descriptor_type,
+                element: 0,
+                count: 1,
+            })
+            .chain(self.descriptor_aliases.iter().copied())
+        }
+
+        fn uses_descriptor_type(&self, descriptor_type: vk::DescriptorType) -> bool {
+            self.descriptor_targets()
+                .any(|target| target.descriptor_type == descriptor_type)
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -2851,6 +2920,115 @@ mod platform {
         }
     }
 
+    pub(super) fn top_level_texture_targets(
+        reflection: &ShaderReflection,
+        metal_index: u32,
+        buffer_texture: bool,
+    ) -> Result<Vec<TextureDescriptorTarget>, String> {
+        let targets = reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.metal_index == metal_index
+                    && matches!(
+                        binding.kind,
+                        metal2vulkan::reflect::ResourceKind::Texture
+                            | metal2vulkan::reflect::ResourceKind::StorageImage
+                    )
+                    && binding.texture_shape.map_or(!buffer_texture, |shape| {
+                        (shape.dimension == metal2vulkan::meta::TextureDimension::Buffer)
+                            == buffer_texture
+                    })
+            })
+            .map(|binding| {
+                let descriptor = binding
+                    .descriptor
+                    .ok_or_else(|| format!("texture {metal_index} has no descriptor location"))?;
+                Ok(TextureDescriptorTarget {
+                    binding: descriptor.binding,
+                    descriptor_type: vulkan_texture_descriptor_type(binding),
+                    element: 0,
+                    count: descriptor.count,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        sorted_texture_targets(targets, &format!("texture {metal_index}"))
+    }
+
+    fn sorted_texture_targets(
+        mut targets: Vec<TextureDescriptorTarget>,
+        label: &str,
+    ) -> Result<Vec<TextureDescriptorTarget>, String> {
+        targets.sort_by_key(|target| {
+            (
+                target.descriptor_type != vk::DescriptorType::STORAGE_IMAGE
+                    && target.descriptor_type != vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                target.binding,
+                target.element,
+            )
+        });
+        targets.dedup();
+        if targets.is_empty() {
+            return Err(format!("{label} has no executable reflection binding"));
+        }
+        Ok(targets)
+    }
+
+    pub(super) fn texture_array_targets(
+        reflection: &ShaderReflection,
+        metal_index: u32,
+        element: u32,
+    ) -> Result<Vec<TextureDescriptorTarget>, String> {
+        let targets = reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.kind == metal2vulkan::reflect::ResourceKind::TextureArray
+                    && binding.metal_index == metal_index
+            })
+            .map(|binding| {
+                let descriptor = binding.descriptor.ok_or_else(|| {
+                    format!("texture-array {metal_index} has no descriptor location")
+                })?;
+                Ok(TextureDescriptorTarget {
+                    binding: descriptor.binding,
+                    descriptor_type: vulkan_texture_descriptor_type(binding),
+                    element,
+                    count: descriptor.count,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        sorted_texture_targets(targets, &format!("texture-array {metal_index}"))
+    }
+
+    fn embedded_texture_targets(
+        reflection: &ShaderReflection,
+        resource: &crate::literal::LiteralArgumentBufferTexture,
+    ) -> Result<Vec<TextureDescriptorTarget>, String> {
+        let targets = reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.kind == metal2vulkan::reflect::ResourceKind::EmbeddedArgBufferTexture
+            })
+            .filter_map(|binding| {
+                let source = binding.embedded_source?;
+                let descriptor = binding.descriptor?;
+                let delta = resource.field_offset.checked_sub(source.field_offset)?;
+                (source.buffer_index == resource.buffer_binding
+                    && delta % 8 == 0
+                    && delta / 8 < descriptor.count)
+                    .then_some(TextureDescriptorTarget {
+                        binding: descriptor.binding,
+                        descriptor_type: vulkan_texture_descriptor_type(binding),
+                        element: delta / 8,
+                        count: descriptor.count,
+                    })
+            })
+            .collect();
+        sorted_texture_targets(targets, &resource.label())
+    }
+
     fn descriptor_pool_sizes(
         bindings: &[vk::DescriptorSetLayoutBinding<'_>],
     ) -> Vec<vk::DescriptorPoolSize> {
@@ -2879,106 +3057,45 @@ mod platform {
             .iter()
             .filter(|resource| resource.texture_type != crate::case::TextureType::Buffer)
             .map(|resource| {
-                let reflected = reflection
-                    .bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.metal_index == resource.binding
-                            && matches!(
-                                binding.kind,
-                                metal2vulkan::reflect::ResourceKind::Texture
-                                    | metal2vulkan::reflect::ResourceKind::StorageImage
-                            )
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "texture {} has no executable reflection binding",
-                            resource.binding
-                        )
-                    })?;
-                let descriptor = reflected.descriptor.ok_or_else(|| {
-                    format!("texture {} has no descriptor location", resource.binding)
-                })?;
-                let descriptor_type = vulkan_texture_descriptor_type(reflected);
+                let mut targets = top_level_texture_targets(reflection, resource.binding, false)?;
+                let primary = targets.remove(0);
                 create_image(
                     context,
                     &TextureLiteralRef::top_level(resource),
-                    descriptor.binding,
-                    descriptor_type,
-                    0,
-                    descriptor.count,
+                    primary.binding,
+                    primary.descriptor_type,
+                    primary.element,
+                    primary.count,
+                    targets,
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
         for array in &resources.texture_arrays {
-            let reflected = reflection
-                .bindings
-                .iter()
-                .find(|binding| {
-                    binding.kind == metal2vulkan::reflect::ResourceKind::TextureArray
-                        && binding.metal_index == array.binding
-                })
-                .ok_or_else(|| {
-                    format!(
-                        "texture-array {} has no executable reflection binding",
-                        array.binding
-                    )
-                })?;
-            let descriptor = reflected.descriptor.ok_or_else(|| {
-                format!("texture-array {} has no descriptor location", array.binding)
-            })?;
-            let descriptor_type =
-                if reflected.access == Some(metal2vulkan::reflect::ResourceAccess::Storage) {
-                    vk::DescriptorType::STORAGE_IMAGE
-                } else {
-                    vk::DescriptorType::SAMPLED_IMAGE
-                };
             for (element, resource) in array.elements.iter().enumerate() {
+                let mut targets = texture_array_targets(reflection, array.binding, element as u32)?;
+                let primary = targets.remove(0);
                 images.push(create_image(
                     context,
                     &TextureLiteralRef::array_element(array.binding, element as u32, resource),
-                    descriptor.binding,
-                    descriptor_type,
-                    element as u32,
-                    descriptor.count,
+                    primary.binding,
+                    primary.descriptor_type,
+                    primary.element,
+                    primary.count,
+                    targets,
                 )?);
             }
         }
         for resource in &resources.argument_buffer_textures {
-            let (reflected, element) = reflection
-                .bindings
-                .iter()
-                .filter(|binding| {
-                    binding.kind == metal2vulkan::reflect::ResourceKind::EmbeddedArgBufferTexture
-                })
-                .find_map(|binding| {
-                    let source = binding.embedded_source?;
-                    let descriptor = binding.descriptor?;
-                    let delta = resource.field_offset.checked_sub(source.field_offset)?;
-                    (source.buffer_index == resource.buffer_binding
-                        && delta % 8 == 0
-                        && delta / 8 < descriptor.count)
-                        .then_some((binding, delta / 8))
-                })
-                .ok_or_else(|| {
-                    format!("{} has no executable reflection binding", resource.label())
-                })?;
-            let descriptor = reflected
-                .descriptor
-                .ok_or_else(|| format!("{} has no descriptor location", resource.label()))?;
-            let descriptor_type =
-                if reflected.access == Some(metal2vulkan::reflect::ResourceAccess::Storage) {
-                    vk::DescriptorType::STORAGE_IMAGE
-                } else {
-                    vk::DescriptorType::SAMPLED_IMAGE
-                };
+            let mut targets = embedded_texture_targets(reflection, resource)?;
+            let primary = targets.remove(0);
             images.push(create_image(
                 context,
                 &TextureLiteralRef::argument_buffer(resource),
-                descriptor.binding,
-                descriptor_type,
-                element,
-                descriptor.count,
+                primary.binding,
+                primary.descriptor_type,
+                primary.element,
+                primary.count,
+                targets,
             )?);
         }
         for attachment in &reflection.implicit_imageblock_attachments {
@@ -3022,6 +3139,7 @@ mod platform {
                 vk::DescriptorType::STORAGE_IMAGE,
                 0,
                 1,
+                Vec::new(),
             )?);
         }
         if let (Some(authored), Some(reflected)) = (
@@ -3061,6 +3179,7 @@ mod platform {
                     vk::DescriptorType::STORAGE_IMAGE,
                     0,
                     1,
+                    Vec::new(),
                 )?);
             }
         }
@@ -3077,64 +3196,48 @@ mod platform {
             .iter()
             .filter(|resource| resource.texture_type == crate::case::TextureType::Buffer)
             .map(|resource| {
-                let reflected = reflection
-                    .bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.metal_index == resource.binding
-                            && matches!(
-                                binding.kind,
-                                metal2vulkan::reflect::ResourceKind::Texture
-                                    | metal2vulkan::reflect::ResourceKind::StorageImage
-                            )
-                            && binding.texture_shape.is_some_and(|shape| {
-                                shape.dimension == metal2vulkan::meta::TextureDimension::Buffer
-                            })
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "texture buffer {} has no executable reflection binding",
-                            resource.binding
-                        )
-                    })?;
-                let descriptor = reflected.descriptor.ok_or_else(|| {
-                    format!(
-                        "texture buffer {} has no descriptor location",
-                        resource.binding
-                    )
-                })?;
-                if descriptor.count != 1 {
+                let mut targets = top_level_texture_targets(reflection, resource.binding, true)?;
+                if let Some(target) = targets.iter().find(|target| target.count != 1) {
                     return Err(format!(
                         "texture buffer {} has unsupported descriptor count {}",
-                        resource.binding, descriptor.count
+                        resource.binding, target.count
                     ));
                 }
-                let descriptor_type = vulkan_texture_descriptor_type(reflected);
-                let required_feature =
-                    if descriptor_type == vk::DescriptorType::STORAGE_TEXEL_BUFFER {
-                        vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER
-                    } else {
-                        vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER
-                    };
+                let primary = targets.remove(0);
+                let uses_storage = primary.descriptor_type
+                    == vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                    || targets.iter().any(|target| {
+                        target.descriptor_type == vk::DescriptorType::STORAGE_TEXEL_BUFFER
+                    });
+                let uses_uniform = primary.descriptor_type
+                    == vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                    || targets.iter().any(|target| {
+                        target.descriptor_type == vk::DescriptorType::UNIFORM_TEXEL_BUFFER
+                    });
+                let mut required_features = vk::FormatFeatureFlags::empty();
+                let mut usage = vk::BufferUsageFlags::empty();
+                if uses_storage {
+                    required_features |= vk::FormatFeatureFlags::STORAGE_TEXEL_BUFFER;
+                    usage |= vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER;
+                }
+                if uses_uniform {
+                    required_features |= vk::FormatFeatureFlags::UNIFORM_TEXEL_BUFFER;
+                    usage |= vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER;
+                }
                 let format = vulkan_format(resource.format);
                 let properties = unsafe {
                     context
                         .instance
                         .get_physical_device_format_properties(context.physical, format)
                 };
-                if !properties.buffer_features.contains(required_feature) {
+                if !properties.buffer_features.contains(required_features) {
                     return Err(format!(
                         "Vulkan device lacks texel-buffer feature {:#x} for texture {} format {}",
-                        required_feature.as_raw(),
+                        required_features.as_raw(),
                         resource.binding,
                         format.as_raw()
                     ));
                 }
-                let usage = if descriptor_type == vk::DescriptorType::STORAGE_TEXEL_BUFFER {
-                    vk::BufferUsageFlags::STORAGE_TEXEL_BUFFER
-                } else {
-                    vk::BufferUsageFlags::UNIFORM_TEXEL_BUFFER
-                };
                 let buffer = create_host_buffer(
                     context,
                     &format!("texture buffer {}", resource.binding),
@@ -3152,8 +3255,9 @@ mod platform {
                 Ok(TexelBufferAllocation {
                     device: context.device.clone(),
                     binding: resource.binding,
-                    descriptor_binding: descriptor.binding,
-                    descriptor_type,
+                    descriptor_binding: primary.binding,
+                    descriptor_type: primary.descriptor_type,
+                    descriptor_aliases: targets,
                     format: resource.format,
                     dimensions: resource.dimensions,
                     buffer,
@@ -3495,11 +3599,16 @@ mod platform {
         descriptor_type: vk::DescriptorType,
         descriptor_element: u32,
         descriptor_count: u32,
+        descriptor_aliases: Vec<TextureDescriptorTarget>,
     ) -> Result<ImageAllocation, String> {
         let layout = resource.layout()?;
         let label = &resource.label;
         if layout.sample_count != 1 {
-            if descriptor_type != vk::DescriptorType::SAMPLED_IMAGE {
+            if descriptor_type != vk::DescriptorType::SAMPLED_IMAGE
+                || descriptor_aliases
+                    .iter()
+                    .any(|target| target.descriptor_type != vk::DescriptorType::SAMPLED_IMAGE)
+            {
                 return Err(format!(
                     "multisample {label} requires a sampled-image descriptor"
                 ));
@@ -3507,20 +3616,35 @@ mod platform {
             return create_multisample_image(
                 context,
                 resource,
-                descriptor_binding,
-                descriptor_type,
-                descriptor_element,
-                descriptor_count,
+                TextureDescriptorTarget {
+                    binding: descriptor_binding,
+                    descriptor_type,
+                    element: descriptor_element,
+                    count: descriptor_count,
+                },
+                descriptor_aliases,
                 layout,
             );
         }
         let format = vulkan_format(resource.format);
-        let optimal_staging = requires_optimal_staging(resource.texture_type, descriptor_type);
-        let required_feature = if descriptor_type == vk::DescriptorType::STORAGE_IMAGE {
-            vk::FormatFeatureFlags::STORAGE_IMAGE
-        } else {
-            vk::FormatFeatureFlags::SAMPLED_IMAGE
-        };
+        let uses_storage = descriptor_type == vk::DescriptorType::STORAGE_IMAGE
+            || descriptor_aliases
+                .iter()
+                .any(|target| target.descriptor_type == vk::DescriptorType::STORAGE_IMAGE);
+        let uses_sampled = descriptor_type == vk::DescriptorType::SAMPLED_IMAGE
+            || descriptor_aliases
+                .iter()
+                .any(|target| target.descriptor_type == vk::DescriptorType::SAMPLED_IMAGE);
+        let optimal_staging = uses_sampled
+            && !uses_storage
+            && requires_optimal_staging(resource.texture_type, vk::DescriptorType::SAMPLED_IMAGE);
+        let mut required_features = vk::FormatFeatureFlags::empty();
+        if uses_storage {
+            required_features |= vk::FormatFeatureFlags::STORAGE_IMAGE;
+        }
+        if uses_sampled {
+            required_features |= vk::FormatFeatureFlags::SAMPLED_IMAGE;
+        }
         let properties = unsafe {
             context
                 .instance
@@ -3531,11 +3655,11 @@ mod platform {
         } else {
             properties.linear_tiling_features
         };
-        if !available_features.contains(required_feature) {
+        if !available_features.contains(required_features) {
             return Err(format!(
                 "Vulkan device lacks {}-tiling feature {:#x} for texture {} format {}",
                 if optimal_staging { "optimal" } else { "linear" },
-                required_feature.as_raw(),
+                required_features.as_raw(),
                 label,
                 format.as_raw(),
             ));
@@ -3554,11 +3678,14 @@ mod platform {
         ) {
             flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
         }
-        let usage = if descriptor_type == vk::DescriptorType::STORAGE_IMAGE {
-            vk::ImageUsageFlags::STORAGE
-        } else {
-            vk::ImageUsageFlags::SAMPLED
-        } | if optimal_staging {
+        let mut usage = vk::ImageUsageFlags::empty();
+        if uses_storage {
+            usage |= vk::ImageUsageFlags::STORAGE;
+        }
+        if uses_sampled {
+            usage |= vk::ImageUsageFlags::SAMPLED;
+        }
+        usage |= if optimal_staging {
             vk::ImageUsageFlags::TRANSFER_DST
         } else {
             vk::ImageUsageFlags::empty()
@@ -3647,6 +3774,7 @@ mod platform {
             descriptor_type,
             descriptor_element,
             descriptor_count,
+            descriptor_aliases,
             image,
             view,
             memory,
@@ -3780,10 +3908,8 @@ mod platform {
     fn create_multisample_image(
         context: &VulkanContext,
         resource: &TextureLiteralRef<'_>,
-        descriptor_binding: u32,
-        descriptor_type: vk::DescriptorType,
-        descriptor_element: u32,
-        descriptor_count: u32,
+        descriptor: TextureDescriptorTarget,
+        descriptor_aliases: Vec<TextureDescriptorTarget>,
         layout: crate::literal::TextureLayout,
     ) -> Result<ImageAllocation, String> {
         let label = &resource.label;
@@ -3907,10 +4033,11 @@ mod platform {
         Ok(ImageAllocation {
             device: context.device.clone(),
             identity: resource.identity,
-            descriptor_binding,
-            descriptor_type,
-            descriptor_element,
-            descriptor_count,
+            descriptor_binding: descriptor.binding,
+            descriptor_type: descriptor.descriptor_type,
+            descriptor_element: descriptor.element,
+            descriptor_count: descriptor.count,
+            descriptor_aliases,
             image,
             view,
             memory,
@@ -4831,7 +4958,7 @@ OpFunctionEnd
     ) {
         let barriers = buffers
             .iter()
-            .filter(|buffer| buffer.descriptor_type == vk::DescriptorType::STORAGE_TEXEL_BUFFER)
+            .filter(|buffer| buffer.uses_descriptor_type(vk::DescriptorType::STORAGE_TEXEL_BUFFER))
             .map(|buffer| {
                 vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -4991,7 +5118,7 @@ OpFunctionEnd
     ) {
         let barriers = images
             .iter()
-            .filter(|image| image.descriptor_type == vk::DescriptorType::STORAGE_IMAGE)
+            .filter(|image| image.uses_descriptor_type(vk::DescriptorType::STORAGE_IMAGE))
             .map(|image| {
                 vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
@@ -6294,6 +6421,68 @@ mod tests {
             platform::vulkan_texture_descriptor_type(&write.bindings[0])
                 == ash::vk::DescriptorType::STORAGE_TEXEL_BUFFER
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sampled_and_storage_texture_aliases_populate_both_descriptor_bands() {
+        use metal2vulkan::meta::{KernMeta, KernRole};
+
+        for (read_type, write_type, expected_types) in [
+            (
+                "texture2d<float, sample>",
+                "texture2d<float, write>",
+                [
+                    ash::vk::DescriptorType::STORAGE_IMAGE,
+                    ash::vk::DescriptorType::SAMPLED_IMAGE,
+                ],
+            ),
+            (
+                "texture_buffer<float, read>",
+                "texture_buffer<float, write>",
+                [
+                    ash::vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+                    ash::vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                ],
+            ),
+        ] {
+            let mut meta = KernMeta {
+                roles: vec![(0, KernRole::Texture(40)), (1, KernRole::Texture(40))],
+                ..Default::default()
+            };
+            meta.texture_type_names.insert(0, read_type.into());
+            meta.texture_type_names.insert(1, write_type.into());
+            let reflection = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
+            reflection.validate_descriptor_abi().unwrap();
+
+            let targets = platform::top_level_texture_targets(
+                &reflection,
+                40,
+                read_type.starts_with("texture_buffer"),
+            )
+            .unwrap();
+            assert_eq!(targets.len(), 2);
+            assert!(targets[0].descriptor_type == expected_types[0]);
+            assert!(targets[1].descriptor_type == expected_types[1]);
+            assert_eq!(targets[0].binding, 520);
+            assert_eq!(targets[1].binding, 72);
+
+            if !read_type.starts_with("texture_buffer") {
+                let mut array_reflection = reflection.clone();
+                for binding in &mut array_reflection.bindings {
+                    binding.kind = metal2vulkan::reflect::ResourceKind::TextureArray;
+                    binding.descriptor.as_mut().unwrap().count = 128;
+                }
+                let targets = platform::texture_array_targets(&array_reflection, 40, 17).unwrap();
+                assert_eq!(targets.len(), 2);
+                assert!(targets[0].descriptor_type == expected_types[0]);
+                assert!(targets[1].descriptor_type == expected_types[1]);
+                assert_eq!(targets[0].element, 17);
+                assert_eq!(targets[1].element, 17);
+                assert_eq!(targets[0].count, 128);
+                assert_eq!(targets[1].count, 128);
+            }
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

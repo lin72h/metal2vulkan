@@ -487,46 +487,60 @@ fn validate_reflection(
         errors,
     );
     for resource in &case.texture_arrays {
-        let Some(binding) = reflection.bindings.iter().find(|binding| {
-            binding.kind == ResourceKind::TextureArray && binding.metal_index == resource.binding
-        }) else {
+        let alternatives = reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.kind == ResourceKind::TextureArray
+                    && binding.metal_index == resource.binding
+            })
+            .collect::<Vec<_>>();
+        if alternatives.is_empty() {
             continue;
-        };
-        if let Some(fixed_length) = binding
-            .texture_shape
-            .as_ref()
-            .and_then(|shape| shape.array_length)
-        {
-            if resource.elements.len() != fixed_length as usize {
-                errors.push(format!(
-                    "texture-array binding {} has {} authored elements, but AIR declares {fixed_length}",
-                    resource.binding,
-                    resource.elements.len()
-                ));
-            }
         }
-        if binding.descriptor.is_none_or(|descriptor| {
-            descriptor.count != metal2vulkan::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
+        let fixed_lengths = alternatives
+            .iter()
+            .filter_map(|binding| binding.texture_shape?.array_length)
+            .collect::<Vec<_>>();
+        if !fixed_lengths.is_empty()
+            && !fixed_lengths
+                .iter()
+                .any(|length| *length as usize == resource.elements.len())
+        {
+            errors.push(format!(
+                "texture-array binding {} has {} authored elements, but AIR alternatives declare {:?}",
+                resource.binding, resource.elements.len(), fixed_lengths
+            ));
+        }
+        if alternatives.iter().any(|binding| {
+            binding.descriptor.is_none_or(|descriptor| {
+                descriptor.count != metal2vulkan::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
+            })
         }) {
             errors.push(format!(
-                "texture-array binding {} does not expose the {}-descriptor product contract",
+                "texture-array binding {} does not expose the {}-descriptor product contract for every alternative",
                 resource.binding,
                 metal2vulkan::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
             ));
         }
         if resource.role != crate::case::ResourceRole::Input
-            && binding.access != Some(metal2vulkan::reflect::ResourceAccess::Storage)
+            && !alternatives.iter().any(|binding| {
+                binding.access == Some(metal2vulkan::reflect::ResourceAccess::Storage)
+            })
         {
             errors.push(format!(
                 "texture-array binding {} is authored as {:?}, but reflection is read-only",
                 resource.binding, resource.role
             ));
         }
-        validate_texture_shape(
+        validate_texture_alternatives(
             &format!("texture-array binding {}", resource.binding),
             resource.texture_type,
             resource.format,
-            binding.texture_shape,
+            &alternatives
+                .iter()
+                .map(|binding| binding.texture_shape)
+                .collect::<Vec<_>>(),
             errors,
         );
     }
@@ -574,43 +588,53 @@ fn validate_reflection(
         ));
     }
     for resource in &case.argument_buffer_textures {
-        let Some(binding) = reflection.bindings.iter().find(|binding| {
-            if binding.kind != ResourceKind::EmbeddedArgBufferTexture {
-                return false;
-            }
-            let Some(source) = binding.embedded_source else {
-                return false;
-            };
-            let count = binding
-                .descriptor
-                .map(|descriptor| descriptor.count)
-                .unwrap_or(1);
-            source.buffer_index == resource.buffer_binding
-                && resource.field_offset >= source.field_offset
-                && (resource.field_offset - source.field_offset) % 8 == 0
-                && (resource.field_offset - source.field_offset) / 8 < count
-        }) else {
+        let alternatives = reflection
+            .bindings
+            .iter()
+            .filter(|binding| {
+                if binding.kind != ResourceKind::EmbeddedArgBufferTexture {
+                    return false;
+                }
+                let Some(source) = binding.embedded_source else {
+                    return false;
+                };
+                let count = binding
+                    .descriptor
+                    .map(|descriptor| descriptor.count)
+                    .unwrap_or(1);
+                source.buffer_index == resource.buffer_binding
+                    && resource.field_offset >= source.field_offset
+                    && (resource.field_offset - source.field_offset) % 8 == 0
+                    && (resource.field_offset - source.field_offset) / 8 < count
+            })
+            .collect::<Vec<_>>();
+        if alternatives.is_empty() {
             continue;
-        };
+        }
         if resource.role != crate::case::ResourceRole::Input
-            && !binding
-                .texture_shape
-                .as_ref()
-                .is_some_and(|shape| shape.writable)
+            && !alternatives.iter().any(|binding| {
+                binding
+                    .texture_shape
+                    .as_ref()
+                    .is_some_and(|shape| shape.writable)
+            })
         {
             errors.push(format!(
                 "argument-buffer texture {}+{} is authored as {:?}, but reflection is read-only",
                 resource.buffer_binding, resource.field_offset, resource.role
             ));
         }
-        validate_texture_shape(
+        validate_texture_alternatives(
             &format!(
                 "argument-buffer texture {}+{}",
                 resource.buffer_binding, resource.field_offset
             ),
             resource.texture_type,
             resource.format,
-            binding.texture_shape,
+            &alternatives
+                .iter()
+                .map(|binding| binding.texture_shape)
+                .collect::<Vec<_>>(),
             errors,
         );
     }
