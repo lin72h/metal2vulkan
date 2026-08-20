@@ -43,7 +43,7 @@ struct Leaf {
     // zero-offset member path (`%buf %uint_0 %j` → `Some(j)`); `None` for a pure base-address
     // leaf (all indices const-zero). The element pointer is then
     // `OpPtrAccessChain(ConvertUToPtr(base_address), element)` — byte-identical to the descriptor
-    // access because the data array sits at struct byte 0 with stride = `elem_size(pointee)`.
+    // access because the data array sits at struct byte 0 with the pointee's allocation stride.
     element: Option<Word>,
 }
 
@@ -61,6 +61,76 @@ struct PsbDiscovery {
     leaves: Vec<Leaf>,
     buffer_slot: HashMap<Word, u32>,
     const_ids: HashSet<Word>,
+}
+
+/// Allocation stride for a scalar/vector element converted to a physical pointer.
+///
+/// Prefer an existing `ArrayStride` on either a pointer-to-element or an array-of-element: those
+/// decorations were produced by the sidecar-aware layout pass and retain non-default AIR vector
+/// alignment. Conflicting declarations are rejected. With no explicit evidence, use scalar size or
+/// LLVM's ordinary power-of-two vector allocation rule.
+fn element_allocation_stride(
+    module: &Module,
+    type_defs: &HashMap<Word, Instruction>,
+    ty: Word,
+) -> Option<u32> {
+    let mut declared = None;
+    for annotation in &module.annotations {
+        if annotation.class.opcode != Op::Decorate {
+            continue;
+        }
+        let [Operand::IdRef(target), Operand::Decoration(Decoration::ArrayStride), Operand::LiteralBit32(stride)] =
+            annotation.operands.as_slice()
+        else {
+            continue;
+        };
+        let Some(definition) = type_defs.get(target) else {
+            continue;
+        };
+        let carries_ty = match definition.class.opcode {
+            Op::TypePointer => definition.operands.get(1) == Some(&Operand::IdRef(ty)),
+            Op::TypeArray | Op::TypeRuntimeArray => {
+                definition.operands.first() == Some(&Operand::IdRef(ty))
+            }
+            _ => false,
+        };
+        if !carries_ty {
+            continue;
+        }
+        match declared {
+            Some(existing) if existing != *stride => return None,
+            _ => declared = Some(*stride),
+        }
+    }
+    if declared.is_some() {
+        return declared;
+    }
+
+    let definition = type_defs.get(&ty)?;
+    let store_size = match definition.class.opcode {
+        Op::TypeInt | Op::TypeFloat => match definition.operands.first()? {
+            Operand::LiteralBit32(bits) => bits.div_ceil(8),
+            _ => return None,
+        },
+        Op::TypeVector => {
+            let (Operand::IdRef(component), Operand::LiteralBit32(count)) =
+                (definition.operands.first()?, definition.operands.get(1)?)
+            else {
+                return None;
+            };
+            let component = type_defs.get(component)?;
+            let bits = match component.class.opcode {
+                Op::TypeInt | Op::TypeFloat => match component.operands.first()? {
+                    Operand::LiteralBit32(bits) => *bits,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            bits.div_ceil(8).checked_mul(*count)?
+        }
+        _ => return None,
+    };
+    store_size.max(1).checked_next_power_of_two()
 }
 
 /// Discovery + lowerability gate (pure): find the cross-binding pointer-merge closure, prove it is
@@ -133,35 +203,6 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
         .collect();
     let is_buffer_var =
         |id: Word| -> bool { var_storage.get(&id) == Some(&StorageClass::StorageBuffer) };
-
-    // The size in bytes of a scalar/vector type (for the ArrayStride of a physical element pointer).
-    // Bails (None) on aggregates — those sub-graphs are left for the default path / a later lever.
-    let elem_size = |ty: Word| -> Option<u32> {
-        let inst = type_defs.get(&ty)?;
-        match inst.class.opcode {
-            Op::TypeInt | Op::TypeFloat => match inst.operands.first()? {
-                Operand::LiteralBit32(bits) => Some(bits / 8),
-                _ => None,
-            },
-            Op::TypeVector => {
-                let (Operand::IdRef(elem), Operand::LiteralBit32(count)) =
-                    (inst.operands.first()?, inst.operands.get(1)?)
-                else {
-                    return None;
-                };
-                let einst = type_defs.get(elem)?;
-                let ebits = match einst.class.opcode {
-                    Op::TypeInt | Op::TypeFloat => match einst.operands.first()? {
-                        Operand::LiteralBit32(b) => *b,
-                        _ => return None,
-                    },
-                    _ => return None,
-                };
-                Some((ebits / 8) * count)
-            }
-            _ => None,
-        }
-    };
 
     // Whole-function value def map (every SSA result -> defining instruction + result type).
     let mut value_def: HashMap<Word, Instruction> = HashMap::new();
@@ -396,7 +437,7 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
                     Some((_, p)) => p,
                     None => return None,
                 };
-                elem_size(pointee)?;
+                element_allocation_stride(module, &type_defs, pointee)?;
                 if !buffer_slot.contains_key(base) {
                     // The slot IS the buffer's descriptor binding (executor-fillable ABI). A merged
                     // buffer that carries no Binding decoration cannot be addressed by the executor —
@@ -586,38 +627,18 @@ fn rewrite_cross_binding_pointer_merges_inner(
     };
     let is_buffer_var =
         |id: Word| -> bool { var_storage.get(&id) == Some(&StorageClass::StorageBuffer) };
-    let elem_size = |ty: Word| -> Option<u32> {
-        let inst = type_defs.get(&ty)?;
-        match inst.class.opcode {
-            Op::TypeInt | Op::TypeFloat => match inst.operands.first()? {
-                Operand::LiteralBit32(bits) => Some(bits / 8),
-                _ => None,
-            },
-            Op::TypeVector => {
-                let (Operand::IdRef(elem), Operand::LiteralBit32(count)) =
-                    (inst.operands.first()?, inst.operands.get(1)?)
-                else {
-                    return None;
-                };
-                let einst = type_defs.get(elem)?;
-                let ebits = match einst.class.opcode {
-                    Op::TypeInt | Op::TypeFloat => match einst.operands.first()? {
-                        Operand::LiteralBit32(b) => *b,
-                        _ => return None,
-                    },
-                    _ => return None,
-                };
-                Some((ebits / 8) * count)
-            }
-            _ => None,
-        }
-    };
+    let element_strides = type_defs
+        .keys()
+        .filter_map(|ty| {
+            element_allocation_stride(module, &type_defs, *ty).map(|stride| (*ty, stride))
+        })
+        .collect::<HashMap<_, _>>();
     // The natural alignment (component scalar size in bytes) of a scalar/vector pointee. This is the
     // value for the `Aligned` operand of a PhysicalStorageBuffer load/store: it is a power of two and
-    // divides every element offset `j*elem_size` (the buffer base address is highly aligned). A
+    // divides every element offset `j*element_stride` (the buffer base address is highly aligned). A
     // hardcoded `Aligned 1` is rejected (VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314: the
     // value must be at least the largest scalar). A vector's element size (e.g. 12 for v3float) is
-    // NOT necessarily a power of two, so the component size — not `elem_size` — is the correct value.
+    // NOT necessarily a power of two, so the component size — not the allocation stride — is correct.
     let scalar_align = |ty: Word| -> Option<u32> {
         let inst = type_defs.get(&ty)?;
         let scalar = match inst.class.opcode {
@@ -721,7 +742,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         // scalar/vector element pointer). A whole-buffer leaf's pointee is the buffer STRUCT, indexed
         // by `OpAccessChain` (which derives offsets from the struct's own member decorations), so it
         // gets no ArrayStride.
-        if let Some(stride) = elem_size(leaf.pointee) {
+        if let Some(stride) = element_strides.get(&leaf.pointee).copied() {
             module.annotations.push(Instruction::new(
                 Op::Decorate,
                 None,
@@ -764,7 +785,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
                 // Scalar/vector pointee (element pointer used in OpPtrAccessChain) gets an ArrayStride;
                 // an aggregate pointee (the merged whole-buffer struct, indexed by OpAccessChain) does
                 // not — see the leaf pointer creation above.
-                if let Some(stride) = elem_size(pointee) {
+                if let Some(stride) = element_strides.get(&pointee).copied() {
                     module.annotations.push(Instruction::new(
                         Op::Decorate,
                         None,
@@ -1045,7 +1066,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
                             }
                             // Array-element leaf (`%buf %uint_0 %j`): ConvertUToPtr the base address,
                             // then OpPtrAccessChain by the SAME element index `j` (the physical pointee
-                            // pointer is ArrayStride-decorated with `elem_size`, so `base + j*stride`
+                            // pointer carries the source allocation stride, so `base + j*stride`
                             // is byte-identical to the descriptor access). The PtrAccessChain reuses
                             // the leaf id so consumers stay wired.
                             Some(element) => {
@@ -1246,6 +1267,252 @@ mod tests {
 
     fn inst(op: Op, ty: Option<Word>, res: Option<Word>, ops: Vec<Operand>) -> Instruction {
         Instruction::new(op, ty, res, ops)
+    }
+
+    #[test]
+    fn physical_vector_stride_prefers_explicit_layout_and_rejects_conflicts() {
+        let mut module = Module::new();
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeVector,
+                None,
+                Some(2),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(3),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(2),
+                ],
+            ),
+            inst(Op::TypeRuntimeArray, None, Some(4), vec![Operand::IdRef(2)]),
+        ];
+        let type_defs = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| {
+                instruction
+                    .result_id
+                    .map(|result_id| (result_id, instruction.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(element_allocation_stride(&module, &type_defs, 2), Some(4));
+
+        module.annotations.push(inst(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(3),
+                Operand::Decoration(Decoration::ArrayStride),
+                Operand::LiteralBit32(8),
+            ],
+        ));
+        assert_eq!(element_allocation_stride(&module, &type_defs, 2), Some(8));
+
+        module.annotations.push(inst(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(4),
+                Operand::Decoration(Decoration::ArrayStride),
+                Operand::LiteralBit32(4),
+            ],
+        ));
+        assert_eq!(element_allocation_stride(&module, &type_defs, 2), None);
+    }
+
+    #[test]
+    fn rewrite_cross_binding_vector_elements_preserves_source_array_stride() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(40));
+        module.memory_model = Some(inst(
+            Op::MemoryModel,
+            None,
+            None,
+            vec![
+                Operand::AddressingModel(spirv::AddressingModel::Logical),
+                Operand::MemoryModel(MemoryModel::GLSL450),
+            ],
+        ));
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeVector,
+                None,
+                Some(2),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
+            ),
+            inst(Op::TypeRuntimeArray, None, Some(3), vec![Operand::IdRef(2)]),
+            inst(Op::TypeStruct, None, Some(4), vec![Operand::IdRef(3)]),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(4),
+                ],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(2),
+                ],
+            ),
+            inst(Op::TypeBool, None, Some(7), vec![]),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(8),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(8),
+                Some(10),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(8),
+                Some(11),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(Op::ConstantTrue, Some(7), Some(12), vec![]),
+            inst(
+                Op::Variable,
+                Some(5),
+                Some(20),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            inst(
+                Op::Variable,
+                Some(5),
+                Some(21),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+        ];
+        module.annotations = vec![
+            inst(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(3),
+                    Operand::Decoration(Decoration::ArrayStride),
+                    Operand::LiteralBit32(8),
+                ],
+            ),
+            inst(
+                Op::Decorate,
+                None,
+                None,
+                vec![Operand::IdRef(4), Operand::Decoration(Decoration::Block)],
+            ),
+            inst(
+                Op::MemberDecorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(4),
+                    Operand::LiteralBit32(0),
+                    Operand::Decoration(Decoration::Offset),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            inst(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(20),
+                    Operand::Decoration(Decoration::Binding),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            inst(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(21),
+                    Operand::Decoration(Decoration::Binding),
+                    Operand::LiteralBit32(1),
+                ],
+            ),
+        ];
+        let mut block = Block::new();
+        block.label = Some(inst(Op::Label, None, Some(30), vec![]));
+        block.instructions = vec![
+            inst(
+                Op::AccessChain,
+                Some(6),
+                Some(31),
+                vec![Operand::IdRef(20), Operand::IdRef(10), Operand::IdRef(11)],
+            ),
+            inst(
+                Op::AccessChain,
+                Some(6),
+                Some(32),
+                vec![Operand::IdRef(21), Operand::IdRef(10), Operand::IdRef(11)],
+            ),
+            inst(
+                Op::Select,
+                Some(6),
+                Some(33),
+                vec![Operand::IdRef(12), Operand::IdRef(31), Operand::IdRef(32)],
+            ),
+            inst(Op::Load, Some(2), Some(34), vec![Operand::IdRef(33)]),
+            inst(Op::Return, None, None, vec![]),
+        ];
+        let mut function = Function::new();
+        function.blocks = vec![block];
+        module.functions = vec![function];
+
+        assert!(rewrite_cross_binding_pointer_merges(&mut module));
+        let physical_vector_pointer = module
+            .types_global_values
+            .iter()
+            .find_map(|instruction| {
+                (instruction.class.opcode == Op::TypePointer
+                    && instruction.operands
+                        == [
+                            Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                            Operand::IdRef(2),
+                        ])
+                .then_some(instruction.result_id)
+                .flatten()
+            })
+            .expect("physical uchar3 pointer");
+        assert!(module.annotations.iter().any(|annotation| {
+            annotation.class.opcode == Op::Decorate
+                && annotation.operands
+                    == [
+                        Operand::IdRef(physical_vector_pointer),
+                        Operand::Decoration(Decoration::ArrayStride),
+                        Operand::LiteralBit32(8),
+                    ]
+        }));
     }
 
     // A WHOLE-BUFFER cross-binding select — `OpSelect %ptr_struct %cond %bufA %bufB` over two distinct
