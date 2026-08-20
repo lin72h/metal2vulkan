@@ -14,10 +14,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interface globals.
 - Public byte-exact function-constant specialization, reflection-only AIR inspection, authored
   linked-function/table specialization, and vertex-observer generation APIs.
-- Reflection schema v21: consumer metadata now covers decoded static samplers, texture shape and
+- Reflection schema v27: consumer metadata now covers decoded static samplers, texture shape and
   access, argument-buffer resources, kernel stage inputs, tessellation, imageblocks, exact function-
   constant ABI types, buffer extent/access classification, and conservative final-module static and
-  invocation-strided buffer footprints.
+  invocation-strided buffer footprints, plus runtime sampler/storage-image specialization and the
+  effective descriptor layout.
+- Versioned, caller-selected descriptor layouts through `TransformOptions`, allowing independently
+  translated stages to use distinct Vulkan descriptor sets and binding ranges while preserving the
+  existing layout as the explicit default.
+- Runtime pipeline-state specialization by Metal resource index for dynamically bound samplers and
+  writable storage images, including embedded argument-buffer textures, exact reflected sampler and
+  image-format state, and host storage-image feature checks.
 - A task-oriented translation and reflection integration guide plus a compiled serde reflection
   example.
 - Additional stage-interface support for fragment `[[point_coord]]`, `[[primitive_id]]`, and
@@ -50,6 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Buffer, pointer, control-flow, and access-chain lowering handles more structural cases, reducing
   fallbacks and invalid SPIR-V for shaders that use dynamic indices, pointer selects, aggregate
   copies, raw subword loads/stores, and local pointer tables.
+- AIR `target datalayout` vector alignment and exact `air.struct_type_info` member offsets now flow
+  through the primary emitter, aggregate byte walkers, reflection, and every retry tier instead of
+  being reconstructed from generic SPIR-V layout assumptions.
+- The default descriptor ABI now uses checked, non-overlapping bands for buffers, sampled textures,
+  samplers, color inputs, imageblocks, storage textures, and translator-owned resources. Final
+  modules reject descriptors outside their selected class range or set.
 - Structured control-flow retries are bounded more tightly, improving behavior on large shaders and
   avoiding unnecessary fallback to slower emission paths.
 - Corpus translation and classification use bounded parallel workers, a 30-second per-item
@@ -63,8 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full AIR-intrinsic reclassification now updates every cached source in bounded keyset batches,
   independent of `--limit`, without reopening source shards; matrix capability recognition and
   lowering share one exact ABI parser.
-- Reflection documentation now describes the complete schema v21 descriptor, argument-buffer,
-  stage-interface, and conservative buffer-staging contracts.
+- Reflection documentation now describes the complete schema v27 descriptor, argument-buffer,
+  runtime specialization, stage-interface, and conservative buffer-staging contracts.
 
 ### Removed
 
@@ -113,6 +126,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subtraction.
 - Repaired additional raw byte/word buffer, opaque-pointer, aggregate-pointee, record-layout,
   cross-storage select, and late pointer-typing cases without name-keyed workload exceptions.
+- Corrected AIR struct member offsets, aggregate byte strides, and physical-pointer retry layouts
+  for three-lane vectors and custom vector alignments, including preservation and conflict checking
+  of explicit SPIR-V `ArrayStride` evidence.
+- Runtime sampler specialization is now preserved through bounded SSA aliases and rejected when
+  pointer selection or mixed joins make the exact state ambiguous; integer-image LOD queries and
+  gather paths can no longer bypass the specialized state by substituting a default sampler.
+- Runtime storage-image specialization now covers top-level and embedded writable textures across
+  reads, writes, imageblock writes, emulated fetches, and atomics, with matching component and host
+  capability checks in executable and metadata-only reflection paths.
+- Vulkan validation now binds every compatible reflected sampled/storage texture alias to the same
+  allocation and validates texture-array and argument-buffer alternatives as complete sets.
 - Reduced worst-case translation time and memory growth by caching retry verdicts, pruning dead CFG
   before source re-emission, using linear CFG ordering and candidate scans, bounding generated CFG
   growth, and applying resource limits from worker startup.
