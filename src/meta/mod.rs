@@ -437,8 +437,9 @@ pub enum KernRole {
     /// `[[threadgroups_per_grid]]` (`uint` or `uint3`) -> NumWorkgroups.
     /// Scalar params receive component .x; vector params receive the full v3uint.
     ThreadgroupsPerGrid,
-    /// `[[threads_per_grid]]` (`uint` or `uint3`) -> NumWorkgroups * LocalSize.
-    /// Scalar params receive component .x; vector params receive the requested vector prefix.
+    /// `[[threads_per_grid]]` (`uint` or `uint3`) -> the selected kernel dispatch grid. Whole-
+    /// workgroup dispatches derive it as NumWorkgroups * LocalSize; exact-thread dispatches share
+    /// their fixed or push-constant bounds with invocation culling.
     ThreadsPerGrid,
     /// `[[threadgroup_position_in_grid]]` (`uint` or `uint3`) -> WorkgroupId.
     /// Scalar params receive component .x; vector params receive the full v3uint.

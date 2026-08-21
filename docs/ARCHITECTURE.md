@@ -38,6 +38,13 @@ precedence; otherwise all decoration and byte-address walkers share the same nat
 including LLVM allocation-size advancement for three-lane vectors. Retry diagnostics report exact
 metadata layouts that map explicitly and metadata shapes that could not be mapped.
 
+Kernel interface lowering owns one typed dispatch-grid contract. Whole-workgroup dispatch derives
+`[[threads_per_grid]]` from `NumWorkgroups * LocalSize`; exact Metal `dispatchThreads` uses either a
+fixed grid or, by default, a reflected three-`u32` push-constant grid at offset zero. That same value drives a structured entry
+cull for rounded-up Vulkan invocations, including kernels that do not declare the attribute. A
+partial grid with a source control barrier falls back rather than emitting an early return that
+would violate Vulkan barrier participation.
+
 ### Text vs typed IR
 
 The production body path is **parse once → typed IR → emit**. There is no mid-pipeline

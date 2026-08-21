@@ -5,6 +5,33 @@
 //! 480+n, all in descriptor set 0 under the default layout).
 
 use super::*;
+
+#[test]
+fn kernel_dispatch_push_constant_range_is_exact_and_validated() {
+    assert_eq!(
+        KernelDispatch::safe_default(),
+        KernelDispatch::ThreadsPushConstant {
+            offset: DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+        }
+    );
+    let dispatch = KernelDispatch::ThreadsPushConstant { offset: 16 };
+    assert_eq!(
+        dispatch.push_constant_range(),
+        Some(KernelGridPushConstantRange {
+            offset: 16,
+            size: KERNEL_GRID_PUSH_CONSTANT_SIZE,
+        })
+    );
+    assert!(dispatch.validate().is_ok());
+    assert!(KernelDispatch::ThreadsPushConstant { offset: 2 }
+        .validate()
+        .is_err());
+    assert!(KernelDispatch::ThreadsPushConstant {
+        offset: u32::MAX - 3,
+    }
+    .validate()
+    .is_err());
+}
 use crate::meta::{
     parse_air_fragment_meta, parse_air_vertex_meta, EmbeddedTexture, KernMeta, KernRole,
 };
@@ -1391,6 +1418,7 @@ fn reflection_serde_covers_every_reflection_field() {
         depth_qualifier: None,
         stencil_members: vec![2],
         local_size: Some([8, 8, 1]),
+        kernel_dispatch: Some(KernelDispatch::ThreadsPushConstant { offset: 16 }),
         vertex_builtins: Some(VertexBuiltins {
             uses_vertex_index: true,
             uses_instance_index: true,

@@ -69,7 +69,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `27`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `29`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -175,6 +175,7 @@ Top-level fields:
 | `depth_members` / `stencil_members` | Fragment return members tagged depth/stencil |
 | `depth_qualifier` | Fragment depth comparison contract (`Any`, `Less`, or `Greater`) |
 | `local_size` | Kernel GLCompute local size `[x,y,z]` when known |
+| `kernel_dispatch` | Kernel grid source: whole workgroups, fixed exact threads, or the reflected per-dispatch push-constant offset |
 | `vertex_builtins` | Whether vertex uses `VertexIndex` / `InstanceIndex` / writes `Position` |
 | `tessellation` | Post-tessellation patch domain, control-point count, locations, and synthesized system-value carriers |
 | `imageblock_layouts` | Kernel `[[imageblock]]` tiles (param index + AIR struct layout; no descriptor) |
@@ -398,9 +399,14 @@ choice. Create the image view and descriptor from the same runtime state used fo
 8. For vertex: bind attributes from `vertex_attributes` and respect `vertex_builtins`.
 9. For fragment: attach color targets from `render_targets`; attach the reflected depth/stencil
    aspects and derive depth comparison from `depth_qualifier`.
-10. For kernels: set local size from `local_size` when present; specialize function constants if
-   the host supplies values. Use `specialize_function_constant_bytes` for exact scalar/vector
-   payloads; the `u64`-only helper cannot carry vectors wider than eight bytes.
+10. For kernels: set local size from `local_size` and obey `kernel_dispatch`. The default
+    `ThreadsPushConstant` grid begins at `DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET` and occupies
+    `KERNEL_GRID_PUSH_CONSTANT_SIZE` bytes: write three tightly packed `u32` dimensions before each
+    dispatch. Supply the exact thread count for `dispatchThreads`, or `groupCount * local_size` for
+    `dispatchThreadgroups`. `Workgroups` appears only when the caller explicitly proves every launch
+    is complete. Specialize
+    function constants if the host supplies values. Use `specialize_function_constant_bytes` for
+    exact scalar/vector payloads; the `u64`-only helper cannot carry vectors wider than eight bytes.
 
 ## Related APIs
 

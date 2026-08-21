@@ -346,6 +346,11 @@ pub(in crate::passes) fn apply_bindings(
                     }
                 }
             }
+            ParamBinding::LoadKernelGridPushConstant { var, out_ty, lanes } => {
+                let value =
+                    materialize_kernel_grid_push_constant(ctx, &mut loads, var, out_ty, lanes)?;
+                splices.push((pid, value));
+            }
             ParamBinding::FragmentImageblockProjection {
                 coord_var,
                 param_ty,

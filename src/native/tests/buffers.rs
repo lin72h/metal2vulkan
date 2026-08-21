@@ -1361,7 +1361,13 @@ entry:
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert_eq!(asm.matches("OpCompositeExtract").count(), 4, "{asm}");
     assert_eq!(asm.matches("OpStore").count(), 4, "{asm}");
@@ -3013,7 +3019,6 @@ entry:
         &tmp,
         passes::TransformOptions {
             kernel_local_size: [256, 2, 1],
-            kernel_threads_per_grid: None,
             simd_cluster32: false,
             ..passes::TransformOptions::default()
         },
@@ -4253,7 +4258,13 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
     assert!(asm.contains("OpAtomicStore"), "{asm}");

@@ -62,7 +62,90 @@ mod footprint;
 /// v26 rejects component-incompatible runtime formats at the metadata-only reflection boundary,
 /// matching executable translation's specialization contract.
 /// v27 records the versioned effective descriptor layout used by the returned SPIR-V.
-pub const REFLECTION_VERSION: u32 = 27;
+/// v28 records the kernel dispatch contract, including any per-dispatch push-constant range that
+/// supplies the exact Metal thread grid and culls Vulkan's rounded-up invocations.
+/// v29 makes that per-dispatch push-constant grid the safe default for every kernel; whole-workgroup
+/// dispatch is now an explicit caller assertion.
+pub const REFLECTION_VERSION: u32 = 29;
+
+/// Size in bytes of the three tightly packed `u32` grid dimensions used by
+/// [`KernelDispatch::ThreadsPushConstant`].
+pub const KERNEL_GRID_PUSH_CONSTANT_SIZE: u32 = 12;
+
+/// Default byte offset of the per-dispatch kernel grid when callers do not select another
+/// dispatch contract. This safe default keeps one pipeline per kernel and requires the host to
+/// populate the exact effective grid before every dispatch.
+pub const DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET: u32 = 0;
+
+/// Reflected byte range occupied by the dynamic kernel grid in Vulkan push-constant storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct KernelGridPushConstantRange {
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// How a translated compute kernel obtains the exact Metal execution grid.
+///
+/// Vulkan dispatches whole workgroups. Metal `dispatchThreads` can launch a partial workgroup, so
+/// its exact thread count must be supplied separately and the translated entry point must cull
+/// rounded-up Vulkan invocations. This one contract drives both that cull and any AIR
+/// `[[threads_per_grid]]` parameter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum KernelDispatch {
+    /// The caller used whole workgroups. `[[threads_per_grid]]` is derived as
+    /// `NumWorkgroups * LocalSize`, and no invocation cull is needed.
+    Workgroups,
+    /// A fixed Metal `dispatchThreads` grid baked into this module. This is appropriate when the
+    /// caller intentionally creates a pipeline variant for the grid.
+    ThreadsFixed { threads_per_grid: [u32; 3] },
+    /// A Metal `dispatchThreads` grid read at dispatch time from three tightly packed `u32` push
+    /// constants at `offset`, `offset + 4`, and `offset + 8`.
+    ThreadsPushConstant { offset: u32 },
+}
+
+impl KernelDispatch {
+    /// Safe default for a kernel whose per-dispatch launch form is not fixed at translation time.
+    pub const fn safe_default() -> Self {
+        Self::ThreadsPushConstant {
+            offset: DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+        }
+    }
+}
+
+impl KernelDispatch {
+    pub fn validate(self) -> Result<(), String> {
+        let Self::ThreadsPushConstant { offset } = self else {
+            return Ok(());
+        };
+        if offset % 4 != 0 {
+            return Err(format!(
+                "kernel grid push-constant offset {offset} is not 4-byte aligned"
+            ));
+        }
+        offset
+            .checked_add(KERNEL_GRID_PUSH_CONSTANT_SIZE)
+            .ok_or_else(|| "kernel grid push-constant range overflows u32".to_string())?;
+        Ok(())
+    }
+
+    /// Push-constant byte range the consumer must make visible to the compute stage.
+    pub const fn push_constant_range(self) -> Option<KernelGridPushConstantRange> {
+        match self {
+            Self::ThreadsPushConstant { offset }
+                if offset.checked_add(KERNEL_GRID_PUSH_CONSTANT_SIZE).is_some() =>
+            {
+                Some(KernelGridPushConstantRange {
+                    offset,
+                    size: KERNEL_GRID_PUSH_CONSTANT_SIZE,
+                })
+            }
+            Self::Workgroups | Self::ThreadsFixed { .. } => None,
+            Self::ThreadsPushConstant { .. } => None,
+        }
+    }
+}
 
 /// Version of the descriptor-layout contract and its default values.
 pub const DESCRIPTOR_LAYOUT_VERSION: u32 = 1;
@@ -1307,6 +1390,9 @@ pub struct ShaderReflection {
     pub stencil_members: Vec<u32>,
     /// Kernel GLCompute local size (`[x, y, z]`), when the stage is a kernel.
     pub local_size: Option<[u32; 3]>,
+    /// Kernel dispatch/grid ABI, when the stage is a kernel. A push-constant grid must be populated
+    /// before each dispatch using the reflected byte range.
+    pub kernel_dispatch: Option<KernelDispatch>,
     /// Vertex-stage builtin usage (`Some` only for the vertex stage).
     pub vertex_builtins: Option<VertexBuiltins>,
     /// Vulkan tessellation-evaluation interface synthesized from Metal patch metadata.
@@ -1428,6 +1514,18 @@ impl ShaderReflection {
         self.descriptor_layout
             .validate()
             .map_err(|error| error.to_string())?;
+        match (self.stage, self.kernel_dispatch) {
+            (ShaderStage::Kernel, Some(dispatch)) => dispatch.validate()?,
+            (ShaderStage::Kernel, None) => {
+                return Err("kernel reflection is missing its dispatch-grid contract".to_string())
+            }
+            (_, Some(_)) => {
+                return Err(
+                    "non-kernel reflection carries a kernel dispatch-grid contract".to_string(),
+                )
+            }
+            (_, None) => {}
+        }
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum DescriptorClass {
             StorageBuffer,
@@ -1841,6 +1939,7 @@ impl ShaderReflection {
             depth_qualifier: meta.depth_qualifier,
             stencil_members: meta.stencil_members.clone(),
             local_size: None,
+            kernel_dispatch: None,
             vertex_builtins: None,
             tessellation: None,
             imageblock_layouts: Vec::new(),
@@ -1997,6 +2096,7 @@ impl ShaderReflection {
             depth_qualifier: None,
             stencil_members: Vec::new(),
             local_size: None,
+            kernel_dispatch: None,
             vertex_builtins: Some(vertex_builtins),
             tessellation: meta.tessellation.as_ref().map(|tessellation| {
                 let mut patch_input_locations = meta
@@ -2205,6 +2305,7 @@ impl ShaderReflection {
             depth_qualifier: None,
             stencil_members: Vec::new(),
             local_size: Some(local_size),
+            kernel_dispatch: Some(KernelDispatch::safe_default()),
             vertex_builtins: None,
             tessellation: None,
             imageblock_layouts: {

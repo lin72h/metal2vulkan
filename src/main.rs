@@ -4,7 +4,7 @@
 //! on any failure.
 
 use metal2vulkan::passes::{Stage, TransformOptions};
-use metal2vulkan::reflect::ShaderReflection;
+use metal2vulkan::reflect::{KernelDispatch, ShaderReflection};
 use metal2vulkan::{
     detect_stage, tools, translate_passthrough, translate_reflected_with_options,
     translate_with_options,
@@ -19,6 +19,7 @@ struct ReproContext {
     out: String,
     requested_stage: String,
     effective_stage: Option<String>,
+    translation_options: Vec<String>,
 }
 
 impl ReproContext {
@@ -39,6 +40,9 @@ fn main() {
     let mut emit_meta: Option<String> = None;
     let mut simd_cluster32 = false;
     let mut raster_sample_count = None;
+    let mut kernel_local_size = [64, 1, 1];
+    let mut kernel_dispatch = None;
+    let mut translation_options = Vec::new();
     let mut pos: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -58,6 +62,14 @@ options:
       request 32-lane clustered subgroup reductions
   --raster-samples 1|2|4|8|16|32|64
       exact graphics-pipeline sample count for AIR sample-count queries
+  --local X,Y,Z
+      Vulkan/Metal kernel threadgroup size (default: 64,1,1)
+  --threads-per-grid X,Y,Z
+      bake one exact Metal dispatchThreads grid and cull rounded-up Vulkan invocations
+  --threads-per-grid-push-constant OFFSET
+      read the exact grid from three u32 push constants at OFFSET, OFFSET+4, OFFSET+8
+  --whole-workgroups
+      assert every dispatch covers complete workgroups and omit the default grid guard
   -h, --help
       show this help
 "#
@@ -78,6 +90,7 @@ options:
             // M-D2: cluster simd reductions to Metal's 32-lane simdgroup (see TransformOptions).
             "--simd-cluster32" => {
                 simd_cluster32 = true;
+                translation_options.push("--simd-cluster32".to_string());
                 i += 1;
             }
             "--raster-samples" => {
@@ -85,10 +98,61 @@ options:
                 if !matches!(raster_sample_count, Some(1 | 2 | 4 | 8 | 16 | 32 | 64)) {
                     fail("--raster-samples requires one of 1, 2, 4, 8, 16, 32, or 64");
                 }
+                translation_options.extend(["--raster-samples".to_string(), args[i + 1].clone()]);
                 i += 2;
             }
+            "--local" => {
+                kernel_local_size = args
+                    .get(i + 1)
+                    .and_then(|value| parse_u32x3(value))
+                    .filter(|size| !size.contains(&0))
+                    .unwrap_or_else(|| fail("--local requires three non-zero dimensions X,Y,Z"));
+                translation_options.extend(["--local".to_string(), args[i + 1].clone()]);
+                i += 2;
+            }
+            "--threads-per-grid" => {
+                if kernel_dispatch.is_some() {
+                    fail("kernel dispatch grid options are mutually exclusive");
+                }
+                let threads_per_grid = args
+                    .get(i + 1)
+                    .and_then(|value| parse_u32x3(value))
+                    .unwrap_or_else(|| fail("--threads-per-grid requires three dimensions X,Y,Z"));
+                kernel_dispatch = Some(KernelDispatch::ThreadsFixed { threads_per_grid });
+                translation_options.extend(["--threads-per-grid".to_string(), args[i + 1].clone()]);
+                i += 2;
+            }
+            "--threads-per-grid-push-constant" => {
+                if kernel_dispatch.is_some() {
+                    fail("kernel dispatch grid options are mutually exclusive");
+                }
+                let offset = args
+                    .get(i + 1)
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or_else(|| {
+                        fail("--threads-per-grid-push-constant requires a byte offset")
+                    });
+                let dispatch = KernelDispatch::ThreadsPushConstant { offset };
+                if let Err(error) = dispatch.validate() {
+                    fail(&error);
+                }
+                kernel_dispatch = Some(dispatch);
+                translation_options.extend([
+                    "--threads-per-grid-push-constant".to_string(),
+                    args[i + 1].clone(),
+                ]);
+                i += 2;
+            }
+            "--whole-workgroups" => {
+                if kernel_dispatch.is_some() {
+                    fail("kernel dispatch grid options are mutually exclusive");
+                }
+                kernel_dispatch = Some(KernelDispatch::Workgroups);
+                translation_options.push("--whole-workgroups".to_string());
+                i += 1;
+            }
             // Accept and ignore compatibility options used by external harnesses.
-            "--entry" | "--local" => {
+            "--entry" => {
                 i += 2;
             }
             _ => {
@@ -114,12 +178,15 @@ options:
         out: out.clone(),
         requested_stage: stage.clone(),
         effective_stage: None,
+        translation_options,
     };
 
     let tmp = env::temp_dir().join(format!("metal2vulkan_{}", process::id()));
     let _ = fs::create_dir_all(&tmp);
 
     let options = TransformOptions {
+        kernel_local_size,
+        kernel_dispatch,
         simd_cluster32,
         raster_sample_count,
         ..TransformOptions::default()
@@ -204,6 +271,15 @@ options:
     let _ = fs::remove_dir_all(&tmp);
 }
 
+fn parse_u32x3(value: &str) -> Option<[u32; 3]> {
+    let dimensions = value
+        .split([',', 'x'])
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    dimensions.try_into().ok()
+}
+
 /// Translate, also returning the reflection when `--emit-meta` was requested (else `None`, to skip the
 /// small extra metadata build on the common path).
 fn translate_maybe_reflect(
@@ -270,18 +346,25 @@ fn write_repro(ctx: &ReproContext, why: &str, detail: Option<&str>) -> Result<Pa
 
     let repro_out = dir.join("out.spv");
     let stage = ctx.stage_for_repro();
+    let translation_options = if ctx.translation_options.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", shell_join(&ctx.translation_options))
+    };
     let repro_command = format!(
-        "metal2vulkan {} {} --stage {}\n",
+        "metal2vulkan {} {} --stage {}{}\n",
         shell_quote(&input_name),
         shell_quote(repro_out.file_name().unwrap().to_string_lossy().as_ref()),
-        shell_quote(stage)
+        shell_quote(stage),
+        translation_options,
     );
     fs::write(dir.join("repro-command.txt"), &repro_command)
         .map_err(|e| format!("write repro-command.txt: {e}"))?;
 
     let repro_script = format!(
-        "#!/usr/bin/env sh\nset -eu\nDIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\nmetal2vulkan \"$DIR/{input_name}\" \"$DIR/out.spv\" --stage {}\n",
-        shell_quote(stage)
+        "#!/usr/bin/env sh\nset -eu\nDIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\nmetal2vulkan \"$DIR/{input_name}\" \"$DIR/out.spv\" --stage {}{}\n",
+        shell_quote(stage),
+        translation_options,
     );
     let script_path = dir.join("repro.sh");
     fs::write(&script_path, repro_script).map_err(|e| format!("write repro.sh: {e}"))?;

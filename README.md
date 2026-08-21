@@ -80,6 +80,24 @@ Accepted values are `1`, `2`, `4`, `8`, `16`, `32`, and `64`. Library callers se
 `TransformOptions::raster_sample_count`; translation fails visibly when the query is present and
 the value is unknown.
 
+Vulkan dispatches whole workgroups, so every kernel uses a per-dispatch exact thread-grid contract
+by default. Before each dispatch, write three tightly packed `u32` dimensions at push-constant
+offset 0: the requested thread count for Metal `dispatchThreads`, or `groupCount * localSize` for
+Metal `dispatchThreadgroups`. The shader culls rounded-up invocations outside that grid.
+
+For a fixed grid, the CLI can instead bake the exact bounds into a pipeline variant:
+
+```sh
+metal2vulkan kernel.air kernel.spv --local 8,8,1 --threads-per-grid 57,9,1
+```
+
+`--threads-per-grid-push-constant OFFSET` moves the default dynamic grid to another byte offset.
+Library callers select an override with `TransformOptions::kernel_dispatch`; reflected translation
+returns the effective contract in `ShaderReflection::kernel_dispatch`. Callers that can prove every
+launch covers complete workgroups may explicitly select `KernelDispatch::Workgroups` or pass
+`--whole-workgroups` to omit the guard. Kernels with source workgroup barriers require that explicit
+proof until partial-workgroup barrier execution can be modeled without divergent early returns.
+
 ## Library
 
 Library translation takes caller-owned scratch space. Use a unique directory for concurrent calls

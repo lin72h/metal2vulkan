@@ -129,6 +129,9 @@ fn options_for_air(
         .descriptor_layout
         .validate()
         .map_err(|error| error.to_string())?;
+    if let Some(dispatch) = options.kernel_dispatch {
+        dispatch.validate()?;
+    }
     options.validate_runtime_samplers()?;
     options.validate_runtime_storage_images()?;
     if san_ll.contains("air.compile.denorms_disable") {
@@ -224,6 +227,12 @@ fn build_reflection(
     entry_name: Option<&str>,
     options: &passes::TransformOptions,
 ) -> Result<reflect::ShaderReflection, String> {
+    if let Some(dispatch) = options.kernel_dispatch {
+        dispatch.validate()?;
+    }
+    if !matches!(stage, passes::Stage::Kernel) && options.kernel_dispatch.is_some() {
+        return Err("kernel dispatch bounds are only valid for kernel stages".to_string());
+    }
     let mut reflection = match stage {
         passes::Stage::Fragment => {
             reflect::ShaderReflection::from_fragment(&frag.cloned().unwrap_or_default(), entry_name)
@@ -237,6 +246,13 @@ fn build_reflection(
             options.kernel_local_size,
         ),
     };
+    if matches!(stage, passes::Stage::Kernel) {
+        reflection.kernel_dispatch = Some(
+            options
+                .kernel_dispatch
+                .unwrap_or_else(reflect::KernelDispatch::safe_default),
+        );
+    }
     let runtime_sampler_indices = reflection
         .bindings
         .iter()
@@ -538,6 +554,12 @@ fn translate_sanitized_native_reflected_with_layout(
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, options)?;
+    passes::validate_kernel_dispatch_source(
+        san_ll,
+        stage,
+        options,
+        stage_meta.entry_name.as_deref(),
+    )?;
     let mut reflection = build_reflection(
         stage,
         stage_meta.frag.as_ref(),
@@ -554,7 +576,7 @@ fn translate_sanitized_native_reflected_with_layout(
         reflection.add_buffer_address_table()?;
     }
     reflection.validate_descriptor_abi()?;
-    let spv = translate_sanitized_with_meta(
+    let spv = translate_sanitized_with_meta_prevalidated(
         san_ll,
         stage,
         stage_meta.frag.as_ref(),
@@ -973,6 +995,14 @@ pub fn translate_raw_tiers_probe(
     }
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
+    if let Err(error) = passes::validate_kernel_dispatch_source(
+        san_ll,
+        stage,
+        opts,
+        stage_meta.entry_name.as_deref(),
+    ) {
+        return vec![Err(error.clone()), Err(error)];
+    }
     let air_data_layout = layout::AirDataLayout::from_ir(san_ll);
     let run = |emitted: Result<emit_sidecar::EmittedSpirv, String>| -> Result<Vec<u8>, String> {
         let air_data_layout = air_data_layout.as_ref().map_err(Clone::clone)?;
@@ -1035,6 +1065,7 @@ pub fn translate_bda_probe(
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
+    passes::validate_kernel_dispatch_source(san_ll, stage, opts, stage_meta.entry_name.as_deref())?;
     let air_data_layout = layout::AirDataLayout::from_ir(san_ll)?;
     tools::emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
         san_ll,
@@ -1065,6 +1096,41 @@ pub fn translate_bda_probe(
 }
 
 fn translate_sanitized_with_meta(
+    san_ll: &str,
+    stage: passes::Stage,
+    frag: Option<&meta::FragMeta>,
+    vert: Option<&meta::VertMeta>,
+    kern: Option<&meta::KernMeta>,
+    promoted_kern: Option<&meta::KernMeta>,
+    entry_name: Option<&str>,
+    tmp: &Path,
+    options: passes::TransformOptions,
+    psb_retry_enabled: bool,
+    datalayout: Option<layout::AirDataLayout>,
+) -> Result<Vec<u8>, String> {
+    // Shared pre-emission boundary for the ordinary production and diagnostic retry paths. The
+    // reflected facade performs this same check before reflection analysis, then enters the
+    // prevalidated core below.
+    passes::validate_kernel_dispatch_source(san_ll, stage, options, entry_name)?;
+    translate_sanitized_with_meta_prevalidated(
+        san_ll,
+        stage,
+        frag,
+        vert,
+        kern,
+        promoted_kern,
+        entry_name,
+        tmp,
+        options,
+        psb_retry_enabled,
+        datalayout,
+    )
+}
+
+/// Translation core after the facade has enforced the dispatch contract. The reflected facade runs
+/// the same check before its potentially expensive reflection analysis, then enters here so a
+/// barrier-free module is scanned only once.
+fn translate_sanitized_with_meta_prevalidated(
     san_ll: &str,
     stage: passes::Stage,
     frag: Option<&meta::FragMeta>,

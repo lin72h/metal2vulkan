@@ -5,10 +5,16 @@ use crate::meta::primitive_air_type_from_name;
 use crate::passes::access::{is_unsigned_byte_scalar, single_member_array_scalar_elem};
 use crate::passes::stage_output::handle_static_sampler;
 mod decorations;
+mod kernel_grid;
 mod kernel_values;
 mod layout;
 
 pub(in crate::passes) use decorations::*;
+pub(in crate::passes) use kernel_grid::{
+    bind_kernel_grid_push_constant_once, insert_kernel_dispatch_guard,
+    kernel_dispatch_guard_required, materialize_kernel_grid_push_constant,
+    UNSAFE_DISPATCH_BARRIER_ERROR,
+};
 pub(in crate::passes) use kernel_values::const_ivec;
 use kernel_values::{
     bind_kernel_uvec3_builtin, bind_kernel_uvec3_builtin_var, const_kernel_local_size,
@@ -127,6 +133,8 @@ pub(in crate::passes) enum ParamBinding {
         out_ty: Word,
         lanes: u32,
     },
+    /// Exact Metal thread grid loaded from the selected per-dispatch push-constant ABI.
+    LoadKernelGridPushConstant { var: Word, out_ty: Word, lanes: u32 },
     /// An image variable (texture): param uses are the sample call's texture operand; replace param
     /// id with an OpLoad of the image at use. We record the var + image type + its (Dim, arrayed).
     Image {
@@ -301,6 +309,7 @@ pub(super) fn build_stage_input(
     let mut local_invocation_index_var: Option<Word> = None;
     let mut num_workgroups_var: Option<Word> = None;
     let mut global_invocation_id_var: Option<Word> = None;
+    let mut kernel_grid_push_constant_var: Option<Word> = None;
     let stage_input_bindings = kern.map(KernMeta::stage_input_bindings).unwrap_or_default();
 
     for (i, (pid, pty)) in params.iter().enumerate() {
@@ -1276,17 +1285,38 @@ pub(super) fn build_stage_input(
             );
             bind_kernel_uvec3_builtin_var(ctx, &defs, &mut bindings, *pid, *pty, var);
         } else if role_is("threads_per_grid") {
-            if let Some(threads) = ctx.kernel_threads_per_grid {
-                let val = const_kernel_local_size(ctx, &defs, *pty, threads)
-                    .unwrap_or_else(|| ctx.const_uint(threads[0]));
-                bindings.push((*pid, ParamBinding::Value { val }));
-            } else {
-                let var = bind_kernel_v3uint_builtin_once(
-                    ctx,
-                    &mut num_workgroups_var,
-                    BuiltIn::NumWorkgroups,
-                );
-                bind_kernel_threads_per_grid(ctx, &defs, &mut bindings, *pid, *pty, var);
+            match ctx.kernel_dispatch {
+                crate::reflect::KernelDispatch::ThreadsFixed { threads_per_grid } => {
+                    let val = const_kernel_local_size(ctx, &defs, *pty, threads_per_grid)
+                        .unwrap_or_else(|| ctx.const_uint(threads_per_grid[0]));
+                    bindings.push((*pid, ParamBinding::Value { val }));
+                }
+                crate::reflect::KernelDispatch::ThreadsPushConstant { offset } => {
+                    let var = bind_kernel_grid_push_constant_once(
+                        ctx,
+                        &mut kernel_grid_push_constant_var,
+                        offset,
+                    );
+                    let lanes = scalar_or_vector_component(&defs, *pty)
+                        .and_then(|(_, lanes)| lanes)
+                        .unwrap_or(1);
+                    bindings.push((
+                        *pid,
+                        ParamBinding::LoadKernelGridPushConstant {
+                            var,
+                            out_ty: *pty,
+                            lanes,
+                        },
+                    ));
+                }
+                crate::reflect::KernelDispatch::Workgroups => {
+                    let var = bind_kernel_v3uint_builtin_once(
+                        ctx,
+                        &mut num_workgroups_var,
+                        BuiltIn::NumWorkgroups,
+                    );
+                    bind_kernel_threads_per_grid(ctx, &defs, &mut bindings, *pid, *pty, var);
+                }
             }
         } else if role_is("threadgroup_position_in_grid") {
             bind_kernel_uvec3_builtin(ctx, &defs, &mut bindings, *pid, *pty, BuiltIn::WorkgroupId);
@@ -1597,6 +1627,22 @@ pub(super) fn build_stage_input(
             bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
         }
     }
+
+    let guard_required = kernel_dispatch_guard_required(ctx.kernel_dispatch, ctx.kernel_local_size);
+    if let crate::reflect::KernelDispatch::ThreadsPushConstant { offset } = ctx.kernel_dispatch {
+        if guard_required {
+            bind_kernel_grid_push_constant_once(ctx, &mut kernel_grid_push_constant_var, offset);
+        }
+    }
+    if guard_required {
+        let global_id = bind_kernel_v3uint_builtin_once(
+            ctx,
+            &mut global_invocation_id_var,
+            BuiltIn::GlobalInvocationId,
+        );
+        ctx.kernel_dispatch_global_invocation_id_var = Some(global_id);
+    }
+    ctx.kernel_grid_push_constant_var = kernel_grid_push_constant_var;
 
     // Block-decorate buffer structs + member offsets (std140-ish; we trust the AIR member layout and
     // emit offsets from the struct's member types). The map must include synthesized wrapper structs,

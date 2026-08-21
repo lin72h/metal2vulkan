@@ -17,7 +17,6 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -699,15 +698,26 @@ fn audit_translation_source_in_worker(
     let translation_tmp = scratch.path().join("translation");
     fs::create_dir(&translation_tmp)
         .map_err(|error| format!("create {}: {error}", translation_tmp.display()))?;
+    let stdin_path = scratch.path().join("stdin.json");
     let stdout_path = scratch.path().join("stdout.json");
     let stderr_path = scratch.path().join("stderr.txt");
+    let mut stdin_file = fs::File::create(&stdin_path)
+        .map_err(|error| format!("create {}: {error}", stdin_path.display()))?;
+    serde_json::to_writer(&mut stdin_file, source)
+        .map_err(|error| format!("encode translation worker input: {error}"))?;
+    drop(stdin_file);
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve corpus-triage executable: {error}"))?;
     let mut command = Command::new(executable);
     command
         .arg("--translation-worker")
         .arg(&translation_tmp)
-        .stdin(Stdio::piped())
+        // A regular file lets the child decode arbitrarily large rows under the watchdog without
+        // one short-lived parent feeder thread per row. Besides bounding thread count by `jobs`,
+        // this avoids eventually exhausting host thread-creation resources during a full census.
+        .stdin(Stdio::from(fs::File::open(&stdin_path).map_err(
+            |error| format!("open {}: {error}", stdin_path.display()),
+        )?))
         .stdout(Stdio::from(fs::File::create(&stdout_path).map_err(
             |error| format!("create {}: {error}", stdout_path.display()),
         )?))
@@ -715,20 +725,10 @@ fn audit_translation_source_in_worker(
             |error| format!("create {}: {error}", stderr_path.display()),
         )?));
     configure_process_group(&mut command);
-    let input = serde_json::to_vec(source)
-        .map_err(|error| format!("encode translation worker input: {error}"))?;
     let started = Instant::now();
     let mut child = command
         .spawn()
         .map_err(|error| format!("spawn translation worker: {error}"))?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or("translation worker stdin unavailable")?;
-    // Stream the row concurrently so decoding is covered by the same wall/RSS watchdog as
-    // translation. A synchronous write can fill the pipe while the child is parsing a large JSON
-    // string, postponing both limits until most of the work and allocation have already happened.
-    let input_writer = std::thread::spawn(move || child_stdin.write_all(&input));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -766,17 +766,8 @@ fn audit_translation_source_in_worker(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let input_result = input_writer
-        .join()
-        .map_err(|_| "translation worker input writer panicked".to_string())?;
     let status = status?;
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
-    if let Err(error) = input_result {
-        return Err(format!(
-            "write translation worker input: {error}: {}",
-            single_line(&stderr)
-        ));
-    }
     if !status.success() {
         return Err(format!(
             "translation worker failed under {} MiB memory limit: {}",

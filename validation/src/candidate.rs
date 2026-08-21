@@ -1128,8 +1128,19 @@ mod platform {
         let set_layout = objects.set_layouts[reflection.descriptor_layout.set as usize];
         objects.framebuffer_fetch = framebuffer_fetch;
 
-        let pipeline_layout_info =
-            vk::PipelineLayoutCreateInfo::default().set_layouts(&objects.set_layouts);
+        let push_constant_ranges = reflection
+            .kernel_dispatch
+            .and_then(metal2vulkan::reflect::KernelDispatch::push_constant_range)
+            .map(|range| {
+                vec![vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(range.offset)
+                    .size(range.size)]
+            })
+            .unwrap_or_default();
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&objects.set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
         objects.pipeline_layout = unsafe {
             context
                 .device
@@ -1361,9 +1372,14 @@ mod platform {
             transition_images_to_general(&context.device, command, &images);
             prepare_texel_buffers(&context.device, command, &texel_buffers);
             match case.stage {
-                Stage::Kernel => {
-                    encode_compute(&context.device, command, case, descriptor_set, &objects)
-                }
+                Stage::Kernel => encode_compute(
+                    &context.device,
+                    command,
+                    case,
+                    reflection,
+                    descriptor_set,
+                    &objects,
+                ),
                 Stage::Fragment | Stage::Vertex => encode_graphics(
                     &context.device,
                     command,
@@ -1799,6 +1815,7 @@ mod platform {
         device: &Device,
         command: vk::CommandBuffer,
         case: &AuthoredCase,
+        reflection: &ShaderReflection,
         descriptor_set: vk::DescriptorSet,
         objects: &DeviceObjects,
     ) {
@@ -1813,6 +1830,22 @@ mod platform {
                 &[],
             );
             let dispatch = case.dispatch.as_ref().expect("validated kernel dispatch");
+            if let Some(metal2vulkan::reflect::KernelDispatch::ThreadsPushConstant { offset }) =
+                reflection.kernel_dispatch
+            {
+                let grid_bytes = dispatch
+                    .grid
+                    .into_iter()
+                    .flat_map(u32::to_ne_bytes)
+                    .collect::<Vec<_>>();
+                device.cmd_push_constants(
+                    command,
+                    objects.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    offset,
+                    &grid_bytes,
+                );
+            }
             device.cmd_dispatch(
                 command,
                 div_ceil(dispatch.grid[0], dispatch.threads_per_threadgroup[0]),
@@ -6262,7 +6295,9 @@ mod tests {
         );
         let options = metal2vulkan::passes::TransformOptions {
             kernel_local_size: [16, 16, 1],
-            kernel_threads_per_grid: Some([16, 16, 1]),
+            kernel_dispatch: Some(metal2vulkan::reflect::KernelDispatch::ThreadsFixed {
+                threads_per_grid: [16, 16, 1],
+            }),
             ..metal2vulkan::passes::TransformOptions::default()
         };
         let reflection =

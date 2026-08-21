@@ -14,17 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interface globals.
 - Public byte-exact function-constant specialization, reflection-only AIR inspection, authored
   linked-function/table specialization, and vertex-observer generation APIs.
-- Reflection schema v27: consumer metadata now covers decoded static samplers, texture shape and
+- Reflection schema v29: consumer metadata now covers decoded static samplers, texture shape and
   access, argument-buffer resources, kernel stage inputs, tessellation, imageblocks, exact function-
   constant ABI types, buffer extent/access classification, and conservative final-module static and
   invocation-strided buffer footprints, plus runtime sampler/storage-image specialization and the
-  effective descriptor layout.
+  effective descriptor layout and kernel dispatch-grid ABI.
 - Versioned, caller-selected descriptor layouts through `TransformOptions`, allowing independently
   translated stages to use distinct Vulkan descriptor sets and binding ranges while preserving the
   existing layout as the explicit default.
 - Runtime pipeline-state specialization by Metal resource index for dynamically bound samplers and
   writable storage images, including embedded argument-buffer textures, exact reflected sampler and
   image-format state, and host storage-image feature checks.
+- A typed kernel dispatch-grid ABI that safely defaults every kernel to a per-dispatch push-constant
+  grid, with fixed and explicitly proven whole-workgroup forms reflected for consumers and exposed
+  through matching CLI options.
 - A task-oriented translation and reflection integration guide plus a compiled serde reflection
   example.
 - Additional stage-interface support for fragment `[[point_coord]]`, `[[primitive_id]]`, and
@@ -76,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full AIR-intrinsic reclassification now updates every cached source in bounded keyset batches,
   independent of `--limit`, without reopening source shards; matrix capability recognition and
   lowering share one exact ABI parser.
-- Reflection documentation now describes the complete schema v27 descriptor, argument-buffer,
+- Reflection documentation now describes the complete schema v29 descriptor, argument-buffer,
   runtime specialization, stage-interface, and conservative buffer-staging contracts.
 
 ### Removed
@@ -137,6 +140,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capability checks in executable and metadata-only reflection paths.
 - Vulkan validation now binds every compatible reflected sampled/storage texture alias to the same
   allocation and validates texture-array and argument-buffer alternatives as complete sets.
+- Exact Metal `dispatchThreads` grids now use one typed fixed or per-dispatch push-constant source
+  for both `[[threads_per_grid]]` and a structured surplus-invocation cull. Partial grids with source
+  control barriers fail honestly instead of emitting an unsafe divergent return.
 - Reduced worst-case translation time and memory growth by caching retry verdicts, pruning dead CFG
   before source re-emission, using linear CFG ordering and candidate scans, bounding generated CFG
   growth, and applying resource limits from worker startup.

@@ -6,7 +6,7 @@
 //! same inventory, so a newly harvested `air.*` family cannot disappear behind an unrelated clean
 //! authored-resource audit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Where the product intentionally handles an AIR intrinsic family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,14 +97,140 @@ fn matrix16_float_element(token: &str) -> Option<Matrix16Element> {
 pub fn air_call_counts(ll: &str) -> BTreeMap<String, usize> {
     let mut calls = BTreeMap::new();
     for line in ll.lines() {
-        for symbol in direct_air_callees(line) {
+        for symbol in direct_callees(line)
+            .into_iter()
+            .filter(|symbol| symbol.starts_with("air."))
+        {
             *calls.entry(symbol).or_default() += 1;
         }
     }
     calls
 }
 
-fn direct_air_callees(line: &str) -> Vec<String> {
+/// Whether the selected entry's direct source call graph reaches one of the exact AIR ABI symbols.
+///
+/// This intentionally parses only definition boundaries and direct callee symbols. It is the
+/// bounded pre-emission dual of the typed emitter graph: ordinary dead helpers are excluded, while
+/// module static initializers are roots because the emitter injects them into the entry. Indirect
+/// calls remain unsupported elsewhere and cannot silently prove a barrier-free graph here.
+pub(crate) fn entry_reaches_air_call(ll: &str, entry_name: Option<&str>, targets: &[&str]) -> bool {
+    // Most kernels have no barrier symbol at all. Keep their preflight allocation-free: besides
+    // avoiding needless work, this matters to the worker's peak-RSS contract for very large IR.
+    // A textual hit is only a reason to build the exact graph below, never evidence by itself.
+    if !targets
+        .iter()
+        .any(|target| llvm_global_symbol_spelling_may_occur(ll, target))
+    {
+        return false;
+    }
+
+    #[derive(Default)]
+    struct FunctionCalls {
+        callees: Vec<String>,
+        reaches_target_directly: bool,
+    }
+
+    let mut functions = HashMap::<String, FunctionCalls>::new();
+    let mut current = None::<(String, FunctionCalls)>;
+    let mut first_function = None;
+    for line in ll.lines() {
+        let trimmed = strip_llvm_comment(line).trim();
+        if current.is_none() && trimmed.starts_with("define ") {
+            let Some(name) = global_symbol_after_at(trimmed) else {
+                continue;
+            };
+            first_function.get_or_insert_with(|| name.clone());
+            current = Some((name, FunctionCalls::default()));
+            continue;
+        }
+        let Some((_, calls)) = current.as_mut() else {
+            continue;
+        };
+        if trimmed == "}" {
+            let (name, calls) = current.take().expect("current function");
+            functions.insert(name, calls);
+            continue;
+        }
+        for callee in direct_callees(trimmed) {
+            if targets.contains(&callee.as_str()) {
+                calls.reaches_target_directly = true;
+            }
+            calls.callees.push(callee);
+        }
+    }
+
+    let Some(entry_name) = entry_name.map(str::to_string).or(first_function) else {
+        return false;
+    };
+    let mut pending = vec![entry_name.clone()];
+    let mut reachable = HashSet::from([entry_name]);
+    for name in functions.keys() {
+        if name.starts_with("_GLOBAL__sub_I") && reachable.insert(name.clone()) {
+            pending.push(name.clone());
+        }
+    }
+    while let Some(name) = pending.pop() {
+        let Some(calls) = functions.get(&name) else {
+            continue;
+        };
+        if calls.reaches_target_directly {
+            return true;
+        }
+        for callee in &calls.callees {
+            if functions.contains_key(callee) && reachable.insert(callee.clone()) {
+                pending.push(callee.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Allocation-free prefilter for an LLVM global symbol in plain or quoted/hex-escaped spelling.
+/// False positives are harmless because the exact function graph remains authoritative; false
+/// negatives would skip that graph and are therefore forbidden.
+fn llvm_global_symbol_spelling_may_occur(ll: &str, target: &str) -> bool {
+    if ll.contains(target) {
+        return true;
+    }
+    ll.match_indices("@\"")
+        .any(|(offset, _)| quoted_symbol_matches(&ll[offset + 2..], target.as_bytes()))
+}
+
+fn quoted_symbol_matches(mut quoted: &str, target: &[u8]) -> bool {
+    for expected in target {
+        let bytes = quoted.as_bytes();
+        let Some(&first) = bytes.first() else {
+            return false;
+        };
+        let (actual, consumed) = if first == b'\\' {
+            let (Some(&hi), Some(&lo)) = (bytes.get(1), bytes.get(2)) else {
+                return false;
+            };
+            let (Some(hi), Some(lo)) = (hex_nibble(hi), hex_nibble(lo)) else {
+                return false;
+            };
+            ((hi << 4) | lo, 3)
+        } else {
+            (first, 1)
+        };
+        if actual != *expected {
+            return false;
+        }
+        quoted = &quoted[consumed..];
+    }
+    quoted.starts_with('"')
+}
+
+const fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn direct_callees(line: &str) -> Vec<String> {
     if ![
         "call ", "call\t", "invoke ", "invoke\t", "callbr ", "callbr\t",
     ]
@@ -121,7 +247,7 @@ fn direct_air_callees(line: &str) -> Vec<String> {
     .trim();
     call_opcode_ends(line)
         .into_iter()
-        .filter_map(|offset| direct_air_callee_after(&line[offset..]))
+        .filter_map(|offset| direct_callee_after(&line[offset..]))
         .collect()
 }
 
@@ -169,7 +295,7 @@ fn quoted_at(line: &str, offset: usize) -> bool {
     quoted
 }
 
-fn direct_air_callee_after(call: &str) -> Option<String> {
+fn direct_callee_after(call: &str) -> Option<String> {
     let mut depth = 0usize;
     let mut quoted = false;
     let mut escaped = false;
@@ -194,17 +320,41 @@ fn direct_air_callee_after(call: &str) -> Option<String> {
         }
         escaped = false;
     }
-    let symbol = &call[at? + 1..];
+    global_symbol_after_at(&call[at?..])
+}
+
+fn global_symbol_after_at(text: &str) -> Option<String> {
+    let at = text.find('@')?;
+    let symbol = &text[at + 1..];
     if let Some(quoted) = symbol.strip_prefix('"') {
-        let end = quoted.find('"')?;
-        return quoted[..end]
-            .starts_with("air.")
-            .then(|| quoted[..end].to_string());
+        return decode_quoted_symbol(quoted);
     }
     let end = symbol
-        .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.')))
+        .find(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '$' | '-')))
         .unwrap_or(symbol.len());
-    (end > "air.".len() && symbol.starts_with("air.")).then(|| symbol[..end].to_string())
+    (end > 0).then(|| symbol[..end].to_string())
+}
+
+fn decode_quoted_symbol(quoted: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = quoted.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => {
+                let hi = chars.next()?;
+                if hi.is_ascii_hexdigit() && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+                    let lo = chars.next().expect("peeked hex digit");
+                    let byte = ((hi.to_digit(16)? << 4) | lo.to_digit(16)?) as u8;
+                    out.push(byte as char);
+                } else {
+                    out.push(hi);
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    None
 }
 
 fn strip_llvm_comment(line: &str) -> &str {
@@ -667,5 +817,55 @@ mod tests {
                 ("air.quoted_future.i32".into(), 1),
             ])
         );
+    }
+
+    #[test]
+    fn entry_call_graph_excludes_dead_helpers_and_includes_static_initializers() {
+        let ll = r#"
+define void @entry() {
+  call void @live_helper()
+  ret void
+}
+define internal void @live_helper() {
+  ret void
+}
+define internal void @dead_helper() {
+  call void @air.wg.barrier(i32 0, i32 1)
+  ret void
+}
+define internal void @"_GLOBAL__sub_I.quoted"() {
+  call void @"air.simdgroup.barrier"(i32 0, i32 1)
+  ret void
+}
+"#;
+        assert!(!entry_reaches_air_call(
+            ll,
+            Some("entry"),
+            &["air.wg.barrier"]
+        ));
+        assert!(entry_reaches_air_call(
+            ll,
+            Some("entry"),
+            &["air.simdgroup.barrier"]
+        ));
+    }
+
+    #[test]
+    fn entry_call_graph_follows_reachable_quoted_helpers() {
+        let ll = r#"
+define void @entry() {
+  call void @"helper\2Ebarrier"()
+  ret void
+}
+define internal void @"helper.barrier"() {
+  call void @"air\2Ewg\2Ebarrier"(i32 0, i32 1)
+  ret void
+}
+"#;
+        assert!(entry_reaches_air_call(
+            ll,
+            Some("entry"),
+            &["air.wg.barrier"]
+        ));
     }
 }

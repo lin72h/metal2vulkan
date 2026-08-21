@@ -4586,7 +4586,9 @@ declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i3
             metal2vulkan::passes::Stage::Kernel,
             metal2vulkan::passes::TransformOptions {
                 kernel_local_size: [16, 16, 1],
-                kernel_threads_per_grid: Some([16, 16, 1]),
+                kernel_dispatch: Some(metal2vulkan::reflect::KernelDispatch::ThreadsFixed {
+                    threads_per_grid: [16, 16, 1],
+                }),
                 ..metal2vulkan::passes::TransformOptions::default()
             },
         )
@@ -4630,7 +4632,9 @@ declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i3
         );
         let options = metal2vulkan::passes::TransformOptions {
             kernel_local_size: [16, 16, 1],
-            kernel_threads_per_grid: Some([16, 16, 1]),
+            kernel_dispatch: Some(metal2vulkan::reflect::KernelDispatch::ThreadsFixed {
+                threads_per_grid: [16, 16, 1],
+            }),
             ..metal2vulkan::passes::TransformOptions::default()
         };
         let reflection = metal2vulkan::reflect_sanitized(

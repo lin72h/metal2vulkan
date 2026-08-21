@@ -77,6 +77,10 @@ pub(super) fn emit_finish_primary_module(
     entry_name: Option<&str>,
     options: passes::TransformOptions,
 ) -> Result<FinishedModule, String> {
+    // The primary/no-retry facades bypass `translate_sanitized_with_meta`, but they share the same
+    // product dispatch contract and hard resource ceiling. Reject unsafe partial-grid barriers at
+    // this final common boundary before parsing or emission.
+    passes::validate_kernel_dispatch_source(san_ll, stage, options, entry_name)?;
     let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
     let structured = tools::emit_vulkan_spirv_with_sidecar(
         san_ll,

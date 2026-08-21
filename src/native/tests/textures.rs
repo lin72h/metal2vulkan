@@ -4594,7 +4594,13 @@ declare void @air.wg.barrier(i32, i32)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(
         asm.lines()

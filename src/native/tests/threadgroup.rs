@@ -161,7 +161,13 @@ declare void @air.simdgroup.barrier(i32, i32)
     let tmp =
         std::env::temp_dir().join(format!("metal2vulkan_simd_shuffle_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpCapability GroupNonUniform"), "{asm}");
     assert!(
@@ -256,7 +262,13 @@ declare i32 @air.quad_min.u.i32(i32)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert_eq!(
         asm.matches("OpGroupNonUniformShuffleXor").count(),
@@ -1227,7 +1239,7 @@ entry:
         &tmp,
         passes::TransformOptions {
             kernel_local_size: [32, 2, 1],
-            kernel_threads_per_grid: None,
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::Workgroups),
             simd_cluster32: false,
             ..passes::TransformOptions::default()
         },
@@ -1288,7 +1300,9 @@ entry:
         &tmp,
         passes::TransformOptions {
             kernel_local_size: [5, 2, 1],
-            kernel_threads_per_grid: Some([21, 3, 1]),
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsFixed {
+                threads_per_grid: [21, 3, 1],
+            }),
             simd_cluster32: false,
             ..passes::TransformOptions::default()
         },
@@ -1298,6 +1312,8 @@ entry:
     assert!(asm.contains("LocalSize 5 2 1"), "{asm}");
     assert!(!asm.contains("BuiltIn NumWorkgroups"), "{asm}");
     assert!(!asm.contains("OpIMul"), "{asm}");
+    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 3, "{asm}");
+    assert_eq!(asm.matches("OpBranchConditional").count(), 1, "{asm}");
     assert!(
         asm.lines()
             .any(|line| line.contains("OpConstant") && line.contains("21")),
@@ -1315,6 +1331,398 @@ entry:
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_kernel_fixed_dispatch_threads_culls_without_threads_per_grid_parameter() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k() {
+entry:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_fixed_dispatch_guard_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions {
+            kernel_local_size: [8, 8, 1],
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsFixed {
+                threads_per_grid: [57, 9, 1],
+            }),
+            ..passes::TransformOptions::default()
+        },
+    )
+    .expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("BuiltIn GlobalInvocationId"), "{asm}");
+    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 2, "{asm}");
+    assert_eq!(asm.matches("OpBranchConditional").count(), 1, "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+
+    let divisible = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions {
+            kernel_local_size: [8, 8, 1],
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsFixed {
+                threads_per_grid: [64, 16, 1],
+            }),
+            ..passes::TransformOptions::default()
+        },
+    )
+    .expect("translate divisible grid");
+    let divisible_asm = disassemble(&divisible).expect("disassemble divisible grid");
+    assert!(
+        !divisible_asm.contains("OpBranchConditional"),
+        "{divisible_asm}"
+    );
+    assert!(
+        !divisible_asm.contains("BuiltIn GlobalInvocationId"),
+        "{divisible_asm}"
+    );
+}
+
+#[test]
+fn native_kernel_dynamic_dispatch_threads_shares_reflected_push_constant_grid() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k(<3 x i32> %grid_size) {
+entry:
+  %x = extractelement <3 x i32> %grid_size, i64 0
+  %ok = icmp uge i32 %x, 0
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.threads_per_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"grid_size"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_dynamic_dispatch_guard_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let options = passes::TransformOptions {
+        kernel_local_size: [8, 8, 1],
+        kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsPushConstant { offset: 16 }),
+        ..passes::TransformOptions::default()
+    };
+    let (spv, reflection) =
+        crate::translate_sanitized_native_reflected(ll, Stage::Kernel, &tmp, options)
+            .expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PushConstant"), "{asm}");
+    for offset in [16, 20, 24] {
+        assert!(asm.contains(&format!("Offset {offset}")), "{asm}");
+    }
+    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 4, "{asm}");
+    assert_eq!(asm.matches("OpBranchConditional").count(), 1, "{asm}");
+    assert_eq!(
+        reflection.kernel_dispatch,
+        Some(crate::reflect::KernelDispatch::ThreadsPushConstant { offset: 16 })
+    );
+    assert_eq!(
+        reflection
+            .kernel_dispatch
+            .and_then(crate::reflect::KernelDispatch::push_constant_range),
+        Some(crate::reflect::KernelGridPushConstantRange {
+            offset: 16,
+            size: 12,
+        })
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+}
+
+#[test]
+fn native_kernel_default_dispatch_uses_dynamic_grid_and_requires_explicit_workgroups() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k() {
+entry:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_default_dispatch_guard_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (guarded, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect("default translation");
+    let guarded_asm = disassemble(&guarded).expect("disassemble guarded default");
+    assert!(guarded_asm.contains("PushConstant"), "{guarded_asm}");
+    assert_eq!(guarded_asm.matches("OpUGreaterThanEqual").count(), 3);
+    assert_eq!(guarded_asm.matches("OpBranchConditional").count(), 1);
+    assert_eq!(
+        reflection.kernel_dispatch,
+        Some(crate::reflect::KernelDispatch::ThreadsPushConstant {
+            offset: crate::reflect::DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+        })
+    );
+    tools::spirv_val_bytes(&guarded, &tmp).expect("spirv-val guarded default");
+
+    let workgroups = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions {
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::Workgroups),
+            ..passes::TransformOptions::default()
+        },
+    )
+    .expect("explicit whole-workgroup translation");
+    let workgroups_asm = disassemble(&workgroups).expect("disassemble whole workgroups");
+    assert!(!workgroups_asm.contains("PushConstant"), "{workgroups_asm}");
+    assert!(
+        !workgroups_asm.contains("OpBranchConditional"),
+        "{workgroups_asm}"
+    );
+}
+
+#[test]
+fn native_kernel_partial_dispatch_threads_refuses_source_workgroup_barrier() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k() {
+entry:
+  tail call void @air.wg.barrier(i32 0, i32 1)
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_partial_barrier_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let error = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect_err("the safe dynamic default must not emit an unsafe return before a source barrier");
+    assert!(
+        error.contains("source control barriers are unsupported"),
+        "{error}"
+    );
+
+    let workgroups = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions {
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::Workgroups),
+            ..passes::TransformOptions::default()
+        },
+    )
+    .expect("an explicit whole-workgroup proof keeps the barrier uniform");
+    tools::spirv_val_bytes(&workgroups, &tmp).expect("spirv-val whole-workgroup barrier");
+}
+
+#[test]
+fn every_public_emission_facade_rejects_barriers_before_parsing_the_body() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k() {
+entry:
+  tail call void @air.wg.barrier(i32 0, i32 1)
+  %unsupported = futureop i32 0
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_barrier_preflight_facades_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let assert_barrier = |error: String| {
+        assert!(
+            error.contains("source control barriers are unsupported"),
+            "expected barrier preflight before unsupported body parse: {error}"
+        );
+    };
+
+    assert_barrier(
+        crate::translate_sanitized_native_reflected(
+            ll,
+            Stage::Kernel,
+            &tmp,
+            passes::TransformOptions::default(),
+        )
+        .expect_err("reflected translation must preflight barriers"),
+    );
+    assert_barrier(
+        crate::translate_native_no_retry(ll, Stage::Kernel)
+            .expect_err("no-retry translation must preflight barriers"),
+    );
+    assert_barrier(
+        crate::translate_native_primary_validated(ll, Stage::Kernel, &tmp)
+            .expect_err("validated primary translation must preflight barriers"),
+    );
+    for error in crate::translate_raw_tiers_probe(ll, Stage::Kernel, &tmp) {
+        assert_barrier(error.expect_err("raw-tier probes must preflight barriers"));
+    }
+    assert_barrier(
+        crate::translate_bda_probe(ll, Stage::Kernel, &tmp)
+            .expect_err("BDA probe must preflight barriers"),
+    );
+}
+
+#[test]
+fn native_kernel_partial_dispatch_ignores_barrier_in_unreachable_helper() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k() {
+entry:
+  ret void
+}
+
+define internal void @dead_helper() {
+entry:
+  tail call void @air.wg.barrier(i32 0, i32 1)
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_dead_barrier_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect("a dead helper's barrier does not constrain entry dispatch");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PushConstant"), "{asm}");
+    assert!(asm.contains("OpBranchConditional"), "{asm}");
+    assert!(!asm.contains("OpControlBarrier"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val dead barrier helper");
+}
+
+#[test]
+fn native_kernel_partial_dispatch_refuses_barrier_in_reachable_helper() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define void @k() {
+entry:
+  tail call void @barrier_helper()
+  ret void
+}
+
+define internal void @barrier_helper() {
+entry:
+  tail call void @air.wg.barrier(i32 0, i32 1)
+  ret void
+}
+
+declare void @air.wg.barrier(i32, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_reachable_barrier_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let error = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect_err("a reachable helper barrier must keep entry execution uniform");
+    assert!(
+        error.contains("source control barriers are unsupported"),
+        "{error}"
+    );
+}
+
+#[test]
+fn native_kernel_generated_workgroup_initialization_precedes_dispatch_cull() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+@scratch = internal addrspace(3) global [1 x i32] zeroinitializer, align 4
+
+define void @k() {
+entry:
+  %slot = getelementptr [1 x i32], ptr addrspace(3) @scratch, i64 0, i64 0
+  store i32 7, ptr addrspace(3) %slot, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !1}
+!1 = !{}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_generated_barrier_guard_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions {
+            kernel_local_size: [8, 1, 1],
+            kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsFixed {
+                threads_per_grid: [9, 1, 1],
+            }),
+            ..passes::TransformOptions::default()
+        },
+    )
+    .expect("translator-owned barrier remains uniform");
+    let asm = disassemble(&spv).expect("disassemble");
+    let barrier = asm.find("OpControlBarrier").expect("generated barrier");
+    let cull = asm.find("OpBranchConditional").expect("dispatch cull");
+    assert!(barrier < cull, "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
 }
 
 #[test]
@@ -1393,7 +1801,13 @@ entry:
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     let module = load_bytes(&spv).expect("load spv");
     let workgroup_vars = module
@@ -1457,7 +1871,13 @@ declare void @air.wg.barrier(i32, i32)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpControlBarrier"), "{asm}");
     // 584 = AcquireRelease | UniformMemory | CrossWorkgroupMemory.
@@ -1518,7 +1938,13 @@ declare i32 @air.atomic.local.or.u.i32(ptr addrspace(3), i32, i32, i32, i1)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Workgroup"), "{asm}");
     assert!(asm.contains("OpControlBarrier"), "{asm}");
@@ -1581,7 +2007,13 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native_with_options(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        whole_workgroup_options(),
+    )
+    .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(!asm.contains("OpTypeStruct %uint"), "{asm}");
     assert_eq!(asm.matches("OpAtomicIAdd").count(), 4, "{asm}");

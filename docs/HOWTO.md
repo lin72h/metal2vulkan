@@ -48,12 +48,16 @@ metal2vulkan input.ll passthrough.spv --stage passthrough
 Passthrough generation has no Metal interface metadata, so it cannot be combined with
 `--emit-meta`. The accepted alias `--stage compute` is equivalent to `kernel`.
 
-Two options affect pipeline-dependent lowering:
+These options affect pipeline- or dispatch-dependent lowering:
 
 | Option | Supply it when |
 |---|---|
 | `--raster-samples 1|2|4|8|16|32|64` | Fragment AIR calls `air.get_num_samples.i32`; use the exact graphics-pipeline sample count |
 | `--simd-cluster32` | A caller explicitly needs Metal's 32-lane simdgroup reduction partition on a wider Vulkan subgroup |
+| `--local X,Y,Z` | Kernel dispatches use a threadgroup size other than the default `64,1,1` |
+| `--threads-per-grid X,Y,Z` | Bake one exact Metal `dispatchThreads` grid into a pipeline variant |
+| `--threads-per-grid-push-constant OFFSET` | Move the default per-dispatch exact grid from push-constant offset 0 to `OFFSET` |
+| `--whole-workgroups` | Assert every kernel launch covers complete workgroups and omit the default grid guard |
 
 The translator automatically preserves the 32-lane contract for recognized `air.simd_*` modules.
 Do not use either option as a workaround for an unrelated translation failure.
@@ -220,6 +224,13 @@ footprint soundness gate. Treat `access: null` conservatively as read-write.
   `depth_qualifier`.
 - Kernel stages use `local_size`. `imageblock_layouts` and threadgroup bindings describe Workgroup
   storage rather than descriptors.
+- For kernels, obey `kernel_dispatch`. The safe default is `ThreadsPushConstant` at offset 0:
+  declare a compute-stage range of `KERNEL_GRID_PUSH_CONSTANT_SIZE` bytes and write three tightly
+  packed `u32` dimensions before every `vkCmdDispatch`. For Metal `dispatchThreads`, write its exact
+  requested thread count; for `dispatchThreadgroups`, write `groupCount * local_size`. The shader
+  uses that same value for both `[[threads_per_grid]]` and surplus-invocation culling.
+  `ThreadsFixed` bakes a grid into a pipeline variant. `Workgroups` needs no extra state but is an
+  explicit proof that partial threadgroups will never reach the kernel.
 - Use `function_constants` to discover exact indices and Metal ABI type encodings. Specialize IR
   with `specialize_function_constant_bytes` when exact scalar or vector payloads are required.
 

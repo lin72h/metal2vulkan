@@ -24,6 +24,15 @@ fn asm_has_line(asm: &str, needle: &str) -> bool {
     asm.lines().any(|line| line.trim() == needle)
 }
 
+/// Isolate non-dispatch lowering tests from the safe dynamic-grid prologue. Tests using this helper
+/// explicitly model a caller that dispatches complete workgroups.
+fn whole_workgroup_options() -> crate::passes::TransformOptions {
+    crate::passes::TransformOptions {
+        kernel_dispatch: Some(crate::reflect::KernelDispatch::Workgroups),
+        ..crate::passes::TransformOptions::default()
+    }
+}
+
 fn assert_no_pointer_bitcasts(spv: &[u8]) {
     let module = load_bytes(spv).expect("load spv");
     let pointer_types = module

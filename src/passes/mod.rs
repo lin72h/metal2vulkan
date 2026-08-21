@@ -42,9 +42,10 @@ pub struct TransformOptions {
     /// Complete descriptor-set and binding layout for this independently translated stage.
     pub descriptor_layout: crate::reflect::DescriptorLayout,
     pub kernel_local_size: [u32; 3],
-    /// Exact Metal `[[threads_per_grid]]` value when it is not derivable as
-    /// Vulkan NumWorkgroups * LocalSize (non-uniform `dispatchThreads` tail regions).
-    pub kernel_threads_per_grid: Option<[u32; 3]>,
+    /// Explicit kernel dispatch contract. `None` selects the safe per-dispatch push-constant grid
+    /// at offset zero for kernels and is ignored for non-kernel stages. `Workgroups` is therefore
+    /// an explicit assertion that every dispatch covers complete workgroups.
+    pub kernel_dispatch: Option<crate::reflect::KernelDispatch>,
     /// M-D2: lower `air.simd_{sum,min,max,and,or,xor}` REDUCE as a `GroupNonUniform ClusteredReduce`
     /// over a 32-lane cluster (Metal's simdgroup width) instead of a whole-subgroup Reduce, so a
     /// driver whose subgroup is WIDER than 32 still reduces over exactly the 32 lanes Apple's `simd_*`
@@ -76,7 +77,7 @@ impl Default for TransformOptions {
         Self {
             descriptor_layout: crate::reflect::DescriptorLayout::default(),
             kernel_local_size: [64, 1, 1],
-            kernel_threads_per_grid: None,
+            kernel_dispatch: None,
             simd_cluster32: false,
             denorm_flush_to_zero_f32: false,
             raster_sample_count: None,
@@ -87,6 +88,17 @@ impl Default for TransformOptions {
 }
 
 impl TransformOptions {
+    /// Select the complete kernel dispatch/grid contract. Push-constant offsets are validated before
+    /// translation mutates the module.
+    pub fn with_kernel_dispatch(
+        mut self,
+        dispatch: crate::reflect::KernelDispatch,
+    ) -> Result<Self, String> {
+        dispatch.validate()?;
+        self.kernel_dispatch = Some(dispatch);
+        Ok(self)
+    }
+
     pub fn with_descriptor_layout(
         mut self,
         layout: crate::reflect::DescriptorLayout,
@@ -166,6 +178,38 @@ impl TransformOptions {
         }
         Ok(())
     }
+}
+
+/// Reject a dynamic/partial kernel grid before native emission when the source call graph already
+/// proves that the entry contains a control barrier. This is the same safety contract enforced on
+/// emitted SPIR-V, but at the earliest structural boundary so large unsupported kernels still meet
+/// the translation time ceiling under bounded parallel audits.
+pub(crate) fn validate_kernel_dispatch_source(
+    san_ll: &str,
+    stage: Stage,
+    options: TransformOptions,
+    entry_name: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(stage, Stage::Kernel) {
+        return Ok(());
+    }
+    if options.kernel_local_size.contains(&0) {
+        return Err("kernel LocalSize dimensions must be non-zero".to_string());
+    }
+    let dispatch = options
+        .kernel_dispatch
+        .unwrap_or_else(crate::reflect::KernelDispatch::safe_default);
+    if !kernel_dispatch_guard_required(dispatch, options.kernel_local_size) {
+        return Ok(());
+    }
+    if crate::air_intrinsics::entry_reaches_air_call(
+        san_ll,
+        entry_name,
+        &["air.wg.barrier", "air.simdgroup.barrier"],
+    ) {
+        return Err(UNSAFE_DISPATCH_BARRIER_ERROR.to_string());
+    }
+    Ok(())
 }
 
 /// The sampled component type of a texture (the `OpTypeImage` "Sampled Type"). Metal integer
@@ -313,8 +357,11 @@ struct Ctx {
     descriptor_layout: crate::reflect::DescriptorLayout,
     /// GLCompute LocalSize and the value exposed to AIR `[[threads_per_threadgroup]]`.
     kernel_local_size: [u32; 3],
-    /// Optional exact value exposed to AIR `[[threads_per_grid]]`.
-    kernel_threads_per_grid: Option<[u32; 3]>,
+    /// Shared source for AIR `[[threads_per_grid]]` and the entry invocation cull.
+    kernel_dispatch: crate::reflect::KernelDispatch,
+    /// Interface variables retained for the late, post-AIR-lowering invocation cull.
+    kernel_grid_push_constant_var: Option<Word>,
+    kernel_dispatch_global_invocation_id_var: Option<Word>,
     /// M-D2 simd-reduce clustering opt-in (see [`TransformOptions::simd_cluster32`]).
     simd_cluster32: bool,
     /// Exact graphics-pipeline sample count used to lower `air.get_num_samples.i32`.
@@ -399,7 +446,11 @@ impl Ctx {
             air_data_layout,
             descriptor_layout: options.descriptor_layout,
             kernel_local_size: options.kernel_local_size,
-            kernel_threads_per_grid: options.kernel_threads_per_grid,
+            kernel_dispatch: options
+                .kernel_dispatch
+                .unwrap_or_else(crate::reflect::KernelDispatch::safe_default),
+            kernel_grid_push_constant_var: None,
+            kernel_dispatch_global_invocation_id_var: None,
             simd_cluster32: options.simd_cluster32,
             raster_sample_count: options.raster_sample_count,
             runtime_sampler_states: options.runtime_sampler_states,
@@ -1447,7 +1498,10 @@ use finalize::finalize;
 use prune::prune_unreachable_blocks;
 use resources::rewrites::{rewrite_affine_raw_word_loads, rewrite_exact_raw_word_loads};
 use resources::*;
-use stage_input::build_stage_input;
+use stage_input::{
+    build_stage_input, insert_kernel_dispatch_guard, kernel_dispatch_guard_required,
+    materialize_kernel_grid_push_constant, UNSAFE_DISPATCH_BARRIER_ERROR,
+};
 use stage_output::rewrite_return;
 use value_queries::*;
 use workgroup::*;
@@ -2165,7 +2219,11 @@ pub(crate) fn transform(
         vert,
         kern,
         entry_name,
-        TransformOptions::default(),
+        TransformOptions {
+            kernel_dispatch: matches!(stage, Stage::Kernel)
+                .then_some(crate::reflect::KernelDispatch::Workgroups),
+            ..TransformOptions::default()
+        },
     )
 }
 
@@ -2220,6 +2278,12 @@ pub(crate) fn transform_with_options_and_sidecar(
     if matches!(stage, Stage::Kernel) && options.kernel_local_size.contains(&0) {
         return Err("kernel LocalSize dimensions must be non-zero".to_string());
     }
+    if let Some(dispatch) = options.kernel_dispatch {
+        dispatch.validate()?;
+    }
+    if !matches!(stage, Stage::Kernel) && options.kernel_dispatch.is_some() {
+        return Err("kernel dispatch bounds are only valid for kernel stages".to_string());
+    }
     let mut ctx = Ctx::with_options_and_sidecar(module, emit_sidecar, stage, options);
     let retry_debug = crate::env_vars::retry_debug();
     let debug_phase = |phase: &str| {
@@ -2230,6 +2294,16 @@ pub(crate) fn transform_with_options_and_sidecar(
 
     let mut entry_idx = find_entry_index(&ctx.module, entry_name)
         .ok_or_else(|| "no entry function with a body found".to_string())?;
+    if matches!(stage, Stage::Kernel)
+        && kernel_dispatch_guard_required(ctx.kernel_dispatch, ctx.kernel_local_size)
+        && ctx.module.functions[entry_idx]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| instruction.class.opcode == Op::ControlBarrier)
+    {
+        return Err(UNSAFE_DISPATCH_BARRIER_ERROR.to_string());
+    }
 
     debug_phase("cleanup start");
     // Producer-side closure already made the entry self-contained. Preserve the former residual
@@ -2383,6 +2457,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     //     variables exist only in compute, and the barrier is only legal there.
     if matches!(stage, Stage::Kernel) {
         workgroup::unroll_small_workgroup_atomic_loops(&mut ctx, entry_idx);
+        insert_kernel_dispatch_guard(&mut ctx, entry_idx)?;
         workgroup::zero_initialize_workgroup_memory(&mut ctx, entry_idx);
     }
     // 2f) drop blocks unreachable from the entry (orphaned constructs the structured-CFG repair's

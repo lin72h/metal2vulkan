@@ -818,7 +818,6 @@ pub(crate) fn product_transform_options(
     let mut options = match case.dispatch.as_ref() {
         Some(dispatch) => metal2vulkan::passes::TransformOptions {
             kernel_local_size: dispatch.threads_per_threadgroup,
-            kernel_threads_per_grid: Some(dispatch.grid),
             ..metal2vulkan::passes::TransformOptions::default()
         },
         None => metal2vulkan::passes::TransformOptions::default(),
@@ -2888,6 +2887,10 @@ mod tests {
         });
         let options = product_transform_options(&case).expect("authored specialization");
         assert_eq!(options.kernel_local_size, [1, 1, 1]);
+        assert_eq!(
+            options.kernel_dispatch, None,
+            "authored execution must exercise the product's safe dynamic-grid default"
+        );
         assert_eq!(
             options.runtime_sampler_states[3],
             Some(case.samplers[0].runtime_specialization())
