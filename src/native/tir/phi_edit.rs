@@ -37,6 +37,7 @@ fn collect_locals(v: &LlValue, out: &mut Vec<String>) {
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero
@@ -144,6 +145,7 @@ impl TirBlock {
             opcode: "phi".to_string(),
             alloca_ty: None,
             phi_incoming: Some((ty.clone(), incomings.to_vec())),
+            phi_parse_error: None,
             aggregate_indices: None,
             diag_line: None,
             shuffle_mask: None,
@@ -378,7 +380,7 @@ impl TirBlock {
         };
         for inst in &mut self.insts {
             if inst.opcode == "phi" && inst.result.as_deref() == Some(result.as_str()) {
-                inst.phi_incoming = phi_incoming_of(phi_line);
+                (inst.phi_incoming, inst.phi_parse_error) = phi_incoming_of(phi_line);
                 inst.phi_incoming_values = resolve_phi_incoming_values(phi_line, "phi");
                 inst.operands = resolve_operands(phi_line);
                 inst.uses = instruction_uses(phi_line, Some(result.as_str()));
@@ -722,15 +724,11 @@ mod tests {
         }
     }
 
-    /// The reachability boundary for [`TirBlock::push_value_phi`] / [`TirBlock::append_phi_incoming`]: a
-    /// phi with an AGGREGATE incoming lowers to `phi_incoming: None` (`parse_phi` rejects the
-    /// `<N x T> <...>` incoming form) with an `Unresolved` operand, so it fails primary emit and routes
-    /// to retry. A structurizer site therefore never extracts a typed incoming list from such a phi —
-    /// the carrier-direct helpers are only ever fed the parseable (`Some`) incomings the tests above
-    /// cover. This locks that invariant so the helpers are not "fixed" to fake-parse aggregates (which
-    /// would emit where the line path retried — a byte change).
+    /// A phi with a typed vector incoming (e.g. `<2 x i32> <i32 %a, i32 %b>`) now parses
+    /// successfully via `parse_phi_incoming_value` (which tries `parse_typed_value` first).
+    /// The carrier is `Some`, and `emit_phi_resolved` handles the parsed value.
     #[test]
-    fn aggregate_phi_incoming_is_none() {
+    fn aggregate_phi_incoming_carrier_populated() {
         let carrier = lower_block_carrier(
             "%blk",
             &[
@@ -743,8 +741,8 @@ mod tests {
         let phi = &carrier.insts[0];
         assert_eq!(phi.opcode, "phi");
         assert!(
-            phi.phi_incoming.is_none(),
-            "an aggregate phi incoming must not parse to a typed incoming list"
+            phi.phi_incoming.is_some(),
+            "a typed vector phi incoming should parse to a carrier"
         );
     }
 

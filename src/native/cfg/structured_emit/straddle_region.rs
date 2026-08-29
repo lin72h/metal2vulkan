@@ -156,6 +156,7 @@ fn collect_value_locals(value: &LlValue, out: &mut Vec<String>) {
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero
@@ -200,6 +201,7 @@ fn substitute_cross_slot_value(
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero

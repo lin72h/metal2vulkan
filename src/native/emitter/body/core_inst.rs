@@ -440,8 +440,12 @@ impl Emitter {
         // `body_block.lines` text walk. This removes the last graph-walk `inst.text` reader.
         Err(format!(
             "native emitter: instruction not handled by the typed graph walk \
-             (reason=graph_walk_unmigrated_opcode, opcode={})",
-            inst.opcode
+             (reason=graph_walk_unmigrated_opcode, opcode={}, phi_incoming={}, phi_parse_error={:?}, operands={:?}, result={:?})",
+            inst.opcode,
+            inst.phi_incoming.is_some(),
+            inst.phi_parse_error,
+            inst.operands,
+            inst.result
         ))
     }
 

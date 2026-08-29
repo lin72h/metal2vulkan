@@ -1292,6 +1292,93 @@ declare float @air.dot.v3f32(<3 x float>, <3 x float>)
 }
 
 #[test]
+fn native_exact_float32_bit_literal_preserves_constant_bits() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define float @scale(float %x) {
+entry:
+  %scaled = fmul float %x, f0x358637BD
+  ret float %scaled
+}
+"#;
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    assert!(module.types_global_values.iter().any(|inst| {
+        inst.class.opcode == Op::Constant && inst.operands == [Operand::LiteralBit32(0x3586_37bd)]
+    }));
+}
+
+#[test]
+fn native_decimal_half_literal_rounds_to_binary16() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define half @scale(half %x) {
+entry:
+  %scaled = fmul half %x, 1.000000e+00
+  ret half %scaled
+}
+"#;
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let half_ty = module
+        .types_global_values
+        .iter()
+        .find(|inst| {
+            inst.class.opcode == Op::TypeFloat && inst.operands == [Operand::LiteralBit32(16)]
+        })
+        .and_then(|inst| inst.result_id)
+        .expect("float16 type");
+    assert!(module.types_global_values.iter().any(|inst| {
+        inst.class.opcode == Op::Constant
+            && inst.result_type == Some(half_ty)
+            && inst.operands == [Operand::LiteralBit32(0x3c00)]
+    }));
+}
+
+#[test]
+fn native_phi_carrier_accepts_decimal_half_and_exact_float_bits() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define float @merge_constants(i1 %choose) {
+entry:
+  br i1 %choose, label %left, label %right
+left:
+  br label %merge
+right:
+  br label %merge
+merge:
+  %half_value = phi half [ 1.000000e+00, %left ], [ 2.000000e+00, %right ]
+  %float_value = phi float [ f0x358637BD, %left ], [ f0x38D1B717, %right ]
+  %wide = fpext half %half_value to float
+  %result = fadd float %wide, %float_value
+  ret float %result
+}
+"#;
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let constants = module
+        .types_global_values
+        .iter()
+        .filter(|inst| inst.class.opcode == Op::Constant)
+        .filter_map(|inst| match inst.operands.first() {
+            Some(Operand::LiteralBit32(bits)) => Some(*bits),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    assert!(constants.contains(&0x3c00), "{constants:?}");
+    assert!(constants.contains(&0x4000), "{constants:?}");
+    assert!(constants.contains(&0x3586_37bd), "{constants:?}");
+    assert!(constants.contains(&0x38d1_b717), "{constants:?}");
+    assert_eq!(
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|inst| inst.class.opcode == Op::Phi)
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn native_half_hex_literals_lower_as_float16_constants() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"
@@ -2210,5 +2297,134 @@ declare i32 @air.max.s.i32(i32, i32)
         .is_ok()
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_phi_incoming_typed_vector_constant() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <4 x float> @merge_vec(i1 %choose, <4 x float> %a, <4 x float> %b) {
+entry:
+  br i1 %choose, label %left, label %right
+left:
+  br label %merge
+right:
+  br label %merge
+merge:
+  %result = phi <4 x float> [ %a, %left ], [ <4 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00>, %right ]
+  ret <4 x float> %result
+}
+"#;
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let phi_count = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|inst| inst.class.opcode == Op::Phi)
+        .count();
+    assert_eq!(phi_count, 1);
+    // The vector constant <1.0, 2.0, 3.0, 4.0> must be in the constant pool.
+    let constants = module
+        .types_global_values
+        .iter()
+        .filter(|inst| inst.class.opcode == Op::Constant)
+        .filter_map(|inst| match inst.operands.first() {
+            Some(Operand::LiteralBit32(bits)) => Some(*bits),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    assert!(
+        constants.contains(&0x3f80_0000),
+        "1.0f missing: {constants:?}"
+    );
+    assert!(
+        constants.contains(&0x4000_0000),
+        "2.0f missing: {constants:?}"
+    );
+    assert!(
+        constants.contains(&0x4040_0000),
+        "3.0f missing: {constants:?}"
+    );
+    assert!(
+        constants.contains(&0x4080_0000),
+        "4.0f missing: {constants:?}"
+    );
+}
+
+#[test]
+fn native_phi_incoming_hex_float_vector_constant() {
+    // Exact pattern from the reims-vgpu fail log: phi with 4 incoming values,
+    // where the 4th is a <4 x float> vector constant using hex float literals.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <4 x float> @merge_vec(i32 %choose, <4 x float> %a, <4 x float> %b, <4 x float> %c) {
+entry:
+  %c1 = icmp eq i32 %choose, 0
+  br i1 %c1, label %left, label %mid
+left:
+  br label %merge
+mid:
+  %c2 = icmp eq i32 %choose, 1
+  br i1 %c2, label %mid2, label %right
+mid2:
+  br label %merge
+right:
+  br label %merge
+merge:
+  %result = phi <4 x float> [ %a, %left ], [ %b, %mid2 ], [ %c, %right ], [ <4 x float> <float 0x3F800000, float 0x3F800000, float 0x3F800000, float 0x3F800000>, %entry ]
+  ret <4 x float> %result
+}
+"#;
+    let result = emit_vulkan_spirv(ll);
+    match &result {
+        Ok(spv) => {
+            let module = load_bytes(spv).expect("load native spv");
+            let phi_count = module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .filter(|inst| inst.class.opcode == Op::Phi)
+                .count();
+            assert!(phi_count >= 1, "expected at least 1 phi instruction, got {phi_count}");
+        }
+        Err(e) => panic!("emit failed: {}", e),
+    }
+}
+
+#[test]
+fn native_phi_incoming_qnan_vector_constant() {
+    // Exact pattern from the reims-vgpu fail log: phi with a vector constant
+    // containing LLVM NaN literals: <float +qnan, float +qnan, ...>
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.3"
+define <4 x float> @merge_vec(i1 %choose, <4 x float> %a) {
+entry:
+  br i1 %choose, label %left, label %right
+left:
+  br label %merge
+right:
+  br label %merge
+merge:
+  %result = phi <4 x float> [ %a, %left ], [ <4 x float> <float +qnan, float +qnan, float +qnan, float +qnan>, %right ]
+  ret <4 x float> %result
+}
+"#;
+    let result = emit_vulkan_spirv(ll);
+    match &result {
+        Ok(spv) => {
+            let module = load_bytes(spv).expect("load native spv");
+            let phi_count = module
+                .functions
+                .iter()
+                .flat_map(|function| &function.blocks)
+                .flat_map(|block| &block.instructions)
+                .filter(|inst| inst.class.opcode == Op::Phi)
+                .count();
+            assert!(phi_count >= 1, "expected at least 1 phi instruction, got {phi_count}");
+        }
+        Err(e) => panic!("emit failed: {}", e),
     }
 }

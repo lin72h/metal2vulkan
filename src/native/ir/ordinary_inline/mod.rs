@@ -55,6 +55,7 @@ fn is_literal(value: &LlValue) -> bool {
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero
@@ -231,6 +232,7 @@ fn collect_value_capabilities(
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero

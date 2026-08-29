@@ -43,6 +43,7 @@ fn rename_llvalue(v: &mut LlValue, map: &Map) {
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero

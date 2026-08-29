@@ -55,6 +55,7 @@ pub(in crate::native) fn render_value(value: &LlValue) -> Option<String> {
         ),
         LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Vector(_)

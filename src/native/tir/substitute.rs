@@ -44,6 +44,7 @@ fn substitute_value(value: &mut LlValue, substitutions: &Substitutions) {
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero
@@ -94,6 +95,7 @@ fn local_uses(value: &LlValue, uses: &mut Vec<String>) {
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero
@@ -111,6 +113,7 @@ fn replacement_token(value: &TypedValue) -> String {
     match &value.value {
         LlValue::Hex(bits) => format!("0x{bits:016X}"),
         LlValue::Float(number) => format!("{number:e}"),
+        LlValue::Float32Bits(bits) => format!("f0x{bits:08X}"),
         LlValue::HalfBits(bits) => format!("0xH{bits:04X}"),
         LlValue::BFloatBits(bits) => format!("0xR{bits:04X}"),
         LlValue::Zero if matches!(value.ty, LlType::Ptr(_)) => "null".to_string(),

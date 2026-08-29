@@ -150,6 +150,14 @@ pub(super) fn parse_float_literal(s: &str) -> Result<f64, String> {
         .map_err(|e| format!("native emitter: expected float `{s}`: {e}"))
 }
 
+pub(super) fn parse_float32_hex_literal(s: &str) -> Option<u32> {
+    let hex = s.strip_prefix("f0x")?;
+    if hex.len() != 8 {
+        return None;
+    }
+    u32::from_str_radix(hex, 16).ok()
+}
+
 pub(super) fn parse_half_literal(s: &str) -> Option<u16> {
     let hex = s.strip_prefix("0xH")?;
     u16::from_str_radix(hex, 16).ok()
@@ -189,6 +197,15 @@ mod tests {
     //! string/comment/nesting behaviour every higher-level parser re-lexes on top of, so the S7/S8
     //! refactors can't silently regress it. No external tools — part of the pure-static gate (T2).
     use super::*;
+
+    #[test]
+    fn float32_bit_literal_requires_exact_width() {
+        assert_eq!(parse_float32_hex_literal("f0x358637BD"), Some(0x3586_37bd));
+        assert_eq!(parse_float32_hex_literal("f0x00000000"), Some(0));
+        assert_eq!(parse_float32_hex_literal("f0x1234567"), None);
+        assert_eq!(parse_float32_hex_literal("f0x123456789"), None);
+        assert_eq!(parse_float32_hex_literal("f0x1234567g"), None);
+    }
 
     #[test]
     fn split_top_level_respects_nesting_and_strings() {
@@ -274,5 +291,24 @@ mod tests {
         assert_eq!(parse_float_literal("1.5").unwrap(), 1.5);
         assert_eq!(parse_float_literal("1e3").unwrap(), 1000.0);
         assert!(parse_float_literal("10").is_err()); // no '.'/'e' => not a float literal
+    }
+}
+
+/// Parse LLVM IR special float literals: `+qnan`, `-qnan`, `qnan`, `snan`, `-snan`,
+/// `+inf`, `-inf`, `inf`, `nan`. Returns the IEEE 754 f32 bit pattern.
+pub(super) fn parse_float_special_literal(s: &str) -> Option<u32> {
+    let s = s.trim();
+    // Strip leading + if present
+    let s = s.strip_prefix('+').unwrap_or(s);
+    match s {
+        "qnan" => Some(0x7FC0_0000),       // quiet NaN (positive)
+        "-qnan" => Some(0xFFC0_0000),       // quiet NaN (negative)
+        "snan" => Some(0x7F80_0001),       // signaling NaN
+        "-snan" => Some(0xFF80_0001),      // signaling NaN (negative)
+        "inf" => Some(0x7F80_0000),         // positive infinity
+        "-inf" => Some(0xFF80_0000),        // negative infinity
+        "nan" => Some(0x7FC0_0000),         // generic NaN
+        "-nan" => Some(0xFFC0_0000),       // generic NaN (negative)
+        _ => None,
     }
 }

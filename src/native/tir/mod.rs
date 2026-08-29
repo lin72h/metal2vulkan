@@ -333,6 +333,10 @@ pub(super) struct TirInst {
     /// so the `phi` emitter reads them from the typed graph instead of re-lexing `text`. Byte-identical by
     /// construction: the SAME `parse_phi` on the SAME post-opcode rest the emitter computes.
     pub(super) phi_incoming: Option<(LlType, Vec<(LlValue, String)>)>,
+    /// Exact `parse_phi` refusal captured while building a phi whose [`Self::phi_incoming`] carrier
+    /// is absent. Diagnostics-only: emission returns it through the existing fail-visible graph-walk
+    /// error; it never changes parsing or lowering. `None` for valid phis and non-phi instructions.
+    pub(super) phi_parse_error: Option<String>,
     /// For an `extractvalue`/`insertvalue`, the trailing constant INDEX literals — the fields after the
     /// aggregate (`extractvalue`) or aggregate+element (`insertvalue`) value operands. These are plain
     /// integer literals in the opcode text, not SSA value operands the graph lowers, so the emitter used
@@ -449,6 +453,7 @@ impl TirInst {
             opcode: "metal2vulkan.inline_parameter".to_string(),
             alloca_ty: None,
             phi_incoming: None,
+            phi_parse_error: None,
             aggregate_indices: None,
             diag_line: None,
             shuffle_mask: None,
@@ -1128,19 +1133,33 @@ mod tests {
     fn phi_incoming_carrier_parses_type_and_labels() {
         // The carrier holds the phi's parsed (unresolved) type and its (value, predecessor) pairs — the
         // labels the graph `operands` drop. A non-phi line yields `None`.
-        let (ty, incoming) =
-            phi_incoming_of("%p = phi i32 [ %a, %entry ], [ 0, %loop ]").expect("phi parses");
+        let (parsed, error) = phi_incoming_of("%p = phi i32 [ %a, %entry ], [ 0, %loop ]");
+        let (ty, incoming) = parsed.expect("phi parses");
+        assert!(error.is_none());
         assert_eq!(ty, LlType::Int(32));
         assert_eq!(incoming.len(), 2);
         assert_eq!(incoming[0].1, "%entry");
         assert_eq!(incoming[1].1, "%loop");
-        assert!(phi_incoming_of("%a = add i32 %x, %y").is_none());
+        let (incoming, error) = phi_incoming_of("%a = add i32 %x, %y");
+        assert!(incoming.is_none());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn malformed_phi_carrier_retains_the_parser_error() {
+        let (incoming, error) = phi_incoming_of("%p = phi i32 [ nope ]");
+        assert!(incoming.is_none());
+        assert_eq!(
+            error.as_deref(),
+            Some("native emitter: malformed phi incoming fields:  nope ")
+        );
     }
 
     #[test]
     fn array_phi_incoming_does_not_confuse_the_type_bracket_for_an_operand() {
-        let (ty, incoming) = phi_incoming_of("%p = phi [14 x i8] [ %a, %entry ], [ %b, %loop ]")
-            .expect("array phi parses");
+        let (parsed, error) = phi_incoming_of("%p = phi [14 x i8] [ %a, %entry ], [ %b, %loop ]");
+        let (ty, incoming) = parsed.expect("array phi parses");
+        assert!(error.is_none());
         assert_eq!(ty, LlType::Array(Box::new(LlType::Int(8)), 14));
         assert_eq!(incoming.len(), 2);
         assert_eq!(incoming[0].1, "%entry");

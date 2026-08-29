@@ -54,6 +54,7 @@ pub(super) enum LlValue {
     SignedInt(i64),
     Hex(u64),
     Float(f64),
+    Float32Bits(u32),
     HalfBits(u16),
     BFloatBits(u16),
     Vector(Vec<TypedValue>),

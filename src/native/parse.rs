@@ -1,8 +1,9 @@
 use super::ir::{LlDeclaration, LlFunction, LlGep, LlGlobal, LlType, LlValue, TypedValue};
 pub(super) use super::lex::{
-    matching_angle, matching_paren, parse_bfloat_literal, parse_float_literal, parse_half_literal,
-    parse_hex_literal, parse_i64_literal, parse_u32, parse_u64_literal, split_top_level,
-    split_top_level_whitespace, strip_comment,
+    matching_angle, matching_paren, parse_bfloat_literal, parse_float32_hex_literal,
+    parse_float_literal, parse_float_special_literal, parse_half_literal, parse_hex_literal,
+    parse_i64_literal, parse_u32, parse_u64_literal, split_top_level, split_top_level_whitespace,
+    strip_comment,
 };
 use crate::spirv_module::Operand;
 use spirv::Op;
@@ -375,12 +376,18 @@ pub(super) fn parse_value(s: &str) -> Result<LlValue, String> {
         Ok(LlValue::HalfBits(bits))
     } else if let Some(bits) = parse_bfloat_literal(s) {
         Ok(LlValue::BFloatBits(bits))
+    } else if let Some(bits) = parse_float32_hex_literal(s) {
+        Ok(LlValue::Float32Bits(bits))
     } else if let Some(bits) = parse_hex_literal(s) {
         Ok(LlValue::Hex(bits))
     } else if let Ok(v) = parse_i64_literal(s) {
         Ok(LlValue::SignedInt(v))
     } else if let Ok(v) = parse_u64_literal(s) {
         Ok(LlValue::Int(v))
+    } else if let Some(bits) = parse_float_special_literal(s) {
+        // LLVM emits NaN/Inf as `+qnan`, `-qnan`, `+inf`, `-inf`, `qnan`, `snan`, etc.
+        // Map to the exact IEEE 754 f32 bit pattern.
+        Ok(LlValue::Float32Bits(bits))
     } else if let Ok(v) = parse_float_literal(s) {
         Ok(LlValue::Float(v))
     } else {
@@ -728,7 +735,10 @@ pub(super) fn parse_phi(rest: &str) -> Result<(LlType, Vec<(LlValue, String)>), 
                     "native emitter: malformed phi incoming fields: {incoming}"
                 ));
             }
-            Ok((parse_value(parts[0].trim())?, parts[1].trim().to_string()))
+            Ok((
+                parse_phi_incoming_value(parts[0].trim())?,
+                parts[1].trim().to_string(),
+            ))
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok((phi_ty, incoming))
@@ -909,9 +919,20 @@ pub(super) fn parse_phi_incoming_values(rest: &str) -> Result<Vec<LlValue>, Stri
                     "native emitter: malformed phi incoming fields: {incoming}"
                 ));
             }
-            parse_value(parts[0].trim())
+            parse_phi_incoming_value(parts[0].trim())
         })
         .collect()
+}
+
+/// Parse a phi incoming value token. The token may carry an inline type prefix
+/// (e.g. `<4 x float> <float 0x3F800000, …>`), so try `parse_typed_value` first
+/// — which splits the type from the value — and fall back to `parse_value` for
+/// bare constants like `zeroinitializer`, `%name`, or `0x3F800000`.
+fn parse_phi_incoming_value(token: &str) -> Result<LlValue, String> {
+    if let Ok(tv) = parse_typed_value(token) {
+        return Ok(tv.value);
+    }
+    parse_value(token)
 }
 
 pub(super) fn parse_type(s: &str) -> Result<LlType, String> {
@@ -1222,6 +1243,13 @@ mod parse_tests {
 
         assert!(parse_typed_value("i32").is_err()); // no value token
         assert!(parse_typed_value("").is_err());
+    }
+
+    #[test]
+    fn parse_typed_float32_bit_literal_preserves_bits() {
+        let tv = parse_typed_value("float f0x358637BD").unwrap();
+        assert_eq!(tv.ty, LlType::Float);
+        assert!(matches!(tv.value, LlValue::Float32Bits(0x3586_37bd)));
     }
 
     #[test]

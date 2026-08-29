@@ -476,6 +476,13 @@ pub(in crate::native) fn operand_from_bare(token: &str, ty: LlType) -> TirOperan
             ty,
         };
     }
+    // A phi incoming value may carry an inline type prefix (e.g.
+    // `<4 x float> <float 0x3F800000, …>`), so try parse_typed_value first —
+    // which splits the type from the value — and fall back to parse_value
+    // for bare constants like `zeroinitializer` or `0x3F800000`.
+    if let Ok(tv) = parse_typed_value(token) {
+        return operand_from_typed_value(&tv);
+    }
     match parse_value(token) {
         Ok(value) => TirOperand::Const { value, ty },
         Err(_) => TirOperand::Unresolved,

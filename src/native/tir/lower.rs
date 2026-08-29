@@ -45,11 +45,25 @@ pub(in crate::native) fn switch_emit(terminator_text: &str) -> Option<LlSwitch> 
 /// instruction line, or `None` when it is not a parseable `phi`. Computes the post-opcode rest from
 /// `strip_comment(line).trim()` (the rhs after `%r = `, opcode token dropped) and hands
 /// it to `parse_phi` — the same derivation `emit_phi_resolved` consumes from the carrier.
-pub(in crate::native) fn phi_incoming_of(line: &str) -> Option<(LlType, Vec<(LlValue, String)>)> {
-    let rhs = strip_comment(line).trim().split_once(" = ")?.1.trim();
+pub(in crate::native) fn phi_incoming_of(
+    line: &str,
+) -> (Option<(LlType, Vec<(LlValue, String)>)>, Option<String>) {
+    let Some(rhs) = strip_comment(line)
+        .trim()
+        .split_once(" = ")
+        .map(|pair| pair.1.trim())
+    else {
+        return (None, None);
+    };
     let opcode = rhs.split_whitespace().next().unwrap_or("");
+    if opcode != "phi" {
+        return (None, None);
+    }
     let rest = rhs[opcode.len()..].trim_start();
-    parse_phi(rest).ok()
+    match parse_phi(rest) {
+        Ok(incoming) => (Some(incoming), None),
+        Err(error) => (None, Some(error)),
+    }
 }
 
 /// Collect every `getelementptr` result (`%r = getelementptr …`) keyed by SSA name → parsed `LlGep`.
@@ -459,10 +473,10 @@ pub(in crate::native) fn push_inst_line(
     } else {
         None
     };
-    let phi_incoming = if opcode == "phi" {
+    let (phi_incoming, phi_parse_error) = if opcode == "phi" {
         phi_incoming_of(line)
     } else {
-        None
+        (None, None)
     };
     let aggregate_indices = resolve_aggregate_indices(line, &opcode);
     // Diagnostics-only strip-commented line for the element-op families whose resolved cores embed the
@@ -522,6 +536,7 @@ pub(in crate::native) fn push_inst_line(
         opcode,
         alloca_ty,
         phi_incoming,
+        phi_parse_error,
         aggregate_indices,
         diag_line,
         shuffle_mask,

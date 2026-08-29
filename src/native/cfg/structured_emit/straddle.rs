@@ -1404,6 +1404,7 @@ fn collect_llvalue_locals(value: &crate::native::ir::LlValue, out: &mut Vec<Stri
         | LlValue::SignedInt(_)
         | LlValue::Hex(_)
         | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
         | LlValue::HalfBits(_)
         | LlValue::BFloatBits(_)
         | LlValue::Zero
