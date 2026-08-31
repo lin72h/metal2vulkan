@@ -73,7 +73,7 @@ mod footprint;
 /// materializes the plane from the call, which is a property of the body rather than of the stage.
 /// Reflected translation also reports the buffer-address table the finished module declares instead
 /// of the one an AIR text scan predicted.
-pub const REFLECTION_VERSION: u32 = 33;
+pub const REFLECTION_VERSION: u32 = 34;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -1514,29 +1514,110 @@ fn implicit_imageblock_planes(
 }
 
 /// The `Binding` decoration on `variable`, if the module gives it one.
-/// The shape a consumer needs to bind an image at a synthesized placeholder's descriptor, read off
-/// the `OpTypeImage` the module declares rather than off any AIR type name -- there is no Metal
-/// argument to name one.
-fn placeholder_texture_shape(image: &crate::spirv_module::Instruction) -> TextureShape {
-    let literal = |index: usize| match image.operands.get(index) {
-        Some(crate::spirv_module::Operand::LiteralBit32(value)) => *value,
-        _ => 0,
+/// The image an emitted descriptor variable is declared with: what a consumer must match when it
+/// creates the view it binds there.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct EmittedImage {
+    dimension: TextureDimension,
+    arrayed: bool,
+    multisampled: bool,
+    component: TextureComponent,
+    writable: bool,
+    storage_format: Option<crate::meta::TextureFormat>,
+}
+
+impl EmittedImage {
+    fn of(
+        types: &std::collections::HashMap<spirv::Word, &crate::spirv_module::Instruction>,
+        image: spirv::Word,
+    ) -> Option<Self> {
+        let instruction = types.get(&image)?;
+        if instruction.class.opcode != spirv::Op::TypeImage {
+            return None;
+        }
+        let literal = |index: usize| match instruction.operands.get(index) {
+            Some(crate::spirv_module::Operand::LiteralBit32(value)) => Some(*value),
+            _ => None,
+        };
+        let dimension = match instruction.operands.get(1) {
+            Some(crate::spirv_module::Operand::Dim(dim)) => TextureDimension::from_spirv_dim(*dim),
+            _ => return None,
+        };
+        // The sampled type is the image's component class: a float, or an integer whose
+        // signedness operand separates `Sint` from `Uint`.
+        let sampled_type = match instruction.operands.first() {
+            Some(crate::spirv_module::Operand::IdRef(scalar)) => types.get(scalar)?,
+            _ => return None,
+        };
+        let component = match (sampled_type.class.opcode, sampled_type.operands.get(1)) {
+            (spirv::Op::TypeFloat, _) => TextureComponent::Float,
+            (spirv::Op::TypeInt, Some(crate::spirv_module::Operand::LiteralBit32(1))) => {
+                TextureComponent::Sint
+            }
+            (spirv::Op::TypeInt, _) => TextureComponent::Uint,
+            _ => return None,
+        };
+        let storage_format = match instruction.operands.get(6) {
+            Some(crate::spirv_module::Operand::ImageFormat(format)) => {
+                crate::meta::TextureFormat::from_spirv_format(*format)
+            }
+            _ => None,
+        };
+        Some(Self {
+            dimension,
+            arrayed: literal(3)? != 0,
+            multisampled: literal(4)? != 0,
+            component,
+            writable: literal(5)? == 2,
+            storage_format,
+        })
+    }
+}
+
+/// The type a pointer type points at, looking through the array wrappers a descriptor array adds.
+fn pointee_of(
+    types: &std::collections::HashMap<spirv::Word, &crate::spirv_module::Instruction>,
+    pointer: spirv::Word,
+) -> Option<spirv::Word> {
+    let instruction = types.get(&pointer)?;
+    if instruction.class.opcode != spirv::Op::TypePointer {
+        return None;
+    }
+    let mut pointee = match instruction.operands.get(1) {
+        Some(crate::spirv_module::Operand::IdRef(pointee)) => *pointee,
+        _ => return None,
     };
-    let dimension = match image.operands.get(1) {
-        Some(crate::spirv_module::Operand::Dim(dim)) => TextureDimension::from_spirv_dim(*dim),
-        _ => TextureDimension::D2,
-    };
-    TextureShape {
-        dimension,
-        arrayed: literal(3) != 0,
-        multisampled: literal(4) != 0,
-        // `default_null_image_of` always builds a float sampled image; the module carries that in
-        // its sampled-type operand, which is the float scalar this branch would have to contradict.
-        component: TextureComponent::Float,
-        writable: false,
-        array_ref: false,
-        array_length: None,
-        storage_format: None,
+    while let Some(element) = types.get(&pointee).and_then(|instruction| {
+        matches!(
+            instruction.class.opcode,
+            spirv::Op::TypeArray | spirv::Op::TypeRuntimeArray
+        )
+        .then(|| match instruction.operands.first() {
+            Some(crate::spirv_module::Operand::IdRef(element)) => Some(*element),
+            _ => None,
+        })
+        .flatten()
+    }) {
+        pointee = element;
+    }
+    Some(pointee)
+}
+
+impl EmittedImage {
+    /// The reflected shape of this image on its own, for a descriptor with no AIR type name behind
+    /// it. The two array fields describe a descriptor array, which a synthesized placeholder never
+    /// is.
+    fn texture_shape(self) -> TextureShape {
+        TextureShape {
+            dimension: self.dimension,
+            arrayed: self.arrayed,
+            multisampled: self.multisampled,
+            component: self.component,
+            writable: self.writable,
+            array_ref: false,
+            array_length: None,
+            storage_format: self.storage_format,
+        }
     }
 }
 
@@ -2035,6 +2116,80 @@ impl ShaderReflection {
     ///
     /// The module is the fact. Callers that have one observe it here; `reflect_sanitized`, which
     /// never builds a module, keeps the prediction and is documented as an approximation.
+    /// Correct each reported `texture_shape` to the image the module actually declares at that
+    /// binding.
+    ///
+    /// The shape is decoded from the AIR type name, and the emitter does not always bind the image
+    /// that name implies. A `texturecube` that is only texel-read binds as a `Dim2D` ARRAY image,
+    /// because SPIR-V has no cube texel fetch (`resources::discovery`); reflection still said
+    /// `Cube`. A consumer that follows it creates a `VK_IMAGE_VIEW_TYPE_CUBE` view for a descriptor
+    /// whose shader variable is a 2D array, and Vulkan requires the view type to match the image
+    /// type's `Dim`/`Arrayed`, so the dispatch is invalid. Measured over 2880 corpus sources: 2
+    /// modules, both cube textures reflected as `Cube` while the module declares 2D arrayed.
+    ///
+    /// Only a binding whose image variables all declare the SAME image type is corrected. A
+    /// function-constant-gated texture argument can put several differently-shaped variables on one
+    /// binding -- 67 corpus modules do -- and there the module has no single answer to read; the
+    /// consumer selects one by choosing its function constants, and the metadata-derived shape is
+    /// left alone.
+    ///
+    /// `array_ref` and `array_length` describe the descriptor array, not the image, and are left to
+    /// the metadata that decides the descriptor count.
+    pub(crate) fn reconcile_texture_shapes(&mut self, module: &Module) {
+        let types = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| Some((instruction.result_id?, instruction)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut declared = std::collections::HashMap::<u32, Option<EmittedImage>>::new();
+        for instruction in module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == spirv::Op::Variable)
+        {
+            let Some(variable) = instruction.result_id else {
+                continue;
+            };
+            let Some(binding) = descriptor_binding_of(module, variable) else {
+                continue;
+            };
+            let Some(image) = instruction
+                .result_type
+                .and_then(|pointer| pointee_of(&types, pointer))
+                .and_then(|pointee| EmittedImage::of(&types, pointee))
+            else {
+                continue;
+            };
+            match declared.entry(binding) {
+                std::collections::hash_map::Entry::Occupied(mut seen) => {
+                    if seen.get() != &Some(image) {
+                        seen.insert(None);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Some(image));
+                }
+            }
+        }
+        for resource in &mut self.bindings {
+            let Some(shape) = resource.texture_shape.as_mut() else {
+                continue;
+            };
+            let Some(binding) = resource.descriptor.map(|location| location.binding) else {
+                continue;
+            };
+            let Some(Some(image)) = declared.get(&binding) else {
+                continue;
+            };
+            shape.dimension = image.dimension;
+            shape.arrayed = image.arrayed;
+            shape.multisampled = image.multisampled;
+            shape.component = image.component;
+            shape.writable = image.writable;
+            shape.storage_format = image.storage_format;
+        }
+    }
+
     /// Report the descriptors the passes synthesized with no Metal argument behind them.
     ///
     /// `air.get_read_sampler()` and `air.get_null_texture_*()` each make the interface pass bind a
@@ -2069,26 +2224,25 @@ impl ShaderReflection {
                         .map(|variable| descriptor_binding_of(module, variable) == Some(binding))
                         == Some(true)
                 })
-                .find_map(|instruction| types.get(&instruction.result_type?))
-                .and_then(|pointer| match pointer.operands.get(1) {
-                    Some(crate::spirv_module::Operand::IdRef(pointee)) => types.get(pointee),
-                    _ => None,
-                })
+                .find_map(|instruction| pointee_of(&types, instruction.result_type?))
             else {
                 continue;
             };
-            let (kind, metal_index, texture_shape, access) = match pointee.class.opcode {
-                spirv::Op::TypeImage => {
+            let (kind, metal_index, texture_shape, access) = match types
+                .get(&pointee)
+                .map(|instruction| instruction.class.opcode)
+            {
+                Some(spirv::Op::TypeImage) => {
                     let index = null_textures;
                     null_textures += 1;
                     (
                         ResourceKind::SynthesizedNullTexture,
                         index,
-                        Some(placeholder_texture_shape(pointee)),
+                        EmittedImage::of(&types, pointee).map(EmittedImage::texture_shape),
                         Some(ResourceAccess::Sampled),
                     )
                 }
-                spirv::Op::TypeSampler => {
+                Some(spirv::Op::TypeSampler) => {
                     let index = read_samplers;
                     read_samplers += 1;
                     (ResourceKind::SynthesizedReadSampler, index, None, None)

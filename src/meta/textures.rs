@@ -118,6 +118,63 @@ impl TextureFormat {
             TextureFormat::Rgba8i => ImageFormat::Rgba8i,
         }
     }
+
+    /// Every format this ABI can name. [`TextureFormat::from_spirv_format`] inverts
+    /// [`TextureFormat::to_spirv_format`] by searching this list, so a new variant belongs here as
+    /// well as in that match.
+    pub const ALL: [Self; 16] = [
+        TextureFormat::R8,
+        TextureFormat::Rgba8,
+        TextureFormat::R16f,
+        TextureFormat::R16ui,
+        TextureFormat::Rg16f,
+        TextureFormat::Rg32f,
+        TextureFormat::R32f,
+        TextureFormat::R32i,
+        TextureFormat::R32ui,
+        TextureFormat::Rgba32i,
+        TextureFormat::Rgba32ui,
+        TextureFormat::Rgba32f,
+        TextureFormat::Rgba16f,
+        TextureFormat::Rgba8ui,
+        TextureFormat::Rgba16ui,
+        TextureFormat::Rgba8i,
+    ];
+
+    /// The format a decorated storage image carries, or `None` for `ImageFormat::Unknown` and for
+    /// any format outside this ABI. Reflection uses it to describe what the emitter actually
+    /// decorated rather than what a Metal type name implied.
+    pub fn from_spirv_format(format: ImageFormat) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.to_spirv_format() == format)
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn every_texture_format_round_trips_through_its_spirv_image_format() {
+        for format in TextureFormat::ALL {
+            assert_eq!(
+                TextureFormat::from_spirv_format(format.to_spirv_format()),
+                Some(format)
+            );
+        }
+        assert_eq!(TextureFormat::from_spirv_format(ImageFormat::Unknown), None);
+        // The inverse is only single-valued if no two formats emit the same `ImageFormat`.
+        let mapped = TextureFormat::ALL
+            .into_iter()
+            .map(TextureFormat::to_spirv_format)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            mapped.len(),
+            TextureFormat::ALL.len(),
+            "two formats share one SPIR-V ImageFormat, so from_spirv_format cannot invert them"
+        );
+    }
 }
 
 /// The full shape a Metal texture type name (`texture2d_array<half, sample>`, `texture_buffer<uint,

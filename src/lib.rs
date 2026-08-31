@@ -683,6 +683,9 @@ fn translate_sanitized_native_reflected_with_layout(
         &finished.module,
         &finished.placeholder_descriptor_bindings,
     );
+    // The image the emitter binds is not always the one the AIR type name implies -- a texel-read
+    // cube binds as a 2D array -- and the view a consumer creates has to match the module.
+    reflection.reconcile_texture_shapes(&finished.module);
     reflection.add_buffer_footprints(&finished.module)?;
     reflection.validate_descriptor_abi()?;
     Ok((finished.bytes, reflection))

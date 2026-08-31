@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reflection schema v34: `texture_shape` describes the `OpTypeImage` the module declares at that
+  binding, not the shape the AIR type name implies. A `texturecube` that is only texel-read binds as
+  a `Dim2D` array, because SPIR-V has no cube texel fetch, and a consumer that created a cube view
+  from the old shape would have built a view Vulkan rejects against that image variable. A binding
+  whose image variables do not all declare the same type keeps the type-name-derived shape, as does
+  `reflect_sanitized`, which builds no module.
 - Reflection schema v33: reflected translation reports the descriptors the passes synthesize with no
   Metal argument behind them -- `SynthesizedNullTexture` for a read `air.get_null_texture_*()`
   placeholder and `SynthesizedReadSampler` for a consumed `air.get_read_sampler()` one. Nothing in
