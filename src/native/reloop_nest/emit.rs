@@ -94,6 +94,8 @@ pub(super) struct Emitter<'a, 'b> {
     terms: HashMap<Word, Term>,
     /// Original block -> the phi results it must load on entry, as (result, variable, type).
     phi_loads: HashMap<Word, Vec<(Word, Word, Word)>>,
+    /// Every demoted phi slot, as (block, result, variable), for the promotion pass.
+    phi_slots: Vec<(Word, Word, Word)>,
     /// (predecessor, block) -> the values that edge carries into the block's phis.
     phi_stores: HashMap<(Word, Word), Vec<(Word, Word)>>,
     flow_var: Option<Word>,
@@ -130,6 +132,7 @@ pub(super) fn structure_function(
         blocks: HashMap::new(),
         terms: HashMap::new(),
         phi_loads: HashMap::new(),
+        phi_slots: Vec::new(),
         phi_stores: HashMap::new(),
         flow_var: None,
         flow_ty,
@@ -151,6 +154,7 @@ pub(super) fn structure_function(
 
     let entry_label = emitter.head_of(shape)?;
     emitter.emit(shape, &mut Vec::new())?;
+    emitter.promote_phi_slots();
 
     // OpVariable is only legal in a function's first block, and the root shape may be a loop
     // header, so the hoisted declarations get a prologue of their own.
@@ -603,6 +607,7 @@ impl Emitter<'_, '_> {
                     .entry(label)
                     .or_default()
                     .push((result, var, ty));
+                self.phi_slots.push((label, result, var));
                 let mut index = 0;
                 while index + 1 < phi.operands.len() {
                     let (Operand::IdRef(value), Operand::IdRef(predecessor)) =
@@ -1138,6 +1143,154 @@ impl Emitter<'_, '_> {
             .push(Instruction::new(Op::Switch, None, None, operands));
         self.out.push(block);
         Ok(())
+    }
+
+    /// Put back every demoted phi the nesting did not actually disturb.
+    ///
+    /// A phi has to be demoted while the structure is being derived, because the nesting is free to
+    /// rewrite which block physically branches into a merge. Most merges come through unchanged:
+    /// each incoming edge still ends in a block that branches straight at the merge, and the merge
+    /// has no other predecessor. That is exactly the shape of an `OpPhi`, so the slot is folded
+    /// back — the variable, its stores and its load all disappear.
+    ///
+    /// The check is on the emitted blocks, so it needs no model of how they were produced: an edge
+    /// that got a helper block of its own is as good a phi predecessor as the original block.
+    fn promote_phi_slots(&mut self) {
+        let mut predecessors: HashMap<Word, Vec<Word>> = HashMap::new();
+        for block in &self.out {
+            let Some(label) = block_label(block) else {
+                continue;
+            };
+            let Some(term) = block.instructions.last().and_then(decode_term) else {
+                continue;
+            };
+            let targets = match term {
+                Term::Branch(target) => vec![target],
+                Term::BranchCond(_, on_true, on_false) => vec![on_true, on_false],
+                Term::Switch(_, default, cases) => {
+                    let mut targets = vec![default];
+                    targets.extend(cases.into_iter().map(|(_, label)| label));
+                    targets
+                }
+                Term::Return | Term::ReturnValue(_) | Term::Unreachable | Term::Kill(_) => vec![],
+            };
+            for target in targets {
+                let list = predecessors.entry(target).or_default();
+                if !list.contains(&label) {
+                    list.push(label);
+                }
+            }
+        }
+        let index = self
+            .out
+            .iter()
+            .enumerate()
+            .filter_map(|(position, block)| Some((block_label(block)?, position)))
+            .collect::<HashMap<_, _>>();
+
+        let slots = std::mem::take(&mut self.phi_slots);
+        let mut promoted = HashSet::new();
+        for (block, result, var) in slots {
+            let Some(incoming) = predecessors.get(&block) else {
+                continue;
+            };
+            // Every predecessor has to reach this block by an unconditional branch, so the value it
+            // carries is unambiguous, and it has to store this slot exactly once.
+            let mut operands = Vec::with_capacity(incoming.len() * 2);
+            let mut carriers = Vec::with_capacity(incoming.len());
+            let mut usable = !incoming.is_empty();
+            for predecessor in incoming {
+                let Some(source) = index.get(predecessor).map(|position| &self.out[*position])
+                else {
+                    usable = false;
+                    break;
+                };
+                if !matches!(
+                    source.instructions.last().and_then(decode_term),
+                    Some(Term::Branch(_))
+                ) {
+                    usable = false;
+                    break;
+                }
+                // The edge's store may sit one or more pass-through blocks back — a loop's continue
+                // target, for instance, is written by the latch that branches into it. Walking a
+                // chain of single-predecessor branch-only blocks is safe: each dominates the next,
+                // so the value is still available where the phi needs it.
+                let mut carrier = *predecessor;
+                let value = loop {
+                    let Some(&position) = index.get(&carrier) else {
+                        break None;
+                    };
+                    let mut stored =
+                        self.out[position]
+                            .instructions
+                            .iter()
+                            .filter_map(|instruction| {
+                                (instruction.class.opcode == Op::Store
+                                    && instruction.operands.first() == Some(&Operand::IdRef(var)))
+                                .then(|| instruction.operands.get(1).cloned())
+                                .flatten()
+                            });
+                    match (stored.next(), stored.next()) {
+                        (Some(value), None) => break Some(value),
+                        (Some(_), Some(_)) => break None,
+                        (None, _) => {}
+                    }
+                    let ancestors = predecessors.get(&carrier).map(Vec::as_slice).unwrap_or(&[]);
+                    let [only] = ancestors else {
+                        break None;
+                    };
+                    if !matches!(
+                        index
+                            .get(only)
+                            .and_then(|position| self.out[*position].instructions.last())
+                            .and_then(decode_term),
+                        Some(Term::Branch(_))
+                    ) {
+                        break None;
+                    }
+                    carrier = *only;
+                };
+                let Some(value) = value else {
+                    usable = false;
+                    break;
+                };
+                operands.push(value);
+                operands.push(Operand::IdRef(*predecessor));
+                carriers.push(carrier);
+            }
+            if !usable {
+                continue;
+            }
+            let Some(&position) = index.get(&block) else {
+                continue;
+            };
+            let Some(load) = self.out[position]
+                .instructions
+                .iter()
+                .position(|instruction| {
+                    instruction.result_id == Some(result) && instruction.class.opcode == Op::Load
+                })
+            else {
+                continue;
+            };
+            let ty = self.out[position].instructions[load].result_type;
+            self.out[position].instructions.remove(load);
+            self.out[position]
+                .instructions
+                .insert(0, Instruction::new(Op::Phi, ty, Some(result), operands));
+            for carrier in carriers {
+                if let Some(&source) = index.get(&carrier) {
+                    self.out[source].instructions.retain(|instruction| {
+                        instruction.class.opcode != Op::Store
+                            || instruction.operands.first() != Some(&Operand::IdRef(var))
+                    });
+                }
+            }
+            promoted.insert(var);
+        }
+        self.variables
+            .retain(|variable| !variable.result_id.is_some_and(|id| promoted.contains(&id)));
     }
 
     /// Write whatever follows a construct.
