@@ -2339,6 +2339,11 @@ impl Emitter {
             let component_results = component.clone();
             let mut aggregate_values = component_results.clone();
             let mut storage_pointers = HashSet::new();
+            // The specialization below mints one `OpTypePointer` per distinct storage class it
+            // meets, in the order it meets them, so it has to walk the pointers in the order this
+            // fixpoint discovered them. `storage_pointers` answers membership (and whether the
+            // fixpoint changed); `storage_pointer_order` carries the order.
+            let mut storage_pointer_order: Vec<Word> = Vec::new();
             loop {
                 let mut changed = false;
                 for instruction in self
@@ -2355,8 +2360,11 @@ impl Emitter {
                             else {
                                 continue;
                             };
-                            if aggregate_values.contains(object) {
-                                changed |= storage_pointers.insert(*pointer);
+                            if aggregate_values.contains(object)
+                                && storage_pointers.insert(*pointer)
+                            {
+                                storage_pointer_order.push(*pointer);
+                                changed = true;
                             }
                         }
                         Op::Load => {
@@ -2365,8 +2373,11 @@ impl Emitter {
                             else {
                                 continue;
                             };
-                            if aggregate_values.contains(&result) {
-                                changed |= storage_pointers.insert(*pointer);
+                            if aggregate_values.contains(&result)
+                                && storage_pointers.insert(*pointer)
+                            {
+                                storage_pointer_order.push(*pointer);
+                                changed = true;
                             }
                             if storage_pointers.contains(pointer) {
                                 changed |= aggregate_values.insert(result);
@@ -2404,7 +2415,7 @@ impl Emitter {
                 .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
                 .collect::<HashMap<_, _>>();
             let mut specialized_pointer_types = HashMap::new();
-            for pointer in &storage_pointers {
+            for pointer in &storage_pointer_order {
                 let Some(pointer_type) = value_types.get(pointer).copied() else {
                     continue;
                 };
