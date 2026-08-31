@@ -125,169 +125,76 @@ impl Graph {
         true
     }
 
-    /// The reachable subgraph in reverse postorder, entry first.
+    /// The dominator tree of the reachable subgraph.
     ///
-    /// Reverse postorder is what makes the dominator iteration below converge in a couple of passes
-    /// instead of one pass per graph depth: every node's predecessors along a forward edge are
-    /// already final when it is visited.
-    fn reverse_postorder(&self) -> Vec<Label> {
-        let mut order = Vec::new();
-        let mut seen = BTreeSet::new();
-        if !self.successors.contains_key(&self.entry) {
-            return order;
-        }
-        seen.insert(self.entry);
-        let mut stack = vec![(self.entry, 0usize)];
-        while let Some((node, index)) = stack.pop() {
-            let targets = self.succ(node);
-            if index < targets.len() {
-                stack.push((node, index + 1));
-                let target = targets[index];
-                if self.successors.contains_key(&target) && seen.insert(target) {
-                    stack.push((target, 0));
-                }
-            } else {
-                order.push(node);
-            }
-        }
-        order.reverse();
-        order
-    }
-
-    /// The dominator tree of the reachable subgraph, by the Cooper-Harvey-Kennedy iteration.
+    /// Dense block indices are what [`crate::native::dominators`] speaks, and the label ordering
+    /// this graph already keeps makes the translation a single pass each way.
     fn dominators(&self) -> Dominators {
-        let order = self.reverse_postorder();
-        if order.is_empty() {
-            return Dominators::default();
-        }
-        let position = order
-            .iter()
+        let index = self
+            .successors
+            .keys()
+            .copied()
             .enumerate()
-            .map(|(index, label)| (*label, index))
-            .collect::<BTreeMap<_, _>>();
-        // Indexed by reverse-postorder position, so a dominator always sits at a lower index than
-        // the node it dominates -- which is what lets `intersect` walk two fingers to their meet.
-        let mut idom: Vec<Option<usize>> = vec![None; order.len()];
-        idom[0] = Some(0);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for index in 1..order.len() {
-                let mut candidate: Option<usize> = None;
-                for predecessor in self.pred(order[index]) {
-                    let Some(&predecessor) = position.get(predecessor) else {
-                        continue;
-                    };
-                    if idom[predecessor].is_none() {
-                        continue;
-                    }
-                    candidate = Some(match candidate {
-                        None => predecessor,
-                        Some(current) => intersect(current, predecessor, &idom),
-                    });
-                }
-                if candidate.is_some() && idom[index] != candidate {
-                    idom[index] = candidate;
-                    changed = true;
-                }
-            }
+            .map(|(index, label)| (label, index))
+            .collect::<BTreeMap<Label, usize>>();
+        let Some(&entry) = index.get(&self.entry) else {
+            return Dominators::default();
+        };
+        // `dominance` walks from block 0, so the entry has to be block 0. Swapping it with whatever
+        // sorted first is cheaper than renumbering, and the rest of the mapping is unaffected.
+        let swap = |slot: usize| match slot {
+            0 => entry,
+            slot if slot == entry => 0,
+            slot => slot,
+        };
+        let mut successors = vec![Vec::new(); index.len()];
+        for (label, targets) in &self.successors {
+            successors[swap(index[label])] = targets
+                .iter()
+                .filter_map(|target| index.get(target).map(|target| swap(*target)))
+                .collect();
         }
-        Dominators::from_tree(&order, &idom)
-    }
-}
-
-/// The meet of two nodes in the partially built dominator tree: their deepest common dominator.
-///
-/// Both fingers only ever move to a strictly lower reverse-postorder position, so the walk
-/// terminates. An index whose parent link is missing or does not decrease cannot occur once the
-/// iteration is seeded from the entry; treating it as the entry keeps the walk finite and only ever
-/// weakens the dominance the caller concludes, which is the safe direction.
-fn intersect(mut left: usize, mut right: usize, idom: &[Option<usize>]) -> usize {
-    while left != right {
-        while left > right {
-            match idom[left] {
-                Some(parent) if parent < left => left = parent,
-                _ => return 0,
-            }
-        }
-        while right > left {
-            match idom[right] {
-                Some(parent) if parent < right => right = parent,
-                _ => return 0,
-            }
+        let predecessors = crate::native::dominators::build_predecessors(&successors);
+        let (_, intervals, _) = crate::native::dominators::dominance(&successors, &predecessors);
+        Dominators {
+            block: index
+                .into_iter()
+                .map(|(label, slot)| (label, swap(slot)))
+                .collect(),
+            intervals,
         }
     }
-    left
 }
 
 /// Which blocks dominate which, over a graph's reachable subgraph.
 ///
-/// One pre-order interval per block, not a dominator *set* per block. The set form is quadratic in
-/// the block count: a 6301-block function -- an ordinary size for a generated convolution kernel --
+/// One Euler interval per block, not a dominator *set* per block. The set form is quadratic in the
+/// block count: a 6301-block function -- an ordinary size for a generated convolution kernel --
 /// materializes about 40 million set entries, roughly 400 MiB, to answer the single question
 /// [`Graph::is_reducible`] asks of it. That alone exceeds the whole per-translation memory budget.
-/// The interval form is linear, and answers the same question with two integer comparisons.
 #[derive(Default)]
 pub(super) struct Dominators {
-    /// `(enter, exit)` of each block in a pre-order walk of the dominator tree. `a` dominates `b`
-    /// exactly when `b`'s interval nests inside `a`'s.
-    interval: BTreeMap<Label, (u32, u32)>,
+    /// The dense block index each label was given.
+    block: BTreeMap<Label, usize>,
+    intervals: Vec<Option<(usize, usize)>>,
 }
 
 impl Dominators {
-    /// Number the dominator tree described by `idom` (parent links by reverse-postorder position).
-    fn from_tree(order: &[Label], idom: &[Option<usize>]) -> Self {
-        let mut children: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
-        for (index, parent) in idom.iter().enumerate() {
-            match parent {
-                Some(parent) if *parent != index => children[*parent].push(index),
-                _ => {}
-            }
-        }
-        let mut interval = BTreeMap::new();
-        let mut clock = 0u32;
-        // `Descend` numbers a node on the way in, `Close` on the way back out; an explicit stack
-        // rather than recursion because the tree is as deep as the function is long.
-        enum Step {
-            Descend(usize),
-            Close(usize),
-        }
-        let mut stack = vec![Step::Descend(0)];
-        let mut enter = vec![0u32; order.len()];
-        while let Some(step) = stack.pop() {
-            match step {
-                Step::Descend(index) => {
-                    enter[index] = clock;
-                    clock += 1;
-                    stack.push(Step::Close(index));
-                    for child in children[index].iter().rev() {
-                        stack.push(Step::Descend(*child));
-                    }
-                }
-                Step::Close(index) => {
-                    interval.insert(order[index], (enter[index], clock));
-                    clock += 1;
-                }
-            }
-        }
-        Self { interval }
-    }
-
     /// Whether `ancestor` dominates `node`. Reflexive, and false for any block the reachable
     /// subgraph does not contain -- which is what the retreating-edge check wants: an edge whose
     /// source is unreachable was never on the walk that asks.
     pub(super) fn dominates(&self, ancestor: Label, node: Label) -> bool {
-        let (Some(ancestor), Some(node)) = (self.interval.get(&ancestor), self.interval.get(&node))
+        let (Some(&ancestor), Some(&node)) = (self.block.get(&ancestor), self.block.get(&node))
         else {
             return false;
         };
-        ancestor.0 <= node.0 && node.1 <= ancestor.1
+        crate::native::dominators::dominates_interval(&self.intervals, ancestor, node)
     }
 
-    /// How many numbers the tree holds, which is what the linear bound is about.
+    /// How many blocks the tree numbers, which is what the linear bound is about.
     #[cfg(test)]
-    pub(super) fn len(&self) -> usize {
-        self.interval.len()
+    pub(super) fn reached(&self) -> usize {
+        self.intervals.iter().filter(|slot| slot.is_some()).count()
     }
 }
 
@@ -866,6 +773,6 @@ mod tests {
         let blocks = graph.reachable().len();
         assert_eq!(blocks, (diamonds * 4 + 1) as usize);
         assert!(graph.is_reducible());
-        assert_eq!(graph.dominators().len(), blocks);
+        assert_eq!(graph.dominators().reached(), blocks);
     }
 }

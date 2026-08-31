@@ -5,6 +5,7 @@
 //! later rewrite cannot serialize a module that relies on `spirv-val` to discover broken ownership
 //! or typing.
 
+use super::dominators::{build_predecessors, dominance, dominates_interval};
 use crate::spirv_module::{is_block_terminator, Function, Instruction, Operand};
 use spirv::{Op, Word};
 use std::collections::{HashMap, HashSet};
@@ -813,15 +814,6 @@ impl OwnedCfg {
     }
 }
 
-fn dominates_interval(dominance: &[Option<(usize, usize)>], dominator: usize, node: usize) -> bool {
-    let (Some((dom_in, dom_out)), Some((node_in, node_out))) =
-        (dominance[dominator], dominance[node])
-    else {
-        return false;
-    };
-    dom_in <= node_in && node_out <= dom_out
-}
-
 fn operand_label(
     operand: Option<&Operand>,
     labels: &HashMap<Word, usize>,
@@ -1069,96 +1061,6 @@ pub(super) fn owned_function_construction_error(
     cfg.check_structure(function).err()
 }
 
-fn build_predecessors(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
-    let mut predecessors = vec![Vec::new(); successors.len()];
-    for (source, targets) in successors.iter().enumerate() {
-        for target in targets {
-            predecessors[*target].push(source);
-        }
-    }
-    predecessors
-}
-
-pub(super) fn dominance(
-    successors: &[Vec<usize>],
-    predecessors: &[Vec<usize>],
-) -> (Vec<bool>, Vec<Option<(usize, usize)>>, Vec<Option<usize>>) {
-    let count = successors.len();
-    if count == 0 {
-        return (Vec::new(), Vec::new(), Vec::new());
-    }
-    let mut visited = vec![false; count];
-    let mut postorder = Vec::with_capacity(count);
-    let mut stack = vec![(0usize, 0usize)];
-    visited[0] = true;
-    while let Some((node, cursor)) = stack.last_mut() {
-        if *cursor < successors[*node].len() {
-            let child = successors[*node][*cursor];
-            *cursor += 1;
-            if !visited[child] {
-                visited[child] = true;
-                stack.push((child, 0));
-            }
-        } else {
-            postorder.push(*node);
-            stack.pop();
-        }
-    }
-    let mut rpo = postorder;
-    rpo.reverse();
-    let mut rpo_rank = vec![usize::MAX; count];
-    for (rank, block) in rpo.iter().enumerate() {
-        rpo_rank[*block] = rank;
-    }
-    let mut idom = vec![None; count];
-    idom[0] = Some(0);
-    loop {
-        let mut changed = false;
-        for &node in rpo.iter().skip(1) {
-            let mut defined = predecessors[node]
-                .iter()
-                .copied()
-                .filter(|predecessor| idom[*predecessor].is_some());
-            let Some(mut candidate) = defined.next() else {
-                continue;
-            };
-            for predecessor in defined {
-                candidate = intersect(candidate, predecessor, &idom, &rpo_rank);
-            }
-            if idom[node] != Some(candidate) {
-                idom[node] = Some(candidate);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-
-    let mut children = vec![Vec::new(); count];
-    for (node, parent) in idom.iter().enumerate() {
-        if let Some(parent) = parent.filter(|parent| *parent != node) {
-            children[parent].push(node);
-        }
-    }
-    let mut intervals: Vec<Option<(usize, usize)>> = vec![None; count];
-    let mut clock = 0usize;
-    let mut stack = vec![(0usize, false)];
-    while let Some((node, exiting)) = stack.pop() {
-        if exiting {
-            let start = intervals[node].expect("reachable dominator entered").0;
-            intervals[node] = Some((start, clock));
-            clock += 1;
-        } else {
-            intervals[node] = Some((clock, clock));
-            clock += 1;
-            stack.push((node, true));
-            stack.extend(children[node].iter().rev().map(|child| (*child, false)));
-        }
-    }
-    (visited, intervals, idom)
-}
-
 fn post_dominance(
     structural_successors: &[Vec<usize>],
     branch_successors: &[Vec<usize>],
@@ -1282,23 +1184,6 @@ fn dominators_precede_blocks(reachable: &[bool], idom: &[Option<usize>]) -> bool
         let parent = idom[block].expect("reachable non-entry block has an immediate dominator");
         max_dominator[parent].is_some_and(|maximum| maximum < block)
     })
-}
-
-fn intersect(
-    mut left: usize,
-    mut right: usize,
-    idom: &[Option<usize>],
-    rpo_rank: &[usize],
-) -> usize {
-    while left != right {
-        while rpo_rank[left] > rpo_rank[right] {
-            left = idom[left].expect("defined dominator");
-        }
-        while rpo_rank[right] > rpo_rank[left] {
-            right = idom[right].expect("defined dominator");
-        }
-    }
-    left
 }
 
 fn referenced_ids(instruction: &Instruction) -> impl Iterator<Item = Word> + '_ {

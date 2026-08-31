@@ -1129,7 +1129,7 @@ pub(crate) fn function_has_unowned_backedge(function: &crate::spirv_module::Func
             predecessors[successor].push(block);
         }
     }
-    let (reachable, dominance, _) = super::owned_cfg::dominance(&successors, &predecessors);
+    let (reachable, dominance, _) = super::dominators::dominance(&successors, &predecessors);
     let loop_headers = function
         .blocks
         .iter()

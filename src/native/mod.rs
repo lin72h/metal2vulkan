@@ -12,6 +12,7 @@ mod cfg_testkit;
 mod constfold;
 // Read-only typed-SSA soundness / carrier-comparison / reject-census diagnostics (no emission path).
 mod diagnostics;
+mod dominators;
 mod emitter;
 // Emitter entry points for the primary and structurally selected alternate representations.
 mod emit_tiers;
