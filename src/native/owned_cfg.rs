@@ -2940,16 +2940,19 @@ struct OwnedAccessChainFailure {
     raw_buffer_eligible: bool,
 }
 
-/// One type id rendered the way its declaration reads: `%14 (OpTypePointer StorageBuffer %12)`.
+/// One id rendered the way the instruction that defines it reads: `%14 (TypePointer StorageBuffer
+/// %12)`, `%46 (Undef)`, `%4019 (Label)`.
 ///
 /// A contract message that names only the id makes the reader open a disassembly to learn anything;
-/// naming the declaration makes the diagnosis fit in the message. Operand kinds that do not survive
-/// as a short literal are dropped rather than debug-printed, so the rendering stays one line.
-fn describe_owned_type(ty: Word, definitions: &HashMap<Word, &Instruction>) -> String {
-    let Some(definition) = definitions.get(&ty) else {
-        return format!("%{ty} (undeclared)");
+/// naming the definition makes the diagnosis fit in the message. `definitions` covers every result
+/// id in the module, not just types, so this works for an operand as well as for a type. Operand
+/// kinds that do not survive as a short literal are dropped rather than debug-printed, so the
+/// rendering stays one line.
+fn describe_owned_id(id: Word, definitions: &HashMap<Word, &Instruction>) -> String {
+    let Some(definition) = definitions.get(&id) else {
+        return format!("%{id} (undefined)");
     };
-    let mut text = format!("%{ty} ({:?}", definition.class.opcode);
+    let mut text = format!("%{id} ({:?}", definition.class.opcode);
     for operand in &definition.operands {
         match operand {
             Operand::IdRef(id) => text.push_str(&format!(" %{id}")),
@@ -3032,7 +3035,7 @@ fn owned_access_chain_error(
             ) {
                 return Err(format!(
                     "index {position} has type {}, which is not a scalar integer",
-                    describe_owned_type(index_ty, definitions)
+                    describe_owned_id(index_ty, definitions)
                 ));
             }
             let Some(definition) = definitions.get(&selected) else {
@@ -3047,9 +3050,10 @@ fn owned_access_chain_error(
                     };
                     let Some(member) = owned_constant_u32(*index, definitions, value_types) else {
                         return Err(format!(
-                            "index {position} into {} is %{index}, and a struct member index must \
-                             be an OpConstant of 32-bit integer type",
-                            describe_owned_type(selected, definitions)
+                            "index {position} into {} is {}, and a struct member index must be an \
+                             OpConstant of 32-bit integer type",
+                            describe_owned_id(selected, definitions),
+                            describe_owned_id(*index, definitions)
                         ));
                     };
                     let Some(Operand::IdRef(member_type)) =
@@ -3057,7 +3061,7 @@ fn owned_access_chain_error(
                     else {
                         return Err(format!(
                             "index {position} selects member {member} of {}, which has {} members",
-                            describe_owned_type(selected, definitions),
+                            describe_owned_id(selected, definitions),
                             definition.operands.len()
                         ));
                     };
@@ -3067,7 +3071,7 @@ fn owned_access_chain_error(
                     let Some(Operand::IdRef(element)) = definition.operands.first() else {
                         return Err(format!(
                             "index {position} descends into {}, which declares no element type",
-                            describe_owned_type(selected, definitions)
+                            describe_owned_id(selected, definitions)
                         ));
                     };
                     *element
@@ -3077,7 +3081,7 @@ fn owned_access_chain_error(
                     None => {
                         return Err(format!(
                             "index {position} descends into {}, which declares no component type",
-                            describe_owned_type(selected, definitions)
+                            describe_owned_id(selected, definitions)
                         ))
                     }
                 },
@@ -3085,7 +3089,7 @@ fn owned_access_chain_error(
                     let Some(Operand::IdRef(column)) = definition.operands.first() else {
                         return Err(format!(
                             "index {position} descends into {}, which declares no column type",
-                            describe_owned_type(selected, definitions)
+                            describe_owned_id(selected, definitions)
                         ));
                     };
                     *column
@@ -3093,7 +3097,7 @@ fn owned_access_chain_error(
                 _ => {
                     return Err(format!(
                         "index {position} descends into {}, which is not a composite type",
-                        describe_owned_type(selected, definitions)
+                        describe_owned_id(selected, definitions)
                     ))
                 }
             };
@@ -3112,7 +3116,7 @@ fn owned_access_chain_error(
             return Some(match value_types.get(base) {
                 Some(&base_ty) => format!(
                     "base %{base} has type {}, which is not a pointer type",
-                    describe_owned_type(base_ty, definitions)
+                    describe_owned_id(base_ty, definitions)
                 ),
                 None => format!("base %{base} has no type in this module"),
             });
@@ -3121,7 +3125,7 @@ fn owned_access_chain_error(
             return Some(match instruction.result_type {
                 Some(result_ty) => format!(
                     "result type {} is not a pointer type",
-                    describe_owned_type(result_ty, definitions)
+                    describe_owned_id(result_ty, definitions)
                 ),
                 None => "the instruction has no result type".to_string(),
             });
@@ -3130,7 +3134,7 @@ fn owned_access_chain_error(
             return Some(match instruction.operands.get(1).and_then(index_type) {
                 Some(element_ty) => format!(
                     "the element operand has type {}, which is not a scalar integer",
-                    describe_owned_type(element_ty, definitions)
+                    describe_owned_id(element_ty, definitions)
                 ),
                 None => "the element operand is not a value with a type in this module".to_string(),
             });
@@ -3148,8 +3152,8 @@ fn owned_access_chain_error(
         (result_pointee != selected).then(|| {
             format!(
                 "the index path selects {}, but the result pointer points to {}",
-                describe_owned_type(selected, definitions),
-                describe_owned_type(result_pointee, definitions)
+                describe_owned_id(selected, definitions),
+                describe_owned_id(result_pointee, definitions)
             )
         })
     })();
@@ -7908,8 +7912,8 @@ mod tests {
             ),
             (
                 chain(Op::AccessChain, 14, 39, &[46]),
-                "index 0 into %18 (TypeStruct %12 %15) is %46, and a struct member index must be \
-                 an OpConstant of 32-bit integer type",
+                "index 0 into %18 (TypeStruct %12 %15) is %46 (Undef), and a struct member index \
+                 must be an OpConstant of 32-bit integer type",
             ),
             (
                 chain(Op::AccessChain, 14, 39, &[19]),
