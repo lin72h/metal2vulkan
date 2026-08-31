@@ -122,13 +122,20 @@ pub(super) struct Emitter<'a, 'b> {
     out: Vec<Block>,
 }
 
+/// A nesting, and what verifying it needs to know about how it was built.
+pub(super) struct Structured {
+    pub(super) blocks: Vec<Block>,
+    /// The flow variable, if this nesting needed one. See [`super::verify`].
+    pub(super) flow_variable: Option<Word>,
+}
+
 /// Rebuild `function`'s blocks as nested structured control flow.
 pub(super) fn structure_function(
     function: &Function,
     graph: &Graph,
     shape: &Shape,
     tc: &mut TypeCtx<'_>,
-) -> Result<Vec<Block>, String> {
+) -> Result<Structured, String> {
     let flow_ty = tc.i32_ty();
     let mut emitter = Emitter {
         tc,
@@ -169,16 +176,25 @@ pub(super) fn structure_function(
         Some(prologue_label),
         vec![],
     ));
-    prologue.instructions = std::mem::take(&mut emitter.variables);
-    prologue.instructions.push(Instruction::new(
+    let Emitter {
+        mut variables,
+        flow_var,
+        out,
+        ..
+    } = emitter;
+    variables.push(Instruction::new(
         Op::Branch,
         None,
         None,
         vec![Operand::IdRef(entry_label)],
     ));
+    prologue.instructions = variables;
     let mut blocks = vec![prologue];
-    blocks.append(&mut emitter.out);
-    Ok(blocks)
+    blocks.extend(out);
+    Ok(Structured {
+        blocks,
+        flow_variable: flow_var,
+    })
 }
 
 impl Emitter<'_, '_> {
@@ -685,16 +701,25 @@ impl Emitter<'_, '_> {
                 return Ok(Action { label, flow: None });
             }
         }
-        let depth = stack
+        if !stack
             .iter()
-            .rposition(|frame| frame.next_entries.contains(&target))
-            .ok_or_else(|| "branch target is outside every enclosing construct".to_string())?;
-        let records_flow = stack[depth].dispatches || self.merge_flow.contains(&stack[depth].id);
-        let flow = records_flow.then(|| self.flow_id_of(target));
-        let label = stack
+            .any(|frame| frame.next_entries.contains(&target))
+        {
+            return Err("branch target is outside every enclosing construct".to_string());
+        }
+        // The edge leaves through the innermost construct's merge, whichever construct further out
+        // finally renders the destination. So whether it has to name that destination is a
+        // question about the merge it is about to branch to — is that merge a dispatch, or the
+        // header of one in the continuation — and not about the construct that owns the
+        // destination. Asking the owner instead leaves the flow variable unwritten on exactly the
+        // edges that pass through a dispatch on their way further out, and the dispatch then reads
+        // whatever a previous iteration left there.
+        let frame = stack
             .last()
-            .ok_or_else(|| "branch leaves a construct at the top level".to_string())?
-            .merge_label;
+            .ok_or_else(|| "branch leaves a construct at the top level".to_string())?;
+        let records_flow = frame.dispatches || self.merge_flow.contains(&frame.id);
+        let label = frame.merge_label;
+        let flow = records_flow.then(|| self.flow_id_of(target));
         Ok(Action { label, flow })
     }
 

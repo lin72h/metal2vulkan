@@ -21,12 +21,18 @@
 //! crossing value. This pass does not, so [`structure_selected_functions`] checks the function it
 //! emitted against the module's value-flow contract and discards it when the check fails.
 //!
+//! Dominance is not the whole contract either. An edge that leaves more than one construct stages
+//! its destination in a function-scope flow variable that the dispatches it passes through read
+//! back. That lives in memory, where dominance says nothing, so [`verify`] checks separately that
+//! no path reaches a dispatch without having written it.
+//!
 //! It is a strict addition, not a replacement. Irreducible graphs, any shape the emitter cannot
-//! express, and any nesting that does not survive that check stay on the state-machine
+//! express, and any nesting that does not survive those checks stay on the state-machine
 //! constructor.
 
 mod emit;
 mod shape;
+mod verify;
 
 use super::relooper::{block_label, decode_term, Term, TypeCtx};
 use crate::spirv_module::{Function, Module};
@@ -63,7 +69,10 @@ pub(crate) fn structure_selected_functions(
         }
         let before = function.blocks.len();
         match structure_function(function, &mut tc) {
-            Ok(blocks) => {
+            Ok(emit::Structured {
+                blocks,
+                flow_variable,
+            }) => {
                 let candidate = std::mem::replace(&mut function.blocks, blocks);
                 value_types.extend(function.blocks.iter().flat_map(|block| {
                     block.instructions.iter().filter_map(|instruction| {
@@ -93,6 +102,12 @@ pub(crate) fn structure_selected_functions(
                             super::owned_cfg::owned_function_construction_error(
                                 function,
                                 &value_types,
+                            )
+                        })
+                        .or_else(|| {
+                            verify::reads_the_flow_variable_unwritten(
+                                &function.blocks,
+                                flow_variable,
                             )
                         });
                 if let Some(reason) = broken {
@@ -124,14 +139,17 @@ pub(crate) fn structure_selected_functions(
 fn structure_function(
     function: &Function,
     tc: &mut TypeCtx<'_>,
-) -> Result<Vec<crate::spirv_module::Block>, String> {
+) -> Result<emit::Structured, String> {
     let graph = build_graph(function)?;
     if !graph.is_reducible() {
         return Err("irreducible control flow".to_string());
     }
     let tree = shape::calculate(&graph).ok_or_else(|| "empty shape tree".to_string())?;
-    let blocks = emit::structure_function(function, &graph, &tree, tc)?;
-    Ok(reverse_postorder(blocks))
+    let structured = emit::structure_function(function, &graph, &tree, tc)?;
+    Ok(emit::Structured {
+        blocks: reverse_postorder(structured.blocks),
+        flow_variable: structured.flow_variable,
+    })
 }
 
 fn build_graph(function: &Function) -> Result<Graph, String> {

@@ -6,6 +6,9 @@
 
 mod async_copy;
 mod cfg;
+// Differential test support for the control-flow constructors (test builds only).
+#[cfg(test)]
+mod cfg_testkit;
 mod constfold;
 // Read-only typed-SSA soundness / carrier-comparison / reject-census diagnostics (no emission path).
 mod diagnostics;
