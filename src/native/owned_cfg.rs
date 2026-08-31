@@ -2947,19 +2947,28 @@ struct OwnedAccessChainFailure {
 /// naming the definition makes the diagnosis fit in the message. `definitions` covers every result
 /// id in the module, not just types, so this works for an operand as well as for a type. Operand
 /// kinds that do not survive as a short literal are dropped rather than debug-printed, so the
-/// rendering stays one line.
+/// rendering stays one line, and a long operand list is elided: a wide `OpTypeStruct` or a phi with
+/// many arms would otherwise bury the sentence the message is trying to say.
 fn describe_owned_id(id: Word, definitions: &HashMap<Word, &Instruction>) -> String {
+    /// Enough operands to recognize a type or an instruction by, and few enough to read.
+    const SHOWN_OPERANDS: usize = 8;
+
     let Some(definition) = definitions.get(&id) else {
         return format!("%{id} (undefined)");
     };
     let mut text = format!("%{id} ({:?}", definition.class.opcode);
-    for operand in &definition.operands {
+    for operand in definition.operands.iter().take(SHOWN_OPERANDS) {
         match operand {
             Operand::IdRef(id) => text.push_str(&format!(" %{id}")),
             Operand::LiteralBit32(value) => text.push_str(&format!(" {value}")),
             Operand::StorageClass(storage) => text.push_str(&format!(" {storage:?}")),
             Operand::Dim(dim) => text.push_str(&format!(" {dim:?}")),
             _ => {}
+        }
+    }
+    if let Some(elided) = definition.operands.len().checked_sub(SHOWN_OPERANDS) {
+        if elided > 0 {
+            text.push_str(&format!(" +{elided} more"));
         }
     }
     text.push(')');
@@ -7857,6 +7866,50 @@ mod tests {
             validation.is_err(),
             "spirv-val must reject the malformed barrier contract"
         );
+    }
+
+    #[test]
+    fn an_id_renders_as_its_definition_and_a_wide_one_is_elided() {
+        let int = Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(7),
+            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+        );
+        let pointer = Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(8),
+            vec![
+                Operand::StorageClass(spirv::StorageClass::StorageBuffer),
+                Operand::IdRef(7),
+            ],
+        );
+        // Twelve members: four more than the renderer shows.
+        let wide = Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(9),
+            (0..12).map(|_| Operand::IdRef(7)).collect(),
+        );
+        let definitions = [&int, &pointer, &wide]
+            .into_iter()
+            .map(|instruction| (instruction.result_id.expect("result id"), instruction))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(describe_owned_id(7, &definitions), "%7 (TypeInt 64 0)");
+        assert_eq!(
+            describe_owned_id(8, &definitions),
+            "%8 (TypePointer StorageBuffer %7)"
+        );
+        assert_eq!(
+            describe_owned_id(9, &definitions),
+            "%9 (TypeStruct %7 %7 %7 %7 %7 %7 %7 %7 +4 more)",
+            "a wide aggregate must not bury the sentence the message is trying to say"
+        );
+        // An id the module never defines is the interesting case for a contract message, so it says
+        // so rather than rendering as nothing.
+        assert_eq!(describe_owned_id(99, &definitions), "%99 (undefined)");
     }
 
     #[test]
