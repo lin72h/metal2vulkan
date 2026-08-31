@@ -5111,10 +5111,46 @@ fn owned_module_environment_error(module: &crate::spirv_module::Module) -> Resul
     Ok(())
 }
 
+/// The first owned-construction failure in `module`, or `None` when it satisfies the contract.
+///
+/// This is the admission gate, so it stops at the first failure it finds.
 pub(crate) fn owned_module_failure(
     module: &crate::spirv_module::Module,
 ) -> Option<OwnedModuleFailure> {
-    let invalid = |error| Some(OwnedModuleFailure::Invalid(error));
+    owned_module_failures(module, 1).into_iter().next()
+}
+
+/// Up to `limit` owned-construction failures in `module`, at most one per independent check, in the
+/// order the checks run.
+///
+/// The gate only ever wants the first failure; a *diagnostic* reader wants all of them. A module
+/// part-way through lowering routinely carries a transient violation -- a debug `OpName` still
+/// pointing at an id a rewrite replaced, say -- that a later phase repairs, and reporting only that
+/// one hides every structural violation underneath it for as long as it lasts, which is exactly when
+/// a reader is trying to find the phase that introduced one.
+///
+/// Section layout and the id-collection scan are prerequisites rather than independent checks: a
+/// failure in either leaves the definition table incomplete, so every later check would be reading
+/// nonsense. Those are still reported alone.
+pub(crate) fn owned_module_failures(
+    module: &crate::spirv_module::Module,
+    limit: usize,
+) -> Vec<OwnedModuleFailure> {
+    let mut failures: Vec<OwnedModuleFailure> = Vec::new();
+    macro_rules! record {
+        ($failure:expr) => {{
+            failures.push($failure);
+            if failures.len() >= limit {
+                return failures;
+            }
+        }};
+    }
+    macro_rules! record_invalid {
+        ($error:expr) => {
+            record!(OwnedModuleFailure::Invalid($error))
+        };
+    }
+    let invalid = |error| vec![OwnedModuleFailure::Invalid(error)];
     if let Some(error) = owned_module_layout_error(module) {
         return invalid(error);
     }
@@ -5167,48 +5203,49 @@ pub(crate) fn owned_module_failure(
             value_types.insert(id, result_type);
         }
     }
-    for instruction in module.all_inst_iter() {
-        if let Some(id) =
-            referenced_ids(instruction).find(|id| *id == 0 || !definitions.contains_key(id))
-        {
-            return invalid(format!(
-                "native emitter: owned {:?}{} references undefined id %{id}",
-                instruction.class.opcode,
-                instruction
-                    .result_id
-                    .map(|result| format!(" %{result}"))
-                    .unwrap_or_default()
-            ));
-        }
-        if instruction.result_type.is_some_and(|result_type| {
+    if let Some(error) = module.all_inst_iter().find_map(|instruction| {
+        let id =
+            referenced_ids(instruction).find(|id| *id == 0 || !definitions.contains_key(id))?;
+        Some(format!(
+            "native emitter: owned {:?}{} references undefined id %{id}",
+            instruction.class.opcode,
+            instruction
+                .result_id
+                .map(|result| format!(" %{result}"))
+                .unwrap_or_default()
+        ))
+    }) {
+        record_invalid!(error);
+    }
+    if module.all_inst_iter().any(|instruction| {
+        instruction.result_type.is_some_and(|result_type| {
             !definitions
                 .get(&result_type)
                 .is_some_and(|definition| definition.class.opcode.is_type())
-        }) {
-            return invalid(
-                "native emitter: owned instruction result type is not a type declaration"
-                    .to_string(),
-            );
-        }
+        })
+    }) {
+        record_invalid!(
+            "native emitter: owned instruction result type is not a type declaration".to_string()
+        );
     }
     if let Err(error) = owned_type_operand_error(module, &definitions) {
-        return invalid(error);
+        record_invalid!(error);
     }
     if let Some(error) = module
         .annotations
         .iter()
         .find_map(|instruction| owned_annotation_error(instruction, &definitions))
     {
-        return invalid(error);
+        record_invalid!(error);
     }
     if let Some(error) = owned_block_layout_error(module, &definitions) {
-        return invalid(error);
+        record_invalid!(error);
     }
     if let Some(failure) = module
         .all_inst_iter()
         .find_map(|instruction| owned_access_chain_error(instruction, &definitions, &value_types))
     {
-        return Some(if failure.raw_buffer_eligible {
+        record!(if failure.raw_buffer_eligible {
             OwnedModuleFailure::RawBufferConstruction(failure.error)
         } else {
             OwnedModuleFailure::TypeConstruction(failure.error)
@@ -5218,7 +5255,7 @@ pub(crate) fn owned_module_failure(
         .all_inst_iter()
         .find_map(|instruction| owned_memory_type_error(instruction, &definitions, &value_types))
     {
-        return Some(OwnedModuleFailure::TypeConstruction(error));
+        record!(OwnedModuleFailure::TypeConstruction(error));
     }
     if let Some(error) = module
         .types_global_values
@@ -5236,17 +5273,17 @@ pub(crate) fn owned_module_failure(
             })
         })
     {
-        return Some(OwnedModuleFailure::TypeConstruction(error));
+        record!(OwnedModuleFailure::TypeConstruction(error));
     }
     if let Some(error) = module.all_inst_iter().find_map(|instruction| {
         owned_value_instruction_error(instruction, &definitions, &value_types).err()
     }) {
-        return invalid(error);
+        record_invalid!(error);
     }
     if let Some(error) = module.all_inst_iter().find_map(|instruction| {
         owned_composite_instruction_error(instruction, &definitions, &value_types).err()
     }) {
-        return invalid(error);
+        record_invalid!(error);
     }
     let logical = module.memory_model.as_ref().is_some_and(|instruction| {
         instruction.operands.first()
@@ -5282,10 +5319,11 @@ pub(crate) fn owned_module_failure(
                 })
                 .collect::<HashSet<_>>();
             if roots.len() > 1 {
-                return Some(OwnedModuleFailure::RawBufferConstruction(
+                record!(OwnedModuleFailure::RawBufferConstruction(
                     "native emitter: cross-root StorageBuffer pointer phi requires address-domain construction"
                         .to_string(),
                 ));
+                break;
             }
         }
     }
@@ -5299,10 +5337,10 @@ pub(crate) fn owned_module_failure(
             variable_pointers_storage_buffer,
         )
     }) {
-        return Some(OwnedModuleFailure::TypeConstruction(error));
+        record!(OwnedModuleFailure::TypeConstruction(error));
     }
     if let Err(error) = owned_module_environment_error(module) {
-        return invalid(error);
+        record_invalid!(error);
     }
 
     let mut local_owners = HashMap::new();
@@ -5330,9 +5368,10 @@ pub(crate) fn owned_module_failure(
                     .is_some_and(|owner| *owner != function_index)
             })
         }) {
-            return invalid(
-                "native emitter: owned function references an id from another function".to_string(),
+            record_invalid!(
+                "native emitter: owned function references an id from another function".to_string()
             );
+            break;
         }
     }
 
@@ -5342,18 +5381,18 @@ pub(crate) fn owned_module_failure(
         }
         None
     }) {
-        return invalid(error);
+        record_invalid!(error);
     }
     if let Some(error) = module.all_inst_iter().find_map(|instruction| {
         owned_function_call_contract_error(instruction, &definitions, &value_types).err()
     }) {
-        return invalid(error);
+        record_invalid!(error);
     }
     if let Err(error) = owned_module_linkage_error(module, &definitions) {
-        return invalid(error);
+        record_invalid!(error);
     }
 
-    module.functions.iter().find_map(|function| {
+    if let Some(failure) = module.functions.iter().find_map(|function| {
         if function.blocks.is_empty() {
             return None;
         }
@@ -5361,7 +5400,10 @@ pub(crate) fn owned_module_failure(
             .and_then(|cfg| cfg.check(function, &definitions, &value_types))
             .err()
             .map(OwnedModuleFailure::CfgConstruction)
-    })
+    }) {
+        record!(failure);
+    }
+    failures
 }
 
 #[cfg(test)]

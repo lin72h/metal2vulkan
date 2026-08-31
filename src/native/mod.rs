@@ -74,7 +74,7 @@ pub(crate) fn inline_direct_function_pointer_consumers(
     inline::inline_direct_function_pointer_consumers(san_ll, direct_functions)
 }
 
-pub(crate) use owned_cfg::{owned_module_failure, OwnedModuleFailure};
+pub(crate) use owned_cfg::{owned_module_failure, owned_module_failures, OwnedModuleFailure};
 pub(crate) use parse::{
     parse_return_type as parse_llvm_return_type, parse_type_prefix as parse_llvm_type_prefix,
 };

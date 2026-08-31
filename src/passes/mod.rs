@@ -2233,7 +2233,7 @@ mod phase_contract_tests {
     fn a_staged_global_counts_as_declared() {
         assert_eq!(
             phase_contract_verdict(&ctx_with_staged_pointer_type()),
-            None
+            Vec::<String>::new()
         );
     }
 
@@ -2243,34 +2243,91 @@ mod phase_contract_tests {
     fn a_genuinely_missing_global_is_reported_by_id() {
         let mut ctx = ctx_with_staged_pointer_type();
         ctx.new_globals.clear();
-        let verdict = phase_contract_verdict(&ctx).expect("the module references an undefined id");
+        let verdicts = phase_contract_verdict(&ctx);
         assert!(
-            verdict.contains("references undefined id %2"),
-            "verdict must name the missing id, got: {verdict}"
+            verdicts
+                .iter()
+                .any(|verdict| verdict.contains("references undefined id %2")),
+            "verdict must name the missing id, got: {verdicts:?}"
+        );
+    }
+
+    /// Two independent violations at once: a debug name pointing at an id nothing defines, and a
+    /// variable whose result type is another variable rather than a type declaration.
+    ///
+    /// Lowering leaves dangling debug names behind constantly and repairs them later, so a trace
+    /// that stopped at the first failure would report only the name for every phase the name
+    /// survived -- and the reader would blame whichever phase happens to run after the repair.
+    #[test]
+    fn a_transient_debug_name_does_not_hide_the_violation_under_it() {
+        let mut ctx = ctx_with_staged_pointer_type();
+        ctx.module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(9),
+                Operand::LiteralString("erased".to_string()),
+            ],
+        ));
+        // Result type %3 is the Private variable declared above, not a type.
+        ctx.module.types_global_values.push(Instruction::new(
+            Op::Variable,
+            Some(3),
+            Some(4),
+            vec![Operand::StorageClass(StorageClass::Private)],
+        ));
+        let verdicts = phase_contract_verdict(&ctx);
+        assert!(
+            verdicts
+                .iter()
+                .any(|verdict| verdict.contains("references undefined id %9")),
+            "the dangling debug name must be reported, got: {verdicts:?}"
+        );
+        assert!(
+            verdicts
+                .iter()
+                .any(|verdict| verdict.contains("result type is not a type declaration")),
+            "the violation under it must be reported too, got: {verdicts:?}"
         );
     }
 }
 
-/// The owned-construction verdict for the module a phase just produced, or `None` when it holds.
+/// Every owned-construction verdict against the module a phase just produced, empty when it holds.
 ///
 /// Phases stage new type/constant declarations in `new_globals` and only splice them into the module
 /// at the end. Checking the module alone would therefore report an undefined id for every phase in
 /// between, which drowns out the verdict this exists to show. Merging the staged globals in
 /// reproduces the module the pipeline is actually building.
-fn phase_contract_verdict(ctx: &Ctx) -> Option<String> {
+///
+/// All of them, not just the first, because the first is routinely the least interesting: an
+/// in-flight module often carries a transient violation a later phase repairs -- a debug `OpName`
+/// left pointing at an id a rewrite replaced is the common one -- and the gate's first-failure
+/// answer would report only that for every phase it survives, hiding the structural violation the
+/// reader is trying to locate.
+fn phase_contract_verdict(ctx: &Ctx) -> Vec<String> {
     let mut module = ctx.module.clone();
     module
         .types_global_values
         .extend(ctx.new_globals.iter().cloned());
-    let (kind, error) = match crate::native::owned_module_failure(&module)? {
-        crate::native::OwnedModuleFailure::Invalid(error) => ("invalid", error),
-        crate::native::OwnedModuleFailure::TypeConstruction(error) => ("type-construction", error),
-        crate::native::OwnedModuleFailure::CfgConstruction(error) => ("cfg-construction", error),
-        crate::native::OwnedModuleFailure::RawBufferConstruction(error) => {
-            ("raw-buffer-construction", error)
-        }
-    };
-    Some(format!("{kind}: {error}"))
+    crate::native::owned_module_failures(&module, usize::MAX)
+        .into_iter()
+        .map(|failure| {
+            let (kind, error) = match failure {
+                crate::native::OwnedModuleFailure::Invalid(error) => ("invalid", error),
+                crate::native::OwnedModuleFailure::TypeConstruction(error) => {
+                    ("type-construction", error)
+                }
+                crate::native::OwnedModuleFailure::CfgConstruction(error) => {
+                    ("cfg-construction", error)
+                }
+                crate::native::OwnedModuleFailure::RawBufferConstruction(error) => {
+                    ("raw-buffer-construction", error)
+                }
+            };
+            format!("{kind}: {error}")
+        })
+        .collect()
 }
 
 /// Print whether the in-flight module satisfies the owned construction contract, tagged with the
@@ -2283,9 +2340,12 @@ fn phase_contract_verdict(ctx: &Ctx) -> Option<String> {
 /// and the message is the one the finished module would have failed with. Without it, a contract
 /// failure reported at the end says nothing about which phase produced it.
 fn report_phase_contract(ctx: &Ctx, phase: &str) {
-    match phase_contract_verdict(ctx) {
-        None => eprintln!("[pass-contract] {phase}: ok"),
-        Some(verdict) => eprintln!("[pass-contract] {phase}: {verdict}"),
+    let verdicts = phase_contract_verdict(ctx);
+    if verdicts.is_empty() {
+        eprintln!("[pass-contract] {phase}: ok");
+    }
+    for verdict in verdicts {
+        eprintln!("[pass-contract] {phase}: {verdict}");
     }
 }
 
