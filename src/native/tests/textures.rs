@@ -835,20 +835,22 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
 
 #[test]
 fn native_get_null_texture_models_unmodeled_placeholder() {
-    // `air.get_null_texture_2d()` yields a synthesized image in the texture descriptor band. Even a
-    // kernel that only stores the opaque handle must remain valid, and the translator-owned resource
-    // must not escape into sampler/color-input bindings.
+    // `air.get_null_texture_2d()` yields a synthesized image in the texture descriptor band. A
+    // kernel that reads through the placeholder keeps that descriptor, and the translator-owned
+    // resource must not escape into sampler/color-input bindings. The opposite case -- a
+    // placeholder nothing consumes, whose descriptor is retracted -- is
+    // `tests/reflection_covers_declared_bindings.rs`.
     let ll = r#"
 define void @k(ptr addrspace(1) %out) {
 entry:
-  %slot = alloca ptr addrspace(1), align 8
   %tex = call ptr addrspace(1) @air.get_null_texture_2d()
-  store ptr addrspace(1) %tex, ptr %slot, align 8
-  store i32 0, ptr addrspace(1) %out, align 4
+  %width = call i32 @air.get_width_texture_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %width, ptr addrspace(1) %out, align 4
   ret void
 }
 
 declare ptr addrspace(1) @air.get_null_texture_2d()
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
@@ -866,6 +868,25 @@ declare ptr addrspace(1) @air.get_null_texture_2d()
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpFunction"), "{asm}");
     assert!(asm.contains("Binding 32"), "{asm}");
+    for line in asm.lines() {
+        let Some(binding) = line
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .split_first()
+            .and_then(|(head, rest)| (*head == "OpDecorate").then_some(rest))
+            .and_then(|rest| match rest {
+                [_, "Binding", value] => value.parse::<u32>().ok(),
+                _ => None,
+            })
+        else {
+            continue;
+        };
+        assert!(
+            !crate::reflect::SAMPLER_BINDING_RANGE.contains(binding)
+                && !crate::reflect::COLOR_INPUT_BINDING_RANGE.contains(binding),
+            "the translator-owned placeholder must stay in the texture band; got:\n{asm}"
+        );
+    }
     let _ = std::fs::remove_dir_all(tmp);
 }
 

@@ -24,7 +24,8 @@ use layout::*;
 // Layout size/align helpers are reused by the lower pass to decorate OpPtrAccessChain base
 // pointer types with ArrayStride (a sibling-module of interface cannot reach `layout` directly).
 pub(in crate::passes) use layout::{
-    decorate_block_struct, drop_unconsumed_default_sampler_loads, layout_ty_size_align, round_up,
+    decorate_block_struct, drop_unconsumed_placeholder_descriptor_loads, layout_ty_size_align,
+    round_up,
 };
 
 mod air_layout;

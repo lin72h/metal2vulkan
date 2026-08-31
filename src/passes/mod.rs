@@ -369,6 +369,10 @@ struct Ctx {
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
+    /// Descriptor variables the translator invented to give an AIR value a legal SPIR-V type, with
+    /// no Metal argument behind them. Retracted when unconsumed; see
+    /// [`stage_input::drop_unconsumed_placeholder_descriptor_loads`].
+    placeholder_descriptor_vars: HashSet<Word>,
     /// Loaded sampler value ids with an exact static or pipeline-provided state.
     sampler_states: HashMap<Word, StaticSamplerState>,
     /// Direct loads of runtime sampler bindings that were given pipeline state.
@@ -459,6 +463,7 @@ impl Ctx {
             specialized_runtime_sampler_values: HashSet::new(),
             ambiguous_sampler_states: HashSet::new(),
             default_null_image_vars: HashMap::new(),
+            placeholder_descriptor_vars: HashSet::new(),
             implicit_imageblock_vars: HashMap::new(),
             fragment_imageblock_vars: HashMap::new(),
             uses_fragment_imageblock: false,
@@ -2662,9 +2667,10 @@ pub(crate) fn transform_with_options_and_sidecar(
     // sealing synthesized before global liveness runs.
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
-    // `air.get_read_sampler()` needed a real sampler descriptor to type its result; if nothing ever
-    // consumed that value, retract the synthesis before liveness runs so the descriptor goes too.
-    stage_input::drop_unconsumed_default_sampler_loads(&mut ctx);
+    // `air.get_read_sampler()` and `air.get_null_texture_*()` each needed a real descriptor to type
+    // their result; where nothing ever consumed that value, retract the synthesis before liveness
+    // runs so the descriptor goes too.
+    stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
     // The closures above are the last of this boundary's instruction changes, and any of them can
     // delete a variable's last use. Re-establish global liveness against the finished bodies before
     // the collection that would otherwise root a stranded variable at its own interface entry.

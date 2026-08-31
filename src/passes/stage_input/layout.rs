@@ -30,6 +30,40 @@ impl Ctx {
         }
     }
 
+    /// Create one module-scope `UniformConstant` descriptor variable pointing at `pointee_ty`,
+    /// decorate it at `binding` in the descriptor layout's set, and put it on the entry interface.
+    ///
+    /// Every descriptor the passes synthesize goes through here, so the four of them cannot drift
+    /// apart on how a resource variable is created, bound, and reached from the entry point.
+    /// Choosing the binding stays with each caller, because the ABI band a synthesized descriptor
+    /// belongs to is what distinguishes them.
+    pub(in crate::passes) fn descriptor_variable(
+        &mut self,
+        pointee_ty: Word,
+        binding: u32,
+    ) -> Word {
+        let set = self.descriptor_layout.set;
+        let pointer_ty = self.ty_ptr(StorageClass::UniformConstant, pointee_ty);
+        let var = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pointer_ty),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        decorate_binding(&mut self.module, var, set, binding);
+        self.interface_buffer_var(var);
+        var
+    }
+
+    /// Record a descriptor the translator invented purely to give an AIR value a legal SPIR-V type,
+    /// with no Metal argument behind it. See [`drop_unconsumed_placeholder_descriptor_loads`].
+    fn placeholder_descriptor(&mut self, pointee_ty: Word, binding: u32) -> Word {
+        let var = self.descriptor_variable(pointee_ty, binding);
+        self.placeholder_descriptor_vars.insert(var);
+        var
+    }
+
     /// Lazily create a default sampler resource variable for `air.get_read_sampler()`. Metal's
     /// `texture.read(coord)` is sampler-less, but AIR still threads a sampler pointer (from
     /// `air.get_read_sampler`) into the read intrinsic, where our `lower_read` ignores it. To keep the
@@ -44,16 +78,7 @@ impl Ctx {
         let binding = allocate_static_sampler_binding(&self.module, layout)
             .ok_or_else(|| "no free sampler binding for synthesized read sampler".to_string())?;
         let sty = self.ty_sampler();
-        let pptr = self.ty_ptr(StorageClass::UniformConstant, sty);
-        let var = self.module.fresh_id();
-        self.new_globals.push(Instruction::new(
-            Op::Variable,
-            Some(pptr),
-            Some(var),
-            vec![Operand::StorageClass(StorageClass::UniformConstant)],
-        ));
-        decorate_binding(&mut self.module, var, layout.set, binding);
-        self.interface_buffer_var(var);
+        let var = self.placeholder_descriptor(sty, binding);
         self.default_sampler_var = Some(var);
         Ok(var)
     }
@@ -76,16 +101,7 @@ impl Ctx {
         let binding = allocate_default_texture_binding(&self.module, layout)
             .ok_or_else(|| "no free texture binding for synthesized null image".to_string())?;
         let img_ty = self.ty_image(dim, arrayed, ImageComp::Float);
-        let pptr = self.ty_ptr(StorageClass::UniformConstant, img_ty);
-        let var = self.module.fresh_id();
-        self.new_globals.push(Instruction::new(
-            Op::Variable,
-            Some(pptr),
-            Some(var),
-            vec![Operand::StorageClass(StorageClass::UniformConstant)],
-        ));
-        decorate_binding(&mut self.module, var, layout.set, binding);
-        self.interface_buffer_var(var);
+        let var = self.placeholder_descriptor(img_ty, binding);
         self.default_null_image_vars.insert((dim, arrayed), var);
         Ok(var)
     }
@@ -123,16 +139,7 @@ impl Ctx {
                 )
             })?;
         let image_ty = self.ty_storage_image(Dim::Dim2D, true, format, comp);
-        let pointer_ty = self.ty_ptr(StorageClass::UniformConstant, image_ty);
-        let var = self.module.fresh_id();
-        self.new_globals.push(Instruction::new(
-            Op::Variable,
-            Some(pointer_ty),
-            Some(var),
-            vec![Operand::StorageClass(StorageClass::UniformConstant)],
-        ));
-        decorate_binding(&mut self.module, var, layout.set, binding);
-        self.interface_buffer_var(var);
+        let var = self.descriptor_variable(image_ty, binding);
         self.implicit_imageblock_vars
             .insert((attachment, data_rate), (var, image_ty, format));
         Ok((var, image_ty))
@@ -168,25 +175,15 @@ impl Ctx {
                 vec![Operand::Capability(capability)],
             ));
         }
-        let image_ty =
-            self.ty_storage_image(Dim::Dim2D, false, format.image_format, format.component);
-        let pointer_ty = self.ty_ptr(StorageClass::UniformConstant, image_ty);
-        let var = self.module.fresh_id();
-        self.new_globals.push(Instruction::new(
-            Op::Variable,
-            Some(pointer_ty),
-            Some(var),
-            vec![Operand::StorageClass(StorageClass::UniformConstant)],
-        ));
-        let layout = self.descriptor_layout;
-        let binding = layout.fragment_imageblock_binding(master_member)
+        let binding = self.descriptor_layout.fragment_imageblock_binding(master_member)
             .ok_or_else(|| {
                 format!(
                     "fragment imageblock master member {master_member} exceeds the descriptor ABI band"
                 )
             })?;
-        decorate_binding(&mut self.module, var, layout.set, binding);
-        self.interface_buffer_var(var);
+        let image_ty =
+            self.ty_storage_image(Dim::Dim2D, false, format.image_format, format.component);
+        let var = self.descriptor_variable(image_ty, binding);
         self.fragment_imageblock_vars
             .insert(master_member, (var, image_ty));
         Ok((var, image_ty))
@@ -368,30 +365,39 @@ fn decorate_layout_recursive(ctx: &mut Ctx, ty: Word, defs: &HashMap<Word, Instr
     }
 }
 
-/// Retire the synthesized default read sampler when nothing consumed the value it was created to
+/// Retire a descriptor the translator invented when nothing consumed the value it was created to
 /// type.
 ///
-/// `Ctx::default_read_sampler` materializes one `OpTypeSampler` descriptor so that
-/// `air.get_read_sampler()` has a well-typed result: Metal's `texture.read(coord)` is sampler-less,
-/// AIR threads a sampler pointer into the read intrinsic anyway, and `lower_read` discards it. When
-/// every load of that variable feeds nothing, the descriptor is a demand on the consumer for a
-/// sampler the shader never samples with — and reflection cannot report it, because no Metal
-/// argument corresponds to it, so a consumer building its layout from `ShaderReflection` omits the
-/// binding the module declares.
+/// Two passes synthesize a resource with no Metal argument behind it, purely so an AIR value has a
+/// legal SPIR-V type. `Ctx::default_read_sampler` materializes an `OpTypeSampler` because AIR
+/// threads a sampler pointer into `texture.read(coord)`, which in Metal is sampler-less, and
+/// `lower_read` discards it. `Ctx::default_null_image_of` materializes an `OpTypeImage` for
+/// `air.get_null_texture_*()`, whose result a phi may merge away or `air.is_null_texture` may fold
+/// to a constant. When every load of such a variable feeds nothing, the descriptor is a demand on
+/// the consumer for a resource the shader never uses — and reflection cannot report it, because no
+/// Metal argument corresponds to it, so a consumer building its layout from `ShaderReflection`
+/// omits a binding the module declares.
 ///
 /// This is not general dead-code elimination, which this pipeline deliberately does not do: it
-/// retracts one descriptor the translator itself synthesized, and only where the synthesis turned
-/// out to be unnecessary. A load whose result IS consumed keeps the sampler. Dropping the loads is
-/// enough — `drop_unreferenced_global_variables` then removes the variable, its decorations, and its
-/// entry-point interface entry.
-pub(in crate::passes) fn drop_unconsumed_default_sampler_loads(ctx: &mut Ctx) {
-    let Some(sampler) = ctx.default_sampler_var else {
+/// retracts descriptors the translator itself synthesized, and only where the synthesis turned out
+/// to be unnecessary. A load whose result IS consumed keeps its descriptor. Dropping the loads is
+/// enough — `drop_unreferenced_global_variables` then removes each variable, its decorations, and
+/// its entry-point interface entry.
+///
+/// The rule is stated over `Ctx::placeholder_descriptor_vars` rather than over one named variable,
+/// so a third synthesized placeholder is covered by registering it, not by copying this pass.
+pub(in crate::passes) fn drop_unconsumed_placeholder_descriptor_loads(ctx: &mut Ctx) {
+    if ctx.placeholder_descriptor_vars.is_empty() {
         return;
-    };
+    }
     let referenced = crate::passes::module_cleanup::function_referenced_ids(&ctx.module);
+    let placeholders = std::mem::take(&mut ctx.placeholder_descriptor_vars);
     let unconsumed_load = |instruction: &Instruction| {
         instruction.class.opcode == Op::Load
-            && instruction.operands.first() == Some(&Operand::IdRef(sampler))
+            && matches!(
+                instruction.operands.first(),
+                Some(Operand::IdRef(variable)) if placeholders.contains(variable)
+            )
             && instruction
                 .result_id
                 .is_some_and(|id| !referenced.contains(&id))
@@ -403,6 +409,7 @@ pub(in crate::passes) fn drop_unconsumed_default_sampler_loads(ctx: &mut Ctx) {
                 .retain(|instruction| !unconsumed_load(instruction));
         }
     }
+    ctx.placeholder_descriptor_vars = placeholders;
 }
 
 pub(in crate::passes) fn layout_ty_size_align(

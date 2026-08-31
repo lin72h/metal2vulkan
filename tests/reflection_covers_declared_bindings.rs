@@ -10,14 +10,16 @@
 //! the shader never touches, and dropping the binding would silently renumber a consumer's
 //! expectations. Only the other direction is a defect, and that is what this file checks.
 //!
-//! The first case below is where the direction went wrong. `air.get_read_sampler()` exists because
-//! AIR threads a sampler pointer into `texture.read(coord)`, which in Metal is sampler-less; the
-//! interface pass materialized a real `OpTypeSampler` descriptor so the value would be typed, and
-//! `lower_read` then discarded the value. No Metal argument corresponds to that sampler, so
+//! Two of the cases below are where the direction went wrong, and they are the same defect twice.
+//! `air.get_read_sampler()` exists because AIR threads a sampler pointer into `texture.read(coord)`,
+//! which in Metal is sampler-less; `air.get_null_texture_*()` exists because a function-constant
+//! gated optional attachment still has to yield a texture handle. The interface pass materialized a
+//! real `OpTypeSampler` / `OpTypeImage` descriptor so each value would be typed, and the consumer of
+//! that value then turned out to be nothing at all. No Metal argument corresponds to either, so
 //! reflection had nothing to report — while the module demanded the binding anyway.
 
 use metal2vulkan::passes::{Stage, TransformOptions};
-use metal2vulkan::reflect::{ShaderReflection, SAMPLER_BINDING_RANGE};
+use metal2vulkan::reflect::{ShaderReflection, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE};
 use metal2vulkan::translate_sanitized_native_reflected;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -168,6 +170,64 @@ fn a_sampler_less_texture_read_needs_no_sampler_descriptor() {
         "no sampler is bound, so no sampler type should survive:\n{text}"
     );
     assert_eq!(declared.len(), 2, "one sampled and one write texture");
+}
+
+/// A kernel that asks whether a placeholder texture is bound, and does nothing else with it.
+///
+/// `air.get_null_texture_2d()` is what a function-constant-gated optional attachment resolves to
+/// once the constants are folded off. `air.is_null_texture` on that handle folds to a constant, so
+/// the image the interface pass materialized to type the handle ends up with no consumer -- and a
+/// descriptor with no consumer is a demand on the pipeline layout for a texture the shader never
+/// reads. `native_get_null_texture_models_unmodeled_placeholder` is the other half: a placeholder
+/// something DOES read keeps its descriptor.
+const UNCONSUMED_NULL_TEXTURE: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+define void @probe_optional_attachment(ptr addrspace(1) %out) {
+entry:
+  %tex = call ptr addrspace(1) @air.get_null_texture_2d()
+  %isnull = call i1 @air.is_null_texture_2d(ptr addrspace(1) %tex)
+  %flag = zext i1 %isnull to i32
+  store i32 %flag, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare ptr addrspace(1) @air.get_null_texture_2d()
+declare i1 @air.is_null_texture_2d(ptr addrspace(1))
+
+!air.kernel = !{!0}
+!0 = !{ptr @probe_optional_attachment, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+
+#[test]
+fn a_placeholder_texture_nothing_reads_needs_no_texture_descriptor() {
+    let (spirv, reflection) = translate_sanitized_native_reflected(
+        UNCONSUMED_NULL_TEXTURE,
+        Stage::Kernel,
+        &scratch("unconsumed_null_texture"),
+        TransformOptions::default(),
+    )
+    .expect("the optional-attachment probe translates");
+
+    let declared =
+        assert_reflection_covers_declarations("the optional-attachment probe", &spirv, &reflection);
+    let textures = declared
+        .iter()
+        .filter(|(_, binding)| TEXTURE_BINDING_RANGE.contains(*binding))
+        .collect::<Vec<_>>();
+    assert!(
+        textures.is_empty(),
+        "the kernel only asks whether the placeholder is bound and never reads it, so it must not \
+         demand a texture descriptor; it declares {textures:?}"
+    );
+    let text = metal2vulkan::disassemble(&spirv).expect("disassemble");
+    assert!(
+        !text.contains("OpTypeImage"),
+        "no image is bound, so no image type should survive:\n{text}"
+    );
+    assert_eq!(declared.len(), 1, "the one output buffer");
 }
 
 /// A fragment shader that reads its render target back through the implicit imageblock.

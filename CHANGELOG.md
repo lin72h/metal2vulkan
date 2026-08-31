@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+
+- A descriptor the translator synthesizes only to type an AIR value is retracted whenever nothing
+  consumes that value. This already covered `air.get_read_sampler()`; it now covers
+  `air.get_null_texture_*()` too, so a shader that merely asks whether an optional attachment is
+  bound no longer demands a texture descriptor it never reads. The rule is stated once, over the
+  set of synthesized placeholders, rather than per variable.
+
 ### Added
 
 - Reflection schema v32: `ShaderReflection::bindings` reports each resource exactly once. A fragment
