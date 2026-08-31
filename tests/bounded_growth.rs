@@ -1,29 +1,36 @@
-//! Translation memory must grow with the size of a function, not with its square.
+//! What a translation costs must grow with the size of a function, not with its square.
 //!
-//! 500 MiB per translation attempt is a hard budget (`AGENTS.md`), and the way that budget gets
-//! broken is never a leak — it is an analysis whose representation is quadratic in the block count.
-//! One such representation shipped: the nesting structurizer decided reducibility from a dominator
-//! *set* per block, which on a 6301-block function was about 40 million set entries. Nothing about
-//! that is visible on a small graph, and every individual translation is correct; the only symptom
-//! is that a large shader dies at the worker boundary.
+//! 500 MiB and 20 seconds per translation attempt are hard budgets (`AGENTS.md`), and neither gets
+//! broken by a leak or a slow loop body. Both get broken by a quadratic term that a small graph
+//! cannot show: every individual translation is correct, and then a large shader dies at the worker
+//! boundary. Two have shipped, and they are the two different quadratics an analysis can be:
 //!
-//! So this measures the shape of the growth rather than a byte count. Doubling the function must
-//! not much more than double the memory. That ratio is a property of the code, not of the machine:
-//! the allocator below counts bytes the translation asked for, which is the same number on any
-//! host. A quadratic term is unmistakable in it: restoring the dominator-set version behind this
-//! graph measures 3.85x per doubling where the tree version measures 2.00x.
+//! * **The representation.** The nesting structurizer decided reducibility from a dominator *set*
+//!   per block — on a 6301-block function, about 40 million set entries live at once.
+//! * **The repetition.** The merge-ownership pass re-derived the whole function's dominance after
+//!   each split it made, once per construct. Each table is linear and short-lived, so the footprint
+//!   never looks wrong; the wall clock does.
 //!
-//! The single `#[test]` is deliberate. The counter is process-wide, so a second test running
-//! concurrently in this binary would be measured into the first one's peak.
+//! So this measures the shape of the growth rather than a byte count, and it measures it twice:
+//! against the high-water mark, which sees the first kind, and against the total bytes handed out,
+//! which sees the second. Both ratios are properties of the code, not of the machine — the
+//! allocator below counts bytes the translation asked for, which is the same number on any host.
+//! Each defect is unmistakable in its own number: the dominator-set representation measures 3.85x
+//! per doubling against 2.00x for the tree, and the per-split re-derivation measures 3.71x of total
+//! allocation per doubling against 1.95x once it is recorded instead.
+//!
+//! The single `#[test]` is deliberate. The counters are process-wide, so a second test running
+//! concurrently in this binary would be measured into the first one's.
 
 use metal2vulkan::passes::Stage;
 use metal2vulkan::translate_sanitized_native;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Live bytes, and the high-water mark since it was last reset.
+/// Live bytes, the high-water mark since it was last reset, and every byte ever handed out.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static HANDED_OUT: AtomicUsize = AtomicUsize::new(0);
 
 struct Counting;
 
@@ -33,6 +40,7 @@ unsafe impl GlobalAlloc for Counting {
         if !pointer.is_null() {
             let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
             PEAK.fetch_max(live, Ordering::Relaxed);
+            HANDED_OUT.fetch_add(layout.size(), Ordering::Relaxed);
         }
         pointer
     }
@@ -51,6 +59,7 @@ unsafe impl GlobalAlloc for Counting {
                 .saturating_sub(layout.size());
             LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
             PEAK.fetch_max(live, Ordering::Relaxed);
+            HANDED_OUT.fetch_add(new_size.saturating_sub(layout.size()), Ordering::Relaxed);
         }
         grown
     }
@@ -59,13 +68,26 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-/// Peak bytes live at any point during `work`, above what was already live when it started.
-fn peak_bytes<T>(work: impl FnOnce() -> T) -> (T, usize) {
+/// What the allocator saw while `work` ran.
+struct Cost {
+    /// Peak bytes live at any point, above what was already live when `work` started.
+    peak: usize,
+    /// Bytes of fresh memory handed out over the whole run, whether or not they were held at once.
+    handed_out: usize,
+}
+
+fn cost_of<T>(work: impl FnOnce() -> T) -> (T, Cost) {
     let before = LIVE.load(Ordering::Relaxed);
     PEAK.store(before, Ordering::Relaxed);
+    let handed_out_before = HANDED_OUT.load(Ordering::Relaxed);
     let value = work();
-    let peak = PEAK.load(Ordering::Relaxed);
-    (value, peak.saturating_sub(before))
+    let cost = Cost {
+        peak: PEAK.load(Ordering::Relaxed).saturating_sub(before),
+        handed_out: HANDED_OUT
+            .load(Ordering::Relaxed)
+            .saturating_sub(handed_out_before),
+    };
+    (value, cost)
 }
 
 /// A kernel of `groups` chained irreducible pairs: `%a` and `%b` each branch into the other, so
@@ -132,10 +154,21 @@ const SMALL: usize = 100;
 ///
 /// Linear growth doubles, and the measurement is 2.00x. Putting the dominator-set representation
 /// back measures 3.85x on the same two functions. This sits between them with room on both sides.
-const MAX_GROWTH: f64 = 2.6;
+const MAX_PEAK_GROWTH: f64 = 2.6;
+
+/// The most the total allocation may grow for a doubled function.
+///
+/// A bounded peak is not a bounded translation. An analysis that allocates a table proportional to
+/// the whole function, runs, and frees it holds a linear peak however many times it repeats -- and
+/// repeating it once per construct is exactly how the 20-second ceiling gets broken. Total bytes
+/// handed out sees that where a high-water mark cannot: it is the work, not the footprint.
+///
+/// Linear growth doubles, and the measurement is 1.95x. Restoring the per-split re-derivation
+/// measures 3.71x on the same two functions. This sits between them with room on both sides.
+const MAX_WORK_GROWTH: f64 = 2.6;
 
 #[test]
-fn translation_memory_grows_linearly_with_the_block_count() {
+fn translation_cost_grows_linearly_with_the_block_count() {
     let scratch = std::env::temp_dir().join(format!("m2v_bounded_growth_{}", std::process::id()));
     std::fs::create_dir_all(&scratch).expect("scratch directory");
 
@@ -148,26 +181,41 @@ fn translation_memory_grows_linearly_with_the_block_count() {
             .expect("the generated kernel translates");
     }
 
-    let (_, small_peak) = peak_bytes(|| {
+    let (_, small_cost) = cost_of(|| {
         translate_sanitized_native(&small, Stage::Kernel, &scratch)
             .expect("the smaller kernel translates")
     });
-    let (_, large_peak) = peak_bytes(|| {
+    let (_, large_cost) = cost_of(|| {
         translate_sanitized_native(&large, Stage::Kernel, &scratch)
             .expect("the doubled kernel translates")
     });
     let _ = std::fs::remove_dir_all(&scratch);
 
     assert!(
-        small_peak > 0 && large_peak > 0,
-        "the allocator measured nothing: {small_peak} and {large_peak} bytes"
+        small_cost.peak > 0 && large_cost.peak > 0,
+        "the allocator measured nothing: {} and {} bytes",
+        small_cost.peak,
+        large_cost.peak
     );
-    let growth = large_peak as f64 / small_peak as f64;
+    let peak_growth = large_cost.peak as f64 / small_cost.peak as f64;
     assert!(
-        growth <= MAX_GROWTH,
-        "doubling the function multiplied peak translation memory by {growth:.2} \
-         ({small_peak} bytes at {SMALL} groups, {large_peak} bytes at {}); some analysis is \
+        peak_growth <= MAX_PEAK_GROWTH,
+        "doubling the function multiplied peak translation memory by {peak_growth:.2} \
+         ({} bytes at {SMALL} groups, {} bytes at {}); some analysis is \
          quadratic in the block count, which is how the 500 MiB per-translation budget gets broken",
+        small_cost.peak,
+        large_cost.peak,
+        SMALL * 2
+    );
+
+    let work_growth = large_cost.handed_out as f64 / small_cost.handed_out as f64;
+    assert!(
+        work_growth <= MAX_WORK_GROWTH,
+        "doubling the function multiplied total translation allocation by {work_growth:.2} \
+         ({} bytes at {SMALL} groups, {} bytes at {}); an analysis of the whole function is being \
+         re-run once per construct, which is how the 20-second per-translation ceiling gets broken",
+        small_cost.handed_out,
+        large_cost.handed_out,
         SMALL * 2
     );
 }

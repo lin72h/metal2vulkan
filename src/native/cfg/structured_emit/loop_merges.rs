@@ -1164,12 +1164,14 @@ pub(in crate::native) fn privatize_reused_emitted_merge_targets(
         .iter()
         .map(|(header, info)| (info.continue_target.as_str(), header.as_str()))
         .collect::<Vec<_>>();
-    let forest = analyze(blocks);
+    // Every question this pass asks the graph is a dominance question, so it asks for dominance and
+    // not for the natural-loop forest built around it.
+    let mut dominance = PassThroughDominance::of_blocks(blocks);
     let mut shared = claims
         .into_iter()
         .filter(|claim| {
             claim_counts.get(&claim.target).copied().unwrap_or(0) > 1
-                || !forest.dominates(&claim.header, &claim.target)
+                || !dominance.dominates(&claim.header, &claim.target)
                 || continue_owners
                     .iter()
                     .any(|(target, owner)| *target == claim.target && *owner != claim.header)
@@ -1179,26 +1181,26 @@ pub(in crate::native) fn privatize_reused_emitted_merge_targets(
         return false;
     }
 
-    // Use inner-first ownership order. Recompute the forest for each
-    // split so newly synthesized typed blocks participate directly instead of needing a parallel
-    // numeric-label owner table.
-    let initial_forest = analyze(blocks);
+    // Use inner-first ownership order.
     shared.sort_by_cached_key(|claim| {
         let dominated = blocks
             .iter()
-            .filter(|block| initial_forest.dominates(&claim.header, &block.name))
+            .filter(|block| dominance.dominates(&claim.header, &block.name))
             .count();
         (claim.target.clone(), dominated, claim.header.clone())
     });
     let mut counter = next_selection_merge_suffix(blocks);
     let mut changed = false;
     for claim in shared {
-        let forest = analyze(blocks);
+        // Each split is recorded rather than re-analyzed, so the synthesized pass-throughs
+        // participate in the next claim's ownership question directly -- see
+        // [`PassThroughDominance`] for why that is the same answer a fresh analysis gives, and for
+        // what recomputing it per claim costs on a function with one construct per block.
         let predecessors = blocks
             .iter()
             .filter(|block| {
-                forest.dominates(&claim.header, &block.name)
-                    && !forest.dominates(&claim.target, &block.name)
+                dominance.dominates(&claim.header, &block.name)
+                    && !dominance.dominates(&claim.target, &block.name)
                     && block_successors(block)
                         .iter()
                         .any(|target| target == &claim.target)
@@ -1230,6 +1232,9 @@ pub(in crate::native) fn privatize_reused_emitted_merge_targets(
         let Some(private) = private else {
             continue;
         };
+        // The synthesis redirects exactly the predecessor edges named above, and `private` branches
+        // only on to `claim.target`.
+        dominance.record_pass_through(&private, &predecessors);
         match claim.kind {
             EmittedMergeKind::Loop => {
                 loop_merges

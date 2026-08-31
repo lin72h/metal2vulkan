@@ -102,6 +102,103 @@ impl Cfg {
     }
 }
 
+/// The dominator relation of `blocks`, and nothing else.
+///
+/// [`super::loopforest::analyze`] also answers dominance, but it pays for back-edge discovery, a
+/// natural-loop body closure per header, and a nesting comparison between every pair of loops
+/// before it can. A caller that only ever asks "does A dominate B" should ask that question, not
+/// the one that happens to contain it: the ownership passes re-derive dominance after every graph
+/// edit, so the difference is a whole-analysis constant multiplied by the number of edits.
+///
+/// An empty function has no entry, hence no dominance relation; the empty [`Dominators`] answers
+/// `false` to every query but the reflexive one, matching [`super::loopforest::analyze`] there.
+pub(in crate::native) fn block_dominators(blocks: &[BodyBlock]) -> Dominators {
+    Cfg::from_blocks(blocks)
+        .map(|cfg| cfg.dominators())
+        .unwrap_or_default()
+}
+
+/// Dominance over a block list that edge splitting only ever extends with pass-through blocks.
+///
+/// The ownership passes repeatedly split an edge: some predecessors of a block `T` are redirected
+/// through a fresh block `S` whose only successor is `T`. Re-deriving the whole relation after each
+/// split is the obvious way to keep answering dominance questions, and it makes a pass that
+/// performs one split per construct quadratic in the block count — the shape that breaks the
+/// per-translation time ceiling on generated shaders.
+///
+/// It is also unnecessary, twice over:
+///
+/// * **The old blocks do not move.** Every entry-to-`X` path after the split is an entry-to-`X`
+///   path before it with `S` spliced in, and vice versa. The pre-existing blocks on it are the
+///   same ones, so dominance among pre-existing blocks is exactly unchanged.
+/// * **A pass-through's own dominators follow from its predecessors.** Every path to `S` is a path
+///   to one of its predecessors plus one edge, so a block other than `S` dominates `S` exactly when
+///   it dominates all of them. Resolving predecessors that are themselves pass-throughs leaves a
+///   set of original blocks, which the unchanged base relation answers for.
+///
+/// So the base relation is computed once and each split is *recorded* rather than re-derived. The
+/// recording is exact, not an approximation: [`Self::dominates`] agrees with a relation freshly
+/// computed over the mutated block list, which is what
+/// `a_recorded_pass_through_answers_what_a_fresh_analysis_answers` checks.
+///
+/// `dominator` must be a block of the original list. A pass-through is never a split target — split
+/// targets are chosen before any splitting starts — so no caller has reason to ask whether one
+/// dominates something, and this cannot answer it.
+pub(in crate::native) struct PassThroughDominance {
+    /// Dominance of the block list as it stood before any split.
+    base: Dominators,
+    /// Each recorded pass-through, resolved to the original blocks that stand in for it.
+    pass_throughs: HashMap<String, Vec<String>>,
+}
+
+impl PassThroughDominance {
+    /// The relation of `blocks`, with no splits recorded yet.
+    pub(in crate::native) fn of_blocks(blocks: &[BodyBlock]) -> Self {
+        PassThroughDominance {
+            base: block_dominators(blocks),
+            pass_throughs: HashMap::new(),
+        }
+    }
+
+    /// Record that `name` was spliced in front of a block, carrying exactly `predecessors`.
+    ///
+    /// `predecessors` is the complete set of edges redirected through it; a pass-through with no
+    /// predecessors is unreachable, and is then dominated by nothing, as in
+    /// [`crate::native::dominators`].
+    pub(in crate::native) fn record_pass_through(&mut self, name: &str, predecessors: &[String]) {
+        let mut originals = Vec::new();
+        for predecessor in predecessors {
+            match self.pass_throughs.get(predecessor) {
+                Some(resolved) => originals.extend(resolved.iter().cloned()),
+                None => originals.push(predecessor.clone()),
+            }
+        }
+        originals.sort();
+        originals.dedup();
+        self.pass_throughs.insert(name.to_string(), originals);
+    }
+
+    /// Whether `dominator`, a block of the original list, dominates `node`.
+    pub(in crate::native) fn dominates(&self, dominator: &str, node: &str) -> bool {
+        if dominator == node {
+            return true;
+        }
+        debug_assert!(
+            !self.pass_throughs.contains_key(dominator),
+            "a pass-through is never a split target, so nothing asks what it dominates"
+        );
+        match self.pass_throughs.get(node) {
+            Some(originals) => {
+                !originals.is_empty()
+                    && originals
+                        .iter()
+                        .all(|original| self.base.dominates(dominator, original))
+            }
+            None => self.base.dominates(dominator, node),
+        }
+    }
+}
+
 /// Immediate dominators and Euler intervals of a CFG whose blocks are named.
 ///
 /// `order` is the dense numbering, entry first; `successors` names each block's targets. Both the
@@ -447,5 +544,83 @@ mod tests {
     #[test]
     fn empty_function_has_no_cfg() {
         assert!(Cfg::from_blocks(&[]).is_none());
+    }
+
+    /// Splice `name` in front of `target`, taking exactly the `%`-prefixed `predecessors` with it.
+    ///
+    /// The same surgery the ownership passes perform: the redirected predecessors branch to the new
+    /// block, and the new block branches on to the old target. Nothing else moves.
+    fn splice_pass_through(
+        blocks: &mut Vec<BodyBlock>,
+        name: &str,
+        target: &str,
+        predecessors: &[&str],
+    ) {
+        for block in blocks.iter_mut() {
+            if !predecessors.contains(&block.name.as_str()) {
+                continue;
+            }
+            let typed = block.typed_mut().expect("carrier");
+            typed.redirect_successor(target, name);
+        }
+        let at = blocks
+            .iter()
+            .position(|block| block.name == target)
+            .expect("target block");
+        let mut spliced = blk(name.trim_start_matches('%'), &format!("br label {target}"));
+        spliced.name = name.to_string();
+        blocks.insert(at, spliced);
+    }
+
+    /// A recorded split must answer every dominance question the way a fresh analysis of the
+    /// mutated block list answers it.
+    ///
+    /// This is the property [`PassThroughDominance`] trades a re-analysis per split for. It holds
+    /// because a pass-through elides out of every path through it, and it is worth checking rather
+    /// than reasoning about: the failure mode is not a crash but an ownership pass quietly choosing
+    /// a different set of predecessors to redirect, which surfaces much later as a structurally
+    /// invalid module.
+    #[test]
+    fn a_recorded_pass_through_answers_what_a_fresh_analysis_answers() {
+        // A loop whose exit `%m` is entered from inside (`%body`) and from outside (`%pre`), so the
+        // exit has predecessors that a split must separate -- the shape the ownership passes split.
+        let mut blocks = vec![
+            blk("0", "br i1 %c, label %pre, label %h"),
+            blk("pre", "br label %m"),
+            blk("h", "br i1 %c1, label %body, label %m"),
+            blk("body", "br i1 %c2, label %h, label %m"),
+            blk("m", "ret void"),
+        ];
+        let mut dominance = PassThroughDominance::of_blocks(&blocks);
+
+        // Two splits in a row, the second carrying the first's pass-through: the recursive case.
+        splice_pass_through(&mut blocks, "%s0", "%m", &["%h", "%body"]);
+        dominance.record_pass_through("%s0", &["%h".to_string(), "%body".to_string()]);
+        splice_pass_through(&mut blocks, "%s1", "%m", &["%s0", "%pre"]);
+        dominance.record_pass_through("%s1", &["%s0".to_string(), "%pre".to_string()]);
+
+        let cfg = Cfg::from_blocks(&blocks).expect("non-empty");
+        let names = reachable_names(&cfg);
+        assert!(names.contains(&"%s0".to_string()) && names.contains(&"%s1".to_string()));
+        let originals = ["%0", "%pre", "%h", "%body", "%m"];
+        for dominator in originals {
+            for node in &names {
+                assert_eq!(
+                    dominance.dominates(dominator, node),
+                    oracle_dominates(&cfg, dominator, node),
+                    "recorded splits disagree with the split graph: does {dominator} dominate {node}?"
+                );
+            }
+        }
+    }
+
+    /// An unreachable pass-through is dominated by nothing, matching an unreachable original block.
+    #[test]
+    fn a_pass_through_with_no_predecessors_is_dominated_by_nothing() {
+        let blocks = vec![blk("0", "br label %a"), blk("a", "ret void")];
+        let mut dominance = PassThroughDominance::of_blocks(&blocks);
+        dominance.record_pass_through("%s0", &[]);
+        assert!(!dominance.dominates("%0", "%s0"));
+        assert!(dominance.dominates("%s0", "%s0"));
     }
 }

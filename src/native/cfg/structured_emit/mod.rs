@@ -30,6 +30,7 @@
 use super::blocks::{
     block_successors, conditional_branch_targets, index_branch_merges_by_header, synthetic_block,
 };
+use super::graph::PassThroughDominance;
 use super::loopforest::{
     analyze, analyze_reusing_natural_loops, break_aware_selection_merges, selection_merges,
     LoopForest, Restructure,
