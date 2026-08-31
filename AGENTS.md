@@ -248,6 +248,14 @@ When diagnosing a hang, prefer reading full `cargo test` output over piping thro
   warnings; CI will fail the same checks.
 - Do not force-push shared history unless the user asks.
 - Do not commit secrets, large binaries, or lockfiles that this repo intentionally ignores.
+- **Never amend a commit** unless the user explicitly asks for it in the current conversation. A
+  commit that is already written is history someone else may have read; correct it by adding the
+  next commit, not by rewriting the last one.
+- **Every commit is a release candidate.** Do not land partial work, a half-applied refactor, or a
+  fix whose test is still to come. Each commit must build, pass the pre-commit gate above, and leave
+  no capability worse off than the commit before it. If a change is too large to land in one sound
+  step, split it into steps that are each independently sound - not into a broken step followed by a
+  repair.
 
 ## The loop (unit of work)
 
