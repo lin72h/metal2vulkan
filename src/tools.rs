@@ -185,7 +185,7 @@ pub fn air_to_sanitized_ll_with_datalayout(
     let ll_text = if src.ends_with(".ll") {
         std::fs::read_to_string(src).map_err(|e| format!("read {src}: {e}"))?
     } else {
-        let ll = tmp.join("k.ll");
+        let ll = scratch_file(tmp, "k", "ll");
         let text = (|| {
             run("llvm-dis", &[src, "-o", ll.to_str().unwrap()])?;
             std::fs::read_to_string(&ll).map_err(|e| format!("read {}: {e}", ll.display()))
@@ -428,12 +428,30 @@ pub fn spirv_val(spv_path: &str) -> Result<(), String> {
 /// Validate in-memory SPIR-V bytes by writing them to a temp file and invoking `spirv-val`.
 pub fn spirv_val_bytes(spv: &[u8], tmp: &Path) -> Result<(), String> {
     std::fs::create_dir_all(tmp).map_err(|e| format!("spirv_val_bytes create tmp: {e}"))?;
-    let path = tmp.join("a2v_val.spv");
+    let path = scratch_file(tmp, "a2v_val", "spv");
     std::fs::write(&path, spv).map_err(|e| format!("spirv_val_bytes write: {e}"))?;
     let result = spirv_val(path.to_str().ok_or("spirv_val_bytes: bad tmp path")?);
     // spirv-val only needs the path for the subprocess lifetime.
     let _ = std::fs::remove_file(&path);
     result
+}
+
+/// A scratch path inside `tmp` that no other caller can be using.
+///
+/// `tmp` is caller-supplied and callers do share one: parallel tests, a sweep's worker threads, and
+/// separate processes pointed at the same directory. A fixed file name there is shared mutable
+/// state -- one caller overwrites another's input and then deletes it, and the external tool
+/// reports on a file that is not the one the caller asked about, or on no file at all. That
+/// surfaces as a tool failure in an input that is fine, which is a false alarm the reader cannot
+/// tell from a real one. Naming the file after this process and this call removes the sharing
+/// instead of asking every caller to remember to pass a private directory.
+fn scratch_file(tmp: &Path, stem: &str, extension: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    tmp.join(format!(
+        "{stem}_{}_{}.{extension}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
 }
 
 /// Best-effort filename stem (drop the final extension).
@@ -447,6 +465,52 @@ pub fn strip_ext(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `spirv_val_bytes` is called concurrently -- by parallel tests, by a sweep's worker threads,
+    /// and by separate processes pointed at one scratch directory. Its result has to describe the
+    /// bytes it was handed and nothing else. A shared scratch file made it describe whichever
+    /// module won the race, or none, which surfaces as a validation failure in a module that is
+    /// fine; that is a false alarm the reader has no way to tell from a real one.
+    #[test]
+    fn concurrent_validations_sharing_one_scratch_directory_do_not_collide() {
+        if Command::new("spirv-val").arg("--version").output().is_err() {
+            return;
+        }
+        let module = crate::translate_sanitized_native(
+            r#"
+define void @k(ptr addrspace(1) %out) {
+entry:
+  store i32 7, ptr addrspace(1) %out, align 4
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#,
+            crate::passes::Stage::Kernel,
+            &std::env::temp_dir().join(format!("m2v_val_race_build_{}", std::process::id())),
+        )
+        .expect("the probe kernel translates");
+
+        // One directory, deliberately shared by every thread: that is the condition under test.
+        let shared = std::env::temp_dir().join(format!("m2v_val_race_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&shared);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let module = &module;
+                let shared = &shared;
+                scope.spawn(move || {
+                    for _ in 0..16 {
+                        spirv_val_bytes(module, shared)
+                            .expect("a valid module validates, whoever else is validating");
+                    }
+                });
+            }
+        });
+        let _ = std::fs::remove_dir_all(&shared);
+    }
 
     #[test]
     fn sanitizer_captures_and_preserves_target_datalayout() {

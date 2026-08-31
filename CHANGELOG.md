@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Scratch files under a caller-supplied `tmp` are named per process and per call, so two callers
+  sharing one directory no longer overwrite and delete each other's input to `spirv-val` or
+  `llvm-dis`. The shared name surfaced as a validation failure in a module that was fine.
 - `get_width()`/`get_height()` on a `texture_buffer` translates instead of falling back. SPIR-V
   allows `OpImageQuerySizeLod` only on a 1D/2D/3D/Cube image with `MS` 0 and a `Sampled` operand
   that is not 2; a `Dim Buffer` image must use the LOD-less `OpImageQuerySize`. One
