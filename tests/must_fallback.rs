@@ -9,6 +9,10 @@
 //! Covers known-unsupported classes: `air.intersect.*` raytracing, `llvm.agx3.*` emask
 //! intrinsics, texture atomics — plus structural malformations (no definitions, truncated).
 //!
+//! One of them is a GAP rather than a limit: the byte-view vector store below has a lowering, it
+//! just has not been written, and the reason it is pinned is that the obvious ways to write it are
+//! wrong. Closing it must be a deliberate change to this test, not a silent pass.
+//!
 //! Two of these are the classes that actually turn up. Measured over a 2880-source local corpus
 //! sample, 204 sources do not translate, and 191 of them are one of two shapes: a call through a
 //! Metal visible function table, or an intersection whose custom intersection functions come from a
@@ -174,4 +178,72 @@ fn truncated_module_fallbacks() {
               entry:\n\
               \x20 %a = load i32, ptr %x\n";
     assert_fallback(ll, "unterminated function");
+}
+
+/// A `<3 x float>` store through a byte view of a raw word buffer, reached across a call.
+///
+/// This one is a GAP, not a limit — unlike the function-pointer classes above, the lowering is
+/// expressible; nothing has written it. It is the largest remaining non-function-pointer rejection
+/// class in the corpus sample (8 of the 12), and it is pinned here because it is the class most
+/// likely to be closed WRONGLY. A `device uchar*` view of a `{ RuntimeArray<uint> }` block writing
+/// four, eight or twelve bytes at a runtime offset has two tempting lowerings that are not the AIR's
+/// semantics: a non-atomic read-modify-write of the surrounding words, which races another thread
+/// writing the neighbouring bytes (`emit_scalar_narrowing_store` restricts exactly that to
+/// thread-local slots, and `emit_raw_byte_store_from_u32` uses atomics on shared storage); and a
+/// plain word store, which is only byte-exact if the offset is four-byte aligned — the AIR asserts
+/// that with `align`, but the alignment does not reach the SPIR-V pass that would need it. Until one
+/// of those is resolved honestly, this must stay a clean `Err`.
+///
+/// Reduced from a corpus source with `llvm-reduce` (708 lines to 44) and then renamed, so it carries
+/// no third-party identifiers. Every remaining part is load-bearing: dropping the `i32` load or the
+/// byte `getelementptr` in `@k` (which together fix the block's element width at 32 bits and open
+/// the byte view), inlining `@store_vec` into `@k`, flattening its pass-through blocks, or shrinking
+/// the argument list each make the module translate.
+#[test]
+fn byte_view_vector_store_into_a_word_block_fallbacks() {
+    let ll = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+%struct.view = type { ptr addrspace(2), ptr addrspace(1) }
+
+define void @k(ptr addrspace(1) %0) {
+  %2 = alloca %struct.view, align 8
+  %3 = getelementptr %struct.view, ptr %2, i64 0, i32 1
+  store ptr addrspace(1) %0, ptr %3, align 8
+  %4 = getelementptr i8, ptr addrspace(1) %0, i64 0
+  %5 = load i32, ptr addrspace(1) %0, align 16
+  call fastcc void @store_vec(ptr %2)
+  ret void
+}
+
+define fastcc void @store_vec(ptr %0) {
+  br label %2
+
+2:                                                ; preds = %1
+  br label %4
+
+4:                                                ; preds = %2
+  %5 = getelementptr %struct.view, ptr %0, i64 0, i32 1
+  %6 = load ptr addrspace(1), ptr %5, align 8
+  %7 = zext i32 0 to i64
+  %8 = getelementptr i8, ptr addrspace(1) %6, i64 %7
+  store <3 x float> zeroinitializer, ptr addrspace(1) %8, align 16
+  br label %9
+
+9:                                                ; preds = %4
+  ret void
+}
+
+!air.kernel = !{!0}
+
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !7, !8, !9}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"index"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 280, !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 280, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"hdr", !"air.arg_name", !"header"}
+!5 = !{!"air.struct_type_info", !6, i32 0, i32 8, i32 35, !"hdr_entry", !"entries"}
+!6 = !{i32 0, i32 4, i32 0, !"int", !"offset", i32 4, i32 2, i32 0, !"short", !"type", i32 6, i32 2, i32 0, !"short", !"stride"}
+!7 = !{i32 2, !"air.buffer", !"air.location_index", i32 5, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"data"}
+!8 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 280, !"air.location_index", i32 6, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 280, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"hdr", !"air.arg_name", !"header"}
+!9 = !{i32 4, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"data"}"#;
+    assert_fallback(ll, "no dynamic-struct-index rewrite repaired");
 }
