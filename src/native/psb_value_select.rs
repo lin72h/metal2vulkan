@@ -1060,10 +1060,11 @@ pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module
         .iter()
         .zip(&block_labels)
         .map(|(function, labels)| {
-            let entry = labels.first().copied().flatten()?;
+            // The flatten below drops unlabelled blocks, so the entry has to be the first
+            // label for index 0 to still be it.
+            labels.first().copied().flatten()?;
             let labels = labels.iter().copied().flatten().collect::<Vec<_>>();
             Some(EmittedDominators::new(
-                entry,
                 &labels,
                 &spirv_block_successors_by_label(&function.blocks),
             ))

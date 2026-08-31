@@ -1,7 +1,7 @@
 // Dominator/loop-forest analysis backing the structured-by-construction path (`structured_plan`).
 // A rejected local plan is recorded as an owned construction fact so the module can select its raw
 // CFG representation before serialization.
-// Low-level source-CFG graph primitives (successor/predecessor adjacency + CHK
+// Low-level source-CFG graph primitives (successor/predecessor adjacency +
 // dominator tree) shared by the loop-forest and structurizer analyses.
 pub(in crate::native) mod graph;
 pub(super) mod loopforest;

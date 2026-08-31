@@ -1,9 +1,10 @@
 //! Compact dominance over an emitted SPIR-V function CFG.
 //!
-//! Shared by late native rewrites. The immediate-dominator tree uses O(V + E) storage and answers
-//! dominance with DFS intervals; the former
-//! `label -> HashSet<all dominators>` representation was O(V²) and drove large translations far
-//! beyond their resident-memory budget even after those temporary sets were freed.
+//! Shared by late native rewrites. The dominator tree comes from [`crate::native::dominators`]:
+//! O(V + E) storage, answered with DFS intervals. The former `label -> HashSet<all dominators>`
+//! representation here was O(V²) and drove large translations far beyond their resident-memory
+//! budget even after those temporary sets were freed -- which is exactly why there is now one
+//! dominator computation in the crate rather than one per caller.
 
 #[cfg(test)]
 use crate::spirv_module::{Function, Module, Operand};
@@ -18,13 +19,14 @@ pub(in crate::native) struct EmittedDominators {
     index: HashMap<Word, usize>,
     #[cfg(test)]
     immediate_dominator: Vec<Option<usize>>,
-    preorder: Vec<usize>,
-    postorder: Vec<usize>,
+    /// Euler intervals of the dominator tree, indexed as `labels` was.
+    intervals: Vec<Option<(usize, usize)>>,
 }
 
 impl EmittedDominators {
+    /// `labels` is the function's blocks in serialized order, so `labels[0]` is the entry -- which
+    /// is what every caller has, and what the shared dominator computation expects.
     pub(in crate::native) fn new(
-        entry: Word,
         labels: &[Word],
         successors_by_label: &HashMap<Word, Vec<Word>>,
     ) -> Self {
@@ -34,103 +36,26 @@ impl EmittedDominators {
             .map(|(idx, label)| (*label, idx))
             .collect::<HashMap<_, _>>();
         let mut successors = vec![Vec::new(); labels.len()];
-        let mut predecessors = vec![Vec::new(); labels.len()];
         for (&label, targets) in successors_by_label {
             let Some(&from) = index.get(&label) else {
                 continue;
             };
             for target in targets {
-                let Some(&to) = index.get(target) else {
-                    continue;
-                };
-                successors[from].push(to);
-                predecessors[to].push(from);
-            }
-        }
-
-        let mut rpo = Vec::new();
-        if let Some(&entry) = index.get(&entry) {
-            let mut seen = vec![false; labels.len()];
-            let mut stack = vec![(entry, 0usize)];
-            seen[entry] = true;
-            while let Some((node, next)) = stack.last_mut() {
-                if *next < successors[*node].len() {
-                    let successor = successors[*node][*next];
-                    *next += 1;
-                    if !seen[successor] {
-                        seen[successor] = true;
-                        stack.push((successor, 0));
-                    }
-                } else {
-                    rpo.push(*node);
-                    stack.pop();
-                }
-            }
-            rpo.reverse();
-        }
-        let mut rpo_rank = vec![usize::MAX; labels.len()];
-        for (rank, node) in rpo.iter().copied().enumerate() {
-            rpo_rank[node] = rank;
-        }
-        let mut idom = vec![None; labels.len()];
-        if let Some(&entry) = rpo.first() {
-            idom[entry] = Some(entry);
-            loop {
-                let mut changed = false;
-                for node in rpo.iter().copied().skip(1) {
-                    let mut defined = predecessors[node]
-                        .iter()
-                        .copied()
-                        .filter(|pred| idom[*pred].is_some());
-                    let Some(mut next_idom) = defined.next() else {
-                        continue;
-                    };
-                    for pred in defined {
-                        next_idom = intersect(pred, next_idom, &idom, &rpo_rank);
-                    }
-                    if idom[node] != Some(next_idom) {
-                        idom[node] = Some(next_idom);
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
+                if let Some(&to) = index.get(target) {
+                    successors[from].push(to);
                 }
             }
         }
-
-        let mut children = vec![Vec::new(); labels.len()];
-        for (node, parent) in idom.iter().copied().enumerate() {
-            if let Some(parent) = parent.filter(|parent| *parent != node) {
-                children[parent].push(node);
-            }
-        }
-        let mut preorder = vec![usize::MAX; labels.len()];
-        let mut postorder = vec![usize::MAX; labels.len()];
-        if let Some(&entry) = rpo.first() {
-            let mut clock = 0usize;
-            let mut stack = vec![(entry, 0usize)];
-            preorder[entry] = clock;
-            clock += 1;
-            while let Some((node, next)) = stack.last_mut() {
-                if *next < children[*node].len() {
-                    let child = children[*node][*next];
-                    *next += 1;
-                    preorder[child] = clock;
-                    clock += 1;
-                    stack.push((child, 0));
-                } else {
-                    postorder[*node] = clock;
-                    stack.pop();
-                }
-            }
-        }
+        let predecessors = crate::native::dominators::build_predecessors(&successors);
+        // Underscore-prefixed because the parent links are only read by the serialization-order
+        // check, which is test-only; the intervals are what production queries.
+        let (_, intervals, _parents) =
+            crate::native::dominators::dominance(&successors, &predecessors);
         Self {
             index,
             #[cfg(test)]
-            immediate_dominator: idom,
-            preorder,
-            postorder,
+            immediate_dominator: _parents,
+            intervals,
         }
     }
 
@@ -139,9 +64,7 @@ impl EmittedDominators {
         else {
             return false;
         };
-        self.preorder[dominator] != usize::MAX
-            && self.preorder[dominator] <= self.preorder[node]
-            && self.preorder[node] < self.postorder[dominator]
+        crate::native::dominators::dominates_interval(&self.intervals, dominator, node)
     }
 
     /// Whether every reachable block's immediate dominator precedes it in serialized block order.
@@ -230,11 +153,11 @@ fn function_has_late_dominator(function: &Function) -> bool {
         .iter()
         .filter_map(|block| block.label.as_ref()?.result_id)
         .collect::<Vec<_>>();
-    let Some(&entry) = labels.first() else {
+    if labels.is_empty() {
         return false;
-    };
+    }
     let successors = super::graph::spirv_block_successors_by_label(&function.blocks);
-    let dominators = EmittedDominators::new(entry, &labels, &successors);
+    let dominators = EmittedDominators::new(&labels, &successors);
     !dominators.serialization_respects_dominance()
 }
 
@@ -248,11 +171,11 @@ fn function_has_non_dominating_value_use(function: &Function) -> bool {
         .iter()
         .filter_map(|block| block.label.as_ref()?.result_id)
         .collect::<Vec<_>>();
-    let Some(&entry) = labels.first() else {
+    if labels.is_empty() {
         return false;
-    };
+    }
     let successors = super::graph::spirv_block_successors_by_label(&function.blocks);
-    let dominators = EmittedDominators::new(entry, &labels, &successors);
+    let dominators = EmittedDominators::new(&labels, &successors);
     let definitions = function
         .blocks
         .iter()
@@ -322,11 +245,11 @@ fn function_has_unmarked_back_edge(function: &Function) -> bool {
         .iter()
         .filter_map(|block| block.label.as_ref()?.result_id)
         .collect::<Vec<_>>();
-    let Some(&entry) = labels.first() else {
+    if labels.is_empty() {
         return false;
-    };
+    }
     let successors = super::graph::spirv_block_successors_by_label(&function.blocks);
-    let dominators = EmittedDominators::new(entry, &labels, &successors);
+    let dominators = EmittedDominators::new(&labels, &successors);
     let loop_headers = function
         .blocks
         .iter()
@@ -364,11 +287,11 @@ fn function_has_invalid_selection_exit(function: &Function) -> bool {
         .iter()
         .filter_map(|block| block.label.as_ref()?.result_id)
         .collect::<Vec<_>>();
-    let Some(&entry) = labels.first() else {
+    if labels.is_empty() {
         return false;
-    };
+    }
     let successors = super::graph::spirv_block_successors_by_label(&function.blocks);
-    let dominators = EmittedDominators::new(entry, &labels, &successors);
+    let dominators = EmittedDominators::new(&labels, &successors);
     let terminal_targets = function
         .blocks
         .iter()
@@ -512,23 +435,6 @@ fn function_has_invalid_selection_exit(function: &Function) -> bool {
         }
     }
     false
-}
-
-fn intersect(
-    mut left: usize,
-    mut right: usize,
-    idom: &[Option<usize>],
-    rpo_rank: &[usize],
-) -> usize {
-    while left != right {
-        while rpo_rank[left] > rpo_rank[right] {
-            left = idom[left].expect("defined dominator chain");
-        }
-        while rpo_rank[right] > rpo_rank[left] {
-            right = idom[right].expect("defined dominator chain");
-        }
-    }
-    left
 }
 
 #[cfg(test)]

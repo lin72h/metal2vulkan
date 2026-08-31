@@ -2457,11 +2457,10 @@ impl Emitter {
                 Some((label, emitted_block_successors(block)))
             })
             .collect::<HashMap<_, _>>();
-        let entry = labels
-            .first()
-            .copied()
-            .ok_or_else(|| "native emitter: split function has no entry block".to_string())?;
-        let dominators = crate::native::cfg::EmittedDominators::new(entry, &labels, &successors);
+        if labels.is_empty() {
+            return Err("native emitter: split function has no entry block".to_string());
+        }
+        let dominators = crate::native::cfg::EmittedDominators::new(&labels, &successors);
         let redirected = blocks
             .iter()
             .filter_map(|block| {

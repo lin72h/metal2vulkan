@@ -1,14 +1,13 @@
-//! CFG graph primitives: successor/predecessor adjacency and a
-//! Cooper-Harvey-Kennedy dominator tree, over the `BodyBlock` source CFG, plus
-//! the native-side SPIR-V (`crate::spirv_module::Block`, `Word` label) equivalents
-//! used by the emitter's control-flow repair and structurizer (see the `spirv_*`
+//! CFG graph primitives: successor/predecessor adjacency and a dominator tree, over the
+//! `BodyBlock` source CFG, plus the native-side SPIR-V (`crate::spirv_module::Block`, `Word` label)
+//! equivalents used by the emitter's control-flow repair and structurizer (see the `spirv_*`
 //! fns near the end of this file).
 //!
 //! This is the single home for low-level CFG graph analysis. Higher-level passes
 //! (the loop-forest in [`super::loopforest`], the structurizer, merge inference)
 //! build a [`Cfg`] once and query dominance/adjacency through it, instead of each
-//! open-coding its own successor scan and dominator computation. Dominators use
-//! the Cooper-Harvey-Kennedy iterative algorithm over reverse-postorder.
+//! open-coding its own successor scan. The dominators themselves come from
+//! [`crate::native::dominators`], which every dominator question in the crate goes through.
 
 use super::blocks::block_successors;
 use super::BodyBlock;
@@ -31,6 +30,9 @@ pub(in crate::native) struct Cfg {
     pub(in crate::native) predecessors: HashMap<String, Vec<String>>,
     /// The set of real block names, for cheap membership tests.
     names: HashSet<String>,
+    /// Block names in function order, entry first. The dominator computation speaks dense block
+    /// indices, and this is the deterministic numbering it is handed.
+    order: Vec<String>,
 }
 
 impl Cfg {
@@ -67,6 +69,7 @@ impl Cfg {
             successors,
             predecessors,
             names,
+            order: blocks.iter().map(|b| b.name.clone()).collect(),
         })
     }
 
@@ -90,19 +93,52 @@ impl Cfg {
         reachable
     }
 
-    /// The immediate-dominator tree of this CFG (Cooper-Harvey-Kennedy).
+    /// The immediate-dominator tree of this CFG.
     pub(in crate::native) fn dominators(&self) -> Dominators {
-        let names: HashSet<&str> = self.names.iter().map(String::as_str).collect();
-        let rpo = reverse_postorder(&self.entry, &self.successors, &names);
-        let rpo_num: HashMap<&str, usize> = rpo
-            .iter()
-            .enumerate()
-            .map(|(i, n)| (n.as_str(), i))
-            .collect();
-        let idom = compute_idom(&self.entry, &self.predecessors, &rpo, &rpo_num);
-        let intervals = dominance_intervals(&self.entry, &idom);
+        let (idom, intervals) = named_dominators(&self.order, |name| {
+            self.successors.get(name).map(Vec::as_slice).unwrap_or(&[])
+        });
         Dominators { idom, intervals }
     }
+}
+
+/// Immediate dominators and Euler intervals of a CFG whose blocks are named.
+///
+/// `order` is the dense numbering, entry first; `successors` names each block's targets. Both the
+/// forward dominators here and the reverse-graph post-dominators in [`super::loopforest`] are this
+/// same question over a different graph, so both come through here to reach the crate's one
+/// dominator computation in [`crate::native::dominators`].
+pub(super) fn named_dominators<'a>(
+    order: &'a [String],
+    successors: impl Fn(&str) -> &'a [String],
+) -> (HashMap<String, String>, HashMap<String, (usize, usize)>) {
+    let index: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(position, name)| (name.as_str(), position))
+        .collect();
+    let dense: Vec<Vec<usize>> = order
+        .iter()
+        .map(|name| {
+            successors(name)
+                .iter()
+                .filter_map(|target| index.get(target.as_str()).copied())
+                .collect()
+        })
+        .collect();
+    let predecessors = crate::native::dominators::build_predecessors(&dense);
+    let (_, intervals, parents) = crate::native::dominators::dominance(&dense, &predecessors);
+    let named_idom = parents
+        .iter()
+        .enumerate()
+        .filter_map(|(block, parent)| Some((order[block].clone(), order[(*parent)?].clone())))
+        .collect();
+    let named_intervals = intervals
+        .iter()
+        .enumerate()
+        .filter_map(|(block, interval)| Some((order[block].clone(), (*interval)?)))
+        .collect();
+    (named_idom, named_intervals)
 }
 
 /// Immediate-dominator relation of a source CFG (entry maps to itself).
@@ -136,151 +172,6 @@ impl Dominators {
             .map(String::as_str)
             .filter(|d| *d != node)
     }
-}
-
-fn dominance_intervals(
-    entry: &str,
-    idom: &HashMap<String, String>,
-) -> HashMap<String, (usize, usize)> {
-    let mut children = HashMap::<&str, Vec<&str>>::new();
-    for (node, parent) in idom {
-        if node != parent {
-            children.entry(parent).or_default().push(node);
-        }
-    }
-    for descendants in children.values_mut() {
-        descendants.sort_unstable();
-    }
-    let mut entered = HashMap::<String, usize>::new();
-    let mut intervals = HashMap::new();
-    let mut clock = 0usize;
-    let mut stack = vec![(entry, false)];
-    while let Some((node, exiting)) = stack.pop() {
-        if exiting {
-            let start = entered[node];
-            intervals.insert(node.to_string(), (start, clock));
-            clock += 1;
-            continue;
-        }
-        entered.insert(node.to_string(), clock);
-        clock += 1;
-        stack.push((node, true));
-        if let Some(descendants) = children.get(node) {
-            stack.extend(descendants.iter().rev().map(|child| (*child, false)));
-        }
-    }
-    intervals
-}
-
-/// Reverse postorder of the blocks reachable from `entry`, restricted to `names`.
-///
-/// Exposed so the reverse-graph post-dominator computation in [`super::loopforest`]
-/// can reuse it (post-dominators = dominators of the reverse CFG).
-pub(super) fn reverse_postorder(
-    entry: &str,
-    successors: &HashMap<String, Vec<String>>,
-    names: &HashSet<&str>,
-) -> Vec<String> {
-    let mut visited = HashSet::new();
-    let mut post = Vec::new();
-    // Iterative DFS tracking child cursor per frame.
-    let mut stack: Vec<(String, usize)> = vec![(entry.to_string(), 0)];
-    visited.insert(entry.to_string());
-    while let Some((node, idx)) = stack.last().cloned() {
-        let succ = successors.get(&node);
-        let next = succ.and_then(|s| s.iter().filter(|t| names.contains(t.as_str())).nth(idx));
-        match next {
-            Some(child) => {
-                stack.last_mut().unwrap().1 += 1;
-                if visited.insert(child.clone()) {
-                    stack.push((child.clone(), 0));
-                }
-            }
-            None => {
-                post.push(node);
-                stack.pop();
-            }
-        }
-    }
-    post.reverse();
-    post
-}
-
-/// Cooper-Harvey-Kennedy iterative immediate-dominators over reverse-postorder.
-///
-/// Exposed alongside [`reverse_postorder`] so [`super::loopforest`] can run it on
-/// the reverse CFG to obtain post-dominators.
-pub(super) fn compute_idom(
-    entry: &str,
-    predecessors: &HashMap<String, Vec<String>>,
-    rpo: &[String],
-    rpo_num: &HashMap<&str, usize>,
-) -> HashMap<String, String> {
-    let mut idom: HashMap<String, String> = HashMap::new();
-    idom.insert(entry.to_string(), entry.to_string());
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for node in rpo {
-            if node == entry {
-                continue;
-            }
-            let mut new_idom: Option<String> = None;
-            for pred in predecessors.get(node).into_iter().flatten() {
-                if !idom.contains_key(pred) {
-                    continue;
-                }
-                new_idom = Some(match new_idom.as_deref() {
-                    None => pred.clone(),
-                    Some(cur) => intersect(pred, cur, &idom, rpo_num),
-                });
-            }
-            if let Some(new_idom) = new_idom {
-                if idom.get(node) != Some(&new_idom) {
-                    idom.insert(node.clone(), new_idom);
-                    changed = true;
-                }
-            }
-        }
-    }
-    idom
-}
-
-/// Walk two finger up the dominator tree until they meet (CHK `intersect`).
-fn intersect(
-    a: &str,
-    b: &str,
-    idom: &HashMap<String, String>,
-    rpo_num: &HashMap<&str, usize>,
-) -> String {
-    let mut a = a;
-    let mut b = b;
-    let num = |s: &str| rpo_num.get(s).copied().unwrap_or(usize::MAX);
-    while a != b {
-        while num(a) > num(b) {
-            let Some(next) = idom.get(a).map(String::as_str) else {
-                break;
-            };
-            if next == a {
-                break;
-            }
-            a = next;
-        }
-        while num(b) > num(a) {
-            let Some(next) = idom.get(b).map(String::as_str) else {
-                break;
-            };
-            if next == b {
-                break;
-            }
-            b = next;
-        }
-        // Guard against a stuck pair (shouldn't happen for reducible idom).
-        if a != b && num(a) == num(b) {
-            break;
-        }
-    }
-    a.to_string()
 }
 
 /// Blocks reachable from `start` (inclusive) over the given forward-edge adjacency.
@@ -395,7 +286,8 @@ mod tests {
     /// Definitional dominance oracle: `d` dominates `n` iff every path from the
     /// entry to `n` passes through `d`. Equivalently (for `d != n`, `n` reachable),
     /// `n` is NOT reachable from the entry once `d` is deleted from the graph. This
-    /// is an independent check of the CHK implementation in [`Dominators`].
+    /// is an independent check of [`Dominators`], reached through a different route than the
+    /// dense-set oracle in [`crate::native::dominators`]: path reachability, not a fixpoint.
     fn oracle_dominates(cfg: &Cfg, dominator: &str, node: &str) -> bool {
         if dominator == node {
             return true;

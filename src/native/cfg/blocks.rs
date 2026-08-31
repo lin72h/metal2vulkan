@@ -806,7 +806,7 @@ pub(in crate::native) fn infer_loop_merges(blocks: &[BodyBlock]) -> HashMap<Stri
         }
     }
 
-    // Real dominator tree (CHK) over the source CFG's real-block edges — the single
+    // Real dominator tree over the source CFG's real-block edges — the single
     // dominance oracle, replacing the local path-DFS `dominates` this module used to carry.
     // `None` only when `blocks` is empty, in which case the loop below never runs.
     let doms = Cfg::from_blocks(blocks).map(|cfg| cfg.dominators());

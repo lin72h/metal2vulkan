@@ -9,11 +9,11 @@
 //! a previously observed module shape, where the inner loop's merge coincides with the outer loop's continue — see
 //! [[metal2vulkan-native-emitter]]).
 //!
-//! Dominators use the Cooper-Harvey-Kennedy iterative algorithm over reverse-postorder; natural
+//! Dominators come from [`crate::native::dominators`]; natural
 //! loops are the standard back-edge (`u -> v` where `v` dominates `u`) closure.
 
 use super::blocks::block_successors;
-use super::graph::{compute_idom, reverse_postorder, Cfg, Dominators};
+use super::graph::{Cfg, Dominators};
 use super::BodyBlock;
 use std::collections::{HashMap, HashSet};
 
@@ -502,28 +502,19 @@ fn post_idom_cut(blocks: &[BodyBlock], cut: &HashSet<(String, String)>) -> HashM
             .push(VIRTUAL_EXIT.to_string());
     }
 
-    // Reverse-postorder + predecessors of the reverse graph, then CHK dominators rooted at the
-    // virtual exit = post-dominators of the forward graph.
-    let rnames: HashSet<&str> = reachable
-        .iter()
-        .map(String::as_str)
-        .chain(std::iter::once(VIRTUAL_EXIT))
-        .collect();
-    let rpo = reverse_postorder(VIRTUAL_EXIT, &rsucc, &rnames);
-    let rpo_num: HashMap<&str, usize> = rpo
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.as_str(), i))
-        .collect();
-    let mut rpreds: HashMap<String, Vec<String>> = HashMap::new();
-    for (n, ts) in &rsucc {
-        for t in ts {
-            if rnames.contains(t.as_str()) {
-                rpreds.entry(t.clone()).or_default().push(n.clone());
-            }
-        }
-    }
-    let ridom = compute_idom(VIRTUAL_EXIT, &rpreds, &rpo, &rpo_num);
+    // Dominators of the reverse graph rooted at the virtual exit ARE the post-dominators of the
+    // forward graph, so this is the same computation the forward direction uses. Sorted rather than
+    // in `reachable`'s hash order so the dense numbering handed to it is deterministic.
+    let mut order = vec![VIRTUAL_EXIT.to_string()];
+    order.extend(
+        reachable
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+    );
+    let (ridom, _) = super::graph::named_dominators(&order, |name| {
+        rsucc.get(name).map(Vec::as_slice).unwrap_or(&[])
+    });
 
     ridom
         .into_iter()
