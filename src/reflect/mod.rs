@@ -71,6 +71,8 @@ mod footprint;
 /// v31 reports implicit imageblock render-target planes at every stage whose module carries the
 /// `air.load/store.implicit_imageblock.*` intrinsics, not only in kernels. The interface pass
 /// materializes the plane from the call, which is a property of the body rather than of the stage.
+/// Reflected translation also reports the buffer-address table the finished module declares instead
+/// of the one an AIR text scan predicted.
 pub const REFLECTION_VERSION: u32 = 31;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
@@ -1495,6 +1497,26 @@ fn implicit_imageblock_planes(
         .collect()
 }
 
+/// The `Binding` decoration on `variable`, if the module gives it one.
+fn descriptor_binding_of(module: &Module, variable: spirv::Word) -> Option<u32> {
+    module.annotations.iter().find_map(|annotation| {
+        match (
+            annotation.class.opcode,
+            annotation.operands.first(),
+            annotation.operands.get(1),
+            annotation.operands.get(2),
+        ) {
+            (
+                spirv::Op::Decorate,
+                Some(crate::spirv_module::Operand::IdRef(target)),
+                Some(crate::spirv_module::Operand::Decoration(spirv::Decoration::Binding)),
+                Some(crate::spirv_module::Operand::LiteralBit32(binding)),
+            ) if *target == variable => Some(*binding),
+            _ => None,
+        }
+    })
+}
+
 /// Consumer-shaped reflection of one translated shader.
 ///
 /// Interface declarations are built from parser-shaped AIR metadata and the translator's shared
@@ -1908,6 +1930,56 @@ impl ShaderReflection {
     /// Enrich descriptor-backed buffer bindings from the final constructed SPIR-V module.
     pub(crate) fn add_buffer_footprints(&mut self, module: &Module) -> Result<(), String> {
         footprint::attach_buffer_footprints(self, module)
+    }
+
+    /// Report the buffer-address tables the finished module actually declares, replacing whatever
+    /// `add_buffer_address_table` predicted.
+    ///
+    /// The table is a translator-owned descriptor: the emitter creates one when the constructed
+    /// pointer graph needs it. Reflection predicted that from a text scan of the AIR — an
+    /// `inttoptr`, or a `load ptr` through a device-address pointer — and two independent
+    /// derivations of one fact disagree. Measured over 2880 corpus sources: 13 modules declared a
+    /// table reflection omitted, and 26 reflected one the module never declared. The first
+    /// under-binds a consumer's descriptor set; the second demands a buffer nothing reads.
+    ///
+    /// The module is the fact. Callers that have one observe it here; `reflect_sanitized`, which
+    /// never builds a module, keeps the prediction and is documented as an approximation.
+    pub(crate) fn reconcile_buffer_address_table(&mut self, module: &Module) {
+        let mut declared = module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == spirv::Op::Variable)
+            .filter_map(|instruction| instruction.result_id)
+            .filter_map(|variable| descriptor_binding_of(module, variable))
+            .filter(|binding| self.descriptor_layout.synthetic.contains(*binding))
+            .collect::<Vec<_>>();
+        declared.sort_unstable();
+        declared.dedup();
+        self.bindings
+            .retain(|resource| resource.kind != ResourceKind::BufferAddressTable);
+        for (index, binding) in declared.into_iter().enumerate() {
+            self.bindings.push(ResourceBinding {
+                kind: ResourceKind::BufferAddressTable,
+                metal_index: index as u32,
+                descriptor: Some(DescriptorLocation {
+                    set: self.descriptor_layout.set,
+                    binding,
+                    count: 1,
+                }),
+                param_index: None,
+                stage_input_location: None,
+                address_space: None,
+                declared_size: None,
+                extent: None,
+                footprint: None,
+                type_layout: None,
+                type_name: None,
+                texture_shape: None,
+                embedded_source: None,
+                access: Some(ResourceAccess::ReadOnly),
+                static_sampler: None,
+            });
+        }
     }
 
     pub(crate) fn add_buffer_address_table(&mut self) -> Result<(), String> {

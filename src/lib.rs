@@ -571,6 +571,12 @@ pub fn translate_reflected_with_options(
 /// stage interface is fully described by AIR metadata even before indirect calls have been resolved
 /// to linked function definitions. The returned shape is identical to the reflection attached to a
 /// successful translated module.
+///
+/// One field is a prediction rather than an observation. Whether the emitter needs a buffer-address
+/// table is decided by the constructed pointer graph, and this path builds no module, so it is
+/// approximated from an AIR text scan (`has_device_address_pointer_load`). Measured over 2880
+/// corpus sources, that scan disagrees with what the emitter actually emits on 39 of them.
+/// `translate_sanitized_native_reflected` has a module and reads it instead.
 pub fn reflect_sanitized(
     san_ll: &str,
     stage: passes::Stage,
@@ -652,9 +658,6 @@ fn translate_sanitized_native_reflected_with_layout(
     reflection.function_constants = meta::parse_function_constants(san_ll);
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;
-    if stage == passes::Stage::Kernel && has_device_address_pointer_load(san_ll) {
-        reflection.add_buffer_address_table()?;
-    }
     reflection.validate_descriptor_abi()?;
     let finished = translate_sanitized_with_meta_prevalidated_carrier(
         san_ll,
@@ -667,7 +670,11 @@ fn translate_sanitized_native_reflected_with_layout(
         options,
         datalayout,
     )?;
+    // The emitter decides whether the constructed pointer graph needs an address table; reflection
+    // no longer predicts that from the AIR text when a module is in hand to be read.
+    reflection.reconcile_buffer_address_table(&finished.module);
     reflection.add_buffer_footprints(&finished.module)?;
+    reflection.validate_descriptor_abi()?;
     Ok((finished.bytes, reflection))
 }
 
