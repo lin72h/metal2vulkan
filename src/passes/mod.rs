@@ -2662,6 +2662,9 @@ pub(crate) fn transform_with_options_and_sidecar(
     // sealing synthesized before global liveness runs.
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
+    // `air.get_read_sampler()` needed a real sampler descriptor to type its result; if nothing ever
+    // consumed that value, retract the synthesis before liveness runs so the descriptor goes too.
+    stage_input::drop_unconsumed_default_sampler_loads(&mut ctx);
     // The closures above are the last of this boundary's instruction changes, and any of them can
     // delete a variable's last use. Re-establish global liveness against the finished bodies before
     // the collection that would otherwise root a stranded variable at its own interface entry.

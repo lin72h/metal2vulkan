@@ -368,6 +368,43 @@ fn decorate_layout_recursive(ctx: &mut Ctx, ty: Word, defs: &HashMap<Word, Instr
     }
 }
 
+/// Retire the synthesized default read sampler when nothing consumed the value it was created to
+/// type.
+///
+/// `Ctx::default_read_sampler` materializes one `OpTypeSampler` descriptor so that
+/// `air.get_read_sampler()` has a well-typed result: Metal's `texture.read(coord)` is sampler-less,
+/// AIR threads a sampler pointer into the read intrinsic anyway, and `lower_read` discards it. When
+/// every load of that variable feeds nothing, the descriptor is a demand on the consumer for a
+/// sampler the shader never samples with — and reflection cannot report it, because no Metal
+/// argument corresponds to it, so a consumer building its layout from `ShaderReflection` omits the
+/// binding the module declares.
+///
+/// This is not general dead-code elimination, which this pipeline deliberately does not do: it
+/// retracts one descriptor the translator itself synthesized, and only where the synthesis turned
+/// out to be unnecessary. A load whose result IS consumed keeps the sampler. Dropping the loads is
+/// enough — `drop_unreferenced_global_variables` then removes the variable, its decorations, and its
+/// entry-point interface entry.
+pub(in crate::passes) fn drop_unconsumed_default_sampler_loads(ctx: &mut Ctx) {
+    let Some(sampler) = ctx.default_sampler_var else {
+        return;
+    };
+    let referenced = crate::passes::module_cleanup::function_referenced_ids(&ctx.module);
+    let unconsumed_load = |instruction: &Instruction| {
+        instruction.class.opcode == Op::Load
+            && instruction.operands.first() == Some(&Operand::IdRef(sampler))
+            && instruction
+                .result_id
+                .is_some_and(|id| !referenced.contains(&id))
+    };
+    for function in &mut ctx.module.functions {
+        for block in &mut function.blocks {
+            block
+                .instructions
+                .retain(|instruction| !unconsumed_load(instruction));
+        }
+    }
+}
+
 pub(in crate::passes) fn layout_ty_size_align(
     ctx: &Ctx,
     ty: Word,
