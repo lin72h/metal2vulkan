@@ -8,6 +8,13 @@
 //!
 //! Covers known-unsupported classes: `air.intersect.*` raytracing, `llvm.agx3.*` emask
 //! intrinsics, texture atomics — plus structural malformations (no definitions, truncated).
+//!
+//! Two of these are the classes that actually turn up. Measured over a 2880-source local corpus
+//! sample, 204 sources do not translate, and 191 of them are one of two shapes: a call through a
+//! Metal visible function table, or an intersection whose custom intersection functions come from a
+//! function buffer. Both are function pointers, which Logical SPIR-V has none of — no lowering is
+//! coming, so what matters is that the rejection stays a rejection. Each is pinned below on the
+//! exact diagnostic those corpus sources produce.
 
 use metal2vulkan::passes::Stage;
 use metal2vulkan::translate_sanitized_native;
@@ -69,6 +76,11 @@ fn kernel_with(op: &str) -> String {
     format!("{HEAD}{op}{TAIL}")
 }
 
+/// As [`kernel_with`], for a construct that also needs its callee declared.
+fn kernel_with_declarations(op: &str, declarations: &str) -> String {
+    format!("{HEAD}{op}{TAIL}{declarations}")
+}
+
 /// Sanity anchor: the base kernel (op = a plain add) DOES translate, so each negative below is
 /// attributable to its injected construct rather than a broken template.
 #[test]
@@ -98,6 +110,52 @@ fn texture_atomic_fallbacks() {
         "  %r = call i32 @air.atomic_fetch_add.explicit.texture.2d.i32(i32 %a0, i32 %a0)\n",
     );
     assert_fallback(&ll, "@air.atomic_fetch_add.explicit.texture");
+}
+
+/// A call through a Metal visible function table: the callee is an SSA value, not a symbol.
+///
+/// The largest unsupported class in the corpus sample, 136 sources of the 204. Logical SPIR-V has no
+/// function pointers, so this cannot become a lowering; it can only become a wrong one. The
+/// diagnostic names the pointer so the author can find the call.
+#[test]
+fn visible_function_table_call_fallbacks() {
+    let ll = kernel_with_declarations(
+        "  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %out, i32 0)\n\
+         \x20 %r = call i32 %fp(ptr addrspace(2) %in)\n",
+        "declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)\n",
+    );
+    assert_fallback(
+        &ll,
+        "unsupported indirect call through function pointer %fp",
+    );
+}
+
+/// An intersection whose intersection functions come from a function buffer.
+///
+/// The second largest class, about 55 sources. `air.intersect.*` with a null function table lowers
+/// (`ray_intersection.rs`); the `intersection_function_buffer` variant is a dispatch through custom
+/// intersection functions, so it is the same function-pointer wall as the case above wearing a
+/// raytracing hat. The tag suffix is one of a combinatorial family -- `instancing`, `triangle_data`,
+/// `world_space_data`, `user_data`, `primitive_motion`, `instance_motion`,
+/// `multi_level_instancing` -- and the rejection is on the `intersection_function_buffer` stem, not
+/// on any one combination, which is why one of them stands for all of them here.
+#[test]
+fn intersection_function_buffer_fallbacks() {
+    let signature = "{ i32, float, i32, i32, ptr addrspace(1), <2 x float>, i1 }";
+    let ll = kernel_with_declarations(
+        &format!(
+            "  %hit = call {signature} @air.intersect.intersection_function_buffer.triangle_data(\
+             <3 x float> zeroinitializer, <3 x float> zeroinitializer, float 0.0, float 1.0, \
+             ptr addrspace(1) %out, ptr addrspace(1) %out, i64 0, i64 1, ptr null, i64 0, i32 0, \
+             i32 0, i32 0, i32 0, i32 0, i32 0, i32 0, i32 -1, i32 -1, i32 0, i1 false, i1 false)\n\
+             \x20 %r = extractvalue {signature} %hit, 0\n"
+        ),
+        "declare { i32, float, i32, i32, ptr addrspace(1), <2 x float>, i1 } \
+         @air.intersect.intersection_function_buffer.triangle_data(<3 x float>, <3 x float>, float, \
+         float, ptr addrspace(1), ptr addrspace(1), i64, i64, ptr, i64, i32, i32, i32, i32, i32, \
+         i32, i32, i32, i32, i32, i1, i1)\n",
+    );
+    assert_fallback(&ll, "air.intersect.intersection_function_buffer");
 }
 
 #[test]
