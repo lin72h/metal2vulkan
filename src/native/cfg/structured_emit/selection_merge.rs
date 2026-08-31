@@ -578,14 +578,8 @@ pub(in crate::native) fn synth_unique_selection_merge(
     natural: &str,
     counter: &mut usize,
 ) -> Option<String> {
-    let preds: HashSet<String> = blocks
-        .iter()
-        .filter(|b| {
-            b.role != BlockRole::ConstructTreeRoute
-                && block_successors(b).iter().any(|s| s == natural)
-                && forest.dominates(header, &b.name)
-        })
-        .map(|b| b.name.clone())
+    let preds: HashSet<String> = header_owned_merge_predecessors(blocks, forest, header, natural)
+        .into_iter()
         .collect();
     if preds.is_empty() {
         return None;
@@ -627,16 +621,36 @@ pub(in crate::native) fn synth_unique_selection_merge_phi(
     natural: &str,
     counter: &mut usize,
 ) -> Option<String> {
-    let preds = blocks
-        .iter()
-        .filter(|b| {
-            b.role != BlockRole::ConstructTreeRoute
-                && block_successors(b).iter().any(|s| s == natural)
-                && forest.dominates(header, &b.name)
-        })
-        .map(|b| b.name.clone())
-        .collect::<Vec<_>>();
+    let preds = header_owned_merge_predecessors(blocks, forest, header, natural);
     synth_unique_selection_merge_phi_explicit(blocks, &preds, natural, &HashSet::new(), counter)
+}
+
+/// The predecessors of `natural` that a selection headed by `header` owns, in block order.
+///
+/// One rule, in one place, because it is also the answer to "which edges did that split carry?" --
+/// a caller keeping an incremental dominance relation across splits
+/// ([`crate::native::cfg::graph::Dominators::record_pass_through`]) has to record exactly this set,
+/// and a second copy of the rule would be a second thing to keep in step.
+///
+/// Construct-tree gateways are excluded: a route block stands for control that entered the region
+/// from outside, so redirecting it would move edges the header does not own.
+pub(in crate::native) fn header_owned_merge_predecessors(
+    blocks: &[BodyBlock],
+    forest: &LoopForest,
+    header: &str,
+    natural: &str,
+) -> Vec<String> {
+    blocks
+        .iter()
+        .filter(|block| {
+            block.role != BlockRole::ConstructTreeRoute
+                && block_successors(block)
+                    .iter()
+                    .any(|target| target == natural)
+                && forest.dominates(header, &block.name)
+        })
+        .map(|block| block.name.clone())
+        .collect()
 }
 
 /// Phi-aware unique-merge synthesis over an explicit set of owned predecessors.

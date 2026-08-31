@@ -49,6 +49,16 @@ impl LoopForest {
         self.doms.dominates(dominator, node)
     }
 
+    /// Record a pass-through spliced in front of one of this CFG's blocks.
+    ///
+    /// Forwards to [`Dominators::record_pass_through`]; see there for why a recorded split is exact
+    /// and what re-deriving instead costs. Only dominance is updated -- an acyclic pass-through in
+    /// front of an existing block leaves every back edge, natural-loop body and nesting relation
+    /// exactly as it was, so the loops this forest already holds stay correct.
+    pub(in crate::native) fn record_pass_through(&mut self, name: &str, predecessors: &[String]) {
+        self.doms.record_pass_through(name, predecessors);
+    }
+
     /// The natural loop headed by `header`, if any.
     pub(in crate::native) fn loop_for_header(&self, header: &str) -> Option<&NaturalLoop> {
         self.loops.iter().find(|l| l.header == header)

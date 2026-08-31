@@ -30,10 +30,9 @@
 use super::blocks::{
     block_successors, conditional_branch_targets, index_branch_merges_by_header, synthetic_block,
 };
-use super::graph::PassThroughDominance;
+use super::graph::block_dominators;
 use super::loopforest::{
-    analyze, analyze_reusing_natural_loops, break_aware_selection_merges, selection_merges,
-    LoopForest, Restructure,
+    analyze, break_aware_selection_merges, selection_merges, LoopForest, Restructure,
 };
 use super::structured_order::{structured_order, structured_order_terminal};
 // Re-bind the sibling module names so the responsibility bands can reach them via `super::`

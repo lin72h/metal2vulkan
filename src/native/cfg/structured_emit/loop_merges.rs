@@ -1166,7 +1166,7 @@ pub(in crate::native) fn privatize_reused_emitted_merge_targets(
         .collect::<Vec<_>>();
     // Every question this pass asks the graph is a dominance question, so it asks for dominance and
     // not for the natural-loop forest built around it.
-    let mut dominance = PassThroughDominance::of_blocks(blocks);
+    let mut dominance = block_dominators(blocks);
     let mut shared = claims
         .into_iter()
         .filter(|claim| {
@@ -2217,6 +2217,14 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
                 } else {
                     &cur_forest
                 };
+                // Which edges the split below will carry, read before it moves them. Only the
+                // `!construct_tree_owned` arm records into `cur_forest`; the construct-tree arm
+                // deliberately keeps deciding ownership from the immutable source forest.
+                let carried = if construct_tree_owned {
+                    Vec::new()
+                } else {
+                    header_owned_merge_predecessors(&out, synthesis_forest, &b.name, &exit_target)
+                };
                 let synth = if block_has_phi(&out, &exit_target) {
                     synth_unique_selection_merge_phi(
                         &mut out,
@@ -2251,7 +2259,7 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
                             &mut counter,
                         );
                     } else {
-                        cur_forest = analyze_reusing_natural_loops(&out, &forest.loops);
+                        cur_forest.record_pass_through(&merge, &carried);
                         if !loop_exit_selection {
                             let current =
                                 out.iter().find(|block| block.name == b.name).unwrap_or(b);
@@ -2348,6 +2356,12 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
             } else {
                 HashSet::new()
             };
+            // As above: read before the split moves them, and only for the arms that record.
+            let carried = if construct_tree_owned {
+                Vec::new()
+            } else {
+                header_owned_merge_predecessors(&out, &cur_forest, &b.name, &natural)
+            };
             let synth = if natural_has_phi {
                 if construct_tree_owned && !explicit_no_phi_preds.is_empty() {
                     synth_unique_selection_merge_phi_explicit(
@@ -2402,11 +2416,12 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
                         stopped_for_growth = true;
                     } else if !construct_tree_owned {
                         // A unique-selection merge only splits forward edges with an acyclic
-                        // pass-through. Natural loops and their nesting are unchanged; recomputing
-                        // every loop body after each of hundreds of nested selection splits made
-                        // large generated CFGs revisit the whole graph quadratically. Refresh only
-                        // dominance for the newly inserted block and retain the proven loop forest.
-                        cur_forest = analyze_reusing_natural_loops(&out, &forest.loops);
+                        // pass-through. Natural loops and their nesting are unchanged, and so is
+                        // dominance among the blocks that were already there -- so record the one
+                        // block it added rather than re-deriving the relation. Re-deriving here made
+                        // large generated CFGs revisit the whole graph once per split: it was 55% of
+                        // every CFG rebuild the slowest corpus source performed.
+                        cur_forest.record_pass_through(&s, &carried);
                     }
                     if construct_tree_owned && !propagated_origins.is_empty() {
                         for target in &headers {

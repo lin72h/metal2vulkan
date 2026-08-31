@@ -7,6 +7,7 @@ use crate::spirv_module::{load_bytes, Module};
 use spirv::{Decoration, Op, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
+mod bounded_work;
 mod buffers;
 mod control_flow;
 mod interface;
