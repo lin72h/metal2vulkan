@@ -86,7 +86,7 @@ const GROUPS: usize = 6;
 
 /// The most source CFGs this kernel may be worth.
 ///
-/// Measured at 871. Restoring the structurizer's per-split re-derivation puts it at 2209; this sits
+/// Measured at 867. Restoring the structurizer's per-split re-derivation puts it at 2209; this sits
 /// between them with room on both sides. The count is deterministic -- the same six numbers come back on every
 /// run -- so a failure here is a real change in how much whole-function analysis a translation does,
 /// not noise. That is a decision worth making deliberately: raising this bound is fine when a new
