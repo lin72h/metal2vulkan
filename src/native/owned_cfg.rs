@@ -2940,6 +2940,29 @@ struct OwnedAccessChainFailure {
     raw_buffer_eligible: bool,
 }
 
+/// One type id rendered the way its declaration reads: `%14 (OpTypePointer StorageBuffer %12)`.
+///
+/// A contract message that names only the id makes the reader open a disassembly to learn anything;
+/// naming the declaration makes the diagnosis fit in the message. Operand kinds that do not survive
+/// as a short literal are dropped rather than debug-printed, so the rendering stays one line.
+fn describe_owned_type(ty: Word, definitions: &HashMap<Word, &Instruction>) -> String {
+    let Some(definition) = definitions.get(&ty) else {
+        return format!("%{ty} (undeclared)");
+    };
+    let mut text = format!("%{ty} ({:?}", definition.class.opcode);
+    for operand in &definition.operands {
+        match operand {
+            Operand::IdRef(id) => text.push_str(&format!(" %{id}")),
+            Operand::LiteralBit32(value) => text.push_str(&format!(" {value}")),
+            Operand::StorageClass(storage) => text.push_str(&format!(" {storage:?}")),
+            Operand::Dim(dim) => text.push_str(&format!(" {dim:?}")),
+            _ => {}
+        }
+    }
+    text.push(')');
+    text
+}
+
 fn owned_access_chain_error(
     instruction: &Instruction,
     definitions: &HashMap<Word, &Instruction>,
@@ -2991,55 +3014,148 @@ fn owned_access_chain_error(
         };
         value_types.get(id).copied()
     };
-    let selected = base_pointer.and_then(|(_, mut selected)| {
-        for index in instruction.operands.get(first_index..)? {
-            let index_ty = index_type(index)?;
+    let walk_index_path = |base_pointee: Word| -> Result<Word, String> {
+        let mut selected = base_pointee;
+        let indices = instruction
+            .operands
+            .get(first_index..)
+            .map(<[Operand]>::iter)
+            .into_iter()
+            .flatten();
+        for (position, index) in indices.enumerate() {
+            let Some(index_ty) = index_type(index) else {
+                return Err(format!("index {position} is not an id operand"));
+            };
             if !matches!(
                 numeric_type_shape(index_ty, definitions),
                 Some((Op::TypeInt, _, 1))
             ) {
-                return None;
+                return Err(format!(
+                    "index {position} has type {}, which is not a scalar integer",
+                    describe_owned_type(index_ty, definitions)
+                ));
             }
-            let definition = definitions.get(&selected)?;
+            let Some(definition) = definitions.get(&selected) else {
+                return Err(format!(
+                    "index {position} descends into %{selected}, which this module never declares"
+                ));
+            };
             selected = match definition.class.opcode {
                 Op::TypeStruct => {
                     let Operand::IdRef(index) = index else {
-                        return None;
+                        return Err(format!("index {position} is not an id operand"));
                     };
-                    let member = owned_constant_u32(*index, definitions, value_types)?;
-                    let Operand::IdRef(member_type) = definition.operands.get(member as usize)?
+                    let Some(member) = owned_constant_u32(*index, definitions, value_types) else {
+                        return Err(format!(
+                            "index {position} into {} is %{index}, and a struct member index must \
+                             be an OpConstant of 32-bit integer type",
+                            describe_owned_type(selected, definitions)
+                        ));
+                    };
+                    let Some(Operand::IdRef(member_type)) =
+                        definition.operands.get(member as usize)
                     else {
-                        return None;
+                        return Err(format!(
+                            "index {position} selects member {member} of {}, which has {} members",
+                            describe_owned_type(selected, definitions),
+                            definition.operands.len()
+                        ));
                     };
                     *member_type
                 }
                 Op::TypeArray | Op::TypeRuntimeArray => {
-                    let Operand::IdRef(element) = definition.operands.first()? else {
-                        return None;
+                    let Some(Operand::IdRef(element)) = definition.operands.first() else {
+                        return Err(format!(
+                            "index {position} descends into {}, which declares no element type",
+                            describe_owned_type(selected, definitions)
+                        ));
                     };
                     *element
                 }
-                Op::TypeVector => vector_type_shape(selected, definitions)?.0,
+                Op::TypeVector => match vector_type_shape(selected, definitions) {
+                    Some((component, _)) => component,
+                    None => {
+                        return Err(format!(
+                            "index {position} descends into {}, which declares no component type",
+                            describe_owned_type(selected, definitions)
+                        ))
+                    }
+                },
                 Op::TypeMatrix => {
-                    let Operand::IdRef(column) = definition.operands.first()? else {
-                        return None;
+                    let Some(Operand::IdRef(column)) = definition.operands.first() else {
+                        return Err(format!(
+                            "index {position} descends into {}, which declares no column type",
+                            describe_owned_type(selected, definitions)
+                        ));
                     };
                     *column
                 }
-                _ => return None,
+                _ => {
+                    return Err(format!(
+                        "index {position} descends into {}, which is not a composite type",
+                        describe_owned_type(selected, definitions)
+                    ))
+                }
             };
         }
-        Some(selected)
-    });
-    let valid = element_valid
-        && matches!(
-            (base_pointer, result_pointer, selected),
-            (Some((base_storage, _)), Some((result_storage, result_pointee)), Some(selected))
-                if base_storage == result_storage && result_pointee == selected
-        );
-    (!valid).then(|| OwnedAccessChainFailure {
+        Ok(selected)
+    };
+
+    // Report the FIRST clause that fails, in the order the contract reads. The accept/reject verdict
+    // is the conjunction of all of them, so which one is named cannot change it — but it is the whole
+    // difference between a triage bucket and a diagnosis. The dominant corpus failure in this class
+    // is a 64-bit device address used as a base, which is a "base is not a pointer" fact wanting
+    // `OpConvertUToPtr`, and reads nothing like the index-path or result-pointee clauses it used to
+    // be reported alongside.
+    let reason = (|| {
+        let Some((base_storage, base_pointee)) = base_pointer else {
+            return Some(match value_types.get(base) {
+                Some(&base_ty) => format!(
+                    "base %{base} has type {}, which is not a pointer type",
+                    describe_owned_type(base_ty, definitions)
+                ),
+                None => format!("base %{base} has no type in this module"),
+            });
+        };
+        let Some((result_storage, result_pointee)) = result_pointer else {
+            return Some(match instruction.result_type {
+                Some(result_ty) => format!(
+                    "result type {} is not a pointer type",
+                    describe_owned_type(result_ty, definitions)
+                ),
+                None => "the instruction has no result type".to_string(),
+            });
+        };
+        if !element_valid {
+            return Some(match instruction.operands.get(1).and_then(index_type) {
+                Some(element_ty) => format!(
+                    "the element operand has type {}, which is not a scalar integer",
+                    describe_owned_type(element_ty, definitions)
+                ),
+                None => "the element operand is not a value with a type in this module".to_string(),
+            });
+        }
+        let selected = match walk_index_path(base_pointee) {
+            Ok(selected) => selected,
+            Err(reason) => return Some(reason),
+        };
+        if base_storage != result_storage {
+            return Some(format!(
+                "base %{base} is in storage class {base_storage:?} but the result pointer is in \
+                 {result_storage:?}"
+            ));
+        }
+        (result_pointee != selected).then(|| {
+            format!(
+                "the index path selects {}, but the result pointer points to {}",
+                describe_owned_type(selected, definitions),
+                describe_owned_type(result_pointee, definitions)
+            )
+        })
+    })();
+    reason.map(|reason| OwnedAccessChainFailure {
         error: format!(
-            "native emitter: owned {:?} violates its pointer storage, index path, or result-pointee contract",
+            "native emitter: owned {:?} violates its access-chain contract: {reason}",
             instruction.class.opcode
         ),
         raw_buffer_eligible: base_pointer.is_some_and(|(storage, _)| {
@@ -7761,25 +7877,68 @@ mod tests {
             );
         }
 
-        for instruction in [
-            chain(Op::AccessChain, 14, 13, &[13]),
-            chain(Op::AccessChain, 12, 37, &[13]),
-            chain(Op::AccessChain, 50, 37, &[13]),
-            chain(Op::AccessChain, 41, 37, &[13]),
-            chain(Op::AccessChain, 14, 37, &[23]),
-            chain(Op::AccessChain, 14, 37, &[21]),
-            chain(Op::AccessChain, 14, 39, &[46]),
-            chain(Op::AccessChain, 14, 39, &[19]),
-            chain(Op::AccessChain, 14, 37, &[13, 13]),
-            ptr_chain(Op::PtrAccessChain, 36, 37, 23, &[]),
-            ptr_chain(Op::PtrAccessChain, 41, 37, 46, &[46]),
-            ptr_chain(Op::InBoundsPtrAccessChain, 41, 37, 46, &[46]),
+        // Every rejection is paired with the clause it must be rejected FOR. A blanket "this was
+        // rejected" assertion passes just as happily when a case trips some unrelated clause by
+        // accident, which would leave a real hole in the contract covered by a green test.
+        for (instruction, reason) in [
+            (
+                chain(Op::AccessChain, 14, 13, &[13]),
+                "base %13 has type %12 (TypeInt 32 0), which is not a pointer type",
+            ),
+            (
+                chain(Op::AccessChain, 12, 37, &[13]),
+                "result type %12 (TypeInt 32 0) is not a pointer type",
+            ),
+            (
+                chain(Op::AccessChain, 50, 37, &[13]),
+                "base %37 is in storage class Function but the result pointer is in Private",
+            ),
+            (
+                chain(Op::AccessChain, 41, 37, &[13]),
+                "the index path selects %12 (TypeInt 32 0), but the result pointer points to \
+                 %15 (TypeFloat 32)",
+            ),
+            (
+                chain(Op::AccessChain, 14, 37, &[23]),
+                "index 0 has type %15 (TypeFloat 32), which is not a scalar integer",
+            ),
+            (
+                chain(Op::AccessChain, 14, 37, &[21]),
+                "index 0 has type %16 (TypeVector %12 2), which is not a scalar integer",
+            ),
+            (
+                chain(Op::AccessChain, 14, 39, &[46]),
+                "index 0 into %18 (TypeStruct %12 %15) is %46, and a struct member index must be \
+                 an OpConstant of 32-bit integer type",
+            ),
+            (
+                chain(Op::AccessChain, 14, 39, &[19]),
+                "index 0 selects member 2 of %18 (TypeStruct %12 %15), which has 2 members",
+            ),
+            (
+                chain(Op::AccessChain, 14, 37, &[13, 13]),
+                "index 1 descends into %12 (TypeInt 32 0), which is not a composite type",
+            ),
+            (
+                ptr_chain(Op::PtrAccessChain, 36, 37, 23, &[]),
+                "the element operand has type %15 (TypeFloat 32), which is not a scalar integer",
+            ),
+            (
+                ptr_chain(Op::PtrAccessChain, 41, 37, 46, &[46]),
+                "the index path selects %12 (TypeInt 32 0), but the result pointer points to \
+                 %15 (TypeFloat 32)",
+            ),
+            (
+                ptr_chain(Op::InBoundsPtrAccessChain, 41, 37, 46, &[46]),
+                "the index path selects %12 (TypeInt 32 0), but the result pointer points to \
+                 %15 (TypeFloat 32)",
+            ),
         ] {
             let opcode = instruction.class.opcode;
             assert_owned_type_construction(
                 &module_with_access_chain_instruction(instruction),
                 &format!(
-                    "native emitter: owned {opcode:?} violates its pointer storage, index path, or result-pointee contract"
+                    "native emitter: owned {opcode:?} violates its access-chain contract: {reason}"
                 ),
             );
         }
@@ -7799,7 +7958,8 @@ mod tests {
         let invalid = module_with_access_chain_instruction(chain(41));
         assert_owned_type_construction(
             &invalid,
-            "native emitter: owned AccessChain violates its pointer storage, index path, or result-pointee contract",
+            "native emitter: owned AccessChain violates its access-chain contract: the index path \
+             selects %12 (TypeInt 32 0), but the result pointer points to %15 (TypeFloat 32)",
         );
         let tmp = std::env::temp_dir().join(format!(
             "metal2vulkan_owned_access_chain_contract_{}",
