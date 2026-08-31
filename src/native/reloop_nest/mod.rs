@@ -375,6 +375,58 @@ mod tests {
         assert!(asm.contains("OpIAdd"), "{asm}");
     }
 
+    /// `while (c) { if (d) { p(); if (e) break; } q(); }` — the break leaves a selection AND the
+    /// loop on one edge, which SPIR-V cannot express as a single branch.
+    const NESTED_BREAK: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+     %uint_3 = OpConstant %uint 3
+     %uint_8 = OpConstant %uint 8
+     %fnvoid = OpTypeFunction %void
+       %main = OpFunction %void None %fnvoid
+      %entry = OpLabel
+               OpBranch %header
+     %header = OpLabel
+          %i = OpPhi %uint %uint_0 %entry %next %latch
+          %c = OpULessThan %bool %i %uint_8
+               OpBranchConditional %c %body %exit
+       %body = OpLabel
+          %d = OpIEqual %bool %i %uint_1
+               OpBranchConditional %d %then %q
+       %then = OpLabel
+          %p = OpIMul %uint %i %uint_3
+          %e = OpIEqual %bool %p %uint_3
+               OpBranchConditional %e %exit %q
+          %q = OpLabel
+               OpBranch %latch
+      %latch = OpLabel
+       %next = OpIAdd %uint %i %uint_1
+               OpBranch %header
+       %exit = OpLabel
+               OpReturn
+               OpFunctionEnd
+"#;
+
+    #[test]
+    fn a_break_leaving_two_constructs_is_staged_and_validates() {
+        let Some(spv) = assemble(NESTED_BREAK) else {
+            return;
+        };
+        let nested = nested_bytes(&spv).expect("reducible control flow is nested");
+        assert!(validates(&nested));
+        let asm = disassemble(&nested);
+        assert!(asm.contains("OpLoopMerge"), "{asm}");
+        // The loop is a real loop, not a case of a whole-function dispatch.
+        assert_eq!(asm.matches("OpLoopMerge").count(), 1, "{asm}");
+    }
+
     #[test]
     fn irreducible_control_flow_is_declined() {
         let irreducible = r#"

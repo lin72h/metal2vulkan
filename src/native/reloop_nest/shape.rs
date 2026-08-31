@@ -189,6 +189,9 @@ pub(super) enum Shape {
     /// arms share follows in `next`.
     Multiple {
         id: usize,
+        /// The labels control can arrive at, which is not the arm list: an entry whose region is
+        /// shared with another entry owns no arm and is reached through `next`.
+        entries: BTreeSet<Label>,
         handled: Vec<(Label, Shape)>,
         next: Option<Box<Shape>>,
     },
@@ -201,22 +204,13 @@ impl Shape {
         }
     }
 
-    /// The labels this shape can be entered at. A branch whose target is in this set is a branch
-    /// *into* the shape rather than past it.
+    /// Exactly the labels control can arrive at from outside this shape. A branch whose target is
+    /// in this set enters the shape; anything else passes it by, which is what tells the emitter a
+    /// branch has to leave more than one construct.
     pub(super) fn entry_labels(&self) -> BTreeSet<Label> {
         match self {
             Shape::Simple { label, .. } => BTreeSet::from([*label]),
-            Shape::Loop { entries, .. } => entries.clone(),
-            Shape::Multiple { handled, next, .. } => {
-                let mut labels = handled
-                    .iter()
-                    .map(|(label, _)| *label)
-                    .collect::<BTreeSet<_>>();
-                if let Some(next) = next {
-                    labels.extend(next.entry_labels());
-                }
-                labels
-            }
+            Shape::Loop { entries, .. } | Shape::Multiple { entries, .. } => entries.clone(),
         }
     }
 }
@@ -331,15 +325,18 @@ fn make_loop(
         cut.remove(&edge);
     }
     let next = calculate_region(graph, blocks, next_entries, cut, counter);
+    // A loop body always covers at least its entries, so the recursion cannot decline; the empty
+    // dispatch is an unconstructible placeholder the emitter rejects rather than a real shape.
+    let inner = body.unwrap_or_else(|| Shape::Multiple {
+        id: fresh(counter),
+        entries: entries.clone(),
+        handled: Vec::new(),
+        next: None,
+    });
     Shape::Loop {
         id,
         entries,
-        // A loop body always covers at least its entries, so the recursion cannot decline.
-        inner: Box::new(body.unwrap_or(Shape::Multiple {
-            id: fresh(counter),
-            handled: Vec::new(),
-            next: None,
-        })),
+        inner: Box::new(inner),
         next: next.map(Box::new),
     }
 }
@@ -386,6 +383,7 @@ fn make_multiple(
     let next = calculate_region(graph, blocks, next_entries, cut, counter);
     Shape::Multiple {
         id,
+        entries,
         handled,
         next: next.map(Box::new),
     }
