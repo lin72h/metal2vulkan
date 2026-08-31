@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `validate_descriptor_abi` rejects a reported member layout that reaches past the argument holding
+  it. AIR states an argument's size and its member layout as two independent facts and reflection
+  reconstructs them independently, so a layout that over-runs means some member's storage was
+  mistaken and every member after it names an offset the shader never reads. Nothing else catches
+  it: a consumer packs its upload at those offsets, and a buffer whose reconstruction is that far
+  off is emitted as raw bytes with no struct type to compare against. Reaching short stays valid,
+  since the declared size is a `sizeof` and carries tail padding -- 1340 of the corpus's reported
+  layouts legitimately stop short, and none over-run.
 - A texture AIR declares write-capable binds as a storage image even when the shader body only
   queries its size. The binding class came from what the body did, and a size query counted as a
   sampled-image use, so such a texture bound in the sampled-texture band while reflection reported

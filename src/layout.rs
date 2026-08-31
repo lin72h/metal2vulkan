@@ -265,6 +265,34 @@ pub(super) fn air_metadata_size_align(
     }
 }
 
+/// How far a decoded AIR aggregate reaches: byte zero to the last byte any member touches, with no
+/// tail padding.
+///
+/// This is the quantity comparable to `air.arg_type_size`, which is the argument's `sizeof` and so
+/// always at least as large. [`air_metadata_size_align`] answers a different question -- the stride
+/// a pointee type needs -- and rounds accordingly, which makes it unusable as a bound: over 2880
+/// corpus sources it exceeds the declared argument size for 96 buffers whose layout is correct.
+///
+/// An array strides by its element's *declared* size, not a recomputed one, because that is what
+/// AIR states: a member tuple carries the per-element size beside the array length, and the
+/// corpus bears it out exactly (`i32 8192, i32 2, i32 4096, !"half"` -- 4096 halves at stride two
+/// starting where the previous 4096 ended). Recomputing it inflates a `packed_half3` element from
+/// six bytes to eight, since [`memcpy_size_align`] floors array alignment at four.
+///
+/// Overlap is normal here and needs no special case: AIR describes unions by giving two members
+/// the same offset, so the reach is a maximum rather than a sum.
+pub(crate) fn air_metadata_extent(ty: &AirType) -> Option<u64> {
+    match ty {
+        AirType::Struct(members) => members
+            .iter()
+            .map(|member| u64::from(member.offset).checked_add(air_metadata_extent(&member.ty)?))
+            .try_fold(0, |reach, end| Some(reach.max(end?))),
+        AirType::Array { elem, len } => air_metadata_extent(elem)?.checked_mul(u64::from(*len)),
+        _ => memcpy_size_align(&ll_type_from_air_type(ty), &|ty| ty.clone(), None)
+            .map(|(size, _align)| size),
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct SpirvLayout<'a> {
     offsets: Option<&'a HashMap<Word, Vec<u32>>>,
@@ -449,6 +477,50 @@ pub(crate) fn round_up_u32(value: u32, align: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two rules `air_metadata_extent` states that `air_metadata_size_align` does not: an array
+    /// strides by its element's tight size, and overlapping members reach rather than accumulate.
+    #[test]
+    fn air_metadata_extent_strides_arrays_tightly_and_takes_the_furthest_reach() {
+        use crate::meta::{AirMember, AirScalar};
+
+        // `packed_half3[3]` is 18 bytes. The stride rule that floors array alignment at four --
+        // what `air_metadata_size_align` applies -- would report 24 and put the argument over.
+        let packed = AirType::Array {
+            elem: Box::new(AirType::PackedVec {
+                scalar: AirScalar::Half,
+                lanes: 3,
+            }),
+            len: 3,
+        };
+        assert_eq!(air_metadata_extent(&packed), Some(18));
+        assert_eq!(
+            air_metadata_size_align(&packed, &|ty| ty.clone(), None),
+            Some((24, 4)),
+        );
+
+        // AIR spells a union by giving two members one offset. The struct reaches as far as its
+        // furthest member ends, not as far as their sizes add up to, and the last member declared
+        // need not be the furthest.
+        let union = AirType::Struct(vec![
+            AirMember {
+                offset: 0,
+                ty: AirType::Scalar(AirScalar::UInt),
+            },
+            AirMember {
+                offset: 4,
+                ty: AirType::Scalar(AirScalar::UShort),
+            },
+            AirMember {
+                offset: 4,
+                ty: AirType::Scalar(AirScalar::UChar),
+            },
+        ]);
+        assert_eq!(air_metadata_extent(&union), Some(6));
+
+        // A struct with no members reaches nowhere rather than failing.
+        assert_eq!(air_metadata_extent(&AirType::Struct(vec![])), Some(0));
+    }
 
     #[test]
     fn air_datalayout_parses_vector_abi_overrides_and_rejects_partial_bytes() {

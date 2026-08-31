@@ -265,3 +265,55 @@ fn a_reported_layout_reaches_exactly_as_far_as_the_argument_it_describes() {
         );
     }
 }
+
+/// The gate itself: an over-running layout must be a translation error, not a number a consumer has
+/// to re-derive. Without this, the tests above would keep passing if the mistyping were
+/// reintroduced on a path no fixture covers.
+///
+/// `validate_descriptor_abi` runs on both reflection paths and rejects only an over-run, never a
+/// short reach: `declared_size` is a `sizeof` and carries tail padding, which 1340 of the corpus's
+/// reported layouts legitimately stop short of.
+#[test]
+fn the_descriptor_abi_gate_rejects_a_layout_past_its_argument() {
+    let reflection = reflect(ARGUMENT_BUFFER_OF_HANDLES, "gate");
+    reflection
+        .validate_descriptor_abi()
+        .expect("the reflection it produced is valid");
+
+    // Restore what reading the member's name used to produce: a 64-byte matrix in an eight-byte
+    // handle, which alone carries the 36-byte argument past its end.
+    let mut mistyped = reflection.clone();
+    let resource = mistyped
+        .bindings
+        .iter_mut()
+        .find(|resource| resource.declared_size == Some(36))
+        .expect("the argument buffer");
+    let Some(AirType::Struct(members)) = resource.type_layout.as_mut() else {
+        panic!("the argument buffer reports a struct layout");
+    };
+    members[1].ty = AirType::Matrix {
+        scalar: AirScalar::Float,
+        cols: 4,
+        rows: 3,
+    };
+    let error = mistyped
+        .validate_descriptor_abi()
+        .expect_err("a layout past its argument is not a valid descriptor ABI");
+    assert!(
+        error.contains("member layout"),
+        "the rejection should name the layout, got {error}"
+    );
+
+    // Tail padding is not an over-run: an argument whose `sizeof` rounds past its last member stays
+    // valid.
+    let mut padded = reflection;
+    let resource = padded
+        .bindings
+        .iter_mut()
+        .find(|resource| resource.declared_size == Some(36))
+        .expect("the argument buffer");
+    resource.declared_size = Some(40);
+    padded
+        .validate_descriptor_abi()
+        .expect("a layout that stops short of its argument is valid");
+}

@@ -1816,6 +1816,30 @@ impl ShaderReflection {
             }
             (_, None) => {}
         }
+        // AIR states an argument's size (`air.arg_type_size`) and the member layout inside it
+        // (`air.struct_type_info`) as two independent facts, reconstructed here independently. A
+        // layout that reaches past the declared size is describing bytes the argument does not
+        // have: some member's storage was mistaken, and every member after it sits at an offset
+        // the shader never reads. A consumer packs its upload at these offsets, so the
+        // disagreement is silent data corruption rather than anything a driver reports, and the
+        // emitted SPIR-V does not settle it -- a buffer whose reconstruction is that far off is
+        // represented as raw bytes and declares no struct type to compare against. Reaching short
+        // is normal, since the declared size is a `sizeof` and carries tail padding.
+        for resource in &self.bindings {
+            let (Some(layout), Some(declared)) = (&resource.type_layout, resource.declared_size)
+            else {
+                continue;
+            };
+            let Some(extent) = crate::layout::air_metadata_extent(layout) else {
+                continue;
+            };
+            if extent > u64::from(declared) {
+                return Err(format!(
+                    "reflection reports a {extent}-byte member layout for the {declared}-byte argument of {:?}({})",
+                    resource.kind, resource.metal_index
+                ));
+            }
+        }
         // A consumer walks `bindings` and acts once per entry: it allocates a descriptor, writes
         // it, and sizes its per-resource budgets from the count. Two entries equal in every field
         // therefore describe one resource twice and ask for that work twice, while carrying no
