@@ -133,7 +133,9 @@ pub(super) fn tokenize(body: &str) -> Vec<Tok> {
 
 /// Parse an `air.struct_type_info` node into an `AirType::Struct`. Each member is a 5-tuple
 /// `i32 offset, i32 size, i32 array_len, !"type", !"name"`, optionally PREFIXED by
-/// `!"air.struct_type_info", !N` when the member is itself a nested struct (then recurse into `!N`).
+/// `!"air.struct_type_info", !N` when the member is itself a nested struct (then recurse into `!N`)
+/// and optionally SUFFIXED by `!"air.indirect_argument", !N` naming the argument-buffer entry the
+/// member holds (see [`member_holds_resource_handle`]).
 pub(super) fn parse_struct_info(
     nodes: &HashMap<u32, String>,
     id: u32,
@@ -171,6 +173,19 @@ pub(super) fn parse_struct_info(
             _ => break,
         };
         i += 5; // 3 ints + type + name
+
+        // Trailing tokens up to the next member tuple. `!"air.indirect_argument", !N` here binds
+        // node `!N` to THIS member; `embedded::embedded_argument_members` walks the same suffix to
+        // surface the resources an argument buffer carries.
+        let mut argument_node = None;
+        while i < toks.len() && !struct_member_starts_at(&toks, i) {
+            if let (Some(Tok::Str(s)), Some(Tok::Ref(x))) = (toks.get(i), toks.get(i + 1)) {
+                if s == "air.indirect_argument" {
+                    argument_node = Some(*x);
+                }
+            }
+            i += 1;
+        }
         let mut mt = match nested {
             Some(x) => {
                 let nested_ty = parse_struct_info(nodes, x, depth + 1)?;
@@ -179,6 +194,9 @@ pub(super) fn parse_struct_info(
                 } else {
                     storage_air_type_for_size(size)
                 }
+            }
+            None if member_holds_resource_handle(nodes, argument_node) => {
+                storage_air_type_for_size(size)
             }
             None => air_type_from_name(&tyname),
         };
@@ -189,15 +207,31 @@ pub(super) fn parse_struct_info(
             };
         }
         members.push(AirMember { offset, ty: mt });
-        while i < toks.len() && !struct_member_starts_at(&toks, i) {
-            i += 1;
-        }
     }
     if members.is_empty() {
         None
     } else {
         Some(AirType::Struct(members))
     }
+}
+
+/// True when a member's `air.indirect_argument` node describes a resource the argument buffer
+/// references by handle, rather than a value the buffer stores inline.
+///
+/// Metal spells such a member with the type it points AT — `!"char"` for a `device char *`,
+/// `!"texture2d<half, sample>"` for a texture, an opaque class name for a `device Foo *` — while the
+/// member itself stores a handle of the declared size. Reading the name as the member's storage
+/// sizes it wrong and shifts every following member's meaning, so the nested node's role decides
+/// instead. `air.indirect_constant` is the one role that means "stored inline"; `air.buffer`,
+/// `air.texture`, `air.sampler`, `air.indirect_buffer`, and the pipeline-state / command-buffer
+/// roles are all references. An unrecognized role is treated as a reference because that is the
+/// safe direction: the declared size describes the bytes either way, while a handle mistaken for
+/// its pointee corrupts the rest of the layout.
+fn member_holds_resource_handle(nodes: &HashMap<u32, String>, argument_node: Option<u32>) -> bool {
+    let Some(body) = argument_node.and_then(|node| nodes.get(&node)) else {
+        return false;
+    };
+    super::primary_role(&super::role_strings(body)).is_some_and(|role| role != "indirect_constant")
 }
 
 pub(super) fn struct_member_starts_at(toks: &[Tok], mut i: usize) -> bool {

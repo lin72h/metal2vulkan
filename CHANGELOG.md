@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reflection schema v36: an argument-buffer member that holds a resource handle is reported at the
+  eight bytes it occupies instead of as the type it points at. Metal spells such a member with its
+  pointee's name -- `char` for a `device char *`, `float4x3` for a `device float4x3 *`, a
+  `texture2d<...>` for a texture -- and reading that name as the member's storage put a 64-byte
+  matrix where the buffer holds an address, shifting the meaning of every member after it.
+  `MTLGenericBVHData` reported a 120-byte layout for its 72-byte argument; over 2880 corpus sources
+  1736 members across 9 named types and 47 opaque ones were mis-sized this way. The member's
+  `air.indirect_argument` node decides: every role but `air.indirect_constant` is a reference. The
+  emitted SPIR-V follows for the 21 modules whose buffer was typed from this layout, which had
+  declared four-byte floats at eight-byte member offsets.
 - Reflection schema v35: a descriptor-backed buffer's `access` is widened to cover the loads and
   stores the finished module performs through it. AIR's declared access is not a guarantee about the
   body -- over 2880 corpus sources, 20 buffers reflected `ReadOnly` are stored through, 9 reflected
