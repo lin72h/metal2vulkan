@@ -135,11 +135,24 @@ inspect AIR or an owned module directly; validator text is only returned to the 
    dispatcher where their scalar state is representable.
 5. Source ownership rejections are recorded in the sidecar. After interface lowering and static CFG
    pruning, the owned module also checks conditional/switch merge ownership and dominance
-   backedges. Only affected functions are rebuilt by the bounded relooper before assembly.
+   backedges. Only affected functions are reconstructed before assembly.
+6. Reconstruction tries nesting first. `native::reloop_nest` derives the relooper shape tree for a
+   reducible function and writes it as genuinely nested loop and selection constructs, keeping
+   ordinary values in registers; an edge that has to leave more than one construct is staged
+   through a flow variable read by a dispatch at each construct's merge. Whatever it declines
+   stays on the bounded state-machine relooper.
+
+Nesting keeps the source CFG's paths but not necessarily its dominance: a staged edge reaches its
+destination from a merge dispatch rather than from the block that left, so a definition inside the
+construct can stop reaching a use beyond it. The state machine repaired that incidentally, by
+demoting every crossing value. The nesting pass therefore checks the function it emitted against
+the same value-flow contract the owned module is held to and discards a nesting that fails it.
 
 The whole-function state-machine representation has a hard block ceiling because a module can be
-SPIR-V-valid yet pathological for a driver compiler. Exceeding that construction ceiling remains a
-visible failure; validation success is not used to waive it.
+SPIR-V-valid yet pathological for a driver compiler: every block becomes a sibling switch case, so
+every crossing value is demoted to a function-scope variable whose live range spans one loop
+containing the program. That is the shape nesting exists to avoid. Exceeding that construction
+ceiling remains a visible failure; validation success is not used to waive it.
 
 Diagnose planner admission with `METAL2VULKAN_WHY=1`. Diagnostic environment variables may report
 facts, but product representation selection is not environment-gated.
