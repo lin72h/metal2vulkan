@@ -109,6 +109,20 @@ pub(crate) fn drop_unreferenced_global_variables(module: &mut Module) -> bool {
     const INTERFACE_START: usize = 3;
 
     let referenced = function_referenced_ids(module);
+    let mut changed = false;
+    for entry_point in &mut module.entry_points {
+        let before = entry_point.operands.len();
+        entry_point.operands = std::mem::take(&mut entry_point.operands)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, operand)| match operand {
+                Operand::IdRef(id) if *index >= INTERFACE_START => referenced.contains(id),
+                _ => true,
+            })
+            .map(|(_, operand)| operand)
+            .collect();
+        changed |= entry_point.operands.len() != before;
+    }
     let removed = module
         .types_global_values
         .iter()
@@ -117,18 +131,7 @@ pub(crate) fn drop_unreferenced_global_variables(module: &mut Module) -> bool {
         .filter(|id| !referenced.contains(id))
         .collect::<HashSet<_>>();
     if removed.is_empty() {
-        return false;
-    }
-    for entry_point in &mut module.entry_points {
-        entry_point.operands = std::mem::take(&mut entry_point.operands)
-            .into_iter()
-            .enumerate()
-            .filter(|(index, operand)| match operand {
-                Operand::IdRef(id) if *index >= INTERFACE_START => !removed.contains(id),
-                _ => true,
-            })
-            .map(|(_, operand)| operand)
-            .collect();
+        return changed;
     }
     module.types_global_values.retain(|instruction| {
         instruction
@@ -145,16 +148,16 @@ pub(crate) fn drop_unreferenced_global_variables(module: &mut Module) -> bool {
 }
 
 /// Remove OpName/OpDecorate/OpMemberDecorate whose target id is not defined anywhere.
-pub(super) fn drop_dangling_debug(ctx: &mut Ctx) {
-    let defined = defined_ids(&ctx.module);
+pub(crate) fn drop_dangling_debug(module: &mut Module) {
+    let defined = defined_ids(module);
     let keep = |inst: &Instruction| -> bool {
         match inst.operands.first() {
             Some(Operand::IdRef(id)) => defined.contains(id),
             _ => true,
         }
     };
-    ctx.module.debug_names.retain(&keep);
-    ctx.module.annotations.retain(&keep);
+    module.debug_names.retain(&keep);
+    module.annotations.retain(&keep);
 }
 
 /// Iteratively drop types/global-values whose result id is referenced nowhere else in the module
@@ -241,7 +244,7 @@ pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
     ctx.module
         .types_global_values
         .retain(|instruction| instruction.result_id.is_none_or(|id| live.contains(&id)));
-    drop_dangling_debug(ctx);
+    drop_dangling_debug(&mut ctx.module);
 }
 
 /// Remove `OpCapability Int64` when no `OpTypeInt 64` survives (i.e. no genuine 64-bit-int type is

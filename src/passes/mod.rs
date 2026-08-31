@@ -1546,7 +1546,7 @@ mod finalize;
 #[cfg(test)]
 mod lowering_regression_tests;
 mod module_cleanup;
-pub(crate) use module_cleanup::drop_unreferenced_global_variables;
+pub(crate) use module_cleanup::{drop_dangling_debug, drop_unreferenced_global_variables};
 mod prune;
 mod resources;
 mod spirv_cfg;

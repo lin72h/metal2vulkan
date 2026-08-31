@@ -1242,112 +1242,15 @@ fn restore_loop_merges_removed_by_fc_prune(
     }
 }
 
+/// Complete FC branch pruning by re-establishing what the entry point still reaches.
+///
+/// Pruning deletes the arms that read a disabled feature's resources, which can leave a descriptor
+/// variable with no remaining use — and leave `OpName`/`OpDecorate` records pointing at the results
+/// the pruned instructions defined. Both are the shared module-cleanup rules, applied here because
+/// this public specialization path edits a module the ordinary pipeline has already finished.
 fn drop_unreferenced_entry_interface_globals(module: &mut crate::spirv_module::Module) {
-    use crate::spirv_module::Instruction;
-    use crate::spirv_module::Operand;
-    use spirv::Op;
-    let mut function_refs = std::collections::HashSet::new();
-    for function in &module.functions {
-        for block in &function.blocks {
-            for inst in &block.instructions {
-                for op in &inst.operands {
-                    if let Operand::IdRef(id)
-                    | Operand::IdScope(id)
-                    | Operand::IdMemorySemantics(id) = op
-                    {
-                        function_refs.insert(*id);
-                    }
-                }
-            }
-        }
-    }
-
-    let original_interface_ids = module
-        .entry_points
-        .iter()
-        .flat_map(|entry| entry.operands.iter().skip(3))
-        .filter_map(|op| match op {
-            Operand::IdRef(id) => Some(*id),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>();
-    let mut interface_ids = std::collections::HashSet::new();
-    for entry in &mut module.entry_points {
-        let mut rebuilt = Vec::with_capacity(entry.operands.len());
-        for (idx, op) in entry.operands.iter().cloned().enumerate() {
-            if idx < 3 {
-                rebuilt.push(op);
-                continue;
-            }
-            match op {
-                Operand::IdRef(id) if function_refs.contains(&id) => {
-                    interface_ids.insert(id);
-                    rebuilt.push(Operand::IdRef(id));
-                }
-                Operand::IdRef(_) => {}
-                other => rebuilt.push(other),
-            }
-        }
-        entry.operands = rebuilt;
-    }
-
-    module.types_global_values.retain(|inst| {
-        if inst.class.opcode != Op::Variable {
-            return true;
-        }
-        let Some(id) = inst.result_id else {
-            return true;
-        };
-        if !original_interface_ids.contains(&id) {
-            return true;
-        }
-        function_refs.contains(&id) || interface_ids.contains(&id)
-    });
-
-    let defined = defined_ids(module);
-    let keep = |inst: &Instruction| {
-        !matches!(
-            inst.operands.first(),
-            Some(Operand::IdRef(id)) if !defined.contains(id)
-        )
-    };
-    module.debug_names.retain(keep);
-    module.annotations.retain(keep);
-}
-
-fn defined_ids(module: &crate::spirv_module::Module) -> std::collections::HashSet<spirv::Word> {
-    let mut out = std::collections::HashSet::new();
-    for inst in &module.types_global_values {
-        if let Some(id) = inst.result_id {
-            out.insert(id);
-        }
-    }
-    for inst in &module.ext_inst_imports {
-        if let Some(id) = inst.result_id {
-            out.insert(id);
-        }
-    }
-    for function in &module.functions {
-        if let Some(id) = function.def.as_ref().and_then(|def| def.result_id) {
-            out.insert(id);
-        }
-        for param in &function.parameters {
-            if let Some(id) = param.result_id {
-                out.insert(id);
-            }
-        }
-        for block in &function.blocks {
-            if let Some(id) = block.label.as_ref().and_then(|label| label.result_id) {
-                out.insert(id);
-            }
-            for inst in &block.instructions {
-                if let Some(id) = inst.result_id {
-                    out.insert(id);
-                }
-            }
-        }
-    }
-    out
+    crate::passes::drop_unreferenced_global_variables(module);
+    crate::passes::drop_dangling_debug(module);
 }
 
 #[cfg(test)]
