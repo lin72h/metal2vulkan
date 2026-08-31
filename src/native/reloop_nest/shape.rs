@@ -113,10 +113,7 @@ impl Graph {
                         stack.push((target, 0));
                     }
                     // A retreating edge: legal only when the target dominates the source.
-                    1 if !dominators
-                        .get(&node)
-                        .is_some_and(|doms| doms.contains(&target)) =>
-                    {
+                    1 if !dominators.dominates(target, node) => {
                         return false;
                     }
                     _ => {}
@@ -128,43 +125,169 @@ impl Graph {
         true
     }
 
-    /// Iterative dominator sets over the reachable subgraph.
-    fn dominators(&self) -> BTreeMap<Label, BTreeSet<Label>> {
-        let reachable = self.reachable();
-        let mut dominators: BTreeMap<Label, BTreeSet<Label>> = reachable
-            .iter()
-            .map(|label| (*label, reachable.clone()))
-            .collect();
-        if let Some(entry) = dominators.get_mut(&self.entry) {
-            *entry = BTreeSet::from([self.entry]);
+    /// The reachable subgraph in reverse postorder, entry first.
+    ///
+    /// Reverse postorder is what makes the dominator iteration below converge in a couple of passes
+    /// instead of one pass per graph depth: every node's predecessors along a forward edge are
+    /// already final when it is visited.
+    fn reverse_postorder(&self) -> Vec<Label> {
+        let mut order = Vec::new();
+        let mut seen = BTreeSet::new();
+        if !self.successors.contains_key(&self.entry) {
+            return order;
         }
+        seen.insert(self.entry);
+        let mut stack = vec![(self.entry, 0usize)];
+        while let Some((node, index)) = stack.pop() {
+            let targets = self.succ(node);
+            if index < targets.len() {
+                stack.push((node, index + 1));
+                let target = targets[index];
+                if self.successors.contains_key(&target) && seen.insert(target) {
+                    stack.push((target, 0));
+                }
+            } else {
+                order.push(node);
+            }
+        }
+        order.reverse();
+        order
+    }
+
+    /// The dominator tree of the reachable subgraph, by the Cooper-Harvey-Kennedy iteration.
+    fn dominators(&self) -> Dominators {
+        let order = self.reverse_postorder();
+        if order.is_empty() {
+            return Dominators::default();
+        }
+        let position = order
+            .iter()
+            .enumerate()
+            .map(|(index, label)| (*label, index))
+            .collect::<BTreeMap<_, _>>();
+        // Indexed by reverse-postorder position, so a dominator always sits at a lower index than
+        // the node it dominates -- which is what lets `intersect` walk two fingers to their meet.
+        let mut idom: Vec<Option<usize>> = vec![None; order.len()];
+        idom[0] = Some(0);
         let mut changed = true;
         while changed {
             changed = false;
-            for label in &reachable {
-                if *label == self.entry {
-                    continue;
+            for index in 1..order.len() {
+                let mut candidate: Option<usize> = None;
+                for predecessor in self.pred(order[index]) {
+                    let Some(&predecessor) = position.get(predecessor) else {
+                        continue;
+                    };
+                    if idom[predecessor].is_none() {
+                        continue;
+                    }
+                    candidate = Some(match candidate {
+                        None => predecessor,
+                        Some(current) => intersect(current, predecessor, &idom),
+                    });
                 }
-                let mut incoming = self
-                    .pred(*label)
-                    .iter()
-                    .filter(|predecessor| reachable.contains(predecessor))
-                    .filter_map(|predecessor| dominators.get(predecessor));
-                let Some(first) = incoming.next() else {
-                    continue;
-                };
-                let mut next = first.clone();
-                for other in incoming {
-                    next.retain(|candidate| other.contains(candidate));
-                }
-                next.insert(*label);
-                if dominators.get(label) != Some(&next) {
-                    dominators.insert(*label, next);
+                if candidate.is_some() && idom[index] != candidate {
+                    idom[index] = candidate;
                     changed = true;
                 }
             }
         }
-        dominators
+        Dominators::from_tree(&order, &idom)
+    }
+}
+
+/// The meet of two nodes in the partially built dominator tree: their deepest common dominator.
+///
+/// Both fingers only ever move to a strictly lower reverse-postorder position, so the walk
+/// terminates. An index whose parent link is missing or does not decrease cannot occur once the
+/// iteration is seeded from the entry; treating it as the entry keeps the walk finite and only ever
+/// weakens the dominance the caller concludes, which is the safe direction.
+fn intersect(mut left: usize, mut right: usize, idom: &[Option<usize>]) -> usize {
+    while left != right {
+        while left > right {
+            match idom[left] {
+                Some(parent) if parent < left => left = parent,
+                _ => return 0,
+            }
+        }
+        while right > left {
+            match idom[right] {
+                Some(parent) if parent < right => right = parent,
+                _ => return 0,
+            }
+        }
+    }
+    left
+}
+
+/// Which blocks dominate which, over a graph's reachable subgraph.
+///
+/// One pre-order interval per block, not a dominator *set* per block. The set form is quadratic in
+/// the block count: a 6301-block function -- an ordinary size for a generated convolution kernel --
+/// materializes about 40 million set entries, roughly 400 MiB, to answer the single question
+/// [`Graph::is_reducible`] asks of it. That alone exceeds the whole per-translation memory budget.
+/// The interval form is linear, and answers the same question with two integer comparisons.
+#[derive(Default)]
+pub(super) struct Dominators {
+    /// `(enter, exit)` of each block in a pre-order walk of the dominator tree. `a` dominates `b`
+    /// exactly when `b`'s interval nests inside `a`'s.
+    interval: BTreeMap<Label, (u32, u32)>,
+}
+
+impl Dominators {
+    /// Number the dominator tree described by `idom` (parent links by reverse-postorder position).
+    fn from_tree(order: &[Label], idom: &[Option<usize>]) -> Self {
+        let mut children: Vec<Vec<usize>> = vec![Vec::new(); order.len()];
+        for (index, parent) in idom.iter().enumerate() {
+            match parent {
+                Some(parent) if *parent != index => children[*parent].push(index),
+                _ => {}
+            }
+        }
+        let mut interval = BTreeMap::new();
+        let mut clock = 0u32;
+        // `Descend` numbers a node on the way in, `Close` on the way back out; an explicit stack
+        // rather than recursion because the tree is as deep as the function is long.
+        enum Step {
+            Descend(usize),
+            Close(usize),
+        }
+        let mut stack = vec![Step::Descend(0)];
+        let mut enter = vec![0u32; order.len()];
+        while let Some(step) = stack.pop() {
+            match step {
+                Step::Descend(index) => {
+                    enter[index] = clock;
+                    clock += 1;
+                    stack.push(Step::Close(index));
+                    for child in children[index].iter().rev() {
+                        stack.push(Step::Descend(*child));
+                    }
+                }
+                Step::Close(index) => {
+                    interval.insert(order[index], (enter[index], clock));
+                    clock += 1;
+                }
+            }
+        }
+        Self { interval }
+    }
+
+    /// Whether `ancestor` dominates `node`. Reflexive, and false for any block the reachable
+    /// subgraph does not contain -- which is what the retreating-edge check wants: an edge whose
+    /// source is unreachable was never on the walk that asks.
+    pub(super) fn dominates(&self, ancestor: Label, node: Label) -> bool {
+        let (Some(ancestor), Some(node)) = (self.interval.get(&ancestor), self.interval.get(&node))
+        else {
+            return false;
+        };
+        ancestor.0 <= node.0 && node.1 <= ancestor.1
+    }
+
+    /// How many numbers the tree holds, which is what the linear bound is about.
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.interval.len()
     }
 }
 
@@ -605,5 +728,144 @@ mod tests {
         // Two blocks entering each other's "loop" from outside: no single header dominates.
         let irreducible = graph(1, &[(1, &[2, 3]), (2, &[3]), (3, &[2])]);
         assert!(!irreducible.is_reducible());
+    }
+
+    /// The textbook dominator sets, by fixpoint over the reachable subgraph.
+    ///
+    /// This is the definition the tree form has to agree with, kept here rather than in the graph
+    /// because it is quadratic in the block count and no production path can afford it.
+    fn dense_dominators(graph: &Graph) -> BTreeMap<Label, BTreeSet<Label>> {
+        let reachable = graph.reachable();
+        let mut dominators: BTreeMap<Label, BTreeSet<Label>> = reachable
+            .iter()
+            .map(|label| (*label, reachable.clone()))
+            .collect();
+        if let Some(entry) = dominators.get_mut(&graph.entry) {
+            *entry = BTreeSet::from([graph.entry]);
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for label in &reachable {
+                if *label == graph.entry {
+                    continue;
+                }
+                let mut incoming = graph
+                    .pred(*label)
+                    .iter()
+                    .filter(|predecessor| reachable.contains(predecessor))
+                    .filter_map(|predecessor| dominators.get(predecessor));
+                let Some(first) = incoming.next() else {
+                    continue;
+                };
+                let mut next = first.clone();
+                for other in incoming {
+                    next.retain(|candidate| other.contains(candidate));
+                }
+                next.insert(*label);
+                if dominators.get(label) != Some(&next) {
+                    dominators.insert(*label, next);
+                    changed = true;
+                }
+            }
+        }
+        dominators
+    }
+
+    fn assert_matches_dense(graph: &Graph, what: &str) {
+        let dense = dense_dominators(graph);
+        let tree = graph.dominators();
+        let reachable = graph.reachable();
+        for node in &reachable {
+            for ancestor in &reachable {
+                assert_eq!(
+                    tree.dominates(*ancestor, *node),
+                    dense[node].contains(ancestor),
+                    "{what}: disagreement on whether %{ancestor} dominates %{node}"
+                );
+            }
+        }
+    }
+
+    /// The dominator tree has to answer exactly what the dominator sets it replaced answered, on
+    /// every shape the structurizer can be handed -- including the irreducible ones, where the
+    /// reducibility verdict is the whole point of asking.
+    #[test]
+    fn the_dominator_tree_agrees_with_the_dominator_sets() {
+        for (what, graph) in [
+            ("straight line", graph(1, &[(1, &[2]), (2, &[3]), (3, &[])])),
+            (
+                "diamond",
+                graph(1, &[(1, &[2, 3]), (2, &[4]), (3, &[4]), (4, &[])]),
+            ),
+            (
+                "loop with an exit",
+                graph(1, &[(1, &[2]), (2, &[3, 4]), (3, &[2]), (4, &[])]),
+            ),
+            (
+                "nested loops",
+                graph(
+                    1,
+                    &[(1, &[2]), (2, &[3]), (3, &[3, 4]), (4, &[2, 5]), (5, &[])],
+                ),
+            ),
+            ("self loop", graph(1, &[(1, &[1, 2]), (2, &[])])),
+            (
+                "irreducible pair",
+                graph(1, &[(1, &[2, 3]), (2, &[3]), (3, &[2])]),
+            ),
+            (
+                "unreachable block",
+                graph(1, &[(1, &[2]), (2, &[]), (9, &[2])]),
+            ),
+            (
+                "two paths rejoining under a loop",
+                graph(
+                    1,
+                    &[
+                        (1, &[2, 3]),
+                        (2, &[4]),
+                        (3, &[4]),
+                        (4, &[5, 6]),
+                        (5, &[4]),
+                        (6, &[]),
+                    ],
+                ),
+            ),
+        ] {
+            assert_matches_dense(&graph, what);
+        }
+    }
+
+    /// The bound this representation exists for: the dominator structure holds one interval per
+    /// reachable block, not one dominator set per reachable block.
+    ///
+    /// A dominator *set* per block is quadratic, and generated shaders reach block counts where
+    /// that alone costs hundreds of megabytes -- past the whole per-translation memory budget for
+    /// one reducibility question. Asserting the linear size keeps that from creeping back: the
+    /// dense form would report `n * (n + 1) / 2` numbers here, not `n`.
+    #[test]
+    fn the_dominator_structure_stays_linear_in_the_block_count() {
+        // A long chain of two-way diamonds: deep enough that a quadratic representation is
+        // unmistakable, and reducible, so the walk covers every block.
+        let mut edges: Vec<(Label, Vec<Label>)> = Vec::new();
+        let diamonds = 2_000;
+        for index in 0..diamonds {
+            let head = index * 4 + 1;
+            edges.push((head, vec![head + 1, head + 2]));
+            edges.push((head + 1, vec![head + 3]));
+            edges.push((head + 2, vec![head + 3]));
+            edges.push((head + 3, vec![head + 4]));
+        }
+        let last = diamonds * 4 + 1;
+        edges.push((last, vec![]));
+        let graph = Graph::new(
+            1,
+            edges.into_iter().collect::<BTreeMap<Label, Vec<Label>>>(),
+        );
+        let blocks = graph.reachable().len();
+        assert_eq!(blocks, (diamonds * 4 + 1) as usize);
+        assert!(graph.is_reducible());
+        assert_eq!(graph.dominators().len(), blocks);
     }
 }
