@@ -1137,6 +1137,35 @@ pub struct RuntimeStorageImageSpecialization {
 }
 
 impl StaticSamplerState {
+    /// Decode the two `i64` words AIR stores for a `constexpr sampler`.
+    ///
+    /// The complete bit map, so that what is read and what is not are both stated rather than
+    /// implied by the shifts below. Counts are over the 1084 static samplers in a 2880-source
+    /// corpus.
+    ///
+    /// | `words[0]` | Field |
+    /// |---|---|
+    /// | 0-2, 3-5, 6-8 | `address_mode_s` / `_t` / `_r` |
+    /// | 9-10, 11-12, 13-14 | `mag_filter` / `min_filter` / `mip_filter` |
+    /// | 15 | `coordinates` |
+    /// | 16-19 | `compare_function` |
+    /// | 20-23 | `max_anisotropy - 1` |
+    /// | 24-31 | **not read** (always zero) |
+    /// | 32-39 | high byte of the `lod_min_clamp` half; the low byte is assumed zero (always zero) |
+    /// | 40-55 | `lod_max_clamp` half |
+    /// | 56-57, 58-59 | `border_color` / `reduction` |
+    /// | 60-62 | **not read** (always zero) |
+    /// | 63 | **not read**, and set on 151 of them, with no correlate among the decoded fields |
+    ///
+    /// | `words[1]` | Field |
+    /// |---|---|
+    /// | 0-15 | `lod_bias` half |
+    /// | 16-63 | **not read** (always zero) |
+    ///
+    /// Bit 63 is a gap, not a decision: no evidence says what it selects, and every translation
+    /// carrying it is currently accepted. An unrecognized *enum code* in a field this does read is
+    /// a different matter and returns `Err`, since the alternative would be inventing a filter or
+    /// address mode. `raw_words` is retained so a consumer can act on a bit this does not decode.
     pub(crate) fn from_air_words(words: [u64; 2]) -> Result<Self, String> {
         let word = words[0];
         let border_color = match (word >> 56) & 0x3 {

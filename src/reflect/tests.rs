@@ -1727,3 +1727,84 @@ fn runtime_storage_formats_have_complete_component_and_spirv_mappings() {
     assert!(R::R32Sint.supports_atomics());
     assert!(!R::Rgba32Uint.supports_atomics());
 }
+
+/// The AIR static-sampler bit map, pinned so that both halves of it stay deliberate: the bits
+/// `from_air_words` reads, and the bits it does not.
+///
+/// A sampler decoded from the wrong bit is not a translation failure -- it is a shader that filters,
+/// wraps, or compares differently than Metal asked, with valid SPIR-V and no diagnostic. The
+/// ignored ranges are pinned too because ignoring them is a documented gap rather than a
+/// conclusion: bit 63 of `words[0]` is set on 151 of a 2880-source corpus's 1084 static samplers,
+/// with no correlate among the decoded fields, and `raw_words` is what a consumer that learns its
+/// meaning would read.
+#[test]
+fn every_static_sampler_bit_is_either_decoded_or_deliberately_ignored() {
+    // One value per field, each distinct from its neighbours so a swapped shift cannot pass.
+    let decoded = 2
+        | (3 << 3)
+        | (1 << 6)
+        | (1 << 9)
+        | (2 << 11)
+        | (2 << 13)
+        | (1 << 15)
+        | (3 << 16)
+        | (4 << 20)
+        | (0x40 << 32)
+        | (0x4200 << 40)
+        | (1 << 56)
+        | (2 << 58);
+    let expected = StaticSamplerState {
+        address_mode_s: SamplerAddressMode::Repeat,
+        address_mode_t: SamplerAddressMode::MirroredRepeat,
+        address_mode_r: SamplerAddressMode::ClampToEdge,
+        mag_filter: SamplerFilter::Linear,
+        min_filter: SamplerFilter::Bicubic,
+        mip_filter: SamplerMipFilter::Linear,
+        coordinates: SamplerCoordinates::Pixel,
+        compare_function: SamplerCompareFunction::Greater,
+        max_anisotropy: 5,
+        lod_min_clamp: 2.0,
+        lod_max_clamp: 3.0,
+        border_color: SamplerBorderColor::OpaqueBlack,
+        reduction: SamplerReduction::Maximum,
+        lod_bias: 1.0,
+        raw_words: [decoded, 0x3c00],
+    };
+    assert_eq!(
+        StaticSamplerState::from_air_words([decoded, 0x3c00]).expect("decode"),
+        expected,
+    );
+
+    // `words[0]` bits 24-31 and 60-63, and `words[1]` bits 16-63, are not read. Setting every one
+    // of them changes nothing but `raw_words`, which carries them through verbatim.
+    let ignored_word0 = (0xff << 24) | (0xf << 60);
+    let ignored_word1 = !0xffff_u64;
+    let mut with_ignored = expected;
+    with_ignored.raw_words = [decoded | ignored_word0, 0x3c00 | ignored_word1];
+    assert_eq!(
+        StaticSamplerState::from_air_words(with_ignored.raw_words).expect("decode"),
+        with_ignored,
+    );
+
+    // An unrecognized code in a field it DOES read is the opposite case: inventing a filter or an
+    // address mode would silently change how the shader samples, so it is an honest failure.
+    for (field, shift, width, code) in [
+        ("address_mode_s", 0, 0x7_u64, 4_u64),
+        ("address_mode_t", 3, 0x7, 5),
+        ("address_mode_r", 6, 0x7, 7),
+        ("mag_filter", 9, 0x3, 3),
+        ("min_filter", 11, 0x3, 3),
+        ("mip_filter", 13, 0x3, 3),
+        ("compare_function", 16, 0xf, 9),
+        ("border_color", 56, 0x3, 3),
+        ("reduction", 58, 0x3, 3),
+    ] {
+        let word = (decoded & !(width << shift)) | (code << shift);
+        assert!(
+            StaticSamplerState::from_air_words([word, 0x3c00])
+                .unwrap_err()
+                .contains("unsupported"),
+            "an unsupported {field} code should not be decoded into a guess",
+        );
+    }
+}
