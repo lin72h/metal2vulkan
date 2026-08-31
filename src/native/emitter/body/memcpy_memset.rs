@@ -108,52 +108,54 @@ impl Emitter {
         len: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let Some(src_pointee) = self.pointer_pointee_for_value(&src.value)? else {
-            return Ok(false);
-        };
-        let src_pointee = function_storage_local_type(&self.resolve_type(&src_pointee)?);
-        let (src_size, _) = self.raw_type_size_align(&src_pointee)?;
-        if len > src_size {
-            return Ok(false);
-        }
-        let src_ptr = self.value_id(&src.value, &src.ty)?;
-        let src_ty = self.type_id(&src_pointee)?;
-        let src_value = self.fresh();
-        instructions.push(Self::inst(
-            Op::Load,
-            Some(src_ty),
-            Some(src_value),
-            vec![Operand::IdRef(src_ptr)],
-        ));
-
-        let mut words = Vec::new();
-        if !self.collect_typed_memcpy_words(
-            src_value,
-            &src_pointee,
-            0,
-            len,
-            &mut words,
-            instructions,
-        )? {
-            return Ok(false);
-        }
-        words.sort_by_key(|(offset, _)| *offset);
-        let expected_words = (len / 4) as usize;
-        if words.len() != expected_words {
-            let Some(words_with_padding) =
-                self.typed_memcpy_words_with_raw_padding(src, len, words)?
-            else {
+        staged_emit(instructions, |instructions| {
+            let Some(src_pointee) = self.pointer_pointee_for_value(&src.value)? else {
                 return Ok(false);
             };
-            words = words_with_padding;
-        }
-        for (index, (offset, word)) in words.into_iter().enumerate() {
-            if offset != (index as u64) * 4 {
+            let src_pointee = function_storage_local_type(&self.resolve_type(&src_pointee)?);
+            let (src_size, _) = self.raw_type_size_align(&src_pointee)?;
+            if len > src_size {
                 return Ok(false);
             }
-            self.emit_raw_word_store_for_access(dst, offset, word, dst_align, instructions)?;
-        }
-        Ok(true)
+            let src_ptr = self.value_id(&src.value, &src.ty)?;
+            let src_ty = self.type_id(&src_pointee)?;
+            let src_value = self.fresh();
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(src_ty),
+                Some(src_value),
+                vec![Operand::IdRef(src_ptr)],
+            ));
+
+            let mut words = Vec::new();
+            if !self.collect_typed_memcpy_words(
+                src_value,
+                &src_pointee,
+                0,
+                len,
+                &mut words,
+                instructions,
+            )? {
+                return Ok(false);
+            }
+            words.sort_by_key(|(offset, _)| *offset);
+            let expected_words = (len / 4) as usize;
+            if words.len() != expected_words {
+                let Some(words_with_padding) =
+                    self.typed_memcpy_words_with_raw_padding(src, len, words)?
+                else {
+                    return Ok(false);
+                };
+                words = words_with_padding;
+            }
+            for (index, (offset, word)) in words.into_iter().enumerate() {
+                if offset != (index as u64) * 4 {
+                    return Ok(false);
+                }
+                self.emit_raw_word_store_for_access(dst, offset, word, dst_align, instructions)?;
+            }
+            Ok(true)
+        })
     }
 
     pub(in crate::native::emitter) fn typed_memcpy_words_with_raw_padding(
@@ -208,104 +210,106 @@ impl Emitter {
         words: &mut Vec<(u64, Word)>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if base_offset >= len {
-            return Ok(true);
-        }
-        match self.resolve_type(ty)? {
-            LlType::Int(32) | LlType::Float => {
-                if base_offset + 4 > len {
-                    return Ok(false);
-                }
-                let word = self.typed_memcpy_word(value, ty, instructions)?;
-                words.push((base_offset, word));
-                Ok(true)
+        staged_emit(instructions, |instructions| {
+            if base_offset >= len {
+                return Ok(true);
             }
-            LlType::Vector(elem, lanes) => {
-                if !matches!(self.resolve_type(&elem)?, LlType::Int(32) | LlType::Float) {
-                    return Ok(false);
-                }
-                for lane in 0..lanes {
-                    let offset = base_offset + (lane as u64) * 4;
-                    if offset >= len {
-                        break;
-                    }
-                    if offset + 4 > len {
+            match self.resolve_type(ty)? {
+                LlType::Int(32) | LlType::Float => {
+                    if base_offset + 4 > len {
                         return Ok(false);
                     }
-                    let elem_ty = self.resolve_type(&elem)?;
-                    let elem_type = self.type_id(&elem_ty)?;
-                    let elem_value = self.fresh();
-                    instructions.push(Self::inst(
-                        Op::CompositeExtract,
-                        Some(elem_type),
-                        Some(elem_value),
-                        vec![Operand::IdRef(value), Operand::LiteralBit32(lane)],
-                    ));
-                    let word = self.typed_memcpy_word(elem_value, &elem_ty, instructions)?;
-                    words.push((offset, word));
+                    let word = self.typed_memcpy_word(value, ty, instructions)?;
+                    words.push((base_offset, word));
+                    Ok(true)
                 }
-                Ok(true)
-            }
-            LlType::Array(elem, count) => {
-                let elem = self.resolve_type(&elem)?;
-                let (elem_size, elem_align) = self.raw_type_size_align(&elem)?;
-                let stride = round_up_u64(elem_size, elem_align);
-                let elem_type = self.type_id(&elem)?;
-                for index in 0..count {
-                    let offset = base_offset + stride * index as u64;
-                    if offset >= len {
-                        break;
-                    }
-                    let elem_value = self.fresh();
-                    instructions.push(Self::inst(
-                        Op::CompositeExtract,
-                        Some(elem_type),
-                        Some(elem_value),
-                        vec![Operand::IdRef(value), Operand::LiteralBit32(index)],
-                    ));
-                    if !self.collect_typed_memcpy_words(
-                        elem_value,
-                        &elem,
-                        offset,
-                        len,
-                        words,
-                        instructions,
-                    )? {
+                LlType::Vector(elem, lanes) => {
+                    if !matches!(self.resolve_type(&elem)?, LlType::Int(32) | LlType::Float) {
                         return Ok(false);
                     }
-                }
-                Ok(true)
-            }
-            LlType::Struct(fields) => {
-                for index in 0..fields.len() {
-                    let (offset, field) = self.raw_struct_member(&fields, index as u64)?;
-                    let offset = base_offset + offset;
-                    if offset >= len {
-                        break;
+                    for lane in 0..lanes {
+                        let offset = base_offset + (lane as u64) * 4;
+                        if offset >= len {
+                            break;
+                        }
+                        if offset + 4 > len {
+                            return Ok(false);
+                        }
+                        let elem_ty = self.resolve_type(&elem)?;
+                        let elem_type = self.type_id(&elem_ty)?;
+                        let elem_value = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::CompositeExtract,
+                            Some(elem_type),
+                            Some(elem_value),
+                            vec![Operand::IdRef(value), Operand::LiteralBit32(lane)],
+                        ));
+                        let word = self.typed_memcpy_word(elem_value, &elem_ty, instructions)?;
+                        words.push((offset, word));
                     }
-                    let field_type = self.type_id(&field)?;
-                    let field_value = self.fresh();
-                    instructions.push(Self::inst(
-                        Op::CompositeExtract,
-                        Some(field_type),
-                        Some(field_value),
-                        vec![Operand::IdRef(value), Operand::LiteralBit32(index as u32)],
-                    ));
-                    if !self.collect_typed_memcpy_words(
-                        field_value,
-                        &field,
-                        offset,
-                        len,
-                        words,
-                        instructions,
-                    )? {
-                        return Ok(false);
-                    }
+                    Ok(true)
                 }
-                Ok(true)
+                LlType::Array(elem, count) => {
+                    let elem = self.resolve_type(&elem)?;
+                    let (elem_size, elem_align) = self.raw_type_size_align(&elem)?;
+                    let stride = round_up_u64(elem_size, elem_align);
+                    let elem_type = self.type_id(&elem)?;
+                    for index in 0..count {
+                        let offset = base_offset + stride * index as u64;
+                        if offset >= len {
+                            break;
+                        }
+                        let elem_value = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::CompositeExtract,
+                            Some(elem_type),
+                            Some(elem_value),
+                            vec![Operand::IdRef(value), Operand::LiteralBit32(index)],
+                        ));
+                        if !self.collect_typed_memcpy_words(
+                            elem_value,
+                            &elem,
+                            offset,
+                            len,
+                            words,
+                            instructions,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                LlType::Struct(fields) => {
+                    for index in 0..fields.len() {
+                        let (offset, field) = self.raw_struct_member(&fields, index as u64)?;
+                        let offset = base_offset + offset;
+                        if offset >= len {
+                            break;
+                        }
+                        let field_type = self.type_id(&field)?;
+                        let field_value = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::CompositeExtract,
+                            Some(field_type),
+                            Some(field_value),
+                            vec![Operand::IdRef(value), Operand::LiteralBit32(index as u32)],
+                        ));
+                        if !self.collect_typed_memcpy_words(
+                            field_value,
+                            &field,
+                            offset,
+                            len,
+                            words,
+                            instructions,
+                        )? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
             }
-            _ => Ok(false),
-        }
+        })
     }
 
     pub(in crate::native::emitter) fn typed_memcpy_word(
@@ -708,96 +712,100 @@ impl Emitter {
         indices: &mut Vec<Word>,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let ty = function_storage_local_type(&self.resolve_type(ty)?);
-        let (size, _) = self.raw_type_size_align(&ty)?;
-        if size == 0 || offset >= end {
-            return Ok(true);
-        }
-        if offset
-            .checked_add(size)
-            .is_some_and(|object_end| object_end <= end)
-        {
-            let pointer = if indices.is_empty() {
-                base
-            } else {
-                let pointer_type = self.ptr_type_id(storage, &ty)?;
-                let pointer = self.fresh();
-                let mut operands = Vec::with_capacity(indices.len() + 1);
-                operands.push(Operand::IdRef(base));
-                operands.extend(indices.iter().copied().map(Operand::IdRef));
+        staged_emit(instructions, |instructions| {
+            let ty = function_storage_local_type(&self.resolve_type(ty)?);
+            let (size, _) = self.raw_type_size_align(&ty)?;
+            if size == 0 || offset >= end {
+                return Ok(true);
+            }
+            if offset
+                .checked_add(size)
+                .is_some_and(|object_end| object_end <= end)
+            {
+                let pointer = if indices.is_empty() {
+                    base
+                } else {
+                    let pointer_type = self.ptr_type_id(storage, &ty)?;
+                    let pointer = self.fresh();
+                    let mut operands = Vec::with_capacity(indices.len() + 1);
+                    operands.push(Operand::IdRef(base));
+                    operands.extend(indices.iter().copied().map(Operand::IdRef));
+                    instructions.push(Self::inst(
+                        Op::InBoundsAccessChain,
+                        Some(pointer_type),
+                        Some(pointer),
+                        operands,
+                    ));
+                    pointer
+                };
+                let zero = self.const_null(&ty)?;
                 instructions.push(Self::inst(
-                    Op::InBoundsAccessChain,
-                    Some(pointer_type),
-                    Some(pointer),
-                    operands,
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(pointer), Operand::IdRef(zero)],
                 ));
-                pointer
-            };
-            let zero = self.const_null(&ty)?;
-            instructions.push(Self::inst(
-                Op::Store,
-                None,
-                None,
-                vec![Operand::IdRef(pointer), Operand::IdRef(zero)],
-            ));
-            return Ok(true);
-        }
-        match ty {
-            LlType::Struct(fields) => {
-                for index in 0..fields.len() {
-                    let (member_offset, field) = self.raw_struct_member(&fields, index as u64)?;
-                    let index = self.const_uint(index as u32)?;
-                    indices.push(index);
-                    let supported = self.emit_typed_zero_prefix(
-                        base,
-                        storage,
-                        &field,
-                        offset.checked_add(member_offset).ok_or_else(|| {
-                            "native emitter: partial memset struct offset overflows u64".to_string()
-                        })?,
-                        end,
-                        indices,
-                        instructions,
-                    )?;
-                    indices.pop();
-                    if !supported {
-                        return Ok(false);
-                    }
-                }
-                Ok(true)
+                return Ok(true);
             }
-            LlType::Array(elem, count) | LlType::Vector(elem, count) => {
-                let elem = function_storage_local_type(&self.resolve_type(&elem)?);
-                let (elem_size, elem_align) = self.raw_type_size_align(&elem)?;
-                let stride = round_up_u64(elem_size, elem_align);
-                for index in 0..count {
-                    let index_id = self.const_uint(index)?;
-                    indices.push(index_id);
-                    let element_offset = u64::from(index)
-                        .checked_mul(stride)
-                        .and_then(|relative| offset.checked_add(relative))
-                        .ok_or_else(|| {
-                            "native emitter: partial memset aggregate offset overflows u64"
-                                .to_string()
-                        })?;
-                    let supported = self.emit_typed_zero_prefix(
-                        base,
-                        storage,
-                        &elem,
-                        element_offset,
-                        end,
-                        indices,
-                        instructions,
-                    )?;
-                    indices.pop();
-                    if !supported {
-                        return Ok(false);
+            match ty {
+                LlType::Struct(fields) => {
+                    for index in 0..fields.len() {
+                        let (member_offset, field) =
+                            self.raw_struct_member(&fields, index as u64)?;
+                        let index = self.const_uint(index as u32)?;
+                        indices.push(index);
+                        let supported = self.emit_typed_zero_prefix(
+                            base,
+                            storage,
+                            &field,
+                            offset.checked_add(member_offset).ok_or_else(|| {
+                                "native emitter: partial memset struct offset overflows u64"
+                                    .to_string()
+                            })?,
+                            end,
+                            indices,
+                            instructions,
+                        )?;
+                        indices.pop();
+                        if !supported {
+                            return Ok(false);
+                        }
                     }
+                    Ok(true)
                 }
-                Ok(true)
+                LlType::Array(elem, count) | LlType::Vector(elem, count) => {
+                    let elem = function_storage_local_type(&self.resolve_type(&elem)?);
+                    let (elem_size, elem_align) = self.raw_type_size_align(&elem)?;
+                    let stride = round_up_u64(elem_size, elem_align);
+                    for index in 0..count {
+                        let index_id = self.const_uint(index)?;
+                        indices.push(index_id);
+                        let element_offset = u64::from(index)
+                            .checked_mul(stride)
+                            .and_then(|relative| offset.checked_add(relative))
+                            .ok_or_else(|| {
+                                "native emitter: partial memset aggregate offset overflows u64"
+                                    .to_string()
+                            })?;
+                        let supported = self.emit_typed_zero_prefix(
+                            base,
+                            storage,
+                            &elem,
+                            element_offset,
+                            end,
+                            indices,
+                            instructions,
+                        )?;
+                        indices.pop();
+                        if !supported {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                _ => Ok(false),
             }
-            _ => Ok(false),
-        }
+        })
     }
 
     pub(in crate::native::emitter) fn emit_raw_zero_memset(
@@ -921,42 +929,65 @@ impl Emitter {
         call: &LlCall,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if !call.callee.starts_with("llvm.memcpy.") {
-            return Ok(false);
-        }
-        if call.args.len() != 4 || !matches!(call.args[3].value, LlValue::Bool(false)) {
-            return Ok(false);
-        }
-        let Some(len) = typed_value_u64(&call.args[2]) else {
-            return Ok(false);
-        };
-        if len == 0 {
-            return Ok(true);
-        }
-        let Some(dst_pointee) = self.pointer_pointee_for_value(&call.args[0].value)? else {
-            return Ok(false);
-        };
-        let Some(src_pointee) = self.pointer_pointee_for_value(&call.args[1].value)? else {
-            return Ok(false);
-        };
-        let dst_pointee = self.resolve_type(&dst_pointee)?;
-        let src_pointee = self.resolve_type(&src_pointee)?;
-        let copy_pointee = function_storage_local_type(&src_pointee);
-        let (copy_size, _) = self.raw_type_size_align(&copy_pointee)?;
-        if len < copy_size {
-            if !types_compatible(&dst_pointee, &src_pointee) {
-                return self.emit_prefix_source_struct_memcpy(
-                    &call.args[0],
-                    &call.args[1],
-                    &dst_pointee,
-                    &src_pointee,
+        staged_emit(instructions, |instructions| {
+            if !call.callee.starts_with("llvm.memcpy.") {
+                return Ok(false);
+            }
+            if call.args.len() != 4 || !matches!(call.args[3].value, LlValue::Bool(false)) {
+                return Ok(false);
+            }
+            let Some(len) = typed_value_u64(&call.args[2]) else {
+                return Ok(false);
+            };
+            if len == 0 {
+                return Ok(true);
+            }
+            let Some(dst_pointee) = self.pointer_pointee_for_value(&call.args[0].value)? else {
+                return Ok(false);
+            };
+            let Some(src_pointee) = self.pointer_pointee_for_value(&call.args[1].value)? else {
+                return Ok(false);
+            };
+            let dst_pointee = self.resolve_type(&dst_pointee)?;
+            let src_pointee = self.resolve_type(&src_pointee)?;
+            let copy_pointee = function_storage_local_type(&src_pointee);
+            let (copy_size, _) = self.raw_type_size_align(&copy_pointee)?;
+            if len < copy_size {
+                if !types_compatible(&dst_pointee, &src_pointee) {
+                    return self.emit_prefix_source_struct_memcpy(
+                        &call.args[0],
+                        &call.args[1],
+                        &dst_pointee,
+                        &src_pointee,
+                        len,
+                        instructions,
+                    );
+                }
+                let LlType::Struct(fields) = &function_storage_local_type(&src_pointee) else {
+                    return Ok(false);
+                };
+                let LlType::Ptr(dst_addrspace) = self.resolve_type(&call.args[0].ty)? else {
+                    return Ok(false);
+                };
+                let LlType::Ptr(src_addrspace) = self.resolve_type(&call.args[1].ty)? else {
+                    return Ok(false);
+                };
+                let dst_storage = self.pointer_storage_for(&call.args[0].value, dst_addrspace)?;
+                let src_storage = self.pointer_storage_for(&call.args[1].value, src_addrspace)?;
+                let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+                let src = self.value_id(&call.args[1].value, &call.args[1].ty)?;
+                return self.emit_prefix_struct_memcpy(
+                    dst,
+                    src,
+                    dst_storage,
+                    src_storage,
+                    fields,
+                    fields,
                     len,
                     instructions,
                 );
             }
-            let LlType::Struct(fields) = &function_storage_local_type(&src_pointee) else {
-                return Ok(false);
-            };
+
             let LlType::Ptr(dst_addrspace) = self.resolve_type(&call.args[0].ty)? else {
                 return Ok(false);
             };
@@ -965,153 +996,137 @@ impl Emitter {
             };
             let dst_storage = self.pointer_storage_for(&call.args[0].value, dst_addrspace)?;
             let src_storage = self.pointer_storage_for(&call.args[1].value, src_addrspace)?;
-            let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
             let src = self.value_id(&call.args[1].value, &call.args[1].ty)?;
-            return self.emit_prefix_struct_memcpy(
-                dst,
-                src,
+            if self.can_emit_whole_copy_memory(
+                &dst_pointee,
+                &src_pointee,
                 dst_storage,
                 src_storage,
-                fields,
-                fields,
-                len,
-                instructions,
-            );
-        }
-
-        let LlType::Ptr(dst_addrspace) = self.resolve_type(&call.args[0].ty)? else {
-            return Ok(false);
-        };
-        let LlType::Ptr(src_addrspace) = self.resolve_type(&call.args[1].ty)? else {
-            return Ok(false);
-        };
-        let dst_storage = self.pointer_storage_for(&call.args[0].value, dst_addrspace)?;
-        let src_storage = self.pointer_storage_for(&call.args[1].value, src_addrspace)?;
-        let src = self.value_id(&call.args[1].value, &call.args[1].ty)?;
-        if self.can_emit_whole_copy_memory(&dst_pointee, &src_pointee, dst_storage, src_storage)? {
-            let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-            self.emit_copy_memory(dst, src, instructions);
-            return Ok(true);
-        }
-
-        // LLVM may pass an array object directly as the destination of an exact one-element
-        // memcpy. Opaque pointers erase the source-level array-to-first-element decay, but SPIR-V
-        // retains the aggregate pointee and therefore needs that access chain constructed
-        // explicitly. Limit this to one complete source object; a longer byte range would require
-        // source extent information that the erased pointer does not provide.
-        if let LlType::Array(dst_element, count) = &dst_pointee {
-            if *count > 0 && len == copy_size && types_compatible(dst_element, &src_pointee) {
+            )? {
                 let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-                let dst_element = function_storage_local_type(dst_element);
-                let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_element)?;
-                let dst_element_ptr = self.fresh();
-                let zero = self.const_uint(0)?;
-                instructions.push(Self::inst(
-                    Op::InBoundsAccessChain,
-                    Some(dst_ptr_ty),
-                    Some(dst_element_ptr),
-                    vec![Operand::IdRef(dst), Operand::IdRef(zero)],
-                ));
-                return self.emit_aggregate_memcpy(
-                    dst_element_ptr,
+                self.emit_copy_memory(dst, src, instructions);
+                return Ok(true);
+            }
+
+            // LLVM may pass an array object directly as the destination of an exact one-element
+            // memcpy. Opaque pointers erase the source-level array-to-first-element decay, but SPIR-V
+            // retains the aggregate pointee and therefore needs that access chain constructed
+            // explicitly. Limit this to one complete source object; a longer byte range would require
+            // source extent information that the erased pointer does not provide.
+            if let LlType::Array(dst_element, count) = &dst_pointee {
+                if *count > 0 && len == copy_size && types_compatible(dst_element, &src_pointee) {
+                    let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+                    let dst_element = function_storage_local_type(dst_element);
+                    let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_element)?;
+                    let dst_element_ptr = self.fresh();
+                    let zero = self.const_uint(0)?;
+                    instructions.push(Self::inst(
+                        Op::InBoundsAccessChain,
+                        Some(dst_ptr_ty),
+                        Some(dst_element_ptr),
+                        vec![Operand::IdRef(dst), Operand::IdRef(zero)],
+                    ));
+                    return self.emit_aggregate_memcpy(
+                        dst_element_ptr,
+                        src,
+                        dst_storage,
+                        src_storage,
+                        &dst_element,
+                        &src_pointee,
+                        len,
+                        instructions,
+                    );
+                }
+            }
+
+            // A named AIR wrapper can contain the exact aggregate copied into a bare local array
+            // (`metal::matrix<T>` -> its `[N x vector<T>]` storage). Descend through the source's
+            // offset-zero field just as the symmetric destination-wrapper path below does. The helper's
+            // extent guard keeps this honest when a struct has trailing fields or padding covered by the
+            // requested byte count.
+            if matches!(src_pointee, LlType::Struct(_))
+                && self.emit_prefix_source_struct_memcpy(
+                    &call.args[0],
+                    &call.args[1],
+                    &dst_pointee,
+                    &src_pointee,
+                    len,
+                    instructions,
+                )?
+            {
+                return Ok(true);
+            }
+
+            if let (LlType::Struct(dst_fields), LlType::Struct(src_fields)) =
+                (&dst_pointee, &src_pointee)
+            {
+                if self.struct_prefix_fields_compatible(dst_fields, src_fields)? {
+                    let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+                    return self.emit_prefix_struct_memcpy(
+                        dst,
+                        src,
+                        dst_storage,
+                        src_storage,
+                        dst_fields,
+                        src_fields,
+                        len,
+                        instructions,
+                    );
+                }
+            }
+
+            if let (LlType::Array(dst_elem, dst_len), LlType::Array(src_elem, src_len)) =
+                (&dst_pointee, &src_pointee)
+            {
+                if dst_len != src_len || !types_compatible(dst_elem, src_elem) {
+                    return Ok(false);
+                }
+                let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+                return self.emit_prefix_array_memcpy(
+                    dst,
                     src,
                     dst_storage,
                     src_storage,
-                    &dst_element,
+                    dst_elem,
+                    src_elem,
+                    *src_len,
+                    len,
+                    instructions,
+                );
+            }
+
+            if let LlType::Struct(fields) = &dst_pointee {
+                let Some(field) = fields.first() else {
+                    return Ok(false);
+                };
+                if !types_compatible(field, &src_pointee) {
+                    return Ok(false);
+                }
+                let dst_field_pointee = function_storage_local_type(field);
+                let field_ptr_ty = self.ptr_type_id(dst_storage, &dst_field_pointee)?;
+                let base = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+                let zero = self.const_uint(0)?;
+                let field_ptr = self.fresh();
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(field_ptr_ty),
+                    Some(field_ptr),
+                    vec![Operand::IdRef(base), Operand::IdRef(zero)],
+                ));
+                return self.emit_aggregate_memcpy(
+                    field_ptr,
+                    src,
+                    dst_storage,
+                    src_storage,
+                    &dst_field_pointee,
                     &src_pointee,
                     len,
                     instructions,
                 );
             }
-        }
 
-        // A named AIR wrapper can contain the exact aggregate copied into a bare local array
-        // (`metal::matrix<T>` -> its `[N x vector<T>]` storage). Descend through the source's
-        // offset-zero field just as the symmetric destination-wrapper path below does. The helper's
-        // extent guard keeps this honest when a struct has trailing fields or padding covered by the
-        // requested byte count.
-        if matches!(src_pointee, LlType::Struct(_))
-            && self.emit_prefix_source_struct_memcpy(
-                &call.args[0],
-                &call.args[1],
-                &dst_pointee,
-                &src_pointee,
-                len,
-                instructions,
-            )?
-        {
-            return Ok(true);
-        }
-
-        if let (LlType::Struct(dst_fields), LlType::Struct(src_fields)) =
-            (&dst_pointee, &src_pointee)
-        {
-            if self.struct_prefix_fields_compatible(dst_fields, src_fields)? {
-                let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-                return self.emit_prefix_struct_memcpy(
-                    dst,
-                    src,
-                    dst_storage,
-                    src_storage,
-                    dst_fields,
-                    src_fields,
-                    len,
-                    instructions,
-                );
-            }
-        }
-
-        if let (LlType::Array(dst_elem, dst_len), LlType::Array(src_elem, src_len)) =
-            (&dst_pointee, &src_pointee)
-        {
-            if dst_len != src_len || !types_compatible(dst_elem, src_elem) {
-                return Ok(false);
-            }
-            let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-            return self.emit_prefix_array_memcpy(
-                dst,
-                src,
-                dst_storage,
-                src_storage,
-                dst_elem,
-                src_elem,
-                *src_len,
-                len,
-                instructions,
-            );
-        }
-
-        if let LlType::Struct(fields) = &dst_pointee {
-            let Some(field) = fields.first() else {
-                return Ok(false);
-            };
-            if !types_compatible(field, &src_pointee) {
-                return Ok(false);
-            }
-            let dst_field_pointee = function_storage_local_type(field);
-            let field_ptr_ty = self.ptr_type_id(dst_storage, &dst_field_pointee)?;
-            let base = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-            let zero = self.const_uint(0)?;
-            let field_ptr = self.fresh();
-            instructions.push(Self::inst(
-                Op::InBoundsAccessChain,
-                Some(field_ptr_ty),
-                Some(field_ptr),
-                vec![Operand::IdRef(base), Operand::IdRef(zero)],
-            ));
-            return self.emit_aggregate_memcpy(
-                field_ptr,
-                src,
-                dst_storage,
-                src_storage,
-                &dst_field_pointee,
-                &src_pointee,
-                len,
-                instructions,
-            );
-        }
-
-        Ok(false)
+            Ok(false)
+        })
     }
 
     pub(in crate::native::emitter) fn struct_prefix_fields_compatible(
@@ -1238,77 +1253,79 @@ impl Emitter {
         len: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let LlType::Struct(src_fields) = src_pointee else {
-            return Ok(false);
-        };
-        if src_fields.is_empty() {
-            return Ok(false);
-        }
-        let (src_offset, src_field) = self.raw_struct_member(src_fields, 0)?;
-        if src_offset != 0 {
-            return Ok(false);
-        }
-        let src_field = function_storage_local_type(&src_field);
-        let dst_pointee = function_storage_local_type(dst_pointee);
-        // A memcpy starting at an array object and spanning one element addresses element zero.
-        // Opaque LLVM pointers erase that decay: `%dst = alloca [N x T]` is passed directly while
-        // the source is a wrapper struct whose first field is `T`. Construct the element-zero
-        // pointer explicitly instead of leaving a residual byte-pointer memcpy call whose declared
-        // SPIR-V parameter cannot match the aggregate pointer value.
-        let (dst_copy_pointee, decay_destination_array) = match &dst_pointee {
-            LlType::Array(element, count)
-                if *count > 0 && types_compatible(element, &src_field) =>
-            {
-                (function_storage_local_type(element), true)
+        staged_emit(instructions, |instructions| {
+            let LlType::Struct(src_fields) = src_pointee else {
+                return Ok(false);
+            };
+            if src_fields.is_empty() {
+                return Ok(false);
             }
-            _ if types_compatible(&dst_pointee, &src_field) => (dst_pointee.clone(), false),
-            _ => return Ok(false),
-        };
-        let (field_size, _) = self.raw_type_size_align(&src_field)?;
-        if len > field_size {
-            return Ok(false);
-        }
+            let (src_offset, src_field) = self.raw_struct_member(src_fields, 0)?;
+            if src_offset != 0 {
+                return Ok(false);
+            }
+            let src_field = function_storage_local_type(&src_field);
+            let dst_pointee = function_storage_local_type(dst_pointee);
+            // A memcpy starting at an array object and spanning one element addresses element zero.
+            // Opaque LLVM pointers erase that decay: `%dst = alloca [N x T]` is passed directly while
+            // the source is a wrapper struct whose first field is `T`. Construct the element-zero
+            // pointer explicitly instead of leaving a residual byte-pointer memcpy call whose declared
+            // SPIR-V parameter cannot match the aggregate pointer value.
+            let (dst_copy_pointee, decay_destination_array) = match &dst_pointee {
+                LlType::Array(element, count)
+                    if *count > 0 && types_compatible(element, &src_field) =>
+                {
+                    (function_storage_local_type(element), true)
+                }
+                _ if types_compatible(&dst_pointee, &src_field) => (dst_pointee.clone(), false),
+                _ => return Ok(false),
+            };
+            let (field_size, _) = self.raw_type_size_align(&src_field)?;
+            if len > field_size {
+                return Ok(false);
+            }
 
-        let LlType::Ptr(dst_addrspace) = self.resolve_type(&dst_arg.ty)? else {
-            return Ok(false);
-        };
-        let LlType::Ptr(src_addrspace) = self.resolve_type(&src_arg.ty)? else {
-            return Ok(false);
-        };
-        let dst_storage = self.pointer_storage_for(&dst_arg.value, dst_addrspace)?;
-        let src_storage = self.pointer_storage_for(&src_arg.value, src_addrspace)?;
-        let mut dst = self.value_id(&dst_arg.value, &dst_arg.ty)?;
-        let src = self.value_id(&src_arg.value, &src_arg.ty)?;
-        let zero = self.const_uint(0)?;
-        if decay_destination_array {
-            let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_copy_pointee)?;
-            let dst_element = self.fresh();
+            let LlType::Ptr(dst_addrspace) = self.resolve_type(&dst_arg.ty)? else {
+                return Ok(false);
+            };
+            let LlType::Ptr(src_addrspace) = self.resolve_type(&src_arg.ty)? else {
+                return Ok(false);
+            };
+            let dst_storage = self.pointer_storage_for(&dst_arg.value, dst_addrspace)?;
+            let src_storage = self.pointer_storage_for(&src_arg.value, src_addrspace)?;
+            let mut dst = self.value_id(&dst_arg.value, &dst_arg.ty)?;
+            let src = self.value_id(&src_arg.value, &src_arg.ty)?;
+            let zero = self.const_uint(0)?;
+            if decay_destination_array {
+                let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_copy_pointee)?;
+                let dst_element = self.fresh();
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(dst_ptr_ty),
+                    Some(dst_element),
+                    vec![Operand::IdRef(dst), Operand::IdRef(zero)],
+                ));
+                dst = dst_element;
+            }
+            let src_ptr_ty = self.ptr_type_id(src_storage, &src_field)?;
+            let src_field_ptr = self.fresh();
             instructions.push(Self::inst(
                 Op::InBoundsAccessChain,
-                Some(dst_ptr_ty),
-                Some(dst_element),
-                vec![Operand::IdRef(dst), Operand::IdRef(zero)],
+                Some(src_ptr_ty),
+                Some(src_field_ptr),
+                vec![Operand::IdRef(src), Operand::IdRef(zero)],
             ));
-            dst = dst_element;
-        }
-        let src_ptr_ty = self.ptr_type_id(src_storage, &src_field)?;
-        let src_field_ptr = self.fresh();
-        instructions.push(Self::inst(
-            Op::InBoundsAccessChain,
-            Some(src_ptr_ty),
-            Some(src_field_ptr),
-            vec![Operand::IdRef(src), Operand::IdRef(zero)],
-        ));
-        self.emit_aggregate_memcpy(
-            dst,
-            src_field_ptr,
-            dst_storage,
-            src_storage,
-            &dst_copy_pointee,
-            &src_field,
-            len,
-            instructions,
-        )
+            self.emit_aggregate_memcpy(
+                dst,
+                src_field_ptr,
+                dst_storage,
+                src_storage,
+                &dst_copy_pointee,
+                &src_field,
+                len,
+                instructions,
+            )
+        })
     }
 
     pub(in crate::native::emitter) fn emit_prefix_struct_memcpy(
@@ -1322,59 +1339,61 @@ impl Emitter {
         len: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let mut copied_any = false;
-        for index in 0..src_fields.len() {
-            let (dst_offset, dst_field) = self.raw_struct_member(dst_fields, index as u64)?;
-            let (src_offset, src_field) = self.raw_struct_member(src_fields, index as u64)?;
-            if dst_offset != src_offset {
-                return Ok(false);
-            }
-            let offset = src_offset;
-            if offset >= len {
-                break;
-            }
-            let dst_field = function_storage_local_type(&dst_field);
-            let src_field = function_storage_local_type(&src_field);
-            let (field_size, _) = self.raw_type_size_align(&src_field)?;
-            if field_size == 0 {
-                continue;
-            }
-            if offset + field_size > len {
-                return Ok(false);
-            }
+        staged_emit(instructions, |instructions| {
+            let mut copied_any = false;
+            for index in 0..src_fields.len() {
+                let (dst_offset, dst_field) = self.raw_struct_member(dst_fields, index as u64)?;
+                let (src_offset, src_field) = self.raw_struct_member(src_fields, index as u64)?;
+                if dst_offset != src_offset {
+                    return Ok(false);
+                }
+                let offset = src_offset;
+                if offset >= len {
+                    break;
+                }
+                let dst_field = function_storage_local_type(&dst_field);
+                let src_field = function_storage_local_type(&src_field);
+                let (field_size, _) = self.raw_type_size_align(&src_field)?;
+                if field_size == 0 {
+                    continue;
+                }
+                if offset + field_size > len {
+                    return Ok(false);
+                }
 
-            let index_id = self.const_uint(index as u32)?;
-            let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_field)?;
-            let dst_field = self.fresh();
-            instructions.push(Self::inst(
-                Op::InBoundsAccessChain,
-                Some(dst_ptr_ty),
-                Some(dst_field),
-                vec![Operand::IdRef(dst), Operand::IdRef(index_id)],
-            ));
-            let src_ptr_ty = self.ptr_type_id(src_storage, &src_field)?;
-            let src_field = self.fresh();
-            instructions.push(Self::inst(
-                Op::InBoundsAccessChain,
-                Some(src_ptr_ty),
-                Some(src_field),
-                vec![Operand::IdRef(src), Operand::IdRef(index_id)],
-            ));
-            if !self.emit_aggregate_memcpy(
-                dst_field,
-                src_field,
-                dst_storage,
-                src_storage,
-                &dst_fields[index],
-                &src_fields[index],
-                field_size,
-                instructions,
-            )? {
-                return Ok(false);
+                let index_id = self.const_uint(index as u32)?;
+                let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_field)?;
+                let dst_field = self.fresh();
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(dst_ptr_ty),
+                    Some(dst_field),
+                    vec![Operand::IdRef(dst), Operand::IdRef(index_id)],
+                ));
+                let src_ptr_ty = self.ptr_type_id(src_storage, &src_field)?;
+                let src_field = self.fresh();
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(src_ptr_ty),
+                    Some(src_field),
+                    vec![Operand::IdRef(src), Operand::IdRef(index_id)],
+                ));
+                if !self.emit_aggregate_memcpy(
+                    dst_field,
+                    src_field,
+                    dst_storage,
+                    src_storage,
+                    &dst_fields[index],
+                    &src_fields[index],
+                    field_size,
+                    instructions,
+                )? {
+                    return Ok(false);
+                }
+                copied_any = true;
             }
-            copied_any = true;
-        }
-        Ok(copied_any)
+            Ok(copied_any)
+        })
     }
 
     pub(in crate::native::emitter) fn emit_prefix_array_memcpy(
@@ -1389,51 +1408,53 @@ impl Emitter {
         len: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let dst_elem = function_storage_local_type(dst_elem);
-        let src_elem = function_storage_local_type(src_elem);
-        let (elem_size, elem_align) = self.raw_type_size_align(&src_elem)?;
-        let stride = round_up_u64(elem_size, elem_align);
-        let mut copied_any = false;
-        for index in 0..count {
-            let offset = stride * u64::from(index);
-            if offset >= len {
-                break;
-            }
-            if offset + elem_size > len {
-                return Ok(false);
-            }
+        staged_emit(instructions, |instructions| {
+            let dst_elem = function_storage_local_type(dst_elem);
+            let src_elem = function_storage_local_type(src_elem);
+            let (elem_size, elem_align) = self.raw_type_size_align(&src_elem)?;
+            let stride = round_up_u64(elem_size, elem_align);
+            let mut copied_any = false;
+            for index in 0..count {
+                let offset = stride * u64::from(index);
+                if offset >= len {
+                    break;
+                }
+                if offset + elem_size > len {
+                    return Ok(false);
+                }
 
-            let index_id = self.const_uint(index)?;
-            let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_elem)?;
-            let dst_element = self.fresh();
-            instructions.push(Self::inst(
-                Op::InBoundsAccessChain,
-                Some(dst_ptr_ty),
-                Some(dst_element),
-                vec![Operand::IdRef(dst), Operand::IdRef(index_id)],
-            ));
-            let src_ptr_ty = self.ptr_type_id(src_storage, &src_elem)?;
-            let src_element = self.fresh();
-            instructions.push(Self::inst(
-                Op::InBoundsAccessChain,
-                Some(src_ptr_ty),
-                Some(src_element),
-                vec![Operand::IdRef(src), Operand::IdRef(index_id)],
-            ));
-            if !self.emit_aggregate_memcpy(
-                dst_element,
-                src_element,
-                dst_storage,
-                src_storage,
-                &dst_elem,
-                &src_elem,
-                elem_size,
-                instructions,
-            )? {
-                return Ok(false);
+                let index_id = self.const_uint(index)?;
+                let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_elem)?;
+                let dst_element = self.fresh();
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(dst_ptr_ty),
+                    Some(dst_element),
+                    vec![Operand::IdRef(dst), Operand::IdRef(index_id)],
+                ));
+                let src_ptr_ty = self.ptr_type_id(src_storage, &src_elem)?;
+                let src_element = self.fresh();
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(src_ptr_ty),
+                    Some(src_element),
+                    vec![Operand::IdRef(src), Operand::IdRef(index_id)],
+                ));
+                if !self.emit_aggregate_memcpy(
+                    dst_element,
+                    src_element,
+                    dst_storage,
+                    src_storage,
+                    &dst_elem,
+                    &src_elem,
+                    elem_size,
+                    instructions,
+                )? {
+                    return Ok(false);
+                }
+                copied_any = true;
             }
-            copied_any = true;
-        }
-        Ok(copied_any)
+            Ok(copied_any)
+        })
     }
 }

@@ -35,12 +35,14 @@ mod memory;
 mod ops;
 mod pointer_network;
 mod pointers;
+mod staged;
 mod types;
 
 #[cfg(test)]
 mod layout_tests;
 
 use helpers::*;
+use staged::staged_emit;
 
 pub(super) struct Emitter {
     module: Module,
