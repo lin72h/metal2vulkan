@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reflection schema v32: `ShaderReflection::bindings` reports each resource exactly once. A fragment
+  entry with an `air.indirect_buffer` argument previously listed every argument-buffer resident
+  twice, so a consumer sizing its work from that list allocated and wrote each of those descriptors
+  twice. `validate_descriptor_abi`, which both reflection paths run, now rejects two entries that
+  agree in every field.
 - Reflection schema v31: implicit imageblock render-target planes are reported at every stage whose
   module calls the `air.load/store.implicit_imageblock.*` intrinsics, not only in compute. The
   interface pass materializes the descriptor from the call, so a fragment entry that reads its

@@ -73,7 +73,7 @@ mod footprint;
 /// materializes the plane from the call, which is a property of the body rather than of the stage.
 /// Reflected translation also reports the buffer-address table the finished module declares instead
 /// of the one an AIR text scan predicted.
-pub const REFLECTION_VERSION: u32 = 31;
+pub const REFLECTION_VERSION: u32 = 32;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -1690,6 +1690,25 @@ impl ShaderReflection {
             }
             (_, None) => {}
         }
+        // A consumer walks `bindings` and acts once per entry: it allocates a descriptor, writes
+        // it, and sizes its per-resource budgets from the count. Two entries equal in every field
+        // therefore describe one resource twice and ask for that work twice, while carrying no
+        // information the first entry did not. Genuinely distinct resources always differ
+        // somewhere — the Metal index, the entry-parameter index, or, for an argument-buffer
+        // resident, the field offset inside its owning buffer — so equality is the test, not the
+        // `(set, binding)` pair, which raw-word alias buffers legitimately share.
+        for (index, resource) in self.bindings.iter().enumerate() {
+            if let Some(first) = self.bindings[..index]
+                .iter()
+                .position(|other| other == resource)
+            {
+                return Err(format!(
+                    "reflection reports {:?}({}) twice, identically, at bindings[{first}] and bindings[{index}]",
+                    resource.kind, resource.metal_index
+                ));
+            }
+        }
+
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         enum DescriptorClass {
             StorageBuffer,
@@ -2106,11 +2125,6 @@ impl ShaderReflection {
             };
             bindings.push(binding);
         }
-        append_embedded_resources(
-            &mut bindings,
-            &meta.embedded_textures,
-            &meta.embedded_arguments,
-        );
         append_embedded_resources(
             &mut bindings,
             &meta.embedded_textures,

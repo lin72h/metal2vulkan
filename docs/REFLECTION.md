@@ -72,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `31`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `32`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
