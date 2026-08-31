@@ -633,6 +633,23 @@ pub(in crate::passes) fn rewrite_return(
     let mut outputs: Vec<OutputWrite> = vec![];
     let rdef = defs.get(&ret_ty).cloned();
 
+    // AIR states an output because the shader writes it. A member whose role has no lowering used
+    // to be skipped silently, which turns the value the shader computed into one nothing carries —
+    // a wrong module the validator, the descriptor layout and reflection all agree with. Reject it
+    // instead, naming the role so the gap is actionable.
+    let unmodelled = match stage {
+        Stage::Fragment => frag.map(|meta| meta.unmodelled_output_members.as_slice()),
+        Stage::Vertex => vert.map(|meta| meta.unmodelled_output_members.as_slice()),
+        Stage::Kernel => None,
+    }
+    .unwrap_or_default();
+    if let Some((member, role)) = unmodelled.first() {
+        return Err(format!(
+            "return member {member} declares AIR output role `air.{role}`, which has no lowering; \
+             emitting the module would silently drop what the shader wrote to it"
+        ));
+    }
+
     match stage {
         Stage::Fragment => {
             if let Some(def) = &rdef {

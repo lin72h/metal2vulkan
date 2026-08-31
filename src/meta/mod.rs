@@ -175,6 +175,9 @@ pub struct FragMeta {
     /// how alpha-to-coverage and custom MSAA resolves are expressed. Vulkan spells it as the
     /// `SampleMask` builtin, an array of `uint` rather than the scalar Metal returns.
     pub sample_mask_members: Vec<u32>,
+    /// `(member index, AIR role)` for every enabled return member whose role the emitter has no
+    /// lowering for. See [`FRAGMENT_OUTPUT_ROLES`].
+    pub unmodelled_output_members: Vec<(u32, String)>,
     /// Custom per-pixel fragment imageblock master plus the input/output projections that expose
     /// subsets of its fields. `None` when the fragment carries no `air.imageblock_master` contract.
     pub fragment_imageblock: Option<FragmentImageblock>,
@@ -401,6 +404,12 @@ pub struct VertMeta {
     /// exact cross-stage scalar type instead of forcing executors to infer it from a location.
     pub parameter_type_names: HashMap<u32, String>,
     pub output_roles: Vec<VertOutRole>,
+    /// `(member index, AIR role)` for every output member decoded as [`VertOutRole::Other`].
+    ///
+    /// The vertex output walk gives an unrecognised member the next free user Location, so an
+    /// unmodelled role does not vanish — it becomes a varying the pipeline never wired, at a
+    /// Location it takes from a real one. Reporting it lets emission reject instead.
+    pub unmodelled_output_members: Vec<(u32, String)>,
     /// Output member indices AIR marked `air.invariant` — Metal `[[position, invariant]]`.
     ///
     /// The guarantee is bit-exact: the same vertex fed through two pipelines that both declare it
@@ -1614,6 +1623,20 @@ pub(crate) fn parse_air_fragment_meta_with_entry(ll: &str) -> (Option<FragMeta>,
     (meta, entry)
 }
 
+/// The fragment return-member roles the emitter lowers.
+///
+/// A member carrying any other role is reported through `FragMeta::unmodelled_output_members` and
+/// rejected at emission rather than skipped. AIR states an output because the shader writes it, so
+/// a member nothing knows how to write is a value that silently disappears — the shape that let
+/// `[[sample_mask]]` be dropped without a diagnostic for as long as it was unrecognised.
+pub const FRAGMENT_OUTPUT_ROLES: &[&str] = &[
+    "render_target",
+    "depth",
+    "stencil",
+    "sample_mask",
+    "imageblock_data",
+];
+
 fn parse_air_fragment_meta_with_nodes(
     ll: &str,
     nodes: &HashMap<u32, String>,
@@ -1684,6 +1707,23 @@ fn parse_air_fragment_meta_with_nodes(
     });
     let stencil_members = output_members_with_role("stencil");
     let sample_mask_members = output_members_with_role("sample_mask");
+    let unmodelled_output_members: Vec<(u32, String)> = nodes
+        .get(&out_ref)
+        .map(|c| {
+            refs_in(c)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let node = nodes.get(&r)?;
+                    let roles = role_strings(node);
+                    let role = primary_role(&roles)?;
+                    (!FRAGMENT_OUTPUT_ROLES.contains(&role)
+                        && metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then(|| (i as u32, role.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let render_target_indices: Vec<u32> = render_target_members
         .iter()
         .map(|(_, location)| *location)
@@ -1851,6 +1891,7 @@ fn parse_air_fragment_meta_with_nodes(
         depth_qualifier,
         stencil_members,
         sample_mask_members,
+        unmodelled_output_members,
         fragment_imageblock,
         render_target_indices,
         buffer_layouts,
@@ -1915,6 +1956,7 @@ fn parse_air_vertex_meta_with_nodes(
 
     let mut output_roles = vec![];
     let mut invariant_outputs = vec![];
+    let mut unmodelled_output_members = vec![];
     let mut output_varying_types = HashMap::new();
     let mut output_varying_names = HashMap::new();
     let mut output_varying_user_semantics = HashMap::new();
@@ -1952,6 +1994,9 @@ fn parse_air_vertex_meta_with_nodes(
         };
         if strs.iter().any(|s| s == "invariant") {
             invariant_outputs.push(output_roles.len() as u32);
+        }
+        if matches!(role, VertOutRole::Other) {
+            unmodelled_output_members.push((output_roles.len() as u32, first.to_string()));
         }
         output_roles.push(role);
     }
@@ -2110,6 +2155,7 @@ fn parse_air_vertex_meta_with_nodes(
         parameter_type_names,
         output_roles,
         invariant_outputs,
+        unmodelled_output_members,
         output_varying_types,
         output_varying_names,
         output_varying_user_semantics,

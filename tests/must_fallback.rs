@@ -13,6 +13,11 @@
 //! just has not been written, and the reason it is pinned is that the obvious ways to write it are
 //! wrong. Closing it must be a deliberate change to this test, not a silent pass.
 //!
+//! One class here is not an unsupported *construct* but an unmodelled *role*: an AIR stage output
+//! the emitter has no case for. Those used to be skipped silently, which is the one outcome the
+//! floor-safety argument does not survive — the module validates and reflects identically while the
+//! value the shader computed reaches nothing. They are pinned here with their positive controls.
+//!
 //! One case here is deliberately POSITIVE. A rejection is only pinned from one side: a test that
 //! asserts a class FALLBACKs cannot notice a change that starts rejecting inputs that used to
 //! translate. The function-constant-gated pair below asserts both directions over a single
@@ -296,6 +301,109 @@ fn intersection_function_buffer_fallbacks() {
          i32, i32, i32, i32, i32, i1, i1)\n",
     );
     assert_fallback(&ll, "air.intersect.intersection_function_buffer");
+}
+
+/// A return member whose AIR output role has no lowering.
+///
+/// AIR states an output because the shader writes it, so a member the emitter has no case for is a
+/// computed value that reaches nothing. That used to be a `continue` in the output-member walk: the
+/// module still validated, still exposed the same descriptors, and still reflected identically —
+/// only the write was missing. `[[sample_mask]]` sat in exactly that hole until it was noticed by
+/// eye, and the next role to be added to AIR would sit there too.
+///
+/// The rejection is on the *role*, not on any particular name, so an authored marker AIR does not
+/// define stands in for whatever that next role turns out to be. Its positive control is the same
+/// module with the member declared a role that does have a lowering.
+#[test]
+fn an_output_member_with_no_lowering_fallbacks() {
+    const FRAGMENT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+define <{ <4 x float>, i32 }> @frag(<4 x float> %pos, i32 %extra) {
+entry:
+  %r0 = insertvalue <{ <4 x float>, i32 }> undef, <4 x float> %pos, 0
+  %r1 = insertvalue <{ <4 x float>, i32 }> %r0, i32 %extra, 1
+  ret <{ <4 x float>, i32 }> %r1
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!3 = !{!"air.ROLE", !"air.arg_type_name", !"uint", !"air.arg_name", !"extra"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
+!6 = !{i32 1, !"air.fragment_input", !"generated(e)", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"extra"}
+"#;
+
+    let unknown = FRAGMENT.replace("air.ROLE", "air.coverage_of_a_role_that_does_not_exist");
+    match translate_sanitized_native(&unknown, Stage::Fragment, &tmp()) {
+        Ok(spv) => panic!(
+            "expected a clean FALLBACK but translate succeeded ({} bytes); an output member \
+             nothing writes is a silently wrong module",
+            spv.len()
+        ),
+        Err(e) => {
+            assert!(
+                e.contains("air.coverage_of_a_role_that_does_not_exist"),
+                "the diagnostic should name the role it cannot lower; got: {e}"
+            );
+            assert!(
+                e.contains("return member 1"),
+                "and the member it sits on; got: {e}"
+            );
+        }
+    }
+
+    let known = FRAGMENT.replace(r#"!"air.ROLE""#, r#"!"air.sample_mask""#);
+    assert!(
+        translate_sanitized_native(&known, Stage::Fragment, &tmp()).is_ok(),
+        "the same module with a role that does have a lowering must translate"
+    );
+}
+
+/// The same guard on the vertex side, where an unmodelled member is worse than dropped: the output
+/// walk hands it the next free user Location, so it displaces a real varying instead of vanishing.
+#[test]
+fn an_unmodelled_vertex_output_member_fallbacks() {
+    const VERTEX: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+define <{ <4 x float>, <2 x float> }> @vert(<4 x float> %p, <2 x float> %uv) {
+entry:
+  %r0 = insertvalue <{ <4 x float>, <2 x float> }> undef, <4 x float> %p, 0
+  %r1 = insertvalue <{ <4 x float>, <2 x float> }> %r0, <2 x float> %uv, 1
+  ret <{ <4 x float>, <2 x float> }> %r1
+}
+
+!air.vertex = !{!0}
+!0 = !{ptr @vert, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!3 = !{!"air.ROLE", !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"p"}
+!6 = !{i32 1, !"air.vertex_input", !"air.location_index", i32 1, !"air.arg_type_name", !"float2", !"air.arg_name", !"uv"}
+"#;
+
+    let unknown = VERTEX.replace("air.ROLE", "air.output_role_that_does_not_exist");
+    match translate_sanitized_native(&unknown, Stage::Vertex, &tmp()) {
+        Ok(spv) => panic!(
+            "expected a clean FALLBACK but translate succeeded ({} bytes)",
+            spv.len()
+        ),
+        Err(e) => assert!(
+            e.contains("air.output_role_that_does_not_exist"),
+            "the diagnostic should name the role; got: {e}"
+        ),
+    }
+
+    let known = VERTEX.replace(
+        r#"!"air.ROLE""#,
+        r#"!"air.vertex_output", !"generated(uv)""#,
+    );
+    assert!(
+        translate_sanitized_native(&known, Stage::Vertex, &tmp()).is_ok(),
+        "the same module with a modelled role must translate"
+    );
 }
 
 #[test]
