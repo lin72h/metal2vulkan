@@ -1546,6 +1546,7 @@ mod finalize;
 #[cfg(test)]
 mod lowering_regression_tests;
 mod module_cleanup;
+pub(crate) use module_cleanup::drop_unreferenced_global_variables;
 mod prune;
 mod resources;
 mod spirv_cfg;
@@ -2661,6 +2662,10 @@ pub(crate) fn transform_with_options_and_sidecar(
     // sealing synthesized before global liveness runs.
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
+    // The closures above are the last of this boundary's instruction changes, and any of them can
+    // delete a variable's last use. Re-establish global liveness against the finished bodies before
+    // the collection that would otherwise root a stranded variable at its own interface entry.
+    module_cleanup::drop_unreferenced_global_variables(&mut ctx.module);
     module_cleanup::gc_dead_globals(&mut ctx);
     debug_phase!("complete");
 

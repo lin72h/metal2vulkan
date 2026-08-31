@@ -82,6 +82,68 @@ pub(super) fn drop_dead_unreferenced_variables(
     });
 }
 
+/// Whether a non-semantic record (`OpName`, `OpDecorate`, `OpMemberName`, `OpMemberDecorate`) is
+/// about one of `removed`. Every one of them names its target first.
+fn targets_any(instruction: &Instruction, removed: &HashSet<Word>) -> bool {
+    matches!(instruction.operands.first(), Some(Operand::IdRef(id)) if removed.contains(id))
+}
+
+/// Drop every global `OpVariable` no instruction references, together with its entry-point interface
+/// entry, its decorations, and its debug names. Returns whether anything was removed.
+///
+/// `finalize` applies this rule once, against the bodies as they stand when it builds the entry
+/// point. Instruction-deleting work runs after it at two boundaries — the pointer and access-chain
+/// closures at the end of `transform`, and dead-value elimination plus constant-CFG pruning in
+/// `finish_module` — and when one of those deletes a variable's last use, nothing downstream can
+/// remove the variable: `gc_dead_globals` roots liveness AT the entry-point interface, so the
+/// interface entry keeps the variable alive and the variable justifies the interface entry. The
+/// module then ships an `OpVariable` with a `DescriptorSet`/`Binding` no instruction touches, and a
+/// consumer building a descriptor-set layout from the interface has to satisfy a binding the shader
+/// never reads.
+///
+/// Re-applying the rule after the last instruction-deleting step breaks that cycle. It can only
+/// shrink the interface — an id kept here is one an instruction still names — so SPIR-V 1.4's
+/// requirement that the interface list every global the entry point references is preserved.
+pub(crate) fn drop_unreferenced_global_variables(module: &mut Module) -> bool {
+    /// `OpEntryPoint` operands: execution model, entry function id, name, then the interface ids.
+    const INTERFACE_START: usize = 3;
+
+    let referenced = function_referenced_ids(module);
+    let removed = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::Variable)
+        .filter_map(|instruction| instruction.result_id)
+        .filter(|id| !referenced.contains(id))
+        .collect::<HashSet<_>>();
+    if removed.is_empty() {
+        return false;
+    }
+    for entry_point in &mut module.entry_points {
+        entry_point.operands = std::mem::take(&mut entry_point.operands)
+            .into_iter()
+            .enumerate()
+            .filter(|(index, operand)| match operand {
+                Operand::IdRef(id) if *index >= INTERFACE_START => !removed.contains(id),
+                _ => true,
+            })
+            .map(|(_, operand)| operand)
+            .collect();
+    }
+    module.types_global_values.retain(|instruction| {
+        instruction
+            .result_id
+            .is_none_or(|id| !removed.contains(&id))
+    });
+    module
+        .annotations
+        .retain(|instruction| !targets_any(instruction, &removed));
+    module
+        .debug_names
+        .retain(|instruction| !targets_any(instruction, &removed));
+    true
+}
+
 /// Remove OpName/OpDecorate/OpMemberDecorate whose target id is not defined anywhere.
 pub(super) fn drop_dangling_debug(ctx: &mut Ctx) {
     let defined = defined_ids(&ctx.module);
@@ -620,6 +682,142 @@ mod tests {
     use super::*;
     use crate::spirv_module::Module;
     use crate::spirv_module::ModuleHeader;
+
+    /// A module whose entry point lists two descriptor variables while only one is still loaded.
+    /// The second is what a pipeline boundary strands when a later rewrite deletes its last use.
+    fn module_with_one_stranded_descriptor() -> Module {
+        use crate::spirv_module::{Block, Function};
+        let (uint, pointer, live, stranded, entry, loaded) = (1, 2, 3, 4, 5, 6);
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(7));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(uint),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(pointer),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(uint),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(pointer),
+                Some(live),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(pointer),
+                Some(stranded),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+        ];
+        for (variable, binding) in [(live, 0), (stranded, 1)] {
+            module.annotations.push(Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(variable),
+                    Operand::Decoration(spirv::Decoration::Binding),
+                    Operand::LiteralBit32(binding),
+                ],
+            ));
+            module.debug_names.push(Instruction::new(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(variable),
+                    Operand::LiteralString(format!("buffer{binding}")),
+                ],
+            ));
+        }
+        module.entry_points.push(Instruction::new(
+            Op::EntryPoint,
+            None,
+            None,
+            vec![
+                Operand::ExecutionModel(spirv::ExecutionModel::GLCompute),
+                Operand::IdRef(entry),
+                Operand::LiteralString("main".to_string()),
+                Operand::IdRef(live),
+                Operand::IdRef(stranded),
+            ],
+        ));
+        let mut function = Function::new();
+        let mut block = Block::new();
+        block.instructions.push(Instruction::new(
+            Op::Load,
+            Some(uint),
+            Some(loaded),
+            vec![Operand::IdRef(live)],
+        ));
+        function.blocks.push(block);
+        module.functions.push(function);
+        module
+    }
+
+    /// The ids `module_with_one_stranded_descriptor` uses, in the order it names them.
+    const LIVE_VARIABLE: Word = 3;
+    const STRANDED_VARIABLE: Word = 4;
+
+    fn variable_ids(module: &Module) -> HashSet<Word> {
+        module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::Variable)
+            .filter_map(|instruction| instruction.result_id)
+            .collect()
+    }
+
+    fn ids_named_by(records: &[Instruction]) -> HashSet<Word> {
+        records
+            .iter()
+            .filter_map(|instruction| match instruction.operands.first() {
+                Some(Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_variable_no_instruction_references_leaves_with_its_interface_entry_and_records() {
+        let mut module = module_with_one_stranded_descriptor();
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert_eq!(variable_ids(&module), HashSet::from([LIVE_VARIABLE]));
+        let interface = module.entry_points[0].operands[3..]
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(interface, HashSet::from([LIVE_VARIABLE]));
+        assert!(!ids_named_by(&module.annotations).contains(&STRANDED_VARIABLE));
+        assert!(!ids_named_by(&module.debug_names).contains(&STRANDED_VARIABLE));
+        // The surviving descriptor keeps everything that describes it.
+        assert!(ids_named_by(&module.annotations).contains(&LIVE_VARIABLE));
+        assert!(ids_named_by(&module.debug_names).contains(&LIVE_VARIABLE));
+    }
+
+    #[test]
+    fn the_sweep_reaches_a_fixed_point_in_one_pass() {
+        let mut module = module_with_one_stranded_descriptor();
+        assert!(drop_unreferenced_global_variables(&mut module));
+        // Nothing left to remove, so a pipeline that runs it at more than one boundary pays a scan
+        // and changes nothing.
+        assert!(!drop_unreferenced_global_variables(&mut module));
+    }
 
     #[test]
     fn gc_keeps_local_pointer_store_sentinel_rooted_by_typed_sidecar() {

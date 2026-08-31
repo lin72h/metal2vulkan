@@ -960,6 +960,13 @@ fn finish_module(
     native::construct_cfg_functions_module(&mut out, &cfg_construction_functions)
         .map_err(FinishFailure::cfg)?;
     native::construct_physical_atomic_pointer_lvalues_module(&mut out);
+    // Every instruction-deleting step of this boundary has run. Dead-value elimination, constant-CFG
+    // pruning, and CFG construction all delete uses after `transform` established global liveness,
+    // so a variable can outlive its last use here; re-establish liveness before the module is sealed.
+    // An interface entry naming a descriptor binding no instruction touches is a demand on every
+    // consumer that builds its layout from the interface. This runs ahead of the constant sweep
+    // below so the initializers it strands are collected in the same step.
+    passes::drop_unreferenced_global_variables(&mut out);
     // CFG construction rematerializes values used by the selected representation. Discard any
     // null/undef constants that become dead in that final graph; under PhysicalStorageBuffer64 an
     // otherwise unreferenced logical-pointer null is still structurally invalid SPIR-V.
