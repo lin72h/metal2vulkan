@@ -1741,20 +1741,8 @@ fn typed_instruction_count(blocks: &[BodyBlock]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::bb;
     use super::*;
-
-    fn bb(name: &str, lines: &[&str]) -> BodyBlock {
-        let lines = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        BodyBlock {
-            name: name.to_string(),
-            role: BlockRole::Normal,
-            typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new())
-                .map(Into::into),
-        }
-    }
 
     #[test]
     fn straddle_closure_counts_owner_arm_and_merge_tail() {

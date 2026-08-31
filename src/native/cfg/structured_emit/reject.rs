@@ -1330,20 +1330,8 @@ pub(in crate::native) fn reject_reason_inner(blocks: &[BodyBlock]) -> Option<Str
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::bb_role as bb;
     use super::*;
-
-    fn bb(name: &str, role: BlockRole, lines: &[&str]) -> BodyBlock {
-        let lines = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        BodyBlock {
-            name: name.to_string(),
-            role,
-            typed: crate::native::tir::lower_block_carrier(name, &lines, &HashMap::new())
-                .map(Into::into),
-        }
-    }
 
     #[test]
     fn plan_self_check_rejects_merge_claimed_by_two_headers() {

@@ -1472,19 +1472,8 @@ pub(in crate::native) fn renest_loop_exit_sibling(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::bb;
     use super::*;
-
-    fn bb(name: &str, lines: &[&str]) -> BodyBlock {
-        let lines = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        BodyBlock {
-            name: name.to_string(),
-            role: BlockRole::Normal,
-            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()).map(Into::into),
-        }
-    }
 
     #[test]
     fn r2_straddle_derivation_is_reject_only() {

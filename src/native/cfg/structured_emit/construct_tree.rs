@@ -461,19 +461,10 @@ pub(in crate::native) fn materialize_construct_routes(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_support::bb;
     use super::*;
     use crate::native::ir::{LlType, LlValue, TypedValue};
     use crate::native::tir;
-    use std::collections::HashMap;
-
-    fn bb(name: &str, lines: &[&str]) -> BodyBlock {
-        let lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
-        BodyBlock {
-            name: name.to_string(),
-            role: BlockRole::Normal,
-            typed: tir::lower_block_carrier(name, &lines, &HashMap::new()).map(Into::into),
-        }
-    }
 
     fn deep_single_owner_nodes() -> Vec<ConstructNode> {
         vec![

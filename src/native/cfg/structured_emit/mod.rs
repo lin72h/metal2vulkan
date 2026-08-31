@@ -71,32 +71,13 @@ pub(in crate::native) use straddle_region::*;
 
 #[cfg(test)]
 mod construct_tree_fixtures;
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{bb, bb_role};
     use super::*;
-
-    fn bb(name: &str, lines: &[&str]) -> BodyBlock {
-        // Populate the typed carrier exactly as production does at split time (the sole substrate).
-        let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-        let typed = crate::native::tir::lower_block_carrier(
-            name,
-            &lines,
-            &std::collections::HashMap::new(),
-        );
-        BodyBlock {
-            name: name.to_string(),
-            role: BlockRole::Normal,
-            typed: typed.map(Into::into),
-        }
-    }
-
-    fn bb_role(name: &str, role: BlockRole, lines: &[&str]) -> BodyBlock {
-        BodyBlock {
-            role,
-            ..bb(name, lines)
-        }
-    }
 
     /// A phi incoming VALUE rendered to a comparable token for the carrier-substrate test assertions
     /// (the cases these tests use: locals, integer constants, `true`/`false`, `undef`).
