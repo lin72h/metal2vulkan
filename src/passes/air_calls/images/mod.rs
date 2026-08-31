@@ -207,6 +207,40 @@ fn image_type_is_multisampled(ctx: &Ctx, image_ty: Word) -> bool {
     })
 }
 
+/// The `Dim` this image value carries, from the pass-side record when there is one and from the
+/// emitted `OpTypeImage` otherwise.
+pub(in crate::passes) fn image_value_dim(ctx: &Ctx, image: Word) -> Option<spirv::Dim> {
+    if let Some((dim, _)) = ctx.image_dims.get(&image) {
+        return Some(*dim);
+    }
+    let def = type_def_of(ctx, value_result_type(ctx, image)?)?;
+    match (def.class.opcode, def.operands.get(1)) {
+        (Op::TypeImage, Some(Operand::Dim(dim))) => Some(*dim),
+        _ => None,
+    }
+}
+
+/// The size-query opcode this image value requires.
+///
+/// SPIR-V allows `OpImageQuerySizeLod` only on an image whose `Dim` is 1D, 2D, 3D, or Cube, whose
+/// `MS` is 0, and whose `Sampled` operand is not 2. Every other image -- a buffer texture, a
+/// multisample texture, a storage image -- must use `OpImageQuerySize`, which takes no LOD operand.
+///
+/// Two lowerings emit a size query, and they had drifted: one handled multisample images and the
+/// other did not, and neither handled `Dim Buffer`, so `texture_buffer::get_width()` produced an
+/// `OpImageQuerySizeLod` the owned-module check rejected and the whole translation fell back.
+/// Stating the rule here is what keeps them from disagreeing again.
+pub(in crate::passes) fn image_size_query_op(ctx: &Ctx, image: Word) -> Op {
+    if image_is_storage(ctx, image)
+        || image_value_is_multisampled(ctx, image)
+        || image_value_dim(ctx, image) == Some(spirv::Dim::DimBuffer)
+    {
+        Op::ImageQuerySize
+    } else {
+        Op::ImageQuerySizeLod
+    }
+}
+
 #[cfg(test)]
 mod coord_tests {
     //! Behavior pins for the texture-coordinate builders (S22). images.rs had no unit tests; these

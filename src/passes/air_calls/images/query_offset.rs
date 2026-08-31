@@ -16,11 +16,7 @@ pub(in crate::passes) fn query_image_size(
         ctx.ty_vec_uint((spatial + usize::from(arrayed)) as u32)
     };
     let size = ctx.module.fresh_id();
-    let query_op = if image_is_storage(ctx, img) {
-        Op::ImageQuerySize
-    } else {
-        Op::ImageQuerySizeLod
-    };
+    let query_op = image_size_query_op(ctx, img);
     let mut ops = vec![Operand::IdRef(img)];
     if query_op == Op::ImageQuerySizeLod {
         ops.push(Operand::IdRef(lod));

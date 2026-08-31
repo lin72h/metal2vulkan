@@ -207,6 +207,53 @@ fn runtime_storage_image_atomic_requires_scalar_format_and_host_support() {
 }
 
 #[test]
+fn native_buffer_texture_size_query_uses_query_size_without_lod() {
+    // SPIR-V allows `OpImageQuerySizeLod` only on a 1D/2D/3D/Cube image with `MS` 0 and a `Sampled`
+    // operand that is not 2, so a `Dim Buffer` image must use the LOD-less `OpImageQuerySize`.
+    // Metal's `get_width()` is legal on `texture_buffer`; this shader used to emit the LOD form,
+    // which the owned-module check rejected, and the whole translation fell back.
+    //
+    // The other two images that rule out the LOD form have their own cases:
+    // `native_multisample_texture_size_query_uses_query_size_without_lod` and
+    // `native_kernel_write_texture_size_query_uses_storage_query`. All three go through one
+    // `image_size_query_op`, which is what keeps the two size-query lowerings from disagreeing.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %t, ptr addrspace(1) %out) {
+entry:
+  %w = call i32 @air.get_width_texture_buffer(ptr addrspace(1) %t, i32 0)
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i32 @air.get_width_texture_buffer(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture_buffer<int, read>", !"air.arg_name", !"t"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_buffer_texture_size_query_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("a buffer texture size query must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        asm.contains("Buffer 0 0 0 1"),
+        "expected a sampled buffer image:\n{asm}"
+    );
+    assert!(
+        asm.contains("OpImageQuerySize ") && !asm.contains("OpImageQuerySizeLod"),
+        "a buffer image has no LOD to query with:\n{asm}"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn native_array_ref_texture_lowers_to_descriptor_array() {
     // A runtime-indexed `array_ref<texture2d>` argument is a descriptor array, not a single image.
     // Native emission produces real per-element handle loads (`load ptr addrspace(1), ptr %texarg`) that a

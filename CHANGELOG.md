@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `get_width()`/`get_height()` on a `texture_buffer` translates instead of falling back. SPIR-V
+  allows `OpImageQuerySizeLod` only on a 1D/2D/3D/Cube image with `MS` 0 and a `Sampled` operand
+  that is not 2; a `Dim Buffer` image must use the LOD-less `OpImageQuerySize`. One
+  `image_size_query_op` now states that rule for both size-query lowerings, which had drifted --
+  only one of them handled multisample images and neither handled buffer textures.
 - A descriptor the translator synthesizes only to type an AIR value is retracted whenever nothing
   consumes that value. This already covered `air.get_read_sampler()`; it now covers
   `air.get_null_texture_*()` too, so a shader that merely asks whether an optional attachment is

@@ -730,8 +730,8 @@ pub(in crate::passes) fn lower_unpack(
 }
 
 /// `air.get_{width,height,depth,array_size}_{texture,depth}_<dim>(texture, lod)`: an image size
-/// query. Sampled images use `OpImageQuerySizeLod`; storage images (no sampler LOD) use
-/// `OpImageQuerySize`. AIR's result is `i32`; the query yields a same-width uint component, copied
+/// query. The opcode is [`image_size_query_op`], since not every image can carry a LOD operand.
+/// AIR's result is `i32`; the query yields a same-width uint component, copied
 /// when integer canonicalization made the types identical and bitcast otherwise. The wanted
 /// component index is derived from the intrinsic name.
 pub(in crate::passes) fn lower_image_size_query(
@@ -794,11 +794,7 @@ pub(in crate::passes) fn lower_image_size_query(
     };
     let size = ctx.module.fresh_id();
     let mut out = vec![];
-    let query_op = if image_is_storage(ctx, img) || image_value_is_multisampled(ctx, img) {
-        Op::ImageQuerySize
-    } else {
-        Op::ImageQuerySizeLod
-    };
+    let query_op = image_size_query_op(ctx, img);
     let mut ops = vec![Operand::IdRef(img)];
     if query_op == Op::ImageQuerySizeLod {
         // OpImageQuerySizeLod requires a LOD operand; default to 0 if absent.
