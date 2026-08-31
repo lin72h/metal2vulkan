@@ -105,6 +105,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reducible control flow that the structured planner rejects is now nested into real SPIR-V loop
+  and selection constructs before the bounded state-machine relooper is considered. Ordinary values
+  stay in registers and demoted phis are promoted back at the block where their edges meet, so a
+  function no longer arrives as one dispatch loop whose every crossing value is a function-scope
+  variable. The nesting is adopted only when the emitted function satisfies the same construct,
+  structured-exit, dominance, and phi contract the owned module is held to; anything else stays on
+  the state machine.
 - Vulkan 1.2 is now the mandatory translation and validation baseline; newer Vulkan features may
   only be exposed as optional performance paths with faithful Vulkan 1.2 fallbacks.
 - Structured CFG plans now finalize loop-continue selection ownership before their completeness,
@@ -364,6 +371,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `air.get_num_samples_texture*` now lowers from the image type instead of an unconditional literal
+  `1`: a multisampled 2D image queries `OpImageQuerySamples`, a single-sample image keeps the exact
+  constant, and a multisampled non-2D dimensionality is refused. `ImageQuery` capability inference
+  covers `OpImageQuerySamples`.
 - Opaque buffer sources copied into local aggregates are now inferred as byte-addressed even when
   the destination is not another buffer parameter. AIR aggregate metadata whose explicit member
   offsets overlap Vulkan's naturally aligned block extents also selects the faithful byte view.
