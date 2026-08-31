@@ -24,7 +24,10 @@ struct EmitState<'a> {
     globals: &'a mut Vec<Instruction>,
     constants: &'a mut HashMap<u32, Word>,
     unsigned_ints: &'a mut HashMap<u32, Word>,
-    pointer_strides: &'a mut HashMap<Word, u32>,
+    /// `(pointer type, element stride)` in the order the rewrite first needed each type. Every
+    /// entry becomes one `OpDecorate ArrayStride` below, so this has to be an ordered list: a
+    /// `HashMap` here made the annotation block come out in a different order on every run.
+    pointer_strides: &'a mut Vec<(Word, u32)>,
     next_id: &'a mut Word,
 }
 
@@ -234,7 +237,7 @@ pub(in crate::passes) fn materialize_interface_selected_loads(module: &mut Modul
             .flatten()
         })
         .collect::<HashMap<_, _>>();
-    let mut pointer_strides = HashMap::new();
+    let mut pointer_strides: Vec<(Word, u32)> = Vec::new();
     for function in &mut module.functions {
         for block in &mut function.blocks {
             let old = block.instructions.clone();
@@ -374,9 +377,15 @@ fn emit_arm_load(
     let source_bits = scalar_bits(types, arm.pointee)?;
     let value_bits = scalar_bits(types, value_ty)?;
     let units = value_bits / source_bits;
-    state
+    if !state
         .pointer_strides
-        .insert(arm.pointer_ty, source_bits / 8);
+        .iter()
+        .any(|(pointer_ty, _)| *pointer_ty == arm.pointer_ty)
+    {
+        state
+            .pointer_strides
+            .push((arm.pointer_ty, source_bits / 8));
+    }
     let mut assembled = None;
     for unit in 0..units {
         let index = constant(uint, unit, state.globals, state.constants, state.next_id);

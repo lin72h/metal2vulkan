@@ -943,15 +943,21 @@ fn rewrite_cross_binding_pointer_merges_inner(
         .all_inst_iter()
         .filter_map(|instruction| Some((instruction.result_id?, instruction.clone())))
         .collect::<HashMap<_, _>>();
-    let mut memory_view_pointees = HashSet::new();
-    for function in &module.functions {
-        for block in &function.blocks {
-            for instruction in &block.instructions {
+    // Each pointee here mints one `OpTypePointer`, so this order is the order those declarations
+    // land in the module. It has to come from the instruction stream, not from a `HashSet`, or the
+    // same input assembles to different bytes on every run.
+    let memory_view_pointees = crate::emission_order::dedup_in_encounter_order(
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter_map(|instruction| {
                 let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
-                    continue;
+                    return None;
                 };
                 if !closure.contains(pointer) {
-                    continue;
+                    return None;
                 }
                 let accessed_type = match instruction.class.opcode {
                     Op::Load => instruction.result_type,
@@ -968,12 +974,11 @@ fn rewrite_cross_binding_pointer_merges_inner(
                     .get(pointer)
                     .and_then(|ty| ptr_info(*ty))
                     .map(|(_, pointee)| pointee);
-                if accessed_type != pointer_pointee {
-                    memory_view_pointees.extend(accessed_type);
-                }
-            }
-        }
-    }
+                (accessed_type != pointer_pointee)
+                    .then_some(accessed_type)
+                    .flatten()
+            }),
+    );
     for pointee in memory_view_pointees {
         if psb_ptr.contains_key(&pointee) {
             continue;

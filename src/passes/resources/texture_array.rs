@@ -138,6 +138,11 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     let mut candidates: Vec<(Word, Word)> = Vec::new();
     let mut table_candidates = Vec::new();
     let mut handles: HashMap<Word, (Word, Word)> = HashMap::new();
+    // The rewrite below mints one access-chain id per bound handle and the removal transaction
+    // collects one dead root per handle, so both must visit the handles in the order the
+    // instruction stream produced them. `handles` answers "which array element is this?" and is
+    // never iterated; `handle_order` carries the order.
+    let mut handle_order: Vec<Word> = Vec::new();
     let mut handle_preludes: HashMap<Word, Vec<Instruction>> = HashMap::new();
     let mut seen: std::collections::HashSet<Word> = std::collections::HashSet::new();
     for blk in &ctx.module.functions[entry_idx].blocks {
@@ -161,11 +166,15 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
                 continue;
             }
             if let Some(&(arrayvar, idx)) = dynamic_handles.get(handle) {
-                handles.insert(*handle, (arrayvar, idx));
+                if handles.insert(*handle, (arrayvar, idx)).is_none() {
+                    handle_order.push(*handle);
+                }
                 continue;
             }
             if let Some(&(arrayvar, idx)) = fixed_handles.get(handle) {
-                handles.insert(*handle, (arrayvar, idx));
+                if handles.insert(*handle, (arrayvar, idx)).is_none() {
+                    handle_order.push(*handle);
+                }
                 continue;
             }
             if let Some((arrayvar, selector, entries)) = local_table_handles.get(handle).cloned() {
@@ -187,12 +196,16 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     }
     for (handle, ptr) in candidates {
         if let Some((arrayvar, idx)) = resolve_array_element(ctx, &defs, ptr) {
-            handles.insert(handle, (arrayvar, idx));
+            if handles.insert(handle, (arrayvar, idx)).is_none() {
+                handle_order.push(handle);
+            }
         }
     }
     for (handle, arrayvar, selector, entries) in table_candidates {
         if let Some((idx, prelude)) = descriptor_table_index(ctx, selector, &entries) {
-            handles.insert(handle, (arrayvar, idx));
+            if handles.insert(handle, (arrayvar, idx)).is_none() {
+                handle_order.push(handle);
+            }
             handle_preludes.insert(handle, prelude);
         }
     }
@@ -205,7 +218,8 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     let mut new_access_chains: HashMap<Word, Instruction> = HashMap::new(); // handle -> access-chain inst
     let mut retyped_load_ptr: HashMap<Word, (Word, Word)> = HashMap::new(); // handle -> (image_ty, p)
     let mut dead_roots: Vec<Word> = Vec::new();
-    for (&handle, &(arrayvar, idx)) in &handles {
+    for &handle in &handle_order {
+        let (arrayvar, idx) = handles[&handle];
         if !defs.contains_key(&handle) {
             continue;
         }
@@ -250,7 +264,7 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     // root. Include the bound descriptor variable itself so the transaction also reaches parallel
     // stale projections which no longer feed the rewritten handle load. Newly constructed descriptor
     // accesses share the root but remain live through their image loads and are therefore retained.
-    dead_roots.extend(handles.values().map(|(arrayvar, _)| *arrayvar));
+    dead_roots.extend(handle_order.iter().map(|handle| handles[handle].0));
 
     // Opaque pointer loads that the generic emitter cannot type are represented by a Private
     // placeholder variable. Such an id has no function instruction to retype, so materialize the

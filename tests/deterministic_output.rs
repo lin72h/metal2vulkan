@@ -127,6 +127,87 @@ fn a_device_address_kernel_translates_to_the_same_bytes_every_time() {
     );
 }
 
+/// A kernel whose only resource parameter is never bound.
+///
+/// Without `!air.kernel` metadata naming it, `%u` has no descriptor to bind to, so the pipeline
+/// re-classes it into a null-initialized Private placeholder root and rewrites every load from it
+/// into a copy of that type's zero. One `OpConstantNull` is minted per distinct load result type,
+/// and the order they are minted in is the order they are declared in the module.
+///
+/// That order used to come from a `HashSet` of the result types, so this kernel's three nulls came
+/// out in a different permutation on every run. Three distinct load types make an accidental
+/// agreement between two runs a one-in-six event, which `RUNS` repetitions drive to nothing.
+const UNBOUND_BUFFER_KERNEL: &str = r#"
+target triple = "air64_v28-apple-macosx26.5.0"
+
+%Uniforms = type { <2 x float>, <3 x float>, <4 x float> }
+
+define void @k(ptr addrspace(1) %out, ptr addrspace(2) %u) {
+entry:
+  %p2 = getelementptr inbounds %Uniforms, ptr addrspace(2) %u, i64 0, i32 0
+  %v2 = load <2 x float>, ptr addrspace(2) %p2
+  %p3 = getelementptr inbounds %Uniforms, ptr addrspace(2) %u, i64 0, i32 1
+  %v3 = load <3 x float>, ptr addrspace(2) %p3
+  %p4 = getelementptr inbounds %Uniforms, ptr addrspace(2) %u, i64 0, i32 2
+  %v4 = load <4 x float>, ptr addrspace(2) %p4
+  %a = fadd <2 x float> %v2, %v2
+  %b = fadd <3 x float> %v3, %v3
+  %c = fadd <4 x float> %v4, %v4
+  %s0 = extractelement <2 x float> %a, i64 0
+  %s1 = extractelement <3 x float> %b, i64 0
+  %s2 = extractelement <4 x float> %c, i64 0
+  %t0 = fadd float %s0, %s1
+  %t1 = fadd float %t0, %s2
+  store float %t1, ptr addrspace(1) %out
+  ret void
+}
+"#;
+
+/// The zero-root rewrite is the path this test exists for; assert the module really takes it, so a
+/// change that starts binding `%u` cannot leave the test below passing over nothing.
+#[test]
+fn the_unbound_buffer_kernel_really_zeroes_its_absent_resource() {
+    let bytes = translate_sanitized_native(
+        UNBOUND_BUFFER_KERNEL,
+        Stage::Kernel,
+        &scratch("unbound-buffer-probe"),
+    )
+    .expect("the unbound-buffer kernel translates");
+    let text = metal2vulkan::disassemble(&bytes).expect("disassemble");
+    // Each rewritten load is an `OpCopyObject` of an `OpConstantNull` — three loads, three distinct
+    // types, so three nulls minted in one pass. (The module declares a fourth null elsewhere, as the
+    // initializer of the Private placeholder variable itself, which this rewrite does not mint.)
+    let nulls = text
+        .lines()
+        .filter_map(|line| line.split_once(" = OpConstantNull"))
+        .map(|(id, _)| id.trim().to_string())
+        .collect::<Vec<_>>();
+    let copied_nulls = text
+        .lines()
+        .filter(|line| line.contains("OpCopyObject"))
+        .filter(|line| {
+            nulls
+                .iter()
+                .any(|null| line.split_whitespace().any(|word| word == null))
+        })
+        .count();
+    assert_eq!(
+        copied_nulls, 3,
+        "expected the absent resource's three distinct load types to each become a copy of that \
+         type's null, got {copied_nulls}; the determinism test below no longer covers the mint \
+         order it was written for\n{text}"
+    );
+}
+
+#[test]
+fn an_unbound_buffer_kernel_translates_to_the_same_bytes_every_time() {
+    assert_deterministic(
+        "the unbound-buffer kernel",
+        UNBOUND_BUFFER_KERNEL,
+        Stage::Kernel,
+    );
+}
+
 /// The same contract across every committed fixture, so an emission decision that starts following
 /// iteration order anywhere in the pipeline fails here rather than in a consumer's cache.
 #[test]
@@ -152,6 +233,38 @@ fn every_public_fixture_translates_to_the_same_bytes_every_time() {
     assert!(
         checked >= 20,
         "only {checked} public fixtures translated, so this swept almost nothing"
+    );
+}
+
+/// Determinism does not depend on the stage being the one the AIR declares.
+///
+/// `translate_sanitized_native` takes the stage as a parameter, so the stage is an input like any
+/// other and the output has to be a function of it. Translating each fixture at every stage reaches
+/// pipeline paths the declared stage never does — a buffer parameter that the declared stage binds
+/// to a descriptor becomes an unbound Private placeholder under another, which is exactly the
+/// rewrite the kernel above was reduced from. Anything that does not translate under a given stage
+/// is skipped: this test is about byte stability, not about which stages accept which module.
+#[test]
+fn every_public_fixture_is_stable_under_every_stage_it_translates_under() {
+    let mut checked = 0;
+    for path in public_fixtures() {
+        let source = std::fs::read_to_string(&path).expect("read fixture");
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for stage in [Stage::Vertex, Stage::Fragment, Stage::Kernel] {
+            let label = format!("{name}-{stage:?}");
+            if translate_sanitized_native(&source, stage, &scratch(&label)).is_err() {
+                continue;
+            }
+            assert_deterministic(&label, &source, stage);
+            checked += 1;
+        }
+    }
+    assert!(
+        checked >= 30,
+        "only {checked} fixture/stage pairs translated, so this swept almost nothing"
     );
 }
 

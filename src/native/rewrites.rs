@@ -443,11 +443,16 @@ pub(crate) fn construct_physical_atomic_pointer_lvalues_module(module: &mut Modu
         return false;
     }
 
-    let candidate_pointer_types = candidates
-        .iter()
-        .flatten()
-        .map(|(_, _, pointer_type, _)| *pointer_type)
-        .collect::<HashSet<_>>();
+    // Each candidate pointer type mints a wrapper struct, a wrapper pointer, and a decoration
+    // below, so this order is the order those declarations and annotations land in the module.
+    // `candidates` is built by walking the functions in order, which makes the result a property of
+    // the input; a `HashSet` here would make it a property of the run.
+    let candidate_pointer_types = crate::emission_order::dedup_in_encounter_order(
+        candidates
+            .iter()
+            .flatten()
+            .map(|(_, _, pointer_type, _)| *pointer_type),
+    );
     let pointer_pointees = module
         .types_global_values
         .iter()

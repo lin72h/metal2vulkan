@@ -1,6 +1,7 @@
 //! Private-resource atomic lowering and shared raw-access analysis.
 
 use super::*;
+use crate::emission_order::dedup_in_encounter_order;
 use crate::passes::access::direct_scalar_width;
 
 /// Replace direct loads from an absent-resource Private root with the root's exact zero value.
@@ -90,22 +91,24 @@ pub(in crate::passes) fn rewrite_private_zero_root_loads(ctx: &mut Ctx, roots: &
             changed |= roots.insert(id);
         }
     }
-    let mut result_types = HashSet::new();
-    for function in &ctx.module.functions {
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                if instruction.class.opcode == Op::Load
+    // `ctx.const_null` mints one global per distinct result type, so the order these types are
+    // visited is the order the `OpConstantNull` declarations appear in the emitted module. Walking
+    // the module's own instruction stream makes that order a property of the input; collecting the
+    // types into a `HashSet` first made it a property of that run's hasher seed.
+    let result_types = dedup_in_encounter_order(
+        ctx.module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                instruction.class.opcode == Op::Load
                     && instruction.operands.first().is_some_and(
                         |operand| matches!(operand, Operand::IdRef(id) if roots.contains(id)),
                     )
-                {
-                    if let Some(result_type) = instruction.result_type {
-                        result_types.insert(result_type);
-                    }
-                }
-            }
-        }
-    }
+            })
+            .filter_map(|instruction| instruction.result_type),
+    );
     let nulls = result_types
         .into_iter()
         .map(|ty| (ty, ctx.const_null(ty)))

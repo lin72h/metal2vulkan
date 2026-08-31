@@ -19,6 +19,7 @@
 pub mod air_intrinsics;
 pub mod as_shadow;
 mod construction;
+mod emission_order;
 mod emit_sidecar;
 pub mod env_vars;
 mod fc_air_specialize;
