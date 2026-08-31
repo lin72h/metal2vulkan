@@ -2860,6 +2860,55 @@ fn describe_owned_id(id: Word, definitions: &HashMap<Word, &Instruction>) -> Str
     text
 }
 
+/// The extra sentence a dynamic struct-member index gets when the struct is a single-member buffer
+/// block — the shape a raw-word buffer takes, `{ RuntimeArray<E> }`.
+///
+/// A dynamic index there is never a member select; it is an element view of the block's array whose
+/// width the access chain's own result pointee names. Saying so is the difference between a message
+/// a reader can act on and one that describes the address arithmetic: the index is whatever the
+/// emitter computed the offset with, so this violation reports things like `BitwiseOr` or `SConvert`
+/// that exist nowhere in the AIR and say nothing about which view went unrepaired. The pair that
+/// does say it is (element type, view type) — `TypeInt 8` over `TypeInt 32` is a byte view of a word
+/// array, and that is the fact that picks out which of the dynamic-struct-index rewrites should have
+/// matched and did not.
+fn describe_element_view(
+    struct_ty: Word,
+    result_type: Option<Word>,
+    definitions: &HashMap<Word, &Instruction>,
+) -> String {
+    let Some(definition) = definitions.get(&struct_ty) else {
+        return String::new();
+    };
+    if definition.class.opcode != Op::TypeStruct || definition.operands.len() != 1 {
+        return String::new();
+    }
+    let Some(Operand::IdRef(member)) = definition.operands.first() else {
+        return String::new();
+    };
+    let Some(member_definition) = definitions.get(member) else {
+        return String::new();
+    };
+    if !matches!(
+        member_definition.class.opcode,
+        Op::TypeArray | Op::TypeRuntimeArray
+    ) {
+        return String::new();
+    }
+    let Some(Operand::IdRef(element)) = member_definition.operands.first() else {
+        return String::new();
+    };
+    let view = result_type
+        .and_then(|ty| pointer_type_shape(ty, definitions))
+        .map(|(_, pointee)| describe_owned_id(pointee, definitions))
+        .unwrap_or_else(|| "an unknown pointee".to_string());
+    format!(
+        ". The struct is a single-member block over {}, so this is not a member select but a {} \
+         view of that array which no dynamic-struct-index rewrite repaired",
+        describe_owned_id(*element, definitions),
+        view
+    )
+}
+
 fn owned_access_chain_error(
     instruction: &Instruction,
     definitions: &HashMap<Word, &Instruction>,
@@ -2945,9 +2994,10 @@ fn owned_access_chain_error(
                     let Some(member) = owned_constant_u32(*index, definitions, value_types) else {
                         return Err(format!(
                             "index {position} into {} is {}, and a struct member index must be an \
-                             OpConstant of 32-bit integer type",
+                             OpConstant of 32-bit integer type{}",
                             describe_owned_id(selected, definitions),
-                            describe_owned_id(*index, definitions)
+                            describe_owned_id(*index, definitions),
+                            describe_element_view(selected, instruction.result_type, definitions)
                         ));
                     };
                     let Some(Operand::IdRef(member_type)) =
@@ -7837,6 +7887,74 @@ mod tests {
         // An id the module never defines is the interesting case for a contract message, so it says
         // so rather than rendering as nothing.
         assert_eq!(describe_owned_id(99, &definitions), "%99 (undefined)");
+    }
+
+    /// A dynamic index into a single-member block is the raw-word-buffer view shape, and the index
+    /// itself says nothing about it: the emitter computes the offset, so the violation reports
+    /// whatever arithmetic produced it. The pair that identifies the unrepaired view is (element
+    /// type, result pointee), so the message carries it — and only for that shape, since on any
+    /// other struct a dynamic index really is a bad member select.
+    #[test]
+    fn a_dynamic_index_into_a_single_member_block_reports_the_view_it_failed_to_repair() {
+        let word = Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(1),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        );
+        let byte = Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(2),
+            vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+        );
+        let words = Instruction::new(Op::TypeRuntimeArray, None, Some(3), vec![Operand::IdRef(1)]);
+        let block = Instruction::new(Op::TypeStruct, None, Some(4), vec![Operand::IdRef(3)]);
+        let byte_pointer = Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(5),
+            vec![
+                Operand::StorageClass(spirv::StorageClass::StorageBuffer),
+                Operand::IdRef(2),
+            ],
+        );
+        // Not a block view: two members, so a dynamic index is a genuine bad member select.
+        let pair = Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(6),
+            vec![Operand::IdRef(1), Operand::IdRef(1)],
+        );
+        // One member, but not an array — nothing to be an element view OF.
+        let wrapper = Instruction::new(Op::TypeStruct, None, Some(7), vec![Operand::IdRef(1)]);
+        let definitions = [&word, &byte, &words, &block, &byte_pointer, &pair, &wrapper]
+            .into_iter()
+            .map(|instruction| (instruction.result_id.expect("result id"), instruction))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(
+            describe_element_view(4, Some(5), &definitions),
+            ". The struct is a single-member block over %1 (TypeInt 32 0), so this is not a member \
+             select but a %2 (TypeInt 8 0) view of that array which no dynamic-struct-index rewrite \
+             repaired",
+            "a byte view of a word array is the fact that picks out the missing rewrite"
+        );
+        assert_eq!(
+            describe_element_view(6, Some(5), &definitions),
+            "",
+            "a multi-member struct is not a block, so the index really is a bad member select"
+        );
+        assert_eq!(
+            describe_element_view(7, Some(5), &definitions),
+            "",
+            "a single member that is not an array has no elements to view"
+        );
+        assert_eq!(
+            describe_element_view(1, Some(5), &definitions),
+            "",
+            "only a struct can have a member index"
+        );
     }
 
     #[test]
