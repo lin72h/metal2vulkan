@@ -70,17 +70,18 @@ pub(crate) fn structure_selected_functions(
                         Some((instruction.result_id?, instruction.result_type?))
                     })
                 }));
-                // The same structural checks the caller uses to select construction in the first
-                // place. A nesting that leaves an unowned selection header or back edge has not
-                // structured the function, so it is discarded rather than shipped.
+                // A nesting is adopted only if it really is a well-formed construction. That is the
+                // same question the caller asked to select construction in the first place, so it
+                // is asked the same way, then extended to everything else a control-flow rewrite
+                // owns: construct nesting, structured exits, and value flow.
                 //
-                // Value flow is checked for the same reason. Keeping ordinary values in registers
-                // is only sound where the nesting really did preserve the paths that made their
-                // definitions dominate their uses, and that does not always hold: an edge staged
-                // through a construct's merge dispatch reaches its destination from that merge
-                // rather than from the block it left. The state machine this pass replaces repaired
-                // such a function incidentally, by demoting every crossing value; nesting keeps
-                // them, so it has to prove the definitions still reach.
+                // Value flow has to be checked because nesting keeps ordinary values in registers.
+                // That is only sound where it preserved the paths that made their definitions
+                // dominate their uses, and it does not always: an edge staged through a construct's
+                // merge dispatch reaches its destination from that merge rather than from the block
+                // it left. The state machine this pass replaces repaired such a function
+                // incidentally, by demoting every crossing value; nesting keeps them, so it has to
+                // prove the definitions still reach.
                 let broken =
                     super::rewrites::blocks_have_unowned_selection_header(&function.blocks)
                         .then(|| "nesting left an unowned construct".to_string())
@@ -89,7 +90,7 @@ pub(crate) fn structure_selected_functions(
                                 .then(|| "nesting left an unowned back edge".to_string())
                         })
                         .or_else(|| {
-                            super::owned_cfg::owned_function_value_flow_error(
+                            super::owned_cfg::owned_function_construction_error(
                                 function,
                                 &value_types,
                             )

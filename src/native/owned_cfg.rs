@@ -187,6 +187,14 @@ impl OwnedCfg {
         value_types: &HashMap<Word, Word>,
     ) -> Result<(), String> {
         self.check_block_layout(function, definitions, value_types)?;
+        self.check_structure(function)
+    }
+
+    /// The half of [`Self::check`] that reads only control flow: construct containment, structured
+    /// exits, switch merges, back edges, and continue-target ownership. It needs no module-wide
+    /// type tables, so a pass that rewrites a function's blocks can hold its own output to the
+    /// same rules before adopting it.
+    fn check_structure(&self, function: &Function) -> Result<(), String> {
         if !dominators_precede_blocks(&self.flow_reachable, &self.flow_idom) {
             return Err(
                 "native emitter: owned block is serialized before one of its dominators"
@@ -1025,15 +1033,16 @@ fn definition_sites(function: &Function) -> Result<HashMap<Word, DefinitionSite>
     Ok(sites)
 }
 
-/// Report the first way `function` breaks the owned contract that binds values to control flow:
-/// a use its definition does not dominate, or an `OpPhi` whose incoming pairs do not match the
-/// block's predecessors and result type.
+/// Report the first way `function` breaks the part of the owned contract that a control-flow
+/// rewrite is answerable for: an unowned or badly nested construct, an unstructured exit, a use its
+/// definition does not dominate, or an `OpPhi` whose incoming pairs do not match the block's
+/// predecessors and result type.
 ///
-/// This is the part of the module contract a control-flow rewrite is answerable for, so a pass
-/// that reshapes blocks can check its own output before adopting it rather than assume the reshape
-/// preserved dominance. `value_types` maps result ids to their result types; ids missing from it
-/// are not type-checked.
-pub(super) fn owned_function_value_flow_error(
+/// A pass that reshapes a function's blocks uses this to hold its own output to those rules before
+/// adopting it, rather than assume the reshape preserved them. Everything left out needs the
+/// module-wide type tables and is checked once, later, over the whole module. `value_types` maps
+/// result ids to their result types; ids missing from it are not type-checked.
+pub(super) fn owned_function_construction_error(
     function: &Function,
     value_types: &HashMap<Word, Word>,
 ) -> Option<String> {
@@ -1057,7 +1066,7 @@ pub(super) fn owned_function_value_flow_error(
             }
         }
     }
-    None
+    cfg.check_structure(function).err()
 }
 
 fn build_predecessors(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
