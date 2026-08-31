@@ -67,9 +67,9 @@ pub fn straddle_region_report(san_ll: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for (index, f) in parsed.functions.iter().enumerate() {
         let blocks = cfg::lower_unstructured_switches(&f.blocks);
-        let source_reason =
-            cfg::structured_reject_reason(&blocks).unwrap_or_else(|| "ADMIT".to_string());
-        match cfg::renest_straddle_loop_merge(&blocks) {
+        let reject_reason = cfg::structured_reject_reason(&blocks);
+        let source_reason = reject_reason.clone().unwrap_or_else(|| "ADMIT".to_string());
+        match cfg::renest_straddle_loop_merge(&blocks, reject_reason.as_deref()) {
             Ok(Some(candidate)) => {
                 let candidate_status = cfg::construct_tree_reject_reason(&candidate)
                     .unwrap_or_else(|| "ADMIT".to_string());

@@ -220,8 +220,8 @@ fn terminator_uses(carrier: &tir::TirBlock) -> Vec<String> {
     }
 }
 
-fn derive_witness(blocks: &[BodyBlock]) -> Option<Witness> {
-    if structured_reject_reason(blocks).as_deref() != Some("selection:straddle-loop-merge") {
+fn derive_witness(blocks: &[BodyBlock], reject_reason: Option<&str>) -> Option<Witness> {
+    if reject_reason != Some("selection:straddle-loop-merge") {
         return None;
     }
     for (converge, break_aware) in [(false, false), (true, false), (true, true)] {
@@ -1440,12 +1440,13 @@ fn rewrite_entry_and_exit_phis(
 
 pub(in crate::native) fn renest_straddle_loop_merge(
     blocks: &[BodyBlock],
+    reject_reason: Option<&str>,
 ) -> Result<Option<Vec<BodyBlock>>, String> {
-    if structured_reject_reason(blocks).as_deref() != Some("selection:straddle-loop-merge") {
+    if reject_reason != Some("selection:straddle-loop-merge") {
         return Ok(None);
     }
     regional_candidate(
-        derive_witness(blocks)
+        derive_witness(blocks, reject_reason)
             .ok_or_else(|| "construct-tree:straddle-witness-decline".to_string())?,
         true,
     )
@@ -1493,9 +1494,37 @@ mod tests {
             bb("%b", &["br label %merge"]),
             bb("%merge", &["ret void"]),
         ];
-        assert!(renest_straddle_loop_merge(&admitted)
-            .expect("reject gate")
-            .is_none());
+        assert!(renest_straddle_loop_merge(
+            &admitted,
+            structured_reject_reason(&admitted).as_deref()
+        )
+        .expect("reject gate")
+        .is_none());
+    }
+
+    /// The straddle recognizer, like the own-arm one beside it, reads its classification from the
+    /// caller rather than replaying the planner ladder to re-derive it.
+    ///
+    /// This graph is admitted, so the gate can only open on the classification it is handed --
+    /// and it has to reach witness derivation, which declines, rather than short-circuiting.
+    #[test]
+    fn r2_straddle_reads_its_classification_from_the_caller() {
+        let admitted = vec![
+            bb("%entry", &["br i1 %c, label %a, label %b"]),
+            bb("%a", &["br label %merge"]),
+            bb("%b", &["br label %merge"]),
+            bb("%merge", &["ret void"]),
+        ];
+        assert_eq!(
+            structured_reject_reason(&admitted),
+            None,
+            "the fixture has to be admitted for the gate to be the only thing under test"
+        );
+        assert_eq!(
+            renest_straddle_loop_merge(&admitted, Some("selection:straddle-loop-merge")).err(),
+            Some("construct-tree:straddle-witness-decline".to_string()),
+            "the gate must open on the caller's classification and decline at the witness"
+        );
     }
 
     #[test]

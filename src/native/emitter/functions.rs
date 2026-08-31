@@ -909,7 +909,15 @@ impl Emitter {
                     && !skip_source_cfg_construction
                     && body_blocks.len() <= crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS
                 {
-                    match crate::native::cfg::renest_cond_phi_shared_own_arm(&candidate) {
+                    // Both recognizers dispatch on the same classification of the same graph, and
+                    // deriving it replays the whole planner ladder. `candidate` only changes in the
+                    // arm that sets `construct_tree_applied`, which skips the second recognizer, so
+                    // one derivation is all either of them can ever see.
+                    let reject_reason = crate::native::cfg::structured_reject_reason(&candidate);
+                    match crate::native::cfg::renest_cond_phi_shared_own_arm(
+                        &candidate,
+                        reject_reason.as_deref(),
+                    ) {
                         Ok(Some(renested)) => {
                             candidate = renested;
                             candidate_changed = true;
@@ -928,7 +936,10 @@ impl Emitter {
                         }
                     }
                     if !construct_tree_applied {
-                        match crate::native::cfg::renest_straddle_loop_merge(&candidate) {
+                        match crate::native::cfg::renest_straddle_loop_merge(
+                            &candidate,
+                            reject_reason.as_deref(),
+                        ) {
                             Ok(Some(renested)) => {
                                 candidate = renested;
                                 candidate_changed = true;

@@ -666,11 +666,12 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
 
 pub(in crate::native) fn renest_cond_phi_shared_own_arm(
     blocks: &[BodyBlock],
+    reject_reason: Option<&str>,
 ) -> Result<Option<Vec<BodyBlock>>, String> {
     if blocks.len() > OWN_ARM_MAX_BLOCKS {
         return Ok(None);
     }
-    if structured_reject_reason(blocks).as_deref() != Some("selection:cond-phi-shared/own-arm") {
+    if reject_reason != Some("selection:cond-phi-shared/own-arm") {
         return Ok(None);
     }
     regional_candidate(
@@ -704,9 +705,12 @@ mod tests {
             bb("%b", &["br label %merge"]),
             bb("%merge", &["ret void"]),
         ];
-        assert!(renest_cond_phi_shared_own_arm(&admitted)
-            .expect("reject gate")
-            .is_none());
+        assert!(renest_cond_phi_shared_own_arm(
+            &admitted,
+            structured_reject_reason(&admitted).as_deref()
+        )
+        .expect("reject gate")
+        .is_none());
     }
 
     fn lazy_own_arm_loop() -> Vec<BodyBlock> {
@@ -765,6 +769,36 @@ mod tests {
             .any(|block| block.name == "%metal2vulkan.ct.oa.common"));
     }
 
+    /// The recognizer reads its classification from the caller and never derives it again.
+    ///
+    /// Deriving it replays the whole planner ladder, and the caller has to derive it anyway to
+    /// choose between recognizers. Doing it a second time here, plus a third inside the straddle
+    /// recognizer beside it, was more than half the wall time of the slowest corpus shaders.
+    /// This graph is admitted, so the gate can only open on the classification it is handed: an
+    /// edit that reached for `structured_reject_reason` inside would derive `None` and decline.
+    #[test]
+    fn r2_own_arm_reads_its_classification_from_the_caller() {
+        let source = lazy_own_arm_loop();
+        assert_eq!(
+            structured_reject_reason(&source),
+            None,
+            "the fixture has to be admitted for the gate to be the only thing under test"
+        );
+        assert!(
+            renest_cond_phi_shared_own_arm(&source, None)
+                .expect("no classification, no work")
+                .is_none(),
+            "without the caller's classification the recognizer must decline"
+        );
+        assert!(
+            !matches!(
+                renest_cond_phi_shared_own_arm(&source, Some("selection:cond-phi-shared/own-arm")),
+                Ok(None)
+            ),
+            "handed the own-arm classification, the gate must open on the same graph"
+        );
+    }
+
     #[test]
     fn r2_own_arm_large_input_declines_before_witness_derivation() {
         let mut source = lazy_own_arm_loop();
@@ -773,8 +807,11 @@ mod tests {
             source.push(bb(&name, &["ret void"]));
         }
 
-        assert!(renest_cond_phi_shared_own_arm(&source)
-            .expect("large own-arm gate")
-            .is_none());
+        assert!(renest_cond_phi_shared_own_arm(
+            &source,
+            structured_reject_reason(&source).as_deref()
+        )
+        .expect("large own-arm gate")
+        .is_none());
     }
 }
