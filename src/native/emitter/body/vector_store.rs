@@ -820,73 +820,75 @@ impl Emitter {
         pointee: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if !matches!(pointee, LlType::Array(_, _) | LlType::Struct(_)) {
-            return Ok(false);
-        }
-        if matches!(object_ty, LlType::Vector(_, _)) {
-            return Ok(false);
-        }
-        let storage = match self.resolve_type(&ptr.ty)? {
-            LlType::Ptr(addrspace) => self.pointer_storage_for(&ptr.value, addrspace)?,
-            other => {
-                return Err(format!(
-                    "native emitter: store pointer is not a pointer: {other:?}"
-                ))
-            }
-        };
-        if !matches!(
-            storage,
-            StorageClass::Function | StorageClass::Workgroup | StorageClass::Private
-        ) {
-            return Ok(false);
-        }
-        let Some((scalar_ty, access_path)) = first_scalar_access_path(pointee) else {
-            return Ok(false);
-        };
-        let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
-        let store_value = if types_compatible(object_ty, &scalar_ty) {
-            object_id
-        } else {
-            let Some(object_bits) = bitcast_width(object_ty) else {
-                return Ok(false);
-            };
-            let Some(scalar_bits) = bitcast_width(&scalar_ty) else {
-                return Ok(false);
-            };
-            if object_bits != scalar_bits {
+        staged_emit(instructions, |instructions| {
+            if !matches!(pointee, LlType::Array(_, _) | LlType::Struct(_)) {
                 return Ok(false);
             }
-            let scalar_type = self.type_id(&scalar_ty)?;
-            let cast = self.fresh();
-            instructions.push(Self::inst(
-                Op::Bitcast,
-                Some(scalar_type),
-                Some(cast),
-                vec![Operand::IdRef(object_id)],
-            ));
-            cast
-        };
+            if matches!(object_ty, LlType::Vector(_, _)) {
+                return Ok(false);
+            }
+            let storage = match self.resolve_type(&ptr.ty)? {
+                LlType::Ptr(addrspace) => self.pointer_storage_for(&ptr.value, addrspace)?,
+                other => {
+                    return Err(format!(
+                        "native emitter: store pointer is not a pointer: {other:?}"
+                    ))
+                }
+            };
+            if !matches!(
+                storage,
+                StorageClass::Function | StorageClass::Workgroup | StorageClass::Private
+            ) {
+                return Ok(false);
+            }
+            let Some((scalar_ty, access_path)) = first_scalar_access_path(pointee) else {
+                return Ok(false);
+            };
+            let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
+            let store_value = if types_compatible(object_ty, &scalar_ty) {
+                object_id
+            } else {
+                let Some(object_bits) = bitcast_width(object_ty) else {
+                    return Ok(false);
+                };
+                let Some(scalar_bits) = bitcast_width(&scalar_ty) else {
+                    return Ok(false);
+                };
+                if object_bits != scalar_bits {
+                    return Ok(false);
+                }
+                let scalar_type = self.type_id(&scalar_ty)?;
+                let cast = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Bitcast,
+                    Some(scalar_type),
+                    Some(cast),
+                    vec![Operand::IdRef(object_id)],
+                ));
+                cast
+            };
 
-        let ptr_id = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
-        let scalar_ptr_ty = self.ptr_type_id(storage, &scalar_ty)?;
-        let scalar_ptr = self.fresh();
-        let mut ops = vec![Operand::IdRef(ptr_id)];
-        for idx in access_path {
-            ops.push(Operand::IdRef(self.const_uint(idx)?));
-        }
-        instructions.push(Self::inst(
-            Op::InBoundsAccessChain,
-            Some(scalar_ptr_ty),
-            Some(scalar_ptr),
-            ops,
-        ));
-        instructions.push(Self::inst(
-            Op::Store,
-            None,
-            None,
-            vec![Operand::IdRef(scalar_ptr), Operand::IdRef(store_value)],
-        ));
-        Ok(true)
+            let ptr_id = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+            let scalar_ptr_ty = self.ptr_type_id(storage, &scalar_ty)?;
+            let scalar_ptr = self.fresh();
+            let mut ops = vec![Operand::IdRef(ptr_id)];
+            for idx in access_path {
+                ops.push(Operand::IdRef(self.const_uint(idx)?));
+            }
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(scalar_ptr_ty),
+                Some(scalar_ptr),
+                ops,
+            ));
+            instructions.push(Self::inst(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(scalar_ptr), Operand::IdRef(store_value)],
+            ));
+            Ok(true)
+        })
     }
 
     pub(in crate::native::emitter) fn emit_first_pointer_aggregate_reinterpret_load(

@@ -263,47 +263,49 @@ impl Emitter {
         result_ty: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let LlType::Ptr(_) = result_ty else {
-            return Ok(false);
-        };
-        let pointee = self
-            .tir_use_pointees
-            .get(name)
-            .cloned()
-            .or_else(|| self.pointer_pointees.get(name).cloned());
-        let Some(pointee) = pointee else {
-            return Ok(false);
-        };
-        let mut trees = Vec::with_capacity(incoming.len());
-        for (value, label) in incoming {
-            let LlValue::Local(local) = value else {
+        staged_emit(instructions, |instructions| {
+            let LlType::Ptr(_) = result_ty else {
                 return Ok(false);
             };
-            let tree = if let Some(tree) = self.selected_access_trees.get(local).cloned() {
-                if !types_compatible(&self.resolve_type(&tree.pointee)?, &pointee) {
+            let pointee = self
+                .tir_use_pointees
+                .get(name)
+                .cloned()
+                .or_else(|| self.pointer_pointees.get(name).cloned());
+            let Some(pointee) = pointee else {
+                return Ok(false);
+            };
+            let mut trees = Vec::with_capacity(incoming.len());
+            for (value, label) in incoming {
+                let LlValue::Local(local) = value else {
                     return Ok(false);
-                }
-                tree
-            } else if let Some(selected) = self.selected_pointers.get(local).cloned() {
-                self.build_selected_access_tree(
-                    &selected,
-                    &pointee,
-                    &[],
-                    &mut HashSet::new(),
-                    instructions,
-                )?
-            } else {
+                };
+                let tree = if let Some(tree) = self.selected_access_trees.get(local).cloned() {
+                    if !types_compatible(&self.resolve_type(&tree.pointee)?, &pointee) {
+                        return Ok(false);
+                    }
+                    tree
+                } else if let Some(selected) = self.selected_pointers.get(local).cloned() {
+                    self.build_selected_access_tree(
+                        &selected,
+                        &pointee,
+                        &[],
+                        &mut HashSet::new(),
+                        instructions,
+                    )?
+                } else {
+                    return Ok(false);
+                };
+                trees.push((tree, self.label_id(label)?));
+            }
+            let Some(tree) = self.merge_selected_access_tree_phi(&trees, instructions)? else {
                 return Ok(false);
             };
-            trees.push((tree, self.label_id(label)?));
-        }
-        let Some(tree) = self.merge_selected_access_tree_phi(&trees, instructions)? else {
-            return Ok(false);
-        };
-        self.pointer_pointees
-            .insert(name.to_string(), tree.pointee.clone());
-        self.selected_access_trees.insert(name.to_string(), tree);
-        Ok(true)
+            self.pointer_pointees
+                .insert(name.to_string(), tree.pointee.clone());
+            self.selected_access_trees.insert(name.to_string(), tree);
+            Ok(true)
+        })
     }
 
     fn merge_selected_access_tree_phi(
@@ -863,47 +865,49 @@ impl Emitter {
         rhs: &LlValue,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let Some(lhs_provenance) =
-            self.normalized_pointer_icmp_provenance(lhs, name, instructions)?
-        else {
-            return Ok(false);
-        };
-        let Some(rhs_provenance) =
-            self.normalized_pointer_icmp_provenance(rhs, name, instructions)?
-        else {
-            return Ok(false);
-        };
-        if !compatible_pointer_provenance(&lhs_provenance, &rhs_provenance) {
-            return Ok(false);
-        }
-        let Some(equal) = self.emit_pointer_index_equality(
-            &lhs_provenance.indices,
-            &rhs_provenance.indices,
-            instructions,
-        )?
-        else {
-            return Ok(false);
-        };
+        staged_emit(instructions, |instructions| {
+            let Some(lhs_provenance) =
+                self.normalized_pointer_icmp_provenance(lhs, name, instructions)?
+            else {
+                return Ok(false);
+            };
+            let Some(rhs_provenance) =
+                self.normalized_pointer_icmp_provenance(rhs, name, instructions)?
+            else {
+                return Ok(false);
+            };
+            if !compatible_pointer_provenance(&lhs_provenance, &rhs_provenance) {
+                return Ok(false);
+            }
+            let Some(equal) = self.emit_pointer_index_equality(
+                &lhs_provenance.indices,
+                &rhs_provenance.indices,
+                instructions,
+            )?
+            else {
+                return Ok(false);
+            };
 
-        let result_ty = LlType::Bool;
-        let result_type = self.type_id(&result_ty)?;
-        let result = self.result_id(name, &result_ty)?;
-        match pred {
-            Op::IEqual => instructions.push(Self::inst(
-                Op::CopyObject,
-                Some(result_type),
-                Some(result),
-                vec![Operand::IdRef(equal)],
-            )),
-            Op::INotEqual => instructions.push(Self::inst(
-                Op::LogicalNot,
-                Some(result_type),
-                Some(result),
-                vec![Operand::IdRef(equal)],
-            )),
-            _ => return Ok(false),
-        }
-        Ok(true)
+            let result_ty = LlType::Bool;
+            let result_type = self.type_id(&result_ty)?;
+            let result = self.result_id(name, &result_ty)?;
+            match pred {
+                Op::IEqual => instructions.push(Self::inst(
+                    Op::CopyObject,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdRef(equal)],
+                )),
+                Op::INotEqual => instructions.push(Self::inst(
+                    Op::LogicalNot,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdRef(equal)],
+                )),
+                _ => return Ok(false),
+            }
+            Ok(true)
+        })
     }
 
     pub(in crate::native::emitter) fn normalized_pointer_icmp_provenance(

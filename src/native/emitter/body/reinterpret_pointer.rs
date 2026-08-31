@@ -510,125 +510,146 @@ impl Emitter {
         ptr: &TypedValue,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let LlType::Ptr(_) = result_ty else {
-            return Ok(false);
-        };
-        let Some((root, prefix, index, suffix)) = self.local_pointer_dynamic_field_index(ptr)?
-        else {
-            return self.emit_pointer_from_local_multidynamic_field_load(
-                result_name,
-                result,
-                result_ty,
-                ptr,
-                instructions,
-            );
-        };
-        let values = self
-            .local_pointer_fields
-            .iter()
-            .filter_map(|(key, value)| {
-                let suffix_start = prefix.len() + 1;
-                (key.root == root
-                    && key.indices.len() == suffix_start + suffix.len()
-                    && key.indices.starts_with(&prefix)
-                    && &key.indices[suffix_start..] == suffix.as_slice())
-                .then(|| (key.indices[prefix.len()], value.clone()))
-            })
-            .collect::<Vec<_>>();
-        let index_id = self.value_id_in(&index.value, &index.ty, instructions)?;
-        self.emit_sidecar.local_pointer_dynamic_field_loads.push(
-            crate::emit_sidecar::LocalPointerDynamicFieldLoad {
+        staged_emit(instructions, |instructions| {
+            let LlType::Ptr(_) = result_ty else {
+                return Ok(false);
+            };
+            let Some((root, prefix, index, suffix)) =
+                self.local_pointer_dynamic_field_index(ptr)?
+            else {
+                return self.emit_pointer_from_local_multidynamic_field_load(
+                    result_name,
+                    result,
+                    result_ty,
+                    ptr,
+                    instructions,
+                );
+            };
+            let values = self
+                .local_pointer_fields
+                .iter()
+                .filter_map(|(key, value)| {
+                    let suffix_start = prefix.len() + 1;
+                    (key.root == root
+                        && key.indices.len() == suffix_start + suffix.len()
+                        && key.indices.starts_with(&prefix)
+                        && &key.indices[suffix_start..] == suffix.as_slice())
+                    .then(|| (key.indices[prefix.len()], value.clone()))
+                })
+                .collect::<Vec<_>>();
+            let index_id = self.value_id_in(&index.value, &index.ty, instructions)?;
+            // Built here, where its inputs are in scope, but recorded only on the paths that
+            // actually define `result`. It names `result` as a dynamic field load, and the handlers
+            // this one declines to are given the same `result` — so recording it before the
+            // remaining checks leaves the sidecar describing an id a different lowering produced.
+            let dynamic_field_load = crate::emit_sidecar::LocalPointerDynamicFieldLoad {
                 id: result,
                 root,
                 prefix: prefix.clone(),
                 index: index_id,
                 suffix: suffix.clone(),
-            },
-        );
-        if values.is_empty() {
-            let LlType::Ptr(addrspace) = result_ty else {
+            };
+            if values.is_empty() {
+                let LlType::Ptr(addrspace) = result_ty else {
+                    return Ok(false);
+                };
+                self.emit_unmodeled_byte_pointer_copy(
+                    result_name,
+                    result,
+                    *addrspace,
+                    instructions,
+                )?;
+                self.emit_sidecar
+                    .local_pointer_dynamic_field_loads
+                    .push(dynamic_field_load);
+                return Ok(true);
+            }
+            let mut values = values;
+            values.sort_by_key(|(idx, _)| *idx);
+
+            let value_refs = values
+                .iter()
+                .map(|(_, value)| &value.value)
+                .collect::<Vec<_>>();
+            let Some(pointer_meta) = self.pointer_merge_meta(&value_refs, result_ty)? else {
                 return Ok(false);
             };
-            self.emit_unmodeled_byte_pointer_copy(result_name, result, *addrspace, instructions)?;
-            return Ok(true);
-        }
-        let mut values = values;
-        values.sort_by_key(|(idx, _)| *idx);
-
-        let value_refs = values
-            .iter()
-            .map(|(_, value)| &value.value)
-            .collect::<Vec<_>>();
-        let Some(pointer_meta) = self.pointer_merge_meta(&value_refs, result_ty)? else {
-            return Ok(false);
-        };
-        if !matches!(
-            pointer_meta.storage,
-            StorageClass::StorageBuffer | StorageClass::UniformConstant | StorageClass::Workgroup
-        ) {
-            return Ok(false);
-        }
-
-        let index_ty = self.resolve_type(&index.ty)?;
-        let LlType::Int(index_bits) = index_ty else {
-            return Ok(false);
-        };
-        let result_type = self.pointer_aware_type_id(result_ty, Some(&pointer_meta))?;
-        let bool_type = self.type_id(&LlType::Bool)?;
-
-        let mut current = self.value_id_in(&values[0].1.value, &values[0].1.ty, instructions)?;
-        if values.len() == 1 {
-            instructions.push(Self::inst(
-                Op::CopyObject,
-                Some(result_type),
-                Some(result),
-                vec![Operand::IdRef(current)],
-            ));
-        } else {
-            for (entry_idx, (stored_index, stored_value)) in values.iter().enumerate().skip(1) {
-                let stored_id =
-                    self.value_id_in(&stored_value.value, &stored_value.ty, instructions)?;
-                let index_const = self.const_int(index_bits, *stored_index as u64)?;
-                let is_entry = self.fresh();
-                instructions.push(Self::inst(
-                    Op::IEqual,
-                    Some(bool_type),
-                    Some(is_entry),
-                    vec![Operand::IdRef(index_id), Operand::IdRef(index_const)],
-                ));
-                let selected = if entry_idx + 1 == values.len() {
-                    result
-                } else {
-                    self.fresh()
-                };
-                instructions.push(Self::inst(
-                    Op::Select,
-                    Some(result_type),
-                    Some(selected),
-                    vec![
-                        Operand::IdRef(is_entry),
-                        Operand::IdRef(stored_id),
-                        Operand::IdRef(current),
-                    ],
-                ));
-                current = selected;
+            if !matches!(
+                pointer_meta.storage,
+                StorageClass::StorageBuffer
+                    | StorageClass::UniformConstant
+                    | StorageClass::Workgroup
+            ) {
+                return Ok(false);
             }
-        }
 
-        self.record_pointer_meta(result_name.to_string(), pointer_meta);
-        self.dynamic_pointer_tables.insert(
-            result_name.to_string(),
-            DynamicPointerTable {
-                selector: index_id,
-                selector_bits: index_bits,
-                entries: values,
-            },
-        );
-        if !self.pointer_phi_values.is_empty() && !self.pointer_nullness.contains_key(result_name) {
-            let is_null = self.const_bool(false)?;
-            self.record_pointer_nullness(result_name.to_string(), is_null);
-        }
-        Ok(true)
+            let index_ty = self.resolve_type(&index.ty)?;
+            let LlType::Int(index_bits) = index_ty else {
+                return Ok(false);
+            };
+            let result_type = self.pointer_aware_type_id(result_ty, Some(&pointer_meta))?;
+            let bool_type = self.type_id(&LlType::Bool)?;
+
+            let mut current =
+                self.value_id_in(&values[0].1.value, &values[0].1.ty, instructions)?;
+            if values.len() == 1 {
+                instructions.push(Self::inst(
+                    Op::CopyObject,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdRef(current)],
+                ));
+            } else {
+                for (entry_idx, (stored_index, stored_value)) in values.iter().enumerate().skip(1) {
+                    let stored_id =
+                        self.value_id_in(&stored_value.value, &stored_value.ty, instructions)?;
+                    let index_const = self.const_int(index_bits, *stored_index as u64)?;
+                    let is_entry = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::IEqual,
+                        Some(bool_type),
+                        Some(is_entry),
+                        vec![Operand::IdRef(index_id), Operand::IdRef(index_const)],
+                    ));
+                    let selected = if entry_idx + 1 == values.len() {
+                        result
+                    } else {
+                        self.fresh()
+                    };
+                    instructions.push(Self::inst(
+                        Op::Select,
+                        Some(result_type),
+                        Some(selected),
+                        vec![
+                            Operand::IdRef(is_entry),
+                            Operand::IdRef(stored_id),
+                            Operand::IdRef(current),
+                        ],
+                    ));
+                    current = selected;
+                }
+            }
+
+            self.record_pointer_meta(result_name.to_string(), pointer_meta);
+            self.dynamic_pointer_tables.insert(
+                result_name.to_string(),
+                DynamicPointerTable {
+                    selector: index_id,
+                    selector_bits: index_bits,
+                    entries: values,
+                },
+            );
+            if !self.pointer_phi_values.is_empty()
+                && !self.pointer_nullness.contains_key(result_name)
+            {
+                let is_null = self.const_bool(false)?;
+                self.record_pointer_nullness(result_name.to_string(), is_null);
+            }
+            self.emit_sidecar
+                .local_pointer_dynamic_field_loads
+                .push(dynamic_field_load);
+            Ok(true)
+        })
     }
 
     /// Load from a local pointer table addressed by two or more dynamic aggregate indices. Each
