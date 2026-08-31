@@ -85,6 +85,29 @@ pub(in crate::native) fn run_module(
     run(module, function, arguments, step_limit)
 }
 
+/// Run the first function of `module` that has a body, then report the final contents of `slot` —
+/// the module-scope variable the function stored its answer into.
+pub(in crate::native) fn run_module_to_global(
+    module: &Module,
+    slot: Word,
+    step_limit: usize,
+) -> Result<Value, String> {
+    let function = module
+        .functions
+        .iter()
+        .find(|function| !function.blocks.is_empty())
+        .ok_or_else(|| "module has no function with a body".to_string())?;
+    let mut interpreter = Interpreter::new(module, function, &[])?;
+    match interpreter.run(step_limit)? {
+        Outcome::ReturnedVoid => interpreter
+            .memory
+            .get(&slot)
+            .copied()
+            .ok_or_else(|| format!("%{slot} is not a variable of this module")),
+        other => Err(format!("expected a void return, got {other:?}")),
+    }
+}
+
 struct Interpreter<'a> {
     function: &'a Function,
     blocks: HashMap<Word, usize>,
@@ -95,6 +118,7 @@ struct Interpreter<'a> {
 impl<'a> Interpreter<'a> {
     fn new(module: &Module, function: &'a Function, arguments: &[u32]) -> Result<Self, String> {
         let mut values = HashMap::new();
+        let mut initial_memory = Vec::new();
         for instruction in &module.types_global_values {
             let Some(id) = instruction.result_id else {
                 continue;
@@ -114,6 +138,12 @@ impl<'a> Interpreter<'a> {
                 }
                 Op::Undef => {
                     values.insert(id, Value::Undef);
+                }
+                // A module-scope variable is a slot like a function-scope one, except that its
+                // initializer runs before the function does.
+                Op::Variable => {
+                    values.insert(id, Value::Pointer(id));
+                    initial_memory.push((id, instruction.operands.get(1).cloned()));
                 }
                 _ => {}
             }
@@ -142,11 +172,24 @@ impl<'a> Interpreter<'a> {
                 return Err(format!("label %{label} is defined twice"));
             }
         }
+        let mut memory = HashMap::new();
+        for (slot, initializer) in initial_memory {
+            let value = match initializer {
+                Some(operand) => match &operand {
+                    Operand::IdRef(id) => *values
+                        .get(id)
+                        .ok_or_else(|| format!("%{slot} is initialized by unknown %{id}"))?,
+                    other => return Err(format!("{other:?} is not a value initializer")),
+                },
+                None => Value::Undef,
+            };
+            memory.insert(slot, value);
+        }
         Ok(Self {
             function,
             blocks,
             values,
-            memory: HashMap::new(),
+            memory,
         })
     }
 

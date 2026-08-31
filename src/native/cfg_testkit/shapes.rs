@@ -368,7 +368,57 @@ fn grow(seed: u64, depth: u32, crossings: u32) -> Shape {
 /// The returned value combines all three asymmetrically, so exchanging any two of them, or picking
 /// a phi's incoming value from the wrong predecessor, changes the answer.
 pub(in crate::native) fn author(shape: &Shape) -> Module {
-    let mut builder = CfgBuilder::new(1);
+    author_with(shape, Seed::Parameter).0
+}
+
+/// Author `shape` as a `void ()` `GLCompute` entry point whose three values all start from one
+/// constant, and return the `Private` slot it stores its answer into.
+///
+/// With nothing coming in from outside, the whole function is statically decidable, which is what
+/// [`crate::native::constfold`] is for: it propagates the constant, folds every branch it reaches,
+/// drops the blocks that become unreachable, and collapses the phis that lose their other
+/// predecessors. The one answer has to survive all of that.
+pub(in crate::native) fn author_constant_seeded(shape: &Shape, value: u32) -> (Module, Word) {
+    let (module, result) = author_with(shape, Seed::PrivateConstant(value));
+    (
+        module,
+        result.expect("a constant-seeded function stores its answer"),
+    )
+}
+
+/// Where a generated function's three live values start.
+enum Seed {
+    /// The function's one `uint` argument, so a shape can be run on many inputs.
+    Parameter,
+    /// A load of a module-scope `Private` variable with this constant initializer, and no
+    /// parameters at all.
+    ///
+    /// This is the shape a Metal `[[function_constant]]` compiles to at its disabled default, and
+    /// it is what makes the whole function statically decidable: `crate::native::constfold`
+    /// propagates the constant, folds every branch it reaches, drops the blocks that become
+    /// unreachable, and collapses the phis that lose their other predecessors. The function's one
+    /// answer must survive all of that.
+    PrivateConstant(u32),
+}
+
+/// Author `shape` with its values started from `seed`.
+///
+/// With [`Seed::Parameter`] the result is a `uint (uint)` helper that returns its answer. With
+/// [`Seed::PrivateConstant`] it is a `void ()` `GLCompute` entry point that stores its answer into
+/// [`RESULT_GLOBAL`] instead, because a pass that reasons about liveness deletes a function no
+/// entry point reaches. See [`author`].
+fn author_with(shape: &Shape, seed: Seed) -> (Module, Option<Word>) {
+    let mut builder = match seed {
+        Seed::Parameter => CfgBuilder::new(1),
+        Seed::PrivateConstant(_) => CfgBuilder::new_entry_point(),
+    };
+    let (global, result_global) = match seed {
+        Seed::Parameter => (None, None),
+        Seed::PrivateConstant(value) => (
+            Some(builder.private_global(value)),
+            Some(builder.private_global(0)),
+        ),
+    };
     let name = |block: usize| format!("b{block}");
 
     let predecessors = predecessors(&shape.terminators);
@@ -392,7 +442,10 @@ pub(in crate::native) fn author(shape: &Shape) -> Module {
                 predecessors[0].is_empty(),
                 "the entry block has predecessors, so its values would ignore them"
             );
-            let seed = builder.parameter(0);
+            let seed = match global {
+                Some(global) => builder.load(global),
+                None => builder.parameter(0),
+            };
             let five = builder.constant(5);
             let nine = builder.constant(9);
             let seeded_mix = builder.bitwise_xor(seed, five);
@@ -490,11 +543,17 @@ pub(in crate::native) fn author(shape: &Shape) -> Module {
                 // Asymmetric in all three, so exchanging any two changes it.
                 let summed = builder.add(value, mixed[block]);
                 let result = builder.bitwise_xor(summed, carried[block]);
-                builder.return_value(result);
+                match result_global {
+                    Some(slot) => {
+                        builder.store(slot, result);
+                        builder.return_void();
+                    }
+                    None => builder.return_value(result),
+                }
             }
         }
     }
-    builder.finish()
+    (builder.finish(), result_global)
 }
 
 /// A block's predecessors, in the order the blocks appear, so authored `OpPhi` operand order is a

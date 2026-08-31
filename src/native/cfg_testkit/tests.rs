@@ -374,3 +374,89 @@ fn generated_shapes_carry_the_phi_swap_on_real_back_edges() {
          in total); the swap the author hangs on them is not being exercised"
     );
 }
+
+/// Constant folding is a rewrite like any other, and the only thing that can say whether it
+/// preserved meaning is running the module. A function seeded entirely from a constant global is
+/// statically decidable, so `constfold` propagates, folds branches, deletes the blocks that become
+/// unreachable, and collapses the phis that lose predecessors — four rewrites whose interaction is
+/// where a fold goes wrong, over control flow far messier than an authored fixture would be.
+///
+/// Both pass orders are checked. Folding a constructed CFG and constructing a folded one are both
+/// things the pipeline does, and an optimizer that is right on the input shape can still be wrong
+/// on the shape a structurizer left behind.
+#[test]
+fn constant_folding_preserves_the_one_answer_a_constant_seeded_shape_has() {
+    for depth in [3u32, 5] {
+        for seed in 0..32u64 {
+            for value in [0u32, 3] {
+                let shape = shapes::irreducible_shape(seed, depth, 2);
+                let (module, slot) = shapes::author_constant_seeded(&shape, value);
+                let expected = interp::run_module_to_global(&module, slot, STEP_LIMIT)
+                    .unwrap_or_else(|error| {
+                        panic!("authored: {error}\n{}", shapes::describe(&shape))
+                    });
+
+                let mut folded_then_constructed = module.clone();
+                crate::native::rewrites::prune_constant_cfg_module_if_changed(
+                    &mut folded_then_constructed,
+                );
+                let _ = crate::native::rewrites::construct_cfg_functions_module(
+                    &mut folded_then_constructed,
+                    &std::collections::HashSet::new(),
+                );
+
+                let mut constructed_then_folded = module;
+                let _ = crate::native::rewrites::construct_cfg_functions_module(
+                    &mut constructed_then_folded,
+                    &std::collections::HashSet::new(),
+                );
+                crate::native::rewrites::prune_constant_cfg_module_if_changed(
+                    &mut constructed_then_folded,
+                );
+
+                for (order, module) in [
+                    ("fold then construct", &folded_then_constructed),
+                    ("construct then fold", &constructed_then_folded),
+                ] {
+                    let actual = interp::run_module_to_global(module, slot, STEP_LIMIT)
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{order} (value {value}): {error}\n{}",
+                                shapes::describe(&shape)
+                            )
+                        });
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "{order} (value {value}) changed the answer of this shape:\n{}",
+                        shapes::describe(&shape)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The sweep above only means something if the fold is actually folding. A constant-seeded shape's
+/// straight-line prefix is decidable, so blocks must disappear; a loop-carried condition is not,
+/// so not all of them do.
+#[test]
+fn constant_folding_actually_removes_blocks_from_a_constant_seeded_shape() {
+    let mut before = 0;
+    let mut after = 0;
+    for seed in 0..32u64 {
+        let shape = shapes::irreducible_shape(seed, 5, 2);
+        let (mut module, _) = shapes::author_constant_seeded(&shape, 3);
+        before += module.functions[0].blocks.len();
+        crate::native::rewrites::prune_constant_cfg_module_if_changed(&mut module);
+        after += module.functions.first().map_or(0, |f| f.blocks.len());
+    }
+    // Measured at 4131 -> 3772 when this was written: a modest fraction, because most blocks in a
+    // depth-5 shape are inside a loop whose accumulator is not a constant. The floor is set below
+    // the measurement, not at it.
+    assert!(
+        after * 20 <= before * 19 && after > 0,
+        "constant folding took {before} blocks to {after}; it is not deciding what it should, or \
+         it decided the whole function away"
+    );
+}

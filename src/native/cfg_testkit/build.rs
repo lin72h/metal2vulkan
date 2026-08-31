@@ -11,7 +11,7 @@
 //! against whatever the structurizers turn it into.
 
 use crate::spirv_module::{Block, Function, Instruction, Module, ModuleHeader, Operand};
-use spirv::{AddressingModel, MemoryModel, Op, Word};
+use spirv::{AddressingModel, MemoryModel, Op, StorageClass, Word};
 use std::collections::BTreeMap;
 
 /// A block under construction, addressed by the caller's name.
@@ -40,6 +40,19 @@ pub(in crate::native) struct CfgBuilder {
 impl CfgBuilder {
     /// Start a function taking `parameters` `uint` arguments and returning `uint`.
     pub(in crate::native) fn new(parameters: usize) -> Self {
+        Self::build(parameters, false)
+    }
+
+    /// Start a `void ()` function declared as the module's `GLCompute` entry point.
+    ///
+    /// Needed whenever a pass under test reasons about liveness: `constfold::sweep_uncalled_
+    /// functions` removes any function no entry point reaches, so a module without one has nothing
+    /// left to check after folding.
+    pub(in crate::native) fn new_entry_point() -> Self {
+        Self::build(0, true)
+    }
+
+    fn build(parameters: usize, entry_point: bool) -> Self {
         let mut next_id = 1;
         let mut fresh = || {
             let id = next_id;
@@ -76,7 +89,7 @@ impl CfgBuilder {
                 Op::TypeFunction,
                 None,
                 Some(fn_ty),
-                std::iter::once(Operand::IdRef(uint))
+                std::iter::once(Operand::IdRef(if entry_point { void } else { uint }))
                     .chain(std::iter::repeat_n(
                         Operand::IdRef(uint),
                         parameter_ids.len(),
@@ -84,11 +97,41 @@ impl CfgBuilder {
                     .collect(),
             ),
         ];
+        if entry_point {
+            module.capabilities.push(Instruction::new(
+                Op::Capability,
+                None,
+                None,
+                vec![Operand::Capability(spirv::Capability::Shader)],
+            ));
+            module.entry_points.push(Instruction::new(
+                Op::EntryPoint,
+                None,
+                None,
+                vec![
+                    Operand::ExecutionModel(spirv::ExecutionModel::GLCompute),
+                    Operand::IdRef(function_id),
+                    Operand::LiteralString("main".to_string()),
+                ],
+            ));
+            module.execution_modes.push(Instruction::new(
+                Op::ExecutionMode,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(function_id),
+                    Operand::ExecutionMode(spirv::ExecutionMode::LocalSize),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(1),
+                ],
+            ));
+        }
 
         let mut function = Function::new();
         function.def = Some(Instruction::new(
             Op::Function,
-            Some(uint),
+            Some(if entry_point { void } else { uint }),
             Some(function_id),
             vec![
                 Operand::FunctionControl(spirv::FunctionControl::NONE),
@@ -113,6 +156,60 @@ impl CfgBuilder {
             blocks: Vec::new(),
             current: None,
         }
+    }
+
+    /// A module-scope `Private` `uint` variable initialized to `value`.
+    ///
+    /// This is the shape a Metal `[[function_constant]]` compiles to once the emitter has modelled
+    /// it at its disabled default: a scalar global that nothing stores and that has a constant
+    /// initializer. It is what `crate::native::constfold` keys on, so a function that branches on
+    /// a load of one is a function the constant-folding optimizer will rewrite.
+    pub(in crate::native) fn private_global(&mut self, value: u32) -> Word {
+        let initializer = self.constant(value);
+        let pointer = self.pointer_to_uint(StorageClass::Private);
+        let id = self.fresh();
+        self.module.types_global_values.push(Instruction::new(
+            Op::Variable,
+            Some(pointer),
+            Some(id),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(initializer),
+            ],
+        ));
+        id
+    }
+
+    /// `OpLoad` of a `uint` through `pointer`.
+    pub(in crate::native) fn load(&mut self, pointer: Word) -> Word {
+        let id = self.fresh();
+        self.push(Instruction::new(
+            Op::Load,
+            Some(self.uint),
+            Some(id),
+            vec![Operand::IdRef(pointer)],
+        ));
+        id
+    }
+
+    fn pointer_to_uint(&mut self, storage: StorageClass) -> Word {
+        let existing = self.module.types_global_values.iter().find(|instruction| {
+            instruction.class.opcode == Op::TypePointer
+                && instruction.operands.first() == Some(&Operand::StorageClass(storage))
+                && instruction.operands.get(1) == Some(&Operand::IdRef(self.uint))
+        });
+        if let Some(id) = existing.and_then(|instruction| instruction.result_id) {
+            return id;
+        }
+        let id = self.fresh();
+        let uint = self.uint;
+        self.module.types_global_values.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(id),
+            vec![Operand::StorageClass(storage), Operand::IdRef(uint)],
+        ));
+        id
     }
 
     /// The result id of function parameter `index`.
@@ -290,6 +387,20 @@ impl CfgBuilder {
             operands.push(Operand::IdRef(label));
         }
         self.push(Instruction::new(Op::Switch, None, None, operands));
+    }
+
+    /// `OpStore` of `value` through `pointer`.
+    pub(in crate::native) fn store(&mut self, pointer: Word, value: Word) {
+        self.push(Instruction::new(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(pointer), Operand::IdRef(value)],
+        ));
+    }
+
+    pub(in crate::native) fn return_void(&mut self) {
+        self.push(Instruction::new(Op::Return, None, None, vec![]));
     }
 
     pub(in crate::native) fn return_value(&mut self, value: Word) {
