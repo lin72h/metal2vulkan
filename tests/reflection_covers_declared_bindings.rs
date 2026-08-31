@@ -10,6 +10,11 @@
 //! the shader never touches, and dropping the binding would silently renumber a consumer's
 //! expectations. Only the other direction is a defect, and that is what this file checks.
 //!
+//! The same asymmetry applies to how MANY descriptors a binding holds. `docs/REFLECTION.md` tells a
+//! consumer to group entries by `(set, binding, descriptor type)` and take the largest reported
+//! `count`; that number has to reach the largest array the module declares there, or the layout is
+//! smaller than the array the shader indexes into. The last test checks that direction.
+//!
 //! Two of the cases below are where the direction went wrong, and they are the same defect twice.
 //! `air.get_read_sampler()` exists because AIR threads a sampler pointer into `texture.read(coord)`,
 //! which in Metal is sampler-less; `air.get_null_texture_*()` exists because a function-constant
@@ -346,6 +351,148 @@ fn a_fragment_shader_reflects_the_imageblock_plane_it_declares() {
     );
 }
 
+/// A kernel that indexes a runtime-sized texture argument, which binds as a descriptor ARRAY.
+///
+/// `array_ref<texture2d<...>>` has no fixed length in AIR, so the module declares the descriptor-ABI
+/// capacity and reflection reports the same number as its `count`. A consumer that sized the layout
+/// from a smaller count would build one the shader indexes past.
+const RUNTIME_TEXTURE_ARRAY: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @k(ptr readonly captures(none) %imgs, ptr addrspace(1) %out) {
+entry:
+  %tex = load ptr addrspace(1), ptr %imgs, align 8
+  %w = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"array_ref<texture2d<float, sample>>", !"air.arg_name", !"imgs"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+
+#[test]
+fn a_descriptor_array_reports_at_least_as_many_descriptors_as_the_module_declares() {
+    let (spirv, reflection) = translate_sanitized_native_reflected(
+        RUNTIME_TEXTURE_ARRAY,
+        Stage::Kernel,
+        &scratch("runtime_texture_array"),
+        TransformOptions::default(),
+    )
+    .expect("the descriptor-array kernel translates");
+
+    assert_reflection_covers_declarations("the descriptor-array kernel", &spirv, &reflection);
+    let declared = array_lengths_the_module_declares(&spirv);
+    assert!(
+        declared.values().any(|length| *length > 1),
+        "this fixture is only meaningful if the module declares a descriptor array; got {declared:?}"
+    );
+    assert_counts_cover_declared_arrays("the descriptor-array kernel", &spirv, &reflection);
+}
+
+/// Require the largest reported `count` at each binding to reach the largest array the module
+/// declares there, and return how many bindings carried an array.
+fn assert_counts_cover_declared_arrays(
+    label: &str,
+    spirv: &[u8],
+    reflection: &ShaderReflection,
+) -> usize {
+    let mut reported = std::collections::BTreeMap::<u32, u32>::new();
+    for location in reflection
+        .bindings
+        .iter()
+        .filter_map(|resource| resource.descriptor)
+    {
+        let slot = reported.entry(location.binding).or_default();
+        *slot = (*slot).max(location.count);
+    }
+    let declared = array_lengths_the_module_declares(spirv);
+    let mut checked = 0;
+    for (binding, length) in &declared {
+        // A binding the module declares but reflection does not report is the other direction, and
+        // `assert_reflection_covers_declarations` is what says so.
+        let Some(count) = reported.get(binding) else {
+            continue;
+        };
+        assert!(
+            count >= length,
+            "{label} reports at most {count} descriptor(s) at binding {binding}, but the module \
+             declares an array of {length} there, so a layout built from the reflection is smaller \
+             than the array the shader indexes"
+        );
+        checked += 1;
+    }
+    checked
+}
+
+/// The largest descriptor-array length the module declares at each binding; `1` for a scalar.
+///
+/// Reads the crate's own disassembly, which prints raw ids and one instruction per line.
+fn array_lengths_the_module_declares(spirv: &[u8]) -> std::collections::BTreeMap<u32, u32> {
+    let text = metal2vulkan::disassemble(spirv).expect("disassemble the translated module");
+    let mut constants: Vec<(String, u32)> = Vec::new();
+    let mut arrays: Vec<(String, String)> = Vec::new();
+    let mut pointees: Vec<(String, String)> = Vec::new();
+    let mut variables: Vec<(String, String)> = Vec::new();
+    let mut bindings: Vec<(String, u32)> = Vec::new();
+    for line in text.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        match tokens.as_slice() {
+            ["OpDecorate", target, "Binding", value] => {
+                if let Ok(value) = value.parse::<u32>() {
+                    bindings.push(((*target).to_string(), value));
+                }
+            }
+            [result, "=", "OpConstant", _, value] => {
+                if let Ok(value) = value.parse::<u32>() {
+                    constants.push(((*result).to_string(), value));
+                }
+            }
+            [result, "=", "OpTypeArray", _, length] => {
+                arrays.push(((*result).to_string(), (*length).to_string()));
+            }
+            [result, "=", "OpTypePointer", _, pointee] => {
+                pointees.push(((*result).to_string(), (*pointee).to_string()));
+            }
+            [result, "=", "OpVariable", pointer, _] => {
+                variables.push(((*result).to_string(), (*pointer).to_string()));
+            }
+            _ => {}
+        }
+    }
+    let find = |pairs: &Vec<(String, String)>, key: &str| {
+        pairs
+            .iter()
+            .find(|(id, _)| id == key)
+            .map(|(_, value)| value.clone())
+    };
+    let mut declared = std::collections::BTreeMap::<u32, u32>::new();
+    for (variable, binding) in bindings {
+        let Some(pointer) = find(&variables, &variable) else {
+            continue;
+        };
+        let Some(pointee) = find(&pointees, &pointer) else {
+            continue;
+        };
+        let length = match find(&arrays, &pointee) {
+            // A runtime array has no length to compare against; it is bounded by the layout, which
+            // is what the count reports.
+            Some(length) => match constants.iter().find(|(id, _)| *id == length) {
+                Some((_, value)) => *value,
+                None => continue,
+            },
+            None => 1,
+        };
+        let slot = declared.entry(binding).or_insert(1);
+        *slot = (*slot).max(length);
+    }
+    declared
+}
+
 /// The same contract over every committed fixture, at the stage its AIR declares.
 ///
 /// The stage is not varied here, unlike the sweeps in `deterministic_output.rs`. Reflection is
@@ -374,6 +521,7 @@ fn every_public_fixture_reflects_every_descriptor_it_declares() {
             continue;
         };
         declared += assert_reflection_covers_declarations(&label, &spirv, &reflection).len();
+        assert_counts_cover_declared_arrays(&label, &spirv, &reflection);
         checked += 1;
     }
     assert!(

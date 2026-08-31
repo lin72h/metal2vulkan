@@ -135,7 +135,10 @@ reflection—not list positions or recomputed synthetic indices—to allocate de
 descriptor updates. Multiple AIR parameters may intentionally alias one Metal index. When building
 a Vulkan descriptor-set layout, group reflected entries by `(set, binding, descriptor type)` and use
 the maximum reflected `count`; incompatible descriptor types are assigned different ABI bands and
-are rejected by translation if they ever collide.
+are rejected by translation if they ever collide. That maximum is guaranteed to reach the largest
+array the module declares at the binding —
+`tests/reflection_covers_declared_bindings.rs` checks it, since a smaller layout is one the shader
+indexes past.
 
 Descriptor types for `bindings`:
 
