@@ -13,6 +13,11 @@
 //! just has not been written, and the reason it is pinned is that the obvious ways to write it are
 //! wrong. Closing it must be a deliberate change to this test, not a silent pass.
 //!
+//! One case here is deliberately POSITIVE. A rejection is only pinned from one side: a test that
+//! asserts a class FALLBACKs cannot notice a change that starts rejecting inputs that used to
+//! translate. The function-constant-gated pair below asserts both directions over a single
+//! template, so the boundary itself is what is pinned, not just the far side of it.
+//!
 //! Two of these are the classes that actually turn up. Measured over a 2880-source local corpus
 //! sample, 204 sources do not translate, and 191 of them are one of two shapes: a call through a
 //! Metal visible function table, or an intersection whose custom intersection functions come from a
@@ -128,6 +133,109 @@ fn visible_function_table_call_fallbacks() {
          \x20 %r = call i32 %fp(ptr addrspace(2) %in)\n",
         "declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)\n",
     );
+    assert_fallback(
+        &ll,
+        "unsupported indirect call through function pointer %fp",
+    );
+}
+
+/// The same visible-function-table call, reached only when a `[[function_constant]]` predicate is
+/// true — which pins the *edge* of the rejection above rather than its interior.
+///
+/// Nothing supplies function-constant values at translate time (`fc_air_specialize` bakes any
+/// caller-supplied ones into the AIR before parsing, and the emitted modules carry no
+/// `OpSpecConstant` for them), so `air.is_function_constant_defined` folds to `false` and the
+/// module's static initializer stores `0` into the gating global. The gated region is then
+/// statically dead, gets pruned, and the indirect call never reaches the emitter.
+///
+/// That fold is load-bearing for real shaders: corpus sources that call through a visible function
+/// table inside an off-by-default region translate today *because of it*. It is also fragile —
+/// it spans `fold_static_initializer_constants` and `prune_unreachable_function_bodies`
+/// (`src/native/ir/static_init.rs`) and depends on the initializer being recognised as one. So the
+/// two directions are pinned as a pair over one template that differs in exactly one token, the
+/// order of the branch arms:
+///
+/// - dead side taken → the call is folded away and the kernel translates;
+/// - live side taken → the same call FALLBACKs with the same diagnostic as above.
+///
+/// A regression that stops recognising the initializer turns the first into a FALLBACK; one that
+/// prunes too eagerly turns the second into a silent success. Neither is caught by either half
+/// alone.
+const FC_GATED_VFT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+@enabled.MTL_FC_INIT_0_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@kEnabled = internal unnamed_addr addrspace(2) global i8 0, align 1
+
+declare i1 @air.is_function_constant_defined(ptr addrspace(2))
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
+
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
+  %1 = load i8, ptr addrspace(2) @enabled.MTL_FC_INIT_0_b, align 1
+  %2 = call i1 @air.is_function_constant_defined(ptr addrspace(2) @enabled.MTL_FC_INIT_0_b)
+  %3 = icmp ne i8 %1, 0
+  %4 = select i1 %2, i1 %3, i1 false
+  %5 = zext i1 %4 to i8
+  store i8 %5, ptr addrspace(2) @kEnabled, align 1
+  ret void
+}
+
+define internal fastcc float @fetch(ptr addrspace(1) %table, ptr addrspace(1) %data) {
+  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 0)
+  %r = call float %fp(ptr addrspace(1) %data)
+  ret float %r
+}
+
+define void @k(ptr addrspace(1) %out, ptr addrspace(1) %table) {
+entry:
+  %e = load i8, ptr addrspace(2) @kEnabled, align 1
+  %c = icmp eq i8 %e, 0
+  br i1 %c, label %ARMS
+
+use:
+  %v = call fastcc float @fetch(ptr addrspace(1) %table, ptr addrspace(1) %out)
+  br label %done
+
+done:
+  %r = phi float [ 0.000000e+00, %entry ], [ %v, %use ]
+  store float %r, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!air.function_constants = !{!6}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.function_constant", !6, !"air.visible_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table", !"air.arg_name", !"table"}
+!6 = !{ptr addrspace(2) @enabled.MTL_FC_INIT_0_b, !"bool", !"enabled", i32 0, i1 false}
+"#;
+
+/// `FC_GATED_VFT` with the branch arms in `arms` order — the sole difference between the two cases.
+fn fc_gated_vft(arms: &str) -> String {
+    assert!(
+        FC_GATED_VFT.contains("label %ARMS"),
+        "the branch placeholder must survive edits to the template"
+    );
+    FC_GATED_VFT.replace("label %ARMS", arms)
+}
+
+#[test]
+fn function_constant_gated_visible_function_table_call_is_folded_away() {
+    let ll = fc_gated_vft("label %done, label %use");
+    let spv = translate_sanitized_native(&ll, Stage::Kernel, &tmp()).expect(
+        "an off-by-default function constant makes the visible-function-table region dead; \
+         folding it is what lets such shaders translate at all",
+    );
+    assert!(
+        !spv.is_empty(),
+        "the folded kernel must still emit a module"
+    );
+}
+
+#[test]
+fn live_visible_function_table_call_still_fallbacks_under_a_function_constant() {
+    let ll = fc_gated_vft("label %use, label %done");
     assert_fallback(
         &ll,
         "unsupported indirect call through function pointer %fp",
