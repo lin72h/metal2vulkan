@@ -255,3 +255,49 @@ fn break_out_of_a_selection_inside_a_loop() -> crate::spirv_module::Module {
 
     builder.finish()
 }
+
+/// The state-machine constructor's own territory. A graph with an edge into the interior of an
+/// already-written region is irreducible, so the nesting structurizer declines it by contract and
+/// the state machine is what has to be right.
+#[test]
+fn construction_preserves_semantics_across_irreducible_shapes() {
+    for depth in [3u32, 5] {
+        for seed in 0..48u64 {
+            let shape = shapes::irreducible_shape(seed, depth, 3);
+            let module = shapes::author(&shape);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert_construction_preserves_semantics(module, ARGUMENTS);
+            }))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "construction lost the semantics of this shape:\n{}",
+                    shapes::describe(&shape)
+                )
+            });
+        }
+    }
+}
+
+/// The irreducible family only tests the state machine if it really is irreducible. Nesting
+/// declining most of it is the observable form of that; if this drops, the sweep above has quietly
+/// become a second run of the reducible one.
+#[test]
+fn irreducible_shapes_are_declined_by_the_nesting_structurizer() {
+    let mut declined = 0;
+    let mut total = 0;
+    for depth in [3u32, 5] {
+        for seed in 0..48u64 {
+            total += 1;
+            if !nests(&shapes::author(&shapes::irreducible_shape(seed, depth, 3))) {
+                declined += 1;
+            }
+        }
+    }
+    // Measured at 66/96 when this was written. A crossing whose target happens to dominate its
+    // source is an ordinary back edge and leaves the graph reducible, so the family is a mixture
+    // by construction; the floor only has to be high enough to prove the mixture is real.
+    assert!(
+        declined * 2 >= total,
+        "only {declined}/{total} shapes with interior cross edges reach the state machine"
+    );
+}

@@ -82,6 +82,8 @@ impl Rng {
 struct Generator {
     rng: Rng,
     terminators: Vec<Option<Term>>,
+    /// Blocks already given a terminator, as candidates for an irreducible cross edge.
+    settled: Vec<usize>,
     /// Headers of the loops currently enclosing the region being emitted, outermost first.
     loop_headers: Vec<usize>,
     /// Exit blocks of the regions currently enclosing the one being emitted, outermost first.
@@ -89,6 +91,10 @@ struct Generator {
     /// How many escape edges the shape has taken so far, so a shape stays finite.
     escapes: u32,
     escape_budget: u32,
+    /// How many edges into the interior of an already-written region are still allowed. Each one
+    /// gives some loop a second entry, so a graph with any of them is irreducible and only the
+    /// state-machine constructor can express it.
+    cross_budget: u32,
 }
 
 impl Generator {
@@ -103,6 +109,43 @@ impl Generator {
             "block {block} terminated twice"
         );
         self.terminators[block] = Some(term);
+        self.settled.push(block);
+    }
+
+    /// An edge into the interior of a region already written, which is what makes the graph
+    /// irreducible: the target keeps its original predecessors and gains one that does not go
+    /// through whatever header used to dominate it.
+    ///
+    /// The edge is guarded by the same monotonic `accumulator < bound` test the loops use, never by
+    /// a mask, so it stops being taken once the accumulator has grown past the bound. Without that,
+    /// a cross edge could close a cycle containing no bounded test at all and the shape would not
+    /// terminate.
+    fn cross_edge(&mut self, from: usize) -> Option<(Cond, usize)> {
+        if self.cross_budget == 0 {
+            return None;
+        }
+        // Never the entry block: it has no `OpPhi` to merge a second arrival into, because nothing
+        // precedes the first one. Never an enclosing header or exit either — those already
+        // dominate this block, so an edge to one is an ordinary back edge or break and leaves the
+        // graph reducible, which is not what this is for.
+        let candidates = self
+            .settled
+            .iter()
+            .copied()
+            .filter(|block| {
+                *block != 0
+                    && *block != from
+                    && !self.loop_headers.contains(block)
+                    && !self.region_exits.contains(block)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        self.cross_budget -= 1;
+        let pick = self.rng.below(candidates.len() as u32) as usize;
+        let bound = ACCUMULATOR_BOUND - self.rng.below(64);
+        Some((Cond::LessThan(bound), candidates[pick]))
     }
 
     /// A target an escape edge from inside the current region may jump to: an enclosing region's
@@ -125,9 +168,20 @@ impl Generator {
         Some(candidates[pick])
     }
 
-    /// Terminate `block` with a branch to `next`, or — when an escape is available and the coin
-    /// falls that way — with a conditional that leaves the current construct entirely.
+    /// Terminate `block` with a branch to `next`, or — when a target is available and the coin
+    /// falls that way — with a conditional that leaves the current construct entirely or jumps
+    /// into the interior of one already written.
+    ///
+    /// The cross-edge coin is flipped whether or not any crossings are allowed, so a seed names
+    /// the same underlying shape with and without them.
     fn flow(&mut self, block: usize, next: usize) {
+        let crossing = self.rng.chance(4);
+        if crossing {
+            if let Some((cond, target)) = self.cross_edge(block) {
+                self.set(block, Term::Conditional(cond, target, next));
+                return;
+            }
+        }
         if self.rng.chance(6) {
             if let Some(target) = self.escape_target() {
                 let mask = 1 << self.rng.below(5);
@@ -241,15 +295,32 @@ impl Shape {
     }
 }
 
-/// Grow one shape from `seed`. `depth` bounds the region tree, so it bounds the block count.
+/// Grow one reducible shape from `seed`. `depth` bounds the region tree, so it bounds the block
+/// count.
 pub(in crate::native) fn shape(seed: u64, depth: u32) -> Shape {
+    grow(seed, depth, 0)
+}
+
+/// Grow one shape from `seed` with up to `crossings` edges into the interior of an already-written
+/// region.
+///
+/// Any such edge makes the graph irreducible, which the nesting structurizer declines by contract,
+/// so this is how the state-machine constructor gets exercised on its own territory rather than
+/// only on what nesting hands back.
+pub(in crate::native) fn irreducible_shape(seed: u64, depth: u32, crossings: u32) -> Shape {
+    grow(seed, depth, crossings)
+}
+
+fn grow(seed: u64, depth: u32, crossings: u32) -> Shape {
     let mut generator = Generator {
         rng: Rng(seed),
         terminators: Vec::new(),
+        settled: Vec::new(),
         loop_headers: Vec::new(),
         region_exits: Vec::new(),
         escapes: 0,
         escape_budget: 24,
+        cross_budget: crossings,
     };
     // The function entry is its own block, branching into the region tree. It cannot be a region
     // entry: the top-level region may be a loop, and a loop header needs a predecessor other than
