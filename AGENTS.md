@@ -128,7 +128,7 @@ fixes over one-off workarounds.
 
 ### Translation performance is a correctness contract
 
-- **30 seconds is a hard end-to-end ceiling per translation attempt.** Measure from handing the
+- **20 seconds is a hard end-to-end ceiling per translation attempt.** Measure from handing the
   selected AIR input to an isolated worker through translation, SPIR-V validation, and reporting
   the result. Success or an honest unsupported-input `FALLBACK` must arrive within the ceiling;
   exceeding it, timing out, or killing a stuck worker is a failing result that must be diagnosed
@@ -161,7 +161,7 @@ fixes over one-off workarounds.
   slowest row and the scope measured. Debug-build timing does not verify the ceiling.
 - When a slow or memory-heavy failure class is found, add a deterministic regression check for
   the underlying redundant-work or boundedness property. Avoid machine-fragile microbenchmarks;
-  keep the 30-second and 500-MiB worker guards as hard integration backstops.
+  keep the 20-second and 500-MiB worker guards as hard integration backstops.
 - **Do not normalize known breaches.** An observed over-budget translation is an active correctness
   bug, not acceptable technical debt or a reason to weaken the workload. Profile where its time
   and memory go, remove redundant or global work structurally, and remeasure the same input under
@@ -262,6 +262,6 @@ When diagnosing a hang, prefer reading full `cargo test` output over piping thro
    when fmt, clippy, and applicable Rustdoc checks are clean.
 
 **Done** = it works under the checks above, claims match evidence, fmt/clippy/Rustdoc are green,
-measured translations in the touched scope stay within 30 seconds and 500 MiB, relevant capability
+measured translations in the touched scope stay within 20 seconds and 500 MiB, relevant capability
 audits remain closed without stale evidence or unrelated source reads, and the tree stays
 publishable as a general AIR→SPIR-V translator.

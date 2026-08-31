@@ -157,7 +157,7 @@ cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
 
 The 500-row checkpoint is the measured default for the current 88,820-row corpus: unlike a
 1,000-row checkpoint containing several of its largest modules, it retained comfortable margin
-under the repository's 30-second workflow ceiling while still persisting every ten completions.
+under the repository's 20-second workflow ceiling while still persisting every ten completions.
 Jobs default to the host's available logical cores (`nproc`). Explicitly increasing that value
 beyond the available cores can starve individual workers and create false timeouts.
 
@@ -166,7 +166,7 @@ when lowering `air.get_num_samples.i32`; authored candidate execution uses that 
 not a product default: general callers provide their exact raster sample count through
 `TransformOptions` or the CLI.
 
-Each translation runs in a killable child with a 30-second / 500-MiB ceiling. The parent owns the
+Each translation runs in a killable child with a 20-second / 500-MiB ceiling. The parent owns the
 child's scratch subtree, so success, failure, timeout, and memory termination all have the same
 deterministic cleanup path; a killed child never strands a PID-named directory. Completed results
 cross a queue bounded by the requested worker count. If a ten-row SQLite checkpoint fails, the
@@ -210,7 +210,7 @@ translation cannot drift into separate whole-symbol allowlists.
 
 Focused audits select cached structural facts, not unsupported-requirement rows. A feature therefore
 remains auditable after it becomes fully supported. Device-address captures use the same cursor and
-the same killable 30-second / 500-MiB translation worker as the full census:
+the same killable 20-second / 500-MiB translation worker as the full census:
 
 ```sh
 cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \

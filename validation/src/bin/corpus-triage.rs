@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
-const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(30);
+const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(20);
 const TRANSLATION_MEMORY_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
 const LARGE_TRANSLATION_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_LARGE_TRANSLATION_JOBS: usize = 2;
@@ -2194,7 +2194,7 @@ declare i32 @linked.MTL_VISIBLE_FN_REF() section "air.externally_defined"
     fn timeout_shape_excludes_bounded_phase_diagnostics() {
         assert_eq!(
             normalize_failure_shape(
-                "translation timeout after 30 seconds: [retry-debug] passes: cfg repair start"
+                "translation timeout after 20 seconds: [retry-debug] passes: cfg repair start"
             ),
             "translation timeout after # seconds"
         );
