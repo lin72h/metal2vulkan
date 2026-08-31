@@ -81,12 +81,12 @@ the following work before assembly:
    construction, then rebuild the selected CFG and canonicalize the completed graph.
 9. Reject malformed result-type IDs and core type-declaration graphs before any instruction can
    treat an arbitrary defined ID as a type.
-10. Reject owned arithmetic, comparison, shift, numeric-bitcast, bit-count, Boolean reduction,
-   float-classification, vector-algebra, derivative, copy, select, phi, load, and store type
-   disagreement; atomic pointer-pointee, result, value, comparator, scope, and memory-semantics type
-   disagreement; unknown GLSL.std.450 opcodes and extended-instruction arity or type-shape
-   disagreement; sampled-image result, image, and sampler type disagreement; image-query result,
-   dimension, array, multisample, sampled/storage mode, LOD, and coordinate disagreement; derivatives
+10. Reject owned arithmetic, comparison, shift, numeric-bitcast, width-conversion, bit-count,
+   Boolean reduction, float-classification, vector-algebra, derivative, copy, select, phi, load,
+   and store type disagreement; atomic pointer-pointee, result, value, comparator, scope, and
+   memory-semantics type disagreement; unknown GLSL.std.450 opcodes and extended-instruction
+   arity or type-shape disagreement; sampled-image result, image, and sampler type disagreement;
+   image-query result, dimension, array, multisample, sampled/storage mode, LOD, and coordinate disagreement; derivatives
    and implicit-LOD queries reachable outside a Fragment call tree; texel fetch/read/write image mode,
    component, coordinate, result, texel, LOD, and sample disagreement; sampled-image operation result,
    coordinate, component, LOD, constant-offset, and stage disagreement; image-texel-pointer result,

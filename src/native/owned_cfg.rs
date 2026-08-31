@@ -1866,10 +1866,18 @@ enum ComparisonClass {
     Float,
 }
 
+/// The numeric-conversion families the owned module can construct, split by the shape contract
+/// SPIR-V places on each. The three width-changing families additionally require the source and
+/// result component widths to differ: a same-width `OpUConvert`, `OpSConvert`, or `OpFConvert` is
+/// not a no-op conversion, it is an invalid instruction.
 #[derive(Clone, Copy)]
 enum ConversionClass {
-    IntegerToInteger,
-    FloatToFloat,
+    /// `OpUConvert`: integer source and unsigned integer result of a different width.
+    UnsignedWidth,
+    /// `OpSConvert`: integer source and integer result of a different width.
+    SignedWidth,
+    /// `OpFConvert`: float source and float result of a different width.
+    FloatWidth,
     FloatToInteger,
     IntegerToFloat,
 }
@@ -1933,10 +1941,9 @@ fn comparison_class(opcode: Op) -> Option<ComparisonClass> {
 
 fn conversion_class(opcode: Op) -> Option<ConversionClass> {
     match opcode {
-        Op::UConvert | Op::SConvert | Op::SatConvertSToU | Op::SatConvertUToS => {
-            Some(ConversionClass::IntegerToInteger)
-        }
-        Op::FConvert => Some(ConversionClass::FloatToFloat),
+        Op::UConvert => Some(ConversionClass::UnsignedWidth),
+        Op::SConvert => Some(ConversionClass::SignedWidth),
+        Op::FConvert => Some(ConversionClass::FloatWidth),
         Op::ConvertFToU | Op::ConvertFToS => Some(ConversionClass::FloatToInteger),
         Op::ConvertSToF | Op::ConvertUToF => Some(ConversionClass::IntegerToFloat),
         _ => None,
@@ -3665,6 +3672,18 @@ fn owned_value_instruction_error(
             ));
         }
     }
+    // The saturating OpenCL conversions require the Kernel capability and have no Vulkan
+    // environment. They are rejected as a shape class rather than reaching a numeric contract that
+    // does not describe them.
+    if matches!(
+        instruction.class.opcode,
+        Op::SatConvertSToU | Op::SatConvertUToS
+    ) {
+        return Err(format!(
+            "native emitter: owned {:?} is not available in Vulkan 1.2",
+            instruction.class.opcode
+        ));
+    }
     if let Some(class) = conversion_class(instruction.class.opcode) {
         let Some(source_type) = instruction.operands.first().and_then(operand_type) else {
             return Ok(());
@@ -3672,28 +3691,28 @@ fn owned_value_instruction_error(
         let Some(result_type) = instruction.result_type else {
             return Ok(());
         };
-        let source_shape = scalar_type_shape(source_type, definitions);
-        let result_shape = scalar_type_shape(result_type, definitions);
+        let source_shape = numeric_type_shape(source_type, definitions);
+        let result_shape = numeric_type_shape(result_type, definitions);
         let matches = match (class, source_shape, result_shape) {
             (
-                ConversionClass::IntegerToInteger,
-                Some((Op::TypeInt, source_lanes)),
-                Some((Op::TypeInt, result_lanes)),
+                ConversionClass::UnsignedWidth | ConversionClass::SignedWidth,
+                Some((Op::TypeInt, source_width, source_lanes)),
+                Some((Op::TypeInt, result_width, result_lanes)),
             )
             | (
-                ConversionClass::FloatToFloat,
-                Some((Op::TypeFloat, source_lanes)),
-                Some((Op::TypeFloat, result_lanes)),
-            )
-            | (
+                ConversionClass::FloatWidth,
+                Some((Op::TypeFloat, source_width, source_lanes)),
+                Some((Op::TypeFloat, result_width, result_lanes)),
+            ) => source_lanes == result_lanes && source_width != result_width,
+            (
                 ConversionClass::FloatToInteger,
-                Some((Op::TypeFloat, source_lanes)),
-                Some((Op::TypeInt, result_lanes)),
+                Some((Op::TypeFloat, _, source_lanes)),
+                Some((Op::TypeInt, _, result_lanes)),
             )
             | (
                 ConversionClass::IntegerToFloat,
-                Some((Op::TypeInt, source_lanes)),
-                Some((Op::TypeFloat, result_lanes)),
+                Some((Op::TypeInt, _, source_lanes)),
+                Some((Op::TypeFloat, _, result_lanes)),
             ) => source_lanes == result_lanes,
             _ => false,
         };
@@ -3702,6 +3721,16 @@ fn owned_value_instruction_error(
                 "native emitter: owned {:?} source and result shapes are inconsistent",
                 instruction.class.opcode
             ));
+        }
+        // `OpUConvert` names an unsigned zero extension or truncation, so its Result Type must
+        // carry Signedness 0. `OpSConvert` accepts either signedness.
+        if matches!(class, ConversionClass::UnsignedWidth)
+            && integer_type_signedness(result_type, definitions) != Some(false)
+        {
+            return Err(
+                "native emitter: owned OpUConvert result type is not an unsigned integer"
+                    .to_string(),
+            );
         }
     }
     if matches!(
@@ -8608,6 +8637,137 @@ mod tests {
             validation.is_err(),
             "spirv-val must reject the malformed conversion type contract"
         );
+    }
+
+    /// The width-changing numeric conversions (`OpUConvert`, `OpSConvert`, `OpFConvert`) are only
+    /// well-formed when the source and result component widths differ, and `OpUConvert` must name
+    /// an unsigned result. Each rejected shape is paired with the independent `spirv-val` verdict
+    /// so the owned contract stays a construction-time restatement of the Vulkan rule rather than
+    /// a locally invented one.
+    #[test]
+    fn owned_width_conversions_require_a_width_change() {
+        let signed_short = Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(39),
+            vec![Operand::LiteralBit32(16), Operand::LiteralBit32(1)],
+        );
+        let rejected: [(Instruction, Option<Instruction>, &str); 6] = [
+            (
+                // int32 -> int32 is not a conversion.
+                Instruction::new(Op::UConvert, Some(12), Some(40), vec![Operand::IdRef(13)]),
+                None,
+                "native emitter: owned UConvert source and result shapes are inconsistent",
+            ),
+            (
+                Instruction::new(Op::SConvert, Some(12), Some(40), vec![Operand::IdRef(13)]),
+                None,
+                "native emitter: owned SConvert source and result shapes are inconsistent",
+            ),
+            (
+                // f32 -> f32 is not a conversion.
+                Instruction::new(Op::FConvert, Some(15), Some(40), vec![Operand::IdRef(23)]),
+                None,
+                "native emitter: owned FConvert source and result shapes are inconsistent",
+            ),
+            (
+                // Equal component width across differing lane counts is still not a conversion.
+                Instruction::new(Op::UConvert, Some(16), Some(40), vec![Operand::IdRef(21)]),
+                None,
+                "native emitter: owned UConvert source and result shapes are inconsistent",
+            ),
+            (
+                Instruction::new(Op::UConvert, Some(39), Some(40), vec![Operand::IdRef(13)]),
+                Some(signed_short.clone()),
+                "native emitter: owned OpUConvert result type is not an unsigned integer",
+            ),
+            (
+                Instruction::new(
+                    Op::SatConvertSToU,
+                    Some(29),
+                    Some(40),
+                    vec![Operand::IdRef(13)],
+                ),
+                None,
+                "native emitter: owned SatConvertSToU is not available in Vulkan 1.2",
+            ),
+        ];
+        for (instruction, extra_type, expected) in rejected {
+            let opcode = instruction.class.opcode;
+            let mut module = module_with_composite_instruction(instruction);
+            if let Some(extra_type) = extra_type {
+                module.types_global_values.push(extra_type);
+            }
+            assert_owned_invalid(&module, expected);
+            let bytes = module
+                .assemble()
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>();
+            let tmp = std::env::temp_dir().join(format!(
+                "metal2vulkan_owned_width_conversion_{opcode:?}_{}",
+                std::process::id()
+            ));
+            let validation = crate::tools::spirv_val_bytes(&bytes, &tmp);
+            let _ = std::fs::remove_dir(&tmp);
+            assert!(
+                validation.is_err(),
+                "spirv-val must reject {opcode:?} without a width change"
+            );
+        }
+    }
+
+    /// The same contract must not reject the conversions the emitter constructs for real narrowing
+    /// and widening, so each accepted shape is also validated end to end.
+    #[test]
+    fn owned_width_conversions_accept_a_real_width_change() {
+        let accepted = [
+            // uint32 -> uint16 truncation.
+            Instruction::new(Op::UConvert, Some(29), Some(40), vec![Operand::IdRef(13)]),
+            // uint16 -> uint32 zero extension.
+            Instruction::new(Op::UConvert, Some(12), Some(40), vec![Operand::IdRef(33)]),
+            // f32 -> f16 narrowing.
+            Instruction::new(Op::FConvert, Some(34), Some(40), vec![Operand::IdRef(23)]),
+            // f16 -> f32 widening.
+            Instruction::new(Op::FConvert, Some(15), Some(40), vec![Operand::IdRef(35)]),
+            // Class-changing conversions carry no width restriction.
+            Instruction::new(
+                Op::ConvertFToU,
+                Some(12),
+                Some(40),
+                vec![Operand::IdRef(23)],
+            ),
+            Instruction::new(
+                Op::ConvertUToF,
+                Some(15),
+                Some(40),
+                vec![Operand::IdRef(13)],
+            ),
+        ];
+        for instruction in accepted {
+            let opcode = instruction.class.opcode;
+            let result_type = instruction.result_type;
+            let module = module_with_composite_instruction(instruction);
+            assert!(
+                owned_module_failure(&module).is_none(),
+                "owned construction rejected a valid {opcode:?} to {result_type:?}"
+            );
+            let bytes = module
+                .assemble()
+                .iter()
+                .flat_map(|word| word.to_le_bytes())
+                .collect::<Vec<_>>();
+            let tmp = std::env::temp_dir().join(format!(
+                "metal2vulkan_owned_valid_conversion_{opcode:?}_{}",
+                std::process::id()
+            ));
+            let validation = crate::tools::spirv_val_bytes(&bytes, &tmp);
+            let _ = std::fs::remove_dir(&tmp);
+            assert!(
+                validation.is_ok(),
+                "spirv-val rejected a conversion the owned contract accepts: {validation:?}"
+            );
+        }
     }
 
     #[test]
