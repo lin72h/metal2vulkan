@@ -976,15 +976,25 @@ pub(crate) fn construct_cfg_functions_module(
     // module because a surviving caller may contain that inlined CFG. If no selected identity
     // remains, there is no structural owner to construct; do not guess that every function owns it.
     // When all rejected identities survive, retain the narrower per-function construction.
-    let changed = if named.len() == construction_names.len() {
+    // Reducible control flow does not need the state-machine representation. Nest what can be
+    // nested first: that keeps ordinary SSA values in registers and the constructs properly
+    // enclosed, which is what a driver's shader compiler needs to stay bounded. Whatever the
+    // nesting structurizer declines stays on the state machine below, unchanged.
+    let nested = crate::native::reloop_nest::structure_selected_functions(module, &selected);
+    let mut remaining = selected.clone();
+    remaining.retain(|id| !nested.contains(id));
+    let relooped = if remaining.is_empty() {
+        false
+    } else if named.len() == construction_names.len() || !nested.is_empty() {
         relooper::rewrite_selected_to_relooper(
             module,
             relooper::default_max_relooper_blocks(),
-            &selected,
+            &remaining,
         )
     } else {
         relooper::rewrite_to_relooper(module, relooper::default_max_relooper_blocks())
     };
+    let changed = relooped || !nested.is_empty();
     if !changed {
         return Err("native emitter: selected CFG function cannot be constructed".to_string());
     }
@@ -1056,7 +1066,7 @@ pub(crate) fn unowned_selection_header_labels(
         .collect()
 }
 
-fn function_has_unowned_backedge(function: &crate::spirv_module::Function) -> bool {
+pub(crate) fn function_has_unowned_backedge(function: &crate::spirv_module::Function) -> bool {
     let labels = function
         .blocks
         .iter()

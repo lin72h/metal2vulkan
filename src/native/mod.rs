@@ -24,6 +24,7 @@ mod private_vector_word;
 mod psb;
 mod psb_value_select;
 pub(crate) mod ray_intersection;
+mod reloop_nest;
 mod relooper;
 mod render;
 // Owned-module construction rewrites and compatibility byte adapters.

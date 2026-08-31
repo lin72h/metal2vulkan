@@ -103,7 +103,7 @@ fn rewrite_to_relooper_if(
 
 /// Find-or-create cache for the integer / bool / pointer types and the integer constants the relooper
 /// synthesizes. Accumulates new global instructions in `pending`, flushed into the module at the end.
-struct TypeCtx<'a> {
+pub(super) struct TypeCtx<'a> {
     next_id: &'a mut Word,
     /// Existing + pending type/const defs, keyed for lookup.
     int_types: HashMap<(u32, u32), Word>, // (width, signedness) -> id
@@ -123,7 +123,7 @@ struct TypeCtx<'a> {
 }
 
 impl<'a> TypeCtx<'a> {
-    fn new(module: &Module, next_id: &'a mut Word) -> Self {
+    pub(super) fn new(module: &Module, next_id: &'a mut Word) -> Self {
         let mut int_types = HashMap::new();
         let mut int_widths = HashMap::new();
         let mut bool_type = None;
@@ -237,7 +237,7 @@ impl<'a> TypeCtx<'a> {
         }
     }
 
-    fn fresh(&mut self) -> Word {
+    pub(super) fn fresh(&mut self) -> Word {
         let id = *self.next_id;
         *self.next_id += 1;
         id
@@ -247,7 +247,7 @@ impl<'a> TypeCtx<'a> {
         self.type_op.get(&ty).copied()
     }
 
-    fn value_type(&self, value: Word) -> Option<Word> {
+    pub(super) fn value_type(&self, value: Word) -> Option<Word> {
         self.value_types.get(&value).copied()
     }
 
@@ -311,7 +311,7 @@ impl<'a> TypeCtx<'a> {
         id
     }
 
-    fn i32_ty(&mut self) -> Word {
+    pub(super) fn i32_ty(&mut self) -> Word {
         self.int_ty(32, 0)
     }
 
@@ -327,7 +327,7 @@ impl<'a> TypeCtx<'a> {
         id
     }
 
-    fn ptr_function(&mut self, pointee: Word) -> Word {
+    pub(super) fn ptr_function(&mut self, pointee: Word) -> Word {
         self.ptr(StorageClass::Function, pointee)
     }
 
@@ -383,7 +383,7 @@ impl<'a> TypeCtx<'a> {
         self.array_strides.insert(pointer, stride);
     }
 
-    fn int_const(&mut self, ty: Word, value: u64) -> Word {
+    pub(super) fn int_const(&mut self, ty: Word, value: u64) -> Word {
         if let Some(&id) = self.int_consts.get(&(ty, value)) {
             return id;
         }
@@ -402,14 +402,15 @@ impl<'a> TypeCtx<'a> {
         id
     }
 
-    fn flush(self, module: &mut Module) {
+    pub(super) fn flush(self, module: &mut Module) {
         module.types_global_values.extend(self.pending);
         module.annotations.extend(self.pending_annotations);
     }
 }
 
 /// A handled block terminator, decoded from the original block's last instruction.
-enum Term {
+#[derive(Clone)]
+pub(super) enum Term {
     Branch(Word),
     BranchCond(Word, Word, Word),         // cond, true, false
     Switch(Word, Word, Vec<(u64, Word)>), // selector, default, (literal, label)
@@ -525,7 +526,7 @@ fn load_spill(tc: &mut TypeCtx<'_>, spill: &Spill, instructions: &mut Vec<Instru
     }
 }
 
-fn decode_term(inst: &Instruction) -> Option<Term> {
+pub(super) fn decode_term(inst: &Instruction) -> Option<Term> {
     match inst.class.opcode {
         Op::Branch => match inst.operands.first()? {
             Operand::IdRef(t) => Some(Term::Branch(*t)),
@@ -575,7 +576,7 @@ fn decode_term(inst: &Instruction) -> Option<Term> {
     }
 }
 
-fn block_label(block: &Block) -> Option<Word> {
+pub(super) fn block_label(block: &Block) -> Option<Word> {
     block.label.as_ref().and_then(|l| l.result_id)
 }
 
