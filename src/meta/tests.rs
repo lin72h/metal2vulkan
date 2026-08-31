@@ -424,6 +424,34 @@ fn vertex_builtin_roles() {
     assert_eq!(m.output_role_of(2), Some(&VertOutRole::ClipDistance));
 }
 
+/// `air.invariant` is decoded onto the member it sits on and nowhere else.
+#[test]
+fn invariance_is_decoded_per_output_member() {
+    let plain = parse_air_vertex_meta(VERT_BUILTIN_LL).unwrap();
+    assert!(
+        !plain.output_is_invariant(0),
+        "a position without the marker is not invariant"
+    );
+
+    let ll = VERT_BUILTIN_LL.replace(
+        r#"!16 = !{!"air.position","#,
+        r#"!16 = !{!"air.position", !"air.invariant","#,
+    );
+    assert_ne!(ll, VERT_BUILTIN_LL);
+    let m = parse_air_vertex_meta(&ll).unwrap();
+    assert!(m.output_is_invariant(0));
+    assert_eq!(
+        m.output_role_of(0),
+        Some(&VertOutRole::Position),
+        "the marker must not displace the role it qualifies"
+    );
+    assert!(
+        !m.output_is_invariant(1),
+        "the viewport index is not marked"
+    );
+    assert!(!m.output_is_invariant(2), "the clip distance is not marked");
+}
+
 #[test]
 fn function_constant_wrapped_function_tables_keep_their_linkage_roles() {
     let ll = r#"

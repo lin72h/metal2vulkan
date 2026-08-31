@@ -1,7 +1,9 @@
 //! Return-value lowering, output variables, and static-sampler materialization.
 
 use super::*;
-use crate::passes::stage_input::{decorate_builtin, decorate_location, scalar_or_vector_component};
+use crate::passes::stage_input::{
+    decorate_builtin, decorate_location, decorate_with, scalar_or_vector_component,
+};
 
 fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
     match frag {
@@ -828,6 +830,11 @@ pub(in crate::passes) fn rewrite_return(
                             }
                             OutKind::Location(loc) => decorate_location(&mut ctx.module, var, loc),
                         }
+                        // `[[position, invariant]]` asks for a bit-exact position across
+                        // pipelines; the decoration is the only place that request survives.
+                        if vert.is_some_and(|m| m.output_is_invariant(mi as u32)) {
+                            decorate_with(&mut ctx.module, var, Decoration::Invariant);
+                        }
                         ctx.interface.push(var);
                         match clip_distance_ty {
                             Some(ClipDistanceOutputType::Scalar { elem_ty, .. }) => {
@@ -852,6 +859,9 @@ pub(in crate::passes) fn rewrite_return(
                     // bare position vec4
                     let var = make_output_var(ctx, ret_ty);
                     decorate_builtin(&mut ctx.module, var, BuiltIn::Position);
+                    if vert.is_some_and(|m| m.output_is_invariant(0)) {
+                        decorate_with(&mut ctx.module, var, Decoration::Invariant);
+                    }
                     ctx.interface.push(var);
                     outputs.push(OutputWrite::Direct {
                         var,

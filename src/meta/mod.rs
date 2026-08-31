@@ -392,6 +392,14 @@ pub struct VertMeta {
     /// exact cross-stage scalar type instead of forcing executors to infer it from a location.
     pub parameter_type_names: HashMap<u32, String>,
     pub output_roles: Vec<VertOutRole>,
+    /// Output member indices AIR marked `air.invariant` — Metal `[[position, invariant]]`.
+    ///
+    /// The guarantee is bit-exact: the same vertex fed through two pipelines that both declare it
+    /// must produce the identical clip position, which is what lets a depth-prepass and the pass
+    /// that tests against it agree instead of z-fighting. Vulkan spells it `OpDecorate … Invariant`.
+    /// A translation that drops it stays valid and reflects identically, so nothing but this record
+    /// carries the request across.
+    pub invariant_outputs: Vec<u32>,
     /// User-varying output Location -> AIR type name.
     pub output_varying_types: HashMap<u32, String>,
     /// User-varying output Location -> Metal field name.
@@ -466,6 +474,10 @@ impl VertMeta {
     }
     pub fn output_role_of(&self, idx: u32) -> Option<&VertOutRole> {
         self.output_roles.get(idx as usize)
+    }
+    /// Whether AIR marked output member `idx` `air.invariant`.
+    pub fn output_is_invariant(&self, idx: u32) -> bool {
+        self.invariant_outputs.contains(&idx)
     }
     pub fn output_varying_type(&self, loc: u32) -> Option<&str> {
         self.output_varying_types.get(&loc).map(String::as_str)
@@ -1901,6 +1913,7 @@ fn parse_air_vertex_meta_with_nodes(
     });
 
     let mut output_roles = vec![];
+    let mut invariant_outputs = vec![];
     let mut output_varying_types = HashMap::new();
     let mut output_varying_names = HashMap::new();
     let mut output_varying_user_semantics = HashMap::new();
@@ -1936,6 +1949,9 @@ fn parse_air_vertex_meta_with_nodes(
             }
             _ => VertOutRole::Other,
         };
+        if strs.iter().any(|s| s == "invariant") {
+            invariant_outputs.push(output_roles.len() as u32);
+        }
         output_roles.push(role);
     }
 
@@ -2092,6 +2108,7 @@ fn parse_air_vertex_meta_with_nodes(
         implicit_imageblock_attachments: detect_implicit_imageblock_attachments(ll)?,
         parameter_type_names,
         output_roles,
+        invariant_outputs,
         output_varying_types,
         output_varying_names,
         output_varying_user_semantics,

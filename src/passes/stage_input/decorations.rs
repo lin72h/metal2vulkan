@@ -56,7 +56,8 @@ pub(in crate::passes) fn decorate_interpolation(
     }
 }
 
-fn decorate_with(module: &mut Module, id: Word, decoration: Decoration) {
+/// Apply a decoration that takes no literal operands.
+pub(in crate::passes) fn decorate_with(module: &mut Module, id: Word, decoration: Decoration) {
     module.annotations.push(Instruction::new(
         Op::Decorate,
         None,
