@@ -30,6 +30,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reflection schema v35: a descriptor-backed buffer's `access` is widened to cover the loads and
+  stores the finished module performs through it. AIR's declared access is not a guarantee about the
+  body -- over 2880 corpus sources, 20 buffers reflected `ReadOnly` are stored through, 9 reflected
+  `WriteOnly` are loaded from, and 3 reflected `Unused` are both -- and a consumer barriers and
+  stages from this field. It only ever widens, since the analysis can miss an access through a
+  device address it cannot attribute. `reflect_sanitized` builds no module and keeps the declared
+  classification.
 - Reflection schema v34: `texture_shape` describes the `OpTypeImage` the module declares at that
   binding, not the shape the AIR type name implies. A `texturecube` that is only texel-read binds as
   a `Dim2D` array, because SPIR-V has no cube texel fetch, and a consumer that created a cube view

@@ -73,7 +73,7 @@ mod footprint;
 /// materializes the plane from the call, which is a property of the body rather than of the stage.
 /// Reflected translation also reports the buffer-address table the finished module declares instead
 /// of the one an AIR text scan predicted.
-pub const REFLECTION_VERSION: u32 = 34;
+pub const REFLECTION_VERSION: u32 = 35;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).

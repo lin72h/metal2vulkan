@@ -72,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `34`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `35`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -225,7 +225,7 @@ binding them as ordinary vertex attributes.
 | `type_name` | AIR type string when metadata carried it |
 | `texture_shape` | Dim / arrayed / MS / component / writable / storage format, plus fixed handle-array length when present. Reflected translation corrects these to the `OpTypeImage` the module declares at the binding, so the view a consumer creates matches the image variable the descriptor is read through — a texel-read `texturecube` binds as a `D2` array, since SPIR-V has no cube texel fetch. A binding whose image variables do not all declare the same type (a function-constant-gated texture argument can produce that) keeps the type-name-derived shape, as does `reflect_sanitized`, which builds no module. |
 | `embedded_source` | For arg-buffer textures: owning buffer index, field byte offset, and Metal `[[id(n)]]` argument-encoder index |
-| `access` | When known: `Unused` / `ReadOnly` / `WriteOnly` / `ReadWrite` / `Sampled` / `Storage` |
+| `access` | When known: `Unused` / `ReadOnly` / `WriteOnly` / `ReadWrite` / `Sampled` / `Storage`. For a descriptor-backed buffer, reflected translation widens the declared classification to cover the loads and stores the finished module performs through it, so it is safe to barrier and stage from. It only ever widens: the analysis follows the pointer graph it can attribute, so a buffer it saw no write through may still be written via a device address. `reflect_sanitized` builds no module and reports the declared classification alone. |
 | `static_sampler` | Decoded immutable state for `StaticSampler`; `None` for other kinds |
 
 ### Buffer extent and access

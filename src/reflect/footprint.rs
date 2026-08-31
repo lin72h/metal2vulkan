@@ -157,7 +157,7 @@ pub(super) fn attach_buffer_footprints(
     }
 
     let mut analyzer = Analyzer::new(module, &target_bindings);
-    let footprints = analyzer.analyze();
+    let analysis = analyzer.analyze();
 
     for binding in &mut reflection.bindings {
         if !binding_supports_footprint(binding) {
@@ -167,7 +167,7 @@ pub(super) fn attach_buffer_footprints(
             continue;
         };
         let key = DescriptorKey::from(descriptor);
-        binding.footprint = Some(footprints.get(&key).cloned().unwrap_or_else(|| {
+        binding.footprint = Some(analysis.footprints.get(&key).cloned().unwrap_or_else(|| {
             // A genuinely unused reflected binding can be optimized out of the final module. Any
             // other missing descriptor is conservatively unbounded rather than silently empty.
             BufferFootprint {
@@ -175,8 +175,43 @@ pub(super) fn attach_buffer_footprints(
                 ..BufferFootprint::default()
             }
         }));
+        if let Some(observed) = analysis.observed.get(&key) {
+            binding.access = Some(widen_access(binding.access, *observed));
+        }
     }
     Ok(())
+}
+
+/// Widen a declared access to cover what the module was seen doing through the descriptor.
+///
+/// The declared classification comes from AIR metadata, tightened by the specialized entry's
+/// parameter attributes. It can be narrower than the module: measured over 2880 corpus sources, 20
+/// buffers reflected `ReadOnly` are stored through, 9 reflected `WriteOnly` are loaded from, and 3
+/// reflected `Unused` are both. A consumer that staged a `ReadOnly` buffer into read-only memory,
+/// or skipped a barrier for one, would be acting on a description the module contradicts.
+///
+/// This only ever widens. The walk resolves accesses through the pointer graph it can follow, so
+/// finding no write is not proof there is none -- an access through a device address the analysis
+/// cannot attribute would be missed -- and narrowing on that basis would turn a conservative answer
+/// into a wrong one.
+fn widen_access(declared: Option<ResourceAccess>, observed: AccessDirection) -> ResourceAccess {
+    let (declared_reads, declared_writes) = match declared {
+        Some(ResourceAccess::ReadOnly) => (true, false),
+        Some(ResourceAccess::WriteOnly) => (false, true),
+        Some(ResourceAccess::ReadWrite) => (true, true),
+        // `Sampled` and `Storage` classify textures, which have no footprint and never reach here;
+        // `Unused` and `None` assert nothing to preserve.
+        _ => (false, false),
+    };
+    match (
+        declared_reads || observed.reads,
+        declared_writes || observed.writes,
+    ) {
+        (true, true) => ResourceAccess::ReadWrite,
+        (true, false) => ResourceAccess::ReadOnly,
+        (false, true) => ResourceAccess::WriteOnly,
+        (false, false) => declared.unwrap_or(ResourceAccess::Unused),
+    }
 }
 
 fn binding_supports_footprint(binding: &ResourceBinding) -> bool {
@@ -239,7 +274,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn analyze(&mut self) -> BTreeMap<DescriptorKey, BufferFootprint> {
+    fn analyze(&mut self) -> Analysis {
         self.propagate_pointer_addresses();
         let mut footprints = self
             .roots
@@ -247,6 +282,7 @@ impl<'a> Analyzer<'a> {
             .copied()
             .map(|key| (key, BufferFootprint::default()))
             .collect::<BTreeMap<_, _>>();
+        let mut observed = BTreeMap::<DescriptorKey, AccessDirection>::new();
 
         for instruction in self
             .module
@@ -260,6 +296,12 @@ impl<'a> Analyzer<'a> {
                     continue;
                 };
                 for address in addresses {
+                    let seen = observed.entry(address.root).or_insert(AccessDirection {
+                        reads: false,
+                        writes: false,
+                    });
+                    seen.reads |= access.direction.reads;
+                    seen.writes |= access.direction.writes;
                     let footprint = footprints.entry(address.root).or_default();
                     let Some(size) = access.size else {
                         footprint.has_unbounded_access = true;
@@ -311,7 +353,10 @@ impl<'a> Analyzer<'a> {
             footprint.strided_accesses.sort();
             footprint.strided_accesses.dedup();
         }
-        footprints
+        Analysis {
+            footprints,
+            observed,
+        }
     }
 
     fn mark_unmodeled_pointer_escapes(
@@ -880,6 +925,7 @@ impl<'a> Analyzer<'a> {
                 .map(|pointer| MemoryAccess {
                     pointer,
                     size: result_size(),
+                    direction: AccessDirection::READ,
                 })
                 .into_iter()
                 .collect(),
@@ -892,33 +938,49 @@ impl<'a> Analyzer<'a> {
                         .and_then(id_ref)
                         .and_then(|value| self.value_types.get(&value).copied())
                         .and_then(|ty| self.access_type_span(pointer, ty)),
+                    direction: AccessDirection::WRITE,
                 })
                 .into_iter()
                 .collect(),
-            Op::CopyMemory => [pointer(0), pointer(1)]
-                .into_iter()
-                .flatten()
-                .map(|pointer| MemoryAccess {
-                    pointer,
-                    size: pointee_size(self, pointer),
-                })
-                .collect(),
+            // `OpCopyMemory Target Source`: operand 0 is written, operand 1 is read.
+            Op::CopyMemory => [
+                (pointer(0), AccessDirection::WRITE),
+                (pointer(1), AccessDirection::READ),
+            ]
+            .into_iter()
+            .filter_map(|(pointer, direction)| Some((pointer?, direction)))
+            .map(|(pointer, direction)| MemoryAccess {
+                pointer,
+                size: pointee_size(self, pointer),
+                direction,
+            })
+            .collect(),
             Op::CopyMemorySized => {
                 let size = instruction
                     .operands
                     .get(2)
                     .and_then(id_ref)
                     .and_then(|id| self.constants.get(&id).copied());
-                [pointer(0), pointer(1)]
-                    .into_iter()
-                    .flatten()
-                    .map(|pointer| MemoryAccess { pointer, size })
-                    .collect()
+                [
+                    (pointer(0), AccessDirection::WRITE),
+                    (pointer(1), AccessDirection::READ),
+                ]
+                .into_iter()
+                .filter_map(|(pointer, direction)| Some((pointer?, direction)))
+                .map(|(pointer, direction)| MemoryAccess {
+                    pointer,
+                    size,
+                    direction,
+                })
+                .collect()
             }
+            // Every SPIR-V atomic reads its pointee, and all but `OpAtomicLoad` write it back. The
+            // read-modify-write classification is the conservative one for the two that do not.
             opcode if is_atomic(opcode) => pointer(0)
                 .map(|pointer| MemoryAccess {
                     pointer,
                     size: result_size().or_else(|| pointee_size(self, pointer)),
+                    direction: AccessDirection::READ_WRITE,
                 })
                 .into_iter()
                 .collect(),
@@ -935,6 +997,7 @@ impl<'a> Analyzer<'a> {
                 .map(|pointer| MemoryAccess {
                     pointer,
                     size: None,
+                    direction: AccessDirection::READ_WRITE,
                 })
                 .into_iter()
                 .collect(),
@@ -1119,10 +1182,43 @@ impl<'a> Analyzer<'a> {
     }
 }
 
+/// What one walk of the module found for the descriptors it was asked about.
+struct Analysis {
+    footprints: BTreeMap<DescriptorKey, BufferFootprint>,
+    /// Whether the module reads and/or writes through each descriptor. Absent means the walk found
+    /// no access it could attribute to that descriptor, which is not the same as no access.
+    observed: BTreeMap<DescriptorKey, AccessDirection>,
+}
+
 #[derive(Clone, Copy)]
 struct MemoryAccess {
     pointer: Word,
     size: Option<u64>,
+    /// Whether this access reads the pointee, writes it, or both. `CopyMemory` is one instruction
+    /// with a reading pointer and a writing one, so the direction belongs to the access rather than
+    /// to the instruction.
+    direction: AccessDirection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccessDirection {
+    reads: bool,
+    writes: bool,
+}
+
+impl AccessDirection {
+    const READ: Self = Self {
+        reads: true,
+        writes: false,
+    };
+    const WRITE: Self = Self {
+        reads: false,
+        writes: true,
+    };
+    const READ_WRITE: Self = Self {
+        reads: true,
+        writes: true,
+    };
 }
 
 impl Decorations {

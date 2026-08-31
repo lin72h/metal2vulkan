@@ -579,8 +579,13 @@ pub fn translate_reflected_with_options(
 /// 2880 corpus sources, that scan disagrees with what the emitter actually emits on 39 of them.
 /// The descriptors the passes synthesize to type an AIR value -- `SynthesizedNullTexture` and
 /// `SynthesizedReadSampler` -- are absent entirely, because whether one survives depends on whether
-/// anything in the finished module consumed its value. `translate_sanitized_native_reflected` has a
-/// module and reads both off it instead.
+/// anything in the finished module consumed its value.
+///
+/// Three per-binding fields are likewise the declaration rather than the module: a texture's
+/// `texture_shape` is the shape its AIR type name implies, which is not always the image the
+/// emitter binds; a buffer's `access` is the declared classification, not widened to the loads and
+/// stores the module performs; and `footprint` is absent. `translate_sanitized_native_reflected`
+/// has a module and reads all of these off it instead.
 pub fn reflect_sanitized(
     san_ll: &str,
     stage: passes::Stage,
