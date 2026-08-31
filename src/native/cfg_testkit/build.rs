@@ -177,6 +177,12 @@ impl CfgBuilder {
                 Operand::IdRef(initializer),
             ],
         ));
+        // From SPIR-V 1.4 on, an entry point's interface lists every module-scope variable it can
+        // reach, whatever the storage class. Leaving one out is rejected before anything about the
+        // module's control flow is looked at.
+        for entry_point in &mut self.module.entry_points {
+            entry_point.operands.push(Operand::IdRef(id));
+        }
         id
     }
 
@@ -460,7 +466,11 @@ impl CfgBuilder {
             });
         }
         module.functions[0].blocks = emitted;
-        module.header = Some(ModuleHeader::new(next_id));
+        let mut header = ModuleHeader::new(next_id);
+        // The version the product emits, and the one `spirv-val` is asked about: a fixture at a
+        // later version is rejected before anything about its content is examined.
+        header.set_version(1, 5);
+        module.header = Some(header);
         module
     }
 }

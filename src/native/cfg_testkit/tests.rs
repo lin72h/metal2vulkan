@@ -460,3 +460,78 @@ fn constant_folding_actually_removes_blocks_from_a_constant_seeded_shape() {
          it decided the whole function away"
     );
 }
+
+/// Executing a construction says it computes the right thing; it does not say a driver would
+/// accept it. SPIR-V's structured control flow rules -- a block appears before every block it
+/// dominates, a merge block is dominated by its header, a construct is left only at its own merge
+/// or an enclosing loop's continue -- are all things a semantically correct rewrite can still get
+/// wrong, and `spirv-val` is what knows them.
+///
+/// The authored shape is invalid on purpose (that is what selects construction), so only the
+/// output is validated.
+#[test]
+fn constructed_shapes_are_valid_spirv() {
+    let tmp = std::env::temp_dir().join("m2v_cfg_testkit_val");
+    for depth in [3u32, 5] {
+        for crossings in [0u32, 2] {
+            for seed in 0..16u64 {
+                let shape = shapes::irreducible_shape(seed, depth, crossings);
+                let (mut module, _) = shapes::author_constant_seeded(&shape, 3);
+                let _ = crate::native::rewrites::construct_cfg_functions_module(
+                    &mut module,
+                    &std::collections::HashSet::new(),
+                );
+                let bytes = assemble(&module);
+                crate::tools::spirv_val_bytes(&bytes, &tmp).unwrap_or_else(|error| {
+                    panic!(
+                        "construction produced invalid SPIR-V: {error}\n{}",
+                        shapes::describe(&shape)
+                    )
+                });
+            }
+        }
+    }
+}
+
+/// A constructed module has to survive the trip through binary that a consumer puts it through.
+/// Round-tripping it and comparing the disassembly catches an assembler and a parser that disagree
+/// about an instruction's encoding, which neither validation nor execution of the in-memory module
+/// would notice.
+#[test]
+fn constructed_shapes_survive_a_binary_round_trip_unchanged() {
+    for depth in [3u32, 5] {
+        for seed in 0..24u64 {
+            let shape = shapes::irreducible_shape(seed, depth, 2);
+            let (mut module, slot) = shapes::author_constant_seeded(&shape, 3);
+            let _ = crate::native::rewrites::construct_cfg_functions_module(
+                &mut module,
+                &std::collections::HashSet::new(),
+            );
+            let expected = interp::run_module_to_global(&module, slot, STEP_LIMIT)
+                .expect("constructed module runs");
+
+            let reloaded = crate::spirv_module::load_bytes(assemble(&module))
+                .unwrap_or_else(|error| panic!("reloading: {error:?}"));
+            assert_eq!(
+                reloaded.disassemble(),
+                module.disassemble(),
+                "a binary round trip changed this module:\n{}",
+                shapes::describe(&shape)
+            );
+            assert_eq!(
+                interp::run_module_to_global(&reloaded, slot, STEP_LIMIT).expect("reloaded runs"),
+                expected,
+                "a binary round trip changed what this module computes:\n{}",
+                shapes::describe(&shape)
+            );
+        }
+    }
+}
+
+fn assemble(module: &crate::spirv_module::Module) -> Vec<u8> {
+    module
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect()
+}
