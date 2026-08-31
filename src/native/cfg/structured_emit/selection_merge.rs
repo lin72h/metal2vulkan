@@ -659,6 +659,9 @@ pub(in crate::native) fn header_owned_merge_predecessors(
 /// that case redirect the owned predecessor around the gateway and copy the gateway's phi value onto
 /// the new predecessor edge. If outside control still enters the gateway, its original natural-phi
 /// incoming remains; otherwise the private merge replaces it completely.
+///
+/// Declining leaves `blocks` byte-identical: the body runs against a staged copy that is
+/// committed only on `Some` (see [`atomic_rewrite`]).
 pub(in crate::native) fn synth_unique_selection_merge_phi_explicit(
     blocks: &mut Vec<BodyBlock>,
     preds: &[String],
@@ -666,135 +669,138 @@ pub(in crate::native) fn synth_unique_selection_merge_phi_explicit(
     routes_into_natural: &HashSet<String>,
     counter: &mut usize,
 ) -> Option<String> {
-    let pred_set = preds.iter().map(String::as_str).collect::<HashSet<_>>();
-    let mut redirects = Vec::<(String, String)>::new();
-    for block in blocks.iter() {
-        if !pred_set.contains(block.name.as_str()) {
-            continue;
-        }
-        for target in block_successors(block) {
-            if target == natural || routes_into_natural.contains(&target) {
-                redirects.push((block.name.clone(), target));
+    atomic_rewrite(blocks, |blocks| {
+        let pred_set = preds.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut redirects = Vec::<(String, String)>::new();
+        for block in blocks.iter() {
+            if !pred_set.contains(block.name.as_str()) {
+                continue;
+            }
+            for target in block_successors(block) {
+                if target == natural || routes_into_natural.contains(&target) {
+                    redirects.push((block.name.clone(), target));
+                }
             }
         }
-    }
-    if redirects.is_empty() {
-        return None;
-    }
+        if redirects.is_empty() {
+            return None;
+        }
 
-    let direct_preds = redirects
-        .iter()
-        .filter(|(_, target)| target == natural)
-        .map(|(pred, _)| pred.as_str())
-        .collect::<HashSet<_>>();
-    let route_preds = redirects
-        .iter()
-        .filter(|(_, target)| target != natural)
-        .fold(
-            HashMap::<&str, Vec<&str>>::new(),
-            |mut map, (pred, route)| {
-                map.entry(route.as_str()).or_default().push(pred.as_str());
-                map
+        let direct_preds = redirects
+            .iter()
+            .filter(|(_, target)| target == natural)
+            .map(|(pred, _)| pred.as_str())
+            .collect::<HashSet<_>>();
+        let route_preds = redirects
+            .iter()
+            .filter(|(_, target)| target != natural)
+            .fold(
+                HashMap::<&str, Vec<&str>>::new(),
+                |mut map, (pred, route)| {
+                    map.entry(route.as_str()).or_default().push(pred.as_str());
+                    map
+                },
+            );
+        let route_has_unredirected_predecessor = |route: &str| {
+            blocks.iter().any(|block| {
+                !pred_set.contains(block.name.as_str())
+                    && block_successors(block).iter().any(|target| target == route)
+            })
+        };
+
+        let new_name = format!("{SPLIT_PREFIX}{SEL_TOKEN}{counter}");
+        *counter += 1;
+
+        // Rebuild `natural`'s phis: the redirected predecessors' incomings fold into a merged phi in the
+        // pass-through; the rest stay, plus one `[merged, pass-through]` incoming. Driven off `natural`'s
+        // TYPED carrier (line order preserved by `t.insts`). Aggregate phis (`phi_incoming: None`) carry no
+        // typed incoming list, so they are skipped — such a phi fails primary emit → retry regardless (the
+        // carrier is the sole emission substrate). Each primitive has a `== re-lower` unit test (kb
+        // "STEP-1/STEP-2 decomposition").
+        let nat_idx = blocks.iter().position(|b| b.name == natural)?;
+        type TypedIncomings = Vec<(crate::native::ir::LlValue, String)>;
+        // (merged pass-through phi name, phi type, redirected typed incomings).
+        let mut passthrough_merges: Vec<(String, crate::native::ir::LlType, TypedIncomings)> =
+            Vec::new();
+        // (nat phi dst, kept typed incomings + the `[ merged, {new_name} ]` funnel).
+        let mut nat_rewrites: Vec<(String, TypedIncomings)> = Vec::new();
+        if let Some(t) = &blocks[nat_idx].typed {
+            for inst in &t.insts {
+                let (Some(dst), Some((ty, inc))) =
+                    (inst.result.clone(), inst.phi_incoming().clone())
+                else {
+                    continue;
+                };
+                let mut typed_red = Vec::new();
+                let mut kept_plus = Vec::new();
+                for (value, predecessor) in inc {
+                    if direct_preds.contains(predecessor.as_str()) {
+                        typed_red.push((value, predecessor));
+                        continue;
+                    }
+                    if let Some(owned_preds) = route_preds.get(predecessor.as_str()) {
+                        typed_red.extend(
+                            owned_preds
+                                .iter()
+                                .map(|owned| (value.clone(), (*owned).to_string())),
+                        );
+                        if route_has_unredirected_predecessor(&predecessor) {
+                            kept_plus.push((value, predecessor));
+                        }
+                        continue;
+                    }
+                    kept_plus.push((value, predecessor));
+                }
+                if typed_red.is_empty() {
+                    continue;
+                }
+                let merged = format!("{new_name}.phi{}", passthrough_merges.len());
+                kept_plus.push((
+                    crate::native::ir::LlValue::Local(merged.clone()),
+                    new_name.clone(),
+                ));
+                passthrough_merges.push((merged, ty, typed_red));
+                nat_rewrites.push((dst, kept_plus));
+            }
+        }
+        if let Some(t) = blocks[nat_idx].typed_mut() {
+            for (dst, kept_plus) in &nat_rewrites {
+                t.set_phi_incomings(dst, kept_plus);
+            }
+        }
+
+        for (predecessor, old_target) in &redirects {
+            if let Some(block) = blocks.iter_mut().find(|block| block.name == *predecessor) {
+                block.typed_mut()?.redirect_successor(old_target, &new_name);
+            }
+        }
+
+        let at = blocks
+            .iter()
+            .position(|b| b.name == natural)
+            .unwrap_or(blocks.len());
+        // Pass-through block: build its carrier by pushing the typed merged phis onto a fresh
+        // `br label {natural}` carrier (byte-identical to lowering the merged phi lines + terminator —
+        // `push_value_phi`'s `== re-lower` test).
+        let mut blk = crate::native::tir::lower_block_carrier(
+            &new_name,
+            &[format!("br label {natural}")],
+            &std::collections::HashMap::new(),
+        )?;
+        for (merged, ty, typed_red) in &passthrough_merges {
+            blk.push_value_phi(merged, ty, typed_red);
+        }
+        blocks.insert(
+            at,
+            BodyBlock {
+                name: new_name.clone(),
+                role: role_for_name(&new_name),
+                typed: Some(blk.into()),
             },
         );
-    let route_has_unredirected_predecessor = |route: &str| {
-        blocks.iter().any(|block| {
-            !pred_set.contains(block.name.as_str())
-                && block_successors(block).iter().any(|target| target == route)
-        })
-    };
 
-    let new_name = format!("{SPLIT_PREFIX}{SEL_TOKEN}{counter}");
-    *counter += 1;
-
-    // Rebuild `natural`'s phis: the redirected predecessors' incomings fold into a merged phi in the
-    // pass-through; the rest stay, plus one `[merged, pass-through]` incoming. Driven off `natural`'s
-    // TYPED carrier (line order preserved by `t.insts`). Aggregate phis (`phi_incoming: None`) carry no
-    // typed incoming list, so they are skipped — such a phi fails primary emit → retry regardless (the
-    // carrier is the sole emission substrate). Each primitive has a `== re-lower` unit test (kb
-    // "STEP-1/STEP-2 decomposition").
-    let nat_idx = blocks.iter().position(|b| b.name == natural)?;
-    type TypedIncomings = Vec<(crate::native::ir::LlValue, String)>;
-    // (merged pass-through phi name, phi type, redirected typed incomings).
-    let mut passthrough_merges: Vec<(String, crate::native::ir::LlType, TypedIncomings)> =
-        Vec::new();
-    // (nat phi dst, kept typed incomings + the `[ merged, {new_name} ]` funnel).
-    let mut nat_rewrites: Vec<(String, TypedIncomings)> = Vec::new();
-    if let Some(t) = &blocks[nat_idx].typed {
-        for inst in &t.insts {
-            let (Some(dst), Some((ty, inc))) = (inst.result.clone(), inst.phi_incoming().clone())
-            else {
-                continue;
-            };
-            let mut typed_red = Vec::new();
-            let mut kept_plus = Vec::new();
-            for (value, predecessor) in inc {
-                if direct_preds.contains(predecessor.as_str()) {
-                    typed_red.push((value, predecessor));
-                    continue;
-                }
-                if let Some(owned_preds) = route_preds.get(predecessor.as_str()) {
-                    typed_red.extend(
-                        owned_preds
-                            .iter()
-                            .map(|owned| (value.clone(), (*owned).to_string())),
-                    );
-                    if route_has_unredirected_predecessor(&predecessor) {
-                        kept_plus.push((value, predecessor));
-                    }
-                    continue;
-                }
-                kept_plus.push((value, predecessor));
-            }
-            if typed_red.is_empty() {
-                continue;
-            }
-            let merged = format!("{new_name}.phi{}", passthrough_merges.len());
-            kept_plus.push((
-                crate::native::ir::LlValue::Local(merged.clone()),
-                new_name.clone(),
-            ));
-            passthrough_merges.push((merged, ty, typed_red));
-            nat_rewrites.push((dst, kept_plus));
-        }
-    }
-    if let Some(t) = blocks[nat_idx].typed_mut() {
-        for (dst, kept_plus) in &nat_rewrites {
-            t.set_phi_incomings(dst, kept_plus);
-        }
-    }
-
-    for (predecessor, old_target) in &redirects {
-        if let Some(block) = blocks.iter_mut().find(|block| block.name == *predecessor) {
-            block.typed_mut()?.redirect_successor(old_target, &new_name);
-        }
-    }
-
-    let at = blocks
-        .iter()
-        .position(|b| b.name == natural)
-        .unwrap_or(blocks.len());
-    // Pass-through block: build its carrier by pushing the typed merged phis onto a fresh
-    // `br label {natural}` carrier (byte-identical to lowering the merged phi lines + terminator —
-    // `push_value_phi`'s `== re-lower` test).
-    let mut blk = crate::native::tir::lower_block_carrier(
-        &new_name,
-        &[format!("br label {natural}")],
-        &std::collections::HashMap::new(),
-    )?;
-    for (merged, ty, typed_red) in &passthrough_merges {
-        blk.push_value_phi(merged, ty, typed_red);
-    }
-    blocks.insert(
-        at,
-        BodyBlock {
-            name: new_name.clone(),
-            role: role_for_name(&new_name),
-            typed: Some(blk.into()),
-        },
-    );
-
-    Some(new_name)
+        Some(new_name)
+    })
 }
 
 /// Does the single-exit loop `header`'s merge block double as the natural selection merge

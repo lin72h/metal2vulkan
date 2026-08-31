@@ -57,6 +57,8 @@ mod multi_exit;
 pub(in crate::native) use multi_exit::*;
 mod phi_util;
 pub(in crate::native) use phi_util::*;
+mod rewrite;
+pub(in crate::native) use rewrite::*;
 // The own-arm and loop-exit-sibling paths consume the construct-tree planner core. The bounded
 // dispatcher materializers are also the typed source-level fallback for modest rejected CFGs.
 #[allow(dead_code)]
