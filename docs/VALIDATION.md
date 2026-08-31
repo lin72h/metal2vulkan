@@ -7,20 +7,20 @@ Choose the smallest route that proves the claim being made:
 
 | Goal | Required starting point |
 |---|---|
-| Ordinary code change | Format, clippy, and serial product/validation tests |
+| Ordinary code change | Format, clippy, and parallel product/validation tests |
 | Behavior-preserving translator refactor | Ordinary gate plus exact old/new `corpus-ab` over the structurally affected selection |
 | Intentional shader behavior change | Synthetic regression, reviewed byte drift, and affected authored Metal/candidate evidence |
 | Corpus-wide support or performance claim | Resumable indexed `corpus-triage` audit with its completion/read/time summaries |
 
 ## Ordinary gate
 
-Always run Rust tests serially:
+Run Rust tests with Cargo's default available parallelism:
 
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p metal2vulkan -- --test-threads=1
-cargo test -p metal2vulkan-validation -- --test-threads=1
+cargo test -p metal2vulkan
+cargo test -p metal2vulkan-validation
 ```
 
 CI uses owned synthetic fixtures. Private AIR and machine-specific GPU execution are optional.
@@ -80,38 +80,69 @@ cargo run -p metal2vulkan-validation --release --bin corpus-triage -- \
   --audit authoring-capabilities --limit 100000
 ```
 
-After changing only the product's AIR-intrinsic recognition/lowering contract, add
-`--reclassify-all`. It recomputes the product disposition for every current analyzer row directly
-from the cached exact `air_calls` inventory. The operation ignores the ordinary `--limit`, uses
-bounded keyset batches, and opens zero AIR source shards. Changes to source-derived structural
-analysis instead require an analyzer ABI bump; the ordinary incremental audit then reads and caches
-each row once under the new ABI.
+After changing the product or source-derived structural contract, bump the analyzer ABI and add
+`--reclassify-all`. It deliberately selects every indexed identity up to `--limit`, reopens the
+indexed source slices, and replaces their facts under the new contract. This is the cold closure
+proof; follow it with the ordinary command above, which must select no rows and open/read zero source
+shards once the index is warm.
 
 The summary exposes classified and remaining counts plus exact shard bytes read, so both an
 incomplete support claim and an accidental corpus rescan are visible. Classification defaults to
-all logical CPU cores. Only one parsed source may wait outside the workers (individual rows can be
-tens of MiB), result channels are bounded, and cache writes are committed in fixed-size batches, so
-a full recomputation does not retain the corpus in memory; use `--jobs N` to lower the aggregate
-working set.
+the host's available logical CPU count (the equivalent of `nproc`). Only one parsed source may wait
+outside the workers (individual rows can be tens of MiB), result channels are bounded, and cache
+writes are committed in fixed-size batches, so a full recomputation does not retain the corpus in
+memory.
 
 ### Run the bounded translation census
 
 The translation census is resumable and uses the same indexed source locations. Discovery skips any
 hash that has already translated (or has been classified as requiring authored linkage), while
-`--current-fingerprint` performs a fresh regression sweep after product changes. A validation-harness
-fix can re-run only failures recorded for the current product with `--retry-failures`:
+`--current-fingerprint` performs a fresh regression sweep after product or translation-audit harness
+changes. Its cache fingerprint covers both contracts. `--retry-failures` re-runs only failures
+recorded for that exact fingerprint. `--retry-linkage` resumably revisits every row that an older
+fingerprint classified as requiring linkage but the current fingerprint has not attempted.
+Uncursored batches still prioritize historical failures, but materialize that compact priority set
+once rather than probing the complete audit history independently for every indexed identity;
+cursor pages use strict hash order and skip the priority work entirely.
+
+Rows whose exact AIR flow proves that an observed visible-table operation depends on table contents
+are classified as `authored_linkage_required` before spawning translation tools. Dead lookups remain
+ordinary translation work, while unsupported pointer escapes remain failures; the shortcut applies
+only when the shared structural audit proves authored linkage is the sole missing semantic input.
+Direct `!air.visible_function_references` are different: their metadata already names the logical
+symbol. The audit resolves that symbol recursively when exactly one retained module from the same
+library defines it, using the disposable SQLite `(library, symbol)` index and the module's exact
+JSONL byte range. When parent-library resolution is missing or ambiguous, an exact authored case
+may instead name cross-library reference modules and their recursive dependency closure. Function
+tables likewise require exact authored slot population. For either authored linkage form, the
+isolated worker reads only that identity's hash-derived case shard, checks every case against the
+source row it already owns, translates with the exact linked modules, slots, and function
+constants, and validates every resulting module. The row is `translated` only when all of its
+authored cases succeed; a row with no complete authored population remains
+`authored_linkage_required`.
+
+`--tier-census` is retained as compatibility telemetry. Product translation now reports `default`
+for any successfully constructed module and `fallback` for a construction error; representation
+selection is deliberately not exposed as validator-gated tier adoption. The disposable index can
+resume this measurement without rescanning warm source shards. Inputs that structurally require
+authored linkage remain `authored_linkage_required`.
 
 For a targeted regression set, `--hash-file PATH` reads the lowercase SHA-256 in the first
 whitespace-delimited field of each non-empty line. It audits exactly those identities through their
-indexed byte ranges, so a saved structural manifest never requires a shard or corpus rescan.
+indexed byte ranges, so a saved structural manifest never requires a shard or corpus rescan. Combine
+it with `--tier-census` to persist the compatibility construction result for exactly that set.
 
-Translation workers default to all available logical CPU cores. Each row is decoded from its indexed
-shard slice and translated in an independent child with the per-translation limits below; use
-`--jobs N` to reduce aggregate memory pressure. The summary reports source-read time separately from
+Translation workers default to the host's available logical CPU count (the equivalent of `nproc`).
+An explicit `--jobs N` is an operator override, not part of the normal full-corpus command. Each row
+is decoded from its indexed shard slice and translated in an independent child with the
+per-translation limits below. The summary reports source-read time separately from
 translate/validate time so serial decode overhead stays visible. To prevent CPU contention from
-turning into false wall-time failures, at most four AIR sources of 1 MiB or larger run concurrently;
-the remaining workers consume the small-source lane, and large-lane workers steal small work after
-their lane drains.
+turning into false wall-time failures, all requested workers finish sources below 256 KiB first,
+then at most two workers translate the costly 256-KiB-and-larger lane. Structurally costly
+device-address/function-table rows join that bounded lane regardless of serialized size. Inputs no
+larger than 384 KiB with at least 370 source blocks and 400 call instructions use a dedicated
+single-worker sublane, so their attempts cannot consume one another's wall-time budget while
+unrelated costly rows continue on the other worker.
 
 ```sh
 cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
@@ -119,23 +150,28 @@ cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
 cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
   --audit translation --retry-failures --limit 500 --summary-only
 cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
-  --audit translation --hash-file imageblock-sources.txt --summary-only
+  --audit translation --tier-census --limit 500 --summary-only
+cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
+  --audit translation --hash-file imageblock-sources.txt --tier-census --summary-only
 ```
 
-The 500-row checkpoint is the measured default for the current 88,819-row corpus: unlike a
+The 500-row checkpoint is the measured default for the current 88,820-row corpus: unlike a
 1,000-row checkpoint containing several of its largest modules, it retained comfortable margin
 under the repository's 30-second workflow ceiling while still persisting every ten completions.
-Jobs default to the host's available logical cores; increasing that value beyond the available
-cores can starve individual workers and create false timeouts.
+Jobs default to the host's available logical cores (`nproc`). Explicitly increasing that value
+beyond the available cores can starve individual workers and create false timeouts.
 
 The translation audit supplies the validation graphics executor's single-sample pipeline contract
 when lowering `air.get_num_samples.i32`; authored candidate execution uses that same value. This is
 not a product default: general callers provide their exact raster sample count through
 `TransformOptions` or the CLI.
 
-Each translation runs in a killable child with a 30-second / 512-MiB ceiling. The parent owns the
+Each translation runs in a killable child with a 30-second / 500-MiB ceiling. The parent owns the
 child's scratch subtree, so success, failure, timeout, and memory termination all have the same
-deterministic cleanup path; a killed child never strands a PID-named directory.
+deterministic cleanup path; a killed child never strands a PID-named directory. Completed results
+cross a queue bounded by the requested worker count. If a ten-row SQLite checkpoint fails, the
+parent cancels unclaimed work and drains only the in-flight bounded queue before reporting the
+database error.
 
 ### Run focused structural audits
 
@@ -150,12 +186,14 @@ cargo run -p metal2vulkan-validation --bin corpus-triage -- \
   --audit visible-function-tables --after LAST_SHA256 --limit 200 --summary-only
 ```
 
-The audit distinguishes direct/cast calls, internal-helper parameter threading, authored slot
-nullness checks, and unsupported pointer escapes. Dynamic dispatchers contain only linked functions
-whose LLVM signature matches the call site, allowing one authored table to hold heterogeneous
-visible-function types. AIR's exact `ptrtoint` / truncate / compare-with-`1` opaque-intersection
-sentinel probe is folded to false for authored visible tables, whose slots are strictly linked
-functions or null; other pointer-integer observations remain unsupported.
+The audit distinguishes direct/cast calls, table-handle and callback-pointer threading through
+internal helper parameters, authored slot nullness checks, and unsupported pointer escapes.
+Function-constant-wrapped table parameters retain the same authored-linkage role. Dynamic
+dispatchers contain only linked functions whose LLVM signature matches the call site, allowing one
+authored table to hold heterogeneous visible-function types. AIR's exact `ptrtoint` / truncate /
+compare-with-`1` opaque-intersection sentinel probe is folded to false for authored visible tables,
+whose slots are strictly linked functions or null; other pointer-integer observations remain
+unsupported.
 
 Ray-intersection families use the same indexed cursor workflow:
 
@@ -172,7 +210,7 @@ translation cannot drift into separate whole-symbol allowlists.
 
 Focused audits select cached structural facts, not unsupported-requirement rows. A feature therefore
 remains auditable after it becomes fully supported. Device-address captures use the same cursor and
-the same killable 30-second / 512-MiB translation worker as the full census:
+the same killable 30-second / 500-MiB translation worker as the full census:
 
 ```sh
 cargo run --release -p metal2vulkan-validation --bin corpus-triage -- \
@@ -188,7 +226,10 @@ Authored fragment cases are executable, not review-only: `render_targets`, `dept
 `any`/`less`/`greater` qualifier, while stencil outputs use the native fragment stencil-export
 contract. Each runner derives the same fullscreen vertex inputs from the
 fragment AIR interface, and the candidate dependency hash covers both generated vertex SPIR-V and
-translated fragment SPIR-V.
+translated fragment SPIR-V. Render-target formats retain their exact channel width across both
+executors, including scalar `R32Float`, two-channel `Rg32Float`, and four-channel `Rgba32Float`.
+Authored Vulkan draws use clockwise front faces, matching a Metal render encoder's default winding;
+this keeps `[[front_facing]]` values comparable without rewriting the shader builtin.
 
 Custom fragment `[[imageblock_data]]` is authored separately as `fragment_imageblock`: one
 tightly-packed plane per accessed AIR user semantic, with an explicit `half`, `half4`, `uchar4`, or
@@ -313,10 +354,17 @@ cargo run -p metal2vulkan-validation --release --bin corpus-metal -- \
   --case-id CASE --environment-id METAL_ENV
 ```
 
-Qualification executes the literal manifest three times. The selected bytes must be identical on
-all runs and must differ from the exact initial poison bytes throughout the selected region. The
-accepted row records case/AIR/input/output hashes, output bytes, environment identity, and exact
-oracle ABI.
+Qualification first requires the shared checker to prove that the selected output maps to a
+shader-writable reflected resource, then executes the literal manifest three times. The selected
+bytes must be identical on all runs; byte-identical in-place transformations remain valid evidence
+because their write contract is established structurally rather than inferred from changed poison
+bytes. The accepted row records case/AIR/input/output hashes, output bytes, environment identity,
+and exact oracle ABI.
+
+An authored `output` with `kind: "none"` records the exact empty byte sequence after normal GPU
+execution. The shared checker accepts it only when product reflection exposes no writable buffer,
+image, attachment, depth/stencil aspect, imageblock member, vertex position, or vertex varying; it
+cannot be used to ignore an observable shader result.
 
 Candidates require a matching Metal slot and run independently:
 
@@ -338,9 +386,11 @@ reference under `visible_function_references` names the logical symbol from AIR'
 dependencies may come from a separate explicitly harvested Metal library, matching Metal's linked
 functions API. The Vulkan path recursively closes their dependency metadata, replaces every
 `.MTL_VISIBLE_FN_REF` stub with a direct call, and rejects an unresolved symbol. The checker also
-resolves each authored table slot from the hash-derived private library-module shard and proves
-same-metallib provenance before either runner starts. Metal receives all referenced `MTLFunction`
-handles through one `MTLLinkedFunctions` descriptor and creates native function tables. Intersection
+resolves each authored table slot from the hash-derived private library-module shard and proves that
+the exact module defines the exact authored symbol before either runner starts. Table entries may
+come from a separate explicitly harvested Metal library, matching `MTLLinkedFunctions`' object-based
+linking contract. Metal receives all referenced `MTLFunction` handles through one descriptor and
+creates native function tables. Intersection
 entries may instead author Metal's explicit opaque-triangle sentinel and its sorted signature
 flags; that entry uses the dedicated native opaque-triangle API and needs no library module.
 Vulkan translation specializes visible-table calls to the exact linked AIR definitions; constant
@@ -361,6 +411,13 @@ encodes the native buffer at the reflected argument index. Vulkan allocates it w
 support and writes that address into the reflected owner field; the BDA lowering then dereferences
 the identical logical resource. `argument_buffer_buffer` output selection observes writable nested
 buffers directly.
+
+A top-level AIR `array_ref<void>` is authored under `device_buffer_arrays`. `binding` is the
+literal AIR/Metal base buffer index, `length` is the address-table extent, and each sorted sparse
+element owns ordinary input/output literal bytes; undeclared slots are null. Metal flattens the
+elements onto consecutive native buffer indices. Vulkan binds an address-table buffer at the base,
+allocates every element separately with device-address support, and writes their addresses into the
+matching slots. `device_buffer_array_element` output selection observes one writable element.
 
 Every function table declares `size` separately from `entries`. The size is the native table
 capacity; omitted indices are authored null slots, so `entries: []` honestly represents an all-null

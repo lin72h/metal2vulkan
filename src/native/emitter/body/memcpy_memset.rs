@@ -344,7 +344,7 @@ impl Emitter {
             return Ok(false);
         };
         let dst_pointee = function_storage_local_type(&self.resolve_type(&dst_pointee)?);
-        if !matches!(&dst_pointee, LlType::Struct(_)) {
+        if !matches!(&dst_pointee, LlType::Struct(_) | LlType::Array(_, _)) {
             return Ok(false);
         }
         let LlType::Ptr(dst_addrspace) = self.resolve_type(&dst.ty)? else {
@@ -480,7 +480,11 @@ impl Emitter {
                 }
                 Ok(true)
             }
-            leaf @ (LlType::Int(32) | LlType::Float | LlType::Vector(_, _)) => {
+            leaf @ (LlType::Int(8 | 16 | 32)
+            | LlType::Half
+            | LlType::BFloat
+            | LlType::Float
+            | LlType::Vector(_, _)) => {
                 let Some(value) =
                     self.emit_raw_word_as_typed_memcpy_field(src, base_offset, &leaf, out)?
                 else {
@@ -519,10 +523,20 @@ impl Emitter {
         field: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Option<Word>, String> {
-        if !offset.is_multiple_of(4) {
+        if !offset.is_multiple_of(4)
+            && !matches!(
+                self.resolve_type(field)?,
+                LlType::Int(8 | 16) | LlType::Half | LlType::BFloat
+            )
+        {
             return Ok(None);
         }
         match self.resolve_type(field)? {
+            scalar @ (LlType::Int(8 | 16) | LlType::Half | LlType::BFloat) => {
+                let value = self.fresh();
+                self.emit_raw_scalar_load(value, &scalar, src, offset, None, instructions)?;
+                Ok(Some(value))
+            }
             LlType::Int(32) | LlType::Float => {
                 let (field_size, _) = self.raw_type_size_align(field)?;
                 if field_size != 4 {
@@ -648,46 +662,29 @@ impl Emitter {
         let storage_pointee = function_storage_local_type(&pointee);
         let (size, _) = self.raw_type_size_align(&storage_pointee)?;
         if len < size {
-            // Partial zero-memset: clearing the first `len` bytes of a LARGER object. When the pointee
-            // is an array and `len` is a whole number of leading elements, clear those elements with one
-            // `OpStore null` each (the byte range [0,len) maps to element indices [0, len/elem_size)) —
-            // a typed lowering that stays valid under Logical addressing, where the alternative (a
-            // generic call to the byte `llvm.memset` declaration whose pointer param is `uchar`) is an
-            // invalid-SPIR-V dead end. A sub-element or struct-spanning partial memset has no clean typed
-            // form, so it still falls through.
-            if let LlType::Array(elem, _) = self.resolve_type(&storage_pointee)? {
-                let elem_ty = self.resolve_type(&elem)?;
-                let (elem_size, _) = self.raw_type_size_align(&elem_ty)?;
-                if elem_size > 0 && len % elem_size == 0 {
-                    let LlType::Ptr(addrspace) = self.resolve_type(&call.args[0].ty)? else {
-                        return Ok(false);
-                    };
-                    let storage = self.pointer_storage_for(&call.args[0].value, addrspace)?;
-                    let elem_ptr_ty = self.ptr_type_id(storage, &elem_ty)?;
-                    let base = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-                    let zero = self.const_null(&elem_ty)?;
-                    for i in 0..(len / elem_size) {
-                        let index = self.const_uint(u32::try_from(i).map_err(|_| {
-                            format!("native emitter: memset element index {i} exceeds u32")
-                        })?)?;
-                        let elem_ptr = self.fresh();
-                        instructions.push(Self::inst(
-                            Op::InBoundsAccessChain,
-                            Some(elem_ptr_ty),
-                            Some(elem_ptr),
-                            vec![Operand::IdRef(base), Operand::IdRef(index)],
-                        ));
-                        instructions.push(Self::inst(
-                            Op::Store,
-                            None,
-                            None,
-                            vec![Operand::IdRef(elem_ptr), Operand::IdRef(zero)],
-                        ));
-                    }
-                    return Ok(true);
-                }
+            // Logical SPIR-V cannot call LLVM's byte-pointer declaration with a differently typed
+            // aggregate pointer. Lower a prefix clear through the real aggregate layout: fully
+            // covered subobjects receive typed null stores, partial aggregates recurse, and padding
+            // needs no store. A prefix cutting through a scalar remains an honest unsupported emit.
+            let LlType::Ptr(addrspace) = self.resolve_type(&call.args[0].ty)? else {
+                return Ok(false);
+            };
+            let storage = self.pointer_storage_for(&call.args[0].value, addrspace)?;
+            let base = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+            if self.emit_typed_zero_prefix(
+                base,
+                storage,
+                &storage_pointee,
+                0,
+                len,
+                &mut Vec::new(),
+                instructions,
+            )? {
+                return Ok(true);
             }
-            return Ok(false);
+            return Err(format!(
+                "native emitter: partial zero memset cuts through a scalar subobject of {storage_pointee:?}"
+            ));
         }
         let ptr = self.value_id(&call.args[0].value, &call.args[0].ty)?;
         let zero = self.const_null(&storage_pointee)?;
@@ -698,6 +695,109 @@ impl Emitter {
             vec![Operand::IdRef(ptr), Operand::IdRef(zero)],
         ));
         Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_typed_zero_prefix(
+        &mut self,
+        base: Word,
+        storage: StorageClass,
+        ty: &LlType,
+        offset: u64,
+        end: u64,
+        indices: &mut Vec<Word>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let ty = function_storage_local_type(&self.resolve_type(ty)?);
+        let (size, _) = self.raw_type_size_align(&ty)?;
+        if size == 0 || offset >= end {
+            return Ok(true);
+        }
+        if offset
+            .checked_add(size)
+            .is_some_and(|object_end| object_end <= end)
+        {
+            let pointer = if indices.is_empty() {
+                base
+            } else {
+                let pointer_type = self.ptr_type_id(storage, &ty)?;
+                let pointer = self.fresh();
+                let mut operands = Vec::with_capacity(indices.len() + 1);
+                operands.push(Operand::IdRef(base));
+                operands.extend(indices.iter().copied().map(Operand::IdRef));
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(pointer_type),
+                    Some(pointer),
+                    operands,
+                ));
+                pointer
+            };
+            let zero = self.const_null(&ty)?;
+            instructions.push(Self::inst(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(pointer), Operand::IdRef(zero)],
+            ));
+            return Ok(true);
+        }
+        match ty {
+            LlType::Struct(fields) => {
+                for index in 0..fields.len() {
+                    let (member_offset, field) = self.raw_struct_member(&fields, index as u64)?;
+                    let index = self.const_uint(index as u32)?;
+                    indices.push(index);
+                    let supported = self.emit_typed_zero_prefix(
+                        base,
+                        storage,
+                        &field,
+                        offset.checked_add(member_offset).ok_or_else(|| {
+                            "native emitter: partial memset struct offset overflows u64".to_string()
+                        })?,
+                        end,
+                        indices,
+                        instructions,
+                    )?;
+                    indices.pop();
+                    if !supported {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            LlType::Array(elem, count) | LlType::Vector(elem, count) => {
+                let elem = function_storage_local_type(&self.resolve_type(&elem)?);
+                let (elem_size, elem_align) = self.raw_type_size_align(&elem)?;
+                let stride = round_up_u64(elem_size, elem_align);
+                for index in 0..count {
+                    let index_id = self.const_uint(index)?;
+                    indices.push(index_id);
+                    let element_offset = u64::from(index)
+                        .checked_mul(stride)
+                        .and_then(|relative| offset.checked_add(relative))
+                        .ok_or_else(|| {
+                            "native emitter: partial memset aggregate offset overflows u64"
+                                .to_string()
+                        })?;
+                    let supported = self.emit_typed_zero_prefix(
+                        base,
+                        storage,
+                        &elem,
+                        element_offset,
+                        end,
+                        indices,
+                        instructions,
+                    )?;
+                    indices.pop();
+                    if !supported {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     pub(in crate::native::emitter) fn emit_raw_zero_memset(
@@ -730,6 +830,17 @@ impl Emitter {
         len: u64,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
+        if let LlValue::Local(name) = &dst.value {
+            if let Some(padding) = self.workgroup_padding_byte_pointers.get(name).cloned() {
+                if self.struct_range_is_padding(&padding.struct_ty, padding.byte_offset, len)? {
+                    return Ok(true);
+                }
+                return Err(format!(
+                    "native emitter: zero memset from Workgroup struct padding offset {} spans non-padding bytes",
+                    padding.byte_offset
+                ));
+            }
+        }
         let Some(pointee) = self.pointer_pointee_for_value(&dst.value)? else {
             return Ok(false);
         };
@@ -770,6 +881,37 @@ impl Emitter {
                 None,
                 vec![Operand::IdRef(store_ptr), Operand::IdRef(zero)],
             ));
+        }
+        Ok(true)
+    }
+
+    pub(in crate::native::emitter) fn struct_range_is_padding(
+        &self,
+        struct_ty: &LlType,
+        byte_offset: u64,
+        len: u64,
+    ) -> Result<bool, String> {
+        let LlType::Struct(fields) = self.resolve_type(struct_ty)? else {
+            return Ok(false);
+        };
+        let end = byte_offset.checked_add(len).ok_or_else(|| {
+            "native emitter: Workgroup padding byte range overflows u64".to_string()
+        })?;
+        let (struct_size, _) = self.raw_type_size_align(struct_ty)?;
+        if len == 0 || end > struct_size {
+            return Ok(false);
+        }
+        let mut member_offset = 0u64;
+        for field in &fields {
+            let (field_size, field_align) = self.raw_type_size_align(field)?;
+            member_offset = round_up_u64(member_offset, field_align);
+            let member_end = member_offset.checked_add(field_size).ok_or_else(|| {
+                "native emitter: Workgroup struct member range overflows u64".to_string()
+            })?;
+            if byte_offset < member_end && end > member_offset {
+                return Ok(false);
+            }
+            member_offset = member_end;
         }
         Ok(true)
     }
@@ -850,6 +992,37 @@ impl Emitter {
             let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
             self.emit_copy_memory(dst, src, instructions);
             return Ok(true);
+        }
+
+        // LLVM may pass an array object directly as the destination of an exact one-element
+        // memcpy. Opaque pointers erase the source-level array-to-first-element decay, but SPIR-V
+        // retains the aggregate pointee and therefore needs that access chain constructed
+        // explicitly. Limit this to one complete source object; a longer byte range would require
+        // source extent information that the erased pointer does not provide.
+        if let LlType::Array(dst_element, count) = &dst_pointee {
+            if *count > 0 && len == copy_size && types_compatible(dst_element, &src_pointee) {
+                let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
+                let dst_element = function_storage_local_type(dst_element);
+                let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_element)?;
+                let dst_element_ptr = self.fresh();
+                let zero = self.const_uint(0)?;
+                instructions.push(Self::inst(
+                    Op::InBoundsAccessChain,
+                    Some(dst_ptr_ty),
+                    Some(dst_element_ptr),
+                    vec![Operand::IdRef(dst), Operand::IdRef(zero)],
+                ));
+                return self.emit_aggregate_memcpy(
+                    dst_element_ptr,
+                    src,
+                    dst_storage,
+                    src_storage,
+                    &dst_element,
+                    &src_pointee,
+                    len,
+                    instructions,
+                );
+            }
         }
 
         // A named AIR wrapper can contain the exact aggregate copied into a bare local array
@@ -1077,9 +1250,20 @@ impl Emitter {
         }
         let src_field = function_storage_local_type(&src_field);
         let dst_pointee = function_storage_local_type(dst_pointee);
-        if !types_compatible(&dst_pointee, &src_field) {
-            return Ok(false);
-        }
+        // A memcpy starting at an array object and spanning one element addresses element zero.
+        // Opaque LLVM pointers erase that decay: `%dst = alloca [N x T]` is passed directly while
+        // the source is a wrapper struct whose first field is `T`. Construct the element-zero
+        // pointer explicitly instead of leaving a residual byte-pointer memcpy call whose declared
+        // SPIR-V parameter cannot match the aggregate pointer value.
+        let (dst_copy_pointee, decay_destination_array) = match &dst_pointee {
+            LlType::Array(element, count)
+                if *count > 0 && types_compatible(element, &src_field) =>
+            {
+                (function_storage_local_type(element), true)
+            }
+            _ if types_compatible(&dst_pointee, &src_field) => (dst_pointee.clone(), false),
+            _ => return Ok(false),
+        };
         let (field_size, _) = self.raw_type_size_align(&src_field)?;
         if len > field_size {
             return Ok(false);
@@ -1093,11 +1277,22 @@ impl Emitter {
         };
         let dst_storage = self.pointer_storage_for(&dst_arg.value, dst_addrspace)?;
         let src_storage = self.pointer_storage_for(&src_arg.value, src_addrspace)?;
-        let dst = self.value_id(&dst_arg.value, &dst_arg.ty)?;
+        let mut dst = self.value_id(&dst_arg.value, &dst_arg.ty)?;
         let src = self.value_id(&src_arg.value, &src_arg.ty)?;
+        let zero = self.const_uint(0)?;
+        if decay_destination_array {
+            let dst_ptr_ty = self.ptr_type_id(dst_storage, &dst_copy_pointee)?;
+            let dst_element = self.fresh();
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(dst_ptr_ty),
+                Some(dst_element),
+                vec![Operand::IdRef(dst), Operand::IdRef(zero)],
+            ));
+            dst = dst_element;
+        }
         let src_ptr_ty = self.ptr_type_id(src_storage, &src_field)?;
         let src_field_ptr = self.fresh();
-        let zero = self.const_uint(0)?;
         instructions.push(Self::inst(
             Op::InBoundsAccessChain,
             Some(src_ptr_ty),
@@ -1109,7 +1304,7 @@ impl Emitter {
             src_field_ptr,
             dst_storage,
             src_storage,
-            &dst_pointee,
+            &dst_copy_pointee,
             &src_field,
             len,
             instructions,

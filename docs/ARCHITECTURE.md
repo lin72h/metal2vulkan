@@ -1,213 +1,186 @@
 # metal2vulkan architecture
 
-A map of the AIR→SPIR-V translator: the primary pipeline, the failure-triggered retry cascade, and
-how the pieces fit together. This document describes **structure**. Regression coverage for this
-public tree is the unit/integration suite plus optional local A/B and oracle tooling.
+This document maps the AIR→SPIR-V product pipeline. The central construction contract is simple:
+representation selection happens from AIR and owned-module facts, then one serialized module is
+validated. Validator output is a verdict, never a code-generation input.
 
-## The pipeline
+## Pipeline
 
-The crate emits `OpCapability Shader` / `Logical GLSL450` SPIR-V directly from sanitized AIR LLVM
-IR, structured by construction where the CFG admits it.
-
+```text
+.air | sanitized .ll
+  └─ llvm-dis when needed + AIR sanitization
+  └─ shared pre-parse AIR lowering
+  └─ stage metadata and target-layout parsing
+  └─ typed LLVM/AIR parse
+  └─ primary structured CFG and typed interface emission
+  └─ owned SpirvModule + EmitSidecar
+  └─ stage, resource, memory, and interface passes
+  └─ owned-module construction
+       ├─ close pointer/value and opaque-image representations
+       ├─ prune statically unreachable CFG
+       ├─ construct selected CFG functions with the bounded relooper
+       ├─ check load/store/select and Logical-pointer type invariants
+       └─ check descriptor ABI invariants
+  └─ if an owned invariant rejects the primary representation:
+       construct one structurally selected alternate representation
+  └─ canonical assembly
+  └─ spirv-val --target-env vulkan1.2
+  └─ optional read-only reflection over the returned bytes
 ```
-.air|.ll
-  └─ tools::air_to_sanitized_ll          llvm-dis (if .air) + sanitize → textual LLVM IR
-  └─ lower_async_copy_if_enabled         shared pre-emit AIR rewrites
-  └─ meta::parse_air_{frag,vert,kern}    stage interface metadata (bindings, attributes)
-  └─ native emit (tools::emit_vulkan_spirv → native::emit_vulkan_spirv)
-        parse (native/parse.rs, lex.rs) → LlModule
-        typed IR                        (native/tir/, native/ir/)
-        structured-by-construction emit (native/emitter/**, native/cfg/**)
-          └─ structured_plan admits → Op*Merge; else unrepaired emit + relooper on retry
-  └─ retained SpirvModule + EmitSidecar
-  └─ stage/resource/lowering passes     (passes/**)
-  └─ finish_module                      id canonicalization, portability normalization
-  └─ assemble → SPIR-V words
-  └─ spirv-val (vulkan1.3)              validation/adoption gate; not part of the bytes
-  └─ reflect final buffer footprints    reflected entry points only; read-only over adopted bytes
-```
 
-`translate_native_no_retry` is this path up to (but not including) spirv-val and the retry cascade.
-It is the pure primary emit used when you want “what the emitter produced first,” without rescue
-tiers.
+There is no production loop from `spirv-val` back into emission or rewriting. A validation failure
+is returned as `Err` / CLI `FALLBACK`. The product does not parse the failed output and does not use
+validator wording to select another representation.
 
-Sanitization preserves the source `target datalayout`. The layout module parses its LLVM
-`v<size>:<abi>` entries and carries the typed vector-alignment rules in `EmitSidecar` through
-the primary and every retry. Exact successfully mapped `air.struct_type_info` member offsets take
-precedence; otherwise all decoration and byte-address walkers share the same natural member cursor,
-including LLVM allocation-size advancement for three-lane vectors. Retry diagnostics report exact
-metadata layouts that map explicitly and metadata shapes that could not be mapped.
+`translate_native_no_retry` retains its compatibility name. It constructs the primary
+representation up to, but not including, external validation and does not select an alternate when
+an owned invariant rejects that representation. `translate_native_primary_validated` validates
+that same primary-only construction. Ordinary `translate*` entry points may select an alternate
+before validation from the structural facts described below.
 
-Kernel interface lowering owns one typed dispatch-grid contract. Whole-workgroup dispatch derives
-`[[threads_per_grid]]` from `NumWorkgroups * LocalSize`; exact Metal `dispatchThreads` uses either a
-fixed grid or, by default, a reflected three-`u32` push-constant grid at offset zero. That same value drives a structured entry
-cull for rounded-up Vulkan invocations, including kernels that do not declare the attribute. A
-partial grid with a source control barrier falls back rather than emitting an early return that
-would violate Vulkan barrier participation.
+## Typed ownership
 
-### Text vs typed IR
+The production body path is parse once → typed IR → owned SPIR-V module:
 
-The production body path is **parse once → typed IR → emit**. There is no mid-pipeline
-`Vec<String>` function body:
+- LLVM text is consumed by `native/parse.rs`, `native/lex.rs`, and the AIR metadata parser.
+- Instruction semantics are carried by typed `TirInst` / `TirBlock` fields. Unsupported opcodes
+  fail visibly instead of being recovered from textual spellings.
+- CFG construction mutates typed `BodyBlock` carriers. Loop, selection, and terminal roles are
+  structural tags rather than name-based decisions.
+- The native emitter and all retained passes share the crate-owned `SpirvModule`. Successful
+  product construction does not serialize and reparse between passes.
+- Within each chosen representation, raw buffer scope is fixed from typed AIR before function
+  emission, including incompatible multi-root pointer merges and integer atomics whose source
+  pointee cannot be addressed as an `i32` Logical pointer. A function is emitted once; emitter
+  errors never rerun it with a broader buffer model.
+- `EmitSidecar` carries typed facts that do not belong in SPIR-V instructions, including AIR
+  layouts, buffer-address words, pointer-field stores, and CFG ownership rejections. Passes remap
+  those facts when IDs change.
 
-- LLVM-IR text is read in the parser (`parse.rs` / `lex.rs`) and in `meta/` for AIR metadata.
-- Instruction and terminator **semantics** are carried on typed `TirInst` / `TirBlock` fields
-  (`operands`, `call`, `phi_incoming`, etc.). The emitter walks those carriers
-  (`emit_body_inst`); unmigrated opcodes fail visibly rather than re-lexing text.
-- The CFG structurizer (`cfg/**`) mutates typed block carriers (`BodyBlock.typed`), not string
-  lines. Roles such as loop-merge / terminal-exit are typed tags on `BodyBlock`, not name-decoded
-  decisions in production control flow.
-- Four pre-emit rewrites still run as **text→text** on the sanitized AIR string before parse:
-  `async_copy`, `vec_scalar_merge`, `sroa`, and `inline` (including the `inline_sroa*` retry
-  variants). They are intentional pre-parse passes, not mid-pipeline body text.
+Four source transforms intentionally operate before typed parsing: async-copy lowering,
+vector/scalar pointer-merge lowering, SROA, and internal-helper inlining. Alternate representations
+receive the same already-lowered source, so they do not observe a different program.
 
-### Reflection
+## Validity by construction
 
-Each translation decodes AIR metadata once into a `StageMeta` shared by emission, passes,
-reflection, and retry re-emissions. After a reflected translation adopts its final validating
-module, a read-only analyzer derives conservative buffer byte footprints from those exact bytes.
-Public `translate_*_reflected` entry points return `(Vec<u8>, reflect::ShaderReflection)` with
-**bytes identical** to the non-reflected call.
+`finish_module` is the common owned-module boundary for primary and alternate emission. It performs
+the following work before assembly:
 
-The default descriptor ABI ranges (buffers `0..32`, sampled textures `32..160`, samplers
-`160..192`, colors `192..200`, and storage textures `480..608`, set 0) live in
-`reflect` and are consumed by the resource pass so decorated bindings and reported reflection share
-one checked contract. A final module audit rejects descriptor classes outside their bands. Start
-with the integration [how-to](HOWTO.md); the complete schema and ABI contract is in
-[`REFLECTION.md`](REFLECTION.md).
+1. Run interface, resource, access, workgroup, stage-input, stage-output, finalization, and module
+   cleanup passes.
+2. Close cross-binding pointer operations in the value domain where their load/store closure is
+   representable.
+3. Retype Workgroup atomic storage and construct opaque-image selects using the consumers' image
+   types.
+4. Lower remaining representable cross-binding pointer closures to the address domain.
+5. Canonicalize IDs while remapping the sidecar.
+6. On the primary representation, remove invalid value chains made unreachable by static CFG
+   pruning.
+7. Reconstruct only CFG functions selected by source ownership or final owned-CFG facts.
+8. On the selected raw-relooper representation, carry address-domain selection into final resource
+   construction, then rebuild the selected CFG and canonicalize the completed graph.
+9. Reject malformed result-type IDs and core type-declaration graphs before any instruction can
+   treat an arbitrary defined ID as a type.
+10. Reject owned arithmetic, comparison, shift, numeric-bitcast, bit-count, Boolean reduction,
+   float-classification, vector-algebra, derivative, copy, select, phi, load, and store type
+   disagreement; atomic pointer-pointee, result, value, comparator, scope, and memory-semantics type
+   disagreement; unknown GLSL.std.450 opcodes and extended-instruction arity or type-shape
+   disagreement; sampled-image result, image, and sampler type disagreement; image-query result,
+   dimension, array, multisample, sampled/storage mode, LOD, and coordinate disagreement; derivatives
+   and implicit-LOD queries reachable outside a Fragment call tree; texel fetch/read/write image mode,
+   component, coordinate, result, texel, LOD, and sample disagreement; sampled-image operation result,
+   coordinate, component, LOD, constant-offset, and stage disagreement; image-texel-pointer result,
+   image, coordinate, sample, and atomic-format disagreement; barrier scope, memory-semantics, and
+   execution-model disagreement; subgroup vote, ballot, shuffle, arithmetic, scope, index,
+   group-operation, and cluster-size disagreement; access-chain base/result storage, integer index,
+   structure-member, and result-pointee disagreement; invalid branch and switch
+   controls; inconsistent function signatures, calls, parameters, and returns; inconsistent
+   composite constituents, index paths, dynamic vector operations, and shuffle lanes; invalid
+   structure-member indices; non-32-bit Vulkan 1.2 bit-field/count/reverse bases; and Logical pointer
+   nulls, cross-root selects, or pointer-valued variables.
+11. Reject descriptor bindings outside the configured ABI.
+12. Assemble once.
 
-### Retained module seam
+The owned checks are deliberately narrower than a second SPIR-V validator. They enforce invariant
+classes the translator itself has enough information to guarantee and use failures as construction
+facts while the source and module are still owned. `spirv-val` remains the independent final
+backstop for the complete Vulkan SPIR-V contract.
 
-The native emitter and the typed passes share one crate-owned `SpirvModule`. Emission returns an
-internal `EmittedSpirv` (module + `EmitSidecar`); `finish_module` hands both into the pass
-context. The validating-primary path assembles once after passes complete.
+### Representation selection
 
-`SpirvModule` owns section layout, load/assemble, result-id allocation, and instruction/block
-nodes. Retries may re-enter from bytes, but they parse back into the same module type. There is no production dependency on an external SPIR-V builder; optional validation
-helpers may use `rspirv` as an offline oracle only.
+Alternate construction is selected before validation:
 
-Related ownership:
-
-| Area | Location |
+| Owned fact | Constructed representation |
 |---|---|
-| Layout rules (AIR / SPIR-V / tight / padded) | crate `layout` module |
-| Value/type queries on retained SPIR-V | `passes/value_queries.rs` |
-| Access-chain / subword / Workgroup / Private | `passes/access/` |
-| Structured-CFG repairs after AIR-call phase | `passes/cfg_repair/` |
-| AIR/LLVM intrinsic lowering | `passes/air_calls/` (+ `images/`) |
-| Workgroup interface + zero-init | `passes/workgroup/` |
-| Resource discovery, bindings, rewrites | `passes/resources/` |
-| Stage inputs / outputs | `passes/stage_input/`, `passes/stage_output/` |
-| Finalize, GC, caps, type singletons | `passes/finalize.rs`, `module_cleanup.rs`, `type_singletons.rs` |
+| Source CFG ownership rejection or final owned-CFG construction failure | raw-buffer relooper feed |
+| Internal helper directly consumes a pointer-select result | consuming-helper inline + bounded CFG construction |
 
-The emit sidecar carries Word-id-keyed facts (buffer-address words, local-pointer field stores,
-static/dynamic field loads, AIR struct offsets). Producers append; inlining and resource rewrites
-remap them. There is no cross-seam `OpName` marker protocol for facts.
+If the selected alternate cannot be constructed, translation fails honestly. The implementation
+does not serialize multiple candidates and ask the validator which one to adopt.
+Malformed declarations, load/store/select/access typing, ordinary value typing, environment
+contracts, function contracts, and value-composite contracts are non-repairable validity failures.
+They cannot select an alternate representation merely because they are discovered at the same
+owned-module boundary as CFG facts. Raw buffer scope is chosen from typed AIR before emission.
 
-Metal vertex entries carrying `air.patch` metadata finalize as Vulkan tessellation-evaluation
-entries. The interface pass maps `position_in_patch` to `TessCoord`, `patch_id` to `PrimitiveId`,
-per-patch arguments to `Patch` inputs, and metadata-described control-point accessors to indexed
-loads from control-point input arrays. The AIR patch domain and control-point count, never a shader
-name, determine the execution modes and array extents.
+Validator-message classifiers and byte-level repair adapters are deliberately absent. Diagnostics
+inspect AIR or an owned module directly; validator text is only returned to the caller.
 
-### Inlining
-
-Helpers are inlined on the producer side where structural rules allow (one-block and multi-block
-leaf helpers, constructor CFGs). Typed SSA, pointee/raw-buffer facts, and sidecar IDs move with
-the splice. Residual indirect/bodiless/conflicting cases stay as calls. Dead-function pruning and
-chained-access composition remain in their post-inline cleanup phase; `passes/emitted_inline/` is
-the producer-side inliner.
-
-### Structurizer
-
-Emission is structured-by-construction when possible:
+## CFG structurization
 
 1. `native::cfg` builds a loop/selection forest from the AIR CFG.
-2. `structured_plan` decides whether that forest is expressible as Vulkan structured control flow.
-3. **Admit** → emitter walks the plan (`OpLoopMerge` / `OpSelectionMerge`), then
-   `repair_pre_phi_incoming_materializations` relocates illegal in-phi-block access chains.
-4. **Reject** → function emits with inferred merges unrepaired; the retry cascade’s **relooper**
-   (`native/relooper.rs`) strips merges and rebuilds structured CFG. The relooper is the sole
-   general structuring fallback.
+2. `structured_plan` admits forests expressible as Vulkan structured control flow.
+3. Admitted functions emit `OpLoopMerge` / `OpSelectionMerge`; phi incoming materializations belong
+   to predecessor edges and are inserted before their merge/terminator instructions.
+4. Rejected bounded CFGs use typed construct-tree ownership, regional dispatch, or a whole-CFG
+   dispatcher where their scalar state is representable.
+5. Source ownership rejections are recorded in the sidecar. After interface lowering and static CFG
+   pruning, the owned module also checks conditional/switch merge ownership and dominance
+   backedges. Only affected functions are rebuilt by the bounded relooper before assembly.
 
-Between reject and relooper, a few specialized constructions may still admit a shape
-(`structured_plan_divergent_exit`, construct-tree own-arm retry for a narrow class). Adoption of
-retry-produced modules is always **spirv-val gated**.
+The whole-function state-machine representation has a hard block ceiling because a module can be
+SPIR-V-valid yet pathological for a driver compiler. Exceeding that construction ceiling remains a
+visible failure; validation success is not used to waive it.
 
-Diagnose admit/reject reasons with `METAL2VULKAN_WHY=1` on a local translate of the module under
-study.
+Diagnose planner admission with `METAL2VULKAN_WHY=1`. Diagnostic environment variables may report
+facts, but product representation selection is not environment-gated.
 
-## Retry cascade
+## Layout and interfaces
 
-When the primary emit fails validation (or the emitter returns an error), translation walks a fixed
-ladder of retry **tiers**. Mechanisms live in `retry.rs`; routing lives in
-`translate_sanitized_with_meta` as a match on `native::classify_{validation,emit}_error`.
+Sanitization preserves `target datalayout`. Vector ABI alignment, allocation-size advancement, and
+successfully mapped `air.struct_type_info` offsets flow through the sidecar and are shared by
+decorations and byte-address walkers.
 
-Three invariants:
+The default descriptor ABI ranges are owned by `reflect`: buffers `0..32`, sampled textures
+`32..160`, samplers `160..192`, colors `192..200`, and storage textures `480..608`, all in set 0.
+Resource lowering and reflection consume the same checked contract. See [REFLECTION.md](REFLECTION.md).
 
-1. **Adopt only if the candidate validates.** A module that already passed spirv-val never enters
-   the cascade; a non-validating retry result is discarded.
-2. **Tier order is load-bearing.** Example: value-select before PhysicalStorageBuffer (device-address)
-   lowering, because some drivers cannot pipeline BDA modules as compute; inline+SROA before relooper
-   where that ordering has been proven safer. Do not reorder tiers casually.
-3. **Validator success is not a driver-cost proof.** The whole-function switch/state-machine
-   relooper has a hard 1,024-block ceiling. Larger flattened modules can validate quickly while
-   taking real drivers many minutes to compile or crashing their compiler, so they return
-   `FALLBACK` until a regional structurizer can preserve most of the CFG and SSA.
+Kernel interface lowering also owns the dispatch-grid contract. Whole-workgroup dispatch derives
+`threads_per_grid` from `NumWorkgroups * LocalSize`; exact dispatch uses a fixed or dynamic grid and
+partitions partial workgroups without divergent early returns around barriers.
 
-Classification of validator/emitter text into `ValidationClass` / `EmitErrorClass` is confined to
-`native` (`classify_validation_error` / `classify_emit_error`). The cascade then routes by class:
+Metal vertex entries with `air.patch` metadata become tessellation-evaluation entries. Patch domain,
+control-point count, interface roles, and array extents come from AIR structure and metadata, never
+shader names.
 
-| Class | Typical tier order (census labels under `METAL2VULKAN_TIER_CENSUS`) |
-|---|---|
-| PointerTyping | `fc_promote_logical` → raw → prune → subword pack → raw+relooper → `fc_promote_psb` |
-| CfgStructurization | relooper → prune+relooper → raw+relooper |
-| LogicalPointerPhi | phi-index legalization → prune |
-| CrossBindingPointerMerge | value-select → PSB → raw+PSB → prune |
-| Other (validation) | prune → raw+relooper → value-select |
-| Emit PointerTyping / Other | raw / BDA / PSB / inline-SROA combinations |
+## Reflection
 
-CFG shapes that the structurizer rejects now fail **validation** (unrepaired merges), not a separate
-CFG emit-error arm. Emit-error routing is essentially `{PointerTyping, Other}`.
-
-### Primary-path rewrites
-
-Before the cascade, several validation-gated rewrites run on the primary path itself
-(`apply_primary_emit_rewrites` and related helpers in `lib.rs`). Each is a no-op on modules that do
-not carry its shape. Examples: cross-binding value-domain lowering, logical-pointer-phi
-legalization, multi-entry loop split, and reject-triggered structured-plan admission handlers.
-These run unconditionally on the product path; `src/env_vars.rs` is for diagnostics, tool overrides,
-and default-off measurement substrates only—not product feature gates.
+Reflected translation shares one parsed `StageMeta` with emission and passes. After the sole module
+has validated, read-only analysis derives conservative buffer footprints from the returned bytes.
+The reflected and non-reflected entry points return identical SPIR-V bytes for identical options.
 
 ## Verification
 
-Match the check to the change. The full developer playbook (harvest → author cases → exact A/B →
-targeted GPU evidence) lives in **[`VALIDATION.md`](VALIDATION.md)**.
+Match evidence to the claim. The complete developer ladder is in [VALIDATION.md](VALIDATION.md).
 
-| Check | Command / tool | Catches |
-|---|---|---|
-| Lint | `cargo clippy` | style / obvious bugs |
-| Unit + integration | `cargo test -- --test-threads=1` | translator regressions |
-| Byte A/B | validation `corpus-ab` | exact old/new translator drift without a GPU |
-| Authored cases | `validation/corpus/cases/` | literal semantic inputs and output selection |
-| Exact observations | `validation/corpus/observations/` | dependency-complete current experiment slots |
-| Private corpus (optional) | `validation/corpus/local/sources/` | aligned sanitized AIR source shards |
-| Metal qualification (optional) | validation `corpus-metal` | literal case execution and golden bytes |
-| Candidate execution (optional) | `corpus-moltenvk` / `corpus-vulkan` | candidate bytes vs exact Metal observation |
+| Check | Catches |
+|---|---|
+| `cargo clippy --workspace --all-targets -- -D warnings` | warnings and common defects |
+| serial product and validation tests | construction and tooling regressions |
+| primary-validity tests | violations escaping owned construction |
+| byte A/B | unintended output drift |
+| authored Metal/Vulkan execution | semantic disagreement beyond SPIR-V validity |
+| bounded release-mode corpus translation | time, memory, and unsupported-shape coverage |
 
-Always rebuild the translator binary before measuring. Default CI is synthetic-only; private
-metallib harvest is gitignored under `validation/corpus/local/` (see that README). GPU validation
-never affects product translation paths and never infers an execution plan from AIR.
-
-## Hard-won constraints
-
-- **spirv-val validity ≠ end-to-end correctness.** Retyping a load/store carrier only to silence the
-  validator is unsound if it changes meaning.
-- **Post-hoc repair was deleted for a reason.** Remaining “repair” is narrow and structural (e.g.
-  phi-incoming materialization relocation), not a large merge-rewrite roster. Broad repair deletion
-  is byte-changing and needs execution evidence, not only a reject census of zero.
-- **No name-keyed translation.** Decide from IR structure, types, storage classes, and the AIR
-  metadata ABI—not from shader/function names observed in particular workloads. Stable `air.*` /
-  `llvm.*` ABI symbols are the allowed exception.
-- **Admission is reject-triggered and spirv-val gated.** Do not invent structured exits from
-  dominance alone as a primary admission path.
+`spirv-val` validity is necessary but not sufficient for semantic correctness. A type rewrite that
+only silences the validator is unsound. Construction decisions must follow IR types, storage
+classes, CFG ownership, and stable AIR/LLVM ABI structure; unknown semantics remain `FALLBACK`.

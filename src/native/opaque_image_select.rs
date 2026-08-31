@@ -9,12 +9,12 @@
 //!
 //! This pass deliberately accepts a narrow, structurally proven closure: an image-only select tree
 //! whose every external consumer is `OpSampledImage`, whose sampled-image result is consumed only by
-//! `OpImageSampleExplicitLod`, and whose values are available at the replay point. It clones the
-//! pure sampled-image/read pair for every leaf and rebuilds the select tree over the non-opaque
-//! result. Any query, write, sparse operation, non-dominating value, or opaque consumer declines the
-//! rewrite. Values may come from the function entry block (which dominates every reachable block) or
-//! earlier in the consuming block. The selected image is never selected in emitted SPIR-V, so no
-//! bindless extension is required.
+//! a pure value-producing sample or LOD query, and whose values are available at the replay point.
+//! It clones the pure sampled-image/consumer pair for every leaf and rebuilds the select tree over
+//! the non-opaque result. Any write, sparse operation, non-dominating value, or opaque consumer
+//! declines the rewrite. Values may come from the function entry block (which dominates every
+//! reachable block) or earlier in the consuming block. The selected image is never selected in
+//! emitted SPIR-V, so no bindless extension is required.
 
 use crate::spirv_module::Instruction;
 use crate::spirv_module::Module;
@@ -41,9 +41,38 @@ struct TreePlan {
     replacements: HashMap<Site, Vec<Instruction>>,
 }
 
+#[derive(Clone)]
+enum NestedPhiArm {
+    Image { label: Word, ordinal: u32 },
+    Phi { result: Word, label: Word },
+}
+
+#[derive(Clone)]
+struct NestedPhiNode {
+    site: Site,
+    result: Word,
+    arms: Vec<NestedPhiArm>,
+}
+
+#[derive(Clone)]
+enum NestedPhiConsumer {
+    Direct(UseSite),
+    Sampled {
+        sampled_site: Site,
+        sample_uses: Vec<UseSite>,
+    },
+}
+
+struct NestedPhiPlan {
+    image_ty: Word,
+    nodes: Vec<NestedPhiNode>,
+    leaves: Vec<Word>,
+    consumers: Vec<NestedPhiConsumer>,
+}
+
 /// Replace a selected opaque image consumed only by explicit-LOD sampling with a select over the
 /// sampled value. Returns `true` only after the entire use closure has passed the strict gate.
-pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
+pub(super) fn construct_opaque_image_selects(module: &mut Module) -> bool {
     // The detailed rewrite builds definition/use maps with owned instructions. Avoid that large
     // speculative graph on ordinary compute modules: every supported rewrite must ultimately feed
     // either a direct image value operation or OpSampledImage through an OpSelect/OpPhi result.
@@ -53,6 +82,7 @@ pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
         return false;
     }
     let direct_changed = rewrite_opaque_image_direct_selects(module);
+    let nested_phi_changed = rewrite_nested_opaque_image_phis(module);
     let phi_changed = rewrite_opaque_image_phis(module);
     let type_defs: HashMap<Word, Instruction> = module
         .types_global_values
@@ -177,7 +207,7 @@ pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
     }
 
     if replacements.is_empty() {
-        let changed = direct_changed || phi_changed;
+        let changed = direct_changed || nested_phi_changed || phi_changed;
         if changed {
             // Interface recovery can leave its original pointer-typed select cascade dead after a
             // parallel image-value cascade is replayed. Those stale selects are independently
@@ -189,7 +219,7 @@ pub(super) fn rewrite_opaque_image_selects(module: &mut Module) -> bool {
 
     for (function, func) in module.functions.iter_mut().enumerate() {
         for (block, blk) in func.blocks.iter_mut().enumerate() {
-            let old = std::mem::take(&mut blk.instructions);
+            let old = blk.instructions.clone();
             let mut rebuilt = Vec::with_capacity(old.len());
             for (instruction, inst) in old.into_iter().enumerate() {
                 let site = Site {
@@ -454,7 +484,7 @@ fn rewrite_opaque_image_direct_selects(module: &mut Module) -> bool {
 
     for (function, func) in module.functions.iter_mut().enumerate() {
         for (block, blk) in func.blocks.iter_mut().enumerate() {
-            let old = std::mem::take(&mut blk.instructions);
+            let old = blk.instructions.clone();
             let mut rebuilt = Vec::with_capacity(old.len());
             for (instruction, inst) in old.into_iter().enumerate() {
                 let site = Site {
@@ -484,10 +514,580 @@ fn rewrite_opaque_image_direct_selects(module: &mut Module) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_nested_phi_tree(
+    result: Word,
+    function: usize,
+    type_defs: &HashMap<Word, Instruction>,
+    value_defs: &HashMap<Word, Instruction>,
+    value_types: &HashMap<Word, Word>,
+    positions: &HashMap<Word, Site>,
+    visiting: &mut HashSet<Word>,
+    image_types: &mut HashMap<Word, Word>,
+    nodes: &mut Vec<NestedPhiNode>,
+    leaves: &mut Vec<Word>,
+) -> Option<Word> {
+    if let Some(image_ty) = image_types.get(&result) {
+        return Some(*image_ty);
+    }
+    if !visiting.insert(result) {
+        return None;
+    }
+    let definition = value_defs.get(&result)?;
+    let site = *positions.get(&result)?;
+    if site.function != function
+        || definition.class.opcode != Op::Phi
+        || !definition
+            .result_type
+            .is_some_and(|ty| is_pointer_type(type_defs, ty))
+        || definition.operands.len() < 4
+        || !definition.operands.len().is_multiple_of(2)
+    {
+        visiting.remove(&result);
+        return None;
+    }
+    let mut image_ty = None;
+    let mut arms = Vec::new();
+    for pair in definition.operands.chunks_exact(2) {
+        let (Operand::IdRef(value), Operand::IdRef(label)) = (&pair[0], &pair[1]) else {
+            visiting.remove(&result);
+            return None;
+        };
+        let value_ty = *value_types.get(value)?;
+        let (arm, arm_image_ty) = if is_image_type(type_defs, value_ty) {
+            let ordinal = leaves.len() as u32;
+            leaves.push(*value);
+            (
+                NestedPhiArm::Image {
+                    label: *label,
+                    ordinal,
+                },
+                value_ty,
+            )
+        } else if value_defs
+            .get(value)
+            .is_some_and(|inst| inst.class.opcode == Op::Phi)
+        {
+            let child_image_ty = collect_nested_phi_tree(
+                *value,
+                function,
+                type_defs,
+                value_defs,
+                value_types,
+                positions,
+                visiting,
+                image_types,
+                nodes,
+                leaves,
+            )?;
+            (
+                NestedPhiArm::Phi {
+                    result: *value,
+                    label: *label,
+                },
+                child_image_ty,
+            )
+        } else {
+            visiting.remove(&result);
+            return None;
+        };
+        if image_ty.is_some_and(|expected| expected != arm_image_ty) {
+            visiting.remove(&result);
+            return None;
+        }
+        image_ty = Some(arm_image_ty);
+        arms.push(arm);
+    }
+    visiting.remove(&result);
+    let image_ty = image_ty?;
+    image_types.insert(result, image_ty);
+    nodes.push(NestedPhiNode { site, result, arms });
+    Some(image_ty)
+}
+
+/// Lower a complete phi-of-phi opaque image tree into a tree of integer tag phis. Each image leaf
+/// receives one root-wide ordinal, so a parent phi can carry a child tag directly on the matching
+/// predecessor edge. Pure image consumers are replayed once per concrete leaf and select only their
+/// ordinary result values.
+fn rewrite_nested_opaque_image_phis(module: &mut Module) -> bool {
+    let type_defs: HashMap<Word, Instruction> = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+        .collect();
+    let value_types: HashMap<Word, Word> = module
+        .all_inst_iter()
+        .filter_map(|inst| match (inst.result_id, inst.result_type) {
+            (Some(id), Some(ty)) => Some((id, ty)),
+            _ => None,
+        })
+        .collect();
+    let value_defs: HashMap<Word, Instruction> = module
+        .all_inst_iter()
+        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+        .collect();
+    let global_ids: HashSet<Word> = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id)
+        .collect();
+    let mut positions = HashMap::new();
+    let mut uses: HashMap<Word, Vec<UseSite>> = HashMap::new();
+    for (function, func) in module.functions.iter().enumerate() {
+        for (block, blk) in func.blocks.iter().enumerate() {
+            for (instruction, inst) in blk.instructions.iter().enumerate() {
+                let site = Site {
+                    function,
+                    block,
+                    instruction,
+                };
+                if let Some(id) = inst.result_id {
+                    positions.insert(id, site);
+                }
+                for (operand, value) in inst.operands.iter().enumerate() {
+                    if let Operand::IdRef(id) = value {
+                        uses.entry(*id).or_default().push(UseSite { site, operand });
+                    }
+                }
+            }
+        }
+    }
+    let dominators = module
+        .functions
+        .iter()
+        .map(block_dominator_indices)
+        .collect::<Vec<_>>();
+    let value_dominates_site = |value: Word, site: Site| {
+        if global_ids.contains(&value) {
+            return true;
+        }
+        let Some(definition) = positions.get(&value).copied() else {
+            return false;
+        };
+        definition.function == site.function
+            && if definition.block == site.block {
+                definition.instruction < site.instruction
+            } else {
+                dominators
+                    .get(site.function)
+                    .and_then(|function| function.get(site.block))
+                    .is_some_and(|blocks| blocks.contains(&definition.block))
+            }
+    };
+    let image_available_at_site = |value: Word, site: Site| {
+        value_dominates_site(value, site)
+            || value_defs.get(&value).is_some_and(|inst| {
+                inst.class.opcode == Op::Load
+                    && matches!(inst.operands.first(), Some(Operand::IdRef(root)) if global_ids.contains(root))
+            })
+    };
+    let uint_ty = type_defs.iter().find_map(|(&id, inst)| {
+        (inst.class.opcode == Op::TypeInt
+            && matches!(
+                inst.operands.as_slice(),
+                [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]
+            ))
+        .then_some(id)
+    });
+    let bool_ty = type_defs
+        .iter()
+        .find_map(|(&id, inst)| (inst.class.opcode == Op::TypeBool).then_some(id));
+    let (Some(uint_ty), Some(bool_ty)) = (uint_ty, bool_ty) else {
+        return false;
+    };
+
+    let candidates = positions
+        .iter()
+        .filter_map(|(&result, &site)| {
+            let definition = value_defs.get(&result)?;
+            (definition.class.opcode == Op::Phi
+                && definition
+                    .result_type
+                    .is_some_and(|ty| is_pointer_type(&type_defs, ty))
+                && uses.get(&result).is_some_and(|result_uses| {
+                    result_uses.iter().any(|use_site| {
+                        instruction_at(module, use_site.site).is_some_and(|consumer| {
+                            use_site.operand == 0
+                                && (is_direct_image_value_op(consumer.class.opcode)
+                                    || consumer.class.opcode == Op::SampledImage)
+                        })
+                    })
+                }))
+            .then_some((result, site.function))
+        })
+        .collect::<BTreeSet<_>>();
+
+    let mut plans = Vec::new();
+    let mut processed = HashSet::new();
+    for (root, function) in candidates {
+        if processed.contains(&root) {
+            continue;
+        }
+        let mut nodes = Vec::new();
+        let mut leaves = Vec::new();
+        let mut visiting = HashSet::new();
+        let mut image_types = HashMap::new();
+        let Some(image_ty) = collect_nested_phi_tree(
+            root,
+            function,
+            &type_defs,
+            &value_defs,
+            &value_types,
+            &positions,
+            &mut visiting,
+            &mut image_types,
+            &mut nodes,
+            &mut leaves,
+        ) else {
+            continue;
+        };
+        if nodes.len() < 2 || nodes.iter().any(|node| processed.contains(&node.result)) {
+            continue;
+        }
+        let node_ids = nodes.iter().map(|node| node.result).collect::<HashSet<_>>();
+        let mut consumers = Vec::new();
+        let mut valid = true;
+        for node in &nodes {
+            for use_site in uses.get(&node.result).into_iter().flatten() {
+                let Some(consumer) = instruction_at(module, use_site.site) else {
+                    valid = false;
+                    break;
+                };
+                let tree_parent = consumer.class.opcode == Op::Phi
+                    && consumer.result_id.is_some_and(|id| node_ids.contains(&id))
+                    && use_site.operand.is_multiple_of(2);
+                if tree_parent {
+                    continue;
+                }
+                if node.result != root || use_site.operand != 0 {
+                    valid = false;
+                    break;
+                }
+                if is_direct_image_value_op(consumer.class.opcode)
+                    && consumer.result_id.is_some()
+                    && consumer.result_type.is_some()
+                    && !consumer
+                        .result_type
+                        .is_some_and(|ty| is_opaque_type(&type_defs, ty))
+                    && leaves
+                        .iter()
+                        .all(|value| image_available_at_site(*value, use_site.site))
+                {
+                    consumers.push(NestedPhiConsumer::Direct(*use_site));
+                    continue;
+                }
+                if consumer.class.opcode != Op::SampledImage {
+                    valid = false;
+                    break;
+                }
+                let Some(sampled_id) = consumer.result_id else {
+                    valid = false;
+                    break;
+                };
+                let Some(sample_uses) = uses.get(&sampled_id).cloned() else {
+                    valid = false;
+                    break;
+                };
+                let sampler = consumer.operands.get(1).and_then(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                });
+                if sample_uses.is_empty()
+                    || sampler.is_none()
+                    || sample_uses.iter().any(|sample_use| {
+                        sample_use.operand != 0
+                            || instruction_at(module, sample_use.site).is_none_or(|sample| {
+                                !is_sampled_image_value_op(sample.class.opcode)
+                                    || sample.result_id.is_none()
+                                    || sample.result_type.is_none()
+                                    || sample
+                                        .result_type
+                                        .is_some_and(|ty| is_opaque_type(&type_defs, ty))
+                            })
+                            || leaves
+                                .iter()
+                                .any(|value| !image_available_at_site(*value, sample_use.site))
+                            || !value_dominates_site(
+                                sampler.expect("sampled-image sampler was gated"),
+                                sample_use.site,
+                            )
+                    })
+                {
+                    valid = false;
+                    break;
+                }
+                consumers.push(NestedPhiConsumer::Sampled {
+                    sampled_site: use_site.site,
+                    sample_uses,
+                });
+            }
+            if !valid {
+                break;
+            }
+        }
+        if valid && !consumers.is_empty() {
+            processed.extend(node_ids);
+            plans.push(NestedPhiPlan {
+                image_ty,
+                nodes,
+                leaves,
+                consumers,
+            });
+        }
+    }
+    if plans.is_empty() {
+        return false;
+    }
+
+    let mut next_id = module.header.as_ref().map_or(1, |header| header.bound);
+    let fresh = |next_id: &mut Word| {
+        let id = *next_id;
+        *next_id += 1;
+        id
+    };
+    let max_leaves = plans
+        .iter()
+        .map(|plan| plan.leaves.len())
+        .max()
+        .unwrap_or(0);
+    let mut constants = HashMap::new();
+    for ordinal in 0..max_leaves as u32 {
+        let id = module
+            .types_global_values
+            .iter()
+            .find_map(|inst| {
+                (inst.class.opcode == Op::Constant
+                    && inst.result_type == Some(uint_ty)
+                    && inst.operands.first() == Some(&Operand::LiteralBit32(ordinal)))
+                .then_some(inst.result_id)
+                .flatten()
+            })
+            .unwrap_or_else(|| fresh(&mut next_id));
+        constants.insert(ordinal, id);
+    }
+    let existing_ids = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id)
+        .collect::<HashSet<_>>();
+    let first_variable = module
+        .types_global_values
+        .iter()
+        .position(|inst| inst.class.opcode == Op::Variable)
+        .unwrap_or(module.types_global_values.len());
+    let mut new_constants = constants
+        .iter()
+        .filter(|(_, id)| !existing_ids.contains(id))
+        .map(|(&value, &id)| {
+            Instruction::new(
+                Op::Constant,
+                Some(uint_ty),
+                Some(id),
+                vec![Operand::LiteralBit32(value)],
+            )
+        })
+        .collect::<Vec<_>>();
+    new_constants.sort_by_key(|inst| inst.result_id);
+    module
+        .types_global_values
+        .splice(first_variable..first_variable, new_constants);
+
+    let mut sampled_type_by_image = type_defs
+        .iter()
+        .filter_map(|(&id, inst)| {
+            (inst.class.opcode == Op::TypeSampledImage).then(|| {
+                inst.operands.first().and_then(|operand| match operand {
+                    Operand::IdRef(image) => Some((*image, id)),
+                    _ => None,
+                })
+            })?
+        })
+        .collect::<HashMap<_, _>>();
+    let mut replacements = HashMap::<Site, Vec<Instruction>>::new();
+    let mut removed_ids = HashSet::new();
+    for plan in plans {
+        let tag_by_result = plan
+            .nodes
+            .iter()
+            .map(|node| (node.result, fresh(&mut next_id)))
+            .collect::<HashMap<_, _>>();
+        for node in &plan.nodes {
+            let operands = node
+                .arms
+                .iter()
+                .flat_map(|arm| match arm {
+                    NestedPhiArm::Image { label, ordinal, .. } => {
+                        [Operand::IdRef(constants[ordinal]), Operand::IdRef(*label)]
+                    }
+                    NestedPhiArm::Phi { result, label } => [
+                        Operand::IdRef(tag_by_result[result]),
+                        Operand::IdRef(*label),
+                    ],
+                })
+                .collect();
+            replacements.insert(
+                node.site,
+                vec![Instruction::new(
+                    Op::Phi,
+                    Some(uint_ty),
+                    Some(tag_by_result[&node.result]),
+                    operands,
+                )],
+            );
+            removed_ids.insert(node.result);
+        }
+        let root = plan
+            .nodes
+            .last()
+            .expect("nested phi tree has a root")
+            .result;
+        let root_tag = tag_by_result[&root];
+        for consumer_plan in plan.consumers {
+            let (consumer, use_sites, sampled_template) = match consumer_plan {
+                NestedPhiConsumer::Direct(use_site) => (
+                    instruction_at(module, use_site.site)
+                        .expect("nested image phi consumer disappeared")
+                        .clone(),
+                    vec![use_site],
+                    None,
+                ),
+                NestedPhiConsumer::Sampled {
+                    sampled_site,
+                    sample_uses,
+                } => {
+                    let sampled = instruction_at(module, sampled_site)
+                        .expect("nested image phi sampled-image consumer disappeared")
+                        .clone();
+                    replacements.insert(sampled_site, Vec::new());
+                    if let Some(id) = sampled.result_id {
+                        removed_ids.insert(id);
+                    }
+                    (sampled, sample_uses, Some(sampled_site))
+                }
+            };
+            for use_site in use_sites {
+                let value_consumer = if sampled_template.is_some() {
+                    instruction_at(module, use_site.site)
+                        .expect("nested image phi sample consumer disappeared")
+                        .clone()
+                } else {
+                    consumer.clone()
+                };
+                let result_ty = value_consumer.result_type.expect("gated result type");
+                let final_result = value_consumer.result_id.expect("gated result");
+                let mut out = Vec::new();
+                let mut arm_results = Vec::with_capacity(plan.leaves.len());
+                for image in &plan.leaves {
+                    let image = if value_dominates_site(*image, use_site.site) {
+                        *image
+                    } else {
+                        let mut load = value_defs
+                            .get(image)
+                            .expect("image leaf was gated as a replayable load")
+                            .clone();
+                        let replayed = fresh(&mut next_id);
+                        load.result_id = Some(replayed);
+                        out.push(load);
+                        replayed
+                    };
+                    let result = if plan.leaves.len() == 1 {
+                        final_result
+                    } else {
+                        fresh(&mut next_id)
+                    };
+                    let mut cloned = value_consumer.clone();
+                    cloned.result_id = Some(result);
+                    if sampled_template.is_some() {
+                        let sampled_ty = *sampled_type_by_image
+                            .entry(plan.image_ty)
+                            .or_insert_with(|| {
+                                let id = fresh(&mut next_id);
+                                module.types_global_values.push(Instruction::new(
+                                    Op::TypeSampledImage,
+                                    None,
+                                    Some(id),
+                                    vec![Operand::IdRef(plan.image_ty)],
+                                ));
+                                id
+                            });
+                        let sampled_result = fresh(&mut next_id);
+                        let mut sampled = consumer.clone();
+                        sampled.result_id = Some(sampled_result);
+                        sampled.result_type = Some(sampled_ty);
+                        sampled.operands[0] = Operand::IdRef(image);
+                        out.push(sampled);
+                        cloned.operands[0] = Operand::IdRef(sampled_result);
+                    } else {
+                        cloned.operands[0] = Operand::IdRef(image);
+                    }
+                    out.push(cloned);
+                    arm_results.push(result);
+                }
+                let mut selected = arm_results[0];
+                for ordinal in 1..arm_results.len() {
+                    let condition = fresh(&mut next_id);
+                    out.push(Instruction::new(
+                        Op::IEqual,
+                        Some(bool_ty),
+                        Some(condition),
+                        vec![
+                            Operand::IdRef(root_tag),
+                            Operand::IdRef(constants[&(ordinal as u32)]),
+                        ],
+                    ));
+                    let result = if ordinal + 1 == arm_results.len() {
+                        final_result
+                    } else {
+                        fresh(&mut next_id)
+                    };
+                    out.push(Instruction::new(
+                        Op::Select,
+                        Some(result_ty),
+                        Some(result),
+                        vec![
+                            Operand::IdRef(condition),
+                            Operand::IdRef(arm_results[ordinal]),
+                            Operand::IdRef(selected),
+                        ],
+                    ));
+                    selected = result;
+                }
+                replacements.insert(use_site.site, out);
+            }
+        }
+    }
+    for (function, func) in module.functions.iter_mut().enumerate() {
+        for (block, blk) in func.blocks.iter_mut().enumerate() {
+            let old = blk.instructions.clone();
+            let mut rebuilt = Vec::with_capacity(old.len());
+            for (instruction, inst) in old.into_iter().enumerate() {
+                let site = Site {
+                    function,
+                    block,
+                    instruction,
+                };
+                if let Some(replacement) = replacements.remove(&site) {
+                    rebuilt.extend(replacement);
+                } else {
+                    rebuilt.push(inst);
+                }
+            }
+            blk.instructions = rebuilt;
+        }
+    }
+    let targets_removed = |inst: &Instruction| matches!(inst.operands.first(), Some(Operand::IdRef(id)) if removed_ids.contains(id));
+    module.debug_names.retain(|inst| !targets_removed(inst));
+    module.annotations.retain(|inst| !targets_removed(inst));
+    if let Some(header) = module.header.as_mut() {
+        header.bound = next_id;
+    }
+    true
+}
+
 /// Lower a stale pointer-typed `OpPhi` whose incoming values are all the same image type into a
 /// plain integer tag phi. Every external use must be a pure image query/read with a non-opaque
 /// result; each use is replayed for every image arm and the ordinary results are selected by tag.
-/// This is the control-flow analogue of [`rewrite_opaque_image_selects`].
+/// This is the control-flow analogue of [`construct_opaque_image_selects`].
 fn rewrite_opaque_image_phis(module: &mut Module) -> bool {
     let type_defs: HashMap<Word, Instruction> = module
         .types_global_values
@@ -688,7 +1288,7 @@ fn rewrite_opaque_image_phis(module: &mut Module) -> bool {
                         || sample_uses.iter().any(|sample_use| {
                             sample_use.operand != 0
                                 || instruction_at(module, sample_use.site).is_none_or(|sample| {
-                                    sample.class.opcode != Op::ImageSampleExplicitLod
+                                    !is_sampled_image_value_op(sample.class.opcode)
                                         || sample.result_id.is_none()
                                         || sample.result_type.is_none()
                                         || sample
@@ -770,18 +1370,9 @@ fn rewrite_opaque_image_phis(module: &mut Module) -> bool {
             id
         });
     }
-    if !new_sampled_types.is_empty() {
-        let old = std::mem::take(&mut module.types_global_values);
-        let mut rebuilt = Vec::with_capacity(old.len() + new_sampled_types.len());
-        for definition in old {
-            let result = definition.result_id;
-            rebuilt.push(definition);
-            if let Some(sampled) = result.and_then(|id| new_sampled_types.remove(&id)) {
-                rebuilt.push(sampled);
-            }
-        }
-        module.types_global_values = rebuilt;
-    }
+    let mut new_sampled_types = new_sampled_types.into_values().collect::<Vec<_>>();
+    new_sampled_types.sort_by_key(|instruction| instruction.result_id);
+    module.types_global_values.extend(new_sampled_types);
     let mut constants = HashMap::new();
     for plan in &plans {
         for ordinal in 0..plan.arms.len() as u32 {
@@ -952,7 +1543,7 @@ fn rewrite_opaque_image_phis(module: &mut Module) -> bool {
 
     for (function, func) in module.functions.iter_mut().enumerate() {
         for (block, blk) in func.blocks.iter_mut().enumerate() {
-            let old = std::mem::take(&mut blk.instructions);
+            let old = blk.instructions.clone();
             let mut rebuilt = Vec::with_capacity(old.len());
             for (instruction, inst) in old.into_iter().enumerate() {
                 let site = Site {
@@ -1123,7 +1714,7 @@ fn plan_tree(
         }
         for use_site in sample_uses {
             let sample = instruction_at(module, use_site.site)?;
-            if sample.class.opcode != Op::ImageSampleExplicitLod || use_site.operand != 0 {
+            if !is_sampled_image_value_op(sample.class.opcode) || use_site.operand != 0 {
                 return None;
             }
             let sample_result_ty = sample.result_type?;
@@ -1239,6 +1830,10 @@ fn is_direct_image_value_op(op: Op) -> bool {
         op,
         Op::ImageQuerySizeLod | Op::ImageQuerySize | Op::ImageFetch | Op::ImageRead
     )
+}
+
+fn is_sampled_image_value_op(op: Op) -> bool {
+    matches!(op, Op::ImageSampleExplicitLod | Op::ImageQueryLod)
 }
 
 fn select_tree_image_type(

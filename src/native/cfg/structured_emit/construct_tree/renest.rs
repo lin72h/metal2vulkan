@@ -1,4 +1,4 @@
-//! Whole-region structured role materialization for the R1 fixture gate.
+//! Whole-region structured role materialization for typed source CFGs.
 //!
 //! The immutable ownership plan is lowered once to a regional dispatcher construct: one loop owns
 //! one switch, every original body is one switch case, and original edges select the next case.
@@ -24,9 +24,12 @@ const PC: &str = "%metal2vulkan.ct.pc";
 const NEXT_PC: &str = "%metal2vulkan.ct.nextpc";
 const DONE: &str = "%metal2vulkan.ct.done";
 const ROUTE: &str = "%metal2vulkan.ct.route";
+const RETURN_VALUE: &str = "%metal2vulkan.ct.return";
+const NEXT_RETURN_VALUE: &str = "%metal2vulkan.ct.nextreturn";
 
 #[derive(Clone, Debug)]
 struct PhiSlot {
+    original: String,
     ty: LlType,
     host: usize,
     incoming: HashMap<usize, LlValue>,
@@ -41,6 +44,158 @@ struct ValueSlot {
     original: String,
     current: String,
     next: String,
+}
+
+#[derive(Clone, Debug)]
+struct HeaderPointerDerivation {
+    owner: usize,
+    original: String,
+    header: String,
+    inst: tir::TirInst,
+    scalar_dependencies: Vec<String>,
+}
+
+fn cross_case_state_type(ty: &LlType) -> bool {
+    match ty {
+        LlType::Named(_) => false,
+        LlType::Vector(element, _) | LlType::Array(element, _) => {
+            pointer_free_composite_component(element)
+        }
+        LlType::Struct(fields) => fields.iter().all(pointer_free_composite_component),
+        _ => true,
+    }
+}
+
+fn pointer_free_composite_component(ty: &LlType) -> bool {
+    match ty {
+        LlType::Ptr(_) | LlType::Named(_) => false,
+        LlType::Vector(element, _) | LlType::Array(element, _) => {
+            pointer_free_composite_component(element)
+        }
+        LlType::Struct(fields) => fields.iter().all(pointer_free_composite_component),
+        _ => true,
+    }
+}
+
+fn opaque_image_dependencies(blocks: &[BodyBlock]) -> HashSet<String> {
+    let mut values = HashSet::new();
+    for block in blocks.iter().filter_map(|block| block.typed.as_ref()) {
+        for inst in &block.insts {
+            let Some(call) = inst.call().as_ref() else {
+                continue;
+            };
+            if !crate::air_intrinsics::air_image_intrinsic(&call.callee) {
+                continue;
+            }
+            for argument in &call.args {
+                if matches!(argument.ty, LlType::Ptr(_)) {
+                    if let LlValue::Local(name) = &argument.value {
+                        values.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for block in blocks.iter().filter_map(|block| block.typed.as_ref()) {
+            for inst in &block.insts {
+                let Some(result) = &inst.result else {
+                    continue;
+                };
+                if !values.contains(result) || !matches!(inst.result_ty, Some(LlType::Ptr(_))) {
+                    continue;
+                }
+                for operand in &inst.operands {
+                    if let tir::TirOperand::Value {
+                        name,
+                        ty: LlType::Ptr(_),
+                    } = operand
+                    {
+                        changed |= values.insert(name.clone());
+                    }
+                }
+                if let Some(phi_values) = inst.phi_values() {
+                    for value in phi_values {
+                        if let LlValue::Local(name) = value {
+                            changed |= values.insert(name.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    values
+}
+
+fn dominating_pointer_derivations(
+    blocks: &[BodyBlock],
+    function_variables: &HashSet<String>,
+    defined_values: &HashSet<String>,
+) -> (HashSet<String>, Vec<tir::TirInst>) {
+    let mut names = HashSet::new();
+    let mut instructions = Vec::new();
+    loop {
+        let mut added = false;
+        for block in blocks.iter().filter_map(|block| block.typed.as_ref()) {
+            for inst in &block.insts {
+                let Some(result) = &inst.result else {
+                    continue;
+                };
+                if names.contains(result)
+                    || !matches!(inst.result_ty, Some(LlType::Ptr(_)))
+                    || !matches!(
+                        inst.opcode,
+                        tir::TirOpcode::Bitcast
+                            | tir::TirOpcode::AddrSpaceCast
+                            | tir::TirOpcode::GetElementPtr
+                    )
+                {
+                    continue;
+                }
+
+                let mut rooted = match inst.opcode {
+                    tir::TirOpcode::GetElementPtr => inst.gep().as_ref().is_some_and(|gep| {
+                        matches!(
+                            &gep.base.value,
+                            LlValue::Local(name) if !defined_values.contains(name)
+                        )
+                    }),
+                    tir::TirOpcode::Bitcast | tir::TirOpcode::AddrSpaceCast => {
+                        inst.operands.iter().any(|operand| {
+                            matches!(
+                                operand,
+                                tir::TirOperand::Value {
+                                    name,
+                                    ty: LlType::Ptr(_)
+                                } if !defined_values.contains(name)
+                            )
+                        })
+                    }
+                    _ => false,
+                };
+                let mut operands_dominate = true;
+                inst.visit_uses(|name| {
+                    if function_variables.contains(name) || names.contains(name) {
+                        rooted = true;
+                    } else if defined_values.contains(name) {
+                        operands_dominate = false;
+                    }
+                });
+                if rooted && operands_dominate {
+                    names.insert(result.clone());
+                    instructions.push(inst.clone());
+                    added = true;
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+    (names, instructions)
 }
 
 fn passthrough(name: &str, target: &str) -> BodyBlock {
@@ -212,7 +367,10 @@ pub(in crate::native) fn materialize_construct_tree_roles(
         .iter()
         .map(|route| ((route.edge.from, route.edge.to), route))
         .collect();
+    let opaque_image_dependencies = opaque_image_dependencies(blocks);
 
+    let mut return_ty = None;
+    let mut saw_void_return = false;
     let mut successors = Vec::with_capacity(blocks.len());
     for (source, block) in blocks.iter().enumerate() {
         let carrier = block
@@ -230,11 +388,42 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                 block.name
             ));
         }
-        if matches!(carrier.terminator, tir::TirTerminator::Ret(Some(_))) {
-            return Err(format!(
-                "construct-tree:nonvoid-return block={}",
-                block.name
-            ));
+        match &carrier.ret {
+            tir::RetEmit::Value(value) => {
+                if matches!(value.ty, LlType::Ptr(_)) {
+                    return Err(format!(
+                        "construct-tree:pointer-return block={}",
+                        block.name
+                    ));
+                }
+                if saw_void_return
+                    || return_ty
+                        .as_ref()
+                        .is_some_and(|existing| existing != &value.ty)
+                {
+                    return Err(format!(
+                        "construct-tree:mixed-return-type block={}",
+                        block.name
+                    ));
+                }
+                return_ty = Some(value.ty.clone());
+            }
+            tir::RetEmit::Void => {
+                if return_ty.is_some() {
+                    return Err(format!(
+                        "construct-tree:mixed-return-type block={}",
+                        block.name
+                    ));
+                }
+                saw_void_return = true;
+            }
+            tir::RetEmit::FromText if matches!(carrier.terminator, tir::TirTerminator::Ret(_)) => {
+                return Err(format!(
+                    "construct-tree:untyped-return block={}",
+                    block.name
+                ));
+            }
+            tir::RetEmit::FromText => {}
         }
         let mut block_successors = Vec::new();
         for target in carrier.terminator.successors() {
@@ -275,7 +464,7 @@ pub(in crate::native) fn materialize_construct_tree_roles(
     for (host, block) in blocks.iter().enumerate() {
         let carrier = block.typed.as_ref().expect("checked above");
         for inst in &carrier.insts {
-            let Some((ty, incoming)) = &inst.phi_incoming else {
+            let Some((ty, incoming)) = &inst.phi_incoming() else {
                 continue;
             };
             let result = inst
@@ -308,12 +497,21 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                 }
             }
             slots.push(PhiSlot {
+                original: result.clone(),
                 ty: ty.clone(),
                 host,
                 incoming: routed,
                 current,
                 next,
             });
+        }
+    }
+    for slot in &slots {
+        if matches!(slot.ty, LlType::Ptr(_)) && opaque_image_dependencies.contains(&slot.original) {
+            return Err(format!(
+                "construct-tree:cross-case-opaque-image owner={} value={}",
+                blocks[slot.host].name, slot.original
+            ));
         }
     }
     for slot in &mut slots {
@@ -323,14 +521,23 @@ pub(in crate::native) fn materialize_construct_tree_roles(
     }
 
     // Non-phi values crossing between original cases are carried explicitly through typed state slots.
-    // Pointer values remain excluded: a raw `ptr` slot would discard provenance/pointee information that
-    // the later pointer path still depends on.
+    // A pointer slot remains a pointer phi rather than becoming a value select. The TIR pointee
+    // propagation sees that phi together with all of its uses and assigns one concrete pointee to the
+    // complete network before SPIR-V emission.
     let mut def_block = HashMap::new();
+    let mut defined_values = HashSet::new();
+    let mut function_variables = HashSet::new();
     for (index, block) in blocks.iter().enumerate() {
         for inst in &block.typed.as_ref().expect("checked above").insts {
+            if let Some(result) = &inst.result {
+                defined_values.insert(result.clone());
+            }
             if !inst.is_phi() {
                 if let Some(result) = &inst.result {
                     def_block.insert(result.clone(), (index, inst.result_ty.clone()));
+                    if inst.opcode == "alloca" {
+                        function_variables.insert(result.clone());
+                    }
                 }
             }
         }
@@ -342,14 +549,14 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             if inst.is_phi() {
                 continue;
             }
-            for name in &inst.uses {
+            inst.visit_uses(|name| {
                 if def_block
-                    .get(name.as_str())
+                    .get(name)
                     .is_some_and(|(owner, _)| *owner != index)
                 {
-                    cross_values.insert(name.clone());
+                    cross_values.insert(name.to_string());
                 }
-            }
+            });
         }
         for name in terminator_value_uses(&carrier.terminator) {
             if def_block
@@ -375,6 +582,79 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             }
         }
     }
+    // The SPIR-V emitter declares every LLVM `alloca` as a function-scope variable in the entry
+    // block. It therefore already dominates every dispatcher case and is not loop-carried SSA state.
+    // Pure pointer derivations whose complete local dependency chain reaches such a variable or a
+    // function parameter can likewise execute once in the dispatcher preheader. Keeping these values
+    // in state would invent pointer merges for addresses which already dominate the whole region.
+    let (dominating_pointer_derivations, pointer_preheader_instructions) =
+        dominating_pointer_derivations(blocks, &function_variables, &defined_values);
+    cross_values.retain(|name| {
+        !function_variables.contains(name) && !dominating_pointer_derivations.contains(name)
+    });
+
+    // A Function pointer derived from a dominating root and dynamic scalar indices is represented by
+    // carrying those indices, not the pointer. The defining case keeps its original GEP for immediate
+    // uses; the dispatcher header reconstructs a distinct pointer from the previous iteration's scalar
+    // state for uses in later cases. This preserves pointer identity without requiring a Function
+    // pointer phi, which SPIR-V cannot express.
+    let mut header_pointer_derivations = Vec::new();
+    for (owner, block) in blocks.iter().enumerate() {
+        for inst in &block.typed.as_ref().expect("checked above").insts {
+            let Some(original) = &inst.result else {
+                continue;
+            };
+            if !cross_values.contains(original) || inst.result_ty != Some(LlType::Ptr(0)) {
+                continue;
+            }
+            let Some(gep) = inst.gep().as_ref() else {
+                continue;
+            };
+            let LlValue::Local(base) = &gep.base.value else {
+                continue;
+            };
+            if defined_values.contains(base)
+                && !function_variables.contains(base)
+                && !dominating_pointer_derivations.contains(base)
+            {
+                continue;
+            }
+
+            let mut scalar_dependencies = Vec::new();
+            let mut representable = true;
+            for index in &gep.indices {
+                let LlValue::Local(name) = &index.value else {
+                    continue;
+                };
+                if rename.contains_key(name) || !defined_values.contains(name) {
+                    continue;
+                }
+                let Some((_, Some(ty))) = def_block.get(name) else {
+                    representable = false;
+                    break;
+                };
+                if matches!(ty, LlType::Ptr(_)) || !cross_case_state_type(ty) {
+                    representable = false;
+                    break;
+                }
+                scalar_dependencies.push(name.clone());
+            }
+            if !representable || scalar_dependencies.is_empty() {
+                continue;
+            }
+            for dependency in &scalar_dependencies {
+                cross_values.insert(dependency.clone());
+            }
+            cross_values.remove(original);
+            header_pointer_derivations.push(HeaderPointerDerivation {
+                owner,
+                original: original.clone(),
+                header: format!("{PREFIX}ptr.{}", header_pointer_derivations.len()),
+                inst: inst.clone(),
+                scalar_dependencies,
+            });
+        }
+    }
     let mut value_slots = Vec::new();
     for original in cross_values {
         let Some((owner, ty)) = def_block.get(&original) else {
@@ -386,9 +666,15 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                 blocks[*owner].name
             ));
         };
-        if matches!(ty, LlType::Ptr(_)) {
+        if !cross_case_state_type(ty) {
             return Err(format!(
-                "construct-tree:cross-case-pointer-value owner={} value={original}",
+                "construct-tree:cross-case-unresolved-composite owner={} value={original}",
+                blocks[*owner].name
+            ));
+        }
+        if matches!(ty, LlType::Ptr(_)) && opaque_image_dependencies.contains(&original) {
+            return Err(format!(
+                "construct-tree:cross-case-opaque-image owner={} value={original}",
                 blocks[*owner].name
             ));
         }
@@ -412,7 +698,21 @@ pub(in crate::native) fn materialize_construct_tree_roles(
     }
 
     let done_state = blocks.len() as u64;
-    let mut out = vec![passthrough(PRE, HEADER)];
+    let mut preheader = passthrough(PRE, HEADER);
+    let preheader_carrier =
+        std::sync::Arc::make_mut(preheader.typed.as_mut().expect("typed preheader"));
+    preheader_carrier.insts.extend(
+        blocks
+            .iter()
+            .filter_map(|block| block.typed.as_ref())
+            .flat_map(|block| &block.insts)
+            .filter(|inst| inst.opcode == "alloca")
+            .cloned(),
+    );
+    preheader_carrier
+        .insts
+        .extend(pointer_preheader_instructions);
+    let mut out = vec![preheader];
     let mut header_phis = vec![(
         PC.to_string(),
         LlType::Int(32),
@@ -441,12 +741,40 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             ],
         ));
     }
-    out.push(carrier_with_phis(
-        HEADER,
-        TEST,
-        &header_phis,
-        BlockRole::Normal,
-    )?);
+    if let Some(return_ty) = &return_ty {
+        header_phis.push((
+            RETURN_VALUE.to_string(),
+            return_ty.clone(),
+            vec![
+                (LlValue::Undef, PRE.to_string()),
+                (
+                    LlValue::Local(NEXT_RETURN_VALUE.to_string()),
+                    CONTINUE.to_string(),
+                ),
+            ],
+        ));
+    }
+    let mut header = carrier_with_phis(HEADER, TEST, &header_phis, BlockRole::Normal)?;
+    if !header_pointer_derivations.is_empty() {
+        let carrier = std::sync::Arc::make_mut(header.typed.as_mut().expect("typed header"));
+        carrier.insts.extend(
+            header_pointer_derivations
+                .iter()
+                .map(|derivation| derivation.inst.clone()),
+        );
+        let mut header_rename = rename.clone();
+        for derivation in &header_pointer_derivations {
+            header_rename.insert(derivation.original.clone(), derivation.header.clone());
+            for dependency in &derivation.scalar_dependencies {
+                let slot = value_slot_by_name
+                    .get(dependency.as_str())
+                    .expect("dynamic pointer scalar has a value slot");
+                header_rename.insert(dependency.clone(), slot.current.clone());
+            }
+        }
+        carrier.rename(&header_rename);
+    }
+    out.push(header);
     out.push(synthetic_block(
         TEST.to_string(),
         vec![
@@ -478,20 +806,27 @@ pub(in crate::native) fn materialize_construct_tree_roles(
         .iter()
         .map(|_| Vec::with_capacity(blocks.len()))
         .collect::<Vec<_>>();
+    let mut return_update_incoming = return_ty.as_ref().map(|_| Vec::with_capacity(blocks.len()));
     for (case_index, original) in blocks.iter().enumerate() {
         let mut case = original.clone();
         let carrier = std::sync::Arc::make_mut(case.typed.as_mut().expect("checked above"));
         carrier.rename(&rename);
+        carrier.insts.retain(|inst| {
+            !inst.result.as_ref().is_some_and(|result| {
+                function_variables.contains(result)
+                    || dominating_pointer_derivations.contains(result)
+            })
+        });
         // Most cross-case values are irrelevant to any one case. Building the full value-slot map
         // for every block made this bounded transform allocate O(cases * slots) cloned names and
         // types before it touched a single operand. Restrict the substitution map to actual uses in
         // this carrier; the deep typed substitution below remains the sole mutation primitive.
-        let mut used_names = carrier
-            .insts
-            .iter()
-            .filter(|inst| !inst.is_phi())
-            .flat_map(|inst| inst.uses.iter().cloned())
-            .collect::<HashSet<_>>();
+        let mut used_names = HashSet::new();
+        for inst in carrier.insts.iter().filter(|inst| !inst.is_phi()) {
+            inst.visit_uses(|name| {
+                used_names.insert(name.to_string());
+            });
+        }
         used_names.extend(terminator_value_uses(&carrier.terminator));
         let mut substitutions = HashMap::new();
         for name in used_names {
@@ -509,8 +844,23 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                 },
             );
         }
+        for derivation in &header_pointer_derivations {
+            if derivation.owner != case_index {
+                substitutions.insert(
+                    derivation.original.clone(),
+                    TypedValue {
+                        ty: LlType::Ptr(0),
+                        value: LlValue::Local(derivation.header.clone()),
+                    },
+                );
+            }
+        }
         carrier.substitute_values(&substitutions);
         carrier.insts.retain(|inst| !inst.is_phi());
+        let case_return = match &carrier.ret {
+            tir::RetEmit::Value(value) => Some(value.value.clone()),
+            tir::RetEmit::Void | tir::RetEmit::FromText => None,
+        };
         let targets = &successors[case_index];
         let join = format!("{PREFIX}casejoin.{case_index}");
         let mut route_tails = Vec::with_capacity(targets.len());
@@ -626,6 +976,12 @@ pub(in crate::native) fn materialize_construct_tree_roles(
         for (incoming, value) in value_update_incoming.iter_mut().zip(case_value_updates) {
             incoming.push((value, join.clone()));
         }
+        if let Some(incoming) = return_update_incoming.as_mut() {
+            incoming.push((
+                case_return.unwrap_or_else(|| LlValue::Local(RETURN_VALUE.to_string())),
+                join,
+            ));
+        }
     }
 
     out.push(passthrough(INVALID, MERGE));
@@ -666,6 +1022,19 @@ pub(in crate::native) fn materialize_construct_tree_roles(
                 .collect(),
         ));
     }
+    if let Some(incoming) = return_update_incoming {
+        merge_phis.push((
+            NEXT_RETURN_VALUE.to_string(),
+            return_ty.clone().expect("return updates require a type"),
+            incoming
+                .into_iter()
+                .chain(std::iter::once((
+                    LlValue::Local(RETURN_VALUE.to_string()),
+                    INVALID.to_string(),
+                )))
+                .collect(),
+        ));
+    }
     out.push(carrier_with_phis(
         MERGE,
         CONTINUE,
@@ -673,9 +1042,16 @@ pub(in crate::native) fn materialize_construct_tree_roles(
         BlockRole::LMerge,
     )?);
     out.push(passthrough(CONTINUE, HEADER));
+    let exit = if let Some(return_ty) = &return_ty {
+        let return_ty = crate::native::render::render_type(return_ty)
+            .ok_or_else(|| "construct-tree:unrenderable-return-type".to_string())?;
+        format!("ret {return_ty} {RETURN_VALUE}")
+    } else {
+        "ret void".to_string()
+    };
     out.push(synthetic_block(
         EXIT.to_string(),
-        vec!["ret void".to_string()],
+        vec![exit],
         BlockRole::Normal,
     ));
 
@@ -702,7 +1078,7 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             .iter()
             .filter_map(|block| block.typed.as_ref())
             .flat_map(|block| &block.insts)
-            .filter_map(|inst| inst.phi_incoming.as_ref())
+            .filter_map(|inst| inst.phi_incoming().as_ref())
             .map(|(_, incoming)| incoming.len())
             .sum::<usize>();
         eprintln!(
@@ -712,21 +1088,27 @@ pub(in crate::native) fn materialize_construct_tree_roles(
             value_slots.len()
         );
     }
-    if super::super::structured_plan(&out).is_none() {
-        let reason =
-            super::super::structured_reject_reason(&out).unwrap_or_else(|| "unknown".to_string());
+    if finalized_construct_tree_plan(&out).is_none() {
+        let reason = super::super::construct_tree_reject_reason(&out)
+            .unwrap_or_else(|| "unknown".to_string());
         return Err(format!("construct-tree:role-plan-reject reason={reason}"));
     }
     Ok(out)
 }
 
-/// Materialize the bounded construct tree and return the ordinary planner's finalized result. Kept as
-/// the direct R1 proof API; production wiring can consume the returned maps without re-planning.
+fn finalized_construct_tree_plan(blocks: &[BodyBlock]) -> Option<super::super::StructuredPlan> {
+    super::super::structured_plan(blocks)
+        .or_else(|| super::super::structured_plan_construct_tree(blocks))
+}
+
+/// Materialize the bounded construct tree and return its finalized ownership-aware planner result.
+/// Kept as the direct R1 proof API; production wiring can consume the returned maps without
+/// re-planning.
 pub(in crate::native) fn renest_construct_tree(
     blocks: &[BodyBlock],
     plan: &ConstructTreePlan,
 ) -> Result<super::super::StructuredPlan, String> {
     let out = materialize_construct_tree_roles(blocks, plan)?;
-    super::super::structured_plan(&out)
+    finalized_construct_tree_plan(&out)
         .ok_or_else(|| "construct-tree:role-plan-nondeterministic".to_string())
 }

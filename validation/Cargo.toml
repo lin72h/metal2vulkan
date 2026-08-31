@@ -57,6 +57,10 @@ name = "corpus-index"
 path = "src/bin/corpus-index.rs"
 
 [[bin]]
+name = "corpus-normalize"
+path = "src/bin/corpus-normalize.rs"
+
+[[bin]]
 name = "corpus-next"
 path = "src/bin/corpus-next.rs"
 

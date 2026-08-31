@@ -1,493 +1,43 @@
-//! SPIR-V rewrite entry points: each applies one legalization/portability rewrite from a sibling
-//! pass module (`psb`, `phi_index`, `cfg`, `relooper`, `constfold`, …) to an in-flight [`Module`].
-//! Callers (the failure-triggered retry tiers in `lib.rs`) adopt a result only if it independently
-//! validates, so every rewrite here is floor-safe by construction. Also holds the remaining
-//! structural screens (`has_*`); public byte compatibility wrappers live at the `native` facade.
+//! Owned SPIR-V construction operations. These apply structural lowering from sibling modules to
+//! an in-flight [`Module`] and check invariants while types, definitions, and CFG ownership remain
+//! directly inspectable. Public byte compatibility wrappers live at the `native` facade.
 
 use super::*;
 
-/// Whether `spv` contains the local selection emitted to guard a raw logical-buffer write whose
-/// source byte offset has a dynamic term wider than the u32 address model.  The guard's true arm
-/// performs the original write and its false arm falls through to the selection merge, preserving
-/// Metal's robust no-write behavior when the complete i64 offset cannot be represented.
-///
-/// This deliberately identifies the emitted control-flow *shape*, not a source symbol or private capture
-/// case.  A guard inserted into a source loop header moves that header's source terminator into the
-/// guard continuation, which can expose a CFG-only validator error.  Callers can then reuse the
-/// ordinary relooper on precisely that already-guarded graph; the resulting bytes are the same
-/// candidate production's first CFG retry would otherwise adopt.
-pub(crate) fn module_has_wide_raw_store_guard(module: &Module) -> bool {
-    let defs: HashMap<Word, &Instruction> = module
+#[cfg(test)]
+thread_local! {
+    static INTERFACE_ADDRESS_CONSTRUCTION_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_address_construction_counts() {
+    INTERFACE_ADDRESS_CONSTRUCTION_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn address_construction_count() -> usize {
+    INTERFACE_ADDRESS_CONSTRUCTION_COUNT.with(std::cell::Cell::get)
+}
+
+fn defined_result_ids(module: &Module) -> HashSet<Word> {
+    module
         .all_inst_iter()
-        .filter_map(|inst| inst.result_id.map(|id| (id, inst)))
-        .collect();
-
-    let is_u64_constant = |id: Word| {
-        let Some(inst) = defs.get(&id) else {
-            return false;
-        };
-        if inst.class.opcode != Op::Constant {
-            return false;
-        }
-        let Some(ty) = inst.result_type else {
-            return false;
-        };
-        let Some(type_inst) = defs.get(&ty) else {
-            return false;
-        };
-        type_inst.class.opcode == Op::TypeInt
-            && type_inst.operands.first() == Some(&Operand::LiteralBit32(64))
-            && type_inst.operands.get(1) == Some(&Operand::LiteralBit32(0))
-    };
-
-    for function in &module.functions {
-        let blocks: HashMap<Word, &crate::spirv_module::Block> = function
-            .blocks
-            .iter()
-            .filter_map(|block| {
-                block
-                    .label
-                    .as_ref()
-                    .and_then(|label| label.result_id)
-                    .map(|id| (id, block))
-            })
-            .collect();
-        for block in &function.blocks {
-            for (index, branch) in block.instructions.iter().enumerate() {
-                if branch.class.opcode != Op::BranchConditional || index == 0 {
-                    continue;
-                }
-                let (
-                    Some(Operand::IdRef(condition)),
-                    Some(Operand::IdRef(write_label)),
-                    Some(Operand::IdRef(false_label)),
-                ) = (
-                    branch.operands.first(),
-                    branch.operands.get(1),
-                    branch.operands.get(2),
-                )
-                else {
-                    continue;
-                };
-                let merge = &block.instructions[index - 1];
-                if merge.class.opcode != Op::SelectionMerge {
-                    continue;
-                }
-                let Some(Operand::IdRef(merge_label)) = merge.operands.first() else {
-                    continue;
-                };
-                if false_label != merge_label {
-                    continue;
-                }
-                let Some(compare) = defs.get(condition) else {
-                    continue;
-                };
-                if compare.class.opcode != Op::ULessThanEqual
-                    || !matches!(compare.operands.get(1), Some(Operand::IdRef(max)) if is_u64_constant(*max))
-                {
-                    continue;
-                }
-                let Some(write_block) = blocks.get(write_label) else {
-                    continue;
-                };
-                let writes_then_merges = write_block
-                    .instructions
-                    .iter()
-                    .any(|inst| is_spirv_memory_write(inst.class.opcode))
-                    && write_block.instructions.last().is_some_and(|terminator| {
-                        terminator.class.opcode == Op::Branch
-                            && terminator.operands.first() == Some(&Operand::IdRef(*merge_label))
-                    });
-                if writes_then_merges {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+        .filter_map(|inst| inst.result_id)
+        .collect()
 }
 
-/// `OpStore` plus the atomic operations that can modify their first pointer operand.  The native
-/// raw subword-store lowering is an atomic AND/OR read-modify-write, so the robust wide-offset
-/// guard must recognize it as a write too.
-fn is_spirv_memory_write(op: Op) -> bool {
-    matches!(
-        op,
-        Op::Store
-            | Op::AtomicStore
-            | Op::AtomicExchange
-            | Op::AtomicCompareExchange
-            | Op::AtomicCompareExchangeWeak
-            | Op::AtomicIIncrement
-            | Op::AtomicIDecrement
-            | Op::AtomicIAdd
-            | Op::AtomicISub
-            | Op::AtomicSMin
-            | Op::AtomicUMin
-            | Op::AtomicSMax
-            | Op::AtomicUMax
-            | Op::AtomicAnd
-            | Op::AtomicOr
-            | Op::AtomicXor
-            | Op::AtomicFAddEXT
-            | Op::AtomicFMinEXT
-            | Op::AtomicFMaxEXT
-    )
-}
-
-/// Drop byte-addressed Workgroup padding clears that the native emitter can produce from AIR
-/// `llvm.memset.p3` over struct tail padding.
-///
-/// SPIR-V Logical addressing cannot express `OpPtrAccessChain %uchar*` from a `%struct*` base. When
-/// the byte offset does not match any `Offset`-decorated struct member and every use is a zero
-/// `OpStore`, the store only clears padding. Workgroup memory has already been zero-filled by the
-/// harness prologue, and no typed load can observe the padding byte, so removing the invalid chain
-/// and its zero stores is value-preserving.
-pub(crate) fn drop_workgroup_struct_padding_byte_zero_stores_module(module: &mut Module) -> bool {
-    use spirv::Decoration;
-
-    let mut type_defs: HashMap<Word, &Instruction> = HashMap::new();
-    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
-    let mut result_type: HashMap<Word, Word> = HashMap::new();
-    let mut constants: HashMap<Word, u64> = HashMap::new();
-    let mut member_offsets: HashMap<Word, HashMap<u32, u32>> = HashMap::new();
-
-    for inst in module.all_inst_iter() {
-        if let Some(id) = inst.result_id {
-            if let Some(ty) = inst.result_type {
-                result_type.insert(id, ty);
-            }
-            match inst.class.opcode {
-                Op::TypeInt | Op::TypePointer | Op::TypeStruct => {
-                    type_defs.insert(id, inst);
-                }
-                Op::Constant => {
-                    let value = match inst.operands.first() {
-                        Some(Operand::LiteralBit32(value)) => u64::from(*value),
-                        Some(Operand::LiteralBit64(value)) => *value,
-                        _ => continue,
-                    };
-                    constants.insert(id, value);
-                }
-                Op::ConstantNull => {
-                    constants.insert(id, 0);
-                }
-                _ => {}
-            }
-        }
-        if inst.class.opcode == Op::TypePointer {
-            if let (Some(id), Some(Operand::StorageClass(sc)), Some(Operand::IdRef(pointee))) =
-                (inst.result_id, inst.operands.first(), inst.operands.get(1))
-            {
-                ptr_info.insert(id, (*sc, *pointee));
-            }
-        }
-        if inst.class.opcode == Op::MemberDecorate {
-            let (
-                Some(Operand::IdRef(struct_ty)),
-                Some(Operand::LiteralBit32(member)),
-                Some(Operand::Decoration(Decoration::Offset)),
-                Some(Operand::LiteralBit32(offset)),
-            ) = (
-                inst.operands.first(),
-                inst.operands.get(1),
-                inst.operands.get(2),
-                inst.operands.get(3),
-            )
-            else {
-                continue;
-            };
-            member_offsets
-                .entry(*struct_ty)
-                .or_default()
-                .insert(*member, *offset);
-        }
-    }
-
-    let is_uchar = |ty: Word| -> bool {
-        matches!(
-            type_defs.get(&ty).map(|inst| inst.operands.as_slice()),
-            Some([Operand::LiteralBit32(8), Operand::LiteralBit32(0)])
-        )
-    };
-    fn align_to(value: u32, align: u32) -> u32 {
-        if align <= 1 {
-            value
-        } else {
-            value.div_ceil(align) * align
-        }
-    }
-    fn type_size_align(
-        type_defs: &HashMap<Word, &Instruction>,
-        constants: &HashMap<Word, u64>,
-        ty: Word,
-    ) -> Option<(u32, u32)> {
-        let def = type_defs.get(&ty)?;
-        match def.class.opcode {
-            Op::TypeInt | Op::TypeFloat => {
-                let Some(Operand::LiteralBit32(width)) = def.operands.first() else {
-                    return None;
-                };
-                let bytes = width.div_ceil(8).max(1);
-                Some((bytes, bytes))
-            }
-            Op::TypeVector => {
-                let (Some(Operand::IdRef(component)), Some(Operand::LiteralBit32(count))) =
-                    (def.operands.first(), def.operands.get(1))
-                else {
-                    return None;
-                };
-                let (size, align) = type_size_align(type_defs, constants, *component)?;
-                Some((size.checked_mul(*count)?, align))
-            }
-            Op::TypeArray => {
-                let (Some(Operand::IdRef(element)), Some(Operand::IdRef(length))) =
-                    (def.operands.first(), def.operands.get(1))
-                else {
-                    return None;
-                };
-                let (size, align) = type_size_align(type_defs, constants, *element)?;
-                let count = u32::try_from(*constants.get(length)?).ok()?;
-                Some((align_to(size, align).checked_mul(count)?, align))
-            }
-            Op::TypeStruct => {
-                let mut offset = 0u32;
-                let mut max_align = 1u32;
-                for operand in &def.operands {
-                    let Operand::IdRef(member_ty) = operand else {
-                        return None;
-                    };
-                    let (member_size, member_align) =
-                        type_size_align(type_defs, constants, *member_ty)?;
-                    max_align = max_align.max(member_align);
-                    offset = align_to(offset, member_align);
-                    offset = offset.checked_add(member_size)?;
-                }
-                Some((align_to(offset, max_align), max_align))
-            }
-            _ => None,
-        }
-    }
-    let inferred_struct_offsets = |ty: Word| -> Option<HashSet<u32>> {
-        let def = type_defs.get(&ty)?;
-        if def.class.opcode != Op::TypeStruct {
-            return None;
-        }
-        let mut offsets = HashSet::new();
-        let mut offset = 0u32;
-        for operand in &def.operands {
-            let Operand::IdRef(member_ty) = operand else {
-                return None;
-            };
-            let (member_size, member_align) = type_size_align(&type_defs, &constants, *member_ty)?;
-            offset = align_to(offset, member_align);
-            offsets.insert(offset);
-            offset = offset.checked_add(member_size)?;
-        }
-        Some(offsets)
-    };
-    let is_struct_padding_offset = |ty: Word, offset: u32| -> bool {
-        let Some(def) = type_defs.get(&ty) else {
-            return false;
-        };
-        if def.class.opcode != Op::TypeStruct {
-            return false;
-        }
-        if let Some(offsets) = member_offsets.get(&ty) {
-            return !offsets
-                .values()
-                .any(|member_offset| *member_offset == offset);
-        };
-        inferred_struct_offsets(ty).is_some_and(|offsets| !offsets.contains(&offset))
+fn drop_debug_targets(module: &mut Module, targets: &HashSet<Word>) -> bool {
+    let targets_removed_id = |inst: &Instruction| -> bool {
+        matches!(inst.operands.first(), Some(Operand::IdRef(id)) if targets.contains(id))
     };
 
-    let mut chain_base: HashMap<Word, (usize, usize, usize, Word, u32)> = HashMap::new();
-    for (fi, function) in module.functions.iter().enumerate() {
-        for (bi, block) in function.blocks.iter().enumerate() {
-            for (ii, inst) in block.instructions.iter().enumerate() {
-                if inst.class.opcode != Op::PtrAccessChain || inst.operands.len() != 2 {
-                    continue;
-                }
-                let (Some(chain), Some(result_ptr_ty)) = (inst.result_id, inst.result_type) else {
-                    continue;
-                };
-                let Some(&(StorageClass::Workgroup, result_pointee)) = ptr_info.get(&result_ptr_ty)
-                else {
-                    continue;
-                };
-                if !is_uchar(result_pointee) {
-                    continue;
-                }
-                let (Some(Operand::IdRef(base)), Some(Operand::IdRef(offset_id))) =
-                    (inst.operands.first(), inst.operands.get(1))
-                else {
-                    continue;
-                };
-                let Some(offset) = constants
-                    .get(offset_id)
-                    .and_then(|value| u32::try_from(*value).ok())
-                else {
-                    continue;
-                };
-                let Some(base_ptr_ty) = result_type.get(base).copied() else {
-                    continue;
-                };
-                let Some(&(StorageClass::Workgroup, base_pointee)) = ptr_info.get(&base_ptr_ty)
-                else {
-                    continue;
-                };
-                if is_struct_padding_offset(base_pointee, offset) {
-                    chain_base.insert(chain, (fi, bi, ii, base_pointee, offset));
-                }
-            }
-        }
-    }
-    let mut changed_candidates = true;
-    while changed_candidates {
-        changed_candidates = false;
-        for (fi, function) in module.functions.iter().enumerate() {
-            for (bi, block) in function.blocks.iter().enumerate() {
-                for (ii, inst) in block.instructions.iter().enumerate() {
-                    if inst.class.opcode != Op::PtrAccessChain || inst.operands.len() != 2 {
-                        continue;
-                    }
-                    let (Some(chain), Some(result_ptr_ty)) = (inst.result_id, inst.result_type)
-                    else {
-                        continue;
-                    };
-                    if chain_base.contains_key(&chain) {
-                        continue;
-                    }
-                    let Some(&(StorageClass::Workgroup, result_pointee)) =
-                        ptr_info.get(&result_ptr_ty)
-                    else {
-                        continue;
-                    };
-                    if !is_uchar(result_pointee) {
-                        continue;
-                    }
-                    let (Some(Operand::IdRef(base)), Some(Operand::IdRef(offset_id))) =
-                        (inst.operands.first(), inst.operands.get(1))
-                    else {
-                        continue;
-                    };
-                    let Some((_, _, _, root_struct, base_offset)) = chain_base.get(base).copied()
-                    else {
-                        continue;
-                    };
-                    let Some(offset) = constants
-                        .get(offset_id)
-                        .and_then(|value| u32::try_from(*value).ok())
-                        .and_then(|offset| base_offset.checked_add(offset))
-                    else {
-                        continue;
-                    };
-                    if is_struct_padding_offset(root_struct, offset) {
-                        chain_base.insert(chain, (fi, bi, ii, root_struct, offset));
-                        changed_candidates = true;
-                    }
-                }
-            }
-        }
-    }
-    if chain_base.is_empty() {
-        return false;
-    }
-
-    let mut zero_values: HashSet<Word> = constants
-        .iter()
-        .filter_map(|(id, value)| (*value == 0).then_some(*id))
-        .collect();
-    let mut changed_zero = true;
-    while changed_zero {
-        changed_zero = false;
-        for inst in module.all_inst_iter() {
-            let Some(id) = inst.result_id else {
-                continue;
-            };
-            if zero_values.contains(&id) {
-                continue;
-            }
-            let zero_operand0 = inst.operands.first().is_some_and(
-                |operand| matches!(operand, Operand::IdRef(value) if zero_values.contains(value)),
-            );
-            let zero = match inst.class.opcode {
-                Op::CopyObject | Op::UConvert | Op::SConvert | Op::Bitcast => zero_operand0,
-                Op::ShiftRightLogical | Op::ShiftRightArithmetic | Op::ShiftLeftLogical => {
-                    zero_operand0
-                }
-                _ => false,
-            };
-            if zero {
-                zero_values.insert(id);
-                changed_zero = true;
-            }
-        }
-    }
-
-    let mut store_sites: HashSet<(usize, usize, usize)> = HashSet::new();
-    let mut disqualified: HashSet<Word> = HashSet::new();
-    for (fi, function) in module.functions.iter().enumerate() {
-        for (bi, block) in function.blocks.iter().enumerate() {
-            for (ii, inst) in block.instructions.iter().enumerate() {
-                for (oi, operand) in inst.operands.iter().enumerate() {
-                    let Operand::IdRef(id) = operand else {
-                        continue;
-                    };
-                    if !chain_base.contains_key(id) {
-                        continue;
-                    }
-                    if inst.class.opcode == Op::PtrAccessChain
-                        && oi == 0
-                        && inst
-                            .result_id
-                            .is_some_and(|result| chain_base.contains_key(&result))
-                    {
-                        continue;
-                    }
-                    if inst.class.opcode == Op::Store
-                        && oi == 0
-                        && inst.operands.get(1).and_then(|operand| match operand {
-                            Operand::IdRef(value) => zero_values.contains(value).then_some(0),
-                            _ => None,
-                        }) == Some(0)
-                    {
-                        store_sites.insert((fi, bi, ii));
-                    } else {
-                        disqualified.insert(*id);
-                    }
-                }
-            }
-        }
-    }
-    chain_base.retain(|chain, _| !disqualified.contains(chain));
-    if chain_base.is_empty() || store_sites.is_empty() {
-        return false;
-    }
-
-    let chain_sites: HashSet<(usize, usize, usize)> = chain_base
-        .into_values()
-        .map(|(fi, bi, ii, _, _)| (fi, bi, ii))
-        .collect();
-    let mut changed = false;
-    for (fi, function) in module.functions.iter_mut().enumerate() {
-        for (bi, block) in function.blocks.iter_mut().enumerate() {
-            let old = std::mem::take(&mut block.instructions);
-            block.instructions = old
-                .into_iter()
-                .enumerate()
-                .filter_map(|(ii, inst)| {
-                    if chain_sites.contains(&(fi, bi, ii)) || store_sites.contains(&(fi, bi, ii)) {
-                        changed = true;
-                        None
-                    } else {
-                        Some(inst)
-                    }
-                })
-                .collect();
-        }
-    }
-    changed
+    let before_names = module.debug_names.len();
+    let before_annotations = module.annotations.len();
+    module.debug_names.retain(|inst| !targets_removed_id(inst));
+    module.annotations.retain(|inst| !targets_removed_id(inst));
+    module.debug_names.len() != before_names || module.annotations.len() != before_annotations
 }
 
 /// Remove debug/decorate records whose target id was deleted by a prior module rewrite.
@@ -496,837 +46,1529 @@ pub(crate) fn drop_workgroup_struct_padding_byte_zero_stores_module(module: &mut
 /// CFG rebuild may preserve their `OpName` records. `OpName` is non-semantic, but SPIR-V still
 /// requires its target id to be defined. This cleanup never touches executable instructions or
 /// interface declarations; it only drops annotations/debug names that already point at nothing.
-pub(crate) fn drop_dangling_debug_targets_module(module: &mut Module) -> bool {
-    let defined: HashSet<Word> = module
-        .all_inst_iter()
-        .filter_map(|inst| inst.result_id)
+#[cfg(test)]
+fn drop_dangling_debug_targets_module(module: &mut Module) -> bool {
+    let defined = defined_result_ids(module);
+    let dangling = module
+        .debug_names
+        .iter()
+        .chain(&module.annotations)
+        .filter_map(|inst| match inst.operands.first() {
+            Some(Operand::IdRef(id)) if !defined.contains(id) => Some(*id),
+            _ => None,
+        })
         .collect();
-    let target_is_dangling = |inst: &Instruction| -> bool {
-        matches!(inst.operands.first(), Some(Operand::IdRef(id)) if !defined.contains(id))
-    };
-
-    let before_names = module.debug_names.len();
-    let before_annotations = module.annotations.len();
-    module.debug_names.retain(|inst| !target_is_dangling(inst));
-    module.annotations.retain(|inst| !target_is_dangling(inst));
-    module.debug_names.len() != before_names || module.annotations.len() != before_annotations
+    drop_debug_targets(module, &dangling)
 }
 
-/// Collapse every one-incoming `OpPhi` to its sole value and substitute its uses within the owning
-/// function. CFG edge splitting legitimately creates this forwarding form; keeping it until
-/// validation is both redundant and hazardous when an earlier interface rewrite refined the value
-/// type but left the phi's stale carrier type behind. The rewrite is an SSA identity, bounded to one
-/// small substitution map per function, and does not clone consumer subgraphs.
-pub(crate) fn collapse_single_incoming_phis_module(module: &mut Module) -> bool {
-    let mut changed = false;
-    for function in &mut module.functions {
-        changed |= constfold::collapse_trivial_phis(function);
-    }
+/// Complete an ID-deleting rewrite as one transaction: executable changes and the non-semantic
+/// records targeting their removed results are committed together. Callers pass the exact change
+/// verdict from the owning structural rewrite, so this never becomes a detached module sweep.
+fn finish_id_deleting_rewrite(
+    module: &mut Module,
+    defined_before: HashSet<Word>,
+    changed: bool,
+) -> bool {
     if changed {
-        drop_dangling_debug_targets_module(module);
+        let defined_after = defined_result_ids(module);
+        let removed = defined_before.difference(&defined_after).copied().collect();
+        drop_debug_targets(module, &removed);
     }
     changed
 }
 
-/// Replace already-invalid packed `i32` loads through a Private 16-bit vector word view with a
-/// direct vector load plus a two-lane bitcast. Returns whether any load was legalized.
-pub(crate) fn rewrite_private_vector_word_loads_module(module: &mut Module) -> bool {
-    let changed = private_vector_word::rewrite_private_vector_word_loads(module);
-    if changed {
-        drop_dangling_debug_targets_module(module);
-    }
-    changed
+/// Close the memory-lowering transaction for packed `i32` loads whose substituted Private vector
+/// backing cannot retain the helper's opaque-pointer word spelling under Logical addressing.
+pub(crate) fn close_private_vector_word_views_module(module: &mut Module) -> bool {
+    let defined_before = defined_result_ids(module);
+    let changed = private_vector_word::close_private_vector_word_views(module);
+    finish_id_deleting_rewrite(module, defined_before, changed)
 }
 
-/// Retype validator-invalid `OpSampledImage` instructions to the concrete image operand's sampled
-/// type after interface refinement.
-pub(crate) fn repair_sampled_image_result_types_module(module: &mut Module) -> bool {
-    sampled_image_type::repair_sampled_image_result_types(module)
-}
-
-/// Apply the W1 PhysicalStorageBuffer64 lowering in place. Errors if no cross-binding pointer-merge
-/// sub-graph was rewritten. The caller (the failure-triggered retry) adopts the result ONLY if it
-/// independently validates, so this is floor-safe by construction.
-pub(crate) fn rewrite_cross_binding_pointer_merges_module(
+/// Complete a late cross-binding pointer `OpPhi` in the address domain. Select-only closures are
+/// deliberately excluded here: their general address-domain fallback belongs at the final owned
+/// module boundary, after memory legalization has exposed the complete pointer graph.
+pub(crate) fn construct_interface_cross_binding_pointer_phis_module(
     module: &mut Module,
     layout: crate::reflect::DescriptorLayout,
-) -> Result<(), String> {
-    if !psb::rewrite_cross_binding_pointer_merges_with_layout(module, layout) {
-        return Err("native emitter: no cross-binding pointer merge to rewrite".to_string());
+) -> Option<spirv::Word> {
+    let address_table = psb::construct_cross_binding_pointer_phis_with_layout(module, layout);
+    if address_table.is_some() {
+        add_native_module_capabilities(module);
     }
-    add_native_module_capabilities(module);
-    Ok(())
+    address_table
 }
 
-/// Report whether `module` has a lowerable cross-binding pointer closure containing an `OpPhi`.
-/// Callers use this cheap structural screen after the exact spirv-val diagnostic to decide whether
-/// the phi could be the failure that warrants the PhysicalStorageBuffer64 primary candidate.
-pub(crate) fn has_cross_binding_pointer_phi_module(module: &Module) -> bool {
-    psb::has_cross_binding_pointer_phi(module)
-}
-
-/// Apply the PhysicalStorageBuffer64 lowering in place only when the cross-binding closure contains
-/// an `OpPhi`. Ordinary cross-binding selects stay available to the Logical value-domain lowering;
-/// a phi with post-merge dynamic accesses needs the address-table representation instead of
-/// replaying values on predecessor edges. The caller still validates before adopting the module.
-pub(crate) fn rewrite_cross_binding_pointer_phis_module(
+/// Complete interface construction for any cross-binding StorageBuffer pointer closure left after
+/// value-domain replay. This is the address-domain representation for closures with opaque
+/// consumers or post-merge access patterns that cannot be represented as selected loaded values.
+pub(crate) fn construct_interface_cross_binding_pointer_merges_module(
     module: &mut Module,
     layout: crate::reflect::DescriptorLayout,
-) -> Result<(), String> {
-    if !psb::rewrite_cross_binding_pointer_phis_with_layout(module, layout) {
-        return Err("native emitter: no cross-binding pointer phi to rewrite".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Lower the cross-binding pointer-merge sub-graph in place INTO THE VALUE DOMAIN (plain Logical
-/// `StorageBuffer`), staying off PhysicalStorageBuffer64. Instead of selecting among POINTERS then
-/// loading once, it loads from every candidate buffer and selects among the LOADED VALUES —
-/// byte-exact (the selected value is the exact load Apple performs; discarded over-reads do not
-/// fault), and MoltenVK-runnable (no buffer-device-address, which blocks compute-pipeline creation).
-/// Errors if no cross-binding pointer merge was value-lowered. The caller (the failure-triggered
-/// retry) adopts the result ONLY if it independently validates, so this is floor-safe by
-/// construction; it is preferred over the PSB lowering when both validate.
-pub(crate) fn rewrite_cross_binding_pointer_merges_to_values_module(
-    module: &mut Module,
-) -> Result<(), String> {
-    if !psb_value_select::rewrite_cross_binding_pointer_merges_to_values(module) {
-        return Err("native emitter: no cross-binding pointer merge to value-lower".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Lower an opaque image `OpSelect` through pure explicit-LOD sampling into ordinary value selects,
-/// in place. Vulkan cannot select images directly without descriptor indexing, while cloning a pure
-/// sample for each image leaf and selecting the sampled result stays in portable Logical SPIR-V. The
-/// pass declines anything except an image-only select tree whose complete consumer closure is
-/// explicit-LOD sampling.
-pub(crate) fn rewrite_opaque_image_selects_module(module: &mut Module) -> Result<(), String> {
-    if !opaque_image_select::rewrite_opaque_image_selects(module) {
-        return Err("native emitter: no lowerable opaque image select".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Remodel every Workgroup variable accessed only as the float-as-int atomic idiom (the
-/// `OpBitcast %_ptr_Workgroup_<int> %chain` → `OpAtomicSMin/SMax` pattern that spirv-val rejects as an
-/// illegal logical-pointer bitcast) so its float leaves become the int the atomics use. Errors if no
-/// variable was remodeled. Byte-safe by construction (Workgroup scratch, float↔int32 bit-identical,
-/// layout-preserving clone, strict all-uses gate). The caller adopts the result ONLY if it
-/// independently validates, so this is floor-safe by construction.
-pub(crate) fn rewrite_workgroup_atomic_floats_module(module: &mut Module) -> Result<(), String> {
-    if !wg_atomic::rewrite_workgroup_atomic_floats(module) {
-        return Err("native emitter: no workgroup float-as-int atomic to remodel".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Retype every Function scalar-integer variable accessed ONLY as the sub-word packed-scalar idiom
-/// (e.g. a `uint` alloca written as two `half` lanes then read whole) into a `<N x E>` vector, in
-/// place. This drops the illegal scalar-indexing access chains' invalidity and value-bitcasts its
-/// whole-word loads/stores. Errors if no variable was remodeled. Byte-safe by construction
-/// (Function scratch, little-endian-identical vector layout). The caller adopts the result ONLY if
-/// it independently validates, so this is floor-safe by construction.
-pub(crate) fn rewrite_subword_packed_scalars_module(module: &mut Module) -> Result<(), String> {
-    if !subword_pack::rewrite_subword_packed_scalars(module) {
-        return Err("native emitter: no sub-word packed scalar to remodel".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Apply the M4 phi-the-index retry to an already-loaded module and re-finalize it in place. Errors
-/// if no eligible illegal logical-pointer `OpPhi` was rewritten. The caller adopts the result ONLY
-/// if it independently validates, so this is floor-safe by construction.
-pub(crate) fn rewrite_logical_pointer_phis_retry_module(module: &mut Module) -> Result<(), String> {
-    if !phi_index::rewrite_logical_pointer_phis(module) {
-        return Err("native emitter: no logical pointer phi to rewrite".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Apply the M4 phi-the-index legalization to an in-flight module (the PRIMARY emit tail), in place.
-/// Rewrites only ILLEGAL logical-pointer phis — a non-`StorageBuffer`/`Workgroup` (Private/Function/
-/// UniformConstant) pointer `OpPhi`, which is always spirv-val-invalid — so it can only move an
-/// already-invalid module toward valid, never touch a validating one (floor-safe by construction).
-/// Same mechanism the retry tier ([`rewrite_logical_pointer_phis_retry_module`]) applies, hoisted
-/// onto the no-retry path so these functions' PRIMARY emit validates instead of shipping via retry
-/// rescue. Returns true if any phi was rewritten. The caller runs `canonicalize_ids` afterward.
-pub(crate) fn rewrite_logical_pointer_phis_module(module: &mut Module) -> bool {
-    phi_index::rewrite_logical_pointer_phis(module)
-}
-
-/// Lower an invalid direct-load `OpSelect` whose opaque-pointer arms cross logical storage classes
-/// into per-arm loads followed by a value select. The structural pass refuses pointer escapes.
-pub(crate) fn rewrite_mixed_storage_pointer_select_loads_module(module: &mut Module) -> bool {
-    mixed_pointer_select::rewrite_mixed_storage_pointer_select_loads(module)
-}
-
-/// Legalize integer `OpPhi` result/incoming width mismatches in an in-flight module (the PRIMARY emit
-/// tail) by truncating a wide incoming to the phi's narrower integer result type. Only touches phis
-/// that are already spirv-val-INVALID (an integer phi whose operand type differs from its result
-/// type), so it can only move an already-invalid module toward valid — floor-safe by construction.
-/// See [`phi_index::rewrite_integer_width_phis`] for the mechanism. The caller runs `canonicalize_ids`
-/// afterward. Returns true if any operand was converted.
-pub(crate) fn rewrite_integer_width_phis_module(module: &mut Module) -> bool {
-    phi_index::rewrite_integer_width_phis(module)
-}
-
-/// Register-demote any value in an in-flight module (the PRIMARY emit tail) whose defining block no
-/// longer dominates a use — the loop-closed-SSA violation the `MultipleExits` funnel
-/// (`synth_multi_exit_merge`) leaves behind (spirv-val: *"ID X defined in block B does not dominate its
-/// use in block U"*). Spills the value to a function-scope `OpVariable` (stored after its def, loaded
-/// before each non-dominated use). Only touches modules that ALREADY carry such a violation (a valid
-/// module has every def dominating its uses), so it is floor-safe by construction. See
-/// [`cfg::demote_nondominating_values`]. The caller runs `canonicalize_ids` afterward. Returns true if
-/// any value was demoted.
-pub(crate) fn demote_nondominating_values_module(module: &mut Module) -> bool {
-    cfg::demote_nondominating_values(module)
-}
-
-/// Node-split a MULTI-ENTRY loop in an in-flight module (the PRIMARY emit tail) whose header is entered
-/// by forward edges from two different selections' arms — the irreducible shape `structured_plan`
-/// over-admits, spirv-val-INVALID (*"block X exits the selection headed by Y, but not via a structured
-/// exit"*; the mlx-steel `steel_attention` family). Duplicates the loop region for the inner arm's
-/// entry, routing the clone's exit to that selection's merge, so each loop is single-entry. Only fires
-/// on a loop with ≥2 forward header entries (a valid loop is single-entry), so it is floor-safe by
-/// construction. See [`cfg::split_multientry_loop_selection_exits`]. The caller runs `canonicalize_ids`
-/// afterward. Returns true if any loop was split.
-pub(crate) fn split_multientry_loop_selection_exits_module(module: &mut Module) -> bool {
-    cfg::split_multientry_loop_selection_exits(module)
-}
-
-/// Lower a cross-binding pointer `OpSelect`/`OpPhi` (pointers into DISTINCT buffer bindings, spirv-val-
-/// INVALID *"Variable pointers must point into the same structure"*) INTO THE VALUE DOMAIN in an
-/// in-flight module (the PRIMARY emit tail): load from every candidate buffer, select among the LOADED
-/// VALUES. This is the SAME portable value-domain form the `value_select` retry tier ships
-/// (`rewrite_cross_binding_pointer_merges_to_values_module`); running it on the primary path makes the
-/// direct emit valid instead of relying on retry-rescue. The caller runs `canonicalize_ids` afterward.
-/// Returns true if a merge was value-lowered.
-///
-/// GUARDED to `StorageBuffer`-pointer merges — the genuine "Variable pointers must point into the same
-/// structure" class the `value_select` retry rescues. A merge over LOGICAL (`Private`/`Function`/
-/// `Workgroup`) pointers is a DIFFERENT population: the unmodeled-device-buffer placeholder family
-/// (`emit_private_zero_pointer_value`, e.g. `01/a70fb990` `%_ptr_Private_float %86` dynamically indexed
-/// → the "reached non-composite" error), which the PRIMARY error routes to `fc_promote_psb` /
-/// pointer-typing retry, NOT `value_select`. Value-lowering such a Private merge does NOT resolve the
-/// module (the non-composite issue remains) and DERAILS that pointer-typing rescue (`a70fb990` regressed
-/// valid→FALLBACK), so it is excluded — mirroring production, where `value_select` never fires for a
-/// non-`CrossBindingPointerMerge` error class. Decides purely from IR pointer storage class, never a
-/// shader name.
-pub(crate) fn value_lower_cross_binding_pointer_merges_module(module: &mut Module) -> bool {
-    let defs = module
+) -> Option<spirv::Word> {
+    #[cfg(test)]
+    INTERFACE_ADDRESS_CONSTRUCTION_COUNT.with(|count| count.set(count.get() + 1));
+    // Address-domain construction is not a substitute for unrelated Logical-pointer legalization.
+    // Decline without mutation when a pointer bitcast or malformed memory operand remains; the
+    // owning memory phase must close those invariants before interface construction.
+    let pointer_types = module
         .types_global_values
         .iter()
-        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+        .filter(|instruction| instruction.class.opcode == Op::TypePointer)
+        .filter_map(|instruction| instruction.result_id)
+        .collect::<HashSet<_>>();
+    let value_types = module
+        .all_inst_iter()
+        .filter_map(|instruction| {
+            let result_type = instruction.result_type?;
+            pointer_types
+                .contains(&result_type)
+                .then_some((instruction.result_id?, result_type))
+        })
         .collect::<HashMap<_, _>>();
-    let has_storage_buffer_pointer_merge = module
+    let has_pointer_bitcast = module.all_inst_iter().any(|instruction| {
+        instruction.class.opcode == Op::Bitcast
+            && (instruction
+                .result_type
+                .is_some_and(|ty| pointer_types.contains(&ty))
+                || instruction.operands.first().is_some_and(|operand| {
+                    matches!(operand, Operand::IdRef(id) if value_types
+                        .get(id)
+                        .is_some_and(|ty| pointer_types.contains(ty)))
+                }))
+    });
+    let has_non_pointer_memory_operand = module.all_inst_iter().any(|instruction| {
+        if !matches!(instruction.class.opcode, Op::Load | Op::Store) {
+            return false;
+        }
+        let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
+            return true;
+        };
+        !value_types
+            .get(pointer)
+            .is_some_and(|ty| pointer_types.contains(ty))
+    });
+    if has_pointer_bitcast || has_non_pointer_memory_operand {
+        return None;
+    }
+    let address_table = psb::construct_cross_binding_pointer_merges_with_layout(module, layout);
+    if address_table.is_some() {
+        add_native_module_capabilities(module);
+    }
+    address_table
+}
+
+/// Complete interface construction for cross-binding StorageBuffer pointer closures whose complete
+/// consumer graph is value-replayable. This handles chained selects, loads, and ordinary stores in
+/// the Logical value domain after descriptor substitution has exposed every concrete root. Pointer
+/// phis whose post-merge indices cannot be replayed remain for the address-domain constructor.
+pub(crate) fn construct_interface_cross_binding_pointer_values_module(module: &mut Module) -> bool {
+    let changed = psb_value_select::rewrite_cross_binding_pointer_merges_to_values(module);
+    if changed {
+        add_native_module_capabilities(module);
+    }
+    changed
+}
+
+/// Construct portable value-domain sampling for every lowerable opaque image selection. This runs
+/// on the owned module before assembly; direct opaque-handle selection is never emitted as a
+/// candidate and no validator result gates the lowering.
+pub(crate) fn construct_opaque_image_selects_module(module: &mut Module) -> bool {
+    let changed = opaque_image_select::construct_opaque_image_selects(module);
+    if changed {
+        add_native_module_capabilities(module);
+    }
+    changed
+}
+
+/// Construct every Workgroup variable accessed only as the float-as-int atomic idiom (the
+/// `OpBitcast %_ptr_Workgroup_<int> %chain` → `OpAtomicSMin/SMax` pattern that spirv-val rejects as an
+/// illegal logical-pointer bitcast) so its float leaves become the int the atomics use. Byte-safe by
+/// construction (Workgroup scratch, float↔int32 bit-identical, layout-preserving clone, strict
+/// all-uses gate). Returns whether it constructed any variable.
+pub(crate) fn construct_workgroup_atomic_floats_module(module: &mut Module) -> bool {
+    let changed = wg_atomic::construct_workgroup_atomic_floats(module);
+    if changed {
+        add_native_module_capabilities(module);
+    }
+    changed
+}
+
+/// Close a pointer-table slot exposed by helper inlining after the emitter's primary BDA closure.
+///
+/// AIR represents a device pointer table as an integer address. A helper can retain the source
+/// spelling `PtrAccessChain pointer-to-pointer; Load pointer` until its parameter is substituted by
+/// that address. The loaded pointer payload is exactly one 64-bit address word, so construct the
+/// slot access as `ConvertUToPtr` to a PhysicalStorageBuffer `u64` pointer, index it, and load `u64`.
+/// Every use of the chain must be such a pointer load; other shapes remain unsupported.
+pub(crate) fn close_inlined_bda_pointer_tables_module(module: &mut Module) -> bool {
+    let Some(address_type) = module.types_global_values.iter().find_map(|instruction| {
+        (instruction.class.opcode == Op::TypeInt
+            && instruction.operands.first() == Some(&Operand::LiteralBit32(64)))
+        .then_some(instruction.result_id?)
+    }) else {
+        return false;
+    };
+    let pointer_pointees = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            if instruction.class.opcode != Op::TypePointer {
+                return None;
+            }
+            match instruction.operands.get(1)? {
+                Operand::IdRef(pointee) => Some((instruction.result_id?, *pointee)),
+                _ => None,
+            }
+        })
+        .collect::<HashMap<_, _>>();
+    let value_types = module
         .functions
         .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|inst| matches!(inst.class.opcode, Op::Phi | Op::Select))
-        .filter_map(|inst| inst.result_type)
-        .any(|ty| ptr_storage(&defs, ty) == Some(StorageClass::StorageBuffer));
-    if !has_storage_buffer_pointer_merge {
-        return false;
-    }
-    psb_value_select::rewrite_cross_binding_pointer_merges_to_values(module)
-}
-
-/// Apply the phi-the-index rewrite in place to VARIABLE-pointer (`StorageBuffer`/`Workgroup`) phis.
-/// These phis are legal SPIR-V under
-/// `VariablePointersStorageBuffer` — spirv-val passes — but MoltenVK's SPIRV-Cross MSL backend
-/// cannot always express them (pipeline creation fails with `cannot initialize a variable of type
-/// 'device float *' with an lvalue of type 'device float'`). The index-phi form is semantically
-/// identical (same base, same per-arm indices, one rematerialized access chain), so the caller runs
-/// this as a PORTABILITY NORMALIZATION on the success path and adopts the result only if it
-/// independently validates. Errors if no eligible phi was rewritten.
-pub(crate) fn rewrite_variable_pointer_phis_module(module: &mut Module) -> Result<(), String> {
-    if !phi_index::rewrite_variable_pointer_phis(module) {
-        return Err("native emitter: no variable pointer phi to rewrite".to_string());
-    }
-    add_native_module_capabilities(module);
-    crate::passes::lower_scalar_i64_arithmetic_module(module);
-    // The i64 lowering can widen a synthesized index-phi backedge after phi-the-index has already
-    // normalized it. Re-run the narrow-incoming legalization on that final shape before validation.
-    phi_index::rewrite_integer_width_phis(module);
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Apply static constant-branch pruning (function-constant dead-arm DCE) in place. Errors if
-/// nothing was pruned. The caller (the failure-triggered retry) adopts the result ONLY if it
-/// independently validates, and the transformation removes only statically-unreachable code +
-/// unused pure values, so it is floor-safe AND semantics-preserving by construction.
-pub(crate) fn prune_constant_branches_module(module: &mut Module) -> Result<(), String> {
-    if !constfold::prune_constant_branches(module) {
-        return Err("native emitter: no constant branch to prune".to_string());
-    }
-    drop_dangling_debug_targets_module(module);
-    add_native_module_capabilities(module);
-    Ok(())
-}
-
-/// Remove dead pure chains rooted at invalid logical-pointer nulls after late primary rewrites.
-/// Preserve every result outside those chains explicitly, so this remains a focused legalization and
-/// cannot become whole-module DCE or perturb unrelated diagnostic instructions.
-pub(crate) fn drop_unused_values_module(module: &mut Module) -> bool {
-    let defs = module
-        .types_global_values
-        .iter()
-        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+        .flat_map(|function| function.parameters.iter().chain(function.all_inst_iter()))
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
         .collect::<HashMap<_, _>>();
-    let mut removable = module
-        .types_global_values
-        .iter()
-        .filter(|instruction| instruction.class.opcode == Op::ConstantNull)
-        .filter_map(|instruction| {
-            let id = instruction.result_id?;
-            let storage = ptr_storage(&defs, instruction.result_type?)?;
-            (!matches!(
-                storage,
-                StorageClass::StorageBuffer | StorageClass::Workgroup
-            ))
-            .then_some(id)
-        })
-        .collect::<HashSet<_>>();
-    if removable.is_empty() {
+
+    let mut candidates = Vec::new();
+    for (function_index, function) in module.functions.iter().enumerate() {
+        let mut uses = HashMap::<Word, Vec<(usize, usize)>>::new();
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                for operand in &instruction.operands {
+                    if let Operand::IdRef(id) = operand {
+                        uses.entry(*id)
+                            .or_default()
+                            .push((block_index, instruction_index));
+                    }
+                }
+            }
+        }
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                if instruction.class.opcode != Op::PtrAccessChain || instruction.operands.len() != 2
+                {
+                    continue;
+                }
+                let (Some(chain), Some(result_type), Some(Operand::IdRef(base))) = (
+                    instruction.result_id,
+                    instruction.result_type,
+                    instruction.operands.first(),
+                ) else {
+                    continue;
+                };
+                if value_types.get(base) != Some(&address_type)
+                    || !pointer_pointees
+                        .get(&result_type)
+                        .is_some_and(|pointee| pointer_pointees.contains_key(pointee))
+                {
+                    continue;
+                }
+                let Some(chain_uses) = uses.get(&chain) else {
+                    continue;
+                };
+                if chain_uses.iter().all(|&(use_block, use_instruction)| {
+                    let user = &function.blocks[use_block].instructions[use_instruction];
+                    user.class.opcode == Op::Load
+                        && user.operands.first() == Some(&Operand::IdRef(chain))
+                        && user
+                            .result_type
+                            .is_some_and(|ty| pointer_pointees.contains_key(&ty))
+                }) {
+                    candidates.push((
+                        function_index,
+                        block_index,
+                        instruction_index,
+                        *base,
+                        chain,
+                        chain_uses.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
         return false;
     }
 
-    loop {
-        let additions = module
-            .all_inst_iter()
-            .filter(|instruction| {
-                constfold::is_pure(instruction.class.opcode) && instruction.result_id.is_some()
-            })
-            .filter(|instruction| {
-                instruction
-                    .operands
-                    .iter()
-                    .any(|operand| matches!(operand, Operand::IdRef(id) if removable.contains(id)))
-            })
-            .filter_map(|instruction| instruction.result_id)
-            .filter(|id| !removable.contains(id))
-            .collect::<Vec<_>>();
-        if additions.is_empty() {
-            break;
-        }
-        removable.extend(additions);
-    }
-
-    let preserved = module
-        .all_inst_iter()
-        .filter_map(|instruction| instruction.result_id)
-        .filter(|id| !removable.contains(id))
-        .collect::<HashSet<_>>();
-    constfold::dce_preserving(module, &preserved)
-}
-
-/// Reconcile the storage class of every typed access-chain result with its actual base pointer.
-///
-/// SPIR-V requires these storage classes to match. Earlier lowering normally establishes that
-/// invariant, but a late value substitution can replace a pointer merge with one of its concrete
-/// roots after the access chain was typed. In particular, folding an AIR function-constant switch
-/// can replace an `addrspace(2)` pointer carrier with a module-scope `Private` constant table while
-/// leaving the chain's former `UniformConstant` result type behind. Retyping only the pointer storage
-/// class is exact: the pointee and every index remain unchanged, and the base determines the only
-/// legal storage class.
-///
-/// Run to a fixpoint because one repaired chain can itself be the base of a later chain. Returns
-/// whether any result type changed.
-pub(crate) fn reconcile_access_chain_storage_classes_module(module: &mut Module) -> bool {
-    let mut changed = false;
-    loop {
-        let pointer_types = module
-            .types_global_values
-            .iter()
-            .filter_map(|instruction| {
-                if instruction.class.opcode != Op::TypePointer {
-                    return None;
-                }
-                let id = instruction.result_id?;
-                let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
-                    (instruction.operands.first(), instruction.operands.get(1))
-                else {
-                    return None;
-                };
-                Some((id, (*storage, *pointee)))
-            })
-            .collect::<HashMap<_, _>>();
-        let value_types = module
-            .all_inst_iter()
-            .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
-            .collect::<HashMap<_, _>>();
-
-        let repairs = module
-            .functions
-            .iter()
-            .flat_map(|function| &function.blocks)
-            .flat_map(|block| &block.instructions)
-            .filter(|instruction| {
-                matches!(
-                    instruction.class.opcode,
-                    Op::AccessChain
-                        | Op::InBoundsAccessChain
-                        | Op::PtrAccessChain
-                        | Op::InBoundsPtrAccessChain
-                )
-            })
-            .filter_map(|instruction| {
-                let result = instruction.result_id?;
-                let result_type = instruction.result_type?;
-                let Operand::IdRef(base) = instruction.operands.first()? else {
-                    return None;
-                };
-                let base_type = value_types.get(base)?;
-                let (base_storage, _) = pointer_types.get(base_type)?;
-                let (result_storage, pointee) = pointer_types.get(&result_type)?;
-                (base_storage != result_storage).then_some((result, (*base_storage, *pointee)))
-            })
-            .collect::<Vec<_>>();
-        if repairs.is_empty() {
-            break;
-        }
-
-        let mut replacement_types = HashMap::new();
-        for (_, key) in &repairs {
-            if replacement_types.contains_key(key) {
-                continue;
-            }
-            if let Some(existing) = pointer_types
-                .iter()
-                .find_map(|(id, candidate)| (candidate == key).then_some(*id))
-            {
-                replacement_types.insert(*key, existing);
-                continue;
-            }
+    let physical_address_pointer = module
+        .types_global_values
+        .iter()
+        .find_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer
+                && instruction.operands.as_slice()
+                    == [
+                        Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                        Operand::IdRef(address_type),
+                    ])
+            .then_some(instruction.result_id?)
+        })
+        .unwrap_or_else(|| {
             let id = module.fresh_id();
             module.types_global_values.push(Instruction::new(
                 Op::TypePointer,
                 None,
                 Some(id),
-                vec![Operand::StorageClass(key.0), Operand::IdRef(key.1)],
+                vec![
+                    Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                    Operand::IdRef(address_type),
+                ],
             ));
-            replacement_types.insert(*key, id);
+            module.annotations.push(Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(id),
+                    Operand::Decoration(spirv::Decoration::ArrayStride),
+                    Operand::LiteralBit32(8),
+                ],
+            ));
+            id
+        });
+
+    candidates.sort_unstable_by_key(|(function, block, instruction, ..)| {
+        (*function, *block, *instruction)
+    });
+    candidates.reverse();
+    for (function_index, block_index, instruction_index, base, chain, chain_uses) in candidates {
+        for (use_block, use_instruction) in chain_uses {
+            let load = &mut module.functions[function_index].blocks[use_block].instructions
+                [use_instruction];
+            load.result_type = Some(address_type);
+            load.operands.truncate(1);
+            load.operands
+                .push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
+            load.operands.push(Operand::LiteralBit32(8));
         }
-        let repairs = repairs.into_iter().collect::<HashMap<_, _>>();
-        for function in &mut module.functions {
-            for block in &mut function.blocks {
-                for instruction in &mut block.instructions {
-                    let Some(result) = instruction.result_id else {
-                        continue;
-                    };
-                    let Some(key) = repairs.get(&result) else {
-                        continue;
-                    };
-                    instruction.result_type = replacement_types.get(key).copied();
-                    changed = true;
+        let converted = module.fresh_id();
+        let block = &mut module.functions[function_index].blocks[block_index];
+        block.instructions.insert(
+            instruction_index,
+            Instruction::new(
+                Op::ConvertUToPtr,
+                Some(physical_address_pointer),
+                Some(converted),
+                vec![Operand::IdRef(base)],
+            ),
+        );
+        let chain_instruction = &mut block.instructions[instruction_index + 1];
+        debug_assert_eq!(chain_instruction.result_id, Some(chain));
+        chain_instruction.result_type = Some(physical_address_pointer);
+        chain_instruction.operands[0] = Operand::IdRef(converted);
+    }
+    add_native_module_capabilities(module);
+    true
+}
+
+/// Give physical-buffer atomics an addressable scalar member after interface construction has
+/// established their final pointer type. A direct scalar `OpConvertUToPtr` remains an rvalue
+/// expression in SPIRV-Cross's Metal output, while a member selected from an explicitly laid-out
+/// physical struct is an lvalue. Both pointers denote the same byte address because member zero has
+/// offset zero.
+///
+/// This runs on the owned final graph and only wraps physical atomic operands defined directly by
+/// `OpConvertUToPtr`. Workgroup and descriptor-backed atomics are left unchanged.
+pub(crate) fn construct_physical_atomic_pointer_lvalues_module(module: &mut Module) -> bool {
+    fn is_atomic(op: Op) -> bool {
+        matches!(
+            op,
+            Op::AtomicLoad
+                | Op::AtomicStore
+                | Op::AtomicExchange
+                | Op::AtomicCompareExchange
+                | Op::AtomicCompareExchangeWeak
+                | Op::AtomicIIncrement
+                | Op::AtomicIDecrement
+                | Op::AtomicIAdd
+                | Op::AtomicISub
+                | Op::AtomicSMin
+                | Op::AtomicUMin
+                | Op::AtomicSMax
+                | Op::AtomicUMax
+                | Op::AtomicAnd
+                | Op::AtomicOr
+                | Op::AtomicXor
+        )
+    }
+
+    let definitions = module
+        .all_inst_iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+        .collect::<HashMap<_, _>>();
+    let physical_pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer
+                && instruction.operands.first()
+                    == Some(&Operand::StorageClass(StorageClass::PhysicalStorageBuffer)))
+            .then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+
+    let mut candidates = Vec::with_capacity(module.functions.len());
+    for function in &module.functions {
+        let mut function_candidates = Vec::new();
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                if !is_atomic(instruction.class.opcode) {
+                    continue;
+                }
+                let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
+                    continue;
+                };
+                let Some(definition) = definitions.get(pointer) else {
+                    continue;
+                };
+                let (Some(pointer_type), Some(Operand::IdRef(address))) =
+                    (definition.result_type, definition.operands.first())
+                else {
+                    continue;
+                };
+                if physical_pointer_types.contains(&pointer_type)
+                    && definition.class.opcode == Op::ConvertUToPtr
+                {
+                    function_candidates.push((
+                        block_index,
+                        instruction_index,
+                        pointer_type,
+                        *address,
+                    ));
+                }
+            }
+        }
+        candidates.push(function_candidates);
+    }
+    if candidates.iter().all(Vec::is_empty) {
+        return false;
+    }
+
+    let candidate_pointer_types = candidates
+        .iter()
+        .flatten()
+        .map(|(_, _, pointer_type, _)| *pointer_type)
+        .collect::<HashSet<_>>();
+    let pointer_pointees = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            let pointer_type = instruction.result_id?;
+            if instruction.class.opcode != Op::TypePointer
+                || !candidate_pointer_types.contains(&pointer_type)
+            {
+                return None;
+            }
+            let Operand::IdRef(pointee) = instruction.operands.get(1)? else {
+                return None;
+            };
+            Some((pointer_type, *pointee))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut next_id = module
+        .header
+        .as_ref()
+        .map(|header| header.bound)
+        .unwrap_or(1);
+    let zero = module
+        .types_global_values
+        .iter()
+        .find_map(|instruction| {
+            let result_type = instruction.result_type?;
+            let type_definition = definitions.get(&result_type)?;
+            let is_zero = match instruction.class.opcode {
+                Op::Constant => matches!(
+                    instruction.operands.first(),
+                    Some(Operand::LiteralBit32(0) | Operand::LiteralBit64(0))
+                ),
+                _ => false,
+            };
+            (type_definition.class.opcode == Op::TypeInt
+                && type_definition.operands.first() == Some(&Operand::LiteralBit32(32))
+                && is_zero)
+                .then_some(instruction.result_id?)
+        })
+        .unwrap_or_else(|| {
+            let integer_type = module
+                .types_global_values
+                .iter()
+                .find_map(|instruction| {
+                    (instruction.class.opcode == Op::TypeInt
+                        && instruction.operands.first() == Some(&Operand::LiteralBit32(32)))
+                    .then_some(instruction.result_id?)
+                })
+                .unwrap_or_else(|| {
+                    let integer_type = next_id;
+                    next_id += 1;
+                    module.types_global_values.push(Instruction::new(
+                        Op::TypeInt,
+                        None,
+                        Some(integer_type),
+                        vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+                    ));
+                    integer_type
+                });
+            let zero = next_id;
+            next_id += 1;
+            module.types_global_values.push(Instruction::new(
+                Op::Constant,
+                Some(integer_type),
+                Some(zero),
+                vec![Operand::LiteralBit32(0)],
+            ));
+            zero
+        });
+    let mut wrapper_pointer_types = HashMap::<Word, Word>::new();
+    for pointer_type in candidate_pointer_types {
+        let pointee = pointer_pointees[&pointer_type];
+        let wrapper = next_id;
+        let wrapper_pointer = next_id + 1;
+        next_id += 2;
+        module.types_global_values.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(wrapper),
+            vec![Operand::IdRef(pointee)],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(wrapper_pointer),
+            vec![
+                Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                Operand::IdRef(wrapper),
+            ],
+        ));
+        module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(wrapper),
+                Operand::Decoration(spirv::Decoration::Block),
+            ],
+        ));
+        module.annotations.push(Instruction::new(
+            Op::MemberDecorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(wrapper),
+                Operand::LiteralBit32(0),
+                Operand::Decoration(spirv::Decoration::Offset),
+                Operand::LiteralBit32(0),
+            ],
+        ));
+        wrapper_pointer_types.insert(pointer_type, wrapper_pointer);
+    }
+
+    for (function, sites) in module.functions.iter_mut().zip(candidates) {
+        let sites = sites
+            .into_iter()
+            .map(|(block, instruction, pointer_type, address)| {
+                ((block, instruction), (pointer_type, address))
+            })
+            .collect::<HashMap<_, _>>();
+        for (block_index, block) in function.blocks.iter_mut().enumerate() {
+            let original = block.instructions.clone();
+            let mut rewritten = Vec::with_capacity(original.len() + sites.len() * 2);
+            for (instruction_index, mut instruction) in original.into_iter().enumerate() {
+                let Some((pointer_type, address)) =
+                    sites.get(&(block_index, instruction_index)).copied()
+                else {
+                    rewritten.push(instruction);
+                    continue;
+                };
+                let wrapper_pointer = next_id;
+                next_id += 1;
+                rewritten.push(Instruction::new(
+                    Op::ConvertUToPtr,
+                    Some(wrapper_pointer_types[&pointer_type]),
+                    Some(wrapper_pointer),
+                    vec![Operand::IdRef(address)],
+                ));
+                let member_pointer = next_id;
+                next_id += 1;
+                rewritten.push(Instruction::new(
+                    Op::AccessChain,
+                    Some(pointer_type),
+                    Some(member_pointer),
+                    vec![Operand::IdRef(wrapper_pointer), Operand::IdRef(zero)],
+                ));
+                instruction.operands[0] = Operand::IdRef(member_pointer);
+                rewritten.push(instruction);
+            }
+            block.instructions = rewritten;
+        }
+    }
+    if let Some(header) = module.header.as_mut() {
+        header.bound = next_id;
+    }
+    true
+}
+
+/// Apply static constant-branch pruning (function-constant dead-arm DCE) in place. Errors if
+/// nothing was pruned. Explicit function-constant specialization owns this complete pruning form;
+/// the transformation removes only statically unreachable code and unused pure values.
+pub(crate) fn prune_constant_branches_module(module: &mut Module) -> Result<(), String> {
+    if !prune_constant_branches_module_if_changed(module) {
+        return Err("native emitter: no constant branch to prune".to_string());
+    }
+    Ok(())
+}
+
+fn prune_constant_branches_module_if_changed(module: &mut Module) -> bool {
+    let defined_before = defined_result_ids(module);
+    let changed = constfold::prune_constant_branches(module);
+    if !changed {
+        return false;
+    }
+    finish_id_deleting_rewrite(module, defined_before, changed);
+    add_native_module_capabilities(module);
+    true
+}
+
+/// Apply static CFG pruning as an ordinary construction phase. Unlike the retry contract above, a
+/// module with no foldable branch is a successful no-op, and unrelated unused values are retained.
+pub(crate) fn prune_constant_cfg_module_if_changed(module: &mut Module) -> bool {
+    let defined_before = defined_result_ids(module);
+    let changed = constfold::prune_constant_cfg(module);
+    if !changed {
+        return false;
+    }
+    finish_id_deleting_rewrite(module, defined_before, changed);
+    add_native_module_capabilities(module);
+    true
+}
+
+/// Remove operand-free null/undef values that have no semantic use. Debug records do not keep an
+/// otherwise dead value alive; retaining an unused logical-pointer `OpConstantNull` would make the
+/// module invalid even though no instruction can observe it.
+pub(crate) fn prune_unused_null_and_undef_constants_module(module: &mut Module) -> bool {
+    let mut referenced = HashSet::new();
+    for instruction in module
+        .entry_points
+        .iter()
+        .chain(&module.execution_modes)
+        .chain(&module.annotations)
+        .chain(&module.types_global_values)
+        .chain(
+            module
+                .functions
+                .iter()
+                .flat_map(|function| function.all_inst_iter()),
+        )
+    {
+        referenced.extend(
+            instruction
+                .operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                }),
+        );
+    }
+    let removed = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| matches!(instruction.class.opcode, Op::ConstantNull | Op::Undef))
+        .filter_map(|instruction| instruction.result_id)
+        .filter(|id| !referenced.contains(id))
+        .collect::<HashSet<_>>();
+    if removed.is_empty() {
+        return false;
+    }
+    module.types_global_values.retain(|instruction| {
+        instruction
+            .result_id
+            .is_none_or(|id| !removed.contains(&id))
+    });
+    module.debug_names.retain(|instruction| {
+        !instruction
+            .operands
+            .first()
+            .is_some_and(|operand| matches!(operand, Operand::IdRef(id) if removed.contains(id)))
+    });
+    module.annotations.retain(|instruction| {
+        !instruction
+            .operands
+            .first()
+            .is_some_and(|operand| matches!(operand, Operand::IdRef(id) if removed.contains(id)))
+    });
+    true
+}
+
+/// Replace an unobservable logical-pointer member of an aggregate with the BDA address scalar.
+///
+/// `PhysicalStorageBuffer64` forbids logical pointers in composites. AIR can nevertheless carry
+/// callback state in a struct where a pointer member is populated but never extracted; only an
+/// adjacent device-address/length member is observed. The same construction closes a pointer field
+/// whose exact stored value has already been forwarded to its integer BDA representation by an
+/// earlier typed pass. Retyping that dead member is exact provided every aggregate value containing
+/// it remains within composite construction/extraction and no extraction reaches the pointer member
+/// itself.
+pub(crate) fn lower_unobserved_bda_aggregate_pointer_fields_module(
+    module: &mut Module,
+) -> Result<bool, String> {
+    let physical = module.memory_model.as_ref().is_some_and(|inst| {
+        matches!(
+            inst.operands.first(),
+            Some(Operand::AddressingModel(
+                spirv::AddressingModel::PhysicalStorageBuffer64
+            ))
+        )
+    });
+    if !physical {
+        return Ok(false);
+    }
+
+    let type_defs = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
+        .collect::<HashMap<_, _>>();
+    let pointer_types = type_defs
+        .iter()
+        .filter_map(|(id, inst)| (inst.class.opcode == Op::TypePointer).then_some(*id))
+        .collect::<HashSet<_>>();
+    let all_value_types = module
+        .types_global_values
+        .iter()
+        .chain(
+            module
+                .functions
+                .iter()
+                .flat_map(|function| function.all_inst_iter()),
+        )
+        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
+        .collect::<HashMap<_, _>>();
+    let address_ty = module
+        .types_global_values
+        .iter()
+        .find_map(|inst| {
+            (inst.class.opcode == Op::TypeInt
+                && matches!(inst.operands.first(), Some(Operand::LiteralBit32(64)))
+                && matches!(inst.operands.get(1), Some(Operand::LiteralBit32(0))))
+            .then_some(inst.result_id?)
+        })
+        .ok_or("native construction: PhysicalStorageBuffer64 module has no ulong type")?;
+    let target_field =
+        |mut aggregate_ty: Word, indices: &[Operand]| -> Option<(Word, usize, Word)> {
+            let mut target = None;
+            for index in indices {
+                let Operand::LiteralBit32(member) = index else {
+                    return None;
+                };
+                let definition = type_defs.get(&aggregate_ty)?;
+                let Operand::IdRef(member_ty) = definition.operands.get(*member as usize)? else {
+                    return None;
+                };
+                target = Some((aggregate_ty, *member as usize, *member_ty));
+                aggregate_ty = *member_ty;
+            }
+            target
+        };
+
+    let mut candidates = HashSet::new();
+    for function in &module.functions {
+        for inst in function.all_inst_iter() {
+            if inst.class.opcode != Op::CompositeInsert {
+                continue;
+            }
+            if let Some((owner, member, leaf_ty)) = inst
+                .result_type
+                .and_then(|ty| target_field(ty, &inst.operands[2..]))
+            {
+                let object_ty = inst.operands.first().and_then(|operand| match operand {
+                    Operand::IdRef(id) => all_value_types.get(id).copied(),
+                    _ => None,
+                });
+                let object_is_pointer = object_ty.is_some_and(|ty| pointer_types.contains(&ty));
+                let object_is_address = object_ty == Some(address_ty);
+                if pointer_types.contains(&leaf_ty) && (object_is_pointer || object_is_address) {
+                    candidates.insert((owner, member));
                 }
             }
         }
     }
-    changed
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    for function in &module.functions {
+        for inst in function.all_inst_iter() {
+            if inst.class.opcode == Op::CompositeExtract {
+                let composite_ty = inst.operands.first().and_then(|operand| match operand {
+                    Operand::IdRef(id) => all_value_types.get(id).copied(),
+                    _ => None,
+                });
+                if let Some((owner, member, _)) =
+                    composite_ty.and_then(|ty| target_field(ty, &inst.operands[1..]))
+                {
+                    candidates.remove(&(owner, member));
+                }
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    let mut containing_types = candidates
+        .iter()
+        .map(|(owner, _)| *owner)
+        .collect::<HashSet<_>>();
+    loop {
+        let before = containing_types.len();
+        for (id, definition) in &type_defs {
+            if matches!(
+                definition.class.opcode,
+                Op::TypeStruct | Op::TypeArray | Op::TypeRuntimeArray
+            ) && definition.operands.iter().any(
+                |operand| matches!(operand, Operand::IdRef(ty) if containing_types.contains(ty)),
+            ) {
+                containing_types.insert(*id);
+            }
+        }
+        if containing_types.len() == before {
+            break;
+        }
+    }
+    let mut aggregate_escapes = false;
+    for function in &module.functions {
+        for inst in function.all_inst_iter() {
+            for (operand_index, operand) in inst.operands.iter().enumerate() {
+                let Operand::IdRef(id) = operand else {
+                    continue;
+                };
+                if !all_value_types
+                    .get(id)
+                    .is_some_and(|ty| containing_types.contains(ty))
+                {
+                    continue;
+                }
+                let structural_use = matches!(
+                    (inst.class.opcode, operand_index),
+                    (Op::CompositeInsert, 1) | (Op::CompositeExtract, 0) | (Op::CopyObject, 0)
+                );
+                if !structural_use {
+                    aggregate_escapes = true;
+                }
+            }
+        }
+    }
+    if aggregate_escapes {
+        return Ok(false);
+    }
+
+    let zero = module
+        .types_global_values
+        .iter()
+        .find_map(|inst| {
+            (inst.result_type == Some(address_ty) && inst.class.opcode == Op::ConstantNull)
+                .then_some(inst.result_id?)
+        })
+        .ok_or("native construction: PhysicalStorageBuffer64 module has no ulong zero")?;
+
+    for inst in &mut module.types_global_values {
+        let Some(owner) = inst.result_id else {
+            continue;
+        };
+        for (member, operand) in inst.operands.iter_mut().enumerate() {
+            if candidates.contains(&(owner, member)) {
+                *operand = Operand::IdRef(address_ty);
+            }
+        }
+    }
+    for function in &mut module.functions {
+        for inst in function.all_inst_iter_mut() {
+            if inst.class.opcode != Op::CompositeInsert {
+                continue;
+            }
+            let Some((owner, member, _)) = inst
+                .result_type
+                .and_then(|ty| target_field(ty, &inst.operands[2..]))
+            else {
+                continue;
+            };
+            let object_is_pointer = inst
+                .operands
+                .first()
+                .and_then(|operand| match operand {
+                    Operand::IdRef(id) => all_value_types.get(id),
+                    _ => None,
+                })
+                .is_some_and(|ty| pointer_types.contains(ty));
+            if object_is_pointer && candidates.contains(&(owner, member)) {
+                inst.operands[0] = Operand::IdRef(zero);
+            }
+        }
+    }
+    Ok(true)
 }
 
-/// Preserving form of [`prune_constant_branches_module`] for a primary module that still carries
-/// typed sidecar roots. Returns whether pruning changed the module.
-pub(crate) fn prune_constant_branches_module_preserving(
+pub(crate) fn eliminate_dead_pointer_values_module(
     module: &mut Module,
-    preserved_global_ids: &[Word],
+    preserved_pointer_ids: &HashSet<Word>,
 ) -> bool {
-    let roots = preserved_global_ids.iter().copied().collect();
-    let changed = constfold::prune_constant_branches_preserving(module, &roots);
-    let dropped = drop_dangling_debug_targets_module(module);
-    changed || dropped
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::TypePointer)
+        .filter_map(|instruction| instruction.result_id)
+        .collect::<HashSet<_>>();
+    let mut preserved_ids = preserved_pointer_ids.clone();
+    preserved_ids.extend(module.functions.iter().flat_map(|function| {
+        function.all_inst_iter().filter_map(|instruction| {
+            let result = instruction.result_id?;
+            let result_type = instruction.result_type?;
+            (!pointer_types.contains(&result_type)).then_some(result)
+        })
+    }));
+    constfold::dce_preserving(module, &preserved_ids)
 }
 
-/// Whether the module contains an `OpFunctionCall` to a BODILESS `llvm.agx*` hardware-intrinsic
-/// declaration (AGX matmul `igemm`, `load/store.with.emask`, …) — the structural trigger for the
-/// primary-path FC prune in `primary_retry.rs`. Such a call is never executable on a Vulkan target:
-/// no lowering exists and the declaration has no body. Keyed on the `llvm.agx` ABI-symbol namespace
-/// via the `OpName` of bodiless functions (the emitter always names emitted declarations) — never a
-/// shader name.
-pub(crate) fn has_bodiless_agx_call_module(module: &Module) -> bool {
-    use std::collections::HashSet;
-    let agx_names: HashSet<spirv::Word> = module
+pub(crate) fn eliminate_dead_values_module(
+    module: &mut Module,
+    preserved_ids: &HashSet<Word>,
+) -> bool {
+    constfold::dce_preserving(module, preserved_ids)
+}
+
+/// Construct functions selected by typed source-planning or post-lowering facts in bounded relooper
+/// form. Names resolve through the emitter's `OpName` records while the module is still owned,
+/// before serialization or validation.
+pub(crate) fn construct_cfg_functions_module(
+    module: &mut Module,
+    construction_names: &HashSet<String>,
+) -> Result<(), String> {
+    let named = module
         .debug_names
         .iter()
-        .filter(|inst| inst.class.opcode == spirv::Op::Name)
-        .filter_map(|inst| {
-            let Operand::IdRef(id) = inst.operands.first()? else {
+        .filter_map(|instruction| {
+            if instruction.class.opcode != Op::Name {
                 return None;
-            };
-            let Operand::LiteralString(name) = inst.operands.get(1)? else {
-                return None;
-            };
-            name.starts_with("llvm.agx").then_some(*id)
+            }
+            match (instruction.operands.first(), instruction.operands.get(1)) {
+                (Some(Operand::IdRef(id)), Some(Operand::LiteralString(name)))
+                    if construction_names.contains(name) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            }
         })
-        .collect();
-    if agx_names.is_empty() {
-        return false;
+        .collect::<HashSet<_>>();
+    let mut selected = named.clone();
+    selected.extend(module.functions.iter().filter_map(|function| {
+        let has_unowned_header = blocks_have_unowned_selection_header(&function.blocks);
+        let has_unowned_backedge = function_has_unowned_backedge(function);
+        (has_unowned_header || has_unowned_backedge)
+            .then_some(function.def.as_ref().and_then(|def| def.result_id))
+            .flatten()
+    }));
+    if selected.is_empty() {
+        return Ok(());
     }
-    let bodiless: HashSet<spirv::Word> = module
-        .functions
+    let defined_before = defined_result_ids(module);
+    // Helper inlining can consume a rejected function and therefore its OpName. If at least one
+    // selected identity remains while another was consumed, conservatively construct the remaining
+    // module because a surviving caller may contain that inlined CFG. If no selected identity
+    // remains, there is no structural owner to construct; do not guess that every function owns it.
+    // When all rejected identities survive, retain the narrower per-function construction.
+    let changed = if named.len() == construction_names.len() {
+        relooper::rewrite_selected_to_relooper(
+            module,
+            relooper::default_max_relooper_blocks(),
+            &selected,
+        )
+    } else {
+        relooper::rewrite_to_relooper(module, relooper::default_max_relooper_blocks())
+    };
+    if !changed {
+        return Err("native emitter: selected CFG function cannot be constructed".to_string());
+    }
+    finish_id_deleting_rewrite(module, defined_before, changed);
+    add_native_module_capabilities(module);
+    Ok(())
+}
+
+/// Shader control flow requires an `OpSelectionMerge` before every switch and before a
+/// non-degenerate conditional whose targets are not already declared merge or continue blocks.
+/// The latter exemption is what permits a loop's back-edge block to choose between another
+/// iteration and the loop merge without inventing a nested selection construct.
+pub(crate) fn blocks_have_unowned_selection_header(blocks: &[crate::spirv_module::Block]) -> bool {
+    !unowned_selection_header_labels(blocks).is_empty()
+}
+
+pub(crate) fn unowned_selection_header_labels(
+    blocks: &[crate::spirv_module::Block],
+) -> Vec<Option<Word>> {
+    let mut declared_boundaries = HashSet::new();
+    for instruction in blocks.iter().flat_map(|block| &block.instructions) {
+        let boundary_count = match instruction.class.opcode {
+            Op::SelectionMerge => 1,
+            Op::LoopMerge => 2,
+            _ => 0,
+        };
+        declared_boundaries.extend(instruction.operands.iter().take(boundary_count).filter_map(
+            |operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            },
+        ));
+    }
+    blocks
         .iter()
-        .filter(|f| f.blocks.is_empty())
-        .filter_map(|f| f.def.as_ref().and_then(|d| d.result_id))
-        .filter(|id| agx_names.contains(id))
-        .collect();
-    if bodiless.is_empty() {
+        .filter_map(|block| {
+            let (terminator, prefix) = block.instructions.split_last()?;
+            if prefix.last().is_some_and(|instruction| {
+                matches!(instruction.class.opcode, Op::SelectionMerge | Op::LoopMerge)
+            }) {
+                return None;
+            }
+            let requires_merge = match terminator.class.opcode {
+                Op::Switch => true,
+                Op::BranchConditional => {
+                    let targets = terminator
+                        .operands
+                        .iter()
+                        .skip(1)
+                        .take(2)
+                        .filter_map(|operand| match operand {
+                            Operand::IdRef(id) => Some(*id),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    match targets.as_slice() {
+                        [true_target, false_target] => {
+                            true_target != false_target
+                                && !declared_boundaries.contains(true_target)
+                                && !declared_boundaries.contains(false_target)
+                        }
+                        _ => true,
+                    }
+                }
+                _ => false,
+            };
+            requires_merge.then(|| block.label.as_ref().and_then(|label| label.result_id))
+        })
+        .collect()
+}
+
+fn function_has_unowned_backedge(function: &crate::spirv_module::Function) -> bool {
+    let labels = function
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| block.label.as_ref()?.result_id.map(|id| (id, index)))
+        .collect::<HashMap<_, _>>();
+    if function.blocks.is_empty() || labels.len() != function.blocks.len() {
         return false;
     }
-    module.functions.iter().any(|f| {
-        f.blocks.iter().any(|b| {
-            b.instructions.iter().any(|inst| {
-                inst.class.opcode == spirv::Op::FunctionCall
-                    && matches!(
-                        inst.operands.first(),
-                        Some(Operand::IdRef(callee)) if bodiless.contains(callee)
-                    )
-            })
+    let successors = function
+        .blocks
+        .iter()
+        .map(|block| {
+            let Some(terminator) = block.instructions.last() else {
+                return Vec::new();
+            };
+            match terminator.class.opcode {
+                Op::Branch => terminator
+                    .operands
+                    .first()
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(id) => labels.get(id).copied(),
+                        _ => None,
+                    })
+                    .into_iter()
+                    .collect(),
+                Op::BranchConditional => terminator
+                    .operands
+                    .iter()
+                    .skip(1)
+                    .take(2)
+                    .filter_map(|operand| match operand {
+                        Operand::IdRef(id) => labels.get(id).copied(),
+                        _ => None,
+                    })
+                    .collect(),
+                Op::Switch => terminator
+                    .operands
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(index, _)| index % 2 == 1)
+                    .filter_map(|(_, operand)| match operand {
+                        Operand::IdRef(id) => labels.get(id).copied(),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
         })
+        .collect::<Vec<Vec<usize>>>();
+    let mut predecessors = vec![Vec::new(); function.blocks.len()];
+    for (block, block_successors) in successors.iter().enumerate() {
+        for &successor in block_successors {
+            predecessors[successor].push(block);
+        }
+    }
+    let (reachable, dominance, _) = super::owned_cfg::dominance(&successors, &predecessors);
+    let loop_headers = function
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            block
+                .instructions
+                .iter()
+                .any(|instruction| instruction.class.opcode == Op::LoopMerge)
+                .then_some(index)
+        })
+        .collect::<HashSet<_>>();
+    successors.iter().enumerate().any(|(block, targets)| {
+        reachable[block]
+            && targets.iter().any(|target| {
+                let (Some((target_in, target_out)), Some((block_in, block_out))) =
+                    (dominance[*target], dominance[block])
+                else {
+                    return false;
+                };
+                target_in <= block_in && block_out <= target_out && !loop_headers.contains(target)
+            })
     })
 }
 
-/// Reconcile whole-buffer scalar fallback arms in place (byte-0 base of an FC-multiplexed
-/// raw-modeled device buffer) to the merge's scalar pointee, so a cross-binding pointer merge's arms
-/// share one pointee type (see [`buffer_arm_reconcile`]). Errors if nothing was reconciled. Applied
-/// only in the adopt-if-VALIDATES `fc_promote_psb` retry (feeding PSB), so floor-safe by
-/// construction; byte-EXACT (element 0 = offset 0 for either scalar element type).
-pub(crate) fn reconcile_whole_buffer_scalar_arms_module(module: &mut Module) -> Result<(), String> {
-    if !buffer_arm_reconcile::reconcile_whole_buffer_scalar_arms(module) {
-        return Err("native emitter: no whole-buffer scalar arm to reconcile".to_string());
-    }
-    add_native_module_capabilities(module);
-    Ok(())
-}
+/// Product-safe case budget for each bounded relooper dispatch group. Larger functions are split
+/// into a bounded number of hierarchical groups rather than emitted as one oversized switch.
+pub const BOUNDED_RELOOPER_MAX_BLOCKS: usize = 1024;
 
-/// Apply the W2 relooper (switch-dispatch + register demotion) in place with the default block cap.
-/// Errors if no function was rewritten. The caller (the failure-triggered cfg retry) adopts the
-/// result ONLY if it independently validates, so this is floor-safe by construction.
-pub(crate) fn rewrite_to_relooper_module(module: &mut Module) -> Result<(), String> {
-    rewrite_to_relooper_module_capped(module, relooper::default_max_relooper_blocks())
-}
-
-/// Product-safe block budget for the function-constant-dead prune → relooper composition. Pruning
-/// may shrink an oversized function below this ceiling; it never licenses a larger state machine.
-pub const PRUNE_THEN_RELOOPER_MAX_BLOCKS: usize = 1024;
-
-/// Higher retry budget for an unrepaired CFG that the structurizer emitted as a REJECT. The normal
-/// relooper stays capped at 1024 blocks; the whole-function relooper independently clamps every
-/// caller to its hard downstream-driver safety ceiling.
+/// Dispatch-group budget for a CFG rejected by source ownership construction.
 pub const CFG_EMIT_RELOOPER_MAX_BLOCKS: usize = 1024;
-
-/// Like [`rewrite_to_relooper_module`] but with an explicit requested block cap. The native
-/// whole-function relooper always clamps that request to its hard downstream-driver safety limit.
-pub(crate) fn rewrite_to_relooper_module_capped(
-    module: &mut Module,
-    max_blocks: usize,
-) -> Result<(), String> {
-    if !relooper::rewrite_to_relooper(module, max_blocks) {
-        return Err("native emitter: no function to relooper".to_string());
-    }
-    drop_dangling_debug_targets_module(module);
-    add_native_module_capabilities(module);
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spirv_module::{Block, Function};
-    use spirv::Decoration;
+    use crate::spirv_module::{Block, Function, ModuleHeader};
+    use spirv::{AddressingModel, Decoration, MemoryModel};
 
     fn inst(op: Op, ty: Option<Word>, id: Option<Word>, operands: Vec<Operand>) -> Instruction {
         Instruction::new(op, ty, id, operands)
     }
 
+    fn set_logical_memory_model(module: &mut Module) {
+        module.memory_model = Some(inst(
+            Op::MemoryModel,
+            None,
+            None,
+            vec![
+                Operand::AddressingModel(AddressingModel::Logical),
+                Operand::MemoryModel(MemoryModel::GLSL450),
+            ],
+        ));
+    }
+
     #[test]
-    fn access_chain_storage_follows_late_substituted_base() {
-        let mut module = Module::default();
+    fn physical_atomic_conversion_is_constructed_as_an_offset_zero_lvalue() {
+        let uint = 1;
+        let ulong = 2;
+        let physical_uint = 3;
+        let zero = 4;
+        let address = 5;
+        let uchar = 6;
+        let uchar_zero = 7;
+        let uint_null = 8;
+        let converted = 11;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(12));
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(uint),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(ulong),
+                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(physical_uint),
+                vec![
+                    Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                    Operand::IdRef(uint),
+                ],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(uchar),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            inst(Op::ConstantNull, Some(uchar), Some(uchar_zero), vec![]),
+            inst(Op::ConstantNull, Some(uint), Some(uint_null), vec![]),
+            inst(
+                Op::Constant,
+                Some(uint),
+                Some(zero),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(ulong),
+                Some(address),
+                vec![Operand::LiteralBit64(64)],
+            ),
+        ];
+        let mut function = Function::new();
+        function.blocks.push(Block {
+            label: Some(inst(Op::Label, None, Some(10), vec![])),
+            instructions: vec![
+                inst(
+                    Op::ConvertUToPtr,
+                    Some(physical_uint),
+                    Some(converted),
+                    vec![Operand::IdRef(address)],
+                ),
+                inst(
+                    Op::AtomicStore,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(converted),
+                        Operand::IdScope(zero),
+                        Operand::IdMemorySemantics(zero),
+                        Operand::IdRef(zero),
+                    ],
+                ),
+                inst(Op::Return, None, None, vec![]),
+            ],
+        });
+        module.functions.push(function);
+
+        assert!(construct_physical_atomic_pointer_lvalues_module(
+            &mut module
+        ));
+        assert!(!construct_physical_atomic_pointer_lvalues_module(
+            &mut module
+        ));
+
+        let body = &module.functions[0].blocks[0].instructions;
+        let atomic = body
+            .iter()
+            .find(|instruction| instruction.class.opcode == Op::AtomicStore)
+            .expect("atomic store");
+        let Operand::IdRef(member_pointer) = atomic.operands[0] else {
+            panic!("atomic pointer is an id")
+        };
+        let member = body
+            .iter()
+            .find(|instruction| instruction.result_id == Some(member_pointer))
+            .expect("member pointer");
+        assert_eq!(member.class.opcode, Op::AccessChain);
+        assert_eq!(member.result_type, Some(physical_uint));
+        assert_eq!(member.operands.get(1), Some(&Operand::IdRef(zero)));
+        let Operand::IdRef(wrapper_pointer) = member.operands[0] else {
+            panic!("wrapper pointer is an id")
+        };
+        assert!(body.iter().any(|instruction| {
+            instruction.result_id == Some(wrapper_pointer)
+                && instruction.class.opcode == Op::ConvertUToPtr
+                && instruction.operands == [Operand::IdRef(address)]
+        }));
+        assert!(module.annotations.iter().any(|instruction| {
+            instruction.class.opcode == Op::MemberDecorate
+                && instruction.operands.get(1) == Some(&Operand::LiteralBit32(0))
+                && instruction.operands.get(2) == Some(&Operand::Decoration(Decoration::Offset))
+                && instruction.operands.get(3) == Some(&Operand::LiteralBit32(0))
+        }));
+    }
+
+    fn module_with_typed_instruction(instruction: Instruction) -> Module {
+        let mut module = Module::new();
         module.types_global_values = vec![
             inst(
                 Op::TypeInt,
                 None,
                 Some(1),
-                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeFloat,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            inst(Op::TypeBool, None, Some(3), vec![]),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(4),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(
+                Op::Constant,
+                Some(1),
+                Some(5),
+                vec![Operand::LiteralBit32(2)],
+            ),
+            inst(
+                Op::Constant,
+                Some(2),
+                Some(6),
+                vec![Operand::LiteralBit32(0x3f80_0000)],
+            ),
+            inst(Op::ConstantTrue, Some(3), Some(7), vec![]),
+            inst(
+                Op::TypeVector,
+                None,
+                Some(8),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(2)],
             ),
             inst(
                 Op::TypeVector,
                 None,
-                Some(2),
-                vec![Operand::IdRef(1), Operand::LiteralBit32(2)],
+                Some(9),
+                vec![Operand::IdRef(3), Operand::LiteralBit32(2)],
             ),
             inst(
-                Op::TypePointer,
+                Op::TypeVector,
                 None,
-                Some(3),
-                vec![
-                    Operand::StorageClass(StorageClass::Private),
-                    Operand::IdRef(2),
-                ],
+                Some(10),
+                vec![Operand::IdRef(3), Operand::LiteralBit32(4)],
             ),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(4),
-                vec![
-                    Operand::StorageClass(StorageClass::UniformConstant),
-                    Operand::IdRef(2),
-                ],
-            ),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(5),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::Constant,
-                Some(5),
-                Some(6),
-                vec![Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::Variable,
-                Some(3),
-                Some(7),
-                vec![Operand::StorageClass(StorageClass::Private)],
-            ),
+            inst(Op::Undef, Some(8), Some(11), vec![]),
+            inst(Op::Undef, Some(8), Some(12), vec![]),
+            inst(Op::Undef, Some(9), Some(13), vec![]),
+            inst(Op::Undef, Some(10), Some(14), vec![]),
         ];
-        module.functions = vec![Function {
-            blocks: vec![Block {
-                label: None,
-                instructions: vec![inst(
-                    Op::InBoundsAccessChain,
-                    Some(4),
-                    Some(8),
-                    vec![Operand::IdRef(7), Operand::IdRef(6)],
-                )],
-            }],
-            ..Default::default()
+        let mut function = Function::new();
+        function.blocks = vec![Block {
+            label: Some(inst(Op::Label, None, Some(20), vec![])),
+            instructions: vec![instruction, inst(Op::Return, None, None, vec![])],
         }];
-
-        assert!(reconcile_access_chain_storage_classes_module(&mut module));
-        assert_eq!(
-            module.functions[0].blocks[0].instructions[0].result_type,
-            Some(3)
-        );
-        assert!(!reconcile_access_chain_storage_classes_module(&mut module));
-    }
-
-    fn workgroup_struct_byte_store_module(byte_offset: u32) -> Module {
-        let mut module = Module::default();
-        module.types_global_values = vec![
-            inst(
-                Op::TypeInt,
-                None,
-                Some(1),
-                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(2),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::TypeStruct,
-                None,
-                Some(3),
-                vec![Operand::IdRef(2), Operand::IdRef(1)],
-            ),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(4),
-                vec![
-                    Operand::StorageClass(StorageClass::Workgroup),
-                    Operand::IdRef(3),
-                ],
-            ),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(5),
-                vec![
-                    Operand::StorageClass(StorageClass::Workgroup),
-                    Operand::IdRef(1),
-                ],
-            ),
-            inst(
-                Op::Constant,
-                Some(2),
-                Some(6),
-                vec![Operand::LiteralBit32(byte_offset)],
-            ),
-            inst(Op::ConstantNull, Some(1), Some(7), vec![]),
-            inst(
-                Op::Variable,
-                Some(4),
-                Some(8),
-                vec![Operand::StorageClass(StorageClass::Workgroup)],
-            ),
-        ];
-        module.annotations = vec![
-            inst(
-                Op::MemberDecorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(3),
-                    Operand::LiteralBit32(0),
-                    Operand::Decoration(Decoration::Offset),
-                    Operand::LiteralBit32(0),
-                ],
-            ),
-            inst(
-                Op::MemberDecorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(3),
-                    Operand::LiteralBit32(1),
-                    Operand::Decoration(Decoration::Offset),
-                    Operand::LiteralBit32(4),
-                ],
-            ),
-        ];
-        module.functions = vec![Function {
-            blocks: vec![Block {
-                label: None,
-                instructions: vec![
-                    inst(
-                        Op::PtrAccessChain,
-                        Some(5),
-                        Some(9),
-                        vec![Operand::IdRef(8), Operand::IdRef(6)],
-                    ),
-                    inst(
-                        Op::Store,
-                        None,
-                        None,
-                        vec![Operand::IdRef(9), Operand::IdRef(7)],
-                    ),
-                ],
-            }],
-            ..Default::default()
-        }];
+        function.def = Some(inst(
+            Op::Function,
+            Some(30),
+            Some(32),
+            vec![
+                Operand::FunctionControl(spirv::FunctionControl::NONE),
+                Operand::IdRef(31),
+            ],
+        ));
+        function.end = Some(inst(Op::FunctionEnd, None, None, vec![]));
+        module.functions.push(function);
+        let mut header = ModuleHeader::new(100);
+        header.set_version(1, 5);
+        module.header = Some(header);
+        module.capabilities.push(inst(
+            Op::Capability,
+            None,
+            None,
+            vec![Operand::Capability(spirv::Capability::Shader)],
+        ));
+        set_logical_memory_model(&mut module);
+        module.entry_points.push(inst(
+            Op::EntryPoint,
+            None,
+            None,
+            vec![
+                Operand::ExecutionModel(spirv::ExecutionModel::GLCompute),
+                Operand::IdRef(32),
+                Operand::LiteralString("main".to_string()),
+            ],
+        ));
+        module.execution_modes.push(inst(
+            Op::ExecutionMode,
+            None,
+            None,
+            vec![
+                Operand::IdRef(32),
+                Operand::ExecutionMode(spirv::ExecutionMode::LocalSize),
+                Operand::LiteralBit32(1),
+                Operand::LiteralBit32(1),
+                Operand::LiteralBit32(1),
+            ],
+        ));
+        module
+            .types_global_values
+            .push(inst(Op::TypeVoid, None, Some(30), vec![]));
+        module.types_global_values.push(inst(
+            Op::TypeFunction,
+            None,
+            Some(31),
+            vec![Operand::IdRef(30)],
+        ));
         module
     }
 
-    #[test]
-    fn drops_workgroup_struct_padding_byte_zero_store() {
-        let mut module = workgroup_struct_byte_store_module(5);
-
-        assert!(drop_workgroup_struct_padding_byte_zero_stores_module(
-            &mut module
-        ));
-        let insts = &module.functions[0].blocks[0].instructions;
-        assert!(
-            !insts.iter().any(|inst| inst.result_id == Some(9)),
-            "padding byte chain should be removed"
-        );
-        assert!(
-            !insts.iter().any(|inst| {
-                inst.class.opcode == Op::Store
-                    && matches!(inst.operands.first(), Some(Operand::IdRef(9)))
-            }),
-            "padding zero store should be removed"
-        );
+    fn owned_invalid_error(module: &Module) -> Option<String> {
+        match owned_module_failure(module) {
+            Some(OwnedModuleFailure::Invalid(error)) => Some(error),
+            Some(OwnedModuleFailure::CfgConstruction(error)) => {
+                panic!("ordinary value typing was misclassified as CFG construction: {error}")
+            }
+            Some(OwnedModuleFailure::TypeConstruction(error)) => {
+                panic!("ordinary value typing was misclassified as type construction: {error}")
+            }
+            Some(OwnedModuleFailure::RawBufferConstruction(error)) => {
+                panic!(
+                    "ordinary value typing was misclassified as raw-buffer construction: {error}"
+                )
+            }
+            None => None,
+        }
     }
 
     #[test]
-    fn drops_derived_workgroup_struct_padding_byte_zero_stores() {
-        let mut module = workgroup_struct_byte_store_module(6);
-        module.types_global_values.extend([
-            inst(
-                Op::Constant,
-                Some(2),
-                Some(10),
-                vec![Operand::LiteralBit32(1)],
+    fn owned_validity_check_enforces_ordinary_instruction_type_classes() {
+        let cases = [
+            (
+                inst(
+                    Op::IAdd,
+                    Some(1),
+                    Some(21),
+                    vec![Operand::IdRef(4), Operand::IdRef(6)],
+                ),
+                "native emitter: owned IAdd operands do not match its result type",
             ),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(12),
-                vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
+            (
+                inst(
+                    Op::IAdd,
+                    Some(2),
+                    Some(21),
+                    vec![Operand::IdRef(6), Operand::IdRef(6)],
+                ),
+                "native emitter: owned IAdd has an invalid result type class",
             ),
-            inst(Op::ConstantNull, Some(12), Some(13), vec![]),
-            inst(
-                Op::Constant,
-                Some(2),
-                Some(16),
-                vec![Operand::LiteralBit32(8)],
+            (
+                inst(
+                    Op::FAdd,
+                    Some(1),
+                    Some(21),
+                    vec![Operand::IdRef(4), Operand::IdRef(5)],
+                ),
+                "native emitter: owned FAdd has an invalid result type class",
             ),
-        ]);
-        module.functions[0].blocks[0].instructions = vec![
-            inst(
-                Op::PtrAccessChain,
-                Some(5),
-                Some(9),
-                vec![Operand::IdRef(8), Operand::IdRef(6)],
+            (
+                inst(
+                    Op::LogicalAnd,
+                    Some(3),
+                    Some(21),
+                    vec![Operand::IdRef(7), Operand::IdRef(4)],
+                ),
+                "native emitter: owned LogicalAnd operands do not match its result type",
             ),
-            inst(Op::UConvert, Some(1), Some(14), vec![Operand::IdRef(13)]),
-            inst(
-                Op::Store,
-                None,
-                None,
-                vec![Operand::IdRef(9), Operand::IdRef(14)],
+            (
+                inst(Op::CopyObject, Some(1), Some(21), vec![Operand::IdRef(6)]),
+                "native emitter: owned CopyObject operands do not match its result type",
             ),
-            inst(
-                Op::PtrAccessChain,
-                Some(5),
-                Some(11),
-                vec![Operand::IdRef(9), Operand::IdRef(10)],
+            (
+                inst(
+                    Op::Select,
+                    Some(1),
+                    Some(21),
+                    vec![Operand::IdRef(4), Operand::IdRef(4), Operand::IdRef(5)],
+                ),
+                "native emitter: owned OpSelect condition does not match its result lane shape",
             ),
-            inst(
-                Op::ShiftRightLogical,
-                Some(12),
-                Some(15),
-                vec![Operand::IdRef(13), Operand::IdRef(16)],
-            ),
-            inst(Op::UConvert, Some(1), Some(17), vec![Operand::IdRef(15)]),
-            inst(
-                Op::Store,
-                None,
-                None,
-                vec![Operand::IdRef(11), Operand::IdRef(17)],
+            (
+                inst(
+                    Op::Select,
+                    Some(8),
+                    Some(21),
+                    vec![Operand::IdRef(14), Operand::IdRef(11), Operand::IdRef(12)],
+                ),
+                "native emitter: owned OpSelect condition does not match its result lane shape",
             ),
         ];
 
-        assert!(drop_workgroup_struct_padding_byte_zero_stores_module(
-            &mut module
-        ));
-        let insts = &module.functions[0].blocks[0].instructions;
-        assert!(
-            !insts
-                .iter()
-                .any(|inst| inst.result_id == Some(9) || inst.result_id == Some(11)),
-            "direct and derived padding byte chains should be removed"
-        );
-        assert!(
-            !insts.iter().any(|inst| inst.class.opcode == Op::Store),
-            "all zero padding byte stores should be removed"
-        );
+        for (instruction, expected) in cases {
+            let module = module_with_typed_instruction(instruction);
+            assert_eq!(owned_invalid_error(&module).as_deref(), Some(expected));
+        }
     }
 
     #[test]
-    fn keeps_workgroup_struct_member_byte_zero_store() {
-        let mut module = workgroup_struct_byte_store_module(4);
+    fn owned_validity_check_enforces_comparison_classes_and_lane_shapes() {
+        let cases = [
+            (
+                inst(
+                    Op::IEqual,
+                    Some(3),
+                    Some(21),
+                    vec![Operand::IdRef(4), Operand::IdRef(6)],
+                ),
+                "native emitter: owned IEqual operands have different types",
+            ),
+            (
+                inst(
+                    Op::IEqual,
+                    Some(3),
+                    Some(21),
+                    vec![Operand::IdRef(7), Operand::IdRef(7)],
+                ),
+                "native emitter: owned IEqual has an invalid operand type class",
+            ),
+            (
+                inst(
+                    Op::FOrdEqual,
+                    Some(1),
+                    Some(21),
+                    vec![Operand::IdRef(6), Operand::IdRef(6)],
+                ),
+                "native emitter: owned FOrdEqual result does not preserve its Boolean lane shape",
+            ),
+            (
+                inst(
+                    Op::IEqual,
+                    Some(10),
+                    Some(21),
+                    vec![Operand::IdRef(11), Operand::IdRef(12)],
+                ),
+                "native emitter: owned IEqual result does not preserve its Boolean lane shape",
+            ),
+        ];
 
-        assert!(!drop_workgroup_struct_padding_byte_zero_stores_module(
-            &mut module
+        for (instruction, expected) in cases {
+            let module = module_with_typed_instruction(instruction);
+            assert_eq!(owned_invalid_error(&module).as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn owned_arithmetic_validity_check_matches_vulkan_validation() {
+        let module = module_with_typed_instruction(inst(
+            Op::IAdd,
+            Some(2),
+            Some(21),
+            vec![Operand::IdRef(4), Operand::IdRef(5)],
         ));
-        let insts = &module.functions[0].blocks[0].instructions;
-        assert!(insts.iter().any(|inst| inst.result_id == Some(9)));
+
+        assert_eq!(
+            owned_invalid_error(&module).as_deref(),
+            Some("native emitter: owned IAdd operands do not match its result type")
+        );
+        let bytes = module
+            .assemble()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_owned_arithmetic_type_{}",
+            std::process::id()
+        ));
+        let validation = crate::tools::spirv_val_bytes(&bytes, &tmp);
+        let _ = std::fs::remove_dir(&tmp);
+        assert!(
+            validation.is_err(),
+            "spirv-val must reject the malformed arithmetic type contract"
+        );
     }
 
     #[test]
@@ -1384,5 +1626,314 @@ mod tests {
             module.annotations[0].operands.first(),
             Some(&Operand::IdRef(1))
         );
+    }
+
+    #[test]
+    fn prunes_unobserved_pointer_null_and_its_debug_records() {
+        let mut module = Module::default();
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(2),
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(1),
+                ],
+            ),
+            inst(Op::ConstantNull, Some(2), Some(3), vec![]),
+        ];
+        module.debug_names.push(inst(
+            Op::Name,
+            None,
+            None,
+            vec![Operand::IdRef(3), Operand::LiteralString("dead".into())],
+        ));
+
+        assert!(prune_unused_null_and_undef_constants_module(&mut module));
+        assert!(module
+            .types_global_values
+            .iter()
+            .all(|instruction| instruction.result_id != Some(3)));
+        assert!(module.debug_names.is_empty());
+    }
+
+    fn module_with_forwarded_bda_address(extracted_path: Vec<Operand>) -> Module {
+        let mut module = Module::new();
+        module.memory_model = Some(inst(
+            Op::MemoryModel,
+            None,
+            None,
+            vec![
+                Operand::AddressingModel(AddressingModel::PhysicalStorageBuffer64),
+                Operand::MemoryModel(MemoryModel::GLSL450),
+            ],
+        ));
+        module.types_global_values = vec![
+            inst(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::TypePointer,
+                None,
+                Some(3),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(1),
+                ],
+            ),
+            inst(
+                Op::TypeStruct,
+                None,
+                Some(4),
+                vec![Operand::IdRef(3), Operand::IdRef(2)],
+            ),
+            inst(Op::TypeStruct, None, Some(5), vec![Operand::IdRef(4)]),
+            inst(Op::ConstantNull, Some(2), Some(6), vec![]),
+            inst(
+                Op::Constant,
+                Some(2),
+                Some(7),
+                vec![Operand::LiteralBit32(1), Operand::LiteralBit32(0)],
+            ),
+            inst(Op::Undef, Some(5), Some(8), vec![]),
+        ];
+        let extract_type = if extracted_path.last() == Some(&Operand::LiteralBit32(0)) {
+            3
+        } else {
+            2
+        };
+        let mut extract_operands = vec![Operand::IdRef(10)];
+        extract_operands.extend(extracted_path);
+        let mut function = Function::new();
+        function.blocks.push(Block {
+            label: Some(inst(Op::Label, None, Some(9), vec![])),
+            instructions: vec![
+                inst(
+                    Op::CompositeInsert,
+                    Some(5),
+                    Some(10),
+                    vec![
+                        Operand::IdRef(7),
+                        Operand::IdRef(8),
+                        Operand::LiteralBit32(0),
+                        Operand::LiteralBit32(0),
+                    ],
+                ),
+                inst(
+                    Op::CompositeExtract,
+                    Some(extract_type),
+                    Some(11),
+                    extract_operands,
+                ),
+            ],
+        });
+        module.functions.push(function);
+        module
+    }
+
+    #[test]
+    fn constructs_unobserved_pointer_field_for_forwarded_bda_address() {
+        let mut module = module_with_forwarded_bda_address(vec![
+            Operand::LiteralBit32(0),
+            Operand::LiteralBit32(1),
+        ]);
+
+        assert!(lower_unobserved_bda_aggregate_pointer_fields_module(&mut module).unwrap());
+        let nested = module
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(4))
+            .unwrap();
+        assert_eq!(nested.operands.first(), Some(&Operand::IdRef(2)));
+
+        let mut observed = module_with_forwarded_bda_address(vec![
+            Operand::LiteralBit32(0),
+            Operand::LiteralBit32(0),
+        ]);
+        assert!(!lower_unobserved_bda_aggregate_pointer_fields_module(&mut observed).unwrap());
+        let nested = observed
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(4))
+            .unwrap();
+        assert_eq!(nested.operands.first(), Some(&Operand::IdRef(3)));
+    }
+
+    #[test]
+    fn unchanged_owner_does_not_mask_an_unrelated_dangling_record() {
+        let mut module = Module::default();
+        module.debug_names.push(inst(
+            Op::Name,
+            None,
+            None,
+            vec![Operand::IdRef(99), Operand::LiteralString("unowned".into())],
+        ));
+
+        assert!(!finish_id_deleting_rewrite(
+            &mut module,
+            HashSet::new(),
+            false
+        ));
+        assert_eq!(module.debug_names.len(), 1);
+    }
+
+    #[test]
+    fn relooper_removes_only_records_for_ids_in_its_replaced_cfg() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(3));
+        let mut function = Function::new();
+        function.blocks = vec![
+            Block {
+                label: Some(inst(Op::Label, None, Some(1), vec![])),
+                instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(2)])],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(2), vec![])),
+                instructions: vec![inst(Op::Return, None, None, vec![])],
+            },
+        ];
+        module.functions.push(function);
+        module.debug_names = vec![
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(1),
+                    Operand::LiteralString("old-entry".into()),
+                ],
+            ),
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![Operand::IdRef(99), Operand::LiteralString("unowned".into())],
+            ),
+        ];
+
+        let defined_before = defined_result_ids(&module);
+        let changed = relooper::rewrite_to_relooper(&mut module, 16);
+        assert!(changed, "expected a construction");
+        finish_id_deleting_rewrite(&mut module, defined_before, changed);
+        add_native_module_capabilities(&mut module);
+        assert_eq!(module.debug_names.len(), 1);
+        assert_eq!(module.debug_names[0].operands[0], Operand::IdRef(99));
+    }
+
+    #[test]
+    fn missing_rejected_helper_identity_does_not_construct_unselected_module() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(3));
+        let mut function = Function::new();
+        function.blocks = vec![
+            Block {
+                label: Some(inst(Op::Label, None, Some(1), vec![])),
+                instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(2)])],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(2), vec![])),
+                instructions: vec![inst(Op::Return, None, None, vec![])],
+            },
+        ];
+        module.functions.push(function);
+
+        construct_cfg_functions_module(&mut module, &HashSet::from(["inlined_helper".to_string()]))
+            .expect("unselected module remains unchanged");
+        assert_eq!(module.functions[0].blocks.len(), 2);
+    }
+
+    #[test]
+    fn unowned_conditional_selects_construction_without_validation() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(14));
+        let mut function = Function::new();
+        function.def = Some(inst(Op::Function, None, Some(10), vec![]));
+        function.blocks = vec![
+            Block {
+                label: Some(inst(Op::Label, None, Some(11), vec![])),
+                instructions: vec![inst(
+                    Op::BranchConditional,
+                    None,
+                    None,
+                    vec![Operand::IdRef(1), Operand::IdRef(12), Operand::IdRef(13)],
+                )],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(12), vec![])),
+                instructions: vec![inst(Op::Return, None, None, vec![])],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(13), vec![])),
+                instructions: vec![inst(Op::Return, None, None, vec![])],
+            },
+        ];
+        module.functions.push(function);
+
+        construct_cfg_functions_module(&mut module, &HashSet::new())
+            .expect("unowned header construction");
+        assert_ne!(module.functions[0].blocks.len(), 3);
+    }
+
+    #[test]
+    fn backedge_to_selection_header_selects_construction_without_validation() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(16));
+        let mut function = Function::new();
+        function.def = Some(inst(Op::Function, None, Some(10), vec![]));
+        function.blocks = vec![
+            Block {
+                label: Some(inst(Op::Label, None, Some(11), vec![])),
+                instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(12)])],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(12), vec![])),
+                instructions: vec![
+                    inst(
+                        Op::SelectionMerge,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(15),
+                            Operand::SelectionControl(spirv::SelectionControl::NONE),
+                        ],
+                    ),
+                    inst(
+                        Op::BranchConditional,
+                        None,
+                        None,
+                        vec![Operand::IdRef(1), Operand::IdRef(13), Operand::IdRef(15)],
+                    ),
+                ],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(13), vec![])),
+                instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(12)])],
+            },
+            Block {
+                label: Some(inst(Op::Label, None, Some(15), vec![])),
+                instructions: vec![inst(Op::Return, None, None, vec![])],
+            },
+        ];
+        module.functions.push(function);
+
+        construct_cfg_functions_module(&mut module, &HashSet::new())
+            .expect("unowned backedge construction");
+        assert_ne!(module.functions[0].blocks.len(), 4);
     }
 }

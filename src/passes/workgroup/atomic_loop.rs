@@ -145,16 +145,44 @@ fn apply_unroll_plan(ctx: &mut Ctx, entry_idx: usize, plan: LoopPlan) {
     ));
     if let Some(preheader_idx) = plan.preheader_idx {
         let preheader = &mut ctx.module.functions[entry_idx].blocks[preheader_idx];
-        if preheader.instructions.last().is_some_and(|inst| {
-            inst.class.opcode == Op::Branch && id_ref_at(inst, 0) == Some(plan.header_id)
-        }) {
-            preheader.instructions.pop();
-            preheader.instructions.extend(unrolled);
-            return;
+        match splice_unrolled_preheader(preheader, plan.header_id, unrolled) {
+            Ok(()) => return,
+            Err(retained) => unrolled = retained,
         }
     }
     let block = &mut ctx.module.functions[entry_idx].blocks[plan.header_idx];
     block.instructions = unrolled;
+}
+
+/// Replace a preheader's branch into the eliminated loop without separating an enclosing loop's
+/// `OpLoopMerge` from the replacement branch. The unrolled body executes in the preheader, but the
+/// enclosing merge declaration still describes that block's terminator and must remain immediately
+/// before it.
+fn splice_unrolled_preheader(
+    preheader: &mut Block,
+    eliminated_header: Word,
+    mut unrolled: Vec<Instruction>,
+) -> Result<(), Vec<Instruction>> {
+    if !preheader.instructions.last().is_some_and(|instruction| {
+        instruction.class.opcode == Op::Branch
+            && id_ref_at(instruction, 0) == Some(eliminated_header)
+    }) {
+        return Err(unrolled);
+    }
+    let Some(replacement_branch) = unrolled.pop() else {
+        return Err(unrolled);
+    };
+    preheader.instructions.pop();
+    let enclosing_loop_merge = preheader
+        .instructions
+        .last()
+        .is_some_and(|instruction| instruction.class.opcode == Op::LoopMerge)
+        .then(|| preheader.instructions.pop())
+        .flatten();
+    preheader.instructions.extend(unrolled);
+    preheader.instructions.extend(enclosing_loop_merge);
+    preheader.instructions.push(replacement_branch);
+    Ok(())
 }
 
 fn collect_phi_specs(phis: &[Instruction], continue_id: Word) -> Option<Vec<PhiSpec>> {
@@ -369,5 +397,61 @@ fn remap_operand(operand: &mut Operand, ids: &HashMap<Word, Word>) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instruction(opcode: Op, result_id: Option<Word>, operands: Vec<Operand>) -> Instruction {
+        Instruction::new(opcode, None, result_id, operands)
+    }
+
+    #[test]
+    fn nested_atomic_unroll_keeps_enclosing_loop_merge_adjacent_to_branch() {
+        let mut preheader = Block {
+            label: Some(instruction(Op::Label, Some(1), vec![])),
+            instructions: vec![
+                instruction(
+                    Op::IAdd,
+                    Some(10),
+                    vec![Operand::IdRef(8), Operand::IdRef(9)],
+                ),
+                instruction(
+                    Op::LoopMerge,
+                    None,
+                    vec![
+                        Operand::IdRef(5),
+                        Operand::IdRef(4),
+                        Operand::LoopControl(spirv::LoopControl::NONE),
+                    ],
+                ),
+                instruction(Op::Branch, None, vec![Operand::IdRef(2)]),
+            ],
+        };
+        let unrolled = vec![
+            instruction(
+                Op::AtomicIAdd,
+                Some(11),
+                vec![Operand::IdRef(20), Operand::IdRef(21)],
+            ),
+            instruction(Op::Branch, None, vec![Operand::IdRef(3)]),
+        ];
+
+        splice_unrolled_preheader(&mut preheader, 2, unrolled).expect("splice");
+
+        assert_eq!(
+            preheader
+                .instructions
+                .iter()
+                .map(|instruction| instruction.class.opcode)
+                .collect::<Vec<_>>(),
+            vec![Op::IAdd, Op::AtomicIAdd, Op::LoopMerge, Op::Branch]
+        );
+        assert_eq!(
+            id_ref_at(preheader.instructions.last().expect("branch"), 0),
+            Some(3)
+        );
     }
 }

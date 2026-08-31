@@ -133,7 +133,11 @@ pub(in crate::passes) fn append_raw_byte_pointer_component_load(
             Op::Load,
             Some(byte_ty),
             Some(raw_byte),
-            vec![Operand::IdRef(ptr)],
+            vec![
+                Operand::IdRef(ptr),
+                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                Operand::LiteralBit32(1),
+            ],
         ));
         let widened = ctx.module.fresh_id();
         out.push(Instruction::new(
@@ -185,16 +189,17 @@ pub(in crate::passes) fn append_raw_byte_pointer_component_load(
     component
 }
 
-/// Replace a currently-invalid direct scalar load through an unsigned-byte pointer with an exact
+/// Replace a currently-invalid direct scalar/vector load through an unsigned-byte pointer with an exact
 /// little-endian byte replay. Unlike [`rewrite_raw_byte_pointer_wide_loads`], this handles a pointer
 /// value that is itself a parameter, select, or phi rather than the result of an over-indexing access
 /// chain. No alias choice is made: every byte access is derived from the already-selected pointer.
 ///
-/// Only plain loads of direct 16/32/64-bit integer or float scalars from StorageBuffer/Workgroup
-/// `uchar*` match. Matching loads are invalid before this repair because their result type differs
+/// Only plain loads of direct 16/32/64-bit integer or float scalars/vectors from StorageBuffer/Workgroup
+/// `uchar*` match. Matching loads are invalid before construction because their result type differs
 /// from the pointer's declared byte pointee; valid byte loads and qualified/volatile loads are left
 /// untouched.
 pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info = HashMap::<Word, (StorageClass, Word)>::new();
     for instruction in ctx
         .new_globals
@@ -220,7 +225,9 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
         pointer_is_byte_array: bool,
         result_id: Word,
         result_ty: Word,
-        result_bits: u32,
+        component_ty: Word,
+        component_bits: u32,
+        lanes: u32,
     }
 
     let mut plans = HashMap::<(usize, usize), Plan>::new();
@@ -236,7 +243,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
             ) else {
                 continue;
             };
-            let Some(pointer_ty) = value_result_type(ctx, *pointer) else {
+            let Some(pointer_ty) = value_types.get(pointer).copied() else {
                 continue;
             };
             let Some(&(storage, pointee)) = ptr_info.get(&pointer_ty) else {
@@ -266,7 +273,9 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
                 }
                 (*element, true)
             };
-            let Some(result_bits @ (16 | 32 | 64)) = direct_scalar_width(ctx, result_ty) else {
+            let Some((component_ty, lanes, component_bits)) =
+                raw_byte_pointer_load_shape(ctx, result_ty)
+            else {
                 continue;
             };
             plans.insert(
@@ -278,7 +287,9 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
                     pointer_is_byte_array,
                     result_id,
                     result_ty,
-                    result_bits,
+                    component_ty,
+                    component_bits,
+                    lanes,
                 },
             );
         }
@@ -287,8 +298,9 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
     let index_ty = ctx.ty_uint();
     let zero = ctx.const_uint(0);
     for block_idx in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old =
-            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[block_idx].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[block_idx]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len());
         for (instruction_idx, instruction) in old.into_iter().enumerate() {
             let Some(plan) = plans.get(&(block_idx, instruction_idx)).copied() else {
@@ -314,34 +326,44 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_direct_loads(ctx: &mut Ctx, en
             } else {
                 (plan.pointer, plan.pointer_ty)
             };
-            let value = append_raw_byte_pointer_component_load(
-                ctx,
-                &mut rewritten,
-                pointer,
-                pointer_ty,
-                plan.byte_ty,
-                index_ty,
-                zero,
-                plan.result_ty,
-                plan.result_bits,
-            );
+            let component_bytes = plan.component_bits / RAW_BYTE_POINTER_ELEMENT_BITS;
+            let mut components = Vec::with_capacity(plan.lanes as usize);
+            for lane in 0..plan.lanes {
+                let byte_offset = ctx.const_uint(lane * component_bytes);
+                let value = append_raw_byte_pointer_component_load(
+                    ctx,
+                    &mut rewritten,
+                    pointer,
+                    pointer_ty,
+                    plan.byte_ty,
+                    index_ty,
+                    byte_offset,
+                    plan.component_ty,
+                    plan.component_bits,
+                );
+                components.push(Operand::IdRef(value));
+            }
             rewritten.push(Instruction::new(
-                Op::CopyObject,
+                if plan.lanes == 1 {
+                    Op::CopyObject
+                } else {
+                    Op::CompositeConstruct
+                },
                 Some(plan.result_ty),
                 Some(plan.result_id),
-                vec![Operand::IdRef(value)],
+                components,
             ));
         }
         ctx.module.functions[entry_idx].blocks[block_idx].instructions = rewritten;
     }
 }
 
-/// Replay plain scalar/vector loads whose exact AIR byte address lands in a canonical raw-byte
+/// Replay plain scalar/vector memory operations whose exact AIR byte address lands in a canonical raw-byte
 /// buffer block. A typed aggregate pointer can become invalid after interface reconstruction turns
 /// its root into `{ RuntimeArray<uchar> }`; the emitter sidecar retains the exact constant byte
 /// address independently of that discarded aggregate shape. Reading the leaf directly from member
 /// zero is therefore both byte-exact and independent of stale intermediate pointer types.
-pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry_idx: usize) {
+pub(in crate::passes) fn rewrite_exact_raw_byte_block_memory(ctx: &mut Ctx, entry_idx: usize) {
     #[derive(Clone)]
     enum OffsetPlan {
         Constant(u32),
@@ -353,15 +375,22 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
     }
 
     #[derive(Clone)]
+    enum Operation {
+        Load { result: Word },
+        Store { value: Word },
+    }
+
+    #[derive(Clone)]
     struct Plan {
         root: Word,
         byte_ty: Word,
         offset: OffsetPlan,
-        result: Word,
-        result_ty: Word,
+        pointer: Word,
+        object_ty: Word,
         component_ty: Word,
         component_bits: u32,
         lanes: u32,
+        operation: Operation,
     }
 
     let value_types = combined_value_types(ctx, entry_idx);
@@ -372,46 +401,6 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
         .filter_map(|inst| inst.result_id.map(|result| (result, inst.clone())))
         .collect::<HashMap<_, _>>();
     let types = combined_type_defs(ctx, &existing_types);
-    let has_invalid_raw_chain = ctx.module.functions[entry_idx].blocks.iter().any(|block| {
-        block.instructions.iter().any(|instruction| {
-            if !matches!(
-                instruction.class.opcode,
-                Op::AccessChain | Op::InBoundsAccessChain
-            ) {
-                return false;
-            }
-            let Some(Operand::IdRef(base)) = instruction.operands.first() else {
-                return false;
-            };
-            let Some(base_pointer_ty) = value_types.get(base) else {
-                return false;
-            };
-            let Some(base_pointer) = types.get(base_pointer_ty) else {
-                return false;
-            };
-            let Some(Operand::IdRef(base_pointee)) = base_pointer.operands.get(1) else {
-                return false;
-            };
-            if !single_member_array_scalar_elem(ctx, *base_pointee)
-                .is_some_and(|element| is_unsigned_byte_scalar(ctx, element))
-            {
-                return false;
-            }
-            let walked = walk_into_type(ctx, *base_pointee, &instruction.operands[1..]);
-            let result_pointee = instruction
-                .result_type
-                .and_then(|pointer_ty| types.get(&pointer_ty))
-                .and_then(|pointer_ty| pointer_ty.operands.get(1))
-                .and_then(|operand| match operand {
-                    Operand::IdRef(pointee) => Some(*pointee),
-                    _ => None,
-                });
-            walked.is_none() || walked != result_pointee
-        })
-    });
-    if !has_invalid_raw_chain {
-        return;
-    }
     let definitions = ctx.module.functions[entry_idx]
         .blocks
         .iter()
@@ -502,17 +491,31 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
     let mut invalid_ancestry = HashMap::new();
     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if inst.class.opcode != Op::Load || inst.operands.len() != 1 {
-                continue;
-            }
-            let (Some(result), Some(result_ty), Some(Operand::IdRef(pointer))) =
-                (inst.result_id, inst.result_type, inst.operands.first())
-            else {
-                continue;
+            let (pointer, object_ty, operation) = match inst.class.opcode {
+                Op::Load if inst.operands.len() == 1 => {
+                    let (Some(result), Some(result_ty), Some(Operand::IdRef(pointer))) =
+                        (inst.result_id, inst.result_type, inst.operands.first())
+                    else {
+                        continue;
+                    };
+                    (*pointer, result_ty, Operation::Load { result })
+                }
+                Op::Store if inst.operands.len() == 2 => {
+                    let (Some(Operand::IdRef(pointer)), Some(Operand::IdRef(value))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    else {
+                        continue;
+                    };
+                    let Some(value_ty) = value_types.get(value).copied() else {
+                        continue;
+                    };
+                    (*pointer, value_ty, Operation::Store { value: *value })
+                }
+                _ => continue,
             };
             let dynamic_source = inherited_affine_byte_offset(
                 ctx,
-                *pointer,
+                pointer,
                 &affine_offsets,
                 &definitions,
                 &types,
@@ -532,7 +535,7 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
             });
             let invalid = pointer_has_invalid_raw_byte_block_ancestor(
                 ctx,
-                *pointer,
+                pointer,
                 &definitions,
                 &types,
                 &value_types,
@@ -541,8 +544,11 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
             );
             if let Some((root, constant, terms, index_ty)) = dynamic_source.filter(|_| invalid) {
                 if let Some((byte_ty, component_ty, lanes, component_bits)) =
-                    raw_root_load_shape(ctx, &types, &value_types, root, result_ty)
+                    raw_root_load_shape(ctx, &types, &value_types, root, object_ty)
                 {
+                    if matches!(operation, Operation::Store { .. }) && lanes != 1 {
+                        continue;
+                    }
                     plans.insert(
                         (bi, ii),
                         Plan {
@@ -553,11 +559,12 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                                 terms,
                                 index_ty,
                             },
-                            result,
-                            result_ty,
+                            pointer,
+                            object_ty,
                             component_ty,
                             component_bits,
                             lanes,
+                            operation,
                         },
                     );
                     continue;
@@ -565,7 +572,7 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
             }
             let inherited = inherited_exact_byte_offset(
                 ctx,
-                *pointer,
+                pointer,
                 &exact_offsets,
                 &definitions,
                 &types,
@@ -579,10 +586,13 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                 continue;
             }
             let Some((byte_ty, component_ty, lanes, component_bits)) =
-                raw_root_load_shape(ctx, &types, &value_types, root, result_ty)
+                raw_root_load_shape(ctx, &types, &value_types, root, object_ty)
             else {
                 continue;
             };
+            if matches!(operation, Operation::Store { .. }) && lanes != 1 {
+                continue;
+            }
             let Ok(byte_offset) = u32::try_from(byte_offset) else {
                 continue;
             };
@@ -592,11 +602,12 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                     root,
                     byte_ty,
                     offset: OffsetPlan::Constant(byte_offset),
-                    result,
-                    result_ty,
+                    pointer,
+                    object_ty,
                     component_ty,
                     component_bits,
                     lanes,
+                    operation,
                 },
             );
         }
@@ -608,7 +619,9 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
     let index_ty = ctx.ty_uint();
     let member0 = ctx.const_uint(0);
     for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len());
         for (ii, inst) in old.into_iter().enumerate() {
             let Some(plan) = plans.get(&(bi, ii)).cloned() else {
@@ -684,7 +697,9 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                     ));
                     sum
                 };
-                let component = if plan.component_bits == RAW_BYTE_POINTER_ELEMENT_BITS {
+                let component = if matches!(plan.operation, Operation::Load { .. })
+                    && plan.component_bits == RAW_BYTE_POINTER_ELEMENT_BITS
+                {
                     let pointer = ctx.module.fresh_id();
                     rewritten.push(Instruction::new(
                         Op::PtrAccessChain,
@@ -700,7 +715,7 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                         vec![Operand::IdRef(pointer)],
                     ));
                     value
-                } else {
+                } else if matches!(plan.operation, Operation::Load { .. }) {
                     append_raw_byte_pointer_component_load(
                         ctx,
                         &mut rewritten,
@@ -712,22 +727,110 @@ pub(in crate::passes) fn rewrite_exact_raw_byte_block_loads(ctx: &mut Ctx, entry
                         plan.component_ty,
                         plan.component_bits,
                     )
+                } else {
+                    offset
                 };
                 components.push(Operand::IdRef(component));
             }
-            rewritten.push(Instruction::new(
-                if plan.lanes == 1 {
-                    Op::CopyObject
-                } else {
-                    Op::CompositeConstruct
-                },
-                Some(plan.result_ty),
-                Some(plan.result),
-                components,
-            ));
+            match plan.operation {
+                Operation::Load { result } => rewritten.push(Instruction::new(
+                    if plan.lanes == 1 {
+                        Op::CopyObject
+                    } else {
+                        Op::CompositeConstruct
+                    },
+                    Some(plan.object_ty),
+                    Some(result),
+                    components,
+                )),
+                Operation::Store { value } => {
+                    let integer_ty = ctx.get_or_create(
+                        Op::TypeInt,
+                        None,
+                        vec![
+                            Operand::LiteralBit32(plan.component_bits),
+                            Operand::LiteralBit32(0),
+                        ],
+                    );
+                    let bits = if plan.object_ty == integer_ty {
+                        value
+                    } else {
+                        let bits = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::Bitcast,
+                            Some(integer_ty),
+                            Some(bits),
+                            vec![Operand::IdRef(value)],
+                        ));
+                        bits
+                    };
+                    let base_offset = match components.as_slice() {
+                        [Operand::IdRef(offset)] => *offset,
+                        _ => unreachable!("scalar exact raw-byte store has one offset"),
+                    };
+                    for byte in 0..component_bytes {
+                        let offset = if byte == 0 {
+                            base_offset
+                        } else {
+                            let byte = ctx.const_int_of(index_ty, i64::from(byte));
+                            let sum = ctx.module.fresh_id();
+                            rewritten.push(Instruction::new(
+                                Op::IAdd,
+                                Some(index_ty),
+                                Some(sum),
+                                vec![Operand::IdRef(base_offset), Operand::IdRef(byte)],
+                            ));
+                            sum
+                        };
+                        let pointer = ctx.module.fresh_id();
+                        rewritten.push(Instruction::new(
+                            Op::PtrAccessChain,
+                            Some(ptr_byte),
+                            Some(pointer),
+                            vec![Operand::IdRef(byte_base), Operand::IdRef(offset)],
+                        ));
+                        let shifted = if byte == 0 {
+                            bits
+                        } else {
+                            let shift = ctx.const_int_of(integer_ty, i64::from(byte * 8));
+                            let shifted = ctx.module.fresh_id();
+                            rewritten.push(Instruction::new(
+                                Op::ShiftRightLogical,
+                                Some(integer_ty),
+                                Some(shifted),
+                                vec![Operand::IdRef(bits), Operand::IdRef(shift)],
+                            ));
+                            shifted
+                        };
+                        let byte_value = if plan.component_bits == 8 {
+                            shifted
+                        } else {
+                            let byte_value = ctx.module.fresh_id();
+                            rewritten.push(Instruction::new(
+                                Op::UConvert,
+                                Some(plan.byte_ty),
+                                Some(byte_value),
+                                vec![Operand::IdRef(shifted)],
+                            ));
+                            byte_value
+                        };
+                        rewritten.push(Instruction::new(
+                            Op::Store,
+                            None,
+                            None,
+                            vec![Operand::IdRef(pointer), Operand::IdRef(byte_value)],
+                        ));
+                    }
+                }
+            }
         }
         ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
     }
+    crate::passes::resources::retire_dead_pointer_projections(
+        ctx,
+        entry_idx,
+        plans.values().map(|plan| plan.pointer),
+    );
 }
 
 fn raw_root_load_shape(
@@ -973,8 +1076,9 @@ fn pointer_has_invalid_raw_byte_block_ancestor(
                     _ => None,
                 })
                 .filter(|pointee| {
-                    single_member_array_scalar_elem(ctx, *pointee)
-                        .is_some_and(|element| is_unsigned_byte_scalar(ctx, element))
+                    is_unsigned_byte_scalar(ctx, *pointee)
+                        || single_member_array_scalar_elem(ctx, *pointee)
+                            .is_some_and(|element| is_unsigned_byte_scalar(ctx, element))
                 })
                 .is_some_and(|pointee| {
                     let walked = walk_into_type(ctx, pointee, &definition.operands[1..]);
@@ -1221,6 +1325,7 @@ pub(in crate::passes) fn inherited_affine_byte_offset(
 /// loads, and non-byte base views remain untouched.  The decision is entirely type/use topology, never
 /// a function name, resource id, or a single-workload observation.
 pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -1251,13 +1356,17 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
         lanes: u32,
         result_pointee: Word,
         base_is_byte_block: bool,
+        storage: StorageClass,
+        index_is_byte_offset: bool,
     }
 
     let mut plans = Vec::new();
     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
-            if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
-                || inst.operands.len() != 2
+            if !matches!(
+                inst.class.opcode,
+                Op::InBoundsAccessChain | Op::AccessChain | Op::PtrAccessChain
+            ) || inst.operands.len() != 2
             {
                 continue;
             }
@@ -1267,7 +1376,12 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
             let Some(&(storage, result_pointee)) = ptr_info.get(&result_ptr_ty) else {
                 continue;
             };
-            if storage != StorageClass::StorageBuffer {
+            if !matches!(
+                storage,
+                StorageClass::StorageBuffer
+                    | StorageClass::UniformConstant
+                    | StorageClass::PhysicalStorageBuffer
+            ) {
                 continue;
             }
             let Some((component_ty, lanes, component_bits)) =
@@ -1280,13 +1394,13 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
             else {
                 continue;
             };
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(base_storage, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
                 continue;
             };
-            if base_storage != StorageClass::StorageBuffer {
+            if base_storage != storage {
                 continue;
             }
             let (base_is_byte_block, byte_ty) = if is_unsigned_byte_scalar(ctx, base_pointee) {
@@ -1298,7 +1412,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
             } else {
                 continue;
             };
-            let Some(index_ty) = value_result_type(ctx, *index) else {
+            let Some(index_ty) = value_types.get(index).copied() else {
                 continue;
             };
             if !raw_byte_pointer_index_type(ctx, index_ty) {
@@ -1323,6 +1437,8 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
                 lanes,
                 result_pointee,
                 base_is_byte_block,
+                storage,
+                index_is_byte_offset: inst.class.opcode == Op::PtrAccessChain,
             });
         }
     }
@@ -1343,7 +1459,10 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if inst.result_id.is_some_and(|id| plan_ids.contains(&id))
-                && matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain)
+                && matches!(
+                    inst.class.opcode,
+                    Op::InBoundsAccessChain | Op::AccessChain | Op::PtrAccessChain
+                )
             {
                 continue;
             }
@@ -1389,7 +1508,9 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     let member0 = ctx.const_uint(0);
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len() + 32);
         for (ii, inst) in old.into_iter().enumerate() {
             if chain_at.contains_key(&(bi, ii)) {
@@ -1406,7 +1527,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
                 .result_id
                 .expect("raw-byte replay's exact typed load has a result id");
             let (byte_base, byte_base_pointer_type) = if plan.base_is_byte_block {
-                let byte_pointer_type = ctx.ty_ptr(StorageClass::StorageBuffer, plan.byte_ty);
+                let byte_pointer_type = ctx.ty_ptr(plan.storage, plan.byte_ty);
                 let byte_base = ctx.module.fresh_id();
                 rewritten.push(Instruction::new(
                     Op::InBoundsAccessChain,
@@ -1423,24 +1544,28 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_loads(ctx: &mut Ctx, entr
                 (plan.base, plan.base_ptr_ty)
             };
             let component_bytes = plan.component_bits / RAW_BYTE_POINTER_ELEMENT_BITS;
-            let stride_bytes = plan
-                .lanes
-                .checked_mul(component_bytes)
-                .expect("SPIR-V vector lane count times component bytes fits u32");
-            let base_offset = if let Some(offset) =
-                const_u32(ctx, plan.index).and_then(|index| index.checked_mul(stride_bytes))
-            {
-                ctx.const_int_of(plan.index_ty, i64::from(offset))
+            let base_offset = if plan.index_is_byte_offset {
+                plan.index
             } else {
-                let stride = ctx.const_int_of(plan.index_ty, stride_bytes as i64);
-                let base_offset = ctx.module.fresh_id();
-                rewritten.push(Instruction::new(
-                    Op::IMul,
-                    Some(plan.index_ty),
-                    Some(base_offset),
-                    vec![Operand::IdRef(plan.index), Operand::IdRef(stride)],
-                ));
-                base_offset
+                let stride_bytes = plan
+                    .lanes
+                    .checked_mul(component_bytes)
+                    .expect("SPIR-V vector lane count times component bytes fits u32");
+                if let Some(offset) =
+                    const_u32(ctx, plan.index).and_then(|index| index.checked_mul(stride_bytes))
+                {
+                    ctx.const_int_of(plan.index_ty, i64::from(offset))
+                } else {
+                    let stride = ctx.const_int_of(plan.index_ty, stride_bytes as i64);
+                    let base_offset = ctx.module.fresh_id();
+                    rewritten.push(Instruction::new(
+                        Op::IMul,
+                        Some(plan.index_ty),
+                        Some(base_offset),
+                        vec![Operand::IdRef(plan.index), Operand::IdRef(stride)],
+                    ));
+                    base_offset
+                }
             };
             let mut components = Vec::with_capacity(plan.lanes as usize);
             for lane in 0..plan.lanes {
@@ -1518,6 +1643,7 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
 ) -> Result<(), String> {
     const SLOT_BITS: u32 = 64;
     const ELEM_BITS: u32 = 32;
+    let value_types = function_value_types(ctx, entry_idx);
 
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
@@ -1542,6 +1668,7 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
         base_pointee: Word,
         result_pointee: Word,
         idx_id: Word,
+        idx_ty: Word,
         const_n: Option<u32>,
     }
     let mut plans: Vec<Plan> = Vec::new();
@@ -1573,6 +1700,12 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
             let Operand::IdRef(idx) = &indices[indices.len() - 1] else {
                 continue;
             };
+            let Some(idx_ty) = value_types.get(idx).copied() else {
+                continue;
+            };
+            if type_def_of(ctx, idx_ty).is_none_or(|def| def.class.opcode != Op::TypeInt) {
+                continue;
+            }
             let Some(&(sc_r, result_pointee)) = ptr_info.get(&result_type) else {
                 continue;
             };
@@ -1583,7 +1716,7 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
                 continue;
             }
             // Base must be a pointer to a DIRECT WIDE SCALAR in the SAME thread-local storage class.
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(sc_b, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -1614,6 +1747,7 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
                 base_pointee,
                 result_pointee,
                 idx_id: *idx,
+                idx_ty,
                 const_n,
             });
         }
@@ -1684,9 +1818,14 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
 
     let ulong_ty = ctx.ty_ulong();
     let uint_ty = ctx.ty_uint();
-    let plan_by_id: HashMap<Word, (Word, Word, Word, Option<u32>)> = plans
+    let plan_by_id: HashMap<Word, (Word, Word, Word, Word, Option<u32>)> = plans
         .iter()
-        .map(|p| (p.ac_id, (p.base, p.base_pointee, p.idx_id, p.const_n)))
+        .map(|p| {
+            (
+                p.ac_id,
+                (p.base, p.base_pointee, p.idx_id, p.idx_ty, p.const_n),
+            )
+        })
         .collect();
     let result_pointee_by_id: HashMap<Word, Word> =
         plans.iter().map(|p| (p.ac_id, p.result_pointee)).collect();
@@ -1705,7 +1844,9 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut newv: Vec<Instruction> = Vec::with_capacity(old.len() + 8);
         for (ii, inst) in old.into_iter().enumerate() {
             // The over-indexing chain itself is dead — every use now computes from the base directly.
@@ -1713,7 +1854,7 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
                 continue;
             }
             if let Some(&ac_id) = use_at.get(&(bi, ii)) {
-                let (base, base_pointee, idx_id, const_n) = plan_by_id[&ac_id];
+                let (base, base_pointee, idx_id, idx_ty, const_n) = plan_by_id[&ac_id];
                 let result_pointee = result_pointee_by_id[&ac_id];
                 // The bit offset of element N within the slot: `N*ELEM_BITS`, as a value id (None when
                 // it is statically zero). Const folds to a literal; a dynamic index multiplies by
@@ -1723,11 +1864,11 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
                     Some(0) => None,
                     Some(n) => Some(ctx.const_uint(n * ELEM_BITS)),
                     None => {
-                        let elem_const = ctx.const_uint(ELEM_BITS);
+                        let elem_const = ctx.const_int_of(idx_ty, i64::from(ELEM_BITS));
                         let id = ctx.module.fresh_id();
                         newv.push(Instruction::new(
                             Op::IMul,
-                            Some(uint_ty),
+                            Some(idx_ty),
                             Some(id),
                             vec![Operand::IdRef(idx_id), Operand::IdRef(elem_const)],
                         ));
@@ -1918,6 +2059,7 @@ pub(in crate::passes) fn rewrite_scalar_slot_array_overindex(
 /// chain for slot `k+1`, never mutating the original). Decides purely from IR structure (storage class
 /// + type walk + layout decorations), never a shader name.
 pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     // Pointer-type -> (storage class, pointee).
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
@@ -2042,7 +2184,7 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
             let Some(Operand::IdRef(ptr)) = inst.operands.first() else {
                 continue;
             };
-            let Some(ptr_ty) = value_result_type(ctx, *ptr) else {
+            let Some(ptr_ty) = value_types.get(ptr).copied() else {
                 continue;
             };
             let Some(&(sc, pointee_ty)) = ptr_info.get(&ptr_ty) else {
@@ -2095,7 +2237,7 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
                 if indices.is_empty() {
                     continue;
                 }
-                let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+                let Some(base_ptr_ty) = value_types.get(base).copied() else {
                     continue;
                 };
                 let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -2394,7 +2536,9 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
     // Splice each replacement in place of its original load.
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut newv: Vec<Instruction> = Vec::with_capacity(old.len() + 8);
         for (ii, inst) in old.into_iter().enumerate() {
             if let Some(seq) = replacement.get(&(bi, ii)) {
@@ -2412,6 +2556,7 @@ pub(in crate::passes) fn rewrite_reinterpret_scalar_loads(ctx: &mut Ctx, entry_i
 /// Workgroup/StorageBuffer byte arrays. Only plain stores of a 16/32/64-bit integer or float scalar
 /// match; valid byte stores and memory-access-qualified operations are untouched.
 pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info = HashMap::<Word, (StorageClass, Word)>::new();
     for instruction in ctx
         .new_globals
@@ -2449,7 +2594,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
             else {
                 continue;
             };
-            let Some(pointer_ty) = value_result_type(ctx, *pointer) else {
+            let Some(pointer_ty) = value_types.get(pointer).copied() else {
                 continue;
             };
             let Some(&(storage, byte_ty)) = ptr_info.get(&pointer_ty) else {
@@ -2462,7 +2607,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
             {
                 continue;
             }
-            let Some(value_ty) = value_result_type(ctx, *value) else {
+            let Some(value_ty) = value_types.get(value).copied() else {
                 continue;
             };
             let Some(value_bits @ (16 | 32 | 64)) = direct_scalar_width(ctx, value_ty) else {
@@ -2483,8 +2628,9 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
     }
 
     for block_idx in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old =
-            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[block_idx].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[block_idx]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len());
         for (instruction_idx, instruction) in old.into_iter().enumerate() {
             let Some(plan) = plans.get(&(block_idx, instruction_idx)).copied() else {

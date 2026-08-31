@@ -2,9 +2,9 @@
 //!
 //! The AIR `llvm.agx3.*.with.emask.global.*` family is a stable LLVM/AGX ABI namespace, not a
 //! shader identifier. The observed `sdpa_tile_fwd_reduction` shape uses byte-addressed global
-//! pointers plus two 4-bit lane masks. Loads leave inactive lanes as zero; stores skip inactive lanes.
-//! Lower memory operations into explicit four-lane guarded control flow so inactive lanes are never
-//! speculatively dereferenced.
+//! pointers plus two lane masks. Loads leave inactive lanes as zero; stores skip inactive lanes.
+//! Lower scalar and short-vector operations into explicit guarded control flow so inactive lanes are
+//! never speculatively dereferenced.
 
 use super::*;
 use std::collections::HashSet;
@@ -190,15 +190,71 @@ fn split_agx_emask_memory_call(
         ));
     }
 
-    let successors = terminator_successors(suffix.last().expect("suffix terminator"));
-    let cont_label = ctx.module.fresh_id();
-    let test_labels: Vec<Word> = (0..AGX_EMASK_LANES)
-        .map(|_| ctx.module.fresh_id())
-        .collect();
-    let body_labels: Vec<Word> = (0..AGX_EMASK_LANES)
-        .map(|_| ctx.module.fresh_id())
-        .collect();
+    // Splitting a loop-header call must not move OpLoopMerge onto the new continuation block: the
+    // original label remains the backedge target and therefore remains the loop header. Keep the
+    // claim on that label, and turn the former loop-exit conditional into an ordinary selection with
+    // a private pass-through merge. This carries CFG ownership through intrinsic lowering instead of
+    // asking a later validator-triggered prune to erase the malformed loop.
+    let loop_merge = suffix
+        .iter()
+        .position(|inst| inst.class.opcode == Op::LoopMerge)
+        .map(|index| suffix.remove(index));
+    let mut loop_exit_passthrough = None;
+    if let Some(loop_merge) = &loop_merge {
+        let merge_target = loop_merge
+            .operands
+            .first()
+            .and_then(|operand| match operand {
+                Operand::IdRef(target) => Some(*target),
+                _ => None,
+            })
+            .ok_or("AGX emask loop split found a malformed OpLoopMerge")?;
+        let terminator = suffix
+            .last_mut()
+            .ok_or("AGX emask loop split lost its terminator")?;
+        match terminator.class.opcode {
+            Op::Branch => {}
+            Op::BranchConditional => {
+                let exits_at_merge = terminator
+                    .operands
+                    .iter()
+                    .skip(1)
+                    .any(|operand| *operand == Operand::IdRef(merge_target));
+                if !exits_at_merge {
+                    return Err(
+                        "AGX emask loop-header conditional does not target its loop merge".into(),
+                    );
+                }
+                let private_merge = ctx.module.fresh_id();
+                for operand in terminator.operands.iter_mut().skip(1) {
+                    if *operand == Operand::IdRef(merge_target) {
+                        *operand = Operand::IdRef(private_merge);
+                    }
+                }
+                let terminator_index = suffix.len() - 1;
+                suffix.insert(
+                    terminator_index,
+                    Instruction::new(
+                        Op::SelectionMerge,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(private_merge),
+                            Operand::SelectionControl(spirv::SelectionControl::NONE),
+                        ],
+                    ),
+                );
+                loop_exit_passthrough = Some((private_merge, merge_target));
+            }
+            _ => {
+                return Err(
+                    "AGX emask lowering cannot split this loop-header terminator honestly".into(),
+                );
+            }
+        }
+    }
 
+    let successors = terminator_successors(suffix.last().expect("suffix terminator"));
     let replacement = if is_load {
         plan_load(
             ctx,
@@ -211,6 +267,10 @@ fn split_agx_emask_memory_call(
     } else {
         plan_store(ctx, &site.name, &args)?
     };
+    let cont_label = ctx.module.fresh_id();
+    let lanes = replacement.lanes;
+    let test_labels: Vec<Word> = (0..lanes).map(|_| ctx.module.fresh_id()).collect();
+    let body_labels: Vec<Word> = (0..lanes).map(|_| ctx.module.fresh_id()).collect();
 
     let mask0 = ensure_u32(ctx, &mut prefix, replacement.mask0, "AGX emask mask0")?;
     let mask1 = ensure_u32(ctx, &mut prefix, replacement.mask1, "AGX emask mask1")?;
@@ -223,6 +283,9 @@ fn split_agx_emask_memory_call(
             vec![Operand::IdRef(scratch), Operand::IdRef(zero)],
         ));
     }
+    if let Some(loop_merge) = loop_merge {
+        prefix.push(loop_merge);
+    }
     prefix.push(Instruction::new(
         Op::Branch,
         None,
@@ -230,10 +293,10 @@ fn split_agx_emask_memory_call(
         vec![Operand::IdRef(test_labels[0])],
     ));
 
-    let mut blocks = Vec::with_capacity((AGX_EMASK_LANES as usize) * 2 + 1);
-    for lane in 0..AGX_EMASK_LANES {
+    let mut blocks = Vec::with_capacity((lanes as usize) * 2 + 1);
+    for lane in 0..lanes {
         let lane_idx = lane as usize;
-        let next = if lane + 1 == AGX_EMASK_LANES {
+        let next = if lane + 1 == lanes {
             cont_label
         } else {
             test_labels[lane_idx + 1]
@@ -284,17 +347,48 @@ fn split_agx_emask_memory_call(
         );
     }
     blocks.push(block(cont_label, suffix));
+    if let Some((private_merge, merge_target)) = loop_exit_passthrough {
+        blocks.push(block(
+            private_merge,
+            vec![Instruction::new(
+                Op::Branch,
+                None,
+                None,
+                vec![Operand::IdRef(merge_target)],
+            )],
+        ));
+    }
 
     ctx.module.functions[entry_idx].blocks[site.block].instructions = prefix;
     ctx.module.functions[entry_idx]
         .blocks
         .splice(site.block + 1..site.block + 1, blocks);
-    rewrite_successor_phi_predecessors(
-        &mut ctx.module.functions[entry_idx],
-        &successors,
-        old_label,
-        cont_label,
-    );
+    if let Some((private_merge, merge_target)) = loop_exit_passthrough {
+        let merge_successor = HashSet::from([merge_target]);
+        rewrite_successor_phi_predecessors(
+            &mut ctx.module.functions[entry_idx],
+            &merge_successor,
+            old_label,
+            private_merge,
+        );
+        let ordinary_successors = successors
+            .difference(&merge_successor)
+            .copied()
+            .collect::<HashSet<_>>();
+        rewrite_successor_phi_predecessors(
+            &mut ctx.module.functions[entry_idx],
+            &ordinary_successors,
+            old_label,
+            cont_label,
+        );
+    } else {
+        rewrite_successor_phi_predecessors(
+            &mut ctx.module.functions[entry_idx],
+            &successors,
+            old_label,
+            cont_label,
+        );
+    }
     Ok(())
 }
 
@@ -309,6 +403,11 @@ struct MemoryReplacement {
     ptr_ty: Word,
     load_scratch: Option<(Word, Word)>,
     load_scratch_result: Option<(Word, Word, Word, Word)>,
+    lanes: u32,
+}
+
+fn emask_value_shape(ctx: &Ctx, ty: Word) -> Option<(Word, u32)> {
+    composite_shape(ctx, ty).or_else(|| direct_scalar_bit_width(ctx, ty).map(|_| (ty, 1)))
 }
 
 fn plan_load(
@@ -325,9 +424,9 @@ fn plan_load(
     let res = res.ok_or_else(|| format!("{name} has no result id"))?;
     let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
     let (elem_ty, lanes) =
-        composite_shape(ctx, rty).ok_or_else(|| format!("{name} result is not a vector"))?;
-    if lanes != AGX_EMASK_LANES {
-        return Err(format!("{name} result is not a 4-lane vector"));
+        emask_value_shape(ctx, rty).ok_or_else(|| format!("{name} result has no scalar shape"))?;
+    if !(1..=AGX_EMASK_LANES).contains(&lanes) {
+        return Err(format!("{name} result is not a scalar or 2-4 lane value"));
     }
     if !matches!(scalar_bit_width(ctx, elem_ty), 8 | 16 | 32) {
         return Err(format!("{name} result element is not 8-, 16-, or 32-bit"));
@@ -349,6 +448,7 @@ fn plan_load(
         ptr_ty,
         load_scratch: Some((scratch, zero)),
         load_scratch_result: Some((scratch, zero, res, rty)),
+        lanes,
     })
 }
 
@@ -358,10 +458,10 @@ fn plan_store(ctx: &mut Ctx, name: &str, args: &[Word]) -> Result<MemoryReplacem
     }
     let value_ty =
         value_result_type(ctx, args[1]).ok_or_else(|| format!("{name} value has no type"))?;
-    let (elem_ty, lanes) =
-        composite_shape(ctx, value_ty).ok_or_else(|| format!("{name} value is not a vector"))?;
-    if lanes != AGX_EMASK_LANES {
-        return Err(format!("{name} value is not a 4-lane vector"));
+    let (elem_ty, lanes) = emask_value_shape(ctx, value_ty)
+        .ok_or_else(|| format!("{name} value has no scalar shape"))?;
+    if !(1..=AGX_EMASK_LANES).contains(&lanes) {
+        return Err(format!("{name} value is not a scalar or 2-4 lane value"));
     }
     if !matches!(scalar_bit_width(ctx, elem_ty), 8 | 16 | 32) {
         return Err(format!("{name} value element is not 8-, 16-, or 32-bit"));
@@ -381,6 +481,7 @@ fn plan_store(ctx: &mut Ctx, name: &str, args: &[Word]) -> Result<MemoryReplacem
         ptr_ty,
         load_scratch: None,
         load_scratch_result: None,
+        lanes,
     })
 }
 
@@ -401,7 +502,11 @@ fn append_lane_memory_op(
         lane,
     )?;
     if let Some(value) = replacement.value {
-        let lane_value = composite_extract(ctx, out, replacement.elem_ty, value, lane);
+        let lane_value = if replacement.lanes == 1 {
+            value
+        } else {
+            composite_extract(ctx, out, replacement.elem_ty, value, lane)
+        };
         let lane_value = coerce_store_lane_value(
             ctx,
             out,
@@ -433,29 +538,34 @@ fn append_lane_memory_op(
         ));
         let lane_value =
             coerce_loaded_lane_value(ctx, out, loaded_lane, load_ty, replacement.elem_ty);
-        let current = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::Load,
-            Some(rty),
-            Some(current),
-            vec![Operand::IdRef(scratch)],
-        ));
-        let inserted = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::CompositeInsert,
-            Some(rty),
-            Some(inserted),
-            vec![
-                Operand::IdRef(lane_value),
-                Operand::IdRef(current),
-                Operand::LiteralBit32(lane),
-            ],
-        ));
+        let stored = if replacement.lanes == 1 {
+            lane_value
+        } else {
+            let current = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::Load,
+                Some(rty),
+                Some(current),
+                vec![Operand::IdRef(scratch)],
+            ));
+            let inserted = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::CompositeInsert,
+                Some(rty),
+                Some(inserted),
+                vec![
+                    Operand::IdRef(lane_value),
+                    Operand::IdRef(current),
+                    Operand::LiteralBit32(lane),
+                ],
+            ));
+            inserted
+        };
         out.push(Instruction::new(
             Op::Store,
             None,
             None,
-            vec![Operand::IdRef(scratch), Operand::IdRef(inserted)],
+            vec![Operand::IdRef(scratch), Operand::IdRef(stored)],
         ));
     }
     Ok(())
@@ -832,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn emask_store_split_retargets_successor_phi_predecessor() {
+    fn emask_store_split_preserves_phi_and_loop_ownership() {
         let mut module = Module::new();
         module.header = Some(ModuleHeader::new(300));
         module.types_global_values = vec![
@@ -954,6 +1064,55 @@ mod tests {
             ],
             end: Some(inst(Op::FunctionEnd, None, None, vec![])),
         }];
+        let mut loop_module = module.clone();
+        loop_module
+            .types_global_values
+            .push(inst(Op::ConstantTrue, Some(5), Some(33), vec![]));
+        let call = loop_module.functions[0].blocks[0].instructions[0].clone();
+        loop_module.functions[0].blocks = vec![
+            block(
+                9,
+                vec![inst(Op::Branch, None, None, vec![Operand::IdRef(10)])],
+            ),
+            block(
+                10,
+                vec![
+                    call,
+                    inst(
+                        Op::LoopMerge,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(20),
+                            Operand::IdRef(12),
+                            Operand::LoopControl(spirv::LoopControl::NONE),
+                        ],
+                    ),
+                    inst(
+                        Op::BranchConditional,
+                        None,
+                        None,
+                        vec![Operand::IdRef(33), Operand::IdRef(12), Operand::IdRef(20)],
+                    ),
+                ],
+            ),
+            block(
+                12,
+                vec![inst(Op::Branch, None, None, vec![Operand::IdRef(10)])],
+            ),
+            block(
+                20,
+                vec![
+                    inst(
+                        Op::Phi,
+                        Some(4),
+                        Some(50),
+                        vec![Operand::IdRef(32), Operand::IdRef(10)],
+                    ),
+                    inst(Op::Return, None, None, vec![]),
+                ],
+            ),
+        ];
         let mut ctx = Ctx::new(module);
 
         lower_agx_emask_memory_calls(&mut ctx, 0).expect("emask store splits");
@@ -981,5 +1140,80 @@ mod tests {
         let phi = phi.expect("successor phi remains");
         assert_ne!(phi.operands.get(1), Some(&Operand::IdRef(10)));
         assert!(matches!(phi.operands.get(1), Some(Operand::IdRef(_))));
+
+        let mut loop_ctx = Ctx::new(loop_module);
+        lower_agx_emask_memory_calls(&mut loop_ctx, 0).expect("loop-header emask store splits");
+        let function = &loop_ctx.module.functions[0];
+        let header = function
+            .blocks
+            .iter()
+            .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(10))
+            .expect("original loop header");
+        assert_eq!(
+            header
+                .instructions
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::LoopMerge)
+                .count(),
+            1
+        );
+        assert_eq!(
+            header.instructions.last().map(|inst| inst.class.opcode),
+            Some(Op::Branch)
+        );
+        assert_eq!(
+            function
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block
+                        .instructions
+                        .iter()
+                        .any(|inst| inst.class.opcode == Op::LoopMerge)
+                })
+                .count(),
+            1,
+            "the backedge target must remain the sole loop header"
+        );
+        let exit_test = function
+            .blocks
+            .iter()
+            .find(|block| {
+                block.instructions.last().is_some_and(|inst| {
+                    inst.class.opcode == Op::BranchConditional
+                        && inst.operands.first() == Some(&Operand::IdRef(33))
+                })
+            })
+            .expect("lowered loop exit test");
+        let selection = &exit_test.instructions[exit_test.instructions.len() - 2];
+        assert_eq!(selection.class.opcode, Op::SelectionMerge);
+        let private_merge = match selection.operands.first() {
+            Some(Operand::IdRef(label)) => *label,
+            other => panic!("selection has no private merge: {other:?}"),
+        };
+        assert_ne!(private_merge, 20);
+        let passthrough = function
+            .blocks
+            .iter()
+            .find(|block| {
+                block.label.as_ref().and_then(|label| label.result_id) == Some(private_merge)
+            })
+            .expect("private loop-exit merge");
+        assert!(matches!(
+            passthrough.instructions.as_slice(),
+            [instruction]
+                if instruction.class.opcode == Op::Branch
+                    && instruction.operands == [Operand::IdRef(20)]
+        ));
+        let merge_phi = function
+            .blocks
+            .iter()
+            .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(20))
+            .and_then(|block| block.instructions.first())
+            .expect("loop merge phi");
+        assert_eq!(
+            merge_phi.operands.get(1),
+            Some(&Operand::IdRef(private_merge))
+        );
     }
 }

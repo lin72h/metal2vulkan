@@ -34,9 +34,27 @@ pub(in crate::native) fn plan_self_check_reason(
     // not (the header sits between CH and CM). If the loop's own merge ML is then dominated by CM — it
     // lands at/after the construct's merge — the construct boundaries invert: CM branches back into the
     // loop's merge, and the structured emitter produces "branches to / exits the selection construct,
-    // but not via the header" rejects (a previously observed module shape). The kept repair path structures
+    // but not via the header" rejects (a previously observed module shape). The relooper retry structures
     // these correctly, so reject and fall back rather than emit invalid SPIR-V.
     let plan_forest = analyze(ordered);
+    // Every dominance back-edge must target a header that the emitted plan owns as a loop. A
+    // construct-tree rewrite can preserve a source back-edge while losing that ownership; emitting
+    // it as an ordinary branch produces a SPIR-V back-edge to a non-loop header.
+    for block in ordered {
+        for successor in block_successors(block) {
+            if plan_forest.dominates(&successor, &block.name)
+                && !loop_merges.contains_key(&successor)
+            {
+                if crate::env_vars::spi_why() {
+                    eprintln!(
+                        "[spi-why]   backedge-target-unowned block={} -> {}",
+                        block.name, successor,
+                    );
+                }
+                return Some("loop:backedge-target-unowned");
+            }
+        }
+    }
     for l in &plan_forest.loops {
         let Some(info) = loop_merges.get(&l.header) else {
             continue;
@@ -69,8 +87,8 @@ pub(in crate::native) fn plan_self_check_reason(
     // loop) MUST be dominated by the header — i.e. private to that arm. When an arm jumps to a block
     // reached from OUTSIDE the construct too, the shared block is not dominated by any one header and
     // lands after that header's merge in emission order, so the header "exits the selection ... but not
-    // via a structured exit". Structured SPIR-V needs the shared block CLONED per level, which the kept
-    // repair path does; reject and fall back. Two shapes hit this:
+    // via a structured exit". Structured SPIR-V needs the shared block CLONED per level; reject so the
+    // whole-CFG retry can rebuild it. Two shapes hit this:
     //   - conditionals: a short-circuit `a || b || c` ladder funnels every condition's taken-arm into
     //     one shared block (a previously observed module shape).
     //   - switches: a `switch` case/default target is a SIBLING arm of an enclosing selection (banked
@@ -93,11 +111,54 @@ pub(in crate::native) fn plan_self_check_reason(
     let is_enclosing_break = |b: &str, a: &str| -> bool {
         plan_forest.loops.iter().any(|l| {
             l.body.iter().any(|n| n == b)
-                && loop_merges
-                    .get(&l.header)
-                    .is_some_and(|i| i.merge == a || i.continue_target == a)
+                && (l.header == a
+                    || loop_merges
+                        .get(&l.header)
+                        .is_some_and(|i| i.merge == a || i.continue_target == a))
         })
     };
+
+    // A child selection merge remains inside every enclosing selection until it reaches each
+    // enclosing selection's own merge. An inner merge may not jump directly to a more distant
+    // selection merge: SPIR-V does not treat that as a structured break. Other internal edges retain
+    // the established construct-tree bare-loop-role handling.
+    let selection_merges = header_merge
+        .values()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    for block in ordered {
+        if !selection_merges.contains(block.name.as_str()) {
+            continue;
+        }
+        for successor in block_successors(block) {
+            let mut owner = Some(block.name.as_str());
+            while let Some(header) = owner {
+                let Some(merge) = header_merge.get(header) else {
+                    owner = plan_forest.idom(header);
+                    continue;
+                };
+                if plan_loop_headers.contains(header) || plan_forest.dominates(merge, &block.name) {
+                    owner = plan_forest.idom(header);
+                    continue;
+                }
+                let remains_inside = plan_forest.dominates(header, &successor)
+                    && !plan_forest.dominates(merge, &successor);
+                if successor != *merge
+                    && !remains_inside
+                    && !is_enclosing_break(&block.name, &successor)
+                {
+                    if crate::env_vars::spi_why() {
+                        eprintln!(
+                            "[spi-why]   nested-exit-bypass header={} merge={} block={} -> {}",
+                            header, merge, block.name, successor,
+                        );
+                    }
+                    return Some("selection:nested-exit-bypass");
+                }
+                owner = plan_forest.idom(header);
+            }
+        }
+    }
     for b in ordered {
         if plan_loop_headers.contains(b.name.as_str()) {
             continue;
@@ -109,7 +170,7 @@ pub(in crate::native) fn plan_self_check_reason(
         // merge-assignment picked a block shared with an ENCLOSING construct's arm — so an outer branch
         // reaches it directly without passing through this header — the header does not dominate it and
         // the selection/switch "exits the selection ... but not via a structured exit" (banked
-        // `e848bc87`/`72cbab44`). The repair path re-nests these; reject and fall back.
+        // `e848bc87`/`72cbab44`). The whole-CFG retry re-nests these; reject and fall back.
         let unreachable_terminal_merge = ordered
             .iter()
             .find(|block| block.name == *m)
@@ -209,6 +270,7 @@ pub(in crate::native) fn plan_self_check_reason(
             }
         }
     }
+
     None
 }
 
@@ -1224,7 +1286,7 @@ pub(in crate::native) fn reject_reason_inner(blocks: &[BodyBlock]) -> Option<Str
     // All merge-synthesis gates passed (every header has a unique merge) — `structured_plan` would now
     // reach its two plan self-checks. Rebuild the same header→merge map + structured order and run them
     // via the shared helper, so a function rejected ONLY by a self-check is reported here too (else it
-    // mis-reports as ADMIT while emission falls back to the repair path).
+    // mis-reports as ADMIT while emission falls back to the relooper retry).
     let mut header_merge: HashMap<String, String> = HashMap::new();
     for (h, info) in &loop_merges {
         header_merge.insert(h.clone(), info.merge.clone());
@@ -1307,6 +1369,61 @@ mod tests {
         assert_eq!(
             plan_self_check_reason(&blocks, &header_merges, &HashMap::new()),
             Some("selection:merge-reused")
+        );
+    }
+
+    #[test]
+    fn plan_self_check_rejects_child_merge_bypassing_parent_selection_merge() {
+        let blocks = vec![
+            bb(
+                "%outer",
+                BlockRole::Normal,
+                &["br i1 %a, label %nested, label %live"],
+            ),
+            bb(
+                "%nested",
+                BlockRole::Normal,
+                &["br i1 %b, label %inner, label %nested_merge"],
+            ),
+            bb(
+                "%inner",
+                BlockRole::Normal,
+                &["br i1 %c, label %work, label %nested_merge"],
+            ),
+            bb("%work", BlockRole::Normal, &["br label %inner_merge"]),
+            bb("%inner_merge", BlockRole::LMerge, &["br label %done"]),
+            bb("%nested_merge", BlockRole::LMerge, &["br label %live"]),
+            bb("%live", BlockRole::Normal, &["br label %done"]),
+            bb("%done", BlockRole::Normal, &["ret void"]),
+        ];
+        let header_merges = HashMap::from([
+            ("%outer".to_string(), "%done".to_string()),
+            ("%nested".to_string(), "%nested_merge".to_string()),
+            ("%inner".to_string(), "%inner_merge".to_string()),
+        ]);
+
+        assert_eq!(
+            plan_self_check_reason(&blocks, &header_merges, &HashMap::new()),
+            Some("selection:nested-exit-bypass")
+        );
+    }
+
+    #[test]
+    fn plan_self_check_rejects_backedge_without_loop_header_ownership() {
+        let blocks = vec![
+            bb("%entry", BlockRole::Normal, &["br label %header"]),
+            bb(
+                "%header",
+                BlockRole::Normal,
+                &["br i1 %condition, label %body, label %exit"],
+            ),
+            bb("%body", BlockRole::Normal, &["br label %header"]),
+            bb("%exit", BlockRole::Normal, &["ret void"]),
+        ];
+
+        assert_eq!(
+            plan_self_check_reason(&blocks, &HashMap::new(), &HashMap::new()),
+            Some("loop:backedge-target-unowned")
         );
     }
 

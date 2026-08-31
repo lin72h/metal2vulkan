@@ -20,7 +20,7 @@ use std::path::PathBuf;
 #[test]
 fn fragment_quad_active_mask_and_narrow_popcount_are_vulkan_valid() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x half> @frag() {
 entry:
@@ -68,7 +68,7 @@ declare i16 @air.popcount.i16(i16)
 #[test]
 fn native_workgroup_array_vector_load_uses_first_element() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @tile = internal unnamed_addr addrspace(3) global [256 x <4 x half>] undef, align 8
 
@@ -104,9 +104,9 @@ entry:
 }
 
 #[test]
-fn native_kernel_ushort2_threads_per_threadgroup_is_constant_vector() {
+fn native_kernel_ushort2_threads_per_threadgroup_uses_specialized_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(<2 x i16> %lsize) {
 entry:
   %x = extractelement <2 x i16> %lsize, i32 0
@@ -127,7 +127,8 @@ entry:
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpConstantComposite"), "{asm}");
+    assert!(asm.contains("OpSpecConstantComposite"), "{asm}");
+    assert!(asm.contains("OpUConvert"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -140,7 +141,7 @@ entry:
 #[test]
 fn native_simd_shuffle_and_barrier_lower_to_subgroup_ops() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %v, i16 %lane) {
 entry:
   %out = tail call i32 @air.simd_shuffle.u.i32(i32 %v, i16 %lane)
@@ -196,7 +197,7 @@ fn native_air_quad_sum_lowers_to_shuffle_xor_butterfly() {
     // intra-quad swap axes (mask 1, then mask 2), so every lane ends with the full quad sum. Two
     // GroupNonUniformShuffleXor + two FAdd, using only the Shuffle capability (no GroupNonUniformQuad).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %v, ptr addrspace(1) %out) {
 entry:
   %sum = tail call float @air.quad_sum.f32(float %v)
@@ -240,7 +241,7 @@ declare float @air.quad_sum.f32(float)
 #[test]
 fn native_air_quad_integer_extrema_stay_inside_aligned_quad() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %v, ptr addrspace(1) %out) {
 entry:
   %max = tail call i32 @air.quad_max.u.i32(i32 %v)
@@ -293,7 +294,7 @@ fn native_simd_sum_uses_metal_32_lane_cluster() {
     // AIR simd operations structurally select Metal's 32-lane simdgroup semantics. This cannot be
     // left to a driver's native subgroup width: MoltenVK may expose a 64-lane subgroup.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %v, ptr addrspace(1) %out) {
 entry:
   %sum = tail call float @air.simd_sum.f32(float %v)
@@ -323,7 +324,7 @@ declare float @air.simd_sum.f32(float)
 #[test]
 fn native_air_simd_is_first_selects_each_32_lane_partition() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out) {
 entry:
   %first = tail call i1 @air.simd_is_first()
@@ -363,7 +364,7 @@ declare i1 @air.simd_is_first()
 #[test]
 fn native_air_quad_is_first_selects_each_four_lane_partition() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out) {
 entry:
   %first = tail call i1 @air.quad_is_first()
@@ -409,7 +410,7 @@ declare i1 @air.quad_is_first()
 #[test]
 fn native_air_quad_all_lowers_to_four_lane_xor_butterfly() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %v, ptr addrspace(1) %out) {
 entry:
   %ok = icmp ne i32 %v, 0
@@ -455,7 +456,7 @@ declare i1 @air.quad_all(i1)
 #[test]
 fn native_air_quad_any_lowers_to_four_lane_xor_butterfly() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %v, ptr addrspace(1) %out) {
 entry:
   %ok = icmp ne i32 %v, 0
@@ -502,7 +503,7 @@ declare i1 @air.quad_any(i1)
 #[test]
 fn native_air_simd_any_all_lower_to_subgroup_vote() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %v, ptr addrspace(1) %out) {
 entry:
   %ok = icmp ne i32 %v, 0
@@ -547,7 +548,7 @@ declare i1 @air.simd_all(i1)
 #[test]
 fn native_air_simd_ballot_i64_lowers_to_subgroup_ballot() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %v, ptr addrspace(1) %out) {
 entry:
   %ok = icmp ne i32 %v, 0
@@ -592,7 +593,7 @@ declare i64 @air.simd_ballot.i64(i1)
 #[test]
 fn native_air_get_simdgroup_size_i16_lowers_to_width_constant() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out) {
 entry:
   %width16 = tail call i16 @air.get_simdgroup_size.i16()
@@ -637,7 +638,7 @@ declare i16 @air.get_simdgroup_size.i16()
 #[test]
 fn native_air_simd_shuffle_and_fill_down_lowers_to_clustered_subgroup_shuffle() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(half %x, half %fill, i16 %delta, ptr addrspace(1) %out) {
 entry:
   %width = tail call i16 @air.get_simdgroup_size.i16()
@@ -699,7 +700,7 @@ declare half @air.simd_shuffle_and_fill_down.f16(half, half, i16, i16)
 #[test]
 fn native_air_simd_broadcast_lowers_to_subgroup_shuffle() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, i16 %lane, ptr addrspace(1) %out) {
 entry:
   %sx = tail call float @air.simd_broadcast.f32(float %x, i16 %lane)
@@ -745,7 +746,7 @@ declare float @air.simd_broadcast.f32(float, i16)
 #[test]
 fn native_air_simd_shuffle_down_lowers_to_32_lane_absolute_shuffle() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, half %h, i16 %delta, ptr addrspace(1) %out) {
 entry:
   %sx = tail call float @air.simd_shuffle_down.f32(float %x, i16 %delta)
@@ -799,7 +800,7 @@ declare half @air.simd_shuffle_down.f16(half, i16)
 #[test]
 fn native_air_simd_shuffle_rotate_down_lowers_to_wrapping_subgroup_shuffle() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, i16 %delta, ptr addrspace(1) %out) {
 entry:
   %sx = tail call float @air.simd_shuffle_rotate_down.f32(float %x, i16 %delta)
@@ -848,7 +849,7 @@ declare float @air.simd_shuffle_rotate_down.f32(float, i16)
 #[test]
 fn native_air_simd_shuffle_up_lowers_to_32_lane_absolute_shuffle() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %x, i16 %delta, ptr addrspace(1) %out) {
 entry:
   %sx = tail call i32 @air.simd_shuffle_up.u.i32(i32 %x, i16 %delta)
@@ -898,7 +899,7 @@ declare i32 @air.simd_shuffle_up.u.i32(i32, i16)
 #[test]
 fn native_air_simd_shuffle_xor_lowers_to_subgroup_shuffle_xor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(half %x, i16 %mask, ptr addrspace(1) %out) {
 entry:
   %sx = tail call half @air.simd_shuffle_xor.f16(half %x, i16 %mask)
@@ -945,7 +946,7 @@ declare half @air.simd_shuffle_xor.f16(half, i16)
 #[test]
 fn native_air_quad_shuffle_down_vector_lowers_to_subgroup_shuffle_down() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(<4 x float> %x, i16 %delta, ptr addrspace(1) %out) {
 entry:
   %sx = tail call <4 x float> @air.quad_shuffle_down.v4f32(<4 x float> %x, i16 %delta)
@@ -991,7 +992,7 @@ declare <4 x float> @air.quad_shuffle_down.v4f32(<4 x float>, i16)
 #[test]
 fn native_air_simd_prefix_exclusive_sum_lowers_to_subgroup_scan() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, ptr addrspace(1) %out) {
 entry:
   %sum = tail call float @air.simd_prefix_exclusive_sum.f32(float %x)
@@ -1031,7 +1032,7 @@ declare float @air.simd_prefix_exclusive_sum.f32(float)
 #[test]
 fn native_air_vector_u16_prefix_exclusive_sum_lowers_componentwise() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(2) %input, ptr addrspace(1) %out) {
 entry:
   %x = load <4 x i16>, ptr addrspace(2) %input, align 8
@@ -1071,7 +1072,7 @@ declare <4 x i16> @air.simd_prefix_exclusive_sum.u.v4i16(<4 x i16>)
 #[test]
 fn native_air_simd_sum_lowers_to_subgroup_reduce() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, ptr addrspace(1) %out) {
 entry:
   %sum = tail call float @air.simd_sum.f32(float %x)
@@ -1113,7 +1114,7 @@ declare float @air.simd_sum.f32(float)
 #[test]
 fn native_air_simd_or_i8_lowers_to_subgroup_bitwise_reduce() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i8 %x, ptr addrspace(1) %out) {
 entry:
   %mask = tail call i8 @air.simd_or.u.i8(i8 %x)
@@ -1157,7 +1158,7 @@ declare i8 @air.simd_or.u.i8(i8)
 #[test]
 fn native_air_simd_inclusive_sum_min_max_lower_to_subgroup_arithmetic() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, ptr addrspace(1) %out) {
 entry:
   %sum = tail call float @air.simd_prefix_inclusive_sum.f32(float %x)
@@ -1207,7 +1208,7 @@ declare float @air.simd_max.f32(float)
 #[test]
 fn native_kernel_threads_per_grid_shares_num_workgroups_builtin() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(<2 x i32> %grid_size, <2 x i32> %group_count) {
 entry:
   %sx = extractelement <2 x i32> %grid_size, i64 0
@@ -1273,7 +1274,7 @@ entry:
 #[test]
 fn native_kernel_threads_per_grid_accepts_exact_dispatch_threads_shape() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(<2 x i32> %grid_size) {
 entry:
   %sx = extractelement <2 x i32> %grid_size, i64 0
@@ -1309,21 +1310,13 @@ entry:
     )
     .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("LocalSize 5 2 1"), "{asm}");
+    assert!(asm.contains("BuiltIn WorkgroupSize"), "{asm}");
+    assert_eq!(asm.matches("SpecId").count(), 3, "{asm}");
+    assert!(asm.contains("PushConstant"), "{asm}");
     assert!(!asm.contains("BuiltIn NumWorkgroups"), "{asm}");
     assert!(!asm.contains("OpIMul"), "{asm}");
-    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 3, "{asm}");
-    assert_eq!(asm.matches("OpBranchConditional").count(), 1, "{asm}");
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpConstant") && line.contains("21")),
-        "{asm}"
-    );
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpConstant") && line.contains("3")),
-        "{asm}"
-    );
+    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 1, "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -1334,9 +1327,9 @@ entry:
 }
 
 #[test]
-fn native_kernel_fixed_dispatch_threads_culls_without_threads_per_grid_parameter() {
+fn native_kernel_fixed_dispatch_threads_uses_specialized_boundary_regions() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   ret void
@@ -1365,9 +1358,9 @@ entry:
     )
     .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("BuiltIn GlobalInvocationId"), "{asm}");
-    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 2, "{asm}");
-    assert_eq!(asm.matches("OpBranchConditional").count(), 1, "{asm}");
+    assert!(asm.contains("BuiltIn WorkgroupSize"), "{asm}");
+    assert_eq!(asm.matches("SpecId").count(), 3, "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
 
     let divisible = crate::translate_sanitized_native_with_options(
@@ -1389,7 +1382,7 @@ entry:
         "{divisible_asm}"
     );
     assert!(
-        !divisible_asm.contains("BuiltIn GlobalInvocationId"),
+        divisible_asm.contains("BuiltIn WorkgroupSize"),
         "{divisible_asm}"
     );
 }
@@ -1397,7 +1390,7 @@ entry:
 #[test]
 fn native_kernel_dynamic_dispatch_threads_shares_reflected_push_constant_grid() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(<3 x i32> %grid_size) {
 entry:
   %x = extractelement <3 x i32> %grid_size, i64 0
@@ -1418,7 +1411,7 @@ entry:
     let _ = std::fs::create_dir_all(&tmp);
     let options = passes::TransformOptions {
         kernel_local_size: [8, 8, 1],
-        kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsPushConstant { offset: 16 }),
+        kernel_dispatch: Some(crate::reflect::KernelDispatch::ThreadsDynamic { offset: 16 }),
         ..passes::TransformOptions::default()
     };
     let (spv, reflection) =
@@ -1426,22 +1419,22 @@ entry:
             .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("PushConstant"), "{asm}");
-    for offset in [16, 20, 24] {
+    for offset in (16..64).step_by(4) {
         assert!(asm.contains(&format!("Offset {offset}")), "{asm}");
     }
-    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 4, "{asm}");
-    assert_eq!(asm.matches("OpBranchConditional").count(), 1, "{asm}");
+    assert_eq!(asm.matches("OpUGreaterThanEqual").count(), 1, "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
     assert_eq!(
         reflection.kernel_dispatch,
-        Some(crate::reflect::KernelDispatch::ThreadsPushConstant { offset: 16 })
+        Some(crate::reflect::KernelDispatch::ThreadsDynamic { offset: 16 })
     );
     assert_eq!(
         reflection
             .kernel_dispatch
             .and_then(crate::reflect::KernelDispatch::push_constant_range),
-        Some(crate::reflect::KernelGridPushConstantRange {
+        Some(crate::reflect::KernelDispatchPushConstantRange {
             offset: 16,
-            size: 12,
+            size: 48,
         })
     );
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
@@ -1450,7 +1443,7 @@ entry:
 #[test]
 fn native_kernel_default_dispatch_uses_dynamic_grid_and_requires_explicit_workgroups() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   ret void
@@ -1473,13 +1466,16 @@ entry:
     )
     .expect("default translation");
     let guarded_asm = disassemble(&guarded).expect("disassemble guarded default");
-    assert!(guarded_asm.contains("PushConstant"), "{guarded_asm}");
-    assert_eq!(guarded_asm.matches("OpUGreaterThanEqual").count(), 3);
-    assert_eq!(guarded_asm.matches("OpBranchConditional").count(), 1);
+    assert!(
+        guarded_asm.contains("BuiltIn WorkgroupSize"),
+        "{guarded_asm}"
+    );
+    assert_eq!(guarded_asm.matches("SpecId").count(), 3);
+    assert!(!guarded_asm.contains("OpBranchConditional"));
     assert_eq!(
         reflection.kernel_dispatch,
-        Some(crate::reflect::KernelDispatch::ThreadsPushConstant {
-            offset: crate::reflect::DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+        Some(crate::reflect::KernelDispatch::ThreadsDynamic {
+            offset: crate::reflect::DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
         })
     );
     tools::spirv_val_bytes(&guarded, &tmp).expect("spirv-val guarded default");
@@ -1503,9 +1499,9 @@ entry:
 }
 
 #[test]
-fn native_kernel_partial_dispatch_threads_refuses_source_workgroup_barrier() {
+fn native_kernel_partial_dispatch_threads_preserves_source_workgroup_barrier() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   tail call void @air.wg.barrier(i32 0, i32 1)
@@ -1523,17 +1519,17 @@ declare void @air.wg.barrier(i32, i32)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native_with_options(
+    let spv = crate::translate_sanitized_native_with_options(
         ll,
         Stage::Kernel,
         &tmp,
         passes::TransformOptions::default(),
     )
-    .expect_err("the safe dynamic default must not emit an unsafe return before a source barrier");
-    assert!(
-        error.contains("source control barriers are unsupported"),
-        "{error}"
-    );
+    .expect("boundary decomposition keeps every workgroup barrier uniform");
+    let asm = disassemble(&spv).expect("disassemble exact-thread barrier");
+    assert!(asm.contains("OpControlBarrier"), "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val exact-thread barrier");
 
     let workgroups = crate::translate_sanitized_native_with_options(
         ll,
@@ -1549,64 +1545,9 @@ declare void @air.wg.barrier(i32, i32)
 }
 
 #[test]
-fn every_public_emission_facade_rejects_barriers_before_parsing_the_body() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
-define void @k() {
-entry:
-  tail call void @air.wg.barrier(i32 0, i32 1)
-  %unsupported = futureop i32 0
-  ret void
-}
-
-declare void @air.wg.barrier(i32, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !1}
-!1 = !{}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_barrier_preflight_facades_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let assert_barrier = |error: String| {
-        assert!(
-            error.contains("source control barriers are unsupported"),
-            "expected barrier preflight before unsupported body parse: {error}"
-        );
-    };
-
-    assert_barrier(
-        crate::translate_sanitized_native_reflected(
-            ll,
-            Stage::Kernel,
-            &tmp,
-            passes::TransformOptions::default(),
-        )
-        .expect_err("reflected translation must preflight barriers"),
-    );
-    assert_barrier(
-        crate::translate_native_no_retry(ll, Stage::Kernel)
-            .expect_err("no-retry translation must preflight barriers"),
-    );
-    assert_barrier(
-        crate::translate_native_primary_validated(ll, Stage::Kernel, &tmp)
-            .expect_err("validated primary translation must preflight barriers"),
-    );
-    for error in crate::translate_raw_tiers_probe(ll, Stage::Kernel, &tmp) {
-        assert_barrier(error.expect_err("raw-tier probes must preflight barriers"));
-    }
-    assert_barrier(
-        crate::translate_bda_probe(ll, Stage::Kernel, &tmp)
-            .expect_err("BDA probe must preflight barriers"),
-    );
-}
-
-#[test]
 fn native_kernel_partial_dispatch_ignores_barrier_in_unreachable_helper() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   ret void
@@ -1637,16 +1578,16 @@ declare void @air.wg.barrier(i32, i32)
     )
     .expect("a dead helper's barrier does not constrain entry dispatch");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("PushConstant"), "{asm}");
-    assert!(asm.contains("OpBranchConditional"), "{asm}");
+    assert!(asm.contains("BuiltIn WorkgroupSize"), "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
     assert!(!asm.contains("OpControlBarrier"), "{asm}");
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val dead barrier helper");
 }
 
 #[test]
-fn native_kernel_partial_dispatch_refuses_barrier_in_reachable_helper() {
+fn native_kernel_partial_dispatch_preserves_barrier_in_reachable_helper() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   tail call void @barrier_helper()
@@ -1670,23 +1611,23 @@ declare void @air.wg.barrier(i32, i32)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native_with_options(
+    let spv = crate::translate_sanitized_native_with_options(
         ll,
         Stage::Kernel,
         &tmp,
         passes::TransformOptions::default(),
     )
-    .expect_err("a reachable helper barrier must keep entry execution uniform");
-    assert!(
-        error.contains("source control barriers are unsupported"),
-        "{error}"
-    );
+    .expect("boundary decomposition keeps a reachable helper barrier uniform");
+    let asm = disassemble(&spv).expect("disassemble reachable barrier");
+    assert!(asm.contains("OpControlBarrier"), "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val reachable barrier");
 }
 
 #[test]
-fn native_kernel_generated_workgroup_initialization_precedes_dispatch_cull() {
+fn native_kernel_generated_workgroup_initialization_needs_no_dispatch_cull() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @scratch = internal addrspace(3) global [1 x i32] zeroinitializer, align 4
 
 define void @k() {
@@ -1719,16 +1660,15 @@ entry:
     )
     .expect("translator-owned barrier remains uniform");
     let asm = disassemble(&spv).expect("disassemble");
-    let barrier = asm.find("OpControlBarrier").expect("generated barrier");
-    let cull = asm.find("OpBranchConditional").expect("dispatch cull");
-    assert!(barrier < cull, "{asm}");
+    assert!(asm.contains("OpControlBarrier"), "{asm}");
+    assert!(!asm.contains("OpBranchConditional"), "{asm}");
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
 }
 
 #[test]
 fn native_kernel_threadgroup_packed_float1_record_array_validates() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Temp = type { [1 x float], i32 }
 
 define void @k(ptr addrspace(3) %temp, i32 %i) {
@@ -1775,9 +1715,49 @@ entry:
 }
 
 #[test]
+fn native_raw_workgroup_vector_view_is_valid_before_retries() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(3) %tile, ptr addrspace(1) %out, i32 %index) {
+entry:
+  %value = call <3 x half> @load3(ptr addrspace(3) %tile, i32 %index)
+  store <3 x half> %value, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+define internal <3 x half> @load3(ptr addrspace(3) %tile, i32 %index) {
+entry:
+  %wide = getelementptr <4 x half>, ptr addrspace(3) %tile, i32 %index
+  %alias = bitcast ptr addrspace(3) %wide to ptr addrspace(3)
+  %value = load <3 x half>, ptr addrspace(3) %alias, align 8
+  ret <3 x half> %value
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"half4", !"air.arg_name", !"tile"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"half3*", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"index"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_raw_workgroup_vector_view_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
+    tools::spirv_val_bytes(&spv, &tmp).expect("primary SPIR-V validates");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("Workgroup"), "{asm}");
+    assert!(asm.contains("OpBitcast"), "{asm}");
+}
+
+#[test]
 fn native_kernel_threadgroup_param_direct_scalar_load_uses_element_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(3) %temp, i32 %i) {
 entry:
@@ -1847,7 +1827,7 @@ entry:
 #[test]
 fn native_wg_barrier_device_flag_orders_storage_buffer_memory() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -1894,7 +1874,7 @@ declare void @air.wg.barrier(i32, i32)
 #[test]
 fn native_threadgroup_atomic_i32_lowers_to_workgroup_spirv() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 @local_counts = internal addrspace(3) global [1 x %"struct.metal::_atomic"] zeroinitializer, align 4
 
@@ -1970,7 +1950,7 @@ declare i32 @air.atomic.local.or.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 #[test]
 fn native_threadgroup_atomic_fixed_loop_is_flattened_and_unrolled() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 @local_counts = internal addrspace(3) global [4 x %"struct.metal::_atomic"] zeroinitializer, align 4
 
@@ -2030,7 +2010,7 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 #[test]
 fn native_simdgroup_matrix_8x8_lowers_through_scalar_array() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(ptr addrspace(1) %out) {
 entry:
   %a = insertelement <64 x float> zeroinitializer, float 1.000000e+00, i64 0
@@ -2074,7 +2054,7 @@ declare <64 x float> @air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f32
 #[test]
 fn native_agx2_distributed_matmad_lowers_to_partitioned_subgroup_shuffles() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(ptr addrspace(1) %out_f, ptr addrspace(1) %out_h) {
 entry:
   %f8 = call <2 x float> @llvm.agx2.f32matmad8x8.v2f32(<2 x float> zeroinitializer, <2 x float> zeroinitializer, <2 x float> zeroinitializer)
@@ -2132,7 +2112,7 @@ declare <2 x half> @llvm.agx2.f16matmad4x4.v2f16(<2 x half>, <2 x half>, <2 x ha
 #[test]
 fn native_simdgroup_matrix_16x16_distributed_mac_lowers_and_validates() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i16 %lane, ptr addrspace(1) %out_f, ptr addrspace(1) %out_i) {
 entry:
   %transpose = icmp eq i16 %lane, 0
@@ -2184,9 +2164,51 @@ declare <8 x i32> @air.simdgroup_matrix_16x16x16_widening_multiply_accumulate.s.
 }
 
 #[test]
+fn native_agx3_packed_igemm_reuses_distributed_matrix_lowering() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @main(ptr addrspace(1) %out) {
+entry:
+  %result = call <8 x i32> @llvm.agx3.igemm.v8i32.i64.i64.v8i32(i8 16, i8 16, i8 16, i16 9, i64 578437695752307201, i16 75, i64 1157159078456920585, i16 75, <8 x i32> zeroinitializer, i16 9)
+  store <8 x i32> %result, ptr addrspace(1) %out, align 32
+  ret void
+}
+
+declare <8 x i32> @llvm.agx3.igemm.v8i32.i64.i64.v8i32(i8, i8, i8, i16, i64, i16, i64, i16, <8 x i32>, i16)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"int8*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_agx3_packed_igemm_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("llvm.agx3.igemm"), "{asm}");
+    assert!(asm.contains("OpShiftRightLogical"), "{asm}");
+    assert!(asm.contains("OpGroupNonUniformShuffle"), "{asm}");
+    assert!(asm.contains("OpSConvert"), "{asm}");
+    assert!(asm.contains("OpIMul"), "{asm}");
+    assert!(asm.contains("OpIAdd"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn native_simdgroup_matrix_16x16_all_observed_float_encodings_validate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(ptr addrspace(1) %out) {
 entry:
   %f32 = call <8 x float> @air.simdgroup_matrix_16x16x16_multiply_accumulate.f.f.v8f32.v8f32.v8f32.v8f32(<8 x float> zeroinitializer, i1 false, <8 x float> zeroinitializer, i1 false, <8 x float> zeroinitializer)
@@ -2242,7 +2264,7 @@ fn native_simdgroup_matrix_8x8_full_pipeline_lowers_and_validates() {
     // to a device buffer. The descriptor vectors carry the documented `<elements_per_row, 8>` / `<1,
     // elements_per_row>` shape (leading dimension = component 0 of the first descriptor vector).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(ptr addrspace(1) %in_h, ptr addrspace(1) %in_f, ptr addrspace(1) %out) {
 entry:
   %pv1 = insertelement <2 x i64> <i64 poison, i64 8>, i64 8, i64 0

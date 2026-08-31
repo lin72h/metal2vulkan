@@ -3,6 +3,127 @@
 use super::*;
 
 impl Emitter {
+    pub(in crate::native::emitter) fn emit_i8_array_integer_bitcast(
+        &mut self,
+        src: Word,
+        src_ty: &LlType,
+        dst_ty: &LlType,
+        result: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        match (src_ty, dst_ty) {
+            (LlType::Array(elem, lanes) | LlType::Vector(elem, lanes), LlType::Int(bits))
+                if **elem == LlType::Int(8)
+                    && *lanes > 0
+                    && lanes.checked_mul(8) == Some(*bits)
+                    && *bits <= 64
+                    && (matches!(src_ty, LlType::Array(_, _)) || *lanes > 4) =>
+            {
+                let byte_ty = self.type_id(&LlType::Int(8))?;
+                let integer_ty = self.type_id(dst_ty)?;
+                let mut packed = None;
+                for lane in 0..*lanes {
+                    let byte = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::CompositeExtract,
+                        Some(byte_ty),
+                        Some(byte),
+                        vec![Operand::IdRef(src), Operand::LiteralBit32(lane)],
+                    ));
+                    let widened = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::UConvert,
+                        Some(integer_ty),
+                        Some(widened),
+                        vec![Operand::IdRef(byte)],
+                    ));
+                    let shifted = if lane == 0 {
+                        widened
+                    } else {
+                        let shift = self.const_int(*bits, u64::from(lane) * 8)?;
+                        let shifted = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::ShiftLeftLogical,
+                            Some(integer_ty),
+                            Some(shifted),
+                            vec![Operand::IdRef(widened), Operand::IdRef(shift)],
+                        ));
+                        shifted
+                    };
+                    packed = Some(match packed {
+                        None => shifted,
+                        Some(low) => {
+                            let combined = if lane + 1 == *lanes {
+                                result
+                            } else {
+                                self.fresh()
+                            };
+                            instructions.push(Self::inst(
+                                Op::BitwiseOr,
+                                Some(integer_ty),
+                                Some(combined),
+                                vec![Operand::IdRef(low), Operand::IdRef(shifted)],
+                            ));
+                            combined
+                        }
+                    });
+                }
+                if *lanes == 1 {
+                    instructions.push(Self::inst(
+                        Op::CopyObject,
+                        Some(integer_ty),
+                        Some(result),
+                        vec![Operand::IdRef(packed.expect("non-empty byte array"))],
+                    ));
+                }
+                Ok(true)
+            }
+            (LlType::Int(bits), LlType::Array(elem, lanes) | LlType::Vector(elem, lanes))
+                if **elem == LlType::Int(8)
+                    && *lanes > 0
+                    && lanes.checked_mul(8) == Some(*bits)
+                    && *bits <= 64
+                    && (matches!(dst_ty, LlType::Array(_, _)) || *lanes > 4) =>
+            {
+                let integer_ty = self.type_id(src_ty)?;
+                let byte_ty = self.type_id(&LlType::Int(8))?;
+                let array_ty = self.type_id(dst_ty)?;
+                let mut bytes = Vec::with_capacity(*lanes as usize);
+                for lane in 0..*lanes {
+                    let shifted = if lane == 0 {
+                        src
+                    } else {
+                        let shift = self.const_int(*bits, u64::from(lane) * 8)?;
+                        let shifted = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::ShiftRightLogical,
+                            Some(integer_ty),
+                            Some(shifted),
+                            vec![Operand::IdRef(src), Operand::IdRef(shift)],
+                        ));
+                        shifted
+                    };
+                    let byte = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::UConvert,
+                        Some(byte_ty),
+                        Some(byte),
+                        vec![Operand::IdRef(shifted)],
+                    ));
+                    bytes.push(Operand::IdRef(byte));
+                }
+                instructions.push(Self::inst(
+                    Op::CompositeConstruct,
+                    Some(array_ty),
+                    Some(result),
+                    bytes,
+                ));
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// The operand-resolved core of the int-convert handler — the M-A4 graph walk drives it from
     /// `TirInst.operands[0]` (source) + `TirInst.result_ty` (dest), see `emit_binary_float_op_resolved`.
     pub(in crate::native::emitter) fn emit_int_convert_resolved(
@@ -53,40 +174,80 @@ impl Emitter {
             ));
         }
         let result_type = self.type_id(&dst_ty)?;
+        let source_type = self.type_id(&src_ty)?;
         let result = self.result_id(&name, &dst_ty)?;
         let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
+        // A nonstandard integer lives in the next legal unsigned container with only its logical
+        // low bits significant. Before `sext`, restore the logical sign bit across that container;
+        // otherwise an i24 value whose bit 23 is set would be interpreted as a positive i32.
+        let converted_src = if op == Op::SConvert {
+            if let Some(bits) = nonstandard_scalar_int_bits(&src_ty) {
+                let legal = spirv_int_width(bits)?;
+                let shift = self.const_int(legal, u64::from(legal - bits))?;
+                let shifted = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ShiftLeftLogical,
+                    Some(source_type),
+                    Some(shifted),
+                    vec![Operand::IdRef(src_id), Operand::IdRef(shift)],
+                ));
+                let extended = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ShiftRightArithmetic,
+                    Some(source_type),
+                    Some(extended),
+                    vec![Operand::IdRef(shifted), Operand::IdRef(shift)],
+                ));
+                extended
+            } else {
+                src_id
+            }
+        } else {
+            src_id
+        };
         // Nonstandard dest widths (`trunc i16 to i2`) emit as the legal container type (i8) via
         // `type_id`. A bare `OpUConvert` to i8 keeps the low *8* bits, but LLVM `i2` only has the
         // low 2 — mask so a subsequent `switch i2` with cases `i2 -1/-2/1` (encoded as 3/2/1)
-        // matches. Unsigned convert (zext/trunc) only; signed narrow/widen of nonstandard widths
-        // is a residual (not seen on the SkyLight reduction kernels).
+        // matches. Signed destinations use the same canonical low-bit representation after their
+        // source has been sign-extended above.
         let dst_resolved = self.resolve_type(&dst_ty)?;
         if let Some(bits) = nonstandard_scalar_int_bits(&dst_resolved) {
-            if op == Op::UConvert {
-                let tmp = self.fresh();
+            let legal = spirv_int_width(bits)?;
+            let mask = self.const_int(legal, (1u64 << bits) - 1)?;
+            let masked_source = if source_type == result_type {
+                converted_src
+            } else {
+                let converted = self.fresh();
                 instructions.push(Self::inst(
                     op,
                     Some(result_type),
-                    Some(tmp),
-                    vec![Operand::IdRef(src_id)],
+                    Some(converted),
+                    vec![Operand::IdRef(converted_src)],
                 ));
-                let legal = spirv_int_width(bits)?;
-                let mask = self.const_int(legal, (1u64 << bits) - 1)?;
-                instructions.push(Self::inst(
-                    Op::BitwiseAnd,
-                    Some(result_type),
-                    Some(result),
-                    vec![Operand::IdRef(tmp), Operand::IdRef(mask)],
-                ));
-                self.record_int_alignment(&name, &dst_ty, self.int_value_alignment(&src.value));
-                return Ok(());
-            }
+                converted
+            };
+            instructions.push(Self::inst(
+                Op::BitwiseAnd,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(masked_source), Operand::IdRef(mask)],
+            ));
+            self.record_int_alignment(&name, &dst_ty, self.int_value_alignment(&src.value));
+            return Ok(());
         }
+        // Choose from the emitted storage types, not the logical LLVM widths. Nonstandard integers
+        // such as i24 share a legal i32 container with their i32 source/destination; SPIR-V forbids
+        // OpUConvert/OpSConvert when those actual types are identical.
+        let emitted_op = if source_type == result_type {
+            Op::CopyObject
+        } else {
+            op
+        };
         instructions.push(Self::inst(
-            op,
+            emitted_op,
             Some(result_type),
             Some(result),
-            vec![Operand::IdRef(src_id)],
+            vec![Operand::IdRef(converted_src)],
         ));
         self.record_int_alignment(&name, &dst_ty, self.int_value_alignment(&src.value));
         Ok(())
@@ -127,10 +288,15 @@ impl Emitter {
             ));
         }
         let result_type = self.type_id(&dst_ty)?;
+        let source_type = self.type_id(&src_ty)?;
         let result = self.result_id(&name, &dst_ty)?;
         let src_id = self.value_id_in(&src.value, &src.ty, instructions)?;
         instructions.push(Self::inst(
-            Op::FConvert,
+            if source_type == result_type {
+                Op::CopyObject
+            } else {
+                Op::FConvert
+            },
             Some(result_type),
             Some(result),
             vec![Operand::IdRef(src_id)],

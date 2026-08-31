@@ -1,0 +1,1 @@
+{"air_sha256":"7e167b00327c7a6ad3c233e5182af8a033fad824dc6d843586b6098568e1d3b0","reason":"AIR entry \"prepare_sort_dispatch\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

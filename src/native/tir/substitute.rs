@@ -144,73 +144,93 @@ fn substitute_inst(
     substitutions: &Substitutions,
     tokens: &HashMap<String, String>,
 ) {
-    let mut uses = Vec::new();
-    for name in &inst.uses {
-        match substitutions.get(name) {
-            Some(replacement) => local_uses(&replacement.value, &mut uses),
-            None => uses.push(name.clone()),
+    if let Some(stored_uses) = &mut inst.uses {
+        let mut uses = Vec::new();
+        for name in &*stored_uses {
+            match substitutions.get(name) {
+                Some(replacement) => local_uses(&replacement.value, &mut uses),
+                None => uses.push(name.clone()),
+            }
         }
+        uses.dedup();
+        *stored_uses = uses;
     }
-    uses.dedup();
-    inst.uses = uses;
 
     for operand in &mut inst.operands {
         substitute_operand(operand, substitutions);
     }
-    if let Some(gep) = &mut inst.gep {
-        substitute_gep(gep, substitutions);
-    }
-    if let Some(call) = &mut inst.call {
-        substitute_call(call, substitutions);
-    }
-    if let Some((_, incoming)) = &mut inst.phi_incoming {
-        for (value, _) in incoming {
-            substitute_value(value, substitutions);
+    match &mut inst.data.payload {
+        TirInstData::Compare { rest, .. } => {
+            if let Some(rest) = rest {
+                *rest = crate::native::cfg::rename_tokens(rest, tokens);
+            }
         }
-    }
-    if let Some((value, _)) = inst.bitcast.as_deref_mut() {
-        substitute_typed_value(value, substitutions);
-    }
-    if let Some((result, base)) = &mut inst.identity_ptr_bitcast {
-        if let Some(replacement) = tokens.get(result) {
-            *result = replacement.clone();
+        TirInstData::Memory { load, store, .. } => {
+            if let Some(load) = load {
+                substitute_typed_value(&mut load.ptr, substitutions);
+            }
+            if let Some((object, pointer)) = store.as_deref_mut() {
+                substitute_typed_value(object, substitutions);
+                substitute_typed_value(pointer, substitutions);
+            }
         }
-        if let Some(replacement) = tokens.get(base) {
-            *base = replacement.clone();
+        TirInstData::Gep { parsed, .. } => {
+            if let Some(gep) = parsed {
+                substitute_gep(gep, substitutions);
+            }
         }
-    }
-    if let Some(values) = &mut inst.phi_incoming_values {
-        for value in values {
-            substitute_value(value, substitutions);
+        TirInstData::Call {
+            parsed,
+            void_line,
+            value_error,
+            alias_override,
+            emit_scan,
+            ..
+        } => {
+            if let Some(call) = parsed {
+                substitute_call(call, substitutions);
+            }
+            if let Some(call) = alias_override {
+                substitute_call(call, substitutions);
+            }
+            if let EmitScanData::Owned(result) = emit_scan {
+                if let Ok(call) = result.as_mut() {
+                    substitute_call(call, substitutions);
+                }
+            }
+            for text in [void_line, value_error].into_iter().flatten() {
+                *text = crate::native::cfg::rename_tokens(text, tokens);
+            }
         }
-    }
-    if let Some((true_value, false_value)) = inst.select_arms.as_deref_mut() {
-        substitute_typed_value(true_value, substitutions);
-        substitute_typed_value(false_value, substitutions);
-    }
-    if let Some(load) = &mut inst.load {
-        substitute_typed_value(&mut load.ptr, substitutions);
-    }
-    if let Some((object, pointer)) = inst.store.as_deref_mut() {
-        substitute_typed_value(object, substitutions);
-        substitute_typed_value(pointer, substitutions);
-    }
-    if let Some(call) = &mut inst.alias_call {
-        substitute_call(call, substitutions);
-    }
-    if let Some(Ok(call)) = inst.emit_scan_call.as_deref_mut() {
-        substitute_call(call, substitutions);
-    }
-    for text in [
-        &mut inst.diag_line,
-        &mut inst.void_call_line,
-        &mut inst.value_call_error,
-        &mut inst.icmp_rest,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        *text = crate::native::cfg::rename_tokens(text, tokens);
+        TirInstData::Phi {
+            incoming,
+            incoming_values,
+            ..
+        } => {
+            if let Some((_, incoming)) = incoming {
+                for (value, _) in incoming {
+                    substitute_value(value, substitutions);
+                }
+            }
+            if let Some(values) = incoming_values {
+                for value in values {
+                    substitute_value(value, substitutions);
+                }
+            }
+        }
+        TirInstData::Element { diag_line, .. } => {
+            if let Some(line) = diag_line {
+                *line = crate::native::cfg::rename_tokens(line, tokens);
+            }
+        }
+        TirInstData::Bitcast { .. } => {}
+        TirInstData::Select(arms) => {
+            if let Some((true_value, false_value)) = arms.as_deref_mut() {
+                substitute_typed_value(true_value, substitutions);
+                substitute_typed_value(false_value, substitutions);
+            }
+        }
+        TirInstData::Plain | TirInstData::Alloca(_) | TirInstData::Aggregate(_) => {}
     }
 }
 
@@ -222,14 +242,15 @@ fn substitute_switch(switch: &mut LlSwitch, substitutions: &Substitutions) {
 }
 
 impl TirBlock {
-    /// Replace every use of a mapped SSA local with its typed caller value.
-    pub(in crate::native) fn substitute_values(&mut self, substitutions: &Substitutions) {
+    fn substitute_values_impl(&mut self, substitutions: &Substitutions, include_phis: bool) {
         if substitutions.is_empty() {
             return;
         }
         let tokens = token_map(substitutions);
         for inst in &mut self.insts {
-            substitute_inst(inst, substitutions, &tokens);
+            if include_phis || !inst.is_phi() {
+                substitute_inst(inst, substitutions, &tokens);
+            }
         }
         match &mut self.terminator {
             TirTerminator::Br(_) | TirTerminator::Ret(None) | TirTerminator::Unreachable => {}
@@ -255,5 +276,18 @@ impl TirBlock {
         if let Some(switch) = &mut self.switch {
             substitute_switch(switch, substitutions);
         }
+    }
+
+    /// Replace every use of a mapped SSA local with its typed caller value.
+    pub(in crate::native) fn substitute_values(&mut self, substitutions: &Substitutions) {
+        self.substitute_values_impl(substitutions, true);
+    }
+
+    /// Replace ordinary and terminator uses while leaving phi incoming edges for the caller's
+    /// dedicated edge rewrite. Structural dispatch construction uses this when a live value crosses
+    /// the new dispatch merge: destination phis are already funnelled by their exact predecessor
+    /// contract, while non-phi consumers need the newly constructed dominating value.
+    pub(in crate::native) fn substitute_non_phi_values(&mut self, substitutions: &Substitutions) {
+        self.substitute_values_impl(substitutions, false);
     }
 }

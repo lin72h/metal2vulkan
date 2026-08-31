@@ -13,8 +13,8 @@ mod types;
 use embedded::{body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_textures};
 pub use embedded::{embedded_synthetic_texture_index, EmbeddedArgument, EmbeddedTexture};
 pub use function_constants::{parse_function_constants, FunctionConstant};
-pub(crate) use globals::static_init_foldable_int_global_values;
 use globals::{location_index_with_static, static_init_int_global_values};
+pub(crate) use globals::{static_init_foldable_global_values, StaticIntValue};
 pub use intersections::{
     AirIntersectionFamily, AirIntersectionInstancing, AirIntersectionResultField,
 };
@@ -24,6 +24,13 @@ pub use textures::{
 };
 use types::{parse_struct_info, struct_info_ref, tokenize, Tok};
 pub use types::{primitive_air_type_from_name, AirMember, AirScalar, AirType};
+
+/// Whether stable AIR argument metadata describes a runtime array of device-buffer addresses.
+pub fn is_device_buffer_array_type_name(name: &str) -> bool {
+    name.chars()
+        .filter(|character| !character.is_whitespace())
+        .eq("array_ref<void>".chars())
+}
 
 /// Role of a single fragment-shader entry parameter, keyed by its parameter index.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -40,6 +47,8 @@ pub enum FragRole {
     SampleId,
     /// `[[viewport_array_index]]` -> Input BuiltIn ViewportIndex (32-bit uint).
     ViewportArrayIndex,
+    /// `[[render_target_array_index]]` -> Input BuiltIn Layer (32-bit uint).
+    RenderTargetArrayIndex,
     /// `[[stage_in]]` interpolated input -> Input var at Location N (N = order among fragment_inputs).
     Varying(u32),
     /// `[[texture(n)]]` -> UniformConstant sampled image.
@@ -438,8 +447,8 @@ pub enum KernRole {
     /// Scalar params receive component .x; vector params receive the full v3uint.
     ThreadgroupsPerGrid,
     /// `[[threads_per_grid]]` (`uint` or `uint3`) -> the selected kernel dispatch grid. Whole-
-    /// workgroup dispatches derive it as NumWorkgroups * LocalSize; exact-thread dispatches share
-    /// their fixed or push-constant bounds with invocation culling.
+    /// workgroup dispatches derive it as NumWorkgroups * LocalSize; exact-thread dispatches read
+    /// the complete logical grid from the region payload.
     ThreadsPerGrid,
     /// `[[threadgroup_position_in_grid]]` (`uint` or `uint3`) -> WorkgroupId.
     /// Scalar params receive component .x; vector params receive the full v3uint.
@@ -473,6 +482,9 @@ pub enum KernRole {
 #[derive(Clone, Debug, Default)]
 pub struct KernMeta {
     pub roles: Vec<(u32, KernRole)>,
+    /// Function-constant-wrapped buffer parameter index -> Metal buffer location. Multiple mutually
+    /// exclusive typed alternatives may intentionally share one location.
+    pub function_constant_buffer_locations: HashMap<u32, u32>,
     /// `param_idx -> reconstructed struct layout` for buffer args (see `FragMeta::buffer_layouts`).
     pub buffer_layouts: HashMap<u32, AirType>,
     /// `param_idx -> reconstructed air.imageblock_data layout` for imageblock args.
@@ -625,6 +637,7 @@ fn parse_air_kernel_meta_with_nodes(
     let in_ref = *refs.get(1)?;
 
     let mut roles = vec![];
+    let mut function_constant_buffer_locations = HashMap::new();
     let mut buffer_layouts = HashMap::new();
     let mut imageblock_layouts = HashMap::new();
     let mut buffer_address_spaces = HashMap::new();
@@ -645,9 +658,17 @@ fn parse_air_kernel_meta_with_nodes(
         let Some(idx) = first_i32(node) else { continue };
         let layout = struct_info_ref(node).and_then(|sref| parse_struct_info(nodes, sref, 0));
         let strs = role_strings(node);
-        let Some(first) = fc_promoted_role(&strs, promote_fc_buffers) else {
+        if strs.first().map(String::as_str) == Some("function_constant")
+            && primary_role(&strs) == Some("buffer")
+        {
+            function_constant_buffer_locations.insert(idx, resource_location(node, idx));
+        }
+        let Some(mut first) = fc_promoted_role(&strs, promote_fc_buffers) else {
             continue;
         };
+        if primary_role(&strs) == Some("texture") && resource_location(node, idx) == u32::MAX {
+            first = "function_constant";
+        }
         let role = match first {
             "buffer" | "indirect_buffer" => {
                 if first == "indirect_buffer" {
@@ -681,7 +702,7 @@ fn parse_air_kernel_meta_with_nodes(
                 if let Some(access) = declared_buffer_access(node) {
                     buffer_accesses.insert(idx, access);
                 }
-                KernRole::Buffer(resource_location(node, idx))
+                KernRole::Buffer(buffer_location_index(node, idx, &static_int_globals))
             }
             "texture" => {
                 if let Some(name) = arg_type_name(node) {
@@ -755,6 +776,7 @@ fn parse_air_kernel_meta_with_nodes(
     let implicit_imageblock_attachments = detect_implicit_imageblock_attachments(ll)?;
     Some(KernMeta {
         roles,
+        function_constant_buffer_locations,
         buffer_layouts,
         imageblock_layouts,
         implicit_imageblock_attachments,
@@ -1125,6 +1147,24 @@ fn location_index(body: &str, fallback: u32) -> u32 {
     i32_after_marker(body, "air.location_index").unwrap_or(fallback)
 }
 
+fn buffer_location_index(
+    body: &str,
+    fallback: u32,
+    static_int_globals: &HashMap<String, u32>,
+) -> u32 {
+    if arg_type_name(body)
+        .as_deref()
+        .is_some_and(is_device_buffer_array_type_name)
+    {
+        // Metal flattens `array_ref<void>` into consecutive buffer-table arguments beginning at
+        // the literal metadata location. Its static initializer computes the array extent/next
+        // free slot, not a replacement binding for element zero.
+        location_index(body, fallback)
+    } else {
+        location_index_with_static(body, fallback, static_int_globals)
+    }
+}
+
 fn render_target_location(
     body: &str,
     fallback: u32,
@@ -1194,7 +1234,7 @@ fn function_constant_gate_global(body: &str, nodes: &HashMap<u32, String>) -> Op
         })
 }
 
-fn output_metadata_enabled_by_default(
+fn metadata_enabled_by_default(
     body: &str,
     nodes: &HashMap<u32, String>,
     static_int_globals: &HashMap<String, u32>,
@@ -1208,11 +1248,50 @@ fn output_metadata_enabled_by_default(
         .unwrap_or(true)
 }
 
+/// Specialize metadata-only `air.function_constant` wrappers from statically evaluated AIR
+/// predicates. A true predicate exposes the wrapped role as unconditional. A false predicate is
+/// marked disabled so interface construction cannot retain an unreachable descriptor or output.
+/// Unknown predicates keep the wrapper and the ordinary unspecialized projection.
+pub(crate) fn specialize_function_constant_metadata(ll: &str) -> String {
+    let nodes = collect_nodes(ll);
+    let static_int_globals = static_init_int_global_values(ll);
+    let marker = "!\"air.function_constant\"";
+    let mut output = String::with_capacity(ll.len());
+
+    for line in ll.split_inclusive('\n') {
+        let value = function_constant_gate_global(line, &nodes)
+            .and_then(|global| static_int_globals.get(&global).copied());
+        match value {
+            Some(0) => {
+                output.push_str(&line.replacen(marker, "!\"air.function_constant_disabled\"", 1))
+            }
+            Some(_) => {
+                let rewritten = line.find(marker).and_then(|start| {
+                    let after_marker = &line[start + marker.len()..];
+                    let next_role = after_marker.find("!\"air.")?;
+                    Some(format!("{}{}", &line[..start], &after_marker[next_role..]))
+                });
+                if let Some(rewritten) = rewritten {
+                    output.push_str(&rewritten);
+                } else {
+                    output.push_str(line);
+                }
+            }
+            None => output.push_str(line),
+        }
+    }
+    output
+}
+
 /// Like `primary_role`, but only looks past the `air.function_constant` wrapper when the wrapped
-/// resource is a TEXTURE, IMAGEBLOCK, or BUFFER (the latter only when `promote_buffers` is set).
+/// resource is a TEXTURE, IMAGEBLOCK, FUNCTION TABLE, or BUFFER (the latter only when
+/// `promote_buffers` is set).
 /// An imageblock has no descriptor binding to promote; recognizing its stable ABI marker merely keeps
-/// its metadata-described cell type available to the native emitter. Promoting a wrapped texture is
-/// additive (it gains its own sampled/storage image binding). Promoting a wrapped BUFFER binds it as a
+/// its metadata-described cell type available to the native emitter. A wrapped texture with a real
+/// location remains a descriptor even when its predicate defaults false: SPIR-V specialization may
+/// enable the resource-using arm, and substituting another texture or erasing the binding would be
+/// semantically wrong. A `-1` location remains absent until AIR specialization assigns a binding.
+/// Promoting a wrapped BUFFER binds it as a
 /// REAL StorageBuffer instead of the "possibly-absent → Private zero placeholder" default; on the
 /// DEFAULT path this regresses byte-conformant goldens (a genuinely-absent fc buffer must stay Private,
 /// and the conditionally-present binding emits an invalid `ArrayStride`-decorated array-of-Block), so
@@ -1227,6 +1306,8 @@ fn fc_promoted_role(strs: &[String], promote_buffers: bool) -> Option<&str> {
         return Some(match primary_role(strs) {
             Some("texture") => "texture",
             Some("imageblock") => "imageblock",
+            Some("visible_function_table") => "visible_function_table",
+            Some("intersection_function_table") => "intersection_function_table",
             Some("buffer") if promote_buffers => "buffer",
             _ => first,
         });
@@ -1460,7 +1541,7 @@ fn parse_air_fragment_meta_with_nodes(
                     let roles = role_strings(node);
                     let is_render_target = primary_role(&roles) == Some("render_target");
                     (is_render_target
-                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals))
+                        && metadata_enabled_by_default(node, nodes, &static_int_globals))
                     .then(|| {
                         (
                             i as u32,
@@ -1481,9 +1562,8 @@ fn parse_air_fragment_meta_with_nodes(
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
                     let is_depth = primary_role(&roles) == Some("depth");
-                    (is_depth
-                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals))
-                    .then_some(i as u32)
+                    (is_depth && metadata_enabled_by_default(node, nodes, &static_int_globals))
+                        .then_some(i as u32)
                 })
                 .collect()
         })
@@ -1512,9 +1592,8 @@ fn parse_air_fragment_meta_with_nodes(
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
                     let is_stencil = primary_role(&roles) == Some("stencil");
-                    (is_stencil
-                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals))
-                    .then_some(i as u32)
+                    (is_stencil && metadata_enabled_by_default(node, nodes, &static_int_globals))
+                        .then_some(i as u32)
                 })
                 .collect()
         })
@@ -1535,7 +1614,7 @@ fn parse_air_fragment_meta_with_nodes(
                     let roles = role_strings(node);
                     let is_render_target = primary_role(&roles) == Some("render_target");
                     if is_render_target
-                        && output_metadata_enabled_by_default(node, nodes, &static_int_globals)
+                        && metadata_enabled_by_default(node, nodes, &static_int_globals)
                     {
                         arg_type_name(node).map(|name| (i as u32, name))
                     } else {
@@ -1579,90 +1658,92 @@ fn parse_air_fragment_meta_with_nodes(
         let Some(role_str) = primary_role(&strs) else {
             continue;
         };
-        let role =
-            match role_str {
-                "position" => FragRole::Position,
-                "point_coord" => FragRole::PointCoord,
-                "front_facing" => FragRole::FrontFacing,
-                "primitive_id" => FragRole::PrimitiveId,
-                "sample_id" => FragRole::SampleId,
-                "viewport_array_index" => FragRole::ViewportArrayIndex,
-                "fragment_input" => {
-                    let l = varying_loc;
-                    varying_loc += 1;
-                    if let Some(name) = arg_type_name(node) {
-                        varying_types.insert(l, name);
-                    }
-                    if let Some(name) = arg_name(node) {
-                        varying_names.insert(l, name);
-                    }
-                    if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
-                        varying_user_semantics.insert(l, semantic);
-                    }
-                    if strs.iter().any(|s| s == "flat") {
-                        flat_varyings.insert(l);
-                    }
-                    FragRole::Varying(l)
+        let role = match role_str {
+            "position" => FragRole::Position,
+            "point_coord" => FragRole::PointCoord,
+            "front_facing" => FragRole::FrontFacing,
+            "primitive_id" => FragRole::PrimitiveId,
+            "sample_id" => FragRole::SampleId,
+            "viewport_array_index" => FragRole::ViewportArrayIndex,
+            "render_target_array_index" => FragRole::RenderTargetArrayIndex,
+            "fragment_input" => {
+                let l = varying_loc;
+                varying_loc += 1;
+                if let Some(name) = arg_type_name(node) {
+                    varying_types.insert(l, name);
                 }
-                "texture" => {
-                    if let Some(name) = arg_type_name(node) {
-                        texture_type_names.insert(idx, name);
-                    }
-                    FragRole::Texture(location_index_with_static(node, idx, &static_int_globals))
+                if let Some(name) = arg_name(node) {
+                    varying_names.insert(l, name);
                 }
-                "sampler" => {
-                    FragRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
+                if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
+                    varying_user_semantics.insert(l, semantic);
                 }
-                "visible_function_table" => FragRole::VisibleFunctionTable(
-                    location_index_with_static(node, idx, &static_int_globals),
-                ),
-                "intersection_function_table" => FragRole::IntersectionFunctionTable(
-                    location_index_with_static(node, idx, &static_int_globals),
-                ),
-                "buffer" | "indirect_buffer" => {
-                    if role_str == "indirect_buffer" {
-                        if let Some(sref) = struct_info_ref(node) {
-                            indirect_buffer_struct_refs.push((
-                                idx,
-                                location_index_with_static(node, idx, &static_int_globals),
-                                sref,
-                            ));
-                        }
-                    }
-                    // Populate address space / declared size ONLY when the IR actually carries them
-                    // (no invented default), so reflection never reports a guessed value.
-                    if let Some(space) =
-                        address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
-                    {
-                        buffer_address_spaces.insert(idx, space);
-                    }
-                    if let Some(size) = i32_after_marker(node, "air.arg_type_size")
-                        .or_else(|| i32_after_marker(node, "air.buffer_size"))
-                    {
-                        buffer_type_sizes.insert(idx, size);
-                    }
-                    if let Some(size) = i32_after_marker(node, "air.buffer_size") {
-                        buffer_object_sizes.insert(idx, size);
-                    }
-                    if let Some(name) = arg_type_name(node) {
-                        buffer_type_names.insert(idx, name);
-                    }
-                    if let Some(access) = declared_buffer_access(node) {
-                        buffer_accesses.insert(idx, access);
-                    }
-                    FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
+                if strs.iter().any(|s| s == "flat") {
+                    flat_varyings.insert(l);
                 }
-                // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
-                "render_target" => {
-                    let location = render_target_location(node, idx, &static_int_globals);
-                    if let Some(name) = arg_type_name(node) {
-                        color_input_type_names.insert(location, name);
-                    }
-                    FragRole::ColorInput(location)
+                FragRole::Varying(l)
+            }
+            "texture" if location_index_with_static(node, idx, &static_int_globals) != u32::MAX => {
+                if let Some(name) = arg_type_name(node) {
+                    texture_type_names.insert(idx, name);
                 }
-                "imageblock_data" => FragRole::ImageblockData,
-                _ => FragRole::Other,
-            };
+                FragRole::Texture(location_index_with_static(node, idx, &static_int_globals))
+            }
+            "sampler" => {
+                FragRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
+            }
+            "visible_function_table" => FragRole::VisibleFunctionTable(location_index_with_static(
+                node,
+                idx,
+                &static_int_globals,
+            )),
+            "intersection_function_table" => FragRole::IntersectionFunctionTable(
+                location_index_with_static(node, idx, &static_int_globals),
+            ),
+            "buffer" | "indirect_buffer" => {
+                if role_str == "indirect_buffer" {
+                    if let Some(sref) = struct_info_ref(node) {
+                        indirect_buffer_struct_refs.push((
+                            idx,
+                            location_index_with_static(node, idx, &static_int_globals),
+                            sref,
+                        ));
+                    }
+                }
+                // Populate address space / declared size ONLY when the IR actually carries them
+                // (no invented default), so reflection never reports a guessed value.
+                if let Some(space) =
+                    address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
+                {
+                    buffer_address_spaces.insert(idx, space);
+                }
+                if let Some(size) = i32_after_marker(node, "air.arg_type_size")
+                    .or_else(|| i32_after_marker(node, "air.buffer_size"))
+                {
+                    buffer_type_sizes.insert(idx, size);
+                }
+                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                    buffer_object_sizes.insert(idx, size);
+                }
+                if let Some(name) = arg_type_name(node) {
+                    buffer_type_names.insert(idx, name);
+                }
+                if let Some(access) = declared_buffer_access(node) {
+                    buffer_accesses.insert(idx, access);
+                }
+                FragRole::Buffer(buffer_location_index(node, idx, &static_int_globals))
+            }
+            // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
+            "render_target" => {
+                let location = render_target_location(node, idx, &static_int_globals);
+                if let Some(name) = arg_type_name(node) {
+                    color_input_type_names.insert(location, name);
+                }
+                FragRole::ColorInput(location)
+            }
+            "imageblock_data" => FragRole::ImageblockData,
+            _ => FragRole::Other,
+        };
         roles.push((idx, role));
     }
     let top_level_texture_locations = roles
@@ -1758,7 +1839,9 @@ fn parse_air_vertex_meta_with_nodes(
             continue;
         };
         let role = match first {
-            "function_constant" => VertOutRole::FunctionConstantDisabled,
+            "function_constant" | "function_constant_disabled" => {
+                VertOutRole::FunctionConstantDisabled
+            }
             "position" => VertOutRole::Position,
             "point_size" => VertOutRole::PointSize,
             "clip_distance" => VertOutRole::ClipDistance,
@@ -1817,6 +1900,11 @@ fn parse_air_vertex_meta_with_nodes(
         let Some(mut first) = fc_promoted_role(&strs, false) else {
             continue;
         };
+        if primary_role(&strs) == Some("texture")
+            && location_index_with_static(node, idx, &static_int_globals) == u32::MAX
+        {
+            first = "function_constant";
+        }
         if primary_role(&strs) == Some("patch_input") {
             first = "patch_input";
         }
@@ -1862,7 +1950,7 @@ fn parse_air_vertex_meta_with_nodes(
                     if let Some(access) = declared_buffer_access(node) {
                         buffer_accesses.insert(idx, access);
                     }
-                    VertRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
+                    VertRole::Buffer(buffer_location_index(node, idx, &static_int_globals))
                 }
                 "texture" => {
                     if let Some(name) = arg_type_name(node) {

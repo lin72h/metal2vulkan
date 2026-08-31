@@ -27,7 +27,8 @@ layout with an average below 1,000 rows while retaining reasonably large sequent
 ## Sources
 
 Private source rows contain the SHA-256 of the exact sanitized text, stable AIR stage/entry
-metadata, sanitized `air_ll`, optional `blob_b64`, source-library hash, and a non-semantic label.
+metadata, sanitized `air_ll`, optional `blob_b64`, the sorted set of parent-library hashes, and a
+non-semantic label.
 Harvest output is sorted by AIR hash and byte-identical for the same extracted inputs. Metallibs,
 AIR bodies, and source shards must never be committed.
 
@@ -35,7 +36,8 @@ Harvest retains non-entry AIR modules separately instead of discarding them. The
 visible/intersection function implementations and other linkable helpers, along with the set of
 parent metallib hashes in which each sanitized module appeared. They are not shader queue rows and
 cannot be authored as standalone cases; later function-table linking resolves them as dependencies
-of a stage entry from the same library provenance.
+of a stage entry across its complete parent-library provenance. Resolution succeeds only when the
+symbol identifies one exact retained module across that union.
 
 ## Cases
 

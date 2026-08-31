@@ -71,6 +71,22 @@ fn raw_rule_errors_on_uncovered_types() {
 }
 
 #[test]
+fn workgroup_struct_padding_ranges_exclude_members_and_allocation_escape() {
+    let e = emitter();
+    let padded = LlType::Struct(vec![LlType::Int(32), LlType::Int(8)]);
+
+    assert!(e
+        .struct_range_is_padding(&padded, 5, 3)
+        .expect("tail-padding range"));
+    assert!(!e
+        .struct_range_is_padding(&padded, 4, 1)
+        .expect("member range"));
+    assert!(!e
+        .struct_range_is_padding(&padded, 5, 4)
+        .expect("range beyond allocation"));
+}
+
+#[test]
 fn raw_rule_uses_source_vector_abi_alignment() {
     let ir = LlModule::parse(concat!(
         "target datalayout = \"e-v24:64:64\"\n",

@@ -37,7 +37,7 @@ pub const REGISTRY: &[EnvVar] = &[
     EnvVar {
         name: "METAL2VULKAN_RELOOPER_MAX_BLOCKS",
         default: "1024",
-        effect: "requested relooper block-count cap (hard maximum: 1024)",
+        effect: "requested relooper cases per dispatch group (hard maximum: 1024)",
     },
     // paths
     EnvVar {
@@ -200,8 +200,9 @@ pub fn val_par() -> usize {
         .unwrap_or(3)
 }
 
-/// Requested relooper block-count cap. The native relooper applies its hard product safety maximum
-/// after reading this value, so the override can lower the cap but cannot raise it above 1024.
+/// Requested case count per relooper dispatch group. The native relooper applies its hard product
+/// safety maximum after reading this value, so the override can lower the group size but cannot
+/// raise it above 1024.
 pub fn relooper_max_blocks(fallback: usize) -> usize {
     std::env::var("METAL2VULKAN_RELOOPER_MAX_BLOCKS")
         .ok()

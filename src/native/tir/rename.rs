@@ -139,74 +139,93 @@ fn rename_inst(inst: &mut TirInst, map: &Map) {
     if let Some(r) = &mut inst.result {
         rn_in_place(r, map);
     }
-    for u in &mut inst.uses {
-        rn_in_place(u, map);
+    if let Some(uses) = &mut inst.uses {
+        for u in uses {
+            rn_in_place(u, map);
+        }
     }
     for op in &mut inst.operands {
         rename_operand(op, map);
     }
-    if let Some(g) = &mut inst.gep {
-        rename_gep(g, map);
-    }
-    if let Some(c) = &mut inst.call {
-        rename_call(c, map);
-    }
-    if let Some((_, incoming)) = &mut inst.phi_incoming {
-        for (value, pred) in incoming {
-            rename_llvalue(value, map);
-            rn_in_place(pred, map);
+    match &mut inst.data.payload {
+        TirInstData::Compare { rest, .. } => {
+            if let Some(rest) = rest {
+                *rest = crate::native::cfg::rename_tokens(rest, map);
+            }
         }
-    }
-    if let Some((tv, _dst)) = inst.bitcast.as_deref_mut() {
-        rename_typed_value(tv, map);
-    }
-    // Parse-time inference views also carry `%`-tokens; rename them so a cloned/renamed carrier stays
-    // byte-identical to re-lowering the renamed line (the `== re-lower` invariant). No parse-time
-    // inference reads a structurized block, but every carried field must match re-lower.
-    if let Some((result, base)) = &mut inst.identity_ptr_bitcast {
-        rn_in_place(result, map);
-        rn_in_place(base, map);
-    }
-    if let Some(values) = &mut inst.phi_incoming_values {
-        for value in values {
-            rename_llvalue(value, map);
+        TirInstData::Memory { load, store, .. } => {
+            if let Some(load) = load {
+                rename_typed_value(&mut load.ptr, map);
+            }
+            if let Some((object, ptr)) = store.as_deref_mut() {
+                rename_typed_value(object, map);
+                rename_typed_value(ptr, map);
+            }
         }
-    }
-    if let Some((true_value, false_value)) = inst.select_arms.as_deref_mut() {
-        rename_typed_value(true_value, map);
-        rename_typed_value(false_value, map);
-    }
-    if let Some(load) = &mut inst.load {
-        rename_typed_value(&mut load.ptr, map);
-    }
-    if let Some((object, ptr)) = inst.store.as_deref_mut() {
-        rename_typed_value(object, map);
-        rename_typed_value(ptr, map);
-    }
-    if let Some(call) = &mut inst.alias_call {
-        rename_call(call, map);
-    }
-    match inst.emit_scan_call.as_deref_mut() {
-        Some(Ok(call)) => rename_call(call, map),
-        Some(Err(msg)) => *msg = crate::native::cfg::rename_tokens(msg, map),
-        None => {}
-    }
-    // Diagnostics-only raw-line carriers: rename with the SAME string `rename_tokens` the clone applies
-    // to the whole line, so a cloned block's error bytes (and a fresh-re-lower Debug) match the
-    // re-lower of the renamed line exactly.
-    for s in [
-        &mut inst.diag_line,
-        &mut inst.void_call_line,
-        &mut inst.value_call_error,
-        &mut inst.icmp_rest,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        *s = crate::native::cfg::rename_tokens(s, map);
-    }
-    if let Some((_, dst)) = inst.bitcast.as_deref_mut() {
-        *dst = crate::native::cfg::rename_tokens(dst, map);
+        TirInstData::Gep { parsed, .. } => {
+            if let Some(gep) = parsed {
+                rename_gep(gep, map);
+            }
+        }
+        TirInstData::Call {
+            parsed,
+            void_line,
+            value_error,
+            alias_override,
+            emit_scan,
+            ..
+        } => {
+            if let Some(call) = parsed {
+                rename_call(call, map);
+            }
+            if let Some(call) = alias_override {
+                rename_call(call, map);
+            }
+            match emit_scan {
+                EmitScanData::Owned(result) => match result.as_mut() {
+                    Ok(call) => rename_call(call, map),
+                    Err(message) => *message = crate::native::cfg::rename_tokens(message, map),
+                },
+                EmitScanData::None | EmitScanData::Parsed => {}
+            }
+            for text in [void_line, value_error].into_iter().flatten() {
+                *text = crate::native::cfg::rename_tokens(text, map);
+            }
+        }
+        TirInstData::Phi {
+            incoming,
+            incoming_values,
+            ..
+        } => {
+            if let Some((_, incoming)) = incoming {
+                for (value, predecessor) in incoming {
+                    rename_llvalue(value, map);
+                    rn_in_place(predecessor, map);
+                }
+            }
+            if let Some(values) = incoming_values {
+                for value in values {
+                    rename_llvalue(value, map);
+                }
+            }
+        }
+        TirInstData::Element { diag_line, .. } => {
+            if let Some(line) = diag_line {
+                *line = crate::native::cfg::rename_tokens(line, map);
+            }
+        }
+        TirInstData::Bitcast { destination, .. } => {
+            if let Some(destination) = destination {
+                *destination = crate::native::cfg::rename_tokens(destination, map);
+            }
+        }
+        TirInstData::Select(arms) => {
+            if let Some((true_value, false_value)) = arms.as_deref_mut() {
+                rename_typed_value(true_value, map);
+                rename_typed_value(false_value, map);
+            }
+        }
+        TirInstData::Plain | TirInstData::Alloca(_) | TirInstData::Aggregate(_) => {}
     }
     // `result_ty`/`gep_source_ty`/`alloca_ty`/`cmp_predicate`/`mem_align`/`opcode`/`aggregate_indices`/
     // `shuffle_mask` never carry a rename-map token (types/opcodes/constants), so they are untouched.

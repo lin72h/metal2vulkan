@@ -91,7 +91,11 @@ pub(in crate::passes) fn buffer_pointer_aliases(func: &Function, pid: Word) -> H
                         changed = true;
                     }
                 }
-                Op::CopyObject => {
+                // LLVM opaque-pointer bitcasts are transparent pointer aliases just like the
+                // `OpCopyObject` used for canonical SSA identities. Following both is required for
+                // interface discovery: a buffer may expose its byte view only behind a bitcast while
+                // another alias retains a wider scalar/vector view.
+                Op::CopyObject | Op::Bitcast => {
                     let Some(Operand::IdRef(source)) = inst.operands.first() else {
                         continue;
                     };
@@ -361,29 +365,35 @@ pub(in crate::passes) fn buffer_has_struct_path_access_chain(
     })
 }
 
-/// The ELEMENT type the body actually reads/writes a buffer param as. For indexed uses this is the
-/// pointee of a single-index `OpAccessChain %pid %i`; for direct scalar/vector load/store uses it is
-/// the loaded/stored value type. Used when the entry param is a bare `uchar*` yet the inlined body
-/// accesses it as a `float`/`v2float`/`v4uint` array.
-/// The interface's `RuntimeArray` element type must match the body access, not the mistyped param
-/// pointee, else `spirv-val` sees pointer/result-type mismatches.
-/// Returns None if no access roots at `pid` (then keep the declared pointee).
-pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Word) -> Option<Word> {
+/// The distinct element types through which the body reads/writes a buffer param. For indexed uses
+/// this is the pointee of a single-index `OpAccessChain %pid %i`; for direct scalar/vector
+/// load/store uses it is the loaded/stored value type. An opaque entry parameter can have several
+/// such views when function-constant branches select a runtime data type. The interface builder
+/// gives those views descriptor aliases at one binding so each retains its own byte stride.
+pub(in crate::passes) fn body_buf_elem_types(ctx: &Ctx, func: &Function, pid: Word) -> Vec<Word> {
     let defs = type_defs(&ctx.module);
     let aliases = buffer_pointer_aliases(func, pid);
+    let mut elements = Vec::new();
     for blk in &func.blocks {
         for inst in &blk.instructions {
-            if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
-                && inst.operands.first().is_some_and(
-                    |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
-                )
-                && inst.operands.len() == 2
-            // exactly one index -> bare buf[i]
+            if matches!(
+                inst.class.opcode,
+                Op::AccessChain
+                    | Op::InBoundsAccessChain
+                    | Op::PtrAccessChain
+                    | Op::InBoundsPtrAccessChain
+            ) && inst.operands.first().is_some_and(
+                |operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)),
+            ) && inst.operands.len() == 2
+            // exactly one index -> bare buf[i]. PtrAccessChain is included: its element operand is
+            // still a statically typed descriptor view, even though it carries pointer arithmetic.
             {
                 // result_type is a pointer to the element type.
                 if let Some(rt) = inst.result_type {
                     if let Some(elem) = ptr_pointee(&defs, rt) {
-                        return Some(elem);
+                        if !elements.contains(&elem) {
+                            elements.push(elem);
+                        }
                     }
                 }
             }
@@ -393,7 +403,9 @@ pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Wor
                 )
             {
                 if let Some(result_type) = inst.result_type {
-                    return Some(result_type);
+                    if !elements.contains(&result_type) {
+                        elements.push(result_type);
+                    }
                 }
             }
             if inst.class.opcode == Op::Store
@@ -403,13 +415,74 @@ pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Wor
             {
                 if let Some(Operand::IdRef(value)) = inst.operands.get(1) {
                     if let Some(result_type) = value_result_type(ctx, func, *value) {
-                        return Some(result_type);
+                        if !elements.contains(&result_type) {
+                            elements.push(result_type);
+                        }
                     }
                 }
             }
         }
     }
-    None
+    elements
+}
+
+pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Word) -> Option<Word> {
+    body_buf_elem_types(ctx, func, pid).into_iter().next()
+}
+
+/// Detect the canonical flat-word view emitted for a homogeneous aggregate buffer. Every rooted
+/// access must have the wrapper-shaped `[0, element]` path and the same scalar result pointee. The
+/// element may be dynamic, so reconstructing a heterogeneous AIR struct would be illegal: SPIR-V
+/// struct member indices must be ordinary constants. Keeping a RuntimeArray of this proven scalar
+/// preserves the source address domain exactly.
+pub(in crate::passes) fn body_buf_flat_scalar_element_type(
+    ctx: &Ctx,
+    func: &Function,
+    pid: Word,
+) -> Option<Word> {
+    let defs = type_defs(&ctx.module);
+    let aliases = buffer_pointer_aliases(func, pid);
+    let mut element = None;
+    let mut saw_access = false;
+    for instruction in func.blocks.iter().flat_map(|block| &block.instructions) {
+        if !matches!(
+            instruction.class.opcode,
+            Op::AccessChain
+                | Op::InBoundsAccessChain
+                | Op::PtrAccessChain
+                | Op::InBoundsPtrAccessChain
+        ) || !instruction
+            .operands
+            .first()
+            .is_some_and(|operand| matches!(operand, Operand::IdRef(id) if aliases.contains(id)))
+        {
+            continue;
+        }
+        let indices = instruction.operands.get(1..)?;
+        let [Operand::IdRef(wrapper), _] = indices else {
+            return None;
+        };
+        if const_int_literal(&defs, *wrapper) != Some(0) {
+            return None;
+        }
+        let pointee = instruction
+            .result_type
+            .and_then(|ty| ptr_pointee(&defs, ty))?;
+        if !defs.get(&pointee).is_some_and(|definition| {
+            matches!(
+                definition.class.opcode,
+                Op::TypeInt | Op::TypeFloat | Op::TypeBool
+            )
+        }) {
+            return None;
+        }
+        if element.is_some_and(|known| known != pointee) {
+            return None;
+        }
+        element = Some(pointee);
+        saw_access = true;
+    }
+    saw_access.then_some(element).flatten()
 }
 
 /// Map each texture PARAMETER id -> its sampled image shape by scanning the entry's sampled/read
@@ -799,6 +872,120 @@ mod tests {
         assert!(aliases.contains(&parameter));
         assert!(aliases.contains(&extracted));
         assert!(buffer_has_access_chains(&function, parameter));
+    }
+
+    #[test]
+    fn buffer_discovery_follows_transparent_pointer_bitcasts() {
+        let parameter = 10;
+        let copied = 11;
+        let bitcast = 12;
+        let chain = 13;
+        let function = Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CopyObject,
+                        Some(30),
+                        Some(copied),
+                        vec![Operand::IdRef(parameter)],
+                    ),
+                    Instruction::new(
+                        Op::Bitcast,
+                        Some(31),
+                        Some(bitcast),
+                        vec![Operand::IdRef(copied)],
+                    ),
+                    Instruction::new(
+                        Op::PtrAccessChain,
+                        Some(32),
+                        Some(chain),
+                        vec![Operand::IdRef(bitcast), Operand::IdRef(40)],
+                    ),
+                ],
+            }],
+        };
+
+        let aliases = buffer_pointer_aliases(&function, parameter);
+        assert!(aliases.contains(&parameter));
+        assert!(aliases.contains(&copied));
+        assert!(aliases.contains(&bitcast));
+        assert!(buffer_has_access_chains(&function, parameter));
+    }
+
+    #[test]
+    fn buffer_element_discovery_includes_pointer_arithmetic_views() {
+        let mut module = Module::new();
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(3),
+                vec![Operand::IdRef(2), Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(4),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(1),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(3),
+                ],
+            ),
+        ];
+        module.functions.push(Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
+                instructions: vec![
+                    Instruction::new(Op::CopyObject, Some(4), Some(11), vec![Operand::IdRef(10)]),
+                    Instruction::new(
+                        Op::PtrAccessChain,
+                        Some(4),
+                        Some(12),
+                        vec![Operand::IdRef(11), Operand::IdRef(30)],
+                    ),
+                    Instruction::new(
+                        Op::AccessChain,
+                        Some(5),
+                        Some(13),
+                        vec![Operand::IdRef(11), Operand::IdRef(31)],
+                    ),
+                ],
+            }],
+        });
+        let ctx = Ctx::new(module);
+
+        assert_eq!(
+            body_buf_elem_types(&ctx, &ctx.module.functions[0], 10),
+            vec![1, 3]
+        );
     }
 
     #[test]

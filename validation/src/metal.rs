@@ -7,7 +7,7 @@ use crate::store::CorpusStore;
 use base64::Engine as _;
 use std::path::Path;
 
-pub const ORACLE_ABI: &str = "metal-literal-resources-v19";
+pub const ORACLE_ABI: &str = "metal-literal-resources-v23";
 pub const QUALIFICATION_RUNS: usize = 3;
 
 pub fn qualify_case(
@@ -71,16 +71,6 @@ fn qualify_outputs(initial: &[u8], outputs: Vec<Vec<u8>>) -> Result<Vec<u8>, Str
             initial.len()
         ));
     }
-    if output
-        .iter()
-        .zip(initial.iter())
-        .any(|(actual, poison)| actual == poison)
-    {
-        return Err(
-            "Metal selected output retained one or more initial poison bytes; write qualification failed"
-                .into(),
-        );
-    }
     Ok(output)
 }
 
@@ -89,6 +79,7 @@ fn selected_initial_bytes(
     resources: &LiteralResources,
 ) -> Result<Vec<u8>, String> {
     match &case.output {
+        crate::case::OutputSelection::None => Ok(Vec::new()),
         crate::case::OutputSelection::Buffer {
             binding,
             offset,
@@ -133,6 +124,30 @@ fn selected_initial_bytes(
                 .get(start..end)
                 .map(<[u8]>::to_vec)
                 .ok_or_else(|| "selected output range exceeds argument-buffer buffer".into())
+        }
+        crate::case::OutputSelection::DeviceBufferArrayElement {
+            binding,
+            element,
+            offset,
+            length,
+        } => {
+            let resource = resources
+                .device_buffer_arrays
+                .iter()
+                .find(|array| array.binding == *binding)
+                .and_then(|array| array.elements.iter().find(|item| item.index == *element))
+                .ok_or_else(|| {
+                    format!("missing device-buffer-array binding {binding} element {element}")
+                })?;
+            let start = *offset as usize;
+            let end = start
+                .checked_add(*length as usize)
+                .ok_or_else(|| "selected output range overflow".to_string())?;
+            resource
+                .bytes
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| "selected output range exceeds device-buffer-array element".into())
         }
         crate::case::OutputSelection::Texture {
             binding,
@@ -258,8 +273,8 @@ mod platform {
         MTLIntersectionFunctionSignature, MTLIntersectionFunctionTable,
         MTLIntersectionFunctionTableDescriptor, MTLLibrary, MTLLinkedFunctions, MTLLoadAction,
         MTLOrigin, MTLPackedFloat3, MTLPackedFloat4x3, MTLPipelineOption, MTLPixelFormat,
-        MTLPrimitiveAccelerationStructureDescriptor, MTLPrimitiveType, MTLRegion,
-        MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
+        MTLPrimitiveAccelerationStructureDescriptor, MTLPrimitiveTopologyClass, MTLPrimitiveType,
+        MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
         MTLRenderPipelineState, MTLRenderStages, MTLResourceOptions, MTLSamplerAddressMode,
         MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState,
         MTLSize, MTLStageInputOutputDescriptor, MTLStencilDescriptor, MTLStencilOperation,
@@ -411,7 +426,9 @@ mod platform {
         let pipeline = make_pipeline(device, &function, resources, reflection, &linked)?;
         let metal_function_tables =
             make_compute_function_tables(&pipeline, function_tables, &linked)?;
-        let buffers = make_buffers(device, resources, reflection)?;
+        let mut buffers = make_buffers(device, resources, reflection)?;
+        let device_buffer_array_elements =
+            append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
         let textures = make_textures(device, &context.queue, resources)?;
         let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
@@ -533,7 +550,8 @@ mod platform {
             &textures,
             &texture_arrays,
             &argument_buffer_textures,
-            MetalAttachments {
+            MetalOutputResources {
+                device_buffer_array_elements: &device_buffer_array_elements,
                 colors: &[],
                 depth_stencil: None,
                 fragment_imageblock: None,
@@ -558,7 +576,7 @@ mod platform {
         let entry = NSString::from_str(&case.entry);
         let function = make_function(&library, &entry, resources)?;
         let linked = load_linked_functions(device, function_tables, resources)?;
-        let render_targets = make_render_targets(device, resources)?;
+        let render_targets = make_render_targets(device, resources, false)?;
         let dispatch = case
             .dispatch
             .as_ref()
@@ -594,7 +612,9 @@ mod platform {
             &linked,
         )?;
 
-        let buffers = make_buffers(device, resources, reflection)?;
+        let mut buffers = make_buffers(device, resources, reflection)?;
+        let device_buffer_array_elements =
+            append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
         let textures = make_textures(device, &context.queue, resources)?;
         let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
@@ -702,7 +722,8 @@ mod platform {
             &textures,
             &texture_arrays,
             &argument_buffer_textures,
-            MetalAttachments {
+            MetalOutputResources {
+                device_buffer_array_elements: &device_buffer_array_elements,
                 colors: &render_targets,
                 depth_stencil: None,
                 fragment_imageblock: None,
@@ -964,6 +985,12 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let entry = NSString::from_str(&case.entry);
         let fragment = make_function(&fragment_library, &entry, resources)?;
         let linked = load_linked_functions(device, function_tables, resources)?;
+        let layered_rendering = metal2vulkan::meta::parse_air_fragment_meta(&source.air_ll)
+            .is_some_and(|meta| {
+                meta.roles.iter().any(|(_, role)| {
+                    matches!(role, metal2vulkan::meta::FragRole::RenderTargetArrayIndex)
+                })
+            });
         let vertex_source = fragment_passthrough_msl(&source.air_ll)?;
         let vertex_library = device
             .newLibraryWithSource_options_error(&NSString::from_str(&vertex_source), None)
@@ -971,11 +998,17 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let vertex = vertex_library
             .newFunctionWithName(&NSString::from_str("metal2vulkan_fragment_vertex"))
             .ok_or_else(|| "generated fragment companion has no vertex function".to_string())?;
-        let render_targets = make_render_targets(device, resources)?;
-        let depth_stencil = make_depth_stencil(device, resources)?;
+        let render_targets = make_render_targets(device, resources, layered_rendering)?;
+        let depth_stencil = make_depth_stencil(device, resources, layered_rendering)?;
         let pipeline_descriptor = MTLRenderPipelineDescriptor::new();
         pipeline_descriptor.setVertexFunction(Some(&vertex));
         pipeline_descriptor.setFragmentFunction(Some(&fragment));
+        if let Some(draw) = &case.draw {
+            unsafe {
+                pipeline_descriptor
+                    .setInputPrimitiveTopology(metal_primitive_topology_class(draw.primitive));
+            }
+        }
         if let Some(linked) = &linked.descriptor {
             pipeline_descriptor.setFragmentLinkedFunctions(Some(linked));
         }
@@ -1012,7 +1045,9 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             &linked,
         )?;
 
-        let buffers = make_buffers(device, resources, reflection)?;
+        let mut buffers = make_buffers(device, resources, reflection)?;
+        let device_buffer_array_elements =
+            append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
         let textures = make_textures(device, &context.queue, resources)?;
         let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
@@ -1035,6 +1070,17 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let depth_stencil_state = make_depth_stencil_state(device, reflection)?;
         let acceleration_structures = make_acceleration_structures(device, &context.queue, case)?;
         let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        if render_targets.is_empty() && depth_stencil.is_none() {
+            // Metal needs explicit raster dimensions when a fragment pass has no attachments.
+            // This executes a structurally output-free fragment without inventing a writable
+            // attachment or observable bytes.
+            pass.setDefaultRasterSampleCount(1);
+            pass.setRenderTargetWidth(1);
+            pass.setRenderTargetHeight(1);
+        }
+        if layered_rendering {
+            pass.setRenderTargetArrayLength(1);
+        }
         let pass_attachments = pass.colorAttachments();
         for (index, texture) in &render_targets {
             let attachment = unsafe { pass_attachments.objectAtIndexedSubscript(*index as usize) };
@@ -1150,7 +1196,8 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             &textures,
             &texture_arrays,
             &argument_buffer_textures,
-            MetalAttachments {
+            MetalOutputResources {
+                device_buffer_array_elements: &device_buffer_array_elements,
                 colors: &render_targets,
                 depth_stencil: depth_stencil.as_ref(),
                 fragment_imageblock: fragment_imageblock.as_ref().and_then(|imageblock| {
@@ -1177,6 +1224,15 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let entry = NSString::from_str(&case.entry);
         let vertex = make_function(&vertex_library, &entry, resources)?;
         let linked = load_linked_functions(device, function_tables, resources)?;
+        let layered_rendering = metal2vulkan::meta::parse_air_vertex_meta(&source.air_ll)
+            .is_some_and(|meta| {
+                meta.output_roles.iter().any(|role| {
+                    matches!(
+                        role,
+                        metal2vulkan::meta::VertOutRole::RenderTargetArrayIndex
+                    )
+                })
+            });
         let fragment = case
             .vertex_observation
             .map(|_| {
@@ -1189,7 +1245,7 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
                     .ok_or_else(|| "generated vertex observer has no fragment function".to_string())
             })
             .transpose()?;
-        let mut render_targets = make_render_targets(device, resources)?;
+        let mut render_targets = make_render_targets(device, resources, layered_rendering)?;
         if case.is_rasterization_disabled_vertex() {
             // Metal still requires a render-pass attachment to create an encoder. Rasterization is
             // disabled on the pipeline, so this private 1x1 sink is API scaffolding and cannot
@@ -1202,6 +1258,12 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         pipeline_descriptor.setFragmentFunction(fragment.as_deref());
         pipeline_descriptor.setRasterizationEnabled(fragment.is_some());
         pipeline_descriptor.setVertexDescriptor(Some(&vertex_inputs.descriptor));
+        if let Some(draw) = &case.draw {
+            unsafe {
+                pipeline_descriptor
+                    .setInputPrimitiveTopology(metal_primitive_topology_class(draw.primitive));
+            }
+        }
         if let Some(tessellation) = &resources.tessellation {
             unsafe {
                 pipeline_descriptor
@@ -1237,7 +1299,9 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             &linked,
         )?;
 
-        let buffers = make_buffers(device, resources, reflection)?;
+        let mut buffers = make_buffers(device, resources, reflection)?;
+        let device_buffer_array_elements =
+            append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
         let textures = make_textures(device, &context.queue, resources)?;
         let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
@@ -1254,6 +1318,9 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let samplers = make_samplers(device, case)?;
         let acceleration_structures = make_acceleration_structures(device, &context.queue, case)?;
         let pass = MTLRenderPassDescriptor::renderPassDescriptor();
+        if layered_rendering {
+            pass.setRenderTargetArrayLength(1);
+        }
         let pass_attachments = pass.colorAttachments();
         for (index, texture) in &render_targets {
             let attachment = unsafe { pass_attachments.objectAtIndexedSubscript(*index as usize) };
@@ -1357,7 +1424,8 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             &textures,
             &texture_arrays,
             &argument_buffer_textures,
-            MetalAttachments {
+            MetalOutputResources {
+                device_buffer_array_elements: &device_buffer_array_elements,
                 colors: &render_targets,
                 depth_stencil: None,
                 fragment_imageblock: None,
@@ -1450,7 +1518,7 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let distinct_float3 = air_ll
             .lines()
             .filter(|line| {
-                line.contains(r#"\"air.fragment_input\""#)
+                line.contains(r#""air.fragment_input""#)
                     && line.contains("!\"air.arg_type_name\", !\"float3\"")
             })
             .count()
@@ -1473,11 +1541,19 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             .roles
             .iter()
             .any(|(_, role)| matches!(role, metal2vulkan::meta::FragRole::ViewportArrayIndex));
+        let has_layer = meta
+            .roles
+            .iter()
+            .any(|(_, role)| matches!(role, metal2vulkan::meta::FragRole::RenderTargetArrayIndex));
         let mut fields = String::from("    float4 position [[position]];\n");
         let mut assignments = String::from("    out.position = float4(p, 0.0, 1.0);\n");
         if has_viewport {
             fields.push_str("    uint viewport [[viewport_array_index]];\n");
             assignments.push_str("    out.viewport = 0;\n");
+        }
+        if has_layer {
+            fields.push_str("    uint layer [[render_target_array_index]];\n");
+            assignments.push_str("    out.layer = 0;\n");
         }
         for (ordinal, location) in locations.into_iter().enumerate() {
             let type_name = meta
@@ -1581,6 +1657,90 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             crate::case::Primitive::LineStrip => MTLPrimitiveType::LineStrip,
             crate::case::Primitive::Triangle => MTLPrimitiveType::Triangle,
             crate::case::Primitive::TriangleStrip => MTLPrimitiveType::TriangleStrip,
+        }
+    }
+
+    fn metal_primitive_topology_class(
+        primitive: crate::case::Primitive,
+    ) -> MTLPrimitiveTopologyClass {
+        match primitive {
+            crate::case::Primitive::Point => MTLPrimitiveTopologyClass::Point,
+            crate::case::Primitive::Line | crate::case::Primitive::LineStrip => {
+                MTLPrimitiveTopologyClass::Line
+            }
+            crate::case::Primitive::Triangle | crate::case::Primitive::TriangleStrip => {
+                MTLPrimitiveTopologyClass::Triangle
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod primitive_topology_tests {
+        use super::*;
+
+        #[test]
+        fn authored_draw_primitives_map_to_their_pipeline_topology_class() {
+            use crate::case::Primitive;
+
+            assert_eq!(
+                metal_primitive_topology_class(Primitive::Point),
+                MTLPrimitiveTopologyClass::Point
+            );
+            for primitive in [Primitive::Line, Primitive::LineStrip] {
+                assert_eq!(
+                    metal_primitive_topology_class(primitive),
+                    MTLPrimitiveTopologyClass::Line
+                );
+            }
+            for primitive in [Primitive::Triangle, Primitive::TriangleStrip] {
+                assert_eq!(
+                    metal_primitive_topology_class(primitive),
+                    MTLPrimitiveTopologyClass::Triangle
+                );
+            }
+        }
+
+        #[test]
+        fn fragment_companion_defines_requested_render_target_layer_zero() {
+            let ll = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.render_target_array_index", !"air.arg_type_name", !"ushort", !"air.arg_name", !"layer"}
+"#;
+            let msl = fragment_passthrough_msl(ll).unwrap();
+            assert!(
+                msl.contains("uint layer [[render_target_array_index]];"),
+                "{msl}"
+            );
+            assert!(msl.contains("out.layer = 0;"), "{msl}");
+        }
+
+        #[test]
+        fn fragment_companion_separates_duplicate_float3_rsqrt_inputs() {
+            let ll = r#"
+declare float @air.fast_rsqrt.f32(float)
+
+define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
+  %delta = fsub <3 x float> %a, %b
+  ret <4 x half> zeroinitializer
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
+!3 = !{!4, !5}
+!4 = !{i32 0, !"air.fragment_input", !"generated(a)", !"air.arg_type_name", !"float3", !"air.arg_name", !"a"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(b)", !"air.arg_type_name", !"float3", !"air.arg_name", !"b"}
+"#;
+            let msl = fragment_passthrough_msl(ll).unwrap();
+            assert!(
+                msl.contains("float3(uv.x, uv.y, 0.5)") && msl.contains("float3(uv.x, uv.y, 1.0)"),
+                "{msl}"
+            );
         }
     }
 
@@ -2013,6 +2173,43 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         Ok(buffers)
     }
 
+    type DeviceBufferArrayElement = ((u32, u32), Buffer);
+
+    fn append_device_buffer_arrays(
+        device: &ProtocolObject<dyn MTLDevice>,
+        resources: &LiteralResources,
+        buffers: &mut Vec<(u32, Buffer)>,
+    ) -> Result<Vec<DeviceBufferArrayElement>, String> {
+        let mut nested = Vec::new();
+        for array in &resources.device_buffer_arrays {
+            for element in &array.elements {
+                let label = format!(
+                    "device-buffer-array {} element {}",
+                    array.binding, element.index
+                );
+                let pointer = NonNull::new(element.bytes.as_ptr().cast_mut().cast::<c_void>())
+                    .ok_or_else(|| format!("{label} bytes pointer is null"))?;
+                let buffer = unsafe {
+                    device.newBufferWithBytes_length_options(
+                        pointer,
+                        element.bytes.len(),
+                        MTLResourceOptions::StorageModeShared,
+                    )
+                }
+                .ok_or_else(|| format!("create Metal {label}"))?;
+                let binding = array.binding.checked_add(element.index).ok_or_else(|| {
+                    format!(
+                        "device-buffer-array {} element {} binding overflows",
+                        array.binding, element.index
+                    )
+                })?;
+                buffers.push((binding, buffer.clone()));
+                nested.push(((array.binding, element.index), buffer));
+            }
+        }
+        Ok(nested)
+    }
+
     fn make_pipeline(
         device: &ProtocolObject<dyn MTLDevice>,
         function: &ProtocolObject<dyn MTLFunction>,
@@ -2365,17 +2562,25 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
     fn make_render_targets(
         device: &ProtocolObject<dyn MTLDevice>,
         resources: &LiteralResources,
+        layered: bool,
     ) -> Result<Vec<(u32, Texture)>, String> {
         resources
             .render_targets
             .iter()
             .map(|resource| {
                 let descriptor = MTLTextureDescriptor::new();
-                descriptor.setTextureType(MTLTextureType::Type2D);
+                descriptor.setTextureType(if layered {
+                    MTLTextureType::Type2DArray
+                } else {
+                    MTLTextureType::Type2D
+                });
                 descriptor.setPixelFormat(metal_pixel_format(resource.format));
                 unsafe {
                     descriptor.setWidth(resource.dimensions[0] as usize);
                     descriptor.setHeight(resource.dimensions[1] as usize);
+                    if layered {
+                        descriptor.setArrayLength(1);
+                    }
                 }
                 descriptor.setStorageMode(MTLStorageMode::Shared);
                 descriptor.setUsage(MTLTextureUsage::RenderTarget);
@@ -2385,7 +2590,11 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
                 upload_texture(
                     &texture,
                     &format!("render target {}", resource.index),
-                    TextureType::D2,
+                    if layered {
+                        TextureType::D2Array
+                    } else {
+                        TextureType::D2
+                    },
                     [resource.dimensions[0], resource.dimensions[1], 1],
                     1,
                     resource.format,
@@ -2426,7 +2635,8 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
     }
 
     #[derive(Clone, Copy)]
-    struct MetalAttachments<'a> {
+    struct MetalOutputResources<'a> {
+        device_buffer_array_elements: &'a [DeviceBufferArrayElement],
         colors: &'a [(u32, Texture)],
         depth_stencil: Option<&'a DepthStencilTexture>,
         fragment_imageblock: Option<(&'a Buffer, [u32; 2], usize)>,
@@ -2435,17 +2645,25 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
     fn make_depth_stencil(
         device: &ProtocolObject<dyn MTLDevice>,
         resources: &LiteralResources,
+        layered: bool,
     ) -> Result<Option<DepthStencilTexture>, String> {
         let Some(resource) = &resources.depth_stencil else {
             return Ok(None);
         };
         let make_aspect = |format, bytes: &[u8], pixel_size| -> Result<Texture, String> {
             let descriptor = MTLTextureDescriptor::new();
-            descriptor.setTextureType(MTLTextureType::Type2D);
+            descriptor.setTextureType(if layered {
+                MTLTextureType::Type2DArray
+            } else {
+                MTLTextureType::Type2D
+            });
             descriptor.setPixelFormat(format);
             unsafe {
                 descriptor.setWidth(resource.dimensions[0] as usize);
                 descriptor.setHeight(resource.dimensions[1] as usize);
+                if layered {
+                    descriptor.setArrayLength(1);
+                }
             }
             descriptor.setStorageMode(MTLStorageMode::Shared);
             descriptor.setUsage(MTLTextureUsage::RenderTarget);
@@ -2784,6 +3002,7 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             TextureFormat::R16Float => ("half", "half", "value", false),
             TextureFormat::R16Uint => ("ushort", "uint", "uint(value)", false),
             TextureFormat::Rg16Float => ("half2", "half2", "value", false),
+            TextureFormat::Rg32Float => ("float2", "float2", "value", false),
             TextureFormat::Rgba16Float => ("half4", "half4", "value", false),
             TextureFormat::Rgba16Uint => ("ushort4", "uint4", "uint4(value)", false),
             TextureFormat::R32Uint => ("uint", "uint", "value", false),
@@ -3140,6 +3359,7 @@ fragment {result_type} metal2vulkan_literal_fragment(
             TextureFormat::R16Float => MTLPixelFormat::R16Float,
             TextureFormat::R16Uint => MTLPixelFormat::R16Uint,
             TextureFormat::Rg16Float => MTLPixelFormat::RG16Float,
+            TextureFormat::Rg32Float => MTLPixelFormat::RG32Float,
             TextureFormat::Rgba16Float => MTLPixelFormat::RGBA16Float,
             TextureFormat::Rgba16Uint => MTLPixelFormat::RGBA16Uint,
             TextureFormat::R32Uint => MTLPixelFormat::R32Uint,
@@ -3388,11 +3608,13 @@ fragment {result_type} metal2vulkan_literal_fragment(
         textures: &[(u32, Texture)],
         texture_arrays: &[TextureArray],
         argument_buffer_textures: &[ArgumentBufferTexture],
-        attachments: MetalAttachments<'_>,
+        output_resources: MetalOutputResources<'_>,
     ) -> Result<Vec<u8>, String> {
-        let render_targets = attachments.colors;
-        let depth_stencil = attachments.depth_stencil;
+        let device_buffer_array_elements = output_resources.device_buffer_array_elements;
+        let render_targets = output_resources.colors;
+        let depth_stencil = output_resources.depth_stencil;
         match case.output {
+            OutputSelection::None => Ok(Vec::new()),
             OutputSelection::Buffer {
                 binding,
                 offset,
@@ -3432,6 +3654,32 @@ fragment {result_type} metal2vulkan_literal_fragment(
                 let length = length as usize;
                 if start.saturating_add(length) > buffer.length() {
                     return Err("selected output exceeds Metal argument-buffer buffer".into());
+                }
+                unsafe {
+                    let pointer = buffer.contents().as_ptr().cast::<u8>().add(start);
+                    Ok(std::slice::from_raw_parts(pointer, length).to_vec())
+                }
+            }
+            OutputSelection::DeviceBufferArrayElement {
+                binding,
+                element,
+                offset,
+                length,
+            } => {
+                let buffer = device_buffer_array_elements
+                    .iter()
+                    .find_map(|((owner, index), buffer)| {
+                        (*owner == binding && *index == element).then_some(buffer)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "output device-buffer-array {binding} element {element} was not bound"
+                        )
+                    })?;
+                let start = offset as usize;
+                let length = length as usize;
+                if start.saturating_add(length) > buffer.length() {
+                    return Err("selected output exceeds Metal device-buffer-array element".into());
                 }
                 unsafe {
                     let pointer = buffer.contents().as_ptr().cast::<u8>().add(start);
@@ -3589,7 +3837,7 @@ fragment {result_type} metal2vulkan_literal_fragment(
                 origin, dimensions, ..
             } => {
                 let (buffer, source_dimensions, pixel_size) =
-                    attachments.fragment_imageblock.ok_or_else(|| {
+                    output_resources.fragment_imageblock.ok_or_else(|| {
                         "selected Metal fragment imageblock output was not resolved".to_string()
                     })?;
                 let bytes = unsafe {
@@ -3707,7 +3955,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qualification_requires_three_identical_full_poison_overwrites() {
+    fn qualification_requires_three_identical_outputs_and_accepts_identity() {
         let initial = [0xab, 0xab, 0xab, 0xab];
         let output = vec![42, 0, 0, 0];
         assert_eq!(
@@ -3724,12 +3972,55 @@ mod tests {
         )
         .unwrap_err()
         .contains("nondeterministic"));
-        assert!(qualify_outputs(
-            &initial,
-            vec![initial.to_vec(), initial.to_vec(), initial.to_vec()]
+        assert_eq!(
+            qualify_outputs(
+                &initial,
+                vec![initial.to_vec(), initial.to_vec(), initial.to_vec()]
+            )
+            .unwrap(),
+            initial
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn attachmentless_fragment_executes_without_invented_output() {
+        use crate::library_module::ResolvedLinkedFunctions;
+        use crate::source::SourceRow;
+
+        let air_ll = crate::case::ATTACHMENTLESS_FRAGMENT_AIR;
+        let source = SourceRow {
+            air_sha256: crate::hash::sha256_bytes(air_ll.as_bytes()),
+            stage: "Fragment".into(),
+            entry: "fragment_no_writes".into(),
+            air_ll: air_ll.into(),
+            blob_b64: Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(compile_metal_fixture("fragment_no_writes")),
+            ),
+            lib_sha256s: vec!["10".repeat(32)],
+            label: "test/fragment-no-writes.air".into(),
+        };
+        let case = crate::case::attachmentless_fragment_test_case(
+            source.air_sha256.clone(),
+            source.entry.clone(),
+        );
+        let reflection = metal2vulkan::reflect_sanitized(
+            &source.air_ll,
+            metal2vulkan::passes::Stage::Fragment,
+            metal2vulkan::passes::TransformOptions::default(),
         )
-        .unwrap_err()
-        .contains("poison"));
+        .unwrap();
+        let resources = LiteralResources::prepare(&case).unwrap();
+        assert!(platform::execute(
+            &case,
+            &source,
+            &resources,
+            &reflection,
+            &ResolvedLinkedFunctions::default(),
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[cfg(target_os = "macos")]
@@ -3752,7 +4043,7 @@ mod tests {
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("vertex_narrow_attributes")),
             ),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/vertex-side-effect.air".into(),
         };
         let case = AuthoredCase {
@@ -3768,6 +4059,7 @@ mod tests {
                 initial_bytes_b64: Some("q6urqw==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -3853,7 +4145,7 @@ mod tests {
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("fragment_depth_stencil")),
             ),
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: "test/fragment-depth-stencil.air".into(),
         };
         let case = crate::case::combined_depth_stencil_test_case(
@@ -3896,7 +4188,7 @@ mod tests {
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("kernel_vector_function_constant")),
             ),
-            lib_sha256: "33".repeat(32),
+            lib_sha256s: vec!["33".repeat(32)],
             label: "test/kernel-vector-function-constant.air".into(),
         };
         let case = crate::case::vector_function_constant_test_case(
@@ -3959,7 +4251,7 @@ declare { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32, ptr) section "air.ext
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("tessellation_literal")),
             ),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/tessellation-literal.air".into(),
         };
         let case = AuthoredCase {
@@ -3970,6 +4262,7 @@ declare { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32, ptr) section "air.ext
             stage: Stage::Vertex,
             buffers: vec![],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -4081,7 +4374,7 @@ entry:
             entry: "kernel_visible_function_table_word".into(),
             air_ll: air_ll.into(),
             blob_b64: Some(base64::engine::general_purpose::STANDARD.encode(entry_blob)),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/kernel-visible-function-table.air".into(),
         };
         let case = AuthoredCase {
@@ -4097,6 +4390,7 @@ entry:
                 initial_bytes_b64: Some("q6urqw==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -4143,7 +4437,7 @@ entry:
             module_sha256,
             air_ll: module_ll.into(),
             blob_b64: base64::engine::general_purpose::STANDARD.encode(helper_blob),
-            lib_sha256s: vec![source.lib_sha256.clone()],
+            lib_sha256s: source.lib_sha256s.clone(),
             label: "test/visible-function-add-one.air".into(),
         };
         let function_tables = ResolvedLinkedFunctions {
@@ -4196,7 +4490,7 @@ entry:
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("kernel_instance_as_intersect")),
             ),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/kernel-instance-as-intersect.air".into(),
         };
         let signature = vec![
@@ -4219,6 +4513,7 @@ entry:
                 ),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -4308,7 +4603,7 @@ entry:
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("fragment_custom_imageblock")),
             ),
-            lib_sha256: "12".repeat(32),
+            lib_sha256s: vec!["12".repeat(32)],
             label: "test/fragment-custom-imageblock.air".into(),
         };
         let case = crate::case::fragment_imageblock_test_case(
@@ -4372,7 +4667,7 @@ entry:
             blob_b64: Some(base64::engine::general_purpose::STANDARD.encode(
                 compile_metal_fixture("kernel_argument_buffer_intersection_table"),
             )),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/kernel-argument-buffer-intersection-table.air".into(),
         };
         let signature = vec![
@@ -4403,6 +4698,7 @@ entry:
                 },
             ],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -4518,7 +4814,7 @@ declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i3
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("kernel_implicit_imageblock_half4")),
             ),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/kernel-implicit-imageblock-half4.air".into(),
         };
         let initial = [0x00, 0x3c, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44];
@@ -4537,6 +4833,7 @@ declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i3
                 ),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: Some(ImageblockResource {
                 dimensions: [16, 16],
@@ -4623,7 +4920,7 @@ declare void @air.store.implicit_imageblock.v4f16(<4 x half>, i32, <2 x i16>, i3
                 base64::engine::general_purpose::STANDARD
                     .encode(compile_metal_fixture("kernel_implicit_imageblock_half2")),
             ),
-            lib_sha256: "11".repeat(32),
+            lib_sha256s: vec!["11".repeat(32)],
             label: "test/kernel-implicit-imageblock-half2.air".into(),
         };
         let case = crate::case::narrow_implicit_imageblock_test_case(

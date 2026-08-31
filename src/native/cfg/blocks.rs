@@ -13,8 +13,9 @@ const SWITCH_BLOCK_PREFIX: &str = "%metal2vulkan_switch_";
 /// string, so it lives here once and is shared.
 pub(in crate::native) const SWITCH_BYPASS_PREFIX: &str = "%metal2vulkan_switch_bypass_";
 
-pub(in crate::native) fn split_body_blocks(
-    lines: &[String],
+#[cfg(test)]
+pub(in crate::native) fn split_body_blocks<S: AsRef<str>>(
+    lines: &[S],
     entry_name: String,
     named_types: &HashMap<String, LlType>,
 ) -> Vec<BodyBlock> {
@@ -26,6 +27,7 @@ pub(in crate::native) fn split_body_blocks(
     let mut cur_name = entry_name;
     let mut cur_lines: Vec<String> = Vec::new();
     for line in lines {
+        let line = line.as_ref();
         let trimmed = strip_comment(line).trim();
         if trimmed.is_empty() {
             continue;
@@ -44,7 +46,7 @@ pub(in crate::native) fn split_body_blocks(
             cur_name = format!("%{label}");
             cur_lines = Vec::new();
         } else {
-            cur_lines.push(line.clone());
+            cur_lines.push(line.to_string());
         }
     }
     let typed =
@@ -55,6 +57,63 @@ pub(in crate::native) fn split_body_blocks(
         typed,
     });
     blocks
+}
+
+/// Split a source function body directly from the module's borrowed line index. Only the current
+/// basic block is staged, and ordinary instruction lines remain borrowed; a multiline `switch` is
+/// the sole owned text because its cases must be joined for the terminator parser. This is the
+/// bounded-memory production parse path for large generated modules.
+pub(in crate::native) fn split_source_body_blocks(
+    lines: &[&str],
+    entry_name: String,
+    named_types: &HashMap<String, LlType>,
+) -> Result<Vec<BodyBlock>, String> {
+    use std::borrow::Cow;
+
+    let mut blocks = Vec::new();
+    let mut cur_name = entry_name;
+    let mut cur_lines: Vec<Cow<'_, str>> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let raw = lines[index];
+        let trimmed = strip_comment(raw).trim();
+        if trimmed.is_empty() {
+            index += 1;
+            continue;
+        }
+        if let Some(label) = trimmed.strip_suffix(':') {
+            if !cur_lines.is_empty() || !blocks.is_empty() {
+                let typed =
+                    crate::native::tir::lower_block_carrier(&cur_name, &cur_lines, named_types)
+                        .map(Into::into);
+                blocks.push(BodyBlock {
+                    name: cur_name,
+                    role: BlockRole::Normal,
+                    typed,
+                });
+            }
+            cur_name = format!("%{label}");
+            cur_lines.clear();
+            index += 1;
+            continue;
+        }
+        if trimmed.starts_with("switch ") {
+            let (switch, next) = crate::native::parse::collect_switch(lines, index)?;
+            cur_lines.push(Cow::Owned(switch));
+            index = next;
+            continue;
+        }
+        cur_lines.push(Cow::Borrowed(raw));
+        index += 1;
+    }
+    let typed =
+        crate::native::tir::lower_block_carrier(&cur_name, &cur_lines, named_types).map(Into::into);
+    blocks.push(BodyBlock {
+        name: cur_name,
+        role: BlockRole::Normal,
+        typed,
+    });
+    Ok(blocks)
 }
 
 /// Build a synthesized [`BodyBlock`] with its `typed` carrier populated from its own `lines`. For the
@@ -409,6 +468,33 @@ pub(in crate::native) fn infer_branch_merges(
         }
     }
     merges
+}
+
+/// Index pair-keyed conditional merge ownership by the header that emits it.
+///
+/// Heuristic inference historically retained only `(true_arm, false_arm) -> merge`, even though
+/// emission and later ownership checks operate on headers. Build that second projection explicitly
+/// at the inference boundary. Existing header-specific claims win, and loop headers are excluded
+/// because they emit `OpLoopMerge` rather than `OpSelectionMerge`.
+pub(in crate::native) fn index_branch_merges_by_header(
+    blocks: &[BodyBlock],
+    loop_merges: &HashMap<String, LoopMergeInfo>,
+    branch_merges: &HashMap<(String, String), String>,
+    branch_merges_by_header: &mut HashMap<String, String>,
+) {
+    for block in blocks {
+        if loop_merges.contains_key(&block.name)
+            || branch_merges_by_header.contains_key(&block.name)
+        {
+            continue;
+        }
+        let Some((on_true, on_false)) = conditional_branch_targets(block) else {
+            continue;
+        };
+        if let Some(merge) = branch_merges.get(&(on_true, on_false)) {
+            branch_merges_by_header.insert(block.name.clone(), merge.clone());
+        }
+    }
 }
 
 /// True when `label` names a synthesized switch-bypass block, read from the block's typed
@@ -771,6 +857,52 @@ pub(in crate::native) fn infer_loop_merges(blocks: &[BodyBlock]) -> HashMap<Stri
     merges
 }
 
+/// Resolve an emission-empty pass-through named as a loop continue before `OpLoopMerge` is emitted.
+///
+/// Structurization can preserve an intermediate edge block while selecting the block after it as
+/// the real back-edge carrier. The finalized typed CFG owns both facts, so collapse the complete
+/// emission-empty/unconditional chain in the loop plan rather than repairing numeric SPIR-V labels
+/// later. Ignored LLVM lifetime/debug markers are semantically empty and emit no instruction, so
+/// they do not turn an otherwise empty edge block into a continue target.
+#[cfg(test)]
+pub(in crate::native) fn normalize_loop_continue_targets(
+    blocks: &[BodyBlock],
+    loop_merges: &mut HashMap<String, LoopMergeInfo>,
+) {
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    for (header, info) in loop_merges {
+        let mut seen = HashSet::new();
+        while info.continue_target != *header
+            && info.continue_target != info.merge
+            && seen.insert(info.continue_target.clone())
+        {
+            let Some(block) = by_name.get(info.continue_target.as_str()) else {
+                break;
+            };
+            let Some(typed) = block.typed.as_ref() else {
+                break;
+            };
+            if !typed.insts.iter().all(|inst| {
+                inst.void_call_line()
+                    .as_deref()
+                    .is_some_and(crate::native::parse::is_ignored_call_line)
+            }) {
+                break;
+            }
+            let crate::native::tir::TirTerminator::Br(target) = &typed.terminator else {
+                break;
+            };
+            if target == header || target == &info.merge {
+                break;
+            }
+            info.continue_target = target.clone();
+        }
+    }
+}
+
 fn natural_loop_nodes(
     header: &str,
     back_preds: &[String],
@@ -894,6 +1026,17 @@ pub(in crate::native) fn infer_switch_merges(blocks: &[BodyBlock]) -> HashMap<St
         }
     }
     merges
+}
+
+/// True when a source switch's default target is also its inferred common merge. Such a block cannot
+/// be both a case header and the selection merge in structured SPIR-V; emission must use the existing
+/// comparison-ladder construction for that switch.
+pub(in crate::native) fn switch_default_is_inferred_merge(blocks: &[BodyBlock]) -> bool {
+    let merges = infer_switch_merges(blocks);
+    blocks.iter().any(|block| {
+        switch_of(block)
+            .is_some_and(|switch| merges.get(&block.name) == Some(&switch.default_label))
+    })
 }
 
 /// Infer only switches whose live targets are the merge itself or branch directly to one common
@@ -1171,7 +1314,7 @@ fn funnel_one_shared_branch_dispatch(
             };
             let mut rewrites = Vec::new();
             for inst in &target_typed.insts {
-                let Some((ty, incoming)) = &inst.phi_incoming else {
+                let Some((ty, incoming)) = &inst.phi_incoming() else {
                     continue;
                 };
                 let from_left = incoming
@@ -1362,7 +1505,7 @@ pub(in crate::native) fn refunnel_one_deep_shared_arm(
                 let entry_set = entries.iter().map(String::as_str).collect::<HashSet<_>>();
                 let mut rewrites = Vec::new();
                 for inst in &target_typed.insts {
-                    let Some((ty, incoming)) = &inst.phi_incoming else {
+                    let Some((ty, incoming)) = &inst.phi_incoming() else {
                         continue;
                     };
                     let selected = incoming
@@ -1378,9 +1521,21 @@ pub(in crate::native) fn refunnel_one_deep_shared_arm(
                     let result = inst.result.as_ref()?;
                     let phi_name = format!("{join_name}.phi.{join_phi_index}");
                     join_phi_index += 1;
-                    let join_incoming = selected
+                    // The join has every shared and bypass predecessor regardless of which target
+                    // owns this value. Cover the other route with `undef`: the route phi branches
+                    // away from this value's target on those edges, so the placeholder is never
+                    // observed, while the phi remains structurally complete by construction.
+                    let join_incoming = all_entries
                         .iter()
-                        .map(|(value, pred)| ((*value).clone(), pred.clone()))
+                        .map(|(pred, _)| {
+                            let value = selected
+                                .iter()
+                                .find_map(|(value, selected_pred)| {
+                                    (selected_pred == pred).then(|| (*value).clone())
+                                })
+                                .unwrap_or(LlValue::Undef);
+                            (value, pred.clone())
+                        })
                         .collect::<Vec<_>>();
                     join_typed.push_value_phi(&phi_name, ty, &join_incoming);
                     let mut replacement = Vec::with_capacity(incoming.len() + 1 - selected.len());
@@ -1436,8 +1591,8 @@ pub(in crate::native) fn lower_unstructured_switches(blocks: &[BodyBlock]) -> Ve
 /// Lower every switch that directly exits an enclosing natural loop while another arm remains in that
 /// loop. SPIR-V cannot use a loop-breaking target as an `OpSwitch` case construct; a branch ladder
 /// makes each equality test an ordinary selection, where the loop-exit arm is a legal structured exit.
-/// This is used only by the reject-triggered loop-exit structurizer tier; the default lowering keeps
-/// its existing byte behavior.
+/// Planning applies this before admitting the source graph so the selected block ownership is valid
+/// by construction rather than repaired after SPIR-V emission.
 pub(in crate::native) fn lower_loop_exit_switches(blocks: &[BodyBlock]) -> Vec<BodyBlock> {
     lower_switches(blocks, true)
 }
@@ -1459,28 +1614,33 @@ fn lower_switches(blocks: &[BodyBlock], force_loop_exit_ladders: bool) -> Vec<Bo
     let mut phi_rewrites: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     let mut synthetic_index = 0usize;
 
-    for block in blocks {
+    for block in normalized {
         // SPIR-V switch case constructs cannot converge at a shared intermediate block when another
         // case can bypass it. A branch ladder lets ordinary branch merge inference model that shape.
         // Source the block's switch from the typed carrier (`switch: switch_emit(term)`, populated for
         // every production switch block).
-        let Some(switch) = switch_of(block) else {
-            lowered.push(block.clone());
+        let Some(switch) = switch_of(&block) else {
+            lowered.push(block);
             continue;
         };
         let needs_ladder = loop_exit_ladders.contains(&block.name)
             || !switch_merges.contains_key(&block.name)
+            // A selection merge cannot simultaneously serve as the switch's default case header:
+            // every explicit case that reconverges there would enter another case construct. The
+            // comparison ladder gives each route an ordinary selection and leaves the common block
+            // solely in its merge role.
+            || switch_merges.get(&block.name) == Some(&switch.default_label)
             || switch_case_order_requires_ladder(&block.name, &switch, &switch_merges, &successors);
         if !needs_ladder {
-            lowered.push(block.clone());
+            lowered.push(block);
             continue;
         }
         let Some(selector_ty) = text_type(&switch.selector.ty) else {
-            lowered.push(block.clone());
+            lowered.push(block);
             continue;
         };
         let Some(selector_value) = text_value(&switch.selector.value) else {
-            lowered.push(block.clone());
+            lowered.push(block);
             continue;
         };
         let cases = switch
@@ -1598,20 +1758,22 @@ fn lower_switches(blocks: &[BodyBlock], force_loop_exit_ladders: bool) -> Vec<Bo
     lowered
 }
 
-/// Return switches in a natural-loop body that branch directly to that loop's sole exit while at least
-/// one other arm stays in the body. Such a `switch` is source-valid, but its exiting case cannot be a
-/// SPIR-V case construct; [`lower_loop_exit_switches`] lowers it to ordinary conditional branches.
+/// Return switches in a natural loop that branch directly to any loop exit while at least one other
+/// arm stays in the body. This includes the loop header itself: lowering its switch leaves the
+/// first comparison on the loop header under `OpLoopMerge`, while subsequent comparisons become
+/// ordinary selection blocks. Such a `switch` is source-valid, but its exiting case cannot be a SPIR-V
+/// case construct; [`lower_loop_exit_switches`] lowers it to ordinary conditional branches.
 fn loop_exit_switch_headers(blocks: &[BodyBlock]) -> HashSet<String> {
     let forest = analyze(blocks);
     let mut headers = HashSet::new();
     for loop_info in &forest.loops {
-        let [merge] = loop_info.exits.as_slice() else {
+        if loop_info.exits.is_empty() {
             continue;
-        };
+        }
+        let exits = loop_info.exits.iter().collect::<HashSet<_>>();
         let body: HashSet<&str> = loop_info.body.iter().map(String::as_str).collect();
         for block in blocks {
-            if block.name == loop_info.header
-                || !body.contains(block.name.as_str())
+            if (block.name != loop_info.header && !body.contains(block.name.as_str()))
                 || !block.typed.as_ref().is_some_and(|t| {
                     matches!(
                         t.terminator,
@@ -1622,7 +1784,7 @@ fn loop_exit_switch_headers(blocks: &[BodyBlock]) -> HashSet<String> {
                 continue;
             }
             let successors = block_successors(block);
-            if successors.iter().any(|target| target == merge)
+            if successors.iter().any(|target| exits.contains(target))
                 && successors
                     .iter()
                     .any(|target| body.contains(target.as_str()))
@@ -1917,7 +2079,7 @@ fn rewrite_switch_bypass_merge(
         }
         let mut additions: HashMap<String, Vec<(LlValue, String)>> = HashMap::new();
         for merge_phi in merge_phis {
-            let Some((_, incoming)) = &merge_phi.phi_incoming else {
+            let Some((_, incoming)) = &merge_phi.phi_incoming() else {
                 return false;
             };
             let Some((inner_value, _)) = incoming.iter().find(|(_, pred)| pred == intermediate)
@@ -1990,33 +2152,34 @@ fn rewrite_switch_bypass_merge(
     }
     // Drop the bypass incomings from the merge carrier's phis (the same `!bypass_set` filter): a merge
     // phi that had a bypass incoming is non-aggregate (the plan loop bailed otherwise), so
-    // `rebuild_phi_incomings` reproduces the same incoming set / operands / uses a re-lower of the
+    // `rebuild_phi_incomings` reproduces the same canonical incoming set and derived uses a re-lower of the
     // bypass-dropped line would.
     if let Some(t) = blocks[merge_idx].typed_mut() {
         t.rebuild_phi_incomings(|pred| !bypass_set.contains(pred));
     }
 
-    let mut rebuilt = Vec::with_capacity(blocks.len() + insert_after.len());
-    for block in blocks.drain(..) {
-        let synthetic = insert_after.get(&block.name).cloned();
-        rebuilt.push(block);
-        if let Some(synthetic) = synthetic {
-            let lines = vec![format!("br label {intermediate}")];
-            // Purely synthetic single-`br` bypass block — lower its carrier directly (empty named-types
-            // is exact for a `br`).
-            let typed =
-                crate::native::tir::lower_block_carrier(&synthetic, &lines, &HashMap::new())
-                    .map(Into::into);
-            rebuilt.push(BodyBlock {
+    // Insert from the end so original indices remain stable and the existing block allocation stays
+    // owned by its caller throughout the transformation.
+    for block_idx in (0..blocks.len()).rev() {
+        let Some(synthetic) = insert_after.get(&blocks[block_idx].name).cloned() else {
+            continue;
+        };
+        let lines = vec![format!("br label {intermediate}")];
+        // Purely synthetic single-`br` bypass block — lower its carrier directly (empty named-types
+        // is exact for a `br`).
+        let typed = crate::native::tir::lower_block_carrier(&synthetic, &lines, &HashMap::new())
+            .map(Into::into);
+        blocks.insert(
+            block_idx + 1,
+            BodyBlock {
                 name: synthetic,
                 // A `%metal2vulkan_switch_bypass_*` block — the one SwitchBypass synthesis site;
                 // `infer_branch_merges` reads this role instead of decoding the bypass-prefixed name.
                 role: BlockRole::SwitchBypass,
                 typed,
-            });
-        }
+            },
+        );
     }
-    *blocks = rebuilt;
     true
 }
 
@@ -2107,6 +2270,62 @@ mod tests {
             vec![terminator.to_string()],
             BlockRole::Normal,
         )
+    }
+
+    #[test]
+    fn loop_plan_resolves_emission_empty_continue_chain_before_emission() {
+        let blocks = vec![
+            block("%header", "br label %body"),
+            block("%body", "br label %pass0"),
+            synthetic_block(
+                "%pass0".to_string(),
+                vec![
+                    "call void @llvm.lifetime.start.p0(i64 4, ptr null)".to_string(),
+                    "br label %pass1".to_string(),
+                ],
+                BlockRole::Normal,
+            ),
+            block("%pass1", "br label %header"),
+            block("%merge", "ret void"),
+        ];
+        let mut loop_merges = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%merge".to_string(),
+                continue_target: "%pass0".to_string(),
+            },
+        )]);
+
+        normalize_loop_continue_targets(&blocks, &mut loop_merges);
+
+        assert_eq!(loop_merges["%header"].continue_target, "%pass1");
+    }
+
+    #[test]
+    fn pair_keyed_branch_merges_are_indexed_only_for_unclaimed_selection_headers() {
+        let blocks = vec![
+            block("%first", "br i1 %c0, label %yes, label %no"),
+            block("%second", "br i1 %c1, label %yes, label %no"),
+            block("%loop", "br i1 %c2, label %yes, label %no"),
+        ];
+        let branch_merges = HashMap::from([(
+            ("%yes".to_string(), "%no".to_string()),
+            "%shared".to_string(),
+        )]);
+        let loop_merges = HashMap::from([(
+            "%loop".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%continue".to_string(),
+            },
+        )]);
+        let mut by_header = HashMap::from([("%second".to_string(), "%specific".to_string())]);
+
+        index_branch_merges_by_header(&blocks, &loop_merges, &branch_merges, &mut by_header);
+
+        assert_eq!(by_header["%first"], "%shared");
+        assert_eq!(by_header["%second"], "%specific");
+        assert!(!by_header.contains_key("%loop"));
     }
 
     #[test]
@@ -2219,6 +2438,28 @@ mod tests {
     }
 
     #[test]
+    fn switch_whose_default_is_its_merge_lowers_to_branch_ladder() {
+        let blocks = vec![
+            block(
+                "%switch",
+                "switch i32 %tag, label %merge [ i32 0, label %a i32 1, label %b i32 2, label %c ]",
+            ),
+            block("%a", "br label %merge"),
+            block("%b", "br label %merge"),
+            block("%c", "br label %merge"),
+            block("%merge", "ret void"),
+        ];
+        assert_eq!(
+            infer_switch_merges(&blocks).get("%switch"),
+            Some(&"%merge".to_string())
+        );
+
+        let lowered = lower_unstructured_switches(&blocks);
+        assert!(lowered.iter().all(|block| switch_of(block).is_none()));
+        assert!(lowered.len() > blocks.len());
+    }
+
+    #[test]
     fn direct_switch_merge_accepts_only_local_common_reconvergence() {
         let blocks = vec![
             block(
@@ -2324,7 +2565,7 @@ mod tests {
 
         let taken = out.iter().find(|block| block.name == "%taken").unwrap();
         let incoming = &taken.typed.as_ref().unwrap().insts[0]
-            .phi_incoming
+            .phi_incoming()
             .as_ref()
             .unwrap()
             .1;
@@ -2353,8 +2594,22 @@ mod tests {
             ),
             block("%via_shared", "br label %shared"),
             block("%bypass", "br label %merge"),
-            block("%shared", "br label %merge"),
-            block("%merge", "ret void"),
+            synthetic_block(
+                "%shared".to_string(),
+                vec![
+                    "%shared_value = phi i32 [ 1, %header ], [ 2, %via_shared ]".to_string(),
+                    "br label %merge".to_string(),
+                ],
+                BlockRole::Normal,
+            ),
+            synthetic_block(
+                "%merge".to_string(),
+                vec![
+                    "%merge_value = phi i32 [ 3, %bypass ], [ %shared_value, %shared ]".to_string(),
+                    "ret void".to_string(),
+                ],
+                BlockRole::Normal,
+            ),
         ];
         let out = refunnel_one_deep_shared_arm(&blocks, &mut 0).unwrap();
         let join = out
@@ -2369,6 +2624,19 @@ mod tests {
             let block = out.iter().find(|block| block.name == predecessor).unwrap();
             assert!(block_successors(block).contains(&join.name));
         }
+        let join_phis = join
+            .typed
+            .as_ref()
+            .unwrap()
+            .insts
+            .iter()
+            .filter_map(|instruction| instruction.phi_incoming().as_ref())
+            .collect::<Vec<_>>();
+        assert_eq!(join_phis.len(), 3, "route plus both forwarded values");
+        assert!(join_phis.iter().all(|(_, incoming)| incoming.len() == 3));
+        assert!(join_phis.iter().skip(1).all(|(_, incoming)| incoming
+            .iter()
+            .any(|(value, _)| matches!(value, LlValue::Undef))));
         assert_eq!(out.len(), blocks.len() + 1);
     }
 

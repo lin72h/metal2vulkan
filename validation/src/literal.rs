@@ -24,6 +24,20 @@ pub struct LiteralArgumentBufferBuffer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiteralDeviceBufferArray {
+    pub binding: u32,
+    pub length: u32,
+    pub elements: Vec<LiteralDeviceBufferArrayElement>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiteralDeviceBufferArrayElement {
+    pub index: u32,
+    pub role: ResourceRole,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiteralAccelerationStructure {
     pub binding: u32,
     pub kind: AccelerationStructureKind,
@@ -65,6 +79,7 @@ pub struct LiteralArgumentBufferTexture {
 pub struct LiteralTextureArray {
     pub binding: u32,
     pub elements: Vec<LiteralTexture>,
+    pub overrides_texture_at_base: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -352,6 +367,26 @@ pub struct LiteralFunctionConstant {
     pub bytes: Vec<u8>,
 }
 
+/// Decode only the authored function constants needed by product specialization.
+///
+/// Translation-only workers use this instead of materializing every execution resource.
+pub fn function_constants(case: &AuthoredCase) -> Result<Vec<LiteralFunctionConstant>, String> {
+    case.function_constants
+        .iter()
+        .map(|constant| {
+            Ok(LiteralFunctionConstant {
+                index: constant.index,
+                scalar_type: constant.scalar_type,
+                lanes: constant.lanes,
+                bytes: decode(
+                    &constant.bytes_b64,
+                    &format!("function constant {}", constant.index),
+                )?,
+            })
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiteralTessellation {
     pub factors: Vec<crate::case::TessellationFactors>,
@@ -365,6 +400,7 @@ pub struct LiteralTessellation {
 pub struct LiteralResources {
     pub buffers: Vec<LiteralBuffer>,
     pub argument_buffer_buffers: Vec<LiteralArgumentBufferBuffer>,
+    pub device_buffer_arrays: Vec<LiteralDeviceBufferArray>,
     pub vertex_inputs: Vec<LiteralStageInput>,
     pub kernel_stage_inputs: Vec<LiteralStageInput>,
     pub acceleration_structure_shadows: Vec<LiteralAccelerationStructure>,
@@ -414,6 +450,38 @@ impl LiteralResources {
                     buffer_binding: resource.buffer_binding,
                     field_offset: resource.field_offset,
                     bytes: decode(encoded, &label)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let device_buffer_arrays = case
+            .device_buffer_arrays
+            .iter()
+            .map(|array| {
+                let elements = array
+                    .elements
+                    .iter()
+                    .map(|resource| {
+                        let label = format!(
+                            "device-buffer-array {} element {}",
+                            array.binding, resource.index
+                        );
+                        let encoded = role_bytes(
+                            resource.role,
+                            resource.bytes_b64.as_deref(),
+                            resource.initial_bytes_b64.as_deref(),
+                        )
+                        .ok_or_else(|| format!("{label} has no literal bytes"))?;
+                        Ok(LiteralDeviceBufferArrayElement {
+                            index: resource.index,
+                            role: resource.role,
+                            bytes: decode(encoded, &label)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                Ok(LiteralDeviceBufferArray {
+                    binding: array.binding,
+                    length: array.length,
+                    elements,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -529,24 +597,11 @@ impl LiteralResources {
                 Ok(LiteralTextureArray {
                     binding: array.binding,
                     elements,
+                    overrides_texture_at_base: array.overrides_texture_at_base,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
-        let function_constants = case
-            .function_constants
-            .iter()
-            .map(|constant| {
-                Ok(LiteralFunctionConstant {
-                    index: constant.index,
-                    scalar_type: constant.scalar_type,
-                    lanes: constant.lanes,
-                    bytes: decode(
-                        &constant.bytes_b64,
-                        &format!("function constant {}", constant.index),
-                    )?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let function_constants = function_constants(case)?;
         let render_targets = case
             .render_targets
             .iter()
@@ -639,6 +694,7 @@ impl LiteralResources {
         Ok(Self {
             buffers,
             argument_buffer_buffers,
+            device_buffer_arrays,
             vertex_inputs,
             kernel_stage_inputs,
             acceleration_structure_shadows,

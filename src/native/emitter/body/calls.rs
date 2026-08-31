@@ -440,6 +440,16 @@ impl Emitter {
             .collect::<Vec<_>>();
         let mut ids = Vec::with_capacity(args.len() + nullness_args.len());
         for (index, arg, (param_name, param_ty)) in args {
+            if let Some(id) = self.data_buffer_array_call_arg_id(
+                &call.callee,
+                &param_name,
+                &param_ty,
+                &arg,
+                instructions,
+            )? {
+                ids.push(id);
+                continue;
+            }
             if let Some(id) = self.raw_workgroup_call_arg_id(
                 &call.callee,
                 index,
@@ -478,6 +488,43 @@ impl Emitter {
             ids.push(self.pointer_call_arg_nullness_id(value)?);
         }
         Ok(ids)
+    }
+
+    fn data_buffer_array_call_arg_id(
+        &mut self,
+        callee: &str,
+        param_name: &str,
+        param_ty: &LlType,
+        arg: &TypedValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<Word>, String> {
+        if !self.bda_device_pointers
+            || !matches!(self.resolve_type(param_ty)?, LlType::Ptr(0))
+            || !self
+                .ir
+                .metadata_data_buffer_params
+                .contains(&(callee.to_string(), param_name.to_string()))
+        {
+            return Ok(None);
+        }
+        let LlValue::Local(arg_name) = &arg.value else {
+            return Ok(None);
+        };
+        if let Some(address) = self.bda_direct_addresses.get(arg_name).copied() {
+            return Ok(Some(address));
+        }
+        if !self.data_buffer_params.contains(arg_name)
+            || !self.direct_param_indices.contains_key(arg_name)
+        {
+            return Ok(None);
+        }
+        let (low, high) = self.emit_direct_buffer_address_payload(arg_name, instructions)?;
+        let address = self.combine_pointer_payload_words(low, high, instructions)?;
+        self.pointer_payload_words
+            .insert(arg_name.to_string(), (low, high));
+        self.bda_direct_addresses
+            .insert(arg_name.to_string(), address);
+        Ok(Some(address))
     }
 
     fn pointer_call_arg_nullness_id(&mut self, value: &LlValue) -> Result<Word, String> {
@@ -734,26 +781,44 @@ impl Emitter {
         if arg_addrspace != 3 {
             return Ok(None);
         }
-        let storage = self.pointer_storage_for(&arg.value, arg_addrspace)?;
+        let raw = match &arg.value {
+            LlValue::Local(arg_name) => self.raw_offsets.get(arg_name).cloned(),
+            _ => None,
+        };
+        let storage = if let Some(raw) = &raw {
+            self.raw_access_storage(raw)?
+        } else {
+            self.pointer_storage_for(&arg.value, arg_addrspace)?
+        };
         if storage != StorageClass::Workgroup {
             return Ok(None);
         }
         let raw_ty = raw_workgroup_array_type();
-        let arg_id = self.value_id_in(&arg.value, &arg.ty, instructions)?;
-        if self
-            .pointer_pointee_for_value(&arg.value)?
-            .is_some_and(|pointee| types_compatible(&pointee, &raw_ty))
-        {
-            return Ok(Some(arg_id));
+        if let Some(raw) = &raw {
+            let root_id = self.raw_root_value_id(raw)?;
+            if self
+                .pointer_pointees
+                .get(&raw.root)
+                .is_some_and(|pointee| types_compatible(pointee, &raw_ty))
+            {
+                return Ok(Some(root_id));
+            }
+        } else {
+            let arg_id = self.value_id_in(&arg.value, &arg.ty, instructions)?;
+            if self
+                .pointer_pointee_for_value(&arg.value)?
+                .is_some_and(|pointee| types_compatible(&pointee, &raw_ty))
+            {
+                return Ok(Some(arg_id));
+            }
         }
         // Reinterpreting the typed Workgroup argument pointer to the raw word-array view would require
         // an `OpBitcast` on a logical pointer — illegal under Logical addressing (the module emits no
         // VariablePointers/PhysicalStorageBuffer for Workgroup). Such a bitcast is never part of a valid
-        // module, so rather than emit it (a guaranteed spirv-val reject), surface a pointer-typing emit
-        // error that routes to the failure-triggered raw retry (`is_pointer_typing_emit_error` ->
-        // all-buffers-raw-with-workgroup), which models the whole callee buffer raw without a pointer
-        // bitcast. Floor-safe: a banked module never contains this illegal bitcast, so it never reaches
-        // here; a module that did was already failing.
+        // module, so rather than emit it (a guaranteed spirv-val reject), surface a pointer-typing
+        // error. Production raw construction reparses the typed AIR and uses its exact connected-param
+        // raw facts; it does not broaden every Workgroup parameter after this error. A module that
+        // reaches this point therefore fails honestly instead of materializing the illegal bitcast.
         Err(format!(
             "native emitter: cannot reinterpret workgroup pointer arg {param_name} to raw word view \
              without a logical-pointer bitcast (callee {callee})"

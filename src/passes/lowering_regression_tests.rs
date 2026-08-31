@@ -1,16 +1,14 @@
-//! Cross-subsystem regression fixtures for retained-SPIR-V access and CFG normalization.
+//! Cross-subsystem regression fixtures for retained lowering passes.
 
 use crate::passes::access::*;
 use crate::passes::air_calls::conversions::is_i1_type_token;
-use crate::passes::cfg_repair::{
-    fix_merge_placement, repair_continue_selection_merge_targets,
-    repair_loop_continue_external_predecessors, repair_loop_continue_pass_through_targets,
-    repair_phi_predecessor_edges,
+use crate::passes::resources::rewrites::{
+    rewrite_private_pointer_atomics, rewrite_private_zero_root_loads,
 };
-use crate::passes::f32_to_f16_bits;
+use crate::passes::{f32_to_f16_bits, value_result_type};
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Block, Function, Instruction, Module, ModuleHeader};
-use spirv::{Decoration, FunctionControl, Op, SelectionControl, StorageClass};
+use spirv::{Decoration, FunctionControl, Op, StorageClass};
 
 // --- Idempotence harness (refactor T5) -------------------------------------------------------
 // Every fixup pass in the `transform_with_options` "2d/2e" blocks must be a no-op on its own output
@@ -781,6 +779,11 @@ fn remodel_workgroup_floatarray_atomic_as_uint_retypes_and_repoints() {
 
     let mut ctx = crate::passes::Ctx::new(module);
     remodel_workgroup_floatarray_atomic_as_uint(&mut ctx, 0).unwrap();
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    assert!(
+        !crate::native::construct_workgroup_atomic_floats_module(&mut ctx.module),
+        "the memory-phase owner must leave no flat Workgroup atomic graph for a later sweep"
+    );
 
     let all_globals: Vec<&Instruction> = ctx
         .new_globals
@@ -1245,6 +1248,122 @@ fn rewrite_scalar_slot_array_overindex_lowers_union_element_load() {
         body.iter().any(|i| i.result_id == Some(loaded)),
         "the load result id should survive the rewrite"
     );
+}
+
+#[test]
+fn rewrite_scalar_slot_array_overindex_scales_in_dynamic_index_type() {
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(100));
+
+    let uint = 1;
+    let float = 2;
+    let ulong = 3;
+    let ptr_func_ulong = 4;
+    let ptr_func_float = 5;
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float),
+            vec![Operand::LiteralBit32(32)],
+        ),
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(ulong),
+            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_func_ulong),
+            vec![
+                Operand::StorageClass(StorageClass::Function),
+                Operand::IdRef(ulong),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_func_float),
+            vec![
+                Operand::StorageClass(StorageClass::Function),
+                Operand::IdRef(float),
+            ],
+        ),
+    ];
+
+    let dynamic_ulong_index = 60;
+    let slot = 61;
+    let chain = 62;
+    let loaded = 63;
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(float),
+            Some(50),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(51),
+            ],
+        )),
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+        parameters: vec![Instruction::new(
+            Op::FunctionParameter,
+            Some(ulong),
+            Some(dynamic_ulong_index),
+            vec![],
+        )],
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
+            instructions: vec![
+                Instruction::new(
+                    Op::Variable,
+                    Some(ptr_func_ulong),
+                    Some(slot),
+                    vec![Operand::StorageClass(StorageClass::Function)],
+                ),
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_func_float),
+                    Some(chain),
+                    vec![Operand::IdRef(slot), Operand::IdRef(dynamic_ulong_index)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(float),
+                    Some(loaded),
+                    vec![Operand::IdRef(chain)],
+                ),
+            ],
+        }],
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    run_idempotent(&mut ctx, |c| {
+        rewrite_scalar_slot_array_overindex(c, 0).unwrap();
+    });
+
+    let body = &ctx.module.functions[0].blocks[0].instructions;
+    let scale = body
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::IMul)
+        .expect("dynamic packed-slot index is scaled");
+    assert_eq!(
+        scale.result_type,
+        Some(ulong),
+        "the scale must retain the dynamic access-chain index width"
+    );
+    assert_eq!(scale.operands[0], Operand::IdRef(dynamic_ulong_index));
+    let factor = operand_id(scale, 1).expect("scale factor");
+    assert_eq!(value_result_type(&ctx, factor), Some(ulong));
+    assert_eq!(const_i64_value(&ctx, factor), Some(32));
 }
 
 #[test]
@@ -1745,152 +1864,6 @@ fn rewrite_strided_descent_promotes_overindexed_array_chain_to_ptr_access_chain(
 }
 
 #[test]
-fn repair_loop_continue_external_predecessors_keeps_preheader_out_of_continue() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.types_global_values = vec![
-        Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
-        Instruction::new(Op::TypeFunction, None, Some(2), vec![Operand::IdRef(1)]),
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(3),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(3),
-            Some(4),
-            vec![Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(3),
-            Some(5),
-            vec![Operand::LiteralBit32(1)],
-        ),
-    ];
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(2),
-            ],
-        )),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(30)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(30), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(50)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::Phi,
-                        Some(3),
-                        Some(70),
-                        vec![Operand::IdRef(71), Operand::IdRef(50)],
-                    ),
-                    Instruction::new(
-                        Op::LoopMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(60),
-                            Operand::IdRef(50),
-                            Operand::LoopControl(spirv::LoopControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(80)]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(80), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(50)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(50), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::Phi,
-                        Some(3),
-                        Some(71),
-                        vec![
-                            Operand::IdRef(4),
-                            Operand::IdRef(30),
-                            Operand::IdRef(5),
-                            Operand::IdRef(80),
-                        ],
-                    ),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(40)]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(60), vec![])),
-                instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
-            },
-        ],
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_loop_continue_external_predecessors(&mut ctx, 0);
-    let blocks = &ctx.module.functions[0].blocks;
-    let preheader = blocks
-        .iter()
-        .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(30))
-        .unwrap();
-    assert_eq!(
-        preheader.instructions.last().unwrap().operands,
-        vec![Operand::IdRef(40)]
-    );
-    let header = blocks
-        .iter()
-        .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(40))
-        .unwrap();
-    assert_eq!(
-        header.instructions[0].operands,
-        vec![
-            Operand::IdRef(71),
-            Operand::IdRef(50),
-            Operand::IdRef(4),
-            Operand::IdRef(30),
-        ]
-    );
-    let continue_block = blocks
-        .iter()
-        .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(50))
-        .unwrap();
-    assert_eq!(
-        continue_block.instructions[0].operands,
-        vec![Operand::IdRef(5), Operand::IdRef(80)]
-    );
-}
-
-#[test]
 fn compose_derived_access_chains_rebases_linear_stream_offsets() {
     let mut module = Module::new();
     module.header = Some(ModuleHeader::new(100));
@@ -1940,6 +1913,12 @@ fn compose_derived_access_chains_rebases_linear_stream_offsets() {
             Some(7),
             vec![Operand::LiteralBit32(1)],
         ),
+        Instruction::new(
+            Op::Variable,
+            Some(3),
+            Some(30),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ),
     ];
     module.functions.push(Function {
         def: Some(Instruction::new(
@@ -1986,559 +1965,6 @@ fn compose_derived_access_chains_rebases_linear_stream_offsets() {
         panic!("composed index should be an id");
     };
     assert_eq!(const_i64_value(&ctx, composed), Some(8));
-}
-
-#[test]
-fn repair_phi_predecessor_edges_reuses_dominating_incoming_value() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(12), vec![])),
-                instructions: vec![
-                    Instruction::new(Op::IAdd, Some(1), Some(20), vec![]),
-                    Instruction::new(
-                        Op::BranchConditional,
-                        None,
-                        None,
-                        vec![Operand::IdRef(30), Operand::IdRef(13), Operand::IdRef(14)],
-                    ),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(13)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(13), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Phi,
-                    Some(1),
-                    Some(21),
-                    vec![Operand::IdRef(20), Operand::IdRef(12)],
-                )],
-            },
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_phi_predecessor_edges(&mut ctx, 0);
-    let phi = &ctx.module.functions[0].blocks[2].instructions[0];
-    assert_eq!(
-        phi.operands,
-        vec![
-            Operand::IdRef(20),
-            Operand::IdRef(12),
-            Operand::IdRef(20),
-            Operand::IdRef(14),
-        ]
-    );
-}
-
-#[test]
-fn repair_phi_predecessor_edges_rewrites_stale_self_backedge_to_continue() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(12), vec![])),
-                instructions: vec![
-                    Instruction::new(Op::IAdd, Some(1), Some(20), vec![]),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(13)]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(13), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::Phi,
-                        Some(1),
-                        Some(21),
-                        vec![
-                            Operand::IdRef(20),
-                            Operand::IdRef(12),
-                            Operand::IdRef(22),
-                            Operand::IdRef(13),
-                        ],
-                    ),
-                    Instruction::new(Op::IAdd, Some(1), Some(22), vec![Operand::IdRef(21)]),
-                    Instruction::new(
-                        Op::LoopMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(15),
-                            Operand::IdRef(14),
-                            Operand::LoopControl(spirv::LoopControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(
-                        Op::BranchConditional,
-                        None,
-                        None,
-                        vec![Operand::IdRef(30), Operand::IdRef(15), Operand::IdRef(14)],
-                    ),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(13)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(15), vec![])),
-                instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
-            },
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_phi_predecessor_edges(&mut ctx, 0);
-    let phi = &ctx.module.functions[0].blocks[1].instructions[0];
-    assert_eq!(
-        phi.operands,
-        vec![
-            Operand::IdRef(20),
-            Operand::IdRef(12),
-            Operand::IdRef(22),
-            Operand::IdRef(14),
-        ]
-    );
-}
-
-#[test]
-fn repair_phi_predecessor_edges_moves_merge_into_synthetic_loop_header() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.types_global_values = vec![
-        Instruction::new(Op::Constant, Some(1), Some(20), vec![]),
-        Instruction::new(Op::Constant, Some(1), Some(21), vec![]),
-    ];
-    let branch = |label, target| Block {
-        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
-        instructions: vec![Instruction::new(
-            Op::Branch,
-            None,
-            None,
-            vec![Operand::IdRef(target)],
-        )],
-    };
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            branch(2, 3),
-            branch(3, 4),
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(4), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::Phi,
-                        Some(1),
-                        Some(22),
-                        vec![
-                            Operand::IdRef(20),
-                            Operand::IdRef(2),
-                            Operand::IdRef(21),
-                            Operand::IdRef(6),
-                        ],
-                    ),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(6)]),
-                ],
-            },
-            branch(6, 7),
-            branch(7, 3),
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    assert!(repair_phi_predecessor_edges(&mut ctx, 0));
-    let forwarded = &ctx.module.functions[0].blocks[1].instructions[0];
-    assert_eq!(forwarded.class.opcode, Op::Phi);
-    assert_eq!(
-        forwarded.operands,
-        vec![
-            Operand::IdRef(20),
-            Operand::IdRef(2),
-            Operand::IdRef(21),
-            Operand::IdRef(7),
-        ]
-    );
-    let phi = &ctx.module.functions[0].blocks[2].instructions[0];
-    assert_eq!(
-        phi.operands,
-        vec![
-            Operand::IdRef(forwarded.result_id.unwrap()),
-            Operand::IdRef(3),
-        ]
-    );
-}
-
-#[test]
-fn repair_phi_predecessor_edges_drops_stale_extra_predecessor() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(13), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::Phi,
-                        Some(1),
-                        Some(21),
-                        vec![
-                            Operand::IdRef(22),
-                            Operand::IdRef(13),
-                            Operand::IdRef(23),
-                            Operand::IdRef(14),
-                        ],
-                    ),
-                    Instruction::new(Op::Return, None, None, vec![]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(13)],
-                )],
-            },
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_phi_predecessor_edges(&mut ctx, 0);
-    let phi = &ctx.module.functions[0].blocks[0].instructions[0];
-    assert_eq!(phi.operands, vec![Operand::IdRef(23), Operand::IdRef(14)]);
-}
-
-#[test]
-fn repair_continue_selection_merge_targets_inserts_in_loop_merge() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(12), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::LoopMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(13),
-                            Operand::IdRef(14),
-                            Operand::LoopControl(spirv::LoopControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(15)]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(15), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::SelectionMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(14),
-                            Operand::SelectionControl(spirv::SelectionControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(
-                        Op::BranchConditional,
-                        None,
-                        None,
-                        vec![Operand::IdRef(20), Operand::IdRef(14), Operand::IdRef(13)],
-                    ),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(13), vec![])),
-                instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(12)],
-                )],
-            },
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_continue_selection_merge_targets(&mut ctx, 0);
-
-    let blocks = &ctx.module.functions[0].blocks;
-    let selection = &blocks[1].instructions[0];
-    assert_eq!(
-        selection.operands.first(),
-        Some(&Operand::IdRef(100)),
-        "selection merge should be the synthetic in-loop block"
-    );
-    assert_eq!(blocks[1].instructions[1].operands[2], Operand::IdRef(100));
-    assert_eq!(
-        blocks[2].label.as_ref().and_then(|label| label.result_id),
-        Some(100),
-        "synthetic block should be inserted before the loop merge"
-    );
-    assert_eq!(
-        blocks[2].instructions[0].operands.first(),
-        Some(&Operand::IdRef(13))
-    );
-}
-
-#[test]
-fn repair_continue_selection_merge_targets_splits_continue_reconvergence() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(12), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::LoopMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(13),
-                            Operand::IdRef(14),
-                            Operand::LoopControl(spirv::LoopControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(15)]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(15), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::SelectionMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(14),
-                            Operand::SelectionControl(spirv::SelectionControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(
-                        Op::BranchConditional,
-                        None,
-                        None,
-                        vec![Operand::IdRef(20), Operand::IdRef(16), Operand::IdRef(17)],
-                    ),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(16), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(17)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(17), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(14)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(12)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(13), vec![])),
-                instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
-            },
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_continue_selection_merge_targets(&mut ctx, 0);
-
-    let blocks = &ctx.module.functions[0].blocks;
-    assert_eq!(
-        blocks[1].instructions[0].operands.first(),
-        Some(&Operand::IdRef(100))
-    );
-    assert_eq!(
-        blocks[3].instructions[0].operands.first(),
-        Some(&Operand::IdRef(100))
-    );
-    assert_eq!(
-        blocks[4].label.as_ref().and_then(|label| label.result_id),
-        Some(100)
-    );
-    assert_eq!(
-        blocks[4].instructions[0].operands.first(),
-        Some(&Operand::IdRef(14))
-    );
-}
-
-#[test]
-fn repair_loop_continue_pass_through_targets_uses_real_continue_block() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(1),
-            Some(10),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(11),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(12), vec![])),
-                instructions: vec![
-                    Instruction::new(
-                        Op::LoopMerge,
-                        None,
-                        None,
-                        vec![
-                            Operand::IdRef(13),
-                            Operand::IdRef(14),
-                            Operand::LoopControl(spirv::LoopControl::NONE),
-                        ],
-                    ),
-                    Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(15)]),
-                ],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(15), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(14)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(14), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(16)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(16), vec![])),
-                instructions: vec![Instruction::new(
-                    Op::Branch,
-                    None,
-                    None,
-                    vec![Operand::IdRef(12)],
-                )],
-            },
-            Block {
-                label: Some(Instruction::new(Op::Label, None, Some(13), vec![])),
-                instructions: vec![Instruction::new(Op::Return, None, None, vec![])],
-            },
-        ],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    repair_loop_continue_pass_through_targets(&mut ctx, 0);
-    let loop_merge = &ctx.module.functions[0].blocks[0].instructions[0];
-    assert_eq!(loop_merge.operands.get(1), Some(&Operand::IdRef(16)));
 }
 
 #[test]
@@ -2684,6 +2110,315 @@ fn lower_private_memory_atomics_uses_plain_load_store() {
     assert_eq!(insts[1].class.opcode, Op::BitwiseAnd);
     assert_eq!(insts[2].class.opcode, Op::Store);
     assert!(!insts.iter().any(|inst| inst.class.opcode == Op::AtomicAnd));
+}
+
+#[test]
+fn lower_reinterpreted_private_atomic_bitcasts_values_not_pointer() {
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(100));
+    let uint = 1;
+    let float = 2;
+    let bool_ty = 3;
+    let ptr_private_float = 4;
+    let ptr_private_uint = 5;
+    let null_float = 6;
+    let private_float = 7;
+    let scope = 8;
+    let semantics = 9;
+    let value = 10;
+    let private_uint = 11;
+    let null_uint = 12;
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float),
+            vec![Operand::LiteralBit32(32)],
+        ),
+        Instruction::new(Op::TypeBool, None, Some(bool_ty), vec![]),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_private_float),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(float),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_private_uint),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(uint),
+            ],
+        ),
+        Instruction::new(Op::ConstantNull, Some(float), Some(null_float), vec![]),
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_private_float),
+            Some(private_float),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(null_float),
+            ],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(scope),
+            vec![Operand::LiteralBit32(1)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(semantics),
+            vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(value),
+            vec![Operand::LiteralBit32(7)],
+        ),
+        Instruction::new(Op::ConstantNull, Some(uint), Some(null_uint), vec![]),
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_private_uint),
+            Some(private_uint),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(null_uint),
+            ],
+        ),
+    ];
+    let pointer_bitcast = 20;
+    let atomic_result = 21;
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(uint),
+            Some(50),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(51),
+            ],
+        )),
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+        parameters: vec![],
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
+            instructions: vec![
+                Instruction::new(
+                    Op::Bitcast,
+                    Some(ptr_private_uint),
+                    Some(pointer_bitcast),
+                    vec![Operand::IdRef(private_float)],
+                ),
+                Instruction::new(
+                    Op::AtomicSMin,
+                    Some(uint),
+                    Some(atomic_result),
+                    vec![
+                        Operand::IdRef(pointer_bitcast),
+                        Operand::IdScope(scope),
+                        Operand::IdMemorySemantics(semantics),
+                        Operand::IdRef(value),
+                    ],
+                ),
+            ],
+        }],
+    });
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(uint),
+            Some(60),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(51),
+            ],
+        )),
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+        parameters: vec![],
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(61), vec![])),
+            instructions: vec![Instruction::new(
+                Op::AtomicLoad,
+                Some(uint),
+                Some(62),
+                vec![
+                    Operand::IdRef(private_uint),
+                    Operand::IdScope(scope),
+                    Operand::IdMemorySemantics(semantics),
+                ],
+            )],
+        }],
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    run_idempotent(&mut ctx, rewrite_private_pointer_atomics);
+
+    let instructions = &ctx.module.functions[0].blocks[0].instructions;
+    assert!(!instructions
+        .iter()
+        .any(|inst| inst.class.opcode == Op::AtomicSMin));
+    assert!(!instructions.iter().any(|inst| {
+        inst.class.opcode == Op::Bitcast && inst.result_type == Some(ptr_private_uint)
+    }));
+    assert_eq!(instructions[0].class.opcode, Op::Load);
+    assert_eq!(instructions[0].result_type, Some(float));
+    assert_eq!(instructions[1].class.opcode, Op::Bitcast);
+    assert_eq!(instructions[1].result_type, Some(uint));
+    assert_eq!(instructions[1].result_id, Some(atomic_result));
+    let store = instructions.last().expect("lowered store");
+    assert_eq!(store.class.opcode, Op::Store);
+    assert_eq!(store.operands.first(), Some(&Operand::IdRef(private_float)));
+    assert_eq!(
+        ctx.module.functions[1].blocks[0].instructions[0]
+            .class
+            .opcode,
+        Op::Load,
+        "a helper function sharing the Private root must be lowered too"
+    );
+}
+
+#[test]
+fn absent_private_aggregate_root_load_through_helper_becomes_typed_zero() {
+    let uint = 1;
+    let length = 2;
+    let array = 3;
+    let pointer = 4;
+    let initializer = 5;
+    let root = 6;
+    let alias = 7;
+    let result = 8;
+    let entry_function = 9;
+    let helper_function = 10;
+    let helper_parameter = 11;
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(64));
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uint),
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(length),
+            vec![Operand::LiteralBit32(4)],
+        ),
+        Instruction::new(
+            Op::TypeArray,
+            None,
+            Some(array),
+            vec![Operand::IdRef(uint), Operand::IdRef(length)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(pointer),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(array),
+            ],
+        ),
+        Instruction::new(Op::ConstantNull, Some(array), Some(initializer), vec![]),
+        Instruction::new(
+            Op::Variable,
+            Some(pointer),
+            Some(root),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(initializer),
+            ],
+        ),
+    ];
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(uint),
+            Some(entry_function),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(60),
+            ],
+        )),
+        end: None,
+        parameters: vec![],
+        blocks: vec![Block {
+            label: None,
+            instructions: vec![Instruction::new(
+                Op::FunctionCall,
+                Some(uint),
+                Some(61),
+                vec![Operand::IdRef(helper_function), Operand::IdRef(root)],
+            )],
+        }],
+    });
+    module.functions.push(Function {
+        def: Some(Instruction::new(
+            Op::Function,
+            Some(uint),
+            Some(helper_function),
+            vec![
+                Operand::FunctionControl(FunctionControl::NONE),
+                Operand::IdRef(62),
+            ],
+        )),
+        end: None,
+        parameters: vec![Instruction::new(
+            Op::FunctionParameter,
+            Some(pointer),
+            Some(helper_parameter),
+            vec![],
+        )],
+        blocks: vec![Block {
+            label: None,
+            instructions: vec![
+                Instruction::new(
+                    Op::CopyObject,
+                    Some(pointer),
+                    Some(alias),
+                    vec![Operand::IdRef(helper_parameter)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(uint),
+                    Some(result),
+                    vec![Operand::IdRef(alias)],
+                ),
+            ],
+        }],
+    });
+
+    let mut ctx = crate::passes::Ctx::new(module);
+    run_idempotent(&mut ctx, |ctx| {
+        rewrite_private_zero_root_loads(ctx, &[root])
+    });
+
+    let rewritten = &ctx.module.functions[1].blocks[0].instructions[1];
+    assert_eq!(rewritten.class.opcode, Op::CopyObject);
+    assert_eq!(rewritten.result_type, Some(uint));
+    assert_eq!(rewritten.result_id, Some(result));
+    let Operand::IdRef(zero) = rewritten.operands[0] else {
+        panic!("rewritten load must copy a null constant")
+    };
+    assert!(ctx.new_globals.iter().any(|instruction| {
+        instruction.class.opcode == Op::ConstantNull
+            && instruction.result_type == Some(uint)
+            && instruction.result_id == Some(zero)
+    }));
 }
 
 // OpPtrAccessChain requires its base pointer TYPE to carry an ArrayStride decoration
@@ -3153,172 +2888,6 @@ fn lower_cross_member_subword_store_splits_into_members() {
     );
 }
 
-// A dead, currently-invalid access chain (an unused `uchar`-pointer re-indexed to a `ushort`
-// pointer) and the otherwise-valid PtrAccessChain suffix that keeps it live are dropped; a used
-// valid chain is kept.
-#[test]
-fn drop_dead_invalid_access_chains_removes_unused_overindex() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-
-    let uchar = 1;
-    let ushort = 2;
-    let uint = 3;
-    let arr = 4; // runtime array of uchar
-    let struct_outer = 5; // { arr }
-    let ptr_sb_outer = 6;
-    let ptr_sb_uchar = 7;
-    let ptr_sb_ushort = 8;
-    let buf = 9;
-    let uint_0 = 10;
-    let idx = 11;
-    let ptr_offset = 12;
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uchar),
-            vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(ushort),
-            vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeRuntimeArray,
-            None,
-            Some(arr),
-            vec![Operand::IdRef(uchar)],
-        ),
-        Instruction::new(
-            Op::TypeStruct,
-            None,
-            Some(struct_outer),
-            vec![Operand::IdRef(arr)],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_outer),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(struct_outer),
-            ],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_uchar),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(uchar),
-            ],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_ushort),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(ushort),
-            ],
-        ),
-        Instruction::new(
-            Op::Variable,
-            Some(ptr_sb_outer),
-            Some(buf),
-            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(uint),
-            Some(uint_0),
-            vec![Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(uint),
-            Some(idx),
-            vec![Operand::LiteralBit32(2)],
-        ),
-    ];
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(uint),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            instructions: vec![
-                // A valid uchar element pointer (used below).
-                Instruction::new(
-                    Op::InBoundsAccessChain,
-                    Some(ptr_sb_uchar),
-                    Some(60),
-                    vec![
-                        Operand::IdRef(buf),
-                        Operand::IdRef(uint_0),
-                        Operand::IdRef(idx),
-                    ],
-                ),
-                // A DEAD, INVALID chain: indexes the scalar uchar pointer to a ushort pointer.
-                Instruction::new(
-                    Op::InBoundsAccessChain,
-                    Some(ptr_sb_ushort),
-                    Some(61),
-                    vec![Operand::IdRef(60), Operand::IdRef(idx)],
-                ),
-                // This valid zero-offset pointer chain is dead, but initially keeps the invalid
-                // parent live. Cleanup must remove the suffix and then the newly orphaned parent.
-                Instruction::new(
-                    Op::PtrAccessChain,
-                    Some(ptr_sb_ushort),
-                    Some(ptr_offset),
-                    vec![Operand::IdRef(61), Operand::IdRef(uint_0)],
-                ),
-                // Keep %60 live.
-                Instruction::new(Op::Load, Some(uchar), Some(62), vec![Operand::IdRef(60)]),
-            ],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, |c| drop_dead_invalid_access_chains(c, 0));
-
-    let insts = &ctx.module.functions[0].blocks[0].instructions;
-    assert!(
-        !insts.iter().any(|i| i.result_id == Some(61)),
-        "the dead invalid chain must be dropped"
-    );
-    assert!(
-        !insts.iter().any(|i| i.result_id == Some(ptr_offset)),
-        "the dead pointer-chain suffix must be dropped"
-    );
-    assert!(
-        insts.iter().any(|i| i.result_id == Some(60)),
-        "the valid, used chain must be kept"
-    );
-    assert!(
-        insts.iter().any(|i| i.result_id == Some(62)),
-        "the load that keeps %60 live must be kept"
-    );
-}
-
 // A `Private` `array<half, 2>` written with a `half2` at BYTE offset 4 (via a `uchar`
 // `OpPtrAccessChain` off the `&half[0]` base) is lowered to two per-element half stores at element
 // indices 2 and 3, and the variable's array is enlarged to `array<half, 4>` so those indices are in
@@ -3684,6 +3253,104 @@ fn retype_demoted_copymemory_placeholder_matches_source_struct() {
         var.operands.len(),
         1,
         "the mistyped scalar initializer must be dropped"
+    );
+}
+
+#[test]
+fn retype_private_direct_memory_placeholder_uses_complete_object_type() {
+    let byte = 1;
+    let float = 2;
+    let vector = 3;
+    let ptr_private_byte = 4;
+    let null_byte = 5;
+    let variable = 6;
+    let loaded = 7;
+    let mut module = Module::new();
+    module.header = Some(ModuleHeader::new(32));
+    module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(byte),
+            vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::TypeFloat,
+            None,
+            Some(float),
+            vec![Operand::LiteralBit32(32)],
+        ),
+        Instruction::new(
+            Op::TypeVector,
+            None,
+            Some(vector),
+            vec![Operand::IdRef(float), Operand::LiteralBit32(4)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_private_byte),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(byte),
+            ],
+        ),
+        Instruction::new(Op::ConstantNull, Some(byte), Some(null_byte), vec![]),
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_private_byte),
+            Some(variable),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(null_byte),
+            ],
+        ),
+    ];
+    module.functions.push(Function {
+        def: Some(Instruction::new(Op::Function, None, Some(20), vec![])),
+        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+        parameters: vec![],
+        blocks: vec![Block {
+            label: Some(Instruction::new(Op::Label, None, Some(21), vec![])),
+            instructions: vec![Instruction::new(
+                Op::Load,
+                Some(vector),
+                Some(loaded),
+                vec![Operand::IdRef(variable)],
+            )],
+        }],
+    });
+    let mut ctx = crate::passes::Ctx::new(module);
+
+    retype_private_direct_memory_placeholders(&mut ctx);
+
+    let variable = ctx
+        .module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.result_id == Some(variable))
+        .expect("private variable");
+    let pointer_ty = variable.result_type.expect("private pointer type");
+    assert_eq!(
+        ctx.module
+            .types_global_values
+            .iter()
+            .find(|instruction| instruction.result_id == Some(pointer_ty))
+            .and_then(|instruction| instruction.operands.get(1)),
+        Some(&Operand::IdRef(vector))
+    );
+    let initializer = match variable.operands.get(1) {
+        Some(Operand::IdRef(initializer)) => *initializer,
+        _ => panic!("typed private initializer"),
+    };
+    assert!(ctx.module.types_global_values.iter().any(|instruction| {
+        instruction.class.opcode == Op::ConstantNull
+            && instruction.result_id == Some(initializer)
+            && instruction.result_type == Some(vector)
+    }));
+    assert_eq!(
+        ctx.module.functions[0].blocks[0].instructions[0].result_type,
+        Some(vector)
     );
 }
 
@@ -4476,415 +4143,6 @@ fn remap_dynamic_word_index_to_array_struct_field_remaps_and_splits_load() {
     );
 }
 
-// `OpLoad %v4float` through a `float*` access chain whose base is a `v4float*` is the emitter's
-// mis-typed vector stride; the chain is rewritten to `OpPtrAccessChain %v4float* %base %idx`.
-#[test]
-fn repair_vector_load_through_scalar_stride_rewrites_to_ptr_access_chain() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-
-    let float = 1;
-    let v4float = 2;
-    let ptr_sb_v4 = 3;
-    let ptr_sb_f = 4;
-    let base = 5; // a v4float* value (model as a variable)
-    let idx = 6;
-    let chain = 7;
-    let load = 8;
-
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeFloat,
-            None,
-            Some(float),
-            vec![Operand::LiteralBit32(32)],
-        ),
-        Instruction::new(
-            Op::TypeVector,
-            None,
-            Some(v4float),
-            vec![Operand::IdRef(float), Operand::LiteralBit32(4)],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_v4),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(v4float),
-            ],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_f),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(float),
-            ],
-        ),
-        Instruction::new(
-            Op::Variable,
-            Some(ptr_sb_v4),
-            Some(base),
-            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(float),
-            Some(idx),
-            vec![Operand::LiteralBit32(2)],
-        ),
-    ];
-
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(float),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            instructions: vec![
-                Instruction::new(
-                    Op::InBoundsAccessChain,
-                    Some(ptr_sb_f),
-                    Some(chain),
-                    vec![Operand::IdRef(base), Operand::IdRef(idx)],
-                ),
-                Instruction::new(
-                    Op::Load,
-                    Some(v4float),
-                    Some(load),
-                    vec![Operand::IdRef(chain)],
-                ),
-            ],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, |c| repair_vector_load_through_scalar_stride(c, 0));
-
-    let c = &ctx.module.functions[0].blocks[0].instructions[0];
-    assert_eq!(
-        c.class.opcode,
-        Op::PtrAccessChain,
-        "chain becomes PtrAccessChain"
-    );
-    assert_eq!(c.result_type, Some(ptr_sb_v4), "retyped to v4float*");
-    assert_eq!(
-        c.operands,
-        vec![Operand::IdRef(base), Operand::IdRef(idx)],
-        "operands unchanged (base + idx)"
-    );
-}
-
-// A vector view into a raw uint-word buffer is expanded to four scalar word loads. The vector index
-// is deliberately defined in the same block: the rewrite must capture its type before taking that
-// block's instructions, or it can delete the old chain while leaving an undefined load pointer. Two
-// trailing zero-stride scalar GEP indices exercise the composed opaque-pointer form seen in AIR.
-#[test]
-fn repair_vector_load_through_raw_word_pointer_handles_local_index_definition() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(200));
-
-    let uint = 1;
-    let float = 2;
-    let v4float = 3;
-    let words = 4;
-    let block = 5;
-    let ptr_block = 6;
-    let ptr_v4float = 7;
-    let buffer = 8;
-    let zero = 9;
-    let base_word = 10;
-    let one = 11;
-    let local_index = 12;
-    let chain = 13;
-    let load = 14;
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeFloat,
-            None,
-            Some(float),
-            vec![Operand::LiteralBit32(32)],
-        ),
-        Instruction::new(
-            Op::TypeVector,
-            None,
-            Some(v4float),
-            vec![Operand::IdRef(float), Operand::LiteralBit32(4)],
-        ),
-        Instruction::new(
-            Op::TypeRuntimeArray,
-            None,
-            Some(words),
-            vec![Operand::IdRef(uint)],
-        ),
-        Instruction::new(
-            Op::TypeStruct,
-            None,
-            Some(block),
-            vec![Operand::IdRef(words)],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_block),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(block),
-            ],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_v4float),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(v4float),
-            ],
-        ),
-        Instruction::new(
-            Op::Variable,
-            Some(ptr_block),
-            Some(buffer),
-            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(uint),
-            Some(zero),
-            vec![Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(uint),
-            Some(base_word),
-            vec![Operand::LiteralBit32(20)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(uint),
-            Some(one),
-            vec![Operand::LiteralBit32(1)],
-        ),
-    ];
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(uint),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            instructions: vec![
-                Instruction::new(
-                    Op::IAdd,
-                    Some(uint),
-                    Some(local_index),
-                    vec![Operand::IdRef(zero), Operand::IdRef(one)],
-                ),
-                Instruction::new(
-                    Op::InBoundsAccessChain,
-                    Some(ptr_v4float),
-                    Some(chain),
-                    vec![
-                        Operand::IdRef(buffer),
-                        Operand::IdRef(zero),
-                        Operand::IdRef(base_word),
-                        Operand::IdRef(local_index),
-                        Operand::IdRef(zero),
-                        Operand::IdRef(one),
-                    ],
-                ),
-                Instruction::new(
-                    Op::Load,
-                    Some(v4float),
-                    Some(load),
-                    vec![Operand::IdRef(chain)],
-                ),
-            ],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, |c| {
-        repair_vector_load_through_raw_word_pointer(c, 0)
-    });
-
-    let body = &ctx.module.functions[0].blocks[0].instructions;
-    assert!(
-        !body.iter().any(|inst| inst.result_id == Some(chain)),
-        "the invalid vector chain must be removed"
-    );
-    assert!(body.iter().any(|inst| {
-        inst.result_id == Some(load) && inst.class.opcode == Op::CompositeConstruct
-    }));
-    assert_eq!(
-        body.iter()
-            .filter(|inst| inst.class.opcode == Op::Load && inst.result_type == Some(uint))
-            .count(),
-        4
-    );
-    let four = ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-        .find(|inst| {
-            inst.class.opcode == Op::Constant
-                && inst.result_type == Some(uint)
-                && inst.operands == [Operand::LiteralBit32(4)]
-        })
-        .and_then(|inst| inst.result_id)
-        .expect("one trailing vector advances four raw words");
-    assert!(body.iter().any(|inst| {
-        inst.class.opcode == Op::IAdd && inst.operands.contains(&Operand::IdRef(four))
-    }));
-}
-
-// `OpLoad %float` through a `v4float*` PtrAccessChain is the matrix-column gather's strided component
-// read; the chain gets a trailing `%uint_0` and is retyped to `float*`.
-#[test]
-fn repair_scalar_load_through_vector_ptr_appends_component_zero() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-
-    let uint = 1;
-    let float = 2;
-    let v4float = 3;
-    let ptr_sb_v4 = 4;
-    let ptr_sb_f = 5;
-    let base = 6;
-    let uint_1 = 7;
-    let chain = 8;
-    let load = 9;
-
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeFloat,
-            None,
-            Some(float),
-            vec![Operand::LiteralBit32(32)],
-        ),
-        Instruction::new(
-            Op::TypeVector,
-            None,
-            Some(v4float),
-            vec![Operand::IdRef(float), Operand::LiteralBit32(4)],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_v4),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(v4float),
-            ],
-        ),
-        Instruction::new(
-            Op::TypePointer,
-            None,
-            Some(ptr_sb_f),
-            vec![
-                Operand::StorageClass(StorageClass::StorageBuffer),
-                Operand::IdRef(float),
-            ],
-        ),
-        Instruction::new(
-            Op::Variable,
-            Some(ptr_sb_v4),
-            Some(base),
-            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-        ),
-        Instruction::new(
-            Op::Constant,
-            Some(uint),
-            Some(uint_1),
-            vec![Operand::LiteralBit32(1)],
-        ),
-    ];
-
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(float),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            instructions: vec![
-                Instruction::new(
-                    Op::PtrAccessChain,
-                    Some(ptr_sb_v4),
-                    Some(chain),
-                    vec![Operand::IdRef(base), Operand::IdRef(uint_1)],
-                ),
-                Instruction::new(
-                    Op::Load,
-                    Some(float),
-                    Some(load),
-                    vec![Operand::IdRef(chain)],
-                ),
-            ],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, |c| repair_scalar_load_through_vector_ptr(c, 0));
-
-    let c = &ctx.module.functions[0].blocks[0].instructions[0];
-    assert_eq!(c.result_type, Some(ptr_sb_f), "retyped to float*");
-    assert_eq!(
-        c.operands.len(),
-        3,
-        "a trailing component index was appended"
-    );
-    let Operand::IdRef(last) = c.operands[2] else {
-        panic!("trailing index not an id")
-    };
-    let lval = ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-        .find(|g| g.result_id == Some(last) && g.class.opcode == Op::Constant)
-        .and_then(|g| match g.operands.first() {
-            Some(Operand::LiteralBit32(v)) => Some(*v),
-            _ => None,
-        });
-    assert_eq!(lval, Some(0), "appended component index is 0");
-}
-
 // A write-only `Function` ulong array with a type-mismatched store (a StorageBuffer pointer stored into
 // a ulong slot) is recognized as dead; its stores and access chains are removed.
 #[test]
@@ -5036,289 +4294,12 @@ fn drop_writeonly_dead_local_array_stores_removes_invalid_stores() {
 
 // --- Additional coverage for previously-untested access.rs repair passes (refactor T6/§6) --------
 //
-// These four passes ran in the `transform_with_options` "2b/2c/2d/2h" blocks with zero isolated unit
+// These three passes ran in the `transform_with_options` "2c/2d/2h" blocks with zero isolated unit
 // coverage (§6 gap-list). Each fixture is a hand-built crate module exercising the pass's transform
-// on a minimal shape, asserting the concrete rewrite. Three are genuinely idempotent (their driver
+// on a minimal shape, asserting the concrete rewrite. Two are genuinely idempotent (their driver
 // slots assume it), so they run through `run_idempotent`; `guard_integer_division_by_zero` is NOT
 // idempotent by design (a second run re-guards the already-guarded denominator) — the driver runs it
 // exactly once, so it is tested with a single call and the non-idempotence is documented, not fixed.
-
-/// A same-width int/float `OpUConvert`/`OpSConvert`/`OpFConvert` is a no-op the SPIR-V would reject as
-/// a width-preserving convert; `fix_noop_width_converts` uses `OpCopyObject` for identical types and
-/// `OpBitcast` for equal-width signedness changes. A genuine narrowing/widening convert is untouched.
-#[test]
-fn fix_noop_width_converts_rewrites_samewidth_convert_to_copyobject() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-
-    let uint = 1; // TypeInt 32 0
-    let ushort = 2; // TypeInt 16 0
-    let sint = 3; // TypeInt 32 1
-    let p_uint = 10; // param : uint  (same width as the convert result)
-    let p_ushort = 11; // param : ushort (genuinely narrower source)
-    let p_sint = 12; // param : signed int (same width, distinct type)
-    let noop_res = 20;
-    let real_res = 21;
-    let signedness_res = 22;
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(ushort),
-            vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(sint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(1)],
-        ),
-    ];
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(uint),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![
-            Instruction::new(Op::FunctionParameter, Some(uint), Some(p_uint), vec![]),
-            Instruction::new(Op::FunctionParameter, Some(ushort), Some(p_ushort), vec![]),
-            Instruction::new(Op::FunctionParameter, Some(sint), Some(p_sint), vec![]),
-        ],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            instructions: vec![
-                // Same width (uint -> uint): the convert is a no-op.
-                Instruction::new(
-                    Op::UConvert,
-                    Some(uint),
-                    Some(noop_res),
-                    vec![Operand::IdRef(p_uint)],
-                ),
-                // Real widening (ushort -> uint): must stay a convert.
-                Instruction::new(
-                    Op::UConvert,
-                    Some(uint),
-                    Some(real_res),
-                    vec![Operand::IdRef(p_ushort)],
-                ),
-                // Equal width and lanes but different signedness: CopyObject would be invalid.
-                Instruction::new(
-                    Op::UConvert,
-                    Some(uint),
-                    Some(signedness_res),
-                    vec![Operand::IdRef(p_sint)],
-                ),
-            ],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, |c| fix_noop_width_converts(c, 0));
-
-    let body = &ctx.module.functions[0].blocks[0].instructions;
-    assert_eq!(
-        body[0].class.opcode,
-        Op::CopyObject,
-        "same-width convert should become OpCopyObject"
-    );
-    assert_eq!(body[0].result_id, Some(noop_res));
-    assert_eq!(body[0].result_type, Some(uint));
-    assert_eq!(body[0].operands, vec![Operand::IdRef(p_uint)]);
-    assert_eq!(
-        body[1].class.opcode,
-        Op::UConvert,
-        "a genuine width-changing convert must be left untouched"
-    );
-    assert_eq!(body[1].result_id, Some(real_res));
-    assert_eq!(body[2].class.opcode, Op::Bitcast);
-    assert_eq!(body[2].result_id, Some(signedness_res));
-    assert_eq!(body[2].result_type, Some(uint));
-    assert_eq!(body[2].operands, vec![Operand::IdRef(p_sint)]);
-}
-
-/// `fix_merge_placement` slides a mid-block `OpSelectionMerge`/`OpLoopMerge` down to sit immediately
-/// before the block's branch terminator (SPIR-V requires the merge to be the second-to-last
-/// instruction), preserving the relative order of displaced values.
-#[test]
-fn fix_merge_placement_slides_midblock_merge_before_terminator() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-
-    let uint = 1;
-    let boolt = 2;
-    let cond = 10; // param : bool
-    let merge_label = 40;
-    let target_a = 41;
-    let target_b = 42;
-    let hoisted = 30;
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(Op::TypeBool, None, Some(boolt), vec![]),
-    ];
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(uint),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![Instruction::new(
-            Op::FunctionParameter,
-            Some(boolt),
-            Some(cond),
-            vec![],
-        )],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            instructions: vec![
-                // Merge left MID-BLOCK (index 0), separated from the branch by a hoisted value.
-                Instruction::new(
-                    Op::SelectionMerge,
-                    None,
-                    None,
-                    vec![
-                        Operand::IdRef(merge_label),
-                        Operand::SelectionControl(SelectionControl::NONE),
-                    ],
-                ),
-                Instruction::new(Op::Undef, Some(uint), Some(hoisted), vec![]),
-                Instruction::new(
-                    Op::BranchConditional,
-                    None,
-                    None,
-                    vec![
-                        Operand::IdRef(cond),
-                        Operand::IdRef(target_a),
-                        Operand::IdRef(target_b),
-                    ],
-                ),
-            ],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, |c| fix_merge_placement(c, 0));
-
-    let body = &ctx.module.functions[0].blocks[0].instructions;
-    let n = body.len();
-    assert_eq!(n, 3, "no instructions added or removed, only reordered");
-    assert_eq!(
-        body[n - 2].class.opcode,
-        Op::SelectionMerge,
-        "the merge must sit immediately before the terminator"
-    );
-    assert_eq!(
-        body[n - 1].class.opcode,
-        Op::BranchConditional,
-        "the branch stays last"
-    );
-    assert_eq!(
-        body[n - 3].result_id,
-        Some(hoisted),
-        "the displaced value keeps its relative order above the merge"
-    );
-}
-
-/// `normalize_int_arith_operand_widths` inserts a truncating `OpUConvert` for any integer-arithmetic
-/// operand wider than the instruction's result type (spirv-val rejects a mismatched-width operand),
-/// deduplicating within one instruction so a value used twice truncates once.
-#[test]
-fn normalize_int_arith_operand_widths_truncates_wider_operand() {
-    let mut module = Module::new();
-    module.header = Some(ModuleHeader::new(100));
-
-    let uint = 1; // TypeInt 32 0
-    let ulong = 2; // TypeInt 64 0
-    let p_ulong = 10; // param : ulong, reused as both IMul operands
-    let mul_res = 20;
-    module.types_global_values = vec![
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(uint),
-            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-        ),
-        Instruction::new(
-            Op::TypeInt,
-            None,
-            Some(ulong),
-            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
-        ),
-    ];
-    module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(uint),
-            Some(50),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(51),
-            ],
-        )),
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-        parameters: vec![Instruction::new(
-            Op::FunctionParameter,
-            Some(ulong),
-            Some(p_ulong),
-            vec![],
-        )],
-        blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
-            // 32-bit result, 64-bit operands (twice) -> one truncating UConvert, both operands rebound.
-            instructions: vec![Instruction::new(
-                Op::IMul,
-                Some(uint),
-                Some(mul_res),
-                vec![Operand::IdRef(p_ulong), Operand::IdRef(p_ulong)],
-            )],
-        }],
-    });
-
-    let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, normalize_int_arith_operand_widths);
-
-    let body = &ctx.module.functions[0].blocks[0].instructions;
-    assert_eq!(
-        body.len(),
-        2,
-        "one truncating UConvert inserted before the IMul"
-    );
-    assert_eq!(
-        body[0].class.opcode,
-        Op::UConvert,
-        "the wide operand is truncated to the result width"
-    );
-    assert_eq!(body[0].result_type, Some(uint));
-    assert_eq!(body[0].operands, vec![Operand::IdRef(p_ulong)]);
-    let narrow = body[0].result_id.expect("truncation has a result id");
-    assert_eq!(body[1].class.opcode, Op::IMul);
-    assert_eq!(
-        body[1].operands,
-        vec![Operand::IdRef(narrow), Operand::IdRef(narrow)],
-        "both IMul operands rebind to the single deduplicated truncation"
-    );
-}
 
 /// `guard_integer_division_by_zero` guards an eager `OpUDiv`/`OpSDiv`/`OpUMod`/`OpSRem` denominator
 /// so the otherwise-undefined divide-by-zero arm becomes deterministic: it inserts `denom == 0` and a
@@ -5616,16 +4597,30 @@ fn drop_overindexed_zero_tail_truncates_trailing_zero_overindex() {
     );
 }
 
-// The pass is byte-neutral where it must not fire: an arithmetic op whose operands already match the
-// result width is left alone, and a shift is excluded entirely (its Shift operand may legally differ
-// in width from the result), so no `OpUConvert` is inserted for either.
 #[test]
-fn normalize_int_arith_operand_widths_leaves_matched_and_shift_operands_alone() {
-    let uint = 1;
-    let ulong = 2;
+fn private_low_byte_word_load_reads_only_declared_byte() {
+    let uchar = 1;
+    let uint = 2;
+    let uchar4 = 3;
+    let ptr_uchar = 4;
+    let ptr_uint = 5;
+    let zero = 6;
+    let base = 7;
+    let chain = 8;
+    let wide = 9;
+    let bytes = 10;
+    let low = 11;
+    let sum = 12;
+    let one = 13;
     let mut module = Module::new();
     module.header = Some(ModuleHeader::new(100));
     module.types_global_values = vec![
+        Instruction::new(
+            Op::TypeInt,
+            None,
+            Some(uchar),
+            vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+        ),
         Instruction::new(
             Op::TypeInt,
             None,
@@ -5633,72 +4628,101 @@ fn normalize_int_arith_operand_widths_leaves_matched_and_shift_operands_alone() 
             vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
         ),
         Instruction::new(
-            Op::TypeInt,
+            Op::TypeVector,
             None,
-            Some(ulong),
-            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+            Some(uchar4),
+            vec![Operand::IdRef(uchar), Operand::LiteralBit32(4)],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_uchar),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(uchar),
+            ],
+        ),
+        Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(ptr_uint),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(uint),
+            ],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(zero),
+            vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uchar),
+            Some(one),
+            vec![Operand::LiteralBit32(1)],
+        ),
+        Instruction::new(
+            Op::Variable,
+            Some(ptr_uchar),
+            Some(base),
+            vec![Operand::StorageClass(StorageClass::Private)],
         ),
     ];
-
-    let wide = 50;
-    let narrow = 51;
-    let add = 60;
-    let shift = 61;
     module.functions.push(Function {
-        def: Some(Instruction::new(
-            Op::Function,
-            Some(uint),
-            Some(40),
-            vec![
-                Operand::FunctionControl(FunctionControl::NONE),
-                Operand::IdRef(41),
-            ],
-        )),
-        parameters: vec![
-            Instruction::new(Op::FunctionParameter, Some(ulong), Some(wide), vec![]),
-            Instruction::new(Op::FunctionParameter, Some(uint), Some(narrow), vec![]),
-        ],
+        def: None,
+        end: None,
+        parameters: vec![],
         blocks: vec![Block {
-            label: Some(Instruction::new(Op::Label, None, Some(52), vec![])),
+            label: None,
             instructions: vec![
-                // Matched widths (uint + uint): no coercion needed.
+                Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(ptr_uint),
+                    Some(chain),
+                    vec![Operand::IdRef(base), Operand::IdRef(zero)],
+                ),
+                Instruction::new(
+                    Op::Load,
+                    Some(uint),
+                    Some(wide),
+                    vec![Operand::IdRef(chain)],
+                ),
+                Instruction::new(
+                    Op::Bitcast,
+                    Some(uchar4),
+                    Some(bytes),
+                    vec![Operand::IdRef(wide)],
+                ),
+                Instruction::new(
+                    Op::CompositeExtract,
+                    Some(uchar),
+                    Some(low),
+                    vec![Operand::IdRef(bytes), Operand::LiteralBit32(0)],
+                ),
                 Instruction::new(
                     Op::IAdd,
-                    Some(uint),
-                    Some(add),
-                    vec![Operand::IdRef(narrow), Operand::IdRef(narrow)],
-                ),
-                // A shift with a WIDER (ulong) shift operand: excluded, so left as-is.
-                Instruction::new(
-                    Op::ShiftLeftLogical,
-                    Some(uint),
-                    Some(shift),
-                    vec![Operand::IdRef(narrow), Operand::IdRef(wide)],
+                    Some(uchar),
+                    Some(sum),
+                    vec![Operand::IdRef(low), Operand::IdRef(one)],
                 ),
             ],
         }],
-        end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
     });
 
     let mut ctx = crate::passes::Ctx::new(module);
-    run_idempotent(&mut ctx, normalize_int_arith_operand_widths);
+    lower_private_low_byte_word_load(&mut ctx, 0);
 
     let body = &ctx.module.functions[0].blocks[0].instructions;
-    assert!(
-        !body.iter().any(|i| i.class.opcode == Op::UConvert),
-        "no truncation is inserted for matched-width or shift operands"
-    );
-    let add_inst = body.iter().find(|i| i.result_id == Some(add)).unwrap();
+    assert_eq!(body.len(), 2);
+    assert_eq!(body[0].class.opcode, Op::Load);
+    assert_eq!(body[0].result_type, Some(uchar));
+    assert_eq!(body[0].operands, vec![Operand::IdRef(base)]);
+    assert_eq!(body[1].class.opcode, Op::IAdd);
     assert_eq!(
-        add_inst.operands,
-        vec![Operand::IdRef(narrow), Operand::IdRef(narrow)],
-        "the matched-width add is untouched"
-    );
-    let shift_inst = body.iter().find(|i| i.result_id == Some(shift)).unwrap();
-    assert_eq!(
-        shift_inst.operands,
-        vec![Operand::IdRef(narrow), Operand::IdRef(wide)],
-        "the shift keeps its wider shift operand"
+        body[1].operands[0],
+        Operand::IdRef(body[0].result_id.unwrap())
     );
 }
 

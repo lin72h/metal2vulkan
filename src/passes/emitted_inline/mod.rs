@@ -47,9 +47,88 @@ pub(super) fn inline_helpers(ctx: &mut Ctx, entry_idx: usize) -> Result<InlineSt
         })
         .collect::<HashSet<_>>();
     let stats = inline_selected_helpers(ctx, entry_idx, &selected)?;
+    complete_inlined_access_chain_descent(ctx, entry_idx);
     compose_chained_access_chains(ctx, entry_idx);
     prune_unreferenced_functions(ctx, entry_idx);
     Ok(stats)
+}
+
+/// Finish the self-contained entry's member-access chains after every helper splice has completed.
+/// A substituted pointer may add address-equivalent array/vector wrapper layers around the helper's
+/// declared pointee. Completing those zero-offset descents once at the closure boundary prevents a
+/// cloned helper body from being completed again by its caller.
+pub(super) fn complete_inlined_access_chain_descent(ctx: &mut Ctx, entry_idx: usize) {
+    let defs = type_defs_with_new_globals(ctx);
+    let result_types = collect_result_types(ctx);
+    for block_idx in 0..ctx.module.functions[entry_idx].blocks.len() {
+        for instruction_idx in 0..ctx.module.functions[entry_idx].blocks[block_idx]
+            .instructions
+            .len()
+        {
+            let instruction = ctx.module.functions[entry_idx].blocks[block_idx].instructions
+                [instruction_idx]
+                .clone();
+            if !is_member_access_chain(instruction.class.opcode) || instruction.operands.len() < 2 {
+                continue;
+            }
+            let Some(result_pointee) = instruction
+                .result_type
+                .and_then(|result_type| ptr_pointee(&defs, result_type))
+            else {
+                continue;
+            };
+            let Some(Operand::IdRef(base)) = instruction.operands.first() else {
+                continue;
+            };
+            let Some(base_pointee) = result_types
+                .get(base)
+                .and_then(|base_type| ptr_pointee(&defs, *base_type))
+            else {
+                continue;
+            };
+            let Some(mut reached) =
+                walk_access_chain_type(&defs, base_pointee, &instruction.operands[1..])
+            else {
+                continue;
+            };
+            let mut zero_tail = 0usize;
+            while reached != result_pointee {
+                let Some(definition) = defs.get(&reached) else {
+                    zero_tail = 0;
+                    break;
+                };
+                reached = match definition.class.opcode {
+                    Op::TypeArray | Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
+                        let Some(Operand::IdRef(element)) = definition.operands.first() else {
+                            zero_tail = 0;
+                            break;
+                        };
+                        *element
+                    }
+                    _ => {
+                        zero_tail = 0;
+                        break;
+                    }
+                };
+                zero_tail += 1;
+            }
+            if zero_tail == 0 || reached != result_pointee {
+                continue;
+            }
+            let Some(index_type) = instruction.operands[1..].iter().rev().find_map(|operand| {
+                let Operand::IdRef(index) = operand else {
+                    return None;
+                };
+                result_types.get(index).copied()
+            }) else {
+                continue;
+            };
+            let zero = get_or_create_int_const(ctx, index_type, 0);
+            ctx.module.functions[entry_idx].blocks[block_idx].instructions[instruction_idx]
+                .operands
+                .extend(std::iter::repeat_n(Operand::IdRef(zero), zero_tail));
+        }
+    }
 }
 
 /// Inline only calls whose callee id is in `selected`.
@@ -65,6 +144,7 @@ pub(super) fn inline_selected_helpers(
     // Map function-def id -> function index, for bodied non-air.* functions (inline candidates).
     let mut stats = InlineStats::default();
     let mut processed_helpers = HashSet::new();
+    let mut pointer_types = collect_pointer_types(ctx);
     let mut guard = 0;
     loop {
         guard += 1;
@@ -105,7 +185,7 @@ pub(super) fn inline_selected_helpers(
         let Some((bi, ii, callee_id)) = target else {
             break;
         };
-        inline_one_call(ctx, entry_idx, bi, ii, callee_id)?;
+        inline_one_call(ctx, entry_idx, bi, ii, callee_id, &mut pointer_types)?;
         stats.splices += 1;
         processed_helpers.insert(callee_id);
     }
@@ -1026,15 +1106,18 @@ fn inline_one_call(
     bi: usize,
     ii: usize,
     callee_id: Word,
+    pointer_types: &mut HashMap<Word, (StorageClass, Word)>,
 ) -> Result<(), String> {
     // Clone the callee function out of the module.
     let callee = ctx
         .module
         .functions
         .iter()
-        .find(|f| f.def.as_ref().and_then(|d| d.result_id) == Some(callee_id))
+        .find(|f| {
+            f.def.as_ref().and_then(|d| d.result_id) == Some(callee_id) && !f.blocks.is_empty()
+        })
         .cloned()
-        .ok_or_else(|| format!("callee {callee_id} not found"))?;
+        .ok_or_else(|| format!("bodied callee {callee_id} not found"))?;
 
     // Gather the call's result id + args.
     let (call_res, args): (Option<Word>, Vec<Word>) = {
@@ -1054,6 +1137,79 @@ fn inline_one_call(
     for (p, a) in callee.parameters.iter().zip(args.iter()) {
         if let Some(pid) = p.result_id {
             remap.insert(pid, *a);
+        }
+    }
+    let definitions = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.module.functions.iter().flat_map(|function| {
+            function
+                .parameters
+                .iter()
+                .chain(function.blocks.iter().flat_map(|block| &block.instructions))
+        }))
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
+    let copy_aliases = definitions
+        .iter()
+        .filter_map(|(&result, instruction)| {
+            if instruction.class.opcode != Op::CopyObject {
+                return None;
+            }
+            let Some(Operand::IdRef(source)) = instruction.operands.first() else {
+                return None;
+            };
+            Some((result, resolve_copy_object_source(*source, &definitions)))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut elided_aggregate_extracts = HashSet::new();
+    for instruction in callee.blocks.iter().flat_map(|block| &block.instructions) {
+        if instruction.class.opcode != Op::CompositeExtract {
+            continue;
+        }
+        let (Some(result), Some(Operand::IdRef(composite))) =
+            (instruction.result_id, instruction.operands.first())
+        else {
+            continue;
+        };
+        let Some(root) = remap.get(composite).copied() else {
+            continue;
+        };
+        let Some(path) = instruction
+            .operands
+            .iter()
+            .skip(1)
+            .map(|operand| match operand {
+                Operand::LiteralBit32(index) => Some(*index),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if let Some(source) = ctx
+            .emit_sidecar
+            .aggregate_pointer_values
+            .iter()
+            .find(|fact| fact.aggregate == root && fact.indices == path)
+            .map(|fact| fact.source)
+        {
+            remap.insert(result, source);
+            elided_aggregate_extracts.insert(result);
+            continue;
+        }
+        let result_is_pointer = instruction
+            .result_type
+            .and_then(|ty| definitions.get(&ty))
+            .is_some_and(|definition| definition.class.opcode == Op::TypePointer);
+        if result_is_pointer
+            || aggregate_path_type(root, &path, &definitions) == instruction.result_type
+        {
+            if let Some(object) = resolve_inserted_object(root, &path, &definitions) {
+                remap.insert(result, object);
+                elided_aggregate_extracts.insert(result);
+            }
         }
     }
 
@@ -1126,6 +1282,8 @@ fn inline_one_call(
     ctx.emit_sidecar.clone_inlined_facts(&remap);
     ctx.emit_sidecar
         .remap_local_pointer_field_store_sources(&remap);
+    ctx.emit_sidecar
+        .remap_local_pointer_field_store_sources(&copy_aliases);
 
     let map_op = |op: &Operand, remap: &HashMap<Word, Word>| -> Operand {
         if let Operand::IdRef(r) = op {
@@ -1136,7 +1294,6 @@ fn inline_one_call(
         op.clone()
     };
     let mut result_types = collect_result_types(ctx);
-
     // M-B2 lever (a): recognize union byte-buffer reinterprets (a struct-pointee param substituted by
     // a caller byte-array or same-size scalar) so their memory operations can be reconstructed at
     // splice time. An empty plan (no such chain) makes `byte_view_splice` a no-op.
@@ -1148,6 +1305,12 @@ fn inline_one_call(
         let mut spliced: Vec<Instruction> = vec![];
         let mut ret_val: Option<Word> = None;
         for inst in &blk.instructions {
+            if inst
+                .result_id
+                .is_some_and(|result| elided_aggregate_extracts.contains(&result))
+            {
+                continue;
+            }
             match inst.class.opcode {
                 Op::ReturnValue => {
                     ret_val = inst.operands.first().map(|o| match map_op(o, &remap) {
@@ -1168,7 +1331,7 @@ fn inline_one_call(
                     ni.result_id = inst.result_id.and_then(|r| remap.get(&r).copied());
                     ni.result_type = inst.result_type;
                     ni.operands = inst.operands.iter().map(|o| map_op(o, &remap)).collect();
-                    retarget_inlined_pointer_result(ctx, &mut ni, &result_types);
+                    retarget_inlined_pointer_result(ctx, &mut ni, &result_types, pointer_types);
                     record_result_type(&mut result_types, &ni);
                     spliced.push(ni);
                 }
@@ -1198,8 +1361,96 @@ fn inline_one_call(
         &remap,
         &map_op,
         &mut result_types,
+        pointer_types,
         &byte_view_plan,
+        &elided_aggregate_extracts,
     )
+}
+
+fn resolve_inserted_object(
+    mut aggregate: Word,
+    mut path: &[u32],
+    definitions: &HashMap<Word, &Instruction>,
+) -> Option<Word> {
+    let mut visited = HashSet::new();
+    while visited.insert(aggregate) {
+        let definition = definitions.get(&aggregate)?;
+        match definition.class.opcode {
+            Op::CompositeInsert => {
+                let [Operand::IdRef(object), Operand::IdRef(composite), indices @ ..] =
+                    definition.operands.as_slice()
+                else {
+                    return None;
+                };
+                let insert_path = indices
+                    .iter()
+                    .map(|operand| match operand {
+                        Operand::LiteralBit32(index) => Some(*index),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                if path == insert_path {
+                    return Some(*object);
+                }
+                if let Some(suffix) = path.strip_prefix(insert_path.as_slice()) {
+                    aggregate = *object;
+                    path = suffix;
+                } else {
+                    aggregate = *composite;
+                }
+            }
+            Op::CopyObject => {
+                let Some(Operand::IdRef(source)) = definition.operands.first() else {
+                    return None;
+                };
+                aggregate = *source;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn resolve_copy_object_source(mut value: Word, definitions: &HashMap<Word, &Instruction>) -> Word {
+    let mut visited = HashSet::new();
+    while visited.insert(value) {
+        let Some(definition) = definitions.get(&value) else {
+            break;
+        };
+        if definition.class.opcode != Op::CopyObject {
+            break;
+        }
+        let Some(Operand::IdRef(source)) = definition.operands.first() else {
+            break;
+        };
+        value = *source;
+    }
+    value
+}
+
+fn aggregate_path_type(
+    aggregate: Word,
+    path: &[u32],
+    definitions: &HashMap<Word, &Instruction>,
+) -> Option<Word> {
+    let mut ty = definitions.get(&aggregate)?.result_type?;
+    for index in path {
+        let definition = definitions.get(&ty)?;
+        ty = match definition.class.opcode {
+            Op::TypeStruct => match definition.operands.get(*index as usize)? {
+                Operand::IdRef(member) => *member,
+                _ => return None,
+            },
+            Op::TypeArray | Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
+                match definition.operands.first()? {
+                    Operand::IdRef(element) => *element,
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+    }
+    Some(ty)
 }
 
 /// Multi-block inline: the caller block is split into [pre | call | post]. The callee's entry block's
@@ -1217,7 +1468,9 @@ fn inline_multiblock(
     remap: &HashMap<Word, Word>,
     map_op: &dyn Fn(&Operand, &HashMap<Word, Word>) -> Operand,
     result_types: &mut HashMap<Word, Word>,
+    pointer_types: &mut HashMap<Word, (StorageClass, Word)>,
     byte_view_plan: &HashMap<Word, ByteViewPlan>,
+    elided_aggregate_extracts: &HashSet<Word>,
 ) -> Result<(), String> {
     // Continuation block id + the post-call instructions.
     let cont_id = ctx.module.fresh_id();
@@ -1273,6 +1526,12 @@ fn inline_multiblock(
         let label_inst = new_label.map(|id| Instruction::new(Op::Label, None, Some(id), vec![]));
         let mut insts: Vec<Instruction> = vec![];
         for inst in &blk.instructions {
+            if inst
+                .result_id
+                .is_some_and(|result| elided_aggregate_extracts.contains(&result))
+            {
+                continue;
+            }
             match inst.class.opcode {
                 Op::ReturnValue => {
                     let val = inst
@@ -1322,7 +1581,7 @@ fn inline_multiblock(
                         .iter()
                         .map(|o| mapped_operand(o, remap))
                         .collect();
-                    retarget_inlined_pointer_result(ctx, &mut ni, result_types);
+                    retarget_inlined_pointer_result(ctx, &mut ni, result_types, pointer_types);
                     record_result_type(result_types, &ni);
                     insts.push(ni);
                 }
@@ -1445,11 +1704,21 @@ fn lift_loop_merge_from_split_tail(
         return (None, None);
     };
     let loop_merge = post.remove(loop_merge_idx);
-    if post
-        .iter()
-        .any(|inst| matches!(inst.class.opcode, Op::SelectionMerge | Op::LoopMerge))
-    {
+    if post.iter().any(|inst| inst.class.opcode == Op::LoopMerge) {
         return (Some(loop_merge), None);
+    }
+    let loop_merge_label = loop_merge.operands.first().and_then(as_id_ref);
+    let continue_label = loop_merge.operands.get(1).and_then(as_id_ref);
+    if let Some(selection_merge) = post
+        .iter()
+        .find(|inst| inst.class.opcode == Op::SelectionMerge)
+        .and_then(|inst| inst.operands.first())
+        .and_then(as_id_ref)
+    {
+        let shared_loop_boundary = (Some(selection_merge) == continue_label
+            || Some(selection_merge) == loop_merge_label)
+            .then_some(selection_merge);
+        return (Some(loop_merge), shared_loop_boundary);
     }
     let Some(term_idx) = post.len().checked_sub(1) else {
         return (Some(loop_merge), None);
@@ -1457,8 +1726,6 @@ fn lift_loop_merge_from_split_tail(
     if post[term_idx].class.opcode != Op::BranchConditional {
         return (Some(loop_merge), None);
     }
-    let loop_merge_label = loop_merge.operands.first().and_then(as_id_ref);
-    let continue_label = loop_merge.operands.get(1).and_then(as_id_ref);
     let true_label = post[term_idx].operands.get(1).and_then(as_id_ref);
     let false_label = post[term_idx].operands.get(2).and_then(as_id_ref);
     let selection_merge = if true_label == continue_label || false_label == continue_label {
@@ -1527,7 +1794,6 @@ fn split_inlined_selection_merge(ctx: &mut Ctx, entry_idx: usize, header_id: Wor
         }
         if !redirected_preds.is_empty() {
             rewrite_structured_merge(&mut func.blocks[header_idx], merge_id, synthetic_label);
-            rewrite_loop_continue_target(&mut func.blocks, merge_id, synthetic_label);
         }
     }
     if redirected_preds.is_empty() {
@@ -1663,21 +1929,6 @@ fn rewrite_structured_merge(block: &mut Block, from: Word, to: Word) {
     }
 }
 
-fn rewrite_loop_continue_target(blocks: &mut [Block], from: Word, to: Word) {
-    for block in blocks {
-        for inst in &mut block.instructions {
-            if inst.class.opcode != Op::LoopMerge {
-                continue;
-            }
-            if let Some(Operand::IdRef(label)) = inst.operands.get_mut(1) {
-                if *label == from {
-                    *label = to;
-                }
-            }
-        }
-    }
-}
-
 fn redirect_terminator_target(block: &mut Block, from: Word, to: Word) -> bool {
     let Some(term) = block.instructions.last_mut() else {
         return false;
@@ -1765,10 +2016,63 @@ fn type_defs_with_new_globals(ctx: &Ctx) -> HashMap<Word, Instruction> {
     defs
 }
 
+fn collect_pointer_types(ctx: &Ctx) -> HashMap<Word, (StorageClass, Word)> {
+    ctx.module
+        .types_global_values
+        .iter()
+        .chain(&ctx.new_globals)
+        .filter_map(|inst| {
+            match (
+                inst.class.opcode,
+                inst.result_id,
+                inst.operands.first(),
+                inst.operands.get(1),
+            ) {
+                (
+                    Op::TypePointer,
+                    Some(id),
+                    Some(Operand::StorageClass(storage)),
+                    Some(Operand::IdRef(pointee)),
+                ) => Some((id, (*storage, *pointee))),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn pointer_type_info(
+    ctx: &Ctx,
+    pointer_types: &mut HashMap<Word, (StorageClass, Word)>,
+    ty: Word,
+) -> Option<(StorageClass, Word)> {
+    if let Some(info) = pointer_types.get(&ty).copied() {
+        return Some(info);
+    }
+    let info = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(&ctx.new_globals)
+        .find_map(|inst| {
+            if inst.class.opcode != Op::TypePointer || inst.result_id != Some(ty) {
+                return None;
+            }
+            match (inst.operands.first()?, inst.operands.get(1)?) {
+                (Operand::StorageClass(storage), Operand::IdRef(pointee)) => {
+                    Some((*storage, *pointee))
+                }
+                _ => None,
+            }
+        })?;
+    pointer_types.insert(ty, info);
+    Some(info)
+}
+
 fn retarget_inlined_pointer_result(
     ctx: &mut Ctx,
     inst: &mut Instruction,
     result_types: &HashMap<Word, Word>,
+    pointer_types: &mut HashMap<Word, (StorageClass, Word)>,
 ) {
     let Some(result_type) = inst.result_type else {
         return;
@@ -1787,20 +2091,17 @@ fn retarget_inlined_pointer_result(
     let Some(base_type) = result_types.get(&base).copied() else {
         return;
     };
-    let defs = type_defs_with_new_globals(ctx);
-    let Some(base_storage) = ptr_storage(&defs, base_type) else {
+    let Some((base_storage, _)) = pointer_type_info(ctx, pointer_types, base_type) else {
         return;
     };
-    let Some(result_storage) = ptr_storage(&defs, result_type) else {
+    let Some((result_storage, pointee)) = pointer_type_info(ctx, pointer_types, result_type) else {
         return;
     };
-    if base_storage == result_storage {
-        return;
+    if base_storage != result_storage {
+        let pointer_type = ctx.ty_ptr(base_storage, pointee);
+        pointer_types.insert(pointer_type, (base_storage, pointee));
+        inst.result_type = Some(pointer_type);
     }
-    let Some(pointee) = ptr_pointee(&defs, result_type) else {
-        return;
-    };
-    inst.result_type = Some(ctx.ty_ptr(base_storage, pointee));
 }
 
 #[cfg(test)]

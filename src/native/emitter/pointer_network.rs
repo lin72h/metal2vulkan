@@ -4,10 +4,10 @@
 //! merge-participant sets (`pointer_phi_values`, `pointer_phi_incoming_values`, `selected_pointers`)
 //! are flat membership sets, NOT a grouping. That is the wall behind the three M-B1 blockers and the
 //! unsound M-A2(a)/(b) read-side flags: a pointee typed differently at two def sites of ONE
-//! phi/select network (e.g. `05/b00a8a8d`'s `%144`, a loop-carried device pointer whose incomings
-//! deref as `<4 x float>` on one arm and scalar `float` on the other) errors `pointer merge pointee
-//! mismatch Float vs Vector(Float,4)`, and no read-side override can fix it because SPIR-V logical
-//! addressing forbids `OpBitcast` between pointer types.
+//! phi/select network (for example, a loop-carried device pointer whose incomings dereference as
+//! `<4 x float>` on one arm and scalar `float` on the other) errors with a pointer-merge pointee
+//! mismatch, and no read-side override can fix it because SPIR-V logical addressing forbids
+//! `OpBitcast` between pointer types.
 //!
 //! The sound fix (plan §M-A2, ~line 325) must first BUILD the network — the transitive closure over
 //! phi result ↔ incoming and select result ↔ arm edges — then census each component's deref
@@ -23,12 +23,14 @@
 //! - [`NetworkClass::Unclassified`] — mixed with a non-scalar-family relationship (structs, nested
 //!   pointers): not a widening candidate.
 //!
-//! Analysis-only: this module reads the IR and the emitter's recorded pointees; it changes no bytes.
+//! The analysis is read-only. The emitter consumes its structural classifications when choosing the
+//! representation of pointer networks.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::native::cfg::BodyBlock;
 use crate::native::ir::{LlType, LlValue};
+use crate::native::tir::TirOperand;
 
 /// How a pointer network's per-def-site deref granularities relate — decides whether recording one
 /// finest pointee uniformly across the component is sound.
@@ -172,7 +174,7 @@ fn pointer_edges_from_carrier(
             continue;
         };
         if inst.opcode == "phi" {
-            if let Some((ty, incomings)) = &inst.phi_incoming {
+            if let Some((ty, incomings)) = &inst.phi_incoming() {
                 if matches!(ty, LlType::Ptr(_)) {
                     for (value, _pred) in incomings {
                         if let LlValue::Local(inc) = value {
@@ -197,18 +199,116 @@ fn pointer_edges_from_carrier(
         } else if inst.opcode == "bitcast" {
             // A `bitcast ptr %src to ptr` is a pointer-identity alias (a no-op in opaque-pointer LLVM):
             // result and source are the same pointer, so they belong to one network. Load-bearing for
-            // the access census — 05's scalar `float` arm reaches its phi through
-            // `%142 = bitcast (%141 = gep float …)`; without this edge `%141`'s Float access is invisible
-            // and the whole-vs-part network masquerades as Uniform.
-            if let Some((src, dst)) = inst.bitcast.as_deref() {
+            // the access census: a scalar `float` arm can reach its phi through a pointer bitcast;
+            // without this edge the scalar access is invisible and a whole-vs-part network can
+            // masquerade as Uniform.
+            if let Some((src, dst)) = inst.bitcast() {
                 if matches!(src.ty, LlType::Ptr(_)) && dst.trim_start().starts_with("ptr") {
                     if let LlValue::Local(local) = &src.value {
                         edges.push((name.clone(), local.clone()));
                     }
                 }
             }
+        } else if inst.opcode == "freeze" && matches!(inst.result_ty, Some(LlType::Ptr(_))) {
+            if let Some(TirOperand::Value {
+                name: local,
+                ty: LlType::Ptr(_),
+            }) = inst.operands.first()
+            {
+                edges.push((name.clone(), local.clone()));
+            }
         }
     }
+}
+
+/// Pointer components whose only roots are `null`/`undef` and whose remaining producers are
+/// transparent pointer aliases or GEPs rooted back in the same component. These arise after literal
+/// specialization removes the concrete arm of a pointer induction. Retaining its separately-carried
+/// nullness is sufficient while the pointer payload may be represented by a correctly typed `OpUndef`.
+/// Source blocks may still contain consumers on paths discarded by the selected CFG and cleanup
+/// construction; the final product module retains only the separately represented nullness.
+pub(in crate::native) fn null_rooted_pointer_networks(blocks: &[BodyBlock]) -> Vec<Vec<String>> {
+    let definitions = blocks
+        .iter()
+        .filter_map(|block| block.typed.as_ref())
+        .flat_map(|block| &block.insts)
+        .filter_map(|inst| inst.result.as_ref().map(|result| (result.as_str(), inst)))
+        .collect::<HashMap<_, _>>();
+    let mut result = Vec::new();
+    for members in build_null_rooted_components(blocks) {
+        let member_set = members.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut saw_nullish = false;
+        let valid = members.iter().all(|name| {
+            let Some(inst) = definitions.get(name.as_str()) else {
+                return false;
+            };
+            let pointer_value = |value: &LlValue, saw_nullish: &mut bool| match value {
+                LlValue::Local(local) => member_set.contains(local.as_str()),
+                LlValue::Zero | LlValue::Undef => {
+                    *saw_nullish = true;
+                    true
+                }
+                _ => false,
+            };
+            match inst.opcode.as_str() {
+                "phi" => inst.phi_values().is_some_and(|values| {
+                    values
+                        .into_iter()
+                        .all(|value| pointer_value(value, &mut saw_nullish))
+                }),
+                "select" => inst.select_arms().as_ref().is_some_and(|arms| {
+                    pointer_value(&arms.0.value, &mut saw_nullish)
+                        && pointer_value(&arms.1.value, &mut saw_nullish)
+                }),
+                "bitcast" | "freeze" => inst
+                    .operands
+                    .first()
+                    .and_then(TirOperand::as_typed_value)
+                    .is_some_and(|value| pointer_value(&value.value, &mut saw_nullish)),
+                "getelementptr" => inst
+                    .gep()
+                    .as_deref()
+                    .is_some_and(|gep| pointer_value(&gep.base.value, &mut saw_nullish)),
+                _ => false,
+            }
+        });
+        if valid && saw_nullish {
+            result.push(members);
+        }
+    }
+    result
+}
+
+/// Components for null-root closure include GEP result↔base edges in addition to the ordinary
+/// phi/select/transparent-alias graph. A GEP is itself an allowed producer in this classification;
+/// omitting its edge can split one recurrence into two apparent components and hide the concrete root
+/// (or make an otherwise closed component appear to reference an external producer).
+fn build_null_rooted_components(blocks: &[BodyBlock]) -> Vec<Vec<String>> {
+    let mut edges = pointer_edges(blocks);
+    for block in blocks {
+        let Some(carrier) = &block.typed else {
+            continue;
+        };
+        for inst in &carrier.insts {
+            let (Some(result), Some(gep)) = (&inst.result, inst.gep().as_deref()) else {
+                continue;
+            };
+            if let LlValue::Local(base) = &gep.base.value {
+                edges.push((result.clone(), base.clone()));
+            }
+        }
+    }
+    build_components_from_edges(edges)
+}
+
+#[cfg(test)]
+pub(in crate::native) fn null_rooted_pointer_network_members(
+    blocks: &[BodyBlock],
+) -> HashSet<String> {
+    null_rooted_pointer_networks(blocks)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// Whether a typed operand is `ptr`-typed (the dual of the line scan's arm `starts_with("ptr")`).
@@ -220,7 +320,10 @@ fn is_ptr_operand(op: &crate::native::tir::TirOperand) -> bool {
 /// Group the pointer SSA names of `blocks` into connected components over the phi/select edges.
 /// Shared by every census; each returned member list is sorted and deduped.
 fn build_components(blocks: &[BodyBlock]) -> Vec<Vec<String>> {
-    let edges = pointer_edges(blocks);
+    build_components_from_edges(pointer_edges(blocks))
+}
+
+fn build_components_from_edges(edges: Vec<(String, String)>) -> Vec<Vec<String>> {
     let mut uf = UnionFind::default();
     let mut nodes: BTreeSet<String> = BTreeSet::new();
     for (a, b) in &edges {
@@ -293,6 +396,155 @@ pub(in crate::native) fn analyze_networks_by_access(blocks: &[BodyBlock]) -> Vec
         .collect()
 }
 
+/// Buffer parameters whose pointer-merge component genuinely reinterprets storage between distinct
+/// scalar families. Logical SPIR-V cannot assign one pointee to such a component. Trace every member
+/// back through typed pointer identities, GEPs, selects, and phis. This primary-construction path is
+/// needed when the merged carrier crosses a phi and either still contains the function-constant
+/// select or has one surviving root after function-constant pruning. A select-only component can
+/// keep using its existing value-domain lowering. The concrete roots must be function-constant
+/// buffer alternatives at one Metal location, and a pruned single root must have another metadata
+/// alternative at that location. This gives the roots one descriptor identity despite their
+/// different source pointees. When every concrete leaf satisfies that contract, return all exact
+/// roots for byte-address modeling. An unknown producer rejects the complete component, preventing
+/// partial or mismatched pointer representations.
+pub(in crate::native) fn reinterpret_mix_buffer_params(
+    blocks: &[BodyBlock],
+    buffer_params: &BTreeMap<String, u32>,
+) -> BTreeSet<String> {
+    let mut sources = HashMap::<String, Vec<LlValue>>::new();
+    let mut phi_results = HashSet::new();
+    let mut select_results = HashSet::new();
+    for block in blocks {
+        let Some(carrier) = &block.typed else {
+            continue;
+        };
+        for inst in &carrier.insts {
+            let (Some(result), Some(LlType::Ptr(_))) = (&inst.result, &inst.result_ty) else {
+                continue;
+            };
+            let values = if let Some(gep) = inst.gep().as_deref() {
+                vec![gep.base.value.clone()]
+            } else if let Some((source, _)) = inst.bitcast() {
+                vec![source.value]
+            } else if let Some((_, incoming)) = inst.phi_incoming().as_ref() {
+                phi_results.insert(result.clone());
+                incoming.iter().map(|(value, _)| value.clone()).collect()
+            } else if let Some((true_value, false_value)) = inst.select_arms().as_deref() {
+                select_results.insert(result.clone());
+                vec![true_value.value.clone(), false_value.value.clone()]
+            } else if matches!(inst.opcode.as_str(), "addrspacecast" | "freeze") {
+                inst.operands
+                    .first()
+                    .and_then(|operand| operand.as_typed_value())
+                    .map(|value| vec![value.value])
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            if !values.is_empty() {
+                sources.insert(result.clone(), values);
+            }
+        }
+    }
+
+    fn roots_for(
+        name: &str,
+        buffer_params: &BTreeMap<String, u32>,
+        sources: &HashMap<String, Vec<LlValue>>,
+        select_results: &HashSet<String>,
+        visiting: &mut HashSet<String>,
+        members: &mut BTreeSet<String>,
+        saw_select: &mut bool,
+    ) -> Option<BTreeSet<String>> {
+        members.insert(name.to_string());
+        *saw_select |= select_results.contains(name);
+        if buffer_params.contains_key(name) {
+            return Some(BTreeSet::from([name.to_string()]));
+        }
+        if !visiting.insert(name.to_string()) {
+            return Some(BTreeSet::new());
+        }
+        let result = sources.get(name).and_then(|values| {
+            let mut roots = BTreeSet::new();
+            for value in values {
+                match value {
+                    LlValue::Local(source) => {
+                        roots.extend(roots_for(
+                            source,
+                            buffer_params,
+                            sources,
+                            select_results,
+                            visiting,
+                            members,
+                            saw_select,
+                        )?);
+                    }
+                    LlValue::Zero | LlValue::Undef => {}
+                    _ => return None,
+                }
+            }
+            Some(roots)
+        });
+        visiting.remove(name);
+        result
+    }
+
+    let mut selected = BTreeSet::new();
+    let access = access_pointees(blocks);
+    for phi in &phi_results {
+        let mut members = BTreeSet::new();
+        let mut saw_select = false;
+        let Some(roots) = roots_for(
+            phi,
+            buffer_params,
+            &sources,
+            &select_results,
+            &mut HashSet::new(),
+            &mut members,
+            &mut saw_select,
+        ) else {
+            continue;
+        };
+        let mut pointees = Vec::new();
+        for pointee in members
+            .iter()
+            .filter_map(|member| access.get(member))
+            .flatten()
+        {
+            if !pointees.contains(pointee) {
+                pointees.push(pointee.clone());
+            }
+        }
+        let root_locations = roots
+            .iter()
+            .filter_map(|root| buffer_params.get(root))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let one_shared_location = root_locations.len() == 1;
+        let metadata_alternatives = root_locations.first().map_or(0, |location| {
+            buffer_params
+                .values()
+                .filter(|candidate| *candidate == location)
+                .count()
+        });
+        let recurrent_phi_carrier = members
+            .iter()
+            .filter(|member| phi_results.contains(*member))
+            .take(2)
+            .count()
+            >= 2;
+        let function_constant_shape = (saw_select && roots.len() >= 2)
+            || (roots.len() == 1 && metadata_alternatives >= 2 && recurrent_phi_carrier);
+        if function_constant_shape
+            && one_shared_location
+            && matches!(classify(&pointees), NetworkClass::ReinterpretMix)
+        {
+            selected.extend(roots);
+        }
+    }
+    selected
+}
+
 /// Collect, per pointer SSA name, the distinct element types it is dereferenced or stepped at across the
 /// function body: a `load T`/`store T` derefs the pointer at `T`; a `getelementptr T, ptr %base, …`
 /// steps `%base` at `T` (element stride) and defines a result whose pointee is `gep_pointee(T, idx)`.
@@ -312,7 +564,7 @@ fn access_pointees(blocks: &[BodyBlock]) -> HashMap<String, Vec<LlType>> {
     for block in blocks {
         // Typed walk (the sole substrate): `load`/`store` carry the deref type on `result_ty` / the
         // value operand and the pointer on `operands`, and `getelementptr` carries the full `parse_gep`
-        // result on `inst.gep`.
+        // result on `inst.gep()`.
         if let Some(carrier) = &block.typed {
             {
                 for inst in &carrier.insts {
@@ -331,7 +583,7 @@ fn access_pointees(blocks: &[BodyBlock]) -> HashMap<String, Vec<LlType>> {
                             record(&ptr, val.ty);
                         }
                     } else if inst.opcode == "getelementptr" {
-                        if let Some(gep) = &inst.gep {
+                        if let Some(gep) = &inst.gep() {
                             if let LlValue::Local(base) = &gep.base.value {
                                 record(base, gep.source_ty.clone());
                             }
@@ -355,6 +607,181 @@ fn local_operand(op: &crate::native::tir::TirOperand) -> Option<String> {
         LlValue::Local(name) => Some(name),
         _ => None,
     }
+}
+
+/// Buffer roots whose typed load spans beyond a struct member. Logical SPIR-V access chains preserve
+/// member boundaries, so a wider load cannot be constructed by incrementing that member index as if
+/// it were an array stride. Select byte-addressed storage before emission for exactly those roots.
+pub(in crate::native) fn cross_member_widening_load_roots(
+    blocks: &[BodyBlock],
+    buffer_params: &HashSet<String>,
+    named_types: &HashMap<String, LlType>,
+) -> BTreeSet<String> {
+    use crate::native::emitter::helpers::{bitcast_width, gep_parent_before_last, gep_pointee};
+
+    let mut sources = HashMap::<String, Vec<String>>::new();
+    let mut cross_member_gep_pointee_bits = HashMap::<String, u32>::new();
+    let mut loads = Vec::<(String, LlType)>::new();
+    fn resolve_type(
+        ty: &LlType,
+        named_types: &HashMap<String, LlType>,
+        visiting: &mut HashSet<String>,
+    ) -> Option<LlType> {
+        match ty {
+            LlType::Named(name) => {
+                if !visiting.insert(name.clone()) {
+                    return None;
+                }
+                let resolved = resolve_type(named_types.get(name)?, named_types, visiting);
+                visiting.remove(name);
+                resolved
+            }
+            LlType::Vector(elem, 1) => resolve_type(elem, named_types, visiting),
+            LlType::Vector(elem, lanes) => Some(LlType::Vector(
+                Box::new(resolve_type(elem, named_types, visiting)?),
+                *lanes,
+            )),
+            LlType::Array(elem, len) => Some(LlType::Array(
+                Box::new(resolve_type(elem, named_types, visiting)?),
+                *len,
+            )),
+            LlType::Struct(fields) => fields
+                .iter()
+                .map(|field| resolve_type(field, named_types, visiting))
+                .collect::<Option<Vec<_>>>()
+                .map(LlType::Struct),
+            LlType::Int(1) => Some(LlType::Bool),
+            other => Some(other.clone()),
+        }
+    }
+    for block in blocks {
+        let Some(carrier) = &block.typed else {
+            continue;
+        };
+        for inst in &carrier.insts {
+            if inst.opcode == "load" {
+                if let (Some(result_ty), Some(pointer)) = (
+                    inst.result_ty.clone(),
+                    inst.operands.first().and_then(local_operand),
+                ) {
+                    loads.push((pointer, result_ty));
+                }
+            }
+            let Some(result) = &inst.result else {
+                continue;
+            };
+            let operands = if let Some(gep) = inst.gep().as_deref() {
+                let source_ty = resolve_type(&gep.source_ty, named_types, &mut HashSet::new());
+                if matches!(
+                    source_ty
+                        .as_ref()
+                        .and_then(|source_ty| { gep_parent_before_last(source_ty, &gep.indices) }),
+                    Some(LlType::Struct(_))
+                ) {
+                    if let Some(bits) = source_ty
+                        .as_ref()
+                        .and_then(|source_ty| gep_pointee(source_ty, &gep.indices).ok())
+                        .and_then(|ty| bitcast_width(&ty))
+                    {
+                        cross_member_gep_pointee_bits.insert(result.clone(), bits);
+                    }
+                }
+                match &gep.base.value {
+                    LlValue::Local(base) => vec![base.clone()],
+                    _ => Vec::new(),
+                }
+            } else if let Some((source, _)) = inst.bitcast() {
+                match source.value {
+                    LlValue::Local(source) => vec![source],
+                    _ => Vec::new(),
+                }
+            } else if let Some((_, incoming)) = inst.phi_incoming().as_ref() {
+                incoming
+                    .iter()
+                    .filter_map(|(value, _)| match value {
+                        LlValue::Local(source) => Some(source.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            } else if let Some((true_value, false_value)) = inst.select_arms().as_deref() {
+                [true_value, false_value]
+                    .into_iter()
+                    .filter_map(|value| match &value.value {
+                        LlValue::Local(source) => Some(source.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            } else if matches!(inst.opcode.as_str(), "addrspacecast" | "freeze") {
+                inst.operands
+                    .first()
+                    .and_then(local_operand)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if !operands.is_empty() {
+                sources.insert(result.clone(), operands);
+            }
+        }
+    }
+
+    fn collect_roots(
+        name: &str,
+        sources: &HashMap<String, Vec<String>>,
+        buffer_params: &HashSet<String>,
+        visiting: &mut HashSet<String>,
+        roots: &mut BTreeSet<String>,
+    ) {
+        if buffer_params.contains(name) {
+            roots.insert(name.to_string());
+            return;
+        }
+        if !visiting.insert(name.to_string()) {
+            return;
+        }
+        if let Some(parents) = sources.get(name) {
+            for parent in parents {
+                collect_roots(parent, sources, buffer_params, visiting, roots);
+            }
+        }
+        visiting.remove(name);
+    }
+
+    let mut roots = BTreeSet::new();
+    for (pointer, load_ty) in loads {
+        let Some(load_bits) = bitcast_width(&load_ty) else {
+            continue;
+        };
+        let mut stack = vec![pointer.clone()];
+        let mut seen = HashSet::new();
+        let mut crosses = false;
+        while let Some(name) = stack.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if cross_member_gep_pointee_bits
+                .get(&name)
+                .is_some_and(|pointee_bits| load_bits > *pointee_bits)
+            {
+                crosses = true;
+                break;
+            }
+            if let Some(parents) = sources.get(&name) {
+                stack.extend(parents.iter().cloned());
+            }
+        }
+        if crosses {
+            collect_roots(
+                &pointer,
+                &sources,
+                buffer_params,
+                &mut HashSet::new(),
+                &mut roots,
+            );
+        }
+    }
+    roots
 }
 
 /// Pointer names that are stepped as an ARRAY of a bare primitive scalar — a
@@ -390,10 +817,10 @@ pub(in crate::native) fn array_indexed_scalar_bases(blocks: &[BodyBlock]) -> BTr
     };
     for block in blocks {
         // Typed walk (the sole substrate): the carrier holds each GEP's full `parse_gep` result on
-        // `inst.gep`.
+        // `inst.gep()`.
         if let Some(carrier) = &block.typed {
             for inst in &carrier.insts {
-                if let Some(gep) = &inst.gep {
+                if let Some(gep) = &inst.gep() {
                     consider(gep);
                 }
             }
@@ -470,6 +897,152 @@ mod tests {
             LlType::Struct(vec![LlType::Half, LlType::Half]),
         ]);
         assert_eq!(c, NetworkClass::Unclassified);
+    }
+
+    #[test]
+    fn recognizes_closed_null_rooted_pointer_recurrence() {
+        let blocks = [block(&[
+            "%cursor = phi ptr addrspace(2) [ null, %entry ], [ %next, %loop ]",
+            "%next = getelementptr float, ptr addrspace(2) %cursor, i64 %stride",
+        ])];
+
+        assert_eq!(
+            null_rooted_pointer_network_members(&blocks),
+            HashSet::from(["%cursor".to_string(), "%next".to_string()])
+        );
+    }
+
+    #[test]
+    fn gep_edges_close_half_whole_part_null_recurrence() {
+        let blocks = [block(&[
+            "%cursor = phi ptr addrspace(2) [ null, %entry ], [ %next, %loop ]",
+            "%wide_next = getelementptr <4 x half>, ptr addrspace(2) %cursor, i64 %index",
+            "%next = bitcast ptr addrspace(2) %wide_next to ptr addrspace(2)",
+            "%wide = load <4 x half>, ptr addrspace(2) %next",
+            "%narrow = load half, ptr addrspace(2) %cursor",
+        ])];
+        let null_members = null_rooted_pointer_network_members(&blocks);
+        let network = analyze_networks_by_access(&blocks)
+            .into_iter()
+            .find(|network| network.members.iter().any(|member| member == "%cursor"))
+            .expect("pointer network");
+
+        assert_eq!(network.class, NetworkClass::WholeVsPart(LlType::Half));
+        assert!(
+            network
+                .members
+                .iter()
+                .all(|member| null_members.contains(member)),
+            "the access network must be one closed null-rooted component"
+        );
+    }
+
+    #[test]
+    fn concrete_pointer_root_disqualifies_null_rooted_recurrence() {
+        let blocks = [block(&[
+            "%cursor = phi ptr addrspace(2) [ %base, %entry ], [ %next, %loop ]",
+            "%next = getelementptr float, ptr addrspace(2) %cursor, i64 %stride",
+        ])];
+
+        assert!(null_rooted_pointer_network_members(&blocks).is_empty());
+    }
+
+    #[test]
+    fn reinterpret_mix_select_marks_only_its_traced_buffer_roots() {
+        let blocks = [block(&[
+            "%fp = getelementptr float, ptr addrspace(2) %floats, i64 0",
+            "%hp = getelementptr half, ptr addrspace(2) %halves, i64 0",
+            "%fv = bitcast ptr addrspace(2) %fp to ptr addrspace(2)",
+            "%hv = bitcast ptr addrspace(2) %hp to ptr addrspace(2)",
+            "%picked = select i1 %condition, ptr addrspace(2) %hv, ptr addrspace(2) %fv",
+            "%vector = getelementptr <4 x float>, ptr addrspace(2) %picked, i64 1",
+            "%merged = phi ptr addrspace(2) [ %vector, %left ], [ %picked, %right ]",
+            "%value = load <4 x float>, ptr addrspace(2) %merged",
+        ])];
+        let eligible = BTreeMap::from([
+            ("%floats".to_string(), 29),
+            ("%halves".to_string(), 29),
+            ("%unrelated".to_string(), 30),
+        ]);
+
+        assert_eq!(
+            reinterpret_mix_buffer_params(&blocks, &eligible),
+            BTreeSet::from(["%floats".to_string(), "%halves".to_string()])
+        );
+    }
+
+    #[test]
+    fn reinterpret_mix_select_without_pointer_phi_keeps_value_domain_lowering() {
+        let blocks = [block(&[
+            "%fp = getelementptr float, ptr addrspace(2) %storage, i64 0",
+            "%hp = getelementptr half, ptr addrspace(2) %storage, i64 0",
+            "%picked = select i1 %condition, ptr addrspace(2) %hp, ptr addrspace(2) %fp",
+            "%value = load <4 x float>, ptr addrspace(2) %picked",
+        ])];
+        let eligible = BTreeMap::from([("%storage".to_string(), 1)]);
+
+        assert!(reinterpret_mix_buffer_params(&blocks, &eligible).is_empty());
+    }
+
+    #[test]
+    fn reinterpret_mix_after_function_constant_pruning_marks_the_surviving_root() {
+        let blocks = [block(&[
+            "%hp = getelementptr half, ptr addrspace(2) %halves, i64 0",
+            "%view = bitcast ptr addrspace(2) %hp to ptr addrspace(2)",
+            "%vector = getelementptr <4 x float>, ptr addrspace(2) %view, i64 1",
+            "%merged = phi ptr addrspace(2) [ %vector, %left ], [ %view, %right ]",
+            "%next = getelementptr <4 x float>, ptr addrspace(2) %merged, i64 1",
+            "%recurred = phi ptr addrspace(2) [ %next, %body ], [ %merged, %entry ]",
+            "%value = load <4 x float>, ptr addrspace(2) %recurred",
+        ])];
+        let eligible = BTreeMap::from([("%floats".to_string(), 29), ("%halves".to_string(), 29)]);
+
+        assert_eq!(
+            reinterpret_mix_buffer_params(&blocks, &eligible),
+            BTreeSet::from(["%halves".to_string()])
+        );
+    }
+
+    #[test]
+    fn single_phi_after_function_constant_pruning_is_not_raw_modeled() {
+        let blocks = [block(&[
+            "%hp = getelementptr half, ptr addrspace(2) %halves, i64 0",
+            "%view = bitcast ptr addrspace(2) %hp to ptr addrspace(2)",
+            "%vector = getelementptr <4 x float>, ptr addrspace(2) %view, i64 1",
+            "%merged = phi ptr addrspace(2) [ %vector, %left ], [ %view, %right ]",
+            "%value = load <4 x float>, ptr addrspace(2) %merged",
+        ])];
+        let eligible = BTreeMap::from([("%floats".to_string(), 29), ("%halves".to_string(), 29)]);
+
+        assert!(reinterpret_mix_buffer_params(&blocks, &eligible).is_empty());
+    }
+
+    #[test]
+    fn reinterpret_mix_with_different_buffer_locations_is_not_raw_modeled() {
+        let blocks = [block(&[
+            "%fp = getelementptr float, ptr addrspace(2) %floats, i64 0",
+            "%hp = getelementptr half, ptr addrspace(2) %halves, i64 0",
+            "%picked = select i1 %condition, ptr addrspace(2) %hp, ptr addrspace(2) %fp",
+            "%merged = phi ptr addrspace(2) [ %picked, %left ], [ %fp, %right ]",
+            "%value = load <4 x float>, ptr addrspace(2) %merged",
+        ])];
+        let eligible = BTreeMap::from([("%floats".to_string(), 28), ("%halves".to_string(), 29)]);
+
+        assert!(reinterpret_mix_buffer_params(&blocks, &eligible).is_empty());
+    }
+
+    #[test]
+    fn reinterpret_mix_with_unknown_pointer_producer_marks_no_partial_roots() {
+        let blocks = [block(&[
+            "%fp = getelementptr float, ptr addrspace(2) %floats, i64 0",
+            "%opaque = call ptr addrspace(2) @pointer_source()",
+            "%picked = select i1 %condition, ptr addrspace(2) %opaque, ptr addrspace(2) %fp",
+            "%merged = phi ptr addrspace(2) [ %picked, %left ], [ %fp, %right ]",
+            "%value = load <4 x i32>, ptr addrspace(2) %merged",
+        ])];
+        let eligible = BTreeMap::from([("%floats".to_string(), 1)]);
+
+        assert!(reinterpret_mix_buffer_params(&blocks, &eligible).is_empty());
     }
 
     #[test]
@@ -559,6 +1132,34 @@ mod tests {
         let net = net_containing(&nets, "%p");
         assert_eq!(net.class, NetworkClass::Uniform);
         assert_eq!(net.pointees, vec![LlType::Float]);
+    }
+
+    #[test]
+    fn cross_member_widening_load_selects_byte_addressed_root() {
+        let blocks = [block(&[
+            "%field = getelementptr %Payload, ptr addrspace(2) %buffer, i64 0, i32 1",
+            "%alias = bitcast ptr addrspace(2) %field to ptr addrspace(2)",
+            "%value = load <3 x float>, ptr addrspace(2) %alias",
+        ])];
+        let params = HashSet::from(["%buffer".to_string()]);
+        let named_types = HashMap::from([(
+            "%Payload".to_string(),
+            LlType::Struct(vec![LlType::Int(32), LlType::Float, LlType::Int(32)]),
+        )]);
+        assert_eq!(
+            cross_member_widening_load_roots(&blocks, &params, &named_types),
+            BTreeSet::from(["%buffer".to_string()])
+        );
+    }
+
+    #[test]
+    fn array_element_widening_load_keeps_structured_root() {
+        let blocks = [block(&[
+            "%element = getelementptr [4 x float], ptr addrspace(2) %buffer, i64 0, i64 1",
+            "%value = load <3 x float>, ptr addrspace(2) %element",
+        ])];
+        let params = HashSet::from(["%buffer".to_string()]);
+        assert!(cross_member_widening_load_roots(&blocks, &params, &HashMap::new()).is_empty());
     }
 
     #[test]

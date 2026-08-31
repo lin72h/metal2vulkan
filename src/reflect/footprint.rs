@@ -1,14 +1,14 @@
-//! Conservative buffer byte-footprint extraction from the final adopted SPIR-V module.
+//! Conservative buffer byte-footprint extraction from the final constructed SPIR-V module.
 //!
-//! This deliberately runs after validation/retry selection. Emitter-side provenance is responsible
-//! for producing correct byte addresses; this module reflects the executable addresses the consumer
-//! actually receives, regardless of which structurizer or retry tier produced them.
+//! Emitter-side provenance is responsible for producing correct byte addresses. This analysis
+//! consumes the same owned module that is assembled and validated for the consumer, so reflection
+//! cannot depend on parsing serialized output back into a second module.
 
 use super::{
     BufferByteRange, BufferFootprint, BufferIndexSource, BufferStrideTerm, BufferStridedAccess,
     DescriptorLocation, ResourceAccess, ResourceBinding, ResourceKind, ShaderReflection,
 };
-use crate::spirv_module::{self, Instruction, Module, Operand};
+use crate::spirv_module::{Instruction, Module, Operand};
 use spirv::{BuiltIn, Decoration, Op, Word};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -144,7 +144,7 @@ struct Analyzer<'a> {
 
 pub(super) fn attach_buffer_footprints(
     reflection: &mut ShaderReflection,
-    bytes: &[u8],
+    module: &Module,
 ) -> Result<(), String> {
     let target_bindings = reflection
         .bindings
@@ -156,9 +156,7 @@ pub(super) fn attach_buffer_footprints(
         return Ok(());
     }
 
-    let module = spirv_module::load_bytes(bytes)
-        .map_err(|error| format!("buffer footprint could not parse translated SPIR-V: {error}"))?;
-    let mut analyzer = Analyzer::new(&module, &target_bindings);
+    let mut analyzer = Analyzer::new(module, &target_bindings);
     let footprints = analyzer.analyze();
 
     for binding in &mut reflection.bindings {
@@ -591,8 +589,16 @@ impl<'a> Analyzer<'a> {
                 self.scalar_expr(instruction.operands.first().and_then(id_ref)?)
             }
             Op::IAdd => {
-                let lhs = self.scalar_expr(instruction.operands.first().and_then(id_ref)?)?;
-                let rhs = self.scalar_expr(instruction.operands.get(1).and_then(id_ref)?)?;
+                let lhs_id = instruction.operands.first().and_then(id_ref)?;
+                let rhs_id = instruction.operands.get(1).and_then(id_ref)?;
+                if let Some(expr) = self.logical_dispatch_index_expr(lhs_id, rhs_id) {
+                    return Some(expr);
+                }
+                if let Some(expr) = self.logical_dispatch_index_expr(rhs_id, lhs_id) {
+                    return Some(expr);
+                }
+                let lhs = self.scalar_expr(lhs_id)?;
+                let rhs = self.scalar_expr(rhs_id)?;
                 lhs.checked_add(&rhs)
             }
             Op::ISub => {
@@ -622,6 +628,69 @@ impl<'a> Analyzer<'a> {
             Op::BitwiseOr => self.lowered_i64_add_sub_expr(instruction),
             _ => None,
         }
+    }
+
+    /// Region decomposition adds a push-constant base to Vulkan's region-relative builtin. The
+    /// resulting value is still the same logical Metal grid index for footprint purposes.
+    fn logical_dispatch_index_expr(
+        &mut self,
+        builtin_id: Word,
+        base_id: Word,
+    ) -> Option<ScalarExpr> {
+        let expression = self.scalar_expr(builtin_id)?;
+        if expression.constant != 0 || expression.terms.len() != 1 {
+            return None;
+        }
+        let (&source, &stride) = expression.terms.iter().next()?;
+        if stride != 1 {
+            return None;
+        }
+        let expected_member = match source {
+            BufferIndexSource::GlobalInvocationIdX => 3,
+            BufferIndexSource::GlobalInvocationIdY => 4,
+            BufferIndexSource::GlobalInvocationIdZ => 5,
+            BufferIndexSource::WorkgroupIdX => 6,
+            BufferIndexSource::WorkgroupIdY => 7,
+            BufferIndexSource::WorkgroupIdZ => 8,
+            _ => return None,
+        };
+        (self.dispatch_payload_member(base_id)? == expected_member).then_some(expression)
+    }
+
+    fn dispatch_payload_member(&self, id: Word) -> Option<u32> {
+        let load = self.definitions.get(&id).copied()?;
+        if load.class.opcode != Op::Load {
+            return None;
+        }
+        let pointer = load.operands.first().and_then(id_ref)?;
+        let access = self.definitions.get(&pointer).copied()?;
+        if access.class.opcode != Op::AccessChain || access.operands.len() != 2 {
+            return None;
+        }
+        let variable = access.operands.first().and_then(id_ref)?;
+        let member_id = access.operands.get(1).and_then(id_ref)?;
+        let member = u32::try_from(*self.constants.get(&member_id)?).ok()?;
+        let variable = self.definitions.get(&variable).copied()?;
+        if variable.class.opcode != Op::Variable
+            || variable.operands.first()
+                != Some(&Operand::StorageClass(spirv::StorageClass::PushConstant))
+        {
+            return None;
+        }
+        let pointer_ty = variable.result_type?;
+        let pointer = self.definitions.get(&pointer_ty).copied()?;
+        let block_ty = pointer.operands.get(1).and_then(id_ref)?;
+        let block = self.definitions.get(&block_ty).copied()?;
+        if block.class.opcode != Op::TypeStruct || block.operands.len() != 12 {
+            return None;
+        }
+        let first_offset = *self.decorations.member_offsets.get(&(block_ty, 0))?;
+        let exact_layout = first_offset % 4 == 0
+            && (0..12).all(|index| {
+                self.decorations.member_offsets.get(&(block_ty, index))
+                    == Some(&(first_offset + u64::from(index) * 4))
+            });
+        exact_layout.then_some(member)
     }
 
     /// Recover the semantic affine expression retained by the translator's u64-as-u32-halves
@@ -1238,7 +1307,7 @@ fn pointer_operand_is_modeled(opcode: Op, position: usize) -> bool {
 fn coalesce_static_ranges(ranges: &mut Vec<BufferByteRange>) {
     ranges.sort();
     let mut merged = Vec::<BufferByteRange>::with_capacity(ranges.len());
-    for range in ranges.drain(..) {
+    for range in ranges.iter().cloned() {
         let Some(end) = range.offset.checked_add(range.size) else {
             continue;
         };

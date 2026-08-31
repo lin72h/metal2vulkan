@@ -3,6 +3,86 @@
 use super::*;
 
 impl Emitter {
+    pub(in crate::native::emitter) fn emit_aggregate_prefix_pointer_reinterpret_load(
+        &mut self,
+        result_name: &str,
+        pointee: &LlType,
+        result_ty: &LlType,
+        ptr_value: &TypedValue,
+        ptr: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !self.bda_device_pointers || !matches!(result_ty, LlType::Ptr(_)) {
+            return Ok(false);
+        }
+        let storage = match self.resolve_type(&ptr_value.ty)? {
+            LlType::Ptr(addrspace) => self.pointer_storage_for(&ptr_value.value, addrspace)?,
+            other => {
+                return Err(format!(
+                    "native emitter: load pointer is not a pointer: {other:?}"
+                ))
+            }
+        };
+        let (address, payload_words) = if let Some((field_ty, access_path)) =
+            first_aggregate_leaf(pointee, &|ty| *ty == LlType::Int(64), false)
+        {
+            let field_ptr_ty = self.ptr_type_id(storage, &field_ty)?;
+            let field_ptr = self.fresh();
+            let mut operands = vec![Operand::IdRef(ptr)];
+            for index in access_path {
+                operands.push(Operand::IdRef(self.const_uint(index)?));
+            }
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(field_ptr_ty),
+                Some(field_ptr),
+                operands,
+            ));
+            let field_type = self.type_id(&field_ty)?;
+            let address = self.fresh();
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(field_type),
+                Some(address),
+                vec![Operand::IdRef(field_ptr)],
+            ));
+            (address, None)
+        } else {
+            let Some(fields) = self.leading_i32_scalar_accesses(pointee, 8)? else {
+                return Ok(false);
+            };
+            if fields.len() != 2 {
+                return Ok(false);
+            }
+            let mut words = fields.into_iter().map(|(access_path, field_ty)| {
+                self.emit_i32_scalar_field_load(ptr, storage, &access_path, &field_ty, instructions)
+            });
+            let low = words.next().transpose()?.expect("two leading words");
+            let high = words.next().transpose()?.expect("two leading words");
+            (
+                self.combine_pointer_payload_words(low, high, instructions)?,
+                Some((low, high)),
+            )
+        };
+        self.emit_device_address_nullness(result_name, address, instructions)?;
+        let LlType::Ptr(addrspace) = result_ty else {
+            unreachable!()
+        };
+        let mut raw = RawBufferOffset::root(format!(".bda_{address}"), *addrspace);
+        raw.device_addr_base = Some(address);
+        self.raw_offsets.insert(result_name.to_string(), raw);
+        if let Some(payload_words) = payload_words {
+            self.pointer_payload_words
+                .insert(result_name.to_string(), payload_words);
+        }
+        self.pointer_storage
+            .insert(result_name.to_string(), StorageClass::PhysicalStorageBuffer);
+        self.pointer_pointees
+            .insert(result_name.to_string(), LlType::Int(8));
+        self.used_device_address = true;
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_i32_pair_struct_to_i64_load(
         &mut self,
         result: Word,
@@ -156,7 +236,28 @@ impl Emitter {
         };
 
         let ptr_id = self.value_id(&ptr.value, &ptr.ty)?;
-        let object_id = self.value_id(&object.value, &object.ty)?;
+        if self.bda_device_pointers && *pointee == LlType::Int(64) {
+            if let LlValue::Local(object_name) = &object.value {
+                if let Some(address) = self.bda_direct_addresses.get(object_name).copied() {
+                    self.emit_sidecar.local_pointer_field_stores.push(
+                        crate::emit_sidecar::LocalPointerFieldStore {
+                            id: address,
+                            source: address,
+                            root: key.root,
+                            indices: key.indices.clone(),
+                        },
+                    );
+                    instructions.push(Self::inst(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(ptr_id), Operand::IdRef(address)],
+                    ));
+                    self.local_pointer_fields.insert(key, object.clone());
+                    return Ok(true);
+                }
+            }
+        }
         let zero_ty = self.type_id(&LlType::Int(64))?;
         let zero = self.fresh();
         self.module.types_global_values.push(Self::inst(
@@ -165,10 +266,19 @@ impl Emitter {
             Some(zero),
             vec![],
         ));
+        // Local pointer fields use an integer payload plus the typed sidecar carrier. A literal
+        // null/undef has no pointer payload to preserve: its exact stored representation is this
+        // integer zero. Do not construct a Private/Function OpConstantNull merely to name the
+        // sidecar source; such logical pointer constants are not legal Vulkan SPIR-V.
+        let source = if matches!(object.value, LlValue::Zero | LlValue::Undef) {
+            zero
+        } else {
+            self.value_id(&object.value, &object.ty)?
+        };
         self.emit_sidecar.local_pointer_field_stores.push(
             crate::emit_sidecar::LocalPointerFieldStore {
                 id: zero,
-                source: object_id,
+                source,
                 root: key.root,
                 indices: key.indices.clone(),
             },
@@ -201,6 +311,33 @@ impl Emitter {
         let Some(key) = self.local_pointer_field_key(ptr)? else {
             return Ok(false);
         };
+        if self.bda_device_pointers
+            && matches!(result_ty, LlType::Ptr(1))
+            && self.bda_forward_addresses.contains(result_name)
+        {
+            let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+            let address_type = self.type_id(&LlType::Int(64))?;
+            let address = self.result_id(&bda_address_name(result_name), &LlType::Int(64))?;
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(address_type),
+                Some(address),
+                vec![Operand::IdRef(pointer)],
+            ));
+            self.bda_address_values.insert(address);
+            self.bda_direct_addresses
+                .insert(result_name.to_string(), address);
+            let mut raw = RawBufferOffset::root(format!(".bda_{address}"), 1);
+            raw.device_addr_base = Some(address);
+            self.raw_offsets.insert(result_name.to_string(), raw);
+            self.pointer_storage
+                .insert(result_name.to_string(), StorageClass::PhysicalStorageBuffer);
+            self.pointer_pointees
+                .insert(result_name.to_string(), LlType::Int(8));
+            self.emit_device_address_nullness(result_name, address, instructions)?;
+            self.used_device_address = true;
+            return Ok(true);
+        }
         self.emit_pointer_from_local_field_key(result_name, result, result_ty, &key, instructions)?;
         Ok(true)
     }
@@ -218,12 +355,30 @@ impl Emitter {
                 "native emitter: local pointer field loaded as non-pointer {result_ty:?}"
             ));
         };
-        let stored = (!self
-            .ir
-            .preinlined_helper_pointer_loads
-            .contains(result_name))
-        .then(|| self.local_pointer_fields.get(key).cloned())
-        .flatten();
+        let stored = self
+            .local_pointer_fields
+            .get(key)
+            .cloned()
+            .filter(|stored| {
+                if !self
+                    .ir
+                    .preinlined_helper_pointer_loads
+                    .contains(result_name)
+                {
+                    return true;
+                }
+                match &stored.value {
+                    LlValue::Local(source_name) => {
+                        self.bda_direct_addresses.contains_key(source_name)
+                            || self.raw_offsets.get(source_name).is_some_and(|raw| {
+                                raw.device_addr_base.is_some()
+                                    || self.bda_direct_addresses.contains_key(&raw.root)
+                            })
+                            || self.bda_phi_value_is_addressable(&stored.value)
+                    }
+                    _ => false,
+                }
+            });
         let Some(stored) = stored else {
             self.emit_unmodeled_byte_pointer_copy(result_name, result, *addrspace, instructions)?;
             self.emit_sidecar.local_pointer_field_loads.push(
@@ -235,39 +390,110 @@ impl Emitter {
             );
             return Ok(());
         };
+        self.pointer_forward_values
+            .insert(result_name.to_string(), stored.clone());
+
+        if matches!(stored.value, LlValue::Zero | LlValue::Undef) {
+            let storage = self.pointer_storage_for(&stored.value, *addrspace)?;
+            let pointee = self
+                .pointer_pointee_for_value(&stored.value)?
+                .unwrap_or(LlType::Int(8));
+            let result_type = self.ptr_type_id(storage, &pointee)?;
+            self.module.types_global_values.push(Self::inst(
+                Op::Undef,
+                Some(result_type),
+                Some(result),
+                vec![],
+            ));
+            self.pointer_storage
+                .insert(result_name.to_string(), storage);
+            self.pointer_pointees
+                .insert(result_name.to_string(), pointee);
+            let is_null = self.const_bool(true)?;
+            self.record_pointer_nullness(result_name.to_string(), is_null);
+            return Ok(());
+        }
+
+        if let LlValue::Local(source_name) = &stored.value {
+            if self.pointer_phi_values.contains(source_name)
+                && !self.raw_offsets.contains_key(source_name)
+            {
+                if let Some(incoming) = self.tir_phi_incomings.get(source_name).cloned() {
+                    let source_ty = self.resolve_type(&stored.ty)?;
+                    self.reserve_bda_address_phi(source_name, &incoming, &source_ty)?;
+                }
+            }
+        }
 
         let storage = self.pointer_storage_for(&stored.value, *addrspace)?;
         let pointee = self
             .pointer_pointee_for_value(&stored.value)?
             .unwrap_or(LlType::Int(8));
-        let result_type = self.ptr_type_id(storage, &pointee)?;
-        let source = self.value_id_in(&stored.value, &stored.ty, instructions)?;
+        let address = if self.bda_device_pointers {
+            match &stored.value {
+                LlValue::Local(source_name) => self
+                    .bda_direct_addresses
+                    .get(source_name)
+                    .copied()
+                    .or_else(|| {
+                        self.raw_offsets.get(source_name).and_then(|raw| {
+                            raw.device_addr_base
+                                .or_else(|| self.bda_direct_addresses.get(&raw.root).copied())
+                        })
+                    }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (result_type, source) = if let Some(address) = address {
+            self.bda_direct_addresses
+                .insert(result_name.to_string(), result);
+            let mut raw = RawBufferOffset::root(format!(".bda_{result}"), *addrspace);
+            raw.device_addr_base = Some(result);
+            self.raw_offsets.insert(result_name.to_string(), raw);
+            (self.type_id(&LlType::Int(64))?, address)
+        } else {
+            (
+                self.ptr_type_id(storage, &pointee)?,
+                self.value_id_in(&stored.value, &stored.ty, instructions)?,
+            )
+        };
         instructions.push(Self::inst(
             Op::CopyObject,
             Some(result_type),
             Some(result),
             vec![Operand::IdRef(source)],
         ));
-        // This is only a pointer-typed copy until interface binding gives an opaque AIR resource
-        // parameter its final SPIR-V image/sampler type. Preserve the field identity even on the
-        // emitter's fast path so `recover_inlined_local_pointer_fields` can replace the copy with
-        // its stored source before that retyping. Without this fact, binding a texture held in a
-        // private aggregate rewrites only the operand to an OpTypeImage and leaves an invalid
-        // pointer-typed OpCopyObject behind.
-        self.emit_sidecar.local_pointer_field_loads.push(
-            crate::emit_sidecar::LocalPointerFieldLoad {
-                id: result,
-                root: key.root,
-                indices: key.indices.clone(),
+        // A logical pointer copy can still be an opaque AIR resource handle whose final image or
+        // sampler type is assigned during interface binding. Preserve that field identity so the
+        // recovery pass can forward its stored source before retyping. A physical-address copy is
+        // already the final 64-bit representation; marking it as a logical field load would make
+        // recovery replace the address with the original pointer-typed SSA id.
+        if address.is_none() {
+            self.emit_sidecar.local_pointer_field_loads.push(
+                crate::emit_sidecar::LocalPointerFieldLoad {
+                    id: result,
+                    root: key.root,
+                    indices: key.indices.clone(),
+                },
+            );
+        }
+        self.pointer_storage.insert(
+            result_name.to_string(),
+            if address.is_some() {
+                StorageClass::PhysicalStorageBuffer
+            } else {
+                storage
             },
         );
-        self.pointer_storage
-            .insert(result_name.to_string(), storage);
         self.pointer_pointees
             .insert(result_name.to_string(), pointee);
         if let LlValue::Local(source_name) = &stored.value {
-            if let Some(raw) = self.raw_offsets.get(source_name).cloned() {
-                self.raw_offsets.insert(result_name.to_string(), raw);
+            if address.is_none() {
+                if let Some(raw) = self.raw_offsets.get(source_name).cloned() {
+                    self.raw_offsets.insert(result_name.to_string(), raw);
+                }
             }
             if let Some(nullness) = self.pointer_nullness.get(source_name).copied() {
                 self.record_pointer_nullness(result_name.to_string(), nullness);
@@ -845,8 +1071,13 @@ impl Emitter {
         ptr: Word,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        let LlType::Array(elem, len) = pointee else {
-            return Ok(false);
+        let (elem, len) = match pointee {
+            LlType::Array(elem, len) => (elem, len),
+            // SPIR-V's native vector width stops at four lanes. Wider LLVM byte vectors are emitted
+            // as fixed arrays, so dereferencing one through an opaque-pointer alias requires the
+            // same byte-wise value reconstruction as an LLVM array.
+            LlType::Vector(elem, len) if *len > 4 => (elem, len),
+            _ => return Ok(false),
         };
         if elem.as_ref() != &LlType::Int(8) {
             return Ok(false);
@@ -945,14 +1176,136 @@ impl Emitter {
         Ok(true)
     }
 
+    /// Reconstruct an integer load whose LLVM GEP selects one byte inside a fixed byte-array leaf
+    /// of Function/Private aggregate storage. Logical SPIR-V cannot widen that leaf pointer or walk
+    /// to its sibling bytes with `OpPtrAccessChain`; replay the aggregate path once per byte and
+    /// pack the loads little-endian instead.
+    pub(in crate::native::emitter) fn emit_trailing_byte_array_integer_load(
+        &mut self,
+        result: Word,
+        result_ty: &LlType,
+        ptr_value: &TypedValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let LlValue::Local(pointer_name) = &ptr_value.value else {
+            return Ok(false);
+        };
+        let Some(provenance) = self.gep_provenance.get(pointer_name).cloned() else {
+            return Ok(false);
+        };
+        let storage = self.pointer_storage_for(&ptr_value.value, provenance.addrspace)?;
+        if !matches!(storage, StorageClass::Function | StorageClass::Private) {
+            return Ok(false);
+        }
+        let LlType::Int(bits) = self.resolve_type(result_ty)? else {
+            return Ok(false);
+        };
+        if bits == 0 || bits % 8 != 0 || provenance.indices.len() < 2 {
+            return Ok(false);
+        }
+        let byte_count = bits / 8;
+        let Some(first_byte) = const_index(provenance.indices.last()) else {
+            return Ok(false);
+        };
+        let parent = self.resolve_type(&gep_pointee(
+            &provenance.source_ty,
+            &provenance.indices[..provenance.indices.len() - 1],
+        )?)?;
+        let LlType::Array(element, length) = parent else {
+            return Ok(false);
+        };
+        if self.resolve_type(&element)? != LlType::Int(8)
+            || first_byte
+                .checked_add(byte_count)
+                .is_none_or(|end| end > length)
+        {
+            return Ok(false);
+        }
+
+        let byte_ty = self.type_id(&LlType::Int(8))?;
+        let byte_ptr_ty = self.ptr_type_id(storage, &LlType::Int(8))?;
+        let result_ty_id = self.type_id(result_ty)?;
+        let mut acc = None;
+        for byte in 0..byte_count {
+            let mut indices = provenance.indices.clone();
+            let last = indices.last_mut().expect("checked non-empty index path");
+            last.value = LlValue::Int(u64::from(first_byte + byte));
+            let mut operands = vec![Operand::IdRef(provenance.root)];
+            for index in gep_spirv_indices(&indices)? {
+                operands.push(Operand::IdRef(self.value_id(&index.value, &index.ty)?));
+            }
+            let byte_ptr = self.fresh();
+            instructions.push(Self::inst(
+                Op::InBoundsAccessChain,
+                Some(byte_ptr_ty),
+                Some(byte_ptr),
+                operands,
+            ));
+            let loaded = self.fresh();
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(byte_ty),
+                Some(loaded),
+                vec![Operand::IdRef(byte_ptr)],
+            ));
+            let widened = if bits == 8 {
+                loaded
+            } else {
+                let widened = self.fresh();
+                instructions.push(Self::inst(
+                    Op::UConvert,
+                    Some(result_ty_id),
+                    Some(widened),
+                    vec![Operand::IdRef(loaded)],
+                ));
+                widened
+            };
+            let term = if byte == 0 {
+                widened
+            } else {
+                let shifted = self.fresh();
+                let shift = self.const_signed_int(bits, i64::from(byte * 8))?;
+                instructions.push(Self::inst(
+                    Op::ShiftLeftLogical,
+                    Some(result_ty_id),
+                    Some(shifted),
+                    vec![Operand::IdRef(widened), Operand::IdRef(shift)],
+                ));
+                shifted
+            };
+            acc = Some(if let Some(previous) = acc {
+                let combined = if byte + 1 == byte_count {
+                    result
+                } else {
+                    self.fresh()
+                };
+                instructions.push(Self::inst(
+                    Op::BitwiseOr,
+                    Some(result_ty_id),
+                    Some(combined),
+                    vec![Operand::IdRef(previous), Operand::IdRef(term)],
+                ));
+                combined
+            } else {
+                term
+            });
+        }
+        if acc != Some(result) {
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(result_ty_id),
+                Some(result),
+                vec![Operand::IdRef(acc.expect("positive byte count"))],
+            ));
+        }
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn local_pointer_field_key(
         &self,
         ptr: &TypedValue,
     ) -> Result<Option<LocalPointerField>, String> {
         let LlValue::Local(name) = &ptr.value else {
-            return Ok(None);
-        };
-        let Some(provenance) = self.gep_provenance.get(name) else {
             return Ok(None);
         };
         let LlType::Ptr(addrspace) = self.resolve_type(&ptr.ty)? else {
@@ -965,6 +1318,24 @@ impl Emitter {
         if !matches!(storage, StorageClass::Function | StorageClass::Private) {
             return Ok(None);
         }
+        let Some(provenance) = self.gep_provenance.get(name) else {
+            // A direct `alloca ptr` is itself the complete local pointer field. Its pointee was
+            // stored as an i64 payload by `function_storage_local_type`, but the typed pointer fact
+            // remains in `pointer_pointees`; use the allocation id as an empty-path field root so
+            // pointer stores and later loads share the same address-domain record.
+            if storage == StorageClass::Function
+                && self
+                    .pointer_pointees
+                    .get(name)
+                    .is_some_and(local_pointer_field_pointee)
+            {
+                return Ok(self.values.get(name).map(|(root, _)| LocalPointerField {
+                    root: *root,
+                    indices: Vec::new(),
+                }));
+            }
+            return Ok(None);
+        };
         let Some(mut indices) = provenance
             .indices
             .iter()

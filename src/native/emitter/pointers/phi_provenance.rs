@@ -129,7 +129,84 @@ impl Emitter {
             }
             return Ok(Some(template));
         }
-        self.pointer_phi_forward_template_provenance(name, incoming)
+        if let Some(template) = self.pointer_phi_forward_template_provenance(name, incoming)? {
+            return Ok(Some(template));
+        }
+        let mut visited = HashSet::new();
+        let values = incoming
+            .iter()
+            .map(|(value, _)| value.clone())
+            .collect::<Vec<_>>();
+        if let Some(template) = self.pointer_network_forward_template(&values, &mut visited)? {
+            return Ok(Some(template));
+        }
+        Ok(None)
+    }
+
+    /// Find a concrete forward GEP behind a cycle of construct-tree pointer state phis/selects.
+    /// Such a network may be encountered before its one concrete arm is emitted; the GEP's typed
+    /// carrier still supplies an exact root, source type, and index vector for index-domain lowering.
+    fn pointer_network_forward_template(
+        &mut self,
+        values: &[LlValue],
+        visited: &mut HashSet<String>,
+    ) -> Result<Option<GepProvenance>, String> {
+        for value in values {
+            let LlValue::Local(name) = value else {
+                continue;
+            };
+            // This is a reachability search for any concrete GEP template. Once one value's complete
+            // forward subgraph has been searched without finding a template, revisiting it through a
+            // reconvergent phi arm cannot produce a different answer. Retaining the mark bounds the
+            // search by the number of pointer values instead of the number of paths through the graph.
+            if !visited.insert(name.clone()) {
+                continue;
+            }
+            let found = if let Some(provenance) = self.gep_provenance.get(name).cloned() {
+                Some(provenance)
+            } else if let Some(gep) = self.forward_geps.get(name).cloned() {
+                self.forward_gep_template_provenance(&gep)?
+            } else if let Some(incoming) = self.tir_phi_incomings.get(name).cloned() {
+                let values = incoming
+                    .into_iter()
+                    .map(|(value, _)| value)
+                    .collect::<Vec<_>>();
+                self.pointer_network_forward_template(&values, visited)?
+            } else if let Some((true_value, false_value)) =
+                self.forward_pointer_selects.get(name).cloned()
+            {
+                self.pointer_network_forward_template(
+                    &[true_value.value, false_value.value],
+                    visited,
+                )?
+            } else {
+                None
+            };
+            if found.is_some() {
+                return Ok(found);
+            }
+        }
+        Ok(None)
+    }
+
+    fn forward_gep_template_provenance(
+        &mut self,
+        gep: &LlGep,
+    ) -> Result<Option<GepProvenance>, String> {
+        let LlType::Ptr(addrspace) = self.resolve_type(&gep.base.ty)? else {
+            return Ok(None);
+        };
+        let Some(root) = self.forward_phi_root_id(&gep.base.value, &gep.base.ty)? else {
+            return Ok(None);
+        };
+        Ok(Some(GepProvenance {
+            root,
+            addrspace,
+            source_ty: self.resolve_type(&gep.source_ty)?,
+            indices: gep.indices.clone(),
+            root_indices: None,
+            root_is_indexed_container: self.is_indexed_container_root(root, None),
+        }))
     }
 
     pub(in crate::native::emitter) fn pointer_phi_forward_template_provenance(
@@ -137,14 +214,21 @@ impl Emitter {
         name: &str,
         incoming: &[(LlValue, String)],
     ) -> Result<Option<GepProvenance>, String> {
-        let Some(gep) = incoming.iter().find_map(|(value, _)| {
+        let direct_gep = incoming.iter().find_map(|(value, _)| {
             let LlValue::Local(incoming_name) = value else {
                 return None;
             };
             let gep = self.forward_geps.get(incoming_name)?;
             matches!(&gep.base.value, LlValue::Local(base_name) if base_name == name)
                 .then(|| gep.clone())
-        }) else {
+        });
+        let select_gep = incoming.iter().find_map(|(value, _)| {
+            let LlValue::Local(incoming_name) = value else {
+                return None;
+            };
+            self.forward_select_recurrence_gep(incoming_name, name)
+        });
+        let Some(gep) = direct_gep.or(select_gep) else {
             return Ok(None);
         };
         let LlValue::Local(base_name) = &gep.base.value else {
@@ -163,7 +247,9 @@ impl Emitter {
                     LlValue::Local(incoming_name) => {
                         self.forward_geps.get(incoming_name).is_some_and(|gep| {
                             matches!(&gep.base.value, LlValue::Local(base_name) if base_name == name)
-                        })
+                        }) || self
+                            .forward_select_recurrence_gep(incoming_name, name)
+                            .is_some()
                     }
                     _ => false,
                 };
@@ -187,6 +273,51 @@ impl Emitter {
             root_indices: None,
             root_is_indexed_container: self.is_indexed_container_root(root, None),
         }))
+    }
+
+    /// Return the first GEP in a forward-defined chain whose base is the loop phi. The chain is
+    /// source-structural: every link must be a typed GEP and cycles or unrelated pointer producers
+    /// decline. Only the root link defines the index domain used to construct the phi; ordinary GEP
+    /// emission composes each later link into that reserved index in source order.
+    fn forward_gep_chain_rooted_at(&self, value: &str, root: &str) -> Option<LlGep> {
+        let mut current = value;
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if !seen.insert(current) {
+                return None;
+            }
+            let gep = self.forward_geps.get(current)?;
+            let LlValue::Local(base) = &gep.base.value else {
+                return None;
+            };
+            if base == root {
+                return Some(gep.clone());
+            }
+            current = base;
+        }
+    }
+
+    pub(in crate::native::emitter) fn forward_select_recurrence_gep(
+        &self,
+        select: &str,
+        phi: &str,
+    ) -> Option<LlGep> {
+        let (true_value, false_value) = self.forward_pointer_selects.get(select)?;
+        let (self_arm, advanced_arm) = if matches!(&true_value.value, LlValue::Local(name) if name == phi)
+        {
+            (true_value, false_value)
+        } else if matches!(&false_value.value, LlValue::Local(name) if name == phi) {
+            (false_value, true_value)
+        } else {
+            return None;
+        };
+        if !matches!(&self_arm.ty, LlType::Ptr(_)) {
+            return None;
+        }
+        let LlValue::Local(advanced_name) = &advanced_arm.value else {
+            return None;
+        };
+        self.forward_gep_chain_rooted_at(advanced_name, phi)
     }
 
     fn forward_phi_root_id(
@@ -233,6 +364,20 @@ impl Emitter {
                     }
                 }
                 let (Some(template), Some(index_ty)) = (template, index_ty) else {
+                    if let Some(template) = template {
+                        if self.tir_phi_incomings.contains_key(name) {
+                            return self
+                                .reserve_pointer_provenance_from_template(name, template, false);
+                        }
+                        if let Some(gep) = self.forward_geps.get(name).cloned() {
+                            let provenance = self.forward_gep_template_provenance(&gep)?;
+                            if provenance.as_ref().is_some_and(|provenance| {
+                                compatible_pointer_provenance(template, provenance)
+                            }) {
+                                return Ok(provenance);
+                            }
+                        }
+                    }
                     if let Some(provenance) = self.gep_provenance.get(name).cloned() {
                         return Ok(Some(provenance));
                     }
@@ -264,6 +409,11 @@ impl Emitter {
                 {
                     return Ok(Some(provenance));
                 }
+                if let Some(provenance) =
+                    self.forward_select_pointer_provenance(name, template, index_ty)?
+                {
+                    return Ok(Some(provenance));
+                }
                 // The reserved-index promise below is fulfilled only by a LATER defining GEP of
                 // `name` (the `materialize_reserved_pointer_index` call sites). A name that already
                 // has a value id is already defined — a param or an emitted pointer — so no future
@@ -288,8 +438,81 @@ impl Emitter {
                 self.gep_provenance.insert(name.clone(), provenance.clone());
                 Ok(Some(provenance))
             }
+            LlValue::Undef => {
+                let Some(mut provenance) = template.cloned() else {
+                    return Ok(None);
+                };
+                // An undefined pointer arm shares the concrete arm's structural path, but it does
+                // not carry that arm's dynamic indices. Copying those SSA values into the undefined
+                // arm can move a branch-local index across the merge without a phi, violating
+                // dominance. Preserve only literal struct/array selectors and make every dynamic
+                // index explicitly undefined so merge construction emits the required index phis.
+                let mut selected_ty = provenance.source_ty.clone();
+                for (position, index) in provenance.indices.iter_mut().enumerate() {
+                    let structural =
+                        structural_pointer_index(position, &mut selected_ty, index, false)
+                        .ok_or_else(|| {
+                            "native emitter: undefined pointer provenance has an invalid structural path"
+                                .to_string()
+                        })?;
+                    if !structural {
+                        index.value = LlValue::Undef;
+                    }
+                }
+                Ok(Some(provenance))
+            }
             _ => Ok(None),
         }
+    }
+
+    pub(in crate::native::emitter) fn reserve_pointer_provenance_from_template(
+        &mut self,
+        name: &str,
+        template: &GepProvenance,
+        first_index_is_pointer_arithmetic: bool,
+    ) -> Result<Option<GepProvenance>, String> {
+        let mut indices = Vec::with_capacity(template.indices.len());
+        let mut selected_ty = template.source_ty.clone();
+        for (position, template_index) in template.indices.iter().enumerate() {
+            // LLVM's leading zero indexes the pointee object itself and is omitted when constructing
+            // the SPIR-V access chain. A later index into a struct is also part of SPIR-V's TYPE path
+            // and must remain a literal member number. Turning either into a phi result would create
+            // a dynamic struct index, which cannot describe an OpAccessChain. Array/vector indices
+            // remain state values and may vary across incoming edges.
+            let Some(structural_literal) = structural_pointer_index(
+                position,
+                &mut selected_ty,
+                template_index,
+                first_index_is_pointer_arithmetic,
+            ) else {
+                return Ok(None);
+            };
+            if structural_literal {
+                indices.push(template_index.clone());
+                continue;
+            }
+            let index_name = if template.indices.len() == 1 {
+                pointer_index_name(name)
+            } else {
+                format!("{}.{position}", pointer_index_name(name))
+            };
+            self.result_id(&index_name, &template_index.ty)?;
+            indices.push(TypedValue {
+                ty: template_index.ty.clone(),
+                value: LlValue::Local(index_name),
+            });
+        }
+        let provenance = GepProvenance {
+            root: template.root,
+            addrspace: template.addrspace,
+            source_ty: template.source_ty.clone(),
+            indices,
+            root_indices: None,
+            root_is_indexed_container: template.root_is_indexed_container,
+        };
+        self.gep_provenance
+            .insert(name.to_string(), provenance.clone());
+        Ok(Some(provenance))
     }
 
     pub(in crate::native::emitter) fn forward_gep_pointer_provenance(
@@ -313,6 +536,58 @@ impl Emitter {
         };
         let source_ty = self.resolve_type(&gep.source_ty)?;
         if addrspace != template.addrspace || source_ty != template.source_ty {
+            return Ok(None);
+        }
+        let index_name = pointer_index_name(name);
+        self.result_id(&index_name, index_ty)?;
+        let provenance = GepProvenance {
+            root: template.root,
+            addrspace: template.addrspace,
+            source_ty: template.source_ty.clone(),
+            indices: vec![TypedValue {
+                ty: index_ty.clone(),
+                value: LlValue::Local(index_name),
+            }],
+            root_indices: None,
+            root_is_indexed_container: template.root_is_indexed_container,
+        };
+        self.gep_provenance
+            .insert(name.to_string(), provenance.clone());
+        Ok(Some(provenance))
+    }
+
+    fn forward_select_pointer_provenance(
+        &mut self,
+        name: &str,
+        template: &GepProvenance,
+        index_ty: &LlType,
+    ) -> Result<Option<GepProvenance>, String> {
+        let Some((true_value, false_value)) = self.forward_pointer_selects.get(name).cloned()
+        else {
+            return Ok(None);
+        };
+        let phi_name = [&true_value, &false_value].into_iter().find_map(|value| {
+            let LlValue::Local(phi_name) = &value.value else {
+                return None;
+            };
+            (self.tir_phi_incomings.contains_key(phi_name)
+                && self.forward_select_recurrence_gep(name, phi_name).is_some())
+            .then_some(phi_name.clone())
+        });
+        let Some(phi_name) = phi_name else {
+            return Ok(None);
+        };
+        let Some(gep) = self.forward_select_recurrence_gep(name, &phi_name) else {
+            return Ok(None);
+        };
+        let LlType::Ptr(addrspace) = self.resolve_type(&gep.base.ty)? else {
+            return Ok(None);
+        };
+        let source_ty = self.resolve_type(&gep.source_ty)?;
+        if addrspace != template.addrspace
+            || source_ty != template.source_ty
+            || gep.indices.len() != 1
+        {
             return Ok(None);
         }
         let index_name = pointer_index_name(name);
@@ -371,26 +646,7 @@ impl Emitter {
         let Some(template) = self.pointer_phi_template_provenance(name, &incoming)? else {
             return Ok(());
         };
-        if template.indices.len() != 1 {
-            return Ok(());
-        }
-        let index_ty = template.indices[0].ty.clone();
-        let index_name = pointer_index_name(name);
-        self.result_id(&index_name, &index_ty)?;
-        self.gep_provenance.insert(
-            name.to_string(),
-            GepProvenance {
-                root: template.root,
-                addrspace: template.addrspace,
-                source_ty: template.source_ty,
-                indices: vec![TypedValue {
-                    ty: index_ty,
-                    value: LlValue::Local(index_name),
-                }],
-                root_indices: None,
-                root_is_indexed_container: template.root_is_indexed_container,
-            },
-        );
+        self.reserve_pointer_provenance_from_template(name, &template, false)?;
         Ok(())
     }
 
@@ -547,27 +803,62 @@ impl Emitter {
         root: Word,
         storage: Option<StorageClass>,
     ) -> bool {
-        self.global_values.iter().any(|(name, (id, ty))| {
-            let matches_storage = match (storage, ty) {
-                (Some(storage), LlType::Ptr(addrspace)) => {
-                    llvm_pointer_storage(*addrspace) == Ok(storage)
+        let emitted_global_is_indexed_container = self
+            .module
+            .types_global_values
+            .iter()
+            .find(|inst| inst.class.opcode == Op::Variable && inst.result_id == Some(root))
+            .and_then(|variable| variable.result_type)
+            .and_then(|pointer_type| {
+                self.module.types_global_values.iter().find(|inst| {
+                    inst.class.opcode == Op::TypePointer && inst.result_id == Some(pointer_type)
+                })
+            })
+            .and_then(|pointer_type| {
+                let matches_storage = storage.is_none_or(|storage| {
+                    pointer_type.operands.first() == Some(&Operand::StorageClass(storage))
+                });
+                match matches_storage.then(|| pointer_type.operands.get(1))?? {
+                    Operand::IdRef(pointee) => Some(*pointee),
+                    _ => None,
                 }
-                (Some(_), _) => false,
-                (None, _) => true,
-            };
-            *id == root
-                && matches_storage
-                && self.pointer_pointees.get(name).is_some_and(|pointee| {
-                    matches!(pointee, LlType::Array(_, _) | LlType::Struct(_))
-                })
-        }) || self.values.iter().any(|(name, (id, _))| {
-            *id == root
-                && storage
-                    .map(|storage| self.pointer_storage.get(name) == Some(&storage))
-                    .unwrap_or(true)
-                && self.pointer_pointees.get(name).is_some_and(|pointee| {
-                    matches!(pointee, LlType::Array(_, _) | LlType::Struct(_))
-                })
-        })
+            })
+            .and_then(|pointee| {
+                self.module
+                    .types_global_values
+                    .iter()
+                    .find(|inst| inst.result_id == Some(pointee))
+            })
+            .is_some_and(|pointee| {
+                matches!(
+                    pointee.class.opcode,
+                    Op::TypeArray | Op::TypeRuntimeArray | Op::TypeStruct
+                )
+            });
+
+        emitted_global_is_indexed_container
+            || self.global_values.iter().any(|(name, (id, ty))| {
+                let matches_storage = match (storage, ty) {
+                    (Some(storage), LlType::Ptr(addrspace)) => {
+                        llvm_pointer_storage(*addrspace) == Ok(storage)
+                    }
+                    (Some(_), _) => false,
+                    (None, _) => true,
+                };
+                *id == root
+                    && matches_storage
+                    && self.pointer_pointees.get(name).is_some_and(|pointee| {
+                        matches!(pointee, LlType::Array(_, _) | LlType::Struct(_))
+                    })
+            })
+            || self.values.iter().any(|(name, (id, _))| {
+                *id == root
+                    && storage
+                        .map(|storage| self.pointer_storage.get(name) == Some(&storage))
+                        .unwrap_or(true)
+                    && self.pointer_pointees.get(name).is_some_and(|pointee| {
+                        matches!(pointee, LlType::Array(_, _) | LlType::Struct(_))
+                    })
+            })
     }
 }

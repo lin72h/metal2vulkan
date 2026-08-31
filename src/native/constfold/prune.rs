@@ -10,15 +10,20 @@ use std::collections::HashSet;
 /// Entry: fold statically-constant branches and DCE the resulting dead code, to a fixpoint.
 /// Returns `true` if anything changed.
 pub(in crate::native) fn prune_constant_branches(module: &mut Module) -> bool {
-    prune_constant_branches_preserving(module, &HashSet::new())
+    prune_constant_branches_impl(module, &HashSet::new(), true)
 }
 
-/// Constant-branch pruning with additional module-global roots supplied by a typed sidecar. This is
-/// used only while a primary module is still in memory: the roots replace the liveness formerly
-/// supplied accidentally by debug `OpName` marker instructions.
-pub(in crate::native) fn prune_constant_branches_preserving(
+/// Fold constant-controlled CFG without sweeping unrelated unused values. This is the primary
+/// construction form: it may run for every module without turning the failure-recovery DCE into a
+/// byte-changing whole-module optimization.
+pub(in crate::native) fn prune_constant_cfg(module: &mut Module) -> bool {
+    prune_constant_branches_impl(module, &HashSet::new(), false)
+}
+
+fn prune_constant_branches_impl(
     module: &mut Module,
     preserved_global_ids: &HashSet<Word>,
+    sweep_dead_values: bool,
 ) -> bool {
     let scalar_int_types = scalar_int_bool_types(module);
     let consts = module_scalar_constants(module, &scalar_int_types);
@@ -32,6 +37,7 @@ pub(in crate::native) fn prune_constant_branches_preserving(
     }
 
     let mut any = false;
+    let mut cfg_was_pruned = false;
     // Module-level fixpoint: each pass may expose new constant conditions (a collapsed single-pred
     // phi whose arms are equal, a freshly-dead block) for the next.
     loop {
@@ -60,17 +66,32 @@ pub(in crate::native) fn prune_constant_branches_preserving(
             for (g, v) in guards {
                 vals.entry(g).or_insert(v);
             }
-            changed |= fold_branches(&mut module.functions[fi], &vals);
-            changed |= prune_unreachable(&mut module.functions[fi]);
-            changed |= collapse_trivial_phis(&mut module.functions[fi]);
+            if sweep_dead_values {
+                changed |= fold_branches(&mut module.functions[fi], &vals);
+                changed |= prune_unreachable(&mut module.functions[fi]);
+                changed |= collapse_trivial_phis(&mut module.functions[fi]);
+            } else {
+                let folded = fold_branches(&mut module.functions[fi], &vals);
+                let pruned = prune_unreachable(&mut module.functions[fi]);
+                let collapsed =
+                    (folded || pruned) && collapse_trivial_phis(&mut module.functions[fi]);
+                changed |= folded || pruned || collapsed;
+                if folded || pruned {
+                    cfg_was_pruned = true;
+                }
+            }
         }
         // DCE is module-wide (uses cross blocks/functions); run once per outer iteration.
-        changed |= dce_preserving(module, preserved_global_ids);
+        if sweep_dead_values {
+            changed |= dce_preserving(module, preserved_global_ids);
+        }
         // Once branch folding removes every call to an unhandled-intrinsic function (igemm /
         // load.with.emask / ... — emitted as a BODYLESS OpFunction declaration), that declaration is
         // dead: a non-imported function with no basic blocks is invalid SPIR-V, so it must be swept
         // or the pruned module never validates. Fold-then-sweep, once per outer iteration.
-        changed |= sweep_uncalled_functions(module);
+        if sweep_dead_values || cfg_was_pruned {
+            changed |= sweep_uncalled_functions(module);
+        }
         any |= changed;
         if !changed {
             break;

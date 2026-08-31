@@ -1,0 +1,1 @@
+{"air_sha256":"0588ba66bac9de027456462c5d0f6ea4dff43c7482c20352a5d26c03de3b6143","reason":"AIR entry \"backwarpNonInterleaved\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

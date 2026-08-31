@@ -149,8 +149,18 @@ pub(in crate::passes) fn lower_integer_op(
         return Ok(Some(rotate_left_i32(ctx, res, rty, args[0], args[1])));
     }
     if name.starts_with("air.extract_bits.u.") && args.len() == 3 {
-        if int_scalar_width(ctx, rty) == Some(64) {
+        let (lanes, width) = validate_extract_bits_shape(ctx, name, rty, args)?;
+        if width == 64 {
+            if lanes != 1 {
+                return Err(format!("{name} currently supports 64-bit scalar results"));
+            }
             return Ok(Some(extract_bits_i64(ctx, res, rty, args, false)?));
+        }
+        if width < 32 {
+            return Ok(Some(extract_bits_narrow(ctx, res, rty, args, lanes, false)));
+        }
+        if width != 32 {
+            return Err(format!("{name} unsupported result width {width}"));
         }
         return Ok(Some(vec![Instruction::new(
             Op::BitFieldUExtract,
@@ -164,8 +174,18 @@ pub(in crate::passes) fn lower_integer_op(
         )]));
     }
     if name.starts_with("air.extract_bits.s.") && args.len() == 3 {
-        if int_scalar_width(ctx, rty) == Some(64) {
+        let (lanes, width) = validate_extract_bits_shape(ctx, name, rty, args)?;
+        if width == 64 {
+            if lanes != 1 {
+                return Err(format!("{name} currently supports 64-bit scalar results"));
+            }
             return Ok(Some(extract_bits_i64(ctx, res, rty, args, true)?));
+        }
+        if width < 32 {
+            return Ok(Some(extract_bits_narrow(ctx, res, rty, args, lanes, true)));
+        }
+        if width != 32 {
+            return Err(format!("{name} unsupported result width {width}"));
         }
         return Ok(Some(vec![Instruction::new(
             Op::BitFieldSExtract,
@@ -179,8 +199,18 @@ pub(in crate::passes) fn lower_integer_op(
         )]));
     }
     if name.starts_with("air.insert_bits.") && args.len() == 4 {
-        if int_scalar_width(ctx, rty) == Some(64) {
+        let (lanes, width) = validate_insert_bits_shape(ctx, name, rty, args)?;
+        if width == 64 {
+            if lanes != 1 {
+                return Err(format!("{name} currently supports 64-bit scalar results"));
+            }
             return Ok(Some(insert_bits_i64(ctx, res, rty, args)?));
+        }
+        if width < 32 {
+            return Ok(Some(insert_bits_narrow(ctx, res, rty, args, lanes)));
+        }
+        if width != 32 {
+            return Err(format!("{name} unsupported result width {width}"));
         }
         return Ok(Some(vec![Instruction::new(
             Op::BitFieldInsert,
@@ -411,6 +441,148 @@ pub(in crate::passes) fn lower_integer_op(
         ]));
     }
     Ok(None)
+}
+
+fn integer_shape(ctx: &Ctx, ty: Word) -> Option<(u32, u32)> {
+    int_scalar_width(ctx, ty)
+        .map(|width| (1, width))
+        .or_else(|| int_vector_width(ctx, ty))
+}
+
+fn scalar_integer_operand(ctx: &Ctx, value: Word) -> bool {
+    value_result_type(ctx, value).is_some_and(|ty| int_scalar_width(ctx, ty).is_some())
+}
+
+fn validate_extract_bits_shape(
+    ctx: &Ctx,
+    name: &str,
+    rty: Word,
+    args: &[Word],
+) -> Result<(u32, u32), String> {
+    let shape = integer_shape(ctx, rty)
+        .ok_or_else(|| format!("{name} result is not an integer scalar or vector"))?;
+    if value_result_type(ctx, args[0]) != Some(rty) {
+        return Err(format!(
+            "{name} base operand does not match its result type"
+        ));
+    }
+    if !scalar_integer_operand(ctx, args[1]) || !scalar_integer_operand(ctx, args[2]) {
+        return Err(format!("{name} offset and count must be integer scalars"));
+    }
+    Ok(shape)
+}
+
+fn validate_insert_bits_shape(
+    ctx: &Ctx,
+    name: &str,
+    rty: Word,
+    args: &[Word],
+) -> Result<(u32, u32), String> {
+    let shape = integer_shape(ctx, rty)
+        .ok_or_else(|| format!("{name} result is not an integer scalar or vector"))?;
+    if value_result_type(ctx, args[0]) != Some(rty) || value_result_type(ctx, args[1]) != Some(rty)
+    {
+        return Err(format!(
+            "{name} base and insert operands do not match its result type"
+        ));
+    }
+    if !scalar_integer_operand(ctx, args[2]) || !scalar_integer_operand(ctx, args[3]) {
+        return Err(format!("{name} offset and count must be integer scalars"));
+    }
+    Ok(shape)
+}
+
+fn bitfield_widened_type(ctx: &mut Ctx, lanes: u32) -> Word {
+    if lanes == 1 {
+        ctx.ty_uint()
+    } else {
+        ctx.ty_vec_uint(lanes)
+    }
+}
+
+fn extract_bits_narrow(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+    lanes: u32,
+    signed: bool,
+) -> Vec<Instruction> {
+    let widened_type = bitfield_widened_type(ctx, lanes);
+    let widened_base = ctx.module.fresh_id();
+    let extracted = ctx.module.fresh_id();
+    vec![
+        Instruction::new(
+            Op::UConvert,
+            Some(widened_type),
+            Some(widened_base),
+            vec![Operand::IdRef(args[0])],
+        ),
+        Instruction::new(
+            if signed {
+                Op::BitFieldSExtract
+            } else {
+                Op::BitFieldUExtract
+            },
+            Some(widened_type),
+            Some(extracted),
+            vec![
+                Operand::IdRef(widened_base),
+                Operand::IdRef(args[1]),
+                Operand::IdRef(args[2]),
+            ],
+        ),
+        Instruction::new(
+            Op::UConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(extracted)],
+        ),
+    ]
+}
+
+fn insert_bits_narrow(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+    lanes: u32,
+) -> Vec<Instruction> {
+    let widened_type = bitfield_widened_type(ctx, lanes);
+    let widened_base = ctx.module.fresh_id();
+    let widened_insert = ctx.module.fresh_id();
+    let inserted = ctx.module.fresh_id();
+    vec![
+        Instruction::new(
+            Op::UConvert,
+            Some(widened_type),
+            Some(widened_base),
+            vec![Operand::IdRef(args[0])],
+        ),
+        Instruction::new(
+            Op::UConvert,
+            Some(widened_type),
+            Some(widened_insert),
+            vec![Operand::IdRef(args[1])],
+        ),
+        Instruction::new(
+            Op::BitFieldInsert,
+            Some(widened_type),
+            Some(inserted),
+            vec![
+                Operand::IdRef(widened_base),
+                Operand::IdRef(widened_insert),
+                Operand::IdRef(args[2]),
+                Operand::IdRef(args[3]),
+            ],
+        ),
+        Instruction::new(
+            Op::UConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(inserted)],
+        ),
+    ]
 }
 
 /// Vulkan without maintenance9 restricts `OpBitFieldInsert`'s base to 32 bits. Preserve the AIR
@@ -1229,7 +1401,7 @@ pub(in crate::passes) fn lower_one(
     // `air.write_texture_<dim>.<coord>.<texel>(image, coord, texel, lod, access)`: a Metal
     // `texture.write(color, coord)`. Lowers to OpImageWrite on the bound STORAGE image (Sampled=2).
     if name.starts_with("air.write_texture") {
-        return lower_write(ctx, args, v4);
+        return lower_write(ctx, name, args, v4);
     }
     if name.starts_with("air.atomic_fetch_max_explicit_texture_") {
         return lower_atomic_texture_fetch_max(ctx, name, res, rty, args);
@@ -1248,7 +1420,8 @@ pub(in crate::passes) fn lower_one(
     }
     if name.starts_with("air.discard_fragment") {
         // OpKill is a block terminator; but AIR calls it mid-block. Use OpDemoteToHelperInvocation
-        // when available (Vulkan 1.3) so control flow is preserved. Capability added in finalize.
+        // through its extension on the Vulkan 1.2 baseline so control flow is preserved. The
+        // capability and extension declaration are added in finalize.
         return Ok(vec![Instruction::new(
             Op::DemoteToHelperInvocation,
             None,
@@ -1271,6 +1444,9 @@ pub(in crate::passes) fn lower_one(
     }
     if name.starts_with("air.fence_texture") {
         return lower_fence_texture(ctx, name, res, rty, args);
+    }
+    if name == "air.get_descriptor_size_tensor" {
+        return lower_descriptor_size_tensor(ctx, name, res, rty, args);
     }
     // AIR global atomic stores do not return a value. The AIR memory-order and scope operands are
     // ignored for now, matching the existing native/global atomic policy.
@@ -1376,6 +1552,16 @@ pub(in crate::passes) fn lower_one(
     if name == "llvm.assume" {
         return Ok(Vec::new());
     }
+    // AGX `yield` is a convergent execution-scheduling hint used by bounded spin loops. It has no
+    // result or portable SPIR-V operation, and its i16 operand controls only the target scheduler's
+    // backoff duration. Preserve the program-visible memory/control semantics by removing the hint;
+    // the surrounding coherent atomics and loop remain intact.
+    if name == "llvm.agx3.yield" {
+        if args.len() != 1 {
+            return Err(format!("{name} expects 1 operand"));
+        }
+        return Ok(Vec::new());
+    }
     let (res, rty) = match (res, rty) {
         (Some(r), Some(t)) => (r, t),
         _ => return Err(format!("air.* call {name} has no result")),
@@ -1383,6 +1569,9 @@ pub(in crate::passes) fn lower_one(
 
     if name == "llvm.agx3.edgecheck" {
         return lower_agx3_edgecheck(ctx, name, res, rty, args);
+    }
+    if name == "llvm.agx3.igemm.v8i32.i64.i64.v8i32" {
+        return lower_agx3_igemm_16x16_mac(ctx, name, res, rty, args);
     }
     if name.starts_with("air.load.implicit_imageblock.") {
         return lower_implicit_imageblock_load(ctx, name, res, rty, args);
@@ -1399,22 +1588,26 @@ pub(in crate::passes) fn lower_one(
     // derivative (`air.fwidth.f16`, `air.dfdx.f16`, ...) must round-trip through float: FConvert the
     // half arg up to float, take the derivative in float, FConvert the result back to half.
     if name.starts_with("air.dfdx") || name.starts_with("air.fast_dfdx") {
-        return Ok(half_deriv(ctx, Op::DPdx, res, rty, args[0]));
+        let [arg] = args else {
+            return Err(format!("{name} requires one operand"));
+        };
+        return half_deriv(ctx, Op::DPdx, res, rty, *arg);
     }
     if name.starts_with("air.dfdy") || name.starts_with("air.fast_dfdy") {
-        return Ok(half_deriv(ctx, Op::DPdy, res, rty, args[0]));
+        let [arg] = args else {
+            return Err(format!("{name} requires one operand"));
+        };
+        return half_deriv(ctx, Op::DPdy, res, rty, *arg);
     }
     if name.starts_with("air.fwidth") {
-        return Ok(half_deriv(ctx, Op::Fwidth, res, rty, args[0]));
+        let [arg] = args else {
+            return Err(format!("{name} requires one operand"));
+        };
+        return half_deriv(ctx, Op::Fwidth, res, rty, *arg);
     }
     // air.dot -> OpDot
     if name.starts_with("air.dot") && args.len() == 2 {
-        return Ok(vec![Instruction::new(
-            Op::Dot,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(args[0]), Operand::IdRef(args[1])],
-        )]);
+        return lower_dot(ctx, name, res, rty, args);
     }
     // simdgroup_matrix 8x8 family (documented Metal cooperative-matrix API). Emulated per-thread as a
     // 64-lane row-major composite: lane r*8+c = element (r,c). Register-level thread distribution is
@@ -1422,8 +1615,8 @@ pub(in crate::passes) fn lower_one(
     // dimension — so a full-matrix SIMT model is byte-faithful to the documented layout. Dispatched on
     // the stable `air.*` ABI symbol (the allowed name-family exception); the emit decides shape from
     // the operand types, never from a shader identifier.
-    if name.starts_with("air.simdgroup_matrix_8x8_multiply_accumulate.") {
-        return lower_simdgroup_matrix_8x8_mac(ctx, res, rty, args);
+    if let Some(signature) = crate::air_intrinsics::matrix8_intrinsic(name) {
+        return lower_simdgroup_matrix_8x8_mac(ctx, name, signature, res, rty, args);
     }
     if name.starts_with("air.simdgroup_matrix_16x16x16_multiply_accumulate.")
         || name.starts_with("air.simdgroup_matrix_16x16x16_widening_multiply_accumulate.")
@@ -1483,4 +1676,35 @@ pub(in crate::passes) fn lower_one(
         return Ok(insts);
     }
     lower_float_math(ctx, name, res, rty, args)
+}
+
+fn lower_dot(
+    ctx: &Ctx,
+    name: &str,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    if type_def_of(ctx, rty).is_none_or(|definition| definition.class.opcode != Op::TypeFloat) {
+        return Err(format!("{name} result is not a floating-point scalar"));
+    }
+    let Some(left_type) = value_result_type(ctx, args[0]) else {
+        return Err(format!("{name} left operand has no result type"));
+    };
+    let Some(right_type) = value_result_type(ctx, args[1]) else {
+        return Err(format!("{name} right operand has no result type"));
+    };
+    let component_matches = left_type == right_type
+        && vector_type_shape(ctx, left_type).is_some_and(|(component, _)| component == rty);
+    if !component_matches {
+        return Err(format!(
+            "{name} operands are not identical vectors of its result component type"
+        ));
+    }
+    Ok(vec![Instruction::new(
+        Op::Dot,
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(args[0]), Operand::IdRef(args[1])],
+    )])
 }

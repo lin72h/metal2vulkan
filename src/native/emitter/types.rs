@@ -15,19 +15,34 @@ impl Emitter {
     /// preserved by `resolve_type` for value-level masking/const encoding; this only normalizes the
     /// type-id key/build basis.
     fn storage_type(ty: &LlType) -> LlType {
+        Self::storage_type_at_depth(ty, false)
+    }
+
+    fn storage_type_at_depth(ty: &LlType, nested: bool) -> LlType {
         match ty {
+            // Logical SPIR-V cannot allocate a Function variable whose pointee recursively contains
+            // a logical pointer. AIR nevertheless uses by-value aggregates as temporary pointer
+            // carriers. The emitter retains those exact pointers in `aggregate_pointer_values`; the
+            // serialized aggregate therefore owns only a fixed-width payload slot for each nested
+            // pointer. A top-level pointer remains a real SPIR-V pointer.
+            LlType::Ptr(_) if nested => LlType::Int(64),
             LlType::BFloat => LlType::Int(16),
             LlType::Int(bits) => match spirv_int_width(*bits) {
                 Ok(legal) if legal != *bits => LlType::Int(legal),
                 _ => ty.clone(),
             },
             LlType::Vector(elem, lanes) => {
-                LlType::Vector(Box::new(Self::storage_type(elem)), *lanes)
+                LlType::Vector(Box::new(Self::storage_type_at_depth(elem, true)), *lanes)
             }
-            LlType::Array(elem, len) => LlType::Array(Box::new(Self::storage_type(elem)), *len),
-            LlType::Struct(fields) => {
-                LlType::Struct(fields.iter().map(Self::storage_type).collect())
+            LlType::Array(elem, len) => {
+                LlType::Array(Box::new(Self::storage_type_at_depth(elem, true)), *len)
             }
+            LlType::Struct(fields) => LlType::Struct(
+                fields
+                    .iter()
+                    .map(|field| Self::storage_type_at_depth(field, true))
+                    .collect(),
+            ),
             other => other.clone(),
         }
     }
@@ -207,6 +222,9 @@ impl Emitter {
             return Ok(*id);
         }
         let pointee_id = self.type_id(&pointee)?;
+        if storage == StorageClass::PhysicalStorageBuffer {
+            self.ensure_physical_storage_layout(&pointee, pointee_id, true)?;
+        }
         let id = self.fresh();
         self.module.types_global_values.push(Self::inst(
             Op::TypePointer,
@@ -216,6 +234,91 @@ impl Emitter {
         ));
         self.interner.ptr_types.insert(key, id);
         Ok(id)
+    }
+
+    fn ensure_physical_storage_layout(
+        &mut self,
+        ty: &LlType,
+        type_id: Word,
+        root: bool,
+    ) -> Result<(), String> {
+        let ty = Self::storage_type(&self.resolve_type(ty)?);
+        let has_decoration = |annotations: &[Instruction], target, decoration| {
+            annotations.iter().any(|instruction| {
+                instruction.class.opcode == Op::Decorate
+                    && instruction.operands.first() == Some(&Operand::IdRef(target))
+                    && instruction.operands.get(1) == Some(&Operand::Decoration(decoration))
+            })
+        };
+        match &ty {
+            LlType::Struct(fields) => {
+                if root
+                    && !has_decoration(&self.module.annotations, type_id, spirv::Decoration::Block)
+                {
+                    self.module.annotations.push(Self::inst(
+                        Op::Decorate,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(type_id),
+                            Operand::Decoration(spirv::Decoration::Block),
+                        ],
+                    ));
+                }
+                let mut offset = 0u64;
+                for (member, field) in fields.iter().enumerate() {
+                    let (size, align) = self.raw_type_size_align(field)?;
+                    offset = offset.div_ceil(align) * align;
+                    let already_decorated = self.module.annotations.iter().any(|instruction| {
+                        instruction.class.opcode == Op::MemberDecorate
+                            && instruction.operands.first() == Some(&Operand::IdRef(type_id))
+                            && instruction.operands.get(1)
+                                == Some(&Operand::LiteralBit32(member as u32))
+                            && instruction.operands.get(2)
+                                == Some(&Operand::Decoration(spirv::Decoration::Offset))
+                    });
+                    if !already_decorated {
+                        self.module.annotations.push(Self::inst(
+                            Op::MemberDecorate,
+                            None,
+                            None,
+                            vec![
+                                Operand::IdRef(type_id),
+                                Operand::LiteralBit32(member as u32),
+                                Operand::Decoration(spirv::Decoration::Offset),
+                                Operand::LiteralBit32(offset as u32),
+                            ],
+                        ));
+                    }
+                    let field_id = self.type_id(field)?;
+                    self.ensure_physical_storage_layout(field, field_id, false)?;
+                    offset += size;
+                }
+            }
+            LlType::Array(element, _) | LlType::Vector(element, 5..) => {
+                let (stride, _) = self.raw_type_size_align(element)?;
+                if !has_decoration(
+                    &self.module.annotations,
+                    type_id,
+                    spirv::Decoration::ArrayStride,
+                ) {
+                    self.module.annotations.push(Self::inst(
+                        Op::Decorate,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(type_id),
+                            Operand::Decoration(spirv::Decoration::ArrayStride),
+                            Operand::LiteralBit32(stride as u32),
+                        ],
+                    ));
+                }
+                let element_id = self.type_id(element)?;
+                self.ensure_physical_storage_layout(element, element_id, false)?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     pub(super) fn const_uint(&mut self, value: u32) -> Result<Word, String> {
@@ -322,15 +425,33 @@ impl Emitter {
     pub(super) fn value_id(&mut self, value: &LlValue, ty: &LlType) -> Result<Word, String> {
         match value {
             LlValue::Local(name) => {
+                if self.pointer_phi_values.contains(name)
+                    && matches!(self.resolve_type(ty)?, LlType::Ptr(_))
+                {
+                    if let Some(address) = self.raw_offsets.get(name).and_then(|raw| {
+                        (raw.const_off == 0 && raw.dyn_terms.is_empty())
+                            .then_some(raw.device_addr_base)
+                            .flatten()
+                    }) {
+                        return Ok(address);
+                    }
+                }
                 let (id, have_ty) = if let Some((id, have_ty)) = self.values.get(name).cloned() {
                     (id, have_ty)
-                } else if self.construct_tree {
-                    // The construct-tree retry can route a loop latch before the header phi it
-                    // back-edges to.  That is still a dominance-valid SSA use, and `OpPhi` already
-                    // allocates ids for future incoming values via `phi_value_id`; mirror that behavior
-                    // for non-phi uses, but only inside this reject-triggered retry tier.  The finished
-                    // module remains adopted only after `spirv-val`, so an actually non-dominating use
-                    // still falls through.
+                } else if self.construct_tree_active
+                    || self.relooper_feed
+                    || self
+                        .tir_result_types
+                        .get(name)
+                        .is_some_and(|ty| !matches!(ty, LlType::Ptr(_)))
+                {
+                    // CFG construction can serialize a cloned predecessor after a block that uses
+                    // one of its scalar results; construct-tree and relooper plans can do the same
+                    // for source-order latches. Those are dominance-valid SSA uses even when their
+                    // definition block is serialized later. `OpPhi` already allocates ids for future
+                    // incoming values via `phi_value_id`; mirror that behavior for typed scalar uses.
+                    // Pointer values retain their dedicated provenance reservation below. An actually
+                    // non-dominating scalar use still fails the owned CFG check or final validation.
                     let Some(have_ty) = self.tir_result_types.get(name).cloned() else {
                         return Err(format!("native emitter: unknown SSA value {name}"));
                     };
@@ -354,31 +475,40 @@ impl Emitter {
                         ));
                     }
                     if let LlType::Ptr(addrspace) = have {
-                        self.reserve_pointer_phi_provenance(name)?;
-                        let merge_meta = self
-                            .tir_phi_incomings
-                            .get(name)
-                            .cloned()
-                            .map(|incoming| {
-                                self.pointer_merge_meta(
-                                    &incoming.iter().map(|(value, _)| value).collect::<Vec<_>>(),
-                                    &have_ty,
-                                )
-                            })
-                            .transpose()?
-                            .flatten();
-                        self.pointer_storage
-                            .entry(name.clone())
-                            .or_insert(match &merge_meta {
-                                Some(meta) => meta.storage,
-                                None => llvm_pointer_storage(addrspace)?,
-                            });
-                        if !self.pointer_pointees.contains_key(name) {
-                            if let Some(pointee) = merge_meta
-                                .and_then(|meta| meta.pointee)
-                                .or_else(|| self.tir_use_pointees.get(name).cloned())
-                            {
-                                self.pointer_pointees.insert(name.clone(), pointee);
+                        let phi_incoming = self.tir_phi_incomings.get(name).cloned();
+                        let reserved_bda = match phi_incoming.as_ref() {
+                            Some(incoming) => self
+                                .reserve_bda_address_phi(name, incoming, &have_ty)?
+                                .is_some(),
+                            None => false,
+                        };
+                        if !reserved_bda {
+                            self.reserve_pointer_phi_provenance(name)?;
+                            let merge_meta = phi_incoming
+                                .map(|incoming| {
+                                    self.pointer_merge_meta(
+                                        &incoming
+                                            .iter()
+                                            .map(|(value, _)| value)
+                                            .collect::<Vec<_>>(),
+                                        &have_ty,
+                                    )
+                                })
+                                .transpose()?
+                                .flatten();
+                            self.pointer_storage
+                                .entry(name.clone())
+                                .or_insert(match &merge_meta {
+                                    Some(meta) => meta.storage,
+                                    None => llvm_pointer_storage(addrspace)?,
+                                });
+                            if !self.pointer_pointees.contains_key(name) {
+                                if let Some(pointee) = merge_meta
+                                    .and_then(|meta| meta.pointee)
+                                    .or_else(|| self.tir_use_pointees.get(name).cloned())
+                                {
+                                    self.pointer_pointees.insert(name.clone(), pointee);
+                                }
                             }
                         }
                     }

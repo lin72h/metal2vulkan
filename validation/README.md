@@ -23,7 +23,11 @@ Vertex cases author ordinary per-vertex attributes plus a `vertex_observation`. 
 fragment observer routes either rasterized position or one typed user varying into render target
 zero, padding scalars and short vectors to a four-component float, signed-integer, or
 unsigned-integer attachment. Metal and Vulkan consume the same draw and attribute bytes; Vulkan
-uses a negative-height viewport for the same screen-space orientation as Metal.
+uses a negative-height viewport for the same screen-space orientation as Metal. The Metal pipeline
+also derives its required input topology class from the authored draw primitive, including for
+layered rendering. When vertex AIR writes or fragment AIR consumes a render-target array index, the
+Metal oracle uses one-layer array attachments and explicitly activates that layer in the render
+pass.
 
 A vertex entry with no raster position may instead omit `vertex_observation` and all attachments,
 then select a writable shader resource as its output. Both executors run that draw with
@@ -64,11 +68,24 @@ so manifests do not encode backend-specific binding numbers. A fixed embedded ar
 texture per handle at `field_offset + 8 * element`; Metal binds consecutive argument IDs and Vulkan
 binds those same elements into the single reflected descriptor array.
 
+A top-level `array_ref<void>` uses `device_buffer_arrays`: its literal base binding and extent own a
+sorted sparse list of separately allocated device-buffer elements. Unauthored slots are null, and
+`output.kind: device_buffer_array_element` selects one writable element for comparison. Metal
+flattens elements to consecutive native buffer indices; Vulkan fills an address-table allocation
+with the corresponding device addresses.
+
 Top-level `array<texture..., N>` and runtime `array_ref<texture...>` arguments use
 `texture_arrays`. Element order is the AIR handle index. Fixed arrays must author exactly `N`
 elements; runtime arrays author their valid logical prefix. Vulkan binds that prefix into the
 reflected 128-descriptor array and fills the unreachable remainder with the final valid descriptor;
 Metal binds the same prefix to consecutive texture slots.
+
+When function-constant alternatives declare a layered texture and a fixed texture array at the
+same Metal base slot, the selected fixed-array case sets `overrides_texture_at_base: true` on the
+array. The checker accepts that alias only for matching input-only array/non-array shape families,
+formats, and sample counts with an authored function constant; all other slot overlaps remain
+invalid. Metal then binds the declared fixed array last, while Vulkan keeps the alternatives in
+their reflected descriptor locations.
 
 Texture `dimensions` describe spatial extent and array layers. Multisample textures additionally
 carry an explicit `sample_count`; literal bytes are tightly packed by layer, row, texel, then sample.
@@ -86,6 +103,7 @@ read-only StorageBuffer array indexed by `GlobalInvocationId.x`.
 |---|---|
 | `corpus-harvest` | Extract and sanitize AIR into deterministic private source shards |
 | `corpus-index` | Incrementally sync or check the disposable SQLite index (`--rebuild` for recovery) |
+| `corpus-normalize` | Explicitly migrate legacy AIR identities and aligned authored artifacts |
 | `corpus-next` | Select unplanned AIR or record a durable non-evidence review note |
 | `corpus-triage` | Run cached structural, capability, or bounded translation audits over indexed rows |
 | `corpus-case-check` | Strictly validate or install an explicit manifest |
@@ -109,20 +127,29 @@ affected/scanned shard counts. llvm-dis's scratch-path `ModuleID` comment is exc
 AIR identity, so reharvesting identical bitcode is a duplicate rather than a new row. Non-entry AIR
 modules are retained in separate private `local/library-modules` shards, preserving their parent
 library memberships for visible/intersection-function dependency resolution instead of dropping
-them during stage classification.
+them during stage classification. Entry identities likewise retain every parent-library
+membership; direct linkage resolves a symbol only when it identifies one exact module across that
+complete provenance set.
 
 Candidate observations record a build-time SHA-256 fingerprint of the product `Cargo.toml` and
 `src/` tree. `corpus-status` compares that fingerprint instead of retranslating every authored AIR
 row, so status and index refresh do not read source bodies. Any translator-source change makes old
 candidate evidence stale until it is refreshed.
 
+Legacy private shards whose identity predates the current sanitizer are migrated explicitly with
+`cargo run -p metal2vulkan-validation --bin corpus-normalize -- --apply`. The command streams AIR
+through a disk-backed canonicalization pass, unions all parent-library memberships, remaps cases
+and linked-module hashes, discards execution observations whose semantic case identity changed,
+and publishes every aligned shard through the recoverable corpus transaction before atomically
+rebuilding the disposable index. It never runs on ordinary lookup or translation paths.
+
 MoltenVK execution is macOS-only. Native Vulkan execution is currently Linux-only; the Vulkan
 command rejects macOS so one portability-stack run cannot occupy both backend slots.
 
-Run all ordinary validation tests serially:
+Run ordinary validation tests with Cargo's default available parallelism:
 
 ```sh
-cargo test -p metal2vulkan-validation -- --test-threads=1
+cargo test -p metal2vulkan-validation
 ```
 
 GPU execution is machine-specific. Ordinary CI covers identities, strict manifest rejection,

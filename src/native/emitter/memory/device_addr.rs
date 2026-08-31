@@ -119,6 +119,30 @@ impl Emitter {
         Ok(addr)
     }
 
+    pub(in crate::native::emitter) fn materialize_reserved_bda_address(
+        &mut self,
+        name: &str,
+        raw: &RawBufferOffset,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let address_name = bda_address_name(name);
+        let Some((reserved, _)) = self.values.get(&address_name).cloned() else {
+            return Ok(());
+        };
+        let address = self.materialize_device_address(raw, instructions)?;
+        if address != reserved {
+            let address_ty = self.type_id(&LlType::Int(64))?;
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(address_ty),
+                Some(reserved),
+                vec![Operand::IdRef(address)],
+            ));
+        }
+        self.bda_address_values.insert(reserved);
+        Ok(())
+    }
+
     /// The `Aligned` memory-operand value for a PhysicalStorageBuffer load/store of `ty`: the component
     /// (scalar) size in bytes, a power of two (`VUID-StandaloneSpirv-PhysicalStorageBuffer64-06314`
     /// requires the operand to be a power of two and present).

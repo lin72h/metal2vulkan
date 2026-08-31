@@ -14,9 +14,9 @@ pub(in crate::native) fn privatize_cross_arm_edge(blocks: &[BodyBlock]) -> Vec<B
     let mut counter = 1_000_000usize;
     // Round + growth caps: bound the cost. Each round re-runs `analyze` (dominator recompute, super-
     // linear in blocks) and clones up to `MAX_REGION_BLOCKS`, and this driver is re-invoked by
-    // `structured_plan` per retry tier, so an unbounded loop on a big function grinds the cascade. Real
+    // `structured_plan` per construction attempt, so an unbounded loop on a big function is costly. Real
     // cross-arm-edge functions converge in 1-3 rounds (the largest landed win needs <=3); a function that
-    // has not converged in `EDGE_ROUNDS` was not going to structure cleanly and falls to repair, exactly
+    // has not converged in `EDGE_ROUNDS` was not going to structure cleanly and falls to the relooper retry, exactly
     // as before this attempt existed. `structured_emit::CROSS_ARM_EDGE_MAX_BLOCKS` already gates the whole
     // attempt to modest functions, so `cap` is a secondary belt.
     const EDGE_ROUNDS: usize = 8;
@@ -37,8 +37,8 @@ pub(in crate::native) fn privatize_cross_arm_edge(blocks: &[BodyBlock]) -> Vec<B
 }
 
 /// Privatize the TRIVIAL-pass-through cross-arm sub-case as a default-path pre-pass for
-/// [`crate::native::cfg::structured_emit::structured_plan`] (distinct from [`clone_cross_arm_shared`], the gated
-/// failure-retry that does full-closure tail duplication).
+/// [`crate::native::cfg::structured_emit::structured_plan`] (distinct from the legacy full-tail
+/// full-tail form that performs full-closure tail duplication).
 ///
 /// The dominant cross-arm shape (`selection:cross-arm-shared`, the frontier's largest reject class) is
 /// a header `H` whose arm targets a block `A` shared with an ENCLOSING construct's arm, so `H` does not
@@ -63,10 +63,28 @@ pub(in crate::native) fn privatize_cross_arm_edge(blocks: &[BodyBlock]) -> Vec<B
 /// returns the (possibly unchanged) block list. When no trivial cross-arm exists it returns a clone of
 /// the input verbatim (same length), which the caller uses to skip the redundant retry.
 pub(in crate::native) fn privatize_trivial_cross_arm(blocks: &[BodyBlock]) -> Vec<BodyBlock> {
+    privatize_trivial_cross_arm_for_headers(blocks, None)
+}
+
+/// Apply the trivial cross-arm clone only to headers whose finalized emission plans declare a
+/// selection merge. This lets the emitter reuse the same typed clone after merge inference without
+/// transforming a conditional that still has no structurally owned merge.
+#[cfg(test)]
+pub(in crate::native) fn privatize_trivial_cross_arm_for_emitted_headers(
+    blocks: &[BodyBlock],
+    headers: &HashSet<String>,
+) -> Vec<BodyBlock> {
+    privatize_trivial_cross_arm_for_headers(blocks, Some(headers))
+}
+
+fn privatize_trivial_cross_arm_for_headers(
+    blocks: &[BodyBlock],
+    headers: Option<&HashSet<String>>,
+) -> Vec<BodyBlock> {
     let mut cur: Vec<BodyBlock> = blocks.to_vec();
     let mut counter = 0usize;
     for _ in 0..MAX_ROUNDS {
-        let Some((header, arm)) = find_trivial_cross_arm(&cur) else {
+        let Some((header, arm)) = find_trivial_cross_arm_for_headers(&cur, headers) else {
             break;
         };
         let Some(next) = privatize_trivial(&cur, &header, &arm, &mut counter) else {
@@ -81,7 +99,15 @@ pub(in crate::native) fn privatize_trivial_cross_arm(blocks: &[BodyBlock]) -> Ve
 /// single unconditional `br label %S` with no phi and no SSA definition — safe to clone verbatim (no
 /// rename, the clone defines nothing). Reuses the same merge / enclosing-break / loop-header
 /// exclusions as [`find_cross_arm`].
+#[cfg(test)]
 pub(in crate::native) fn find_trivial_cross_arm(blocks: &[BodyBlock]) -> Option<(String, String)> {
+    find_trivial_cross_arm_for_headers(blocks, None)
+}
+
+fn find_trivial_cross_arm_for_headers(
+    blocks: &[BodyBlock],
+    eligible_headers: Option<&HashSet<String>>,
+) -> Option<(String, String)> {
     let forest = analyze(blocks);
     let pidom = post_idom(blocks);
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
@@ -93,6 +119,9 @@ pub(in crate::native) fn find_trivial_cross_arm(blocks: &[BodyBlock]) -> Option<
     let by_name: HashMap<&str, &BodyBlock> = blocks.iter().map(|b| (b.name.as_str(), b)).collect();
     let names: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
     for b in blocks {
+        if eligible_headers.is_some_and(|headers| !headers.contains(&b.name)) {
+            continue;
+        }
         if loop_headers.contains(b.name.as_str()) {
             continue;
         }
@@ -181,7 +210,7 @@ pub(in crate::native) fn arm_defs_safe_to_clone(
         let mentions = b.typed.as_ref().is_some_and(|t| {
             t.insts
                 .iter()
-                .any(|i| !i.is_phi() && i.uses.iter().any(|u| defs.contains(u)))
+                .any(|i| !i.is_phi() && i.uses_any(|use_name| defs.contains(use_name)))
                 || terminator_mentions(&t.terminator)
                     .iter()
                     .any(|u| defs.contains(u))
@@ -244,6 +273,9 @@ pub(in crate::native) fn privatize_trivial(
 
     let by_name: HashMap<&str, &BodyBlock> = blocks.iter().map(|b| (b.name.as_str(), b)).collect();
     let arm_block = by_name.get(arm)?;
+    if cloned_labels_overlap_ssa_values(blocks, &HashSet::from([arm.to_string()])) {
+        return None;
+    }
     // The single successor `S` — the shared reconvergence, kept as the merge.
     let succ = block_successors(arm_block);
     let s = succ.first()?.clone();

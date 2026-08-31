@@ -29,10 +29,8 @@ pub const NO_VERDICT_MARKER: &str = "no verdict";
 /// BVH-builder modules make spirv-val allocate hundreds of MB — so spawning one validator per gate
 /// worker exhausts RAM on a constrained host and the OS OOM-killer terminates spirv-val mid-run. A
 /// signal-kill renders NO verdict; while [`spirv_val`]'s escalating-cap loop retries a NO_VERDICT,
-/// sustained memory pressure keeps EVERY retry killed, so a genuinely-valid module is ultimately
-/// dropped as a false failure and the adopt-if-validates retries fall back to the base emit error —
-/// inflating the measured frontier (observed: `--threads 8` reported 60 where `--threads 1` reports
-/// the true ~15, the extra 45 being false OOM-kills of valid retry modules). Bounding concurrent
+/// sustained memory pressure keeps every attempt killed, so a genuinely valid module is ultimately
+/// reported as a false validation failure. Bounding concurrent
 /// validators keeps peak memory under the ceiling so each one actually renders its verdict, making the
 /// floor a pure function of the bytes regardless of `--threads`. The cap is small by default (3) and
 /// overridable with `METAL2VULKAN_VAL_PAR`; emit stays fully parallel, only the validator spawns serialize.
@@ -164,7 +162,10 @@ fn tool_bin(cmd: &str) -> PathBuf {
 }
 
 /// Vulkan SPIR-V triple the sanitizer rewrites AIR modules to.
-pub const VULKAN_TRIPLE: &str = "spirv-unknown-vulkan1.3";
+/// Baseline Vulkan environment every emitted module must satisfy. Higher-version paths may be
+/// offered separately, but must retain a faithful fallback to this contract.
+pub const VULKAN_TARGET_ENV: &str = "vulkan1.2";
+pub const VULKAN_TRIPLE: &str = "spirv-unknown-vulkan1.2";
 
 /// `src` (.air bitcode or .ll) -> sanitized `.ll` text ready for the native emitter.
 /// Rewrites the target triple to the Vulkan one, preserves the AIR datalayout for executable layout
@@ -262,20 +263,14 @@ pub(crate) fn emit_vulkan_spirv_with_sidecar(
     native::emit_vulkan_spirv_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
 }
 
-/// Like [`emit_vulkan_spirv`], but enables the reject-only construct-tree own-arm candidate. Used only
-/// by an adopt-if-validates retry tier after primary CFG validation failure.
-pub fn emit_vulkan_spirv_construct_tree(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
-    native::emit_vulkan_spirv_construct_tree(san_ll)
-}
-
-pub(crate) fn emit_vulkan_spirv_construct_tree_with_sidecar(
+pub(crate) fn emit_vulkan_spirv_with_outcome(
     san_ll: &str,
     _tmp: &Path,
     kern: Option<&crate::meta::KernMeta>,
     entry_name: Option<&str>,
     buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
-) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_construct_tree_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
+) -> Result<crate::emit_sidecar::EmittedSpirv, crate::emit_sidecar::EmissionFailure> {
+    native::emit_vulkan_spirv_with_outcome(san_ll, kern, entry_name, buffer_layouts)
 }
 
 /// Like [`emit_vulkan_spirv`], but models every device/constant buffer param raw. Used by the R4
@@ -290,13 +285,22 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_sidecar(
     kern: Option<&crate::meta::KernMeta>,
     entry_name: Option<&str>,
     buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+    known_ordinary_plan_rejections: &std::collections::HashSet<String>,
+    known_ownership_plan_rejections: &std::collections::HashSet<String>,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_all_buffers_raw_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
+    native::emit_vulkan_spirv_all_buffers_raw_with_sidecar(
+        san_ll,
+        kern,
+        entry_name,
+        buffer_layouts,
+        known_ordinary_plan_rejections,
+        known_ownership_plan_rejections,
+    )
 }
 
 /// Like [`emit_vulkan_spirv_all_buffers_raw`], but also models threadgroup (`addrspace(3)`) buffer
-/// params raw. The second tier of the R4 ground-truth retry, used only after the device/constant-only
-/// raw retry itself fails spirv-val.
+/// params raw. This broad form is retained for explicit diagnostics; production infers the exact
+/// Workgroup raw scope structurally and never selects this form from a failed candidate.
 pub fn emit_vulkan_spirv_all_buffers_raw_with_workgroup(
     san_ll: &str,
     _tmp: &Path,
@@ -310,12 +314,16 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
     kern: Option<&crate::meta::KernMeta>,
     entry_name: Option<&str>,
     buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+    known_ordinary_plan_rejections: &std::collections::HashSet<String>,
+    known_ownership_plan_rejections: &std::collections::HashSet<String>,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
     native::emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
         san_ll,
         kern,
         entry_name,
         buffer_layouts,
+        known_ordinary_plan_rejections,
+        known_ownership_plan_rejections,
     )
 }
 
@@ -357,117 +365,25 @@ pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
     kern: Option<&crate::meta::KernMeta>,
     entry_name: Option<&str>,
     buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
+    known_ordinary_plan_rejections: &std::collections::HashSet<String>,
+    known_ownership_plan_rejections: &std::collections::HashSet<String>,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
     native::emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
         san_ll,
         kern,
         entry_name,
         buffer_layouts,
+        known_ordinary_plan_rejections,
+        known_ownership_plan_rejections,
     )
 }
 
-pub(crate) fn emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
-    san_ll: &str,
-    _tmp: &Path,
-    kern: Option<&crate::meta::KernMeta>,
-    entry_name: Option<&str>,
-    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
-) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_all_buffers_raw_bda_relooper_feed_with_sidecar(
-        san_ll,
-        kern,
-        entry_name,
-        buffer_layouts,
-    )
-}
-
-/// Like [`emit_vulkan_spirv`], but inlines non-recursive internal helper calls and promotes the
-/// resulting entry-stored non-escaping Function allocas (scalar-replacement + aggregate fold) before
-/// emission. The honest retry tier for the MPS NDArray multi-destination (TopK) `missing pointer
-/// storage` frontier class — a device-buffer-pointer array staged through a Function struct forwarded
-/// by value into a helper. See [`native::emit_vulkan_spirv_inline_sroa`].
-pub fn emit_vulkan_spirv_inline_sroa(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
-    native::emit_vulkan_spirv_inline_sroa(san_ll)
-}
-
-pub(crate) fn emit_vulkan_spirv_inline_sroa_with_sidecar(
-    san_ll: &str,
-    _tmp: &Path,
-    kern: Option<&crate::meta::KernMeta>,
-    entry_name: Option<&str>,
-    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
-) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_inline_sroa_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
-}
-
-pub(crate) fn emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
-    san_ll: &str,
-    selected_pointer: &str,
-    _tmp: &Path,
-    kern: Option<&crate::meta::KernMeta>,
-    entry_name: Option<&str>,
-    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
-) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_pointer_select_consumer_inline_with_sidecar(
-        san_ll,
-        selected_pointer,
-        kern,
-        entry_name,
-        buffer_layouts,
-    )
-}
-
-/// Like [`emit_vulkan_spirv_inline_sroa`], but ALSO models device/constant buffers raw so the byte-
-/// addressed float/uint traffic surviving the inline+SROA collapse becomes Logical-legal word-offset
-/// access. The escalation tier for the TopK multi-destination kernels whose lowered `%10` device-
-/// pointer array feeds typed loads/stores at byte offsets. See
-/// [`native::emit_vulkan_spirv_inline_sroa_raw`].
-pub fn emit_vulkan_spirv_inline_sroa_raw(san_ll: &str, _tmp: &Path) -> Result<Vec<u8>, String> {
-    native::emit_vulkan_spirv_inline_sroa_raw(san_ll)
-}
-
-pub(crate) fn emit_vulkan_spirv_inline_sroa_raw_with_sidecar(
-    san_ll: &str,
-    _tmp: &Path,
-    kern: Option<&crate::meta::KernMeta>,
-    entry_name: Option<&str>,
-    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
-) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_inline_sroa_raw_with_sidecar(san_ll, kern, entry_name, buffer_layouts)
-}
-
-/// Like [`emit_vulkan_spirv_inline_sroa_raw`], but ALSO enables the R2 cross-arm restructure — the
-/// missing composition for the straddle-loop-merge + cross-binding-phi cluster (05), where the raw
-/// model needs a restructured CFG before the following PSB rewrite can dissolve the cross-binding phi.
-/// See [`native::emit_vulkan_spirv_inline_sroa_raw_cfg_restructure`]. Adopt-if-validates at the caller.
-pub fn emit_vulkan_spirv_inline_sroa_raw_cfg_restructure(
-    san_ll: &str,
-    _tmp: &Path,
-) -> Result<Vec<u8>, String> {
-    native::emit_vulkan_spirv_inline_sroa_raw_cfg_restructure(san_ll)
-}
-
-pub(crate) fn emit_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
-    san_ll: &str,
-    _tmp: &Path,
-    kern: Option<&crate::meta::KernMeta>,
-    entry_name: Option<&str>,
-    buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
-) -> Result<crate::emit_sidecar::EmittedSpirv, String> {
-    native::emit_vulkan_spirv_inline_sroa_raw_cfg_restructure_with_sidecar(
-        san_ll,
-        kern,
-        entry_name,
-        buffer_layouts,
-    )
-}
-
-/// Validate SPIR-V bytes against `vulkan1.3`. Returns `Ok(())` if valid.
+/// Validate SPIR-V bytes against the Vulkan 1.2 baseline. Returns `Ok(())` if valid.
 ///
 /// A spirv-val TIMEOUT is NOT a validation verdict — it means the validator was killed (starved by
 /// CPU saturation) before it could decide. Under a parallel gate run, a starved spirv-val on a large
-/// module exceeds the wall-clock cap, and treating that as "invalid" would make the adopt-if-validates
-/// retries DROP a module that is in fact valid (inflating the measured frontier with false failures).
+/// module exceeds the wall-clock cap, and treating that as "invalid" would falsely reject a module
+/// that is in fact valid.
 /// So a timeout is retried with an escalating cap (which also lets contending workers drain); only a
 /// real spirv-val FAILURE (a clean non-zero exit carrying validation errors) is returned. Determinism:
 /// the verdict is a pure function of the bytes, so the retry never changes a real result — it only
@@ -478,7 +394,7 @@ pub fn spirv_val(spv_path: &str) -> Result<(), String> {
     // count never exceeds the limit. Byte-neutral / verdict-neutral: serializing spawns cannot change
     // what spirv-val decides, only whether it lives long enough to decide.
     let _permit = ValPermit::acquire();
-    let args = ["--target-env", "vulkan1.3", spv_path];
+    let args = ["--target-env", VULKAN_TARGET_ENV, spv_path];
     // Escalating wall-clock caps. A spirv-val TIMEOUT is not a verdict (the validator was
     // CPU-starved before deciding); only a clean non-zero exit is a real FAILURE. Critically,
     // an INVALID module fails FAST — spirv-val reports the first error and exits in milliseconds,
@@ -511,6 +427,7 @@ pub fn spirv_val(spv_path: &str) -> Result<(), String> {
 
 /// Validate in-memory SPIR-V bytes by writing them to a temp file and invoking `spirv-val`.
 pub fn spirv_val_bytes(spv: &[u8], tmp: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(tmp).map_err(|e| format!("spirv_val_bytes create tmp: {e}"))?;
     let path = tmp.join("a2v_val.spv");
     std::fs::write(&path, spv).map_err(|e| format!("spirv_val_bytes write: {e}"))?;
     let result = spirv_val(path.to_str().ok_or("spirv_val_bytes: bad tmp path")?);

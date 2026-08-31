@@ -23,7 +23,7 @@ pub(in crate::passes) fn split_explicit_layout_type_aliases(
     split_nested_block_root_aliases(ctx, &block_structs, defs);
 
     // Every aggregate reachable from a Block struct gets explicit Offset/ArrayStride layout when
-    // `decorate_block_struct` recurses. A Function or Workgroup pointer whose pointee graph shares
+    // `decorate_block_struct` recurses. A Function, Private, or Workgroup pointer whose pointee graph shares
     // any of those ids would inherit illegal explicit layout (VUID-StandaloneSpirv-None-10684).
     // Clone the complete path from each unlaid root down to every shared aggregate; cloning only a
     // top-level struct is insufficient when the root is an array or the shared type is nested.
@@ -74,7 +74,7 @@ pub(in crate::passes) fn split_explicit_layout_type_aliases(
         defs.insert(clone_ty, clone_inst);
         defs.insert(clone_ptr_ty, clone_ptr_inst);
     }
-    // Function and Workgroup pointers must never inherit explicit interface layout. Discover roots
+    // Function, Private, and Workgroup pointers must never inherit explicit interface layout. Discover roots
     // from pointer declarations rather than variables: Function variables live inside functions,
     // and intermediate access-chain pointer types can expose a nested shared aggregate even when no
     // variable points to it directly.
@@ -88,7 +88,7 @@ pub(in crate::passes) fn split_explicit_layout_type_aliases(
                 && matches!(
                     inst.operands.first(),
                     Some(Operand::StorageClass(
-                        StorageClass::Workgroup | StorageClass::Function
+                        StorageClass::Workgroup | StorageClass::Function | StorageClass::Private
                     ))
                 )
         })
@@ -136,7 +136,7 @@ pub(in crate::passes) fn split_explicit_layout_type_aliases(
                 && matches!(
                     inst.operands.first(),
                     Some(Operand::StorageClass(
-                        StorageClass::Workgroup | StorageClass::Function
+                        StorageClass::Workgroup | StorageClass::Function | StorageClass::Private
                     ))
                 )
                 && matches!(
@@ -149,7 +149,7 @@ pub(in crate::passes) fn split_explicit_layout_type_aliases(
         .types_global_values
         .splice(insert_at..insert_at, cloned_types);
 
-    // Retarget Function and Workgroup pointer types. Both storage classes require the undecorated
+    // Retarget Function, Private, and Workgroup pointer types. All three storage classes require the undecorated
     // clone, while StorageBuffer keeps the original explicit-layout type. Refresh the structural
     // interner keys because these existing type instructions changed shape in place.
     let mut cache_updates = vec![];
@@ -160,6 +160,23 @@ pub(in crate::passes) fn split_explicit_layout_type_aliases(
         &mut cache_updates,
     );
     repoint_unlaid_pointer_types(&mut ctx.new_globals, &cloned, defs, &mut cache_updates);
+    // Values already present before interface binding belong to the unlaid function/workgroup
+    // graph. Keep their result types in the same clone transaction as the pointer declarations;
+    // otherwise a pre-existing aggregate constant or load remains typed as the now-decorated Block
+    // copy and becomes incompatible with the repointed pointer that consumes it. StorageBuffer
+    // loads are synthesized only after this isolation step and retain the laid-out type.
+    for instruction in ctx
+        .module
+        .all_inst_iter_mut()
+        .chain(ctx.new_globals.iter_mut())
+    {
+        if let Some(replacement) = instruction
+            .result_type
+            .and_then(|result_type| cloned.get(&result_type).copied())
+        {
+            instruction.result_type = Some(replacement);
+        }
+    }
     for (id, old_operands, new_operands) in cache_updates {
         let old_key = (Op::TypePointer, None, old_operands);
         if ctx.struct_cache.get(&old_key) == Some(&id) {
@@ -395,7 +412,10 @@ pub(in crate::passes) fn repoint_unlaid_pointer_types(
             continue;
         };
         let storage = *storage;
-        if !matches!(storage, StorageClass::Workgroup | StorageClass::Function) {
+        if !matches!(
+            storage,
+            StorageClass::Workgroup | StorageClass::Function | StorageClass::Private
+        ) {
             continue;
         }
         let Some(Operand::IdRef(pointee)) = inst.operands.get(1) else {

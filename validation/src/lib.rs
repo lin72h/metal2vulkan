@@ -15,6 +15,7 @@ pub mod jsonl;
 pub mod library_module;
 pub mod literal;
 pub mod metal;
+pub mod normalize;
 pub mod observation;
 pub mod observation_contract;
 pub mod requirement;

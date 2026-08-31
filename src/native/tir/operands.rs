@@ -220,8 +220,8 @@ pub(in crate::native) fn resolve_shuffle_mask(line: &str) -> Option<(u32, Vec<u3
 /// stays TEXT because `convert_dst_type` is a `&mut self` emit-time
 /// method (it may register/convert types); the typed core runs it unchanged. The pointer copy-prop
 /// side-tables stay keyed on the source operand's name (from `src.value`) exactly as before, so no
-/// side-table ownership move is needed. `None` for a non-`bitcast` opcode or a malformed line (the emitter
-/// then reaches the fail-visible unmigrated-opcode `Err`, and the retry cascade owns the raw `.lines` text walk).
+/// side-table ownership move is needed. `None` for a non-`bitcast` opcode or a malformed line makes
+/// the emitter return the fail-visible unmigrated-opcode `Err`.
 pub(in crate::native) fn resolve_bitcast(line: &str, opcode: &str) -> Option<(TypedValue, String)> {
     if opcode != "bitcast" {
         return None;

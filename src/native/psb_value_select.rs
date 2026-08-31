@@ -22,10 +22,12 @@
 //! make the pass BAIL so PSB handles those shapes as today.
 //!
 //! Decides purely from IR structure (storage class, access-chain roots, the cross-binding property,
-//! and replayable consumer class) — never a shader name. Applied in `lib.rs`'s failure-triggered
-//! retry as the first candidate (adopt-if-VALIDATES), so a Logical value-lowered module is preferred
-//! over PSB when it validates, and a module that already validates never reaches it.
+//! and replayable consumer class) — never a shader name. Interface binding invokes it when concrete
+//! descriptor roots first exist, and finalization invokes it after the last resource-query rewrite.
+//! Pointer closures that cannot be replayed in the value domain remain for address-domain
+//! construction.
 
+use super::cfg::{graph::spirv_block_successors_by_label, EmittedDominators};
 use crate::spirv_module::Instruction;
 use crate::spirv_module::Module;
 use crate::spirv_module::Operand;
@@ -34,8 +36,8 @@ use std::collections::{HashMap, HashSet};
 
 /// Hard stop for one store's recursive value replay. A normal dynamic pointer table is a linear
 /// select cascade (the 16-entry AIR table is comfortably below this), while a pathological DAG could
-/// otherwise duplicate its arms exponentially. Declining the rewrite is safe: the retry cascade keeps
-/// the original pointer form available to PSB.
+/// otherwise duplicate its arms exponentially. Declining the rewrite leaves the original pointer
+/// form for address-domain construction.
 const MAX_VALUE_STORE_REPLAY_NODES: usize = 4096;
 
 /// Trace a pointer to its root module-scope buffer variable through a single-base access-chain spine.
@@ -114,9 +116,13 @@ fn discover_value_select(module: &Module) -> Option<Discovery> {
         for block in &function.blocks {
             for inst in &block.instructions {
                 if let Some(rid) = inst.result_id {
-                    value_def.insert(rid, inst.clone());
                     if let Some(rty) = inst.result_type {
-                        value_type.insert(rid, rty);
+                        if ptr_info(rty)
+                            .is_some_and(|(storage, _)| storage == StorageClass::StorageBuffer)
+                        {
+                            value_type.insert(rid, rty);
+                            value_def.insert(rid, inst.clone());
+                        }
                     }
                 }
             }
@@ -905,6 +911,104 @@ pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module
         indices: Vec<Word>,
     }
 
+    fn phi_suffix_indices_dominate_predecessors(
+        ptr: Word,
+        suffix: &[Step],
+        value_def: &HashMap<Word, Instruction>,
+        block_of_label: &HashMap<Word, (usize, usize)>,
+        value_available_at: &dyn Fn(Word, (usize, usize)) -> bool,
+        visited: &mut HashSet<(Word, Vec<(u32, Vec<Word>)>)>,
+    ) -> bool {
+        let key = (
+            ptr,
+            suffix
+                .iter()
+                .map(|step| (step.opcode as u32, step.indices.clone()))
+                .collect::<Vec<_>>(),
+        );
+        if !visited.insert(key) {
+            return true;
+        }
+        let Some(def) = value_def.get(&ptr) else {
+            return true;
+        };
+        match def.class.opcode {
+            Op::Select => def.operands.iter().skip(1).all(|operand| match operand {
+                Operand::IdRef(arm) => phi_suffix_indices_dominate_predecessors(
+                    *arm,
+                    suffix,
+                    value_def,
+                    block_of_label,
+                    value_available_at,
+                    visited,
+                ),
+                _ => false,
+            }),
+            Op::Phi => def.operands.chunks_exact(2).all(|arm| {
+                let (Operand::IdRef(value), Operand::IdRef(predecessor)) = (&arm[0], &arm[1])
+                else {
+                    return false;
+                };
+                let Some(&predecessor_block) = block_of_label.get(predecessor) else {
+                    return false;
+                };
+                suffix
+                    .iter()
+                    .flat_map(|step| &step.indices)
+                    .all(|index| value_available_at(*index, predecessor_block))
+                    && phi_suffix_indices_dominate_predecessors(
+                        *value,
+                        suffix,
+                        value_def,
+                        block_of_label,
+                        value_available_at,
+                        visited,
+                    )
+            }),
+            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
+                let Some(Operand::IdRef(base)) = def.operands.first() else {
+                    return false;
+                };
+                let Some(indices) = def.operands[1..]
+                    .iter()
+                    .map(|operand| match operand {
+                        Operand::IdRef(index) => Some(*index),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    return false;
+                };
+                let mut extended = Vec::with_capacity(suffix.len() + 1);
+                extended.push(Step {
+                    opcode: def.class.opcode,
+                    indices,
+                });
+                extended.extend_from_slice(suffix);
+                phi_suffix_indices_dominate_predecessors(
+                    *base,
+                    &extended,
+                    value_def,
+                    block_of_label,
+                    value_available_at,
+                    visited,
+                )
+            }
+            Op::CopyObject => match def.operands.first() {
+                Some(Operand::IdRef(source)) => phi_suffix_indices_dominate_predecessors(
+                    *source,
+                    suffix,
+                    value_def,
+                    block_of_label,
+                    value_available_at,
+                    visited,
+                ),
+                _ => false,
+            },
+            _ => true,
+        }
+    }
+
     // The pointee type of `ptr` after applying `suffix` (used as the load / replay value type).
     fn replay_type(
         ptr: Word,
@@ -940,6 +1044,48 @@ pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module
             }
         }
     }
+    let block_labels = module
+        .functions
+        .iter()
+        .map(|function| {
+            function
+                .blocks
+                .iter()
+                .map(|block| block.label.as_ref().and_then(|label| label.result_id))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let dominators = module
+        .functions
+        .iter()
+        .zip(&block_labels)
+        .map(|(function, labels)| {
+            let entry = labels.first().copied().flatten()?;
+            let labels = labels.iter().copied().flatten().collect::<Vec<_>>();
+            Some(EmittedDominators::new(
+                entry,
+                &labels,
+                &spirv_block_successors_by_label(&function.blocks),
+            ))
+        })
+        .collect::<Vec<_>>();
+    let value_available_at = |value: Word, target: (usize, usize)| {
+        let Some(&(def_function, def_block_index)) = def_block.get(&value) else {
+            return true;
+        };
+        if def_function != target.0 {
+            return false;
+        }
+        let Some(def_label) = block_labels[def_function][def_block_index] else {
+            return false;
+        };
+        let Some(target_label) = block_labels[target.0][target.1] else {
+            return false;
+        };
+        dominators[target.0]
+            .as_ref()
+            .is_some_and(|tree| tree.dominates(def_label, target_label))
+    };
 
     // Instructions to APPEND (before the terminator) into a given block, keyed by (fi, bi).
     let mut block_appends: HashMap<(usize, usize), Vec<Instruction>> = HashMap::new();
@@ -1579,6 +1725,22 @@ pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module
                 }
             }
         }
+        for ptr in loads
+            .iter()
+            .map(|(_, ptr, _)| ptr)
+            .chain(stores.iter().map(|(_, _, _, ptr, _, _)| ptr))
+        {
+            if !phi_suffix_indices_dominate_predecessors(
+                *ptr,
+                &[],
+                &value_def,
+                &block_of_label,
+                &value_available_at,
+                &mut HashSet::new(),
+            ) {
+                return false;
+            }
+        }
         for (load_res, ptr, _load_block) in loads {
             let mut sink: Vec<Instruction> = Vec::new();
             let replayed = vreplay(
@@ -1642,6 +1804,52 @@ pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module
             stores_to_delete.insert((fi, bi, ii));
             store_replay_insts.insert((fi, bi, ii), sink);
         }
+    }
+    // The recursive replay memo can connect one synthesized value phi to another. Prove the complete
+    // planned phi graph before committing it: every incoming value defined in a function block must
+    // dominate that incoming edge's predecessor. This is a construction check over the transaction's
+    // exact placements, not a post-emit repair; a plan that cannot satisfy SSA is left untouched for
+    // the physical-address lowering.
+    let mut planned_def_block = def_block.clone();
+    for (location, instructions) in block_phis.iter().chain(&block_appends) {
+        for instruction in instructions {
+            if let Some(result) = instruction.result_id {
+                planned_def_block.insert(result, *location);
+            }
+        }
+    }
+    let planned_value_available_at = |value: Word, target: (usize, usize)| {
+        let Some(&(def_function, def_block_index)) = planned_def_block.get(&value) else {
+            return true;
+        };
+        if def_function != target.0 {
+            return false;
+        }
+        let Some(def_label) = block_labels[def_function][def_block_index] else {
+            return false;
+        };
+        let Some(target_label) = block_labels[target.0][target.1] else {
+            return false;
+        };
+        dominators[target.0]
+            .as_ref()
+            .is_some_and(|tree| tree.dominates(def_label, target_label))
+    };
+    let planned_phis_are_valid = block_phis.values().flatten().all(|phi| {
+        phi.operands.len().is_multiple_of(2)
+            && phi.operands.chunks_exact(2).all(|incoming| {
+                let (Operand::IdRef(value), Operand::IdRef(predecessor)) =
+                    (&incoming[0], &incoming[1])
+                else {
+                    return false;
+                };
+                block_of_label
+                    .get(predecessor)
+                    .is_some_and(|location| planned_value_available_at(*value, *location))
+            })
+    });
+    if !planned_phis_are_valid {
+        return false;
     }
     if load_remap.is_empty() && stores_to_delete.is_empty() {
         return false;
@@ -1734,7 +1942,7 @@ fn apply_value_domain_rewrite(
             // Rebuild the block: replace each lowered load/store IN PLACE with its consumer-block
             // replay instructions (so uses that follow a load, and suffix indices computed inline before
             // it, stay dominated), and drop dead closure pointer instructions.
-            let old = std::mem::take(&mut block.instructions);
+            let old = block.instructions.clone();
             let mut rebuilt: Vec<Instruction> = Vec::with_capacity(old.len());
             for (ii, inst) in old.into_iter().enumerate() {
                 let store_site = (fi, bi, ii);
@@ -2405,7 +2613,7 @@ mod tests {
     }
 
     #[test]
-    fn reinterpret_load_through_buffer_select_stays_for_byte_or_psb_retry() {
+    fn reinterpret_load_through_buffer_select_stays_for_byte_or_address_domain_lowering() {
         let mut module = build_two_buffer_select();
         let load = module.functions[0].blocks[0]
             .instructions
@@ -2413,6 +2621,75 @@ mod tests {
             .find(|instruction| instruction.result_id == Some(43))
             .expect("fixture load");
         load.result_type = Some(3);
+        let before = module.assemble();
+
+        assert!(!rewrite_cross_binding_pointer_merges_to_values(&mut module));
+        assert_eq!(module.assemble(), before);
+    }
+
+    #[test]
+    fn pointer_phi_with_post_merge_index_stays_for_psb_lowering() {
+        let mut module = build_two_buffer_select();
+        let mut entry = Block::new();
+        entry.label = Some(inst(Op::Label, None, Some(31), vec![]));
+        entry.instructions = vec![inst(
+            Op::BranchConditional,
+            None,
+            None,
+            vec![Operand::IdRef(16), Operand::IdRef(32), Operand::IdRef(33)],
+        )];
+        let mut true_arm = Block::new();
+        true_arm.label = Some(inst(Op::Label, None, Some(32), vec![]));
+        true_arm.instructions = vec![
+            inst(
+                Op::AccessChain,
+                Some(9),
+                Some(40),
+                vec![Operand::IdRef(20), Operand::IdRef(14), Operand::IdRef(14)],
+            ),
+            inst(Op::Branch, None, None, vec![Operand::IdRef(34)]),
+        ];
+        let mut false_arm = Block::new();
+        false_arm.label = Some(inst(Op::Label, None, Some(33), vec![]));
+        false_arm.instructions = vec![
+            inst(
+                Op::AccessChain,
+                Some(13),
+                Some(41),
+                vec![Operand::IdRef(21), Operand::IdRef(14), Operand::IdRef(14)],
+            ),
+            inst(Op::Branch, None, None, vec![Operand::IdRef(34)]),
+        ];
+        let mut merge = Block::new();
+        merge.label = Some(inst(Op::Label, None, Some(34), vec![]));
+        merge.instructions = vec![
+            inst(
+                Op::Phi,
+                Some(9),
+                Some(42),
+                vec![
+                    Operand::IdRef(40),
+                    Operand::IdRef(32),
+                    Operand::IdRef(41),
+                    Operand::IdRef(33),
+                ],
+            ),
+            inst(
+                Op::IAdd,
+                Some(3),
+                Some(45),
+                vec![Operand::IdRef(14), Operand::IdRef(15)],
+            ),
+            inst(
+                Op::PtrAccessChain,
+                Some(9),
+                Some(43),
+                vec![Operand::IdRef(42), Operand::IdRef(45)],
+            ),
+            inst(Op::Load, Some(4), Some(44), vec![Operand::IdRef(43)]),
+            inst(Op::Return, None, None, vec![]),
+        ];
+        module.functions[0].blocks = vec![entry, true_arm, false_arm, merge];
         let before = module.assemble();
 
         assert!(!rewrite_cross_binding_pointer_merges_to_values(&mut module));

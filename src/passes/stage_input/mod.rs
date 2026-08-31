@@ -11,9 +11,8 @@ mod layout;
 
 pub(in crate::passes) use decorations::*;
 pub(in crate::passes) use kernel_grid::{
-    bind_kernel_grid_push_constant_once, insert_kernel_dispatch_guard,
-    kernel_dispatch_guard_required, materialize_kernel_grid_push_constant,
-    UNSAFE_DISPATCH_BARRIER_ERROR,
+    bind_kernel_grid_push_constant_once, load_kernel_dispatch_component,
+    materialize_kernel_dispatch_field,
 };
 pub(in crate::passes) use kernel_values::const_ivec;
 use kernel_values::{
@@ -133,8 +132,25 @@ pub(in crate::passes) enum ParamBinding {
         out_ty: Word,
         lanes: u32,
     },
-    /// Exact Metal thread grid loaded from the selected per-dispatch push-constant ABI.
-    LoadKernelGridPushConstant { var: Word, out_ty: Word, lanes: u32 },
+    /// One three-component field loaded from the exact-thread dispatch payload.
+    LoadKernelDispatchField {
+        var: Word,
+        first_member: u32,
+        out_ty: Word,
+        lanes: u32,
+    },
+    /// A Vulkan grid builtin plus one three-component base from the dispatch payload.
+    LoadBuiltinPlusKernelDispatchField {
+        builtin_var: Word,
+        dispatch_var: Word,
+        first_member: u32,
+        out_ty: Word,
+        lanes: u32,
+    },
+    /// The pipeline-specialized local size, shaped as the AIR parameter type.
+    LoadKernelLocalSize { out_ty: Word, lanes: u32 },
+    /// The number of 32-wide SIMD groups in the pipeline-specialized local size.
+    LoadKernelSimdgroupsPerThreadgroup { out_ty: Word },
     /// An image variable (texture): param uses are the sample call's texture operand; replace param
     /// id with an OpLoad of the image at use. We record the var + image type + its (Dim, arrayed).
     Image {
@@ -196,6 +212,7 @@ pub(in crate::passes) enum ParamBinding {
         var: Word,
         value_ty: Word,
         index_var: Word,
+        dispatch_var: Option<Word>,
     },
     /// Threadgroup memory (`air.buffer` with `air.address_space = 3`): a fixed Workgroup array.
     WorkgroupMemory { var: Word },
@@ -241,6 +258,7 @@ pub(in crate::passes) enum BufWrap {
     Collapsed {
         block_ty: Word,
         prepend_member0: bool,
+        typed_aliases: Vec<(Word, Word)>,
     },
 }
 
@@ -305,11 +323,15 @@ pub(super) fn build_stage_input(
     let mut front_facing_var: Option<Word> = None;
     let mut primitive_id_var: Option<Word> = None;
     let mut sample_id_var: Option<Word> = None;
+    let mut layer_var: Option<Word> = None;
     let mut tess_coord_var: Option<Word> = None;
     let mut local_invocation_index_var: Option<Word> = None;
     let mut num_workgroups_var: Option<Word> = None;
     let mut global_invocation_id_var: Option<Word> = None;
     let mut kernel_grid_push_constant_var: Option<Word> = None;
+    if let Some(range) = ctx.kernel_dispatch.push_constant_range() {
+        bind_kernel_grid_push_constant_once(ctx, &mut kernel_grid_push_constant_var, range.offset);
+    }
     let stage_input_bindings = kern.map(KernMeta::stage_input_bindings).unwrap_or_default();
 
     for (i, (pid, pty)) in params.iter().enumerate() {
@@ -322,6 +344,7 @@ pub(super) fn build_stage_input(
                 Some(FragRole::PrimitiveId) => s == "primitive_id",
                 Some(FragRole::SampleId) => s == "sample_id",
                 Some(FragRole::ViewportArrayIndex) => s == "viewport_array_index",
+                Some(FragRole::RenderTargetArrayIndex) => s == "render_target_array_index",
                 Some(FragRole::Varying(_)) => s == "varying",
                 Some(FragRole::Texture(_)) => s == "texture",
                 Some(FragRole::Sampler(_)) => s == "sampler",
@@ -515,6 +538,7 @@ pub(super) fn build_stage_input(
                     var,
                     value_ty: *pty,
                     index_var,
+                    dispatch_var: kernel_grid_push_constant_var,
                 },
             ));
             buffer_structs.push((var, block_ty));
@@ -773,6 +797,7 @@ pub(super) fn build_stage_input(
                     .and_then(primitive_air_type_from_name),
                 Stage::Fragment | Stage::Vertex => None,
             };
+            let mut typed_alias_elements = Vec::new();
             let (struct_ty, wrap) = if is_raw_uint_block {
                 let carries_indirect_arguments = kern.is_some_and(|meta| {
                     meta.embedded_arguments
@@ -808,18 +833,42 @@ pub(super) fn build_stage_input(
                             *pid,
                             st,
                         );
-                    if has_struct_chain {
+                    let flat_scalar_element = body_buf_flat_scalar_element_type(
+                        ctx,
+                        &ctx.module.functions[entry_idx],
+                        *pid,
+                    );
+                    if flat_scalar_element.is_some()
+                        || ctx.emit_sidecar.all_device_buffers_raw
+                        || ctx.emit_sidecar.flat_raw_buffer_params.contains(&idx)
+                    {
+                        // A proven `[0, scalar-index]` view must remain the native raw-word block:
+                        // its index can be dynamic, while SPIR-V struct-member indices cannot. The
+                        // same representation is required when the producer selected a raw
+                        // interface because no single storage-compatible aggregate exists. Preserve
+                        // it even if another endpoint happens to match the AIR metadata aggregate.
+                        (
+                            pointee,
+                            BufWrap::Collapsed {
+                                block_ty: pointee,
+                                prepend_member0: !access_chains_include_wrapper_member0(
+                                    &defs,
+                                    &ctx.module.functions[entry_idx],
+                                    *pid,
+                                ),
+                                typed_aliases: vec![],
+                            },
+                        )
+                    } else if has_struct_chain {
                         (
                             st,
                             BufWrap::Collapsed {
                                 block_ty: st,
                                 prepend_member0: false,
+                                typed_aliases: vec![],
                             },
                         )
                     } else {
-                        // Native raw-buffer params are already `{ RuntimeArray<uint> }` transport
-                        // blocks. Use that block directly when the body's chains do not match the AIR
-                        // struct metadata; those are raw word/byte paths, not structured member paths.
                         (pointee, BufWrap::Direct)
                     }
                 } else {
@@ -863,11 +912,16 @@ pub(super) fn build_stage_input(
                 // struct and the body is reading flat `buf[i]` elements.
                 let has_access_chains =
                     buffer_has_access_chains(&ctx.module.functions[entry_idx], *pid);
-                let flat_elem = if pointee_is_scalar {
-                    body_buf_elem_type(ctx, &ctx.module.functions[entry_idx], *pid)
-                } else {
-                    None
-                };
+                let flat_elem = pointee_is_scalar
+                    .then(|| body_buf_elem_type(ctx, &ctx.module.functions[entry_idx], *pid))
+                    .flatten()
+                    .or_else(|| {
+                        body_buf_flat_scalar_element_type(
+                            ctx,
+                            &ctx.module.functions[entry_idx],
+                            *pid,
+                        )
+                    });
                 if !has_access_chains {
                     let rta = ctx.ty_runtime_array(pointee);
                     let st = ctx.module.fresh_id();
@@ -878,6 +932,7 @@ pub(super) fn build_stage_input(
                         BufWrap::Collapsed {
                             block_ty: st,
                             prepend_member0: true,
+                            typed_aliases: vec![],
                         },
                     )
                 } else {
@@ -888,7 +943,28 @@ pub(super) fn build_stage_input(
                             layout_defs.entry(id).or_insert_with(|| g.clone());
                         }
                     }
-                    if buffer_access_chains_match_struct_path(
+                    if let Some(elem) = flat_elem {
+                        let already_has_wrapper_member0 = access_chains_include_wrapper_member0(
+                            &defs,
+                            &ctx.module.functions[entry_idx],
+                            *pid,
+                        );
+                        let rta = ctx.ty_runtime_array(elem);
+                        let st = ctx.module.fresh_id();
+                        ctx.new_globals.push(type_inst(
+                            Op::TypeStruct,
+                            st,
+                            vec![Operand::IdRef(rta)],
+                        ));
+                        (
+                            st,
+                            BufWrap::Collapsed {
+                                block_ty: st,
+                                prepend_member0: !already_has_wrapper_member0,
+                                typed_aliases: vec![],
+                            },
+                        )
+                    } else if buffer_access_chains_match_struct_path(
                         &layout_defs,
                         &ctx.module.functions[entry_idx],
                         *pid,
@@ -899,6 +975,7 @@ pub(super) fn build_stage_input(
                             BufWrap::Collapsed {
                                 block_ty: st,
                                 prepend_member0: false,
+                                typed_aliases: vec![],
                             },
                         )
                     } else if !pointee_is_scalar
@@ -927,32 +1004,13 @@ pub(super) fn build_stage_input(
                                 elem_ty: st,
                             },
                         )
-                    } else if let Some(elem) = flat_elem {
-                        let already_has_wrapper_member0 = access_chains_include_wrapper_member0(
-                            &defs,
-                            &ctx.module.functions[entry_idx],
-                            *pid,
-                        );
-                        let rta = ctx.ty_runtime_array(elem);
-                        let st = ctx.module.fresh_id();
-                        ctx.new_globals.push(type_inst(
-                            Op::TypeStruct,
-                            st,
-                            vec![Operand::IdRef(rta)],
-                        ));
-                        (
-                            st,
-                            BufWrap::Collapsed {
-                                block_ty: st,
-                                prepend_member0: !already_has_wrapper_member0,
-                            },
-                        )
                     } else {
                         (
                             st,
                             BufWrap::Collapsed {
                                 block_ty: st,
                                 prepend_member0: false,
+                                typed_aliases: vec![],
                             },
                         )
                     }
@@ -993,8 +1051,16 @@ pub(super) fn build_stage_input(
                     // RuntimeArray element must match what the body READS, not the mistyped pointee
                     // (else the chain indexes a uchar array but loads a float). Prefer the body's
                     // single-index element type.
-                    let elem = body_buf_elem_type(ctx, &ctx.module.functions[entry_idx], *pid)
-                        .unwrap_or(pointee);
+                    let body_elements =
+                        body_buf_elem_types(ctx, &ctx.module.functions[entry_idx], *pid);
+                    let elem = body_elements.first().copied().unwrap_or(pointee);
+                    if body_elements.len() > 1
+                        && body_elements
+                            .iter()
+                            .all(|element| buffer_typed_alias_element(&defs, *element))
+                    {
+                        typed_alias_elements = body_elements;
+                    }
                     let rta = ctx.ty_runtime_array(elem);
                     let st = ctx.module.fresh_id();
                     ctx.new_globals
@@ -1004,6 +1070,7 @@ pub(super) fn build_stage_input(
                         BufWrap::Collapsed {
                             block_ty: st,
                             prepend_member0: !already_has_wrapper_member0,
+                            typed_aliases: vec![],
                         },
                     )
                 }
@@ -1027,6 +1094,33 @@ pub(super) fn build_stage_input(
             }
             let binding = required_resource_binding(*pid, resource_binding)?;
             decorate_binding(&mut ctx.module, var, descriptor_layout.set, binding);
+            let mut wrap = wrap;
+            if let BufWrap::Collapsed { typed_aliases, .. } = &mut wrap {
+                let primary_element = single_member_array_scalar_elem(ctx, struct_ty);
+                for element in typed_alias_elements
+                    .into_iter()
+                    .filter(|element| Some(*element) != primary_element)
+                {
+                    let runtime_array = ctx.ty_runtime_array(element);
+                    let alias_block = ctx.module.fresh_id();
+                    ctx.new_globals.push(type_inst(
+                        Op::TypeStruct,
+                        alias_block,
+                        vec![Operand::IdRef(runtime_array)],
+                    ));
+                    let alias_pointer = ctx.ty_ptr(StorageClass::StorageBuffer, alias_block);
+                    let alias_var = ctx.module.fresh_id();
+                    ctx.new_globals.push(Instruction::new(
+                        Op::Variable,
+                        Some(alias_pointer),
+                        Some(alias_var),
+                        vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+                    ));
+                    decorate_binding(&mut ctx.module, alias_var, descriptor_layout.set, binding);
+                    typed_aliases.push((element, alias_var));
+                    buffer_structs.push((alias_var, alias_block));
+                }
+            }
             bindings.push((*pid, ParamBinding::Buffer { var, wrap }));
             buffer_structs.push((var, struct_ty));
         } else if role_is("varying") {
@@ -1095,14 +1189,30 @@ pub(super) fn build_stage_input(
                                     .is_some_and(|element| type_int_shape(&defs, element).is_some())
                         }))
                 {
-                    bindings.push((
-                        *pid,
+                    let binding = if matches!(
+                        (
+                            integer_component_width(ctx, interface_ty),
+                            integer_component_width(ctx, *pty)
+                        ),
+                        (Some(interface_bits), Some(param_bits)) if interface_bits == param_bits
+                    ) {
+                        // AIR integers are signless in the function body, while vertex metadata
+                        // carries the fetch format's signedness. Equal-width representations need
+                        // only preserve their bits; SPIR-V forbids integer conversion when the
+                        // component widths are equal.
+                        ParamBinding::LoadVarBitcast {
+                            var,
+                            load_ty: interface_ty,
+                            param_ty: *pty,
+                        }
+                    } else {
                         ParamBinding::LoadVarConverted {
                             var,
                             load_ty: interface_ty,
                             param_ty: *pty,
-                        },
-                    ));
+                        }
+                    };
+                    bindings.push((*pid, binding));
                 } else {
                     bindings.push((
                         *pid,
@@ -1127,6 +1237,22 @@ pub(super) fn build_stage_input(
             decorate_builtin(&mut ctx.module, var, BuiltIn::ViewportIndex);
             decorate_flat(&mut ctx.module, var);
             ctx.interface.push(var);
+            if *pty == uint_ty {
+                bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
+            } else {
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadVarConverted {
+                        var,
+                        load_ty: uint_ty,
+                        param_ty: *pty,
+                    },
+                ));
+            }
+        } else if role_is("render_target_array_index") {
+            let uint_ty = ctx.ty_uint();
+            let var = bind_kernel_uint_builtin_once(ctx, &mut layer_var, BuiltIn::Layer);
+            decorate_flat(&mut ctx.module, var);
             if *pty == uint_ty {
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: uint_ty }));
             } else {
@@ -1263,11 +1389,16 @@ pub(super) fn build_stage_input(
                 ));
             }
         } else if role_is("threads_per_threadgroup") {
-            // Expose the same LocalSize that finalize writes into the GLCompute execution mode.
-            let [x, y, z] = ctx.kernel_local_size;
-            let val = const_kernel_local_size(ctx, &defs, *pty, [x, y, z])
-                .unwrap_or_else(|| ctx.const_uint(x));
-            bindings.push((*pid, ParamBinding::Value { val }));
+            let lanes = scalar_or_vector_component(&defs, *pty)
+                .and_then(|(_, lanes)| lanes)
+                .unwrap_or(1);
+            bindings.push((
+                *pid,
+                ParamBinding::LoadKernelLocalSize {
+                    out_ty: *pty,
+                    lanes,
+                },
+            ));
         } else if role_is("thread_position_in_threadgroup") {
             bind_kernel_uvec3_builtin(
                 ctx,
@@ -1278,32 +1409,44 @@ pub(super) fn build_stage_input(
                 BuiltIn::LocalInvocationId,
             );
         } else if role_is("threadgroups_per_grid") {
-            let var = bind_kernel_v3uint_builtin_once(
-                ctx,
-                &mut num_workgroups_var,
-                BuiltIn::NumWorkgroups,
-            );
-            bind_kernel_uvec3_builtin_var(ctx, &defs, &mut bindings, *pid, *pty, var);
+            if matches!(
+                ctx.kernel_dispatch,
+                crate::reflect::KernelDispatch::Workgroups
+            ) {
+                let var = bind_kernel_v3uint_builtin_once(
+                    ctx,
+                    &mut num_workgroups_var,
+                    BuiltIn::NumWorkgroups,
+                );
+                bind_kernel_uvec3_builtin_var(ctx, &defs, &mut bindings, *pid, *pty, var);
+            } else {
+                let var = kernel_grid_push_constant_var.expect("exact dispatch payload bound");
+                let lanes = scalar_or_vector_component(&defs, *pty)
+                    .and_then(|(_, lanes)| lanes)
+                    .unwrap_or(1);
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadKernelDispatchField {
+                        var,
+                        first_member: 9,
+                        out_ty: *pty,
+                        lanes,
+                    },
+                ));
+            }
         } else if role_is("threads_per_grid") {
             match ctx.kernel_dispatch {
-                crate::reflect::KernelDispatch::ThreadsFixed { threads_per_grid } => {
-                    let val = const_kernel_local_size(ctx, &defs, *pty, threads_per_grid)
-                        .unwrap_or_else(|| ctx.const_uint(threads_per_grid[0]));
-                    bindings.push((*pid, ParamBinding::Value { val }));
-                }
-                crate::reflect::KernelDispatch::ThreadsPushConstant { offset } => {
-                    let var = bind_kernel_grid_push_constant_once(
-                        ctx,
-                        &mut kernel_grid_push_constant_var,
-                        offset,
-                    );
+                crate::reflect::KernelDispatch::ThreadsFixed { .. }
+                | crate::reflect::KernelDispatch::ThreadsDynamic { .. } => {
+                    let var = kernel_grid_push_constant_var.expect("exact dispatch payload bound");
                     let lanes = scalar_or_vector_component(&defs, *pty)
                         .and_then(|(_, lanes)| lanes)
                         .unwrap_or(1);
                     bindings.push((
                         *pid,
-                        ParamBinding::LoadKernelGridPushConstant {
+                        ParamBinding::LoadKernelDispatchField {
                             var,
+                            first_member: 0,
                             out_ty: *pty,
                             lanes,
                         },
@@ -1319,7 +1462,36 @@ pub(super) fn build_stage_input(
                 }
             }
         } else if role_is("threadgroup_position_in_grid") {
-            bind_kernel_uvec3_builtin(ctx, &defs, &mut bindings, *pid, *pty, BuiltIn::WorkgroupId);
+            if matches!(
+                ctx.kernel_dispatch,
+                crate::reflect::KernelDispatch::Workgroups
+            ) {
+                bind_kernel_uvec3_builtin(
+                    ctx,
+                    &defs,
+                    &mut bindings,
+                    *pid,
+                    *pty,
+                    BuiltIn::WorkgroupId,
+                );
+            } else {
+                let builtin_var = bind_kernel_v3uint_builtin(ctx, BuiltIn::WorkgroupId);
+                let dispatch_var =
+                    kernel_grid_push_constant_var.expect("exact dispatch payload bound");
+                let lanes = scalar_or_vector_component(&defs, *pty)
+                    .and_then(|(_, lanes)| lanes)
+                    .unwrap_or(1);
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadBuiltinPlusKernelDispatchField {
+                        builtin_var,
+                        dispatch_var,
+                        first_member: 6,
+                        out_ty: *pty,
+                        lanes,
+                    },
+                ));
+            }
         } else if role_is("thread_index_in_threadgroup") {
             let uint_ty = ctx.ty_uint();
             let var = bind_kernel_uint_builtin_once(
@@ -1408,17 +1580,38 @@ pub(super) fn build_stage_input(
                 .unwrap_or_else(|| ctx.const_uint(32));
             bindings.push((*pid, ParamBinding::Value { val }));
         } else if role_is("simdgroups_per_threadgroup") {
-            let simdgroups = ctx.kernel_local_size[0].div_ceil(32).max(1);
-            let val = const_kernel_local_size(ctx, &defs, *pty, [simdgroups, 1, 1])
-                .unwrap_or_else(|| ctx.const_uint(simdgroups));
-            bindings.push((*pid, ParamBinding::Value { val }));
+            bindings.push((
+                *pid,
+                ParamBinding::LoadKernelSimdgroupsPerThreadgroup { out_ty: *pty },
+            ));
         } else if role_is("thread_position_in_grid") {
             let var = bind_kernel_v3uint_builtin_once(
                 ctx,
                 &mut global_invocation_id_var,
                 BuiltIn::GlobalInvocationId,
             );
-            bind_kernel_uvec3_builtin_var(ctx, &defs, &mut bindings, *pid, *pty, var);
+            if matches!(
+                ctx.kernel_dispatch,
+                crate::reflect::KernelDispatch::Workgroups
+            ) {
+                bind_kernel_uvec3_builtin_var(ctx, &defs, &mut bindings, *pid, *pty, var);
+            } else {
+                let dispatch_var =
+                    kernel_grid_push_constant_var.expect("exact dispatch payload bound");
+                let lanes = scalar_or_vector_component(&defs, *pty)
+                    .and_then(|(_, lanes)| lanes)
+                    .unwrap_or(1);
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadBuiltinPlusKernelDispatchField {
+                        builtin_var: var,
+                        dispatch_var,
+                        first_member: 3,
+                        out_ty: *pty,
+                        lanes,
+                    },
+                ));
+            }
         } else if role_is("position") {
             // FragCoord builtin input (vec4). Often unused; bind a load if the type is vec4, else zero.
             let v4 = ctx.ty_vecf(4);
@@ -1628,22 +1821,6 @@ pub(super) fn build_stage_input(
         }
     }
 
-    let guard_required = kernel_dispatch_guard_required(ctx.kernel_dispatch, ctx.kernel_local_size);
-    if let crate::reflect::KernelDispatch::ThreadsPushConstant { offset } = ctx.kernel_dispatch {
-        if guard_required {
-            bind_kernel_grid_push_constant_once(ctx, &mut kernel_grid_push_constant_var, offset);
-        }
-    }
-    if guard_required {
-        let global_id = bind_kernel_v3uint_builtin_once(
-            ctx,
-            &mut global_invocation_id_var,
-            BuiltIn::GlobalInvocationId,
-        );
-        ctx.kernel_dispatch_global_invocation_id_var = Some(global_id);
-    }
-    ctx.kernel_grid_push_constant_var = kernel_grid_push_constant_var;
-
     // Block-decorate buffer structs + member offsets (std140-ish; we trust the AIR member layout and
     // emit offsets from the struct's member types). The map must include synthesized wrapper structs,
     // so merge new_globals into the type-def view.
@@ -1713,6 +1890,51 @@ pub(super) fn build_stage_input(
     lower_buffer_address_facts(ctx, entry_idx, kern)?;
 
     Ok(defs)
+}
+
+/// Whether a direct buffer element view can own a descriptor alias at the same binding. Storage
+/// buffer descriptors do not encode their element type; retaining one scalar/vector numeric view
+/// per statically typed access lets Logical SPIR-V preserve each pointer type without retyping an
+/// alias after construction. Aggregates stay on the layout-aware reconstruction path.
+fn buffer_typed_alias_element(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
+    let Some(definition) = defs.get(&ty) else {
+        return false;
+    };
+    if matches!(definition.class.opcode, Op::TypeInt | Op::TypeFloat) {
+        return true;
+    }
+    if definition.class.opcode != Op::TypeVector {
+        return false;
+    }
+    let (Some(Operand::IdRef(element)), Some(Operand::LiteralBit32(lanes))) =
+        (definition.operands.first(), definition.operands.get(1))
+    else {
+        return false;
+    };
+    (2..=4).contains(lanes)
+        && defs
+            .get(element)
+            .is_some_and(|element| matches!(element.class.opcode, Op::TypeInt | Op::TypeFloat))
+}
+
+fn integer_component_width(ctx: &Ctx, ty: Word) -> Option<u32> {
+    let definition = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+        .find(|instruction| instruction.result_id == Some(ty))?;
+    match definition.class.opcode {
+        Op::TypeInt => match definition.operands.first() {
+            Some(Operand::LiteralBit32(bits)) => Some(*bits),
+            _ => None,
+        },
+        Op::TypeVector => match definition.operands.first() {
+            Some(Operand::IdRef(element)) => integer_component_width(ctx, *element),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn tess_coord_prefix_lanes(
@@ -1807,8 +2029,9 @@ fn lower_patch_control_point_calls(
     }
 
     for block_idx in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old =
-            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[block_idx].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[block_idx]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len());
         for instruction in old {
             if instruction.class.opcode != Op::FunctionCall
@@ -2078,6 +2301,38 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_buffer_alias_elements_include_numeric_vectors() {
+        let defs = HashMap::from([
+            (
+                1,
+                Instruction::new(
+                    Op::TypeFloat,
+                    None,
+                    Some(1),
+                    vec![Operand::LiteralBit32(32)],
+                ),
+            ),
+            (
+                2,
+                Instruction::new(
+                    Op::TypeVector,
+                    None,
+                    Some(2),
+                    vec![Operand::IdRef(1), Operand::LiteralBit32(4)],
+                ),
+            ),
+            (
+                3,
+                Instruction::new(Op::TypeStruct, None, Some(3), vec![Operand::IdRef(1)]),
+            ),
+        ]);
+
+        assert!(buffer_typed_alias_element(&defs, 1));
+        assert!(buffer_typed_alias_element(&defs, 2));
+        assert!(!buffer_typed_alias_element(&defs, 3));
+    }
     use crate::spirv_module::Instruction;
     use crate::spirv_module::ModuleHeader;
     use crate::spirv_module::Operand;
@@ -2388,12 +2643,21 @@ mod tests {
                     Operand::IdRef(2),
                 ],
             ),
+            ty(
+                Op::TypePointer,
+                7,
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(2),
+                ],
+            ),
             Instruction::new(
                 Op::Variable,
                 Some(4),
                 Some(5),
                 vec![Operand::StorageClass(StorageClass::StorageBuffer)],
             ),
+            Instruction::new(Op::ConstantNull, Some(2), Some(6), vec![]),
         ];
 
         let mut defs = module
@@ -2409,7 +2673,21 @@ mod tests {
             _ => panic!("pointer pointee"),
         };
         assert_ne!(pointee(3), 2, "Function pointer receives undecorated clone");
+        assert_eq!(
+            pointee(7),
+            pointee(3),
+            "Private pointer receives the same undecorated clone"
+        );
         assert_eq!(pointee(4), 2, "StorageBuffer keeps laid-out type");
+        assert_eq!(
+            ctx.module
+                .types_global_values
+                .iter()
+                .find(|instruction| instruction.result_id == Some(6))
+                .and_then(|instruction| instruction.result_type),
+            Some(pointee(3)),
+            "pre-existing aggregate values follow the unlaid Function type"
+        );
     }
 
     #[test]

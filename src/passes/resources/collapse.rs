@@ -30,9 +30,10 @@ pub(in crate::passes) fn apply_bindings(
     // Typed emitter sidecar facts must cross that same root substitution.
     let mut buffer_root_splices: Vec<(Word, Word)> = vec![];
     // Collapsed buffers (RuntimeArray-wrapped arrays + reconstructed structs): (param id, var,
-    // block type, prepend_member0). Rewritten after the generic splices, since their uses need
-    // per-use handling (re-root chains vs route direct loads through the offset-0 leaf).
-    let mut collapsed_buffers: Vec<(Word, Word, Word, bool)> = vec![];
+    // block type, prepend_member0, typed descriptor aliases). Rewritten after the generic splices,
+    // since their uses need per-use handling (re-root chains vs route direct loads through the
+    // offset-0 leaf).
+    let mut collapsed_buffers: Vec<(Word, Word, Word, bool, Vec<(Word, Word)>)> = vec![];
     // Struct buffers with implicit record indexing need per-chain handling because some chains are
     // record-0 member paths while others carry a real record index as their first operand.
     let mut record_array_buffers: Vec<(Word, Word, Word, Word)> = vec![];
@@ -346,10 +347,177 @@ pub(in crate::passes) fn apply_bindings(
                     }
                 }
             }
-            ParamBinding::LoadKernelGridPushConstant { var, out_ty, lanes } => {
-                let value =
-                    materialize_kernel_grid_push_constant(ctx, &mut loads, var, out_ty, lanes)?;
+            ParamBinding::LoadKernelDispatchField {
+                var,
+                first_member,
+                out_ty,
+                lanes,
+            } => {
+                let value = materialize_kernel_dispatch_field(
+                    ctx,
+                    &mut loads,
+                    var,
+                    first_member,
+                    out_ty,
+                    lanes,
+                )?;
                 splices.push((pid, value));
+            }
+            ParamBinding::LoadBuiltinPlusKernelDispatchField {
+                builtin_var,
+                dispatch_var,
+                first_member,
+                out_ty,
+                lanes,
+            } => {
+                let uint_ty = ctx.ty_uint();
+                let v3uint_ty = ctx.ty_vec_uint(3);
+                let builtin = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(v3uint_ty),
+                    Some(builtin),
+                    vec![Operand::IdRef(builtin_var)],
+                ));
+                let mut components = Vec::with_capacity(lanes as usize);
+                for lane in 0..lanes {
+                    let relative = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::CompositeExtract,
+                        Some(uint_ty),
+                        Some(relative),
+                        vec![Operand::IdRef(builtin), Operand::LiteralBit32(lane)],
+                    ));
+                    let base = load_kernel_dispatch_component(
+                        ctx,
+                        &mut loads,
+                        dispatch_var,
+                        first_member + lane,
+                    );
+                    let absolute = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::IAdd,
+                        Some(uint_ty),
+                        Some(absolute),
+                        vec![Operand::IdRef(relative), Operand::IdRef(base)],
+                    ));
+                    components.push(absolute);
+                }
+                let value = if lanes == 1 {
+                    components[0]
+                } else {
+                    let vector_ty = ctx.ty_vec_uint(lanes);
+                    let vector = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::CompositeConstruct,
+                        Some(vector_ty),
+                        Some(vector),
+                        components.into_iter().map(Operand::IdRef).collect(),
+                    ));
+                    vector
+                };
+                let value_ty = if lanes == 1 {
+                    uint_ty
+                } else {
+                    ctx.ty_vec_uint(lanes)
+                };
+                if value_ty == out_ty {
+                    splices.push((pid, value));
+                } else {
+                    let converted = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::UConvert,
+                        Some(out_ty),
+                        Some(converted),
+                        vec![Operand::IdRef(value)],
+                    ));
+                    splices.push((pid, converted));
+                }
+            }
+            ParamBinding::LoadKernelLocalSize { out_ty, lanes } => {
+                let ids = ctx.kernel_local_size_ids();
+                let uint_ty = ctx.ty_uint();
+                let value = if lanes == 1 {
+                    ids[0]
+                } else {
+                    let vector_ty = ctx.ty_vec_uint(lanes);
+                    let vector = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::CompositeConstruct,
+                        Some(vector_ty),
+                        Some(vector),
+                        ids[..lanes as usize]
+                            .iter()
+                            .copied()
+                            .map(Operand::IdRef)
+                            .collect(),
+                    ));
+                    vector
+                };
+                let value_ty = if lanes == 1 {
+                    uint_ty
+                } else {
+                    ctx.ty_vec_uint(lanes)
+                };
+                if value_ty == out_ty {
+                    splices.push((pid, value));
+                } else {
+                    let converted = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::UConvert,
+                        Some(out_ty),
+                        Some(converted),
+                        vec![Operand::IdRef(value)],
+                    ));
+                    splices.push((pid, converted));
+                }
+            }
+            ParamBinding::LoadKernelSimdgroupsPerThreadgroup { out_ty } => {
+                let uint_ty = ctx.ty_uint();
+                let [local_x, local_y, local_z] = ctx.kernel_local_size_ids();
+                let local_xy = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::IMul,
+                    Some(uint_ty),
+                    Some(local_xy),
+                    vec![Operand::IdRef(local_x), Operand::IdRef(local_y)],
+                ));
+                let local_threads = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::IMul,
+                    Some(uint_ty),
+                    Some(local_threads),
+                    vec![Operand::IdRef(local_xy), Operand::IdRef(local_z)],
+                ));
+                let rounded = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::IAdd,
+                    Some(uint_ty),
+                    Some(rounded),
+                    vec![
+                        Operand::IdRef(local_threads),
+                        Operand::IdRef(ctx.const_uint(31)),
+                    ],
+                ));
+                let groups = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::UDiv,
+                    Some(uint_ty),
+                    Some(groups),
+                    vec![Operand::IdRef(rounded), Operand::IdRef(ctx.const_uint(32))],
+                ));
+                if out_ty == uint_ty {
+                    splices.push((pid, groups));
+                } else {
+                    let converted = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::UConvert,
+                        Some(out_ty),
+                        Some(converted),
+                        vec![Operand::IdRef(groups)],
+                    ));
+                    splices.push((pid, converted));
+                }
             }
             ParamBinding::FragmentImageblockProjection {
                 coord_var,
@@ -570,6 +738,7 @@ pub(in crate::passes) fn apply_bindings(
                 splices.push((pid, value));
             }
             ParamBinding::Buffer { var, wrap } => {
+                ctx.bound_buffer_vars.insert(var);
                 buffer_root_splices.push((pid, var));
                 let raw_block_ty = match wrap {
                     BufWrap::Direct => None,
@@ -599,6 +768,7 @@ pub(in crate::passes) fn apply_bindings(
                     BufWrap::Collapsed {
                         block_ty,
                         prepend_member0,
+                        typed_aliases,
                     } => {
                         // The parameter may be carried through a by-value helper aggregate. Collapse
                         // that carrier while the original parameter id is still available, so the
@@ -606,7 +776,13 @@ pub(in crate::passes) fn apply_bindings(
                         // CompositeInsert itself for a direct scalar-leaf use.
                         resource_values.insert(pid);
                         // re-rooted / leaf-routed after splices (see below).
-                        collapsed_buffers.push((pid, var, block_ty, prepend_member0));
+                        collapsed_buffers.push((
+                            pid,
+                            var,
+                            block_ty,
+                            prepend_member0,
+                            typed_aliases,
+                        ));
                     }
                     BufWrap::RecordArray { block_ty, elem_ty } => {
                         resource_values.insert(pid);
@@ -618,6 +794,7 @@ pub(in crate::passes) fn apply_bindings(
                 var,
                 value_ty,
                 index_var,
+                dispatch_var,
             } => {
                 let v3u = ctx.ty_vec_uint(3);
                 let uint_ty = ctx.ty_uint();
@@ -628,13 +805,26 @@ pub(in crate::passes) fn apply_bindings(
                     Some(gid),
                     vec![Operand::IdRef(index_var)],
                 ));
-                let x = ctx.module.fresh_id();
+                let relative_x = ctx.module.fresh_id();
                 loads.push(Instruction::new(
                     Op::CompositeExtract,
                     Some(uint_ty),
-                    Some(x),
+                    Some(relative_x),
                     vec![Operand::IdRef(gid), Operand::LiteralBit32(0)],
                 ));
+                let x = if let Some(dispatch_var) = dispatch_var {
+                    let base = load_kernel_dispatch_component(ctx, &mut loads, dispatch_var, 3);
+                    let absolute = ctx.module.fresh_id();
+                    loads.push(Instruction::new(
+                        Op::IAdd,
+                        Some(uint_ty),
+                        Some(absolute),
+                        vec![Operand::IdRef(relative_x), Operand::IdRef(base)],
+                    ));
+                    absolute
+                } else {
+                    relative_x
+                };
                 let zero = ctx.const_uint(0);
                 let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, value_ty);
                 let ptr = ctx.module.fresh_id();
@@ -691,16 +881,11 @@ pub(in crate::passes) fn apply_bindings(
         }
     }
 
-    // Keep typed pointer-field provenance in step with the interface splice so cross-function helper
-    // recovery can replay texture handles after entry parameters become loaded image ids or descriptor
-    // array variables.
-    ctx.emit_sidecar.remap_ids(
-        &splices
-            .iter()
-            .chain(&buffer_root_splices)
-            .copied()
-            .collect(),
-    );
+    // Keep typed provenance in step with the generic interface splice. Buffer parameters are
+    // remapped below, after resource wrappers have collapsed to those parameters, so the two
+    // substitutions compose to the final descriptor variable instead of leaving a stale root.
+    ctx.emit_sidecar
+        .remap_ids(&splices.iter().copied().collect());
 
     // Splice param ids -> their replacement ids.
     {
@@ -710,11 +895,22 @@ pub(in crate::passes) fn apply_bindings(
         }
     }
     let _ = collapse_resource_wrappers(ctx, entry_idx, &resource_values);
+    ctx.emit_sidecar
+        .remap_ids(&buffer_root_splices.iter().copied().collect());
 
     // Rewrite collapsed-buffer uses. Done after the generic splices (these param ids were deliberately
     // NOT spliced) so each use can be handled by kind.
-    for (pid, var, block_ty, prepend_member0) in collapsed_buffers {
-        rewrite_collapsed_buffer(ctx, entry_idx, pid, var, block_ty, prepend_member0, defs);
+    for (pid, var, block_ty, prepend_member0, typed_aliases) in collapsed_buffers {
+        rewrite_collapsed_buffer(
+            ctx,
+            entry_idx,
+            pid,
+            var,
+            block_ty,
+            prepend_member0,
+            &typed_aliases,
+            defs,
+        );
     }
     for (pid, var, block_ty, elem_ty) in record_array_buffers {
         nested_air_ordinal_roots.extend(rewrite_record_array_buffer(
@@ -739,6 +935,7 @@ pub(in crate::passes) fn apply_bindings(
     // Re-class the access chains derived from unmodeled-pointer Private zero vars (same problem as the
     // buffer chains, but the var/leaf type is Private not StorageBuffer).
     if !zero_pointer_vars.is_empty() {
+        rewrite_private_zero_root_loads(ctx, &zero_pointer_vars);
         rewrite_pointer_storage(
             ctx,
             entry_idx,
@@ -749,7 +946,7 @@ pub(in crate::passes) fn apply_bindings(
         // A function-constant-gated atomic buffer (e.g. an MPS reduce `groupid_counter`) becomes one
         // of these absent Private zero vars; SPIR-V forbids OpAtomic* on Private storage. Private
         // memory is per-invocation, so the atomic is semantically a plain load/op/store — rewrite it.
-        rewrite_private_pointer_atomics(ctx, entry_idx);
+        rewrite_private_pointer_atomics(ctx);
     }
     if !workgroup_vars.is_empty() {
         for var in &workgroup_vars {
@@ -764,8 +961,24 @@ pub(in crate::passes) fn apply_bindings(
         )?;
         rewrite_flattened_workgroup_leaf_accesses(ctx, entry_idx, &workgroup_vars, defs);
     }
-    rewrite_structural_load_result_types(ctx, entry_idx, defs);
+    rewrite_structural_result_types(ctx, entry_idx, defs);
     rewrite_ulong_uint2_memory_reinterprets(ctx, entry_idx, defs);
+    // Parameter substitution is the first point where selected pointer arms acquire their final
+    // concrete descriptor roots and storage classes. Publish the binding transaction's types, then
+    // construct direct mixed-domain loads and complete StorageBuffer merge closures in the value
+    // domain. Pointer phis whose post-merge indices cannot be replayed use their established
+    // address-domain constructor here; the general fallback runs only after all memory legalization.
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    let _ = materialize_interface_selected_loads(&mut ctx.module);
+    let _ = crate::native::construct_interface_cross_binding_pointer_values_module(&mut ctx.module);
+    if let Some(address_table) =
+        crate::native::construct_interface_cross_binding_pointer_phis_module(
+            &mut ctx.module,
+            ctx.descriptor_layout,
+        )
+    {
+        ctx.interface_buffer_var(address_table);
+    }
     Ok(())
 }
 
@@ -1005,8 +1218,9 @@ pub(in crate::passes) fn rewrite_ulong_uint2_memory_reinterprets(
 
     let block_count = ctx.module.functions[entry_idx].blocks.len();
     for block_idx in 0..block_count {
-        let instructions =
-            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[block_idx].instructions);
+        let instructions = ctx.module.functions[entry_idx].blocks[block_idx]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(instructions.len());
         for mut inst in instructions {
             match inst.class.opcode {
@@ -1155,6 +1369,16 @@ pub(in crate::passes) fn collapse_resource_wrappers(
     let mut inserts: HashMap<Word, (Word, Vec<u32>)> = HashMap::new();
     let mut extract_bases: Vec<(Word, Word)> = vec![];
     let mut replacements: Vec<(Word, Word)> = vec![];
+    let mut direct_resource_inserts: Vec<(Word, Word, Word)> = vec![];
+
+    for fact in &ctx.emit_sidecar.aggregate_pointer_values {
+        if resource_values.contains(&fact.source) {
+            paths
+                .entry(fact.aggregate)
+                .or_default()
+                .insert(fact.indices.clone(), fact.source);
+        }
+    }
 
     for blk in &func.blocks {
         for inst in &blk.instructions {
@@ -1171,6 +1395,9 @@ pub(in crate::passes) fn collapse_resource_wrappers(
                     };
                     let path = literal_path(&inst.operands[2..]);
                     inserts.insert(result, (*base, path.clone()));
+                    if resource_values.contains(object) {
+                        direct_resource_inserts.push((result, *base, *object));
+                    }
                     let mut result_paths = paths.get(base).cloned().unwrap_or_default();
                     insert_resource_path(
                         &mut result_paths,
@@ -1297,7 +1524,19 @@ pub(in crate::passes) fn collapse_resource_wrappers(
             }
         }
     }
-    remove_dead_resource_wrapper_ops(ctx, entry_idx);
+    let wrapper_bypasses = direct_resource_inserts
+        .into_iter()
+        .map(|(result, base, _)| (result, base))
+        .collect::<Vec<_>>();
+    if !wrapper_bypasses.is_empty() {
+        let replacement_map = wrapper_bypasses.iter().copied().collect();
+        ctx.emit_sidecar.remap_ids(&replacement_map);
+        let func = &mut ctx.module.functions[entry_idx];
+        for (from, to) in wrapper_bypasses {
+            replace_id_in_function(func, from, to);
+        }
+    }
+    remove_dead_resource_wrapper_ops(ctx, entry_idx, resource_values);
     replacement_roots
 }
 
@@ -1313,6 +1552,7 @@ pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
     ctx: &mut Ctx,
     entry_idx: usize,
 ) -> Result<(), String> {
+    let type_defs = combined_type_defs(ctx, &HashMap::new());
     let resource_values = ctx
         .new_globals
         .iter()
@@ -1325,7 +1565,7 @@ pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
         )
         .filter_map(|inst| {
             let result = inst.result_id?;
-            let ty = type_def_of(ctx, inst.result_type?)?;
+            let ty = type_defs.get(&inst.result_type?)?;
             matches!(
                 ty.class.opcode,
                 Op::TypePointer | Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage
@@ -1367,12 +1607,12 @@ pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
         let Some(base_pointer_type) = value_types.get(&base).copied() else {
             continue;
         };
-        let Some(base_storage) = ptr_storage_from_type(ctx, base_pointer_type) else {
+        let Some(base_storage) = ptr_storage_from_type(&type_defs, base_pointer_type) else {
             continue;
         };
         let Some(result_storage) = inst
             .result_type
-            .and_then(|pointer_type| ptr_storage_from_type(ctx, pointer_type))
+            .and_then(|pointer_type| ptr_storage_from_type(&type_defs, pointer_type))
         else {
             continue;
         };
@@ -1416,8 +1656,11 @@ pub(in crate::passes) fn collapse_late_pointer_and_opaque_wrappers(
     Ok(())
 }
 
-fn ptr_storage_from_type(ctx: &Ctx, pointer_type: Word) -> Option<StorageClass> {
-    let pointer_def = type_def_of(ctx, pointer_type)?;
+fn ptr_storage_from_type(
+    type_defs: &HashMap<Word, Instruction>,
+    pointer_type: Word,
+) -> Option<StorageClass> {
+    let pointer_def = type_defs.get(&pointer_type)?;
     if pointer_def.class.opcode != Op::TypePointer {
         return None;
     }
@@ -1470,9 +1713,55 @@ pub(in crate::passes) fn path_suffix<'a>(path: &'a [u32], prefix: &[u32]) -> Opt
     Some(&path[prefix.len()..])
 }
 
-pub(in crate::passes) fn remove_dead_resource_wrapper_ops(ctx: &mut Ctx, entry_idx: usize) {
+pub(in crate::passes) fn remove_dead_resource_wrapper_ops(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    resource_values: &HashSet<Word>,
+) {
+    let value_types = function_value_types(ctx, entry_idx);
+    let type_defs = combined_type_defs(ctx, &HashMap::new());
+    let resource_projection_roots = resource_values
+        .iter()
+        .copied()
+        .filter(|value| {
+            value_types
+                .get(value)
+                .copied()
+                .is_some_and(|ty| opaque_resource_type(&type_defs, ty, &mut HashSet::new()))
+        })
+        .collect::<HashSet<_>>();
     loop {
         let used = function_used_ids(&ctx.module.functions[entry_idx]);
+        let mut resource_projections = resource_projection_roots.clone();
+        loop {
+            let additions = ctx.module.functions[entry_idx]
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter(|instruction| {
+                    matches!(
+                        instruction.class.opcode,
+                        Op::AccessChain
+                            | Op::InBoundsAccessChain
+                            | Op::PtrAccessChain
+                            | Op::InBoundsPtrAccessChain
+                            | Op::Bitcast
+                            | Op::CopyObject
+                    )
+                })
+                .filter(|instruction| {
+                    instruction.operands.first().is_some_and(
+                        |operand| matches!(operand, Operand::IdRef(id) if resource_projections.contains(id)),
+                    )
+                })
+                .filter_map(|instruction| instruction.result_id)
+                .filter(|result| !resource_projections.contains(result))
+                .collect::<Vec<_>>();
+            if additions.is_empty() {
+                break;
+            }
+            resource_projections.extend(additions);
+        }
         let mut changed = false;
         for blk in &mut ctx.module.functions[entry_idx].blocks {
             let before = blk.instructions.len();
@@ -1481,15 +1770,26 @@ pub(in crate::passes) fn remove_dead_resource_wrapper_ops(ctx: &mut Ctx, entry_i
                     .result_id
                     .map(|id| !used.contains(&id))
                     .unwrap_or(false);
-                !(dead
-                    && matches!(
-                        inst.class.opcode,
-                        Op::CompositeInsert
-                            | Op::CompositeExtract
-                            | Op::CompositeConstruct
-                            | Op::CopyObject
-                            | Op::Undef
-                    ))
+                let replaced_wrapper = matches!(
+                    inst.class.opcode,
+                    Op::CompositeInsert
+                        | Op::CompositeExtract
+                        | Op::CompositeConstruct
+                        | Op::CopyObject
+                        | Op::Undef
+                );
+                let replaced_pointer_projection = inst.result_id.is_some_and(|result| {
+                    resource_projections.contains(&result)
+                        && matches!(
+                            inst.class.opcode,
+                            Op::AccessChain
+                                | Op::InBoundsAccessChain
+                                | Op::PtrAccessChain
+                                | Op::InBoundsPtrAccessChain
+                                | Op::Bitcast
+                        )
+                });
+                !(dead && (replaced_wrapper || replaced_pointer_projection))
             });
             changed |= blk.instructions.len() != before;
         }
@@ -1497,6 +1797,34 @@ pub(in crate::passes) fn remove_dead_resource_wrapper_ops(ctx: &mut Ctx, entry_i
             break;
         }
     }
+}
+
+fn opaque_resource_type(
+    type_defs: &HashMap<Word, Instruction>,
+    ty: Word,
+    seen: &mut HashSet<Word>,
+) -> bool {
+    if !seen.insert(ty) {
+        return false;
+    }
+    let Some(definition) = type_defs.get(&ty) else {
+        return false;
+    };
+    if matches!(
+        definition.class.opcode,
+        Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage
+    ) {
+        return true;
+    }
+    if !matches!(
+        definition.class.opcode,
+        Op::TypePointer | Op::TypeArray | Op::TypeRuntimeArray
+    ) {
+        return false;
+    }
+    definition.operands.iter().any(|operand| {
+        matches!(operand, Operand::IdRef(child) if opaque_resource_type(type_defs, *child, seen))
+    })
 }
 
 pub(in crate::passes) fn function_used_ids(func: &Function) -> HashSet<Word> {
@@ -1586,6 +1914,200 @@ mod tests {
             resource
         );
         assert!(ctx.module.functions[0].blocks[0].instructions.is_empty());
+    }
+
+    #[test]
+    fn binding_does_not_retain_dead_pointer_projections_of_image_values() {
+        let float_ty = 1;
+        let image_ty = 2;
+        let image_pointer_ty = 3;
+        let image_variable = 10;
+        let image = 20;
+        let dead_projection = 21;
+        let unrelated_projection = 22;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values.extend([
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(float_ty),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeImage,
+                None,
+                Some(image_ty),
+                vec![
+                    Operand::IdRef(float_ty),
+                    Operand::Dim(spirv::Dim::Dim2D),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(1),
+                    Operand::ImageFormat(spirv::ImageFormat::Unknown),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(image_pointer_ty),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(image_ty),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(image_pointer_ty),
+                Some(image_variable),
+                vec![Operand::StorageClass(StorageClass::UniformConstant)],
+            ),
+        ]);
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::Load,
+                        Some(image_ty),
+                        Some(image),
+                        vec![Operand::IdRef(image_variable)],
+                    ),
+                    Instruction::new(
+                        Op::InBoundsAccessChain,
+                        Some(3),
+                        Some(dead_projection),
+                        vec![Operand::IdRef(image), Operand::IdRef(30)],
+                    ),
+                    Instruction::new(
+                        Op::InBoundsAccessChain,
+                        Some(3),
+                        Some(unrelated_projection),
+                        vec![Operand::IdRef(31), Operand::IdRef(30)],
+                    ),
+                ],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+
+        remove_dead_resource_wrapper_ops(&mut ctx, 0, &HashSet::from([image]));
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        assert!(instructions
+            .iter()
+            .all(|instruction| instruction.result_id != Some(dead_projection)));
+        assert!(instructions
+            .iter()
+            .any(|instruction| instruction.result_id == Some(unrelated_projection)));
+    }
+
+    #[test]
+    fn binding_does_not_retain_dead_pointer_projections_of_image_arrays() {
+        let float_ty = 1;
+        let uint_ty = 2;
+        let image_ty = 3;
+        let array_length = 4;
+        let image_array_ty = 5;
+        let image_array_pointer_ty = 6;
+        let stale_pointer_ty = 7;
+        let image_array_variable = 10;
+        let stale_projection = 20;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values.extend([
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(float_ty),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(uint_ty),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeImage,
+                None,
+                Some(image_ty),
+                vec![
+                    Operand::IdRef(float_ty),
+                    Operand::Dim(spirv::Dim::Dim2D),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(1),
+                    Operand::ImageFormat(spirv::ImageFormat::Unknown),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(uint_ty),
+                Some(array_length),
+                vec![Operand::LiteralBit32(2)],
+            ),
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(image_array_ty),
+                vec![Operand::IdRef(image_ty), Operand::IdRef(array_length)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(image_array_pointer_ty),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(image_array_ty),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(stale_pointer_ty),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(uint_ty),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(image_array_pointer_ty),
+                Some(image_array_variable),
+                vec![Operand::StorageClass(StorageClass::UniformConstant)],
+            ),
+        ]);
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![Instruction::new(
+                    Op::InBoundsAccessChain,
+                    Some(stale_pointer_ty),
+                    Some(stale_projection),
+                    vec![
+                        Operand::IdRef(image_array_variable),
+                        Operand::IdRef(array_length),
+                        Operand::IdRef(array_length),
+                    ],
+                )],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+
+        remove_dead_resource_wrapper_ops(&mut ctx, 0, &HashSet::from([image_array_variable]));
+
+        assert!(ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .all(|instruction| instruction.result_id != Some(stale_projection)));
     }
 
     #[test]

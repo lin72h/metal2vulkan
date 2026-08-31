@@ -16,9 +16,9 @@
 //! on NOTHING workload-specific: the only seed is "a scalar-int/bool global that is never stored and
 //! has a constant initializer" plus "a scalar global stored exactly once (in the entry block, with no
 //! preceding load) by a constant value" — both of which are the function-constant machinery the
-//! emitter produced, identified structurally. Run as a failure-triggered, adopt-if-VALIDATES retry,
-//! so it is floor-safe: a module that validates on the default path never reaches it, and a
-//! non-validating pruned result is discarded.
+//! emitter produced, identified structurally. Primary construction folds the constant-controlled
+//! CFG without global DCE; raw-CFG construction retains the full DCE form for values that require
+//! it. Neither representation depends on validator wording to decide which CFG is executable.
 
 mod prune;
 pub(in crate::native) use prune::*;
@@ -150,8 +150,25 @@ mod tests {
         let mut func = Function::new();
         func.blocks = vec![entry, then_b, else_b, merge_b];
         m.functions = vec![func];
+        m.debug_names = vec![
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(35),
+                    Operand::LiteralString("dead-arm".into()),
+                ],
+            ),
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![Operand::IdRef(39), Operand::LiteralString("unowned".into())],
+            ),
+        ];
 
-        assert!(prune_constant_branches(&mut m), "expected a fold");
+        crate::native::rewrites::prune_constant_branches_module(&mut m).expect("expected a fold");
         let labels: Vec<Word> = m.functions[0]
             .blocks
             .iter()
@@ -165,6 +182,8 @@ mod tests {
             labels.contains(&34),
             "taken then-arm (%34) should survive: {labels:?}"
         );
+        assert_eq!(m.debug_names.len(), 1);
+        assert_eq!(m.debug_names[0].operands[0], Operand::IdRef(39));
     }
 
     #[test]

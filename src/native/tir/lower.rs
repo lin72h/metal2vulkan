@@ -42,40 +42,41 @@ pub(in crate::native) fn switch_emit(terminator_text: &str) -> Option<LlSwitch> 
 }
 
 /// Compute the `phi` incoming carrier (parsed result type + `(value, predecessor)` pairs) for an
-/// instruction line, or `None` when it is not a parseable `phi`. Computes the post-opcode rest from
-/// `strip_comment(line).trim()` (the rhs after `%r = `, opcode token dropped) and hands
-/// it to `parse_phi` — the same derivation `emit_phi_resolved` consumes from the carrier.
-pub(in crate::native) fn phi_incoming_of(
+/// instruction line, together with the exact `parse_phi` refusal when that carrier is absent.
+/// Computes the post-opcode rest from `strip_comment(line).trim()` (the rhs after `%r = `, opcode
+/// token dropped) and hands it to `parse_phi` — the same derivation `emit_phi_resolved` consumes
+/// from the carrier. The refusal is diagnostics-only: it never changes parsing or lowering.
+pub(in crate::native) fn phi_incoming_parse(
     line: &str,
 ) -> (Option<(LlType, Vec<(LlValue, String)>)>, Option<String>) {
     let Some(rhs) = strip_comment(line)
         .trim()
         .split_once(" = ")
-        .map(|pair| pair.1.trim())
+        .map(|s| s.1.trim())
     else {
         return (None, None);
     };
     let opcode = rhs.split_whitespace().next().unwrap_or("");
-    if opcode != "phi" {
-        return (None, None);
-    }
     let rest = rhs[opcode.len()..].trim_start();
     match parse_phi(rest) {
-        Ok(incoming) => (Some(incoming), None),
+        Ok(parsed) => (Some(parsed), None),
         Err(error) => (None, Some(error)),
     }
 }
 
 /// Collect every `getelementptr` result (`%r = getelementptr …`) keyed by SSA name → parsed `LlGep`.
 /// Sourced entirely from the typed graph: a `getelementptr` instruction carries its full parsed
-/// `LlGep` on `TirInst.gep` (set at build via the same `parse_gep` this walk used to re-lex from text)
+/// `LlGep` on `TirInst.gep()` (set at build via the same `parse_gep` this walk used to re-lex from text)
 /// and its result name on `TirInst.result`. Byte-identical to the retired text-walk by construction —
 /// same instructions, same `parse_gep` output, same `%name` keys — with no `inst.text` read.
-pub(in crate::native) fn collect_forward_geps(blocks: &[TirBlock]) -> HashMap<String, LlGep> {
+pub(in crate::native) fn collect_forward_geps<B: AsRef<TirBlock>>(
+    blocks: &[B],
+) -> HashMap<String, LlGep> {
     let mut geps = HashMap::new();
     for block in blocks {
+        let block = block.as_ref();
         for inst in &block.insts {
-            if let (Some(name), Some(gep)) = (&inst.result, &inst.gep) {
+            if let (Some(name), Some(gep)) = (&inst.result, &inst.gep()) {
                 geps.insert(name.clone(), (**gep).clone());
             }
         }
@@ -88,24 +89,32 @@ pub(in crate::native) fn collect_forward_geps(blocks: &[TirBlock]) -> HashMap<St
 /// typed graph: a `phi ptr` is `opcode == "phi"` with a pointer `result_ty` (both the plain `ptr` and
 /// the `ptr addrspace(N)` forms resolve to `LlType::Ptr`, and a vector-of-ptr phi resolves to
 /// `Vector`, so this is exactly the old `phi ptr ` / `phi ptr addrspace(` text predicate), and the
-/// incoming VALUES are the phi's `operands` (labels are control-flow edges the tir already drops, so
-/// every `Value` operand is an incoming `%name` — the dual of the old `parse_phi_incoming_values` +
-/// `LlValue::Local` filter). Byte-identical to the retired text-walk by construction.
-pub(in crate::native) fn collect_pointer_phi_sets(
-    blocks: &[TirBlock],
+/// incoming VALUES come from the canonical phi carrier (labels remain alongside them as control-flow
+/// edges). Byte-identical to the retired `parse_phi_incoming_values` + `LlValue::Local` filter.
+pub(in crate::native) fn collect_pointer_phi_sets<B: AsRef<TirBlock>>(
+    blocks: &[B],
 ) -> (HashSet<String>, HashSet<String>) {
     let mut results = HashSet::new();
     let mut incoming = HashSet::new();
     for block in blocks {
+        let block = block.as_ref();
         for inst in &block.insts {
             if inst.opcode != "phi" || !matches!(inst.result_ty, Some(LlType::Ptr(_))) {
                 continue;
             }
             let Some(name) = &inst.result else { continue };
             results.insert(name.clone());
-            for operand in &inst.operands {
-                if let TirOperand::Value { name, .. } = operand {
-                    incoming.insert(name.clone());
+            if let Some(values) = inst.phi_values() {
+                for value in values {
+                    if let LlValue::Local(name) = value {
+                        incoming.insert(name.clone());
+                    }
+                }
+            } else {
+                for operand in &inst.operands {
+                    if let TirOperand::Value { name, .. } = operand {
+                        incoming.insert(name.clone());
+                    }
                 }
             }
         }
@@ -138,29 +147,6 @@ pub(in crate::native) fn build(
     let mut cur_term: Option<TirTerminator> = None;
     let mut cur_term_text = String::new();
 
-    let flush = |label: &mut String,
-                 insts: &mut Vec<TirInst>,
-                 term: &mut Option<TirTerminator>,
-                 term_text: &mut String,
-                 blocks: &mut Vec<TirBlock>|
-     -> Result<(), String> {
-        if insts.is_empty() && term.is_none() && blocks.is_empty() {
-            return Ok(()); // nothing accumulated yet (file starts with a label)
-        }
-        let terminator = term
-            .take()
-            .ok_or_else(|| format!("native tir: block {label} has no terminator"))?;
-        let terminator_text = std::mem::take(term_text);
-        blocks.push(TirBlock {
-            label: std::mem::take(label),
-            insts: std::mem::take(insts),
-            terminator,
-            ret: ret_emit(&terminator_text),
-            switch: switch_emit(&terminator_text),
-        });
-        Ok(())
-    };
-
     for raw in body {
         let line = raw.trim();
         if line.is_empty() {
@@ -169,13 +155,15 @@ pub(in crate::native) fn build(
         // A `label:` header opens a new block (the previous one must already be terminated).
         if let Some(label) = parse_block_label(line) {
             if cur_term.is_some() || !cur_insts.is_empty() {
-                flush(
-                    &mut cur_label,
-                    &mut cur_insts,
-                    &mut cur_term,
-                    &mut cur_term_text,
-                    &mut blocks,
-                )?;
+                blocks.push(finish_flat_block(
+                    cur_label,
+                    cur_insts,
+                    cur_term,
+                    cur_term_text,
+                )?);
+                cur_insts = Vec::new();
+                cur_term = None;
+                cur_term_text = String::new();
             }
             cur_label = label;
             continue;
@@ -193,19 +181,20 @@ pub(in crate::native) fn build(
             &mut cur_insts,
         );
     }
-    flush(
-        &mut cur_label,
-        &mut cur_insts,
-        &mut cur_term,
-        &mut cur_term_text,
-        &mut blocks,
-    )?;
+    if !cur_insts.is_empty() || cur_term.is_some() || !blocks.is_empty() {
+        blocks.push(finish_flat_block(
+            cur_label,
+            cur_insts,
+            cur_term,
+            cur_term_text,
+        )?);
+    }
 
     let (use_pointees, _, byte_view_pointers) = infer_use_pointees(&blocks);
     let (pointer_phi_results, pointer_phi_incoming) = collect_pointer_phi_sets(&blocks);
     let forward_geps = collect_forward_geps(&blocks);
     Ok(TirFunction {
-        blocks,
+        blocks: blocks.into_iter().map(std::sync::Arc::new).collect(),
         value_types,
         pointer_pointees,
         use_pointees,
@@ -213,6 +202,23 @@ pub(in crate::native) fn build(
         pointer_phi_results,
         pointer_phi_incoming,
         forward_geps,
+    })
+}
+
+#[cfg(test)]
+fn finish_flat_block(
+    label: String,
+    insts: Vec<TirInst>,
+    term: Option<TirTerminator>,
+    terminator_text: String,
+) -> Result<TirBlock, String> {
+    let terminator = term.ok_or_else(|| format!("native tir: block {label} has no terminator"))?;
+    Ok(TirBlock {
+        label,
+        insts,
+        terminator,
+        ret: ret_emit(&terminator_text),
+        switch: switch_emit(&terminator_text),
     })
 }
 
@@ -230,7 +236,7 @@ pub(in crate::native) fn build(
 pub(in crate::native) fn build_from_blocks(
     blocks: &[crate::native::cfg::BodyBlock],
 ) -> Result<TirFunction, String> {
-    let mut tir_blocks: Vec<TirBlock> = Vec::new();
+    let mut tir_blocks: Vec<std::sync::Arc<TirBlock>> = Vec::new();
     let mut value_types: HashMap<String, LlType> = HashMap::new();
     // Diagnostic-only accumulator, rebuilt from each carrier inst's `pointer_pointee` field (stamped at
     // lower time by the same `resolve_gep_pointee` the flat `build` ran) — byte-identical to `build`'s
@@ -255,11 +261,11 @@ pub(in crate::native) fn build_from_blocks(
             if let (Some(name), Some(ty)) = (&inst.result, &inst.result_ty) {
                 value_types.insert(name.clone(), ty.clone());
             }
-            if let (Some(name), Some(pointee)) = (&inst.result, &inst.pointer_pointee) {
+            if let (Some(name), Some(pointee)) = (&inst.result, &inst.pointer_pointee()) {
                 pointer_pointees.insert(name.clone(), pointee.clone());
             }
         }
-        tir_blocks.push((**carrier).clone());
+        tir_blocks.push(std::sync::Arc::clone(carrier));
     }
 
     let (use_pointees, _, byte_view_pointers) = infer_use_pointees(&tir_blocks);
@@ -283,9 +289,9 @@ pub(in crate::native) fn build_from_blocks(
 /// across all blocks). Errs on a block with no terminator. Shared by [`build_from_blocks`] and the
 /// `BodyBlock.typed` carrier population, so a carrier lowered here is byte-identical to the re-parse by
 /// construction — the same `parse_terminator` / `push_inst_line` / `ret_emit` / `switch_emit`.
-pub(in crate::native) fn lower_block(
+pub(in crate::native) fn lower_block<S: AsRef<str>>(
     name: &str,
-    lines: &[String],
+    lines: &[S],
     named_types: &HashMap<String, LlType>,
     value_types: &mut HashMap<String, LlType>,
     pointer_pointees: &mut HashMap<String, LlType>,
@@ -294,7 +300,7 @@ pub(in crate::native) fn lower_block(
     let mut cur_term: Option<TirTerminator> = None;
     let mut cur_term_text = String::new();
     for raw in lines {
-        let line = raw.trim();
+        let line = raw.as_ref().trim();
         if line.is_empty() {
             continue;
         }
@@ -328,9 +334,9 @@ pub(in crate::native) fn lower_block(
 /// re-parse by construction (the shared [`lower_block`]). Pass the module `named_types` when the lines
 /// can carry an `extractvalue` into a named struct; `&HashMap::new()` is exact for purely synthetic
 /// `br`/`ret`/`icmp`/`phi` blocks (which never do).
-pub(in crate::native) fn lower_block_carrier(
+pub(in crate::native) fn lower_block_carrier<S: AsRef<str>>(
     name: &str,
-    lines: &[String],
+    lines: &[S],
     named_types: &HashMap<String, LlType>,
 ) -> Option<TirBlock> {
     let mut value_types = HashMap::new();
@@ -456,28 +462,42 @@ pub(in crate::native) fn push_inst_line(
         }
         None => (result_name(line), None),
     };
-    let uses = instruction_uses(line, result.as_deref());
-    let operands = resolve_operands(line);
+    let mut operands = resolve_operands(line);
     let cmp_predicate = resolve_cmp_predicate(line);
     let mem_align = resolve_mem_align(line);
     let gep = resolve_gep(line).map(Box::new);
-    let gep_source_ty = gep.as_ref().map(|g| g.source_ty.clone());
     let call = resolve_call(line).map(Box::new);
     let opcode = rhs_of(line)
         .split_whitespace()
         .next()
         .unwrap_or("")
         .to_string();
+    let fast_math = rhs_of(line).split_whitespace().nth(1) == Some("fast");
     let alloca_ty = if opcode == "alloca" {
         resolve_alloca_ty(line)
     } else {
         None
     };
     let (phi_incoming, phi_parse_error) = if opcode == "phi" {
-        phi_incoming_of(line)
+        phi_incoming_parse(line)
     } else {
         (None, None)
     };
+    // A parsed phi's canonical `(value, predecessor)` carrier already contains the typed incoming
+    // values consumed by emission and CFG edits. Keeping the parallel `TirOperand` copies would retain
+    // every (often aggregate) value twice on phi-heavy modules. Preserve the unresolved placeholder
+    // only for malformed forms whose canonical parse failed, so they still fall back honestly.
+    if phi_incoming.is_some() {
+        operands.clear();
+    }
+    // Typed operands are the canonical def/use carrier whenever the complete operand shape resolved.
+    // Retain the textual scan only for an unresolved shape, where dropping it could hide an edge from
+    // structurization or diagnostics. Parsed phis derive uses from their canonical incoming values.
+    let uses = (phi_incoming.is_none()
+        && operands
+            .iter()
+            .any(|operand| matches!(operand, TirOperand::Unresolved)))
+    .then(|| instruction_uses(line, result.as_deref()));
     let aggregate_indices = resolve_aggregate_indices(line, &opcode);
     // Diagnostics-only strip-commented line for the element-op families whose resolved cores embed the
     // raw line in post-resolution SEMANTIC errors; read only by that error formatting (never re-parsed).
@@ -500,12 +520,16 @@ pub(in crate::native) fn push_inst_line(
     // off the carrier instead of re-lexing the body text (F-track / T5). Each mirrors the exact expression
     // the inference used, computed once here at lower time; byte-identical by construction, BC-refereed.
     let identity_ptr_bitcast = resolve_identity_ptr_bitcast(line);
-    let phi_incoming_values = resolve_phi_incoming_values(line, &opcode);
+    let phi_incoming_values = if opcode == "phi" && phi_incoming.is_none() {
+        resolve_phi_incoming_values(line, &opcode)
+    } else {
+        None
+    };
     let select_arms = resolve_select_arms(line, &opcode).map(Box::new);
     let load = resolve_load_inst(line, &opcode).map(Box::new);
     let store = resolve_store(line, &opcode).map(Box::new);
     let alias_call = resolve_alias_call(line).map(Box::new);
-    let emit_scan_call = resolve_emit_scan_call(line).map(Box::new);
+    let emit_scan_call = resolve_emit_scan_call(line);
     // For a result-LESS call/tail (a VOID call), the strip-commented line the void-call emitter needs for
     // the is_ignored gate + the non-void diagnostic (a value call carries a result and rides `call`).
     let void_call_line = if matches!(opcode.as_str(), "call" | "tail") && result.is_none() {
@@ -523,34 +547,64 @@ pub(in crate::native) fn push_inst_line(
         } else {
             None
         };
+    let data = match opcode.as_str() {
+        "icmp" | "fcmp" => TirInstData::Compare {
+            predicate: cmp_predicate,
+            rest: icmp_rest,
+        },
+        "load" | "store" => TirInstData::Memory {
+            align: mem_align,
+            load,
+            store,
+        },
+        "getelementptr" => TirInstData::Gep {
+            parsed: gep,
+            pointee: pointer_pointee,
+        },
+        "call" | "tail" | "musttail" | "notail" => {
+            let alias_from_parsed = alias_call.is_some() && call.is_some();
+            let alias_override = (!alias_from_parsed).then_some(alias_call).flatten();
+            let emit_scan = match emit_scan_call {
+                Some(Ok(_)) if call.is_some() => EmitScanData::Parsed,
+                Some(result) => EmitScanData::Owned(Box::new(result)),
+                None => EmitScanData::None,
+            };
+            TirInstData::Call {
+                parsed: call,
+                void_line: void_call_line,
+                value_error: value_call_error,
+                alias_from_parsed,
+                alias_override,
+                emit_scan,
+            }
+        }
+        "alloca" => TirInstData::Alloca(alloca_ty),
+        "phi" => TirInstData::Phi {
+            incoming: phi_incoming,
+            incoming_values: phi_incoming_values,
+            parse_error: phi_parse_error,
+        },
+        "extractvalue" | "insertvalue" => TirInstData::Aggregate(aggregate_indices),
+        "extractelement" | "insertelement" | "shufflevector" => TirInstData::Element {
+            diag_line,
+            shuffle_mask,
+        },
+        "bitcast" => TirInstData::Bitcast {
+            destination: bitcast.map(|parsed| parsed.1),
+            identity: identity_ptr_bitcast.is_some(),
+        },
+        "select" => TirInstData::Select(select_arms),
+        _ => TirInstData::Plain,
+    };
     cur_insts.push(TirInst {
         result,
         result_ty,
         uses,
         operands,
-        cmp_predicate,
-        mem_align,
-        gep_source_ty,
-        gep,
-        call,
-        opcode,
-        alloca_ty,
-        phi_incoming,
-        phi_parse_error,
-        aggregate_indices,
-        diag_line,
-        shuffle_mask,
-        void_call_line,
-        value_call_error,
-        bitcast,
-        icmp_rest,
-        pointer_pointee,
-        identity_ptr_bitcast,
-        phi_incoming_values,
-        select_arms,
-        load,
-        store,
-        alias_call,
-        emit_scan_call,
+        opcode: TirOpcode::new(opcode),
+        data: Box::new(TirInstDetails {
+            fast_math,
+            payload: data,
+        }),
     });
 }

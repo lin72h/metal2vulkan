@@ -12,14 +12,9 @@
 //! Because `R` is the FULL forward closure of `A`, every use of a value defined inside `R` is itself
 //! inside `R` (uses are reachable from their def) — so the clone needs **no exit-phi synthesis**: each
 //! copy is self-contained. The transform fires only when `R` is **single-entry** (every block in
-//! `R\{A}` has all its predecessors inside `R`); otherwise a deeper block is shared too and a single
-//! clone would just move the sharing (the cascade the prior session proved necessary — left to a
-//! future increment).
-//!
-//! It is NOT wired into the default emission path. It is reached only via the failure-triggered
-//! `inline_sroa_raw_cfg_restructure` retry tier (adopt-if-validates, mirroring the R4 raw retry), so a
-//! banked/passing case — which `structured_plan` admits on the default path — never reaches it and the
-//! floor is byte-identical by construction.
+//! `R\{A}` has all its predecessors inside `R`); otherwise the broader region and construct-tree
+//! builders own the shape. These transformations are selected from CFG ownership facts before the
+//! module is serialized.
 
 use super::blocks::{block_successors, conditional_branch_targets};
 use super::loopforest::{analyze, post_idom, selection_merges};
@@ -394,6 +389,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clone_declines_label_that_is_also_an_ssa_operand() {
+        let blocks = vec![
+            blk(
+                "%entry",
+                &["%value = add i32 %shared, 1", "br label %shared"],
+            ),
+            blk("%shared", &["ret void"]),
+        ];
+        assert!(cloned_labels_overlap_ssa_values(
+            &blocks,
+            &HashSet::from(["%shared".to_string()])
+        ));
+    }
+
     /// A shared arm whose def is used in a BODY computation past the arm (`%d` in `%merge`'s
     /// `mul`, not a phi incoming) is still EXCLUDED: the split removes the arm's domination of the
     /// successor, so the body use is undefined on the clone edge (broken SSA — the `000ca89f`
@@ -734,6 +744,123 @@ mod tests {
         );
     }
 
+    /// Adjacent literal cases are the one case-to-case edge SPIR-V permits. Cloning the middle case
+    /// would leave its private prefix entering the third case non-adjacently, converting a valid
+    /// compact fallthrough chain into an invalid construct.
+    #[test]
+    fn privatize_switch_case_continuations_preserves_adjacent_case_chain() {
+        let blocks = vec![
+            blk("entry", &["br label %sw"]),
+            blk(
+                "sw",
+                &["switch i32 %x, label %merge [ i32 3, label %a i32 2, label %b i32 1, label %c ]"],
+            ),
+            blk("a", &["br label %b"]),
+            blk("b", &["br label %c"]),
+            blk("c", &["br label %merge"]),
+            blk("merge", &["ret void"]),
+        ];
+        assert!(find_switch_case_shared_continuations(&blocks).is_empty());
+        let out = privatize_switch_case_continuations(&blocks);
+        assert_eq!(out.len(), blocks.len());
+        assert!(out
+            .iter()
+            .zip(&blocks)
+            .all(|(actual, expected)| actual.name == expected.name
+                && actual.lines() == expected.lines()));
+        assert!(
+            super::super::structured_emit::structured_plan(&out).is_some(),
+            "the legal compact switch remains directly structurable"
+        );
+    }
+
+    /// Adjacency only licenses an unconditional case fallthrough. A conditional edge into the next
+    /// case is still an illegal side entry and must be privatized even when the case labels are
+    /// consecutive in the switch instruction.
+    #[test]
+    fn privatize_switch_case_continuations_rewrites_conditional_adjacent_entry() {
+        let blocks = vec![
+            blk("entry", &["br label %sw"]),
+            blk(
+                "sw",
+                &["switch i32 %x, label %merge [ i32 2, label %a i32 1, label %b ]"],
+            ),
+            blk("a", &["br i1 %take, label %b, label %tail"]),
+            blk("tail", &["br label %merge"]),
+            blk("b", &["br label %merge"]),
+            blk("merge", &["ret void"]),
+        ];
+        assert_eq!(
+            find_switch_case_shared_continuations(&blocks),
+            vec![("%a".into(), "%b".into())]
+        );
+        let out = privatize_switch_case_continuations(&blocks);
+        let a = out.iter().find(|block| block.name == "%a").unwrap();
+        assert!(!block_successors(a).iter().any(|target| target == "%b"));
+        assert!(
+            super::super::structured_emit::structured_plan(&out).is_some(),
+            "the conditional side entry is privatized before planning"
+        );
+    }
+
+    /// A shared continuation outside a loop cannot receive a clone entered from a predecessor inside
+    /// that loop. Structured loop-exit routing later passes through the loop merge, so an edge-local
+    /// value would no longer dominate uses specialized into the clone.
+    #[test]
+    fn shared_clone_rejects_cross_loop_redirected_predecessor() {
+        let blocks = vec![
+            blk("entry", &["br label %outer"]),
+            blk("outer", &["br i1 %direct, label %shared, label %head"]),
+            blk(
+                "head",
+                &[
+                    "%i = phi i32 [ 0, %outer ], [ %next, %body ]",
+                    "br label %body",
+                ],
+            ),
+            blk(
+                "body",
+                &[
+                    "%edge = add i32 %i, 1",
+                    "%next = add i32 %i, 1",
+                    "br i1 %leave, label %shared, label %head",
+                ],
+            ),
+            blk(
+                "shared",
+                &[
+                    "%value = phi i32 [ 0, %outer ], [ %edge, %body ]",
+                    "ret void",
+                ],
+            ),
+        ];
+        let forest = analyze(&blocks);
+        let loop_headers = forest
+            .loops
+            .iter()
+            .map(|natural_loop| natural_loop.header.as_str())
+            .collect::<HashSet<_>>();
+        let loop_latches = forest
+            .loops
+            .iter()
+            .flat_map(|natural_loop| natural_loop.latches.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        let loop_exits = forest
+            .loops
+            .iter()
+            .flat_map(|natural_loop| natural_loop.exits.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        assert!(!shared_clone_is_loop_local(
+            &blocks,
+            &forest,
+            "%outer",
+            "%shared",
+            &loop_headers,
+            &loop_latches,
+            &loop_exits,
+        ));
+    }
+
     /// A case can also enter the switch's DEFAULT CASE through a conditional tail. The switch merge is
     /// ordinarily dominated in this shape, so generic tail sharing is left alone; the continuation is
     /// still a direct case root, though, and SPIR-V forbids one case construct from entering another.
@@ -769,11 +896,77 @@ mod tests {
         );
     }
 
-    /// A switch inside a natural loop is deliberately outside the case-tail transform: its shared
-    /// continuation can be a loop break/continue boundary, which needs a real multi-level-break model
-    /// rather than tail duplication.
+    /// A switch-dominated merge does not make an earlier subset reconvergence legal. Cases `%a` and
+    /// `%b` share `%shared`, while the default and `%c` bypass it and meet them only at `%merge`.
+    /// `%shared` must therefore be private to each entering case even though `%merge` is dominated by
+    /// the switch.
     #[test]
-    fn privatize_switch_case_continuations_skips_loop_contained_switch() {
+    fn privatize_switch_case_continuations_splits_subset_before_dominated_merge() {
+        let blocks = vec![
+            blk("entry", &["br label %sw"]),
+            blk(
+                "sw",
+                &["switch i32 %x, label %default [ i32 0, label %a i32 1, label %b i32 2, label %c ]"],
+            ),
+            blk("a", &["br label %shared"]),
+            blk("b", &["br label %shared"]),
+            blk("c", &["br label %merge"]),
+            blk("default", &["br label %merge"]),
+            blk("shared", &["br label %merge"]),
+            blk("merge", &["ret void"]),
+        ];
+        assert!(
+            find_switch_case_shared_continuations(&blocks)
+                .contains(&("%a".to_string(), "%shared".to_string())),
+            "the intermediate subset reconvergence is not the switch merge"
+        );
+        let out = privatize_switch_case_continuations(&blocks);
+        assert!(out.len() > blocks.len(), "the shared suffix is privatized");
+        assert_eq!(out.iter().filter(|b| b.name == "%merge").count(), 1);
+        assert!(
+            super::super::structured_emit::structured_plan(&out).is_some(),
+            "the split subset remains structurable"
+        );
+    }
+
+    /// A switch inside a natural loop may privatize an ordinary shared suffix when the cloned region
+    /// and its boundary remain inside that loop. The separate latch keeps the clone away from the
+    /// continue construct.
+    #[test]
+    fn privatize_switch_case_continuations_clones_loop_local_tail() {
+        let blocks = vec![
+            blk("entry", &["br label %loop"]),
+            blk("loop", &["br i1 %run, label %sw, label %join"]),
+            blk(
+                "sw",
+                &["switch i32 %x, label %join [ i32 0, label %a i32 1, label %b ]"],
+            ),
+            blk("a", &["br label %shared"]),
+            blk("b", &["br label %shared"]),
+            blk("shared", &["br label %join"]),
+            blk("join", &["br label %latch"]),
+            blk("latch", &["br i1 %again, label %loop, label %exit"]),
+            blk("exit", &["ret void"]),
+        ];
+        assert!(
+            find_switch_case_shared_continuations(&blocks)
+                .contains(&("%a".to_string(), "%shared".to_string())),
+            "a loop-local shared case suffix is eligible"
+        );
+        let out = privatize_switch_case_continuations(&blocks);
+        assert!(out.len() > blocks.len(), "the shared suffix is privatized");
+        assert_eq!(out.iter().filter(|b| b.name == "%join").count(), 1);
+        assert_eq!(out.iter().filter(|b| b.name == "%latch").count(), 1);
+        assert!(
+            super::super::structured_emit::structured_plan(&out).is_some(),
+            "the loop and privatized switch remain structurable"
+        );
+    }
+
+    /// A shared case tail that is itself the loop latch remains outside the case-tail transform: it
+    /// is a continue boundary, which needs loop-aware ownership rather than tail duplication.
+    #[test]
+    fn privatize_switch_case_continuations_skips_loop_latch() {
         let blocks = vec![
             blk("entry", &["br label %loop"]),
             blk("loop", &["br i1 %again, label %sw, label %exit"]),
@@ -789,7 +982,42 @@ mod tests {
         assert_eq!(
             privatize_switch_case_continuations(&blocks).len(),
             blocks.len(),
-            "loop-contained switch is left to the loop-aware structurizer"
+            "a shared loop latch is left to the loop-aware structurizer"
+        );
+    }
+
+    /// A block may be in the same outer loop as a switch while also serving as a nested loop's exit.
+    /// Exact loop-membership equality alone does not make that structural merge cloneable.
+    #[test]
+    fn privatize_switch_case_continuations_skips_nested_loop_exit() {
+        let blocks = vec![
+            blk("entry", &["br label %outer"]),
+            blk("outer", &["br i1 %run, label %sw, label %exit"]),
+            blk(
+                "sw",
+                &["switch i32 %x, label %join [ i32 0, label %a i32 1, label %b i32 2, label %inner ]"],
+            ),
+            blk("a", &["br label %shared"]),
+            blk("b", &["br label %shared"]),
+            blk(
+                "inner",
+                &["br i1 %inner_again, label %inner_body, label %shared"],
+            ),
+            blk("inner_body", &["br label %inner"]),
+            blk("shared", &["br label %join"]),
+            blk("join", &["br label %outer_latch"]),
+            blk("outer_latch", &["br label %outer"]),
+            blk("exit", &["ret void"]),
+        ];
+        assert!(
+            !find_switch_case_shared_continuations(&blocks)
+                .contains(&("%a".to_string(), "%shared".to_string())),
+            "a nested loop exit is retained as that loop's structural merge"
+        );
+        assert_eq!(
+            privatize_switch_case_continuations(&blocks).len(),
+            blocks.len(),
+            "the nested loop exit is not cloned as a case suffix"
         );
     }
 

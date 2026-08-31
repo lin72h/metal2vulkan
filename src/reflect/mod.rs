@@ -9,8 +9,9 @@
 //!
 //! This module exposes that knowledge as one consumer-shaped [`ShaderReflection`] value. Interface
 //! declarations come from the parser-shaped AIR metadata and the ABI constants below; buffer access
-//! footprints are then derived from the final adopted SPIR-V module. The binding numbers here are the
-//! SAME ones the interface pass decorates. The default uses [`RESOURCE_DESCRIPTOR_SET`] and the
+//! footprints are then derived from the final constructed SPIR-V module before its owned carrier is
+//! released. The binding numbers here are the SAME ones the interface pass decorates. The default uses
+//! [`RESOURCE_DESCRIPTOR_SET`] and the
 //! exported default ranges; [`DescriptorLayout`] can select a complete stage-local alternative.
 //! Reflection never mutates the module, so reflected and non-reflected
 //! translation remain byte-identical.
@@ -19,6 +20,7 @@ use crate::meta::{
     texture_shape_from_name, AirType, BufferAccess, FragMeta, FragRole, FunctionConstant, KernMeta,
     KernRole, TextureComponent, TextureDimension, TextureShape, VertMeta, VertOutRole, VertRole,
 };
+use crate::spirv_module::Module;
 
 mod footprint;
 
@@ -50,8 +52,7 @@ mod footprint;
 /// signed scalar/vector values rather than guessing from LLVM's signless integer types.
 ///
 /// v21 adds conservative static and invocation-strided buffer access footprints. The footprint is
-/// derived from the final adopted SPIR-V module, so retry-tier selection cannot leave reflection
-/// describing bytes other than those the consumer receives.
+/// derived from the same finished owned SPIR-V module that supplies the returned bytes.
 ///
 /// v22 replaces the overlapping 32-wide descriptor bases with checked, non-overlapping resource
 /// bands and reserves a separate high range for translator-owned descriptors.
@@ -62,62 +63,64 @@ mod footprint;
 /// v26 rejects component-incompatible runtime formats at the metadata-only reflection boundary,
 /// matching executable translation's specialization contract.
 /// v27 records the versioned effective descriptor layout used by the returned SPIR-V.
-/// v28 records the kernel dispatch contract, including any per-dispatch push-constant range that
-/// supplies the exact Metal thread grid and culls Vulkan's rounded-up invocations.
+/// v28 records the original kernel dispatch-bound contract.
 /// v29 makes that per-dispatch push-constant grid the safe default for every kernel; whole-workgroup
 /// dispatch is now an explicit caller assertion.
-pub const REFLECTION_VERSION: u32 = 29;
+/// v30 replaces surplus-invocation culling with exact boundary-region decomposition. Exact-thread
+/// kernels expose three local-size specialization constants and a complete logical-grid payload.
+pub const REFLECTION_VERSION: u32 = 30;
 
-/// Size in bytes of the three tightly packed `u32` grid dimensions used by
-/// [`KernelDispatch::ThreadsPushConstant`].
-pub const KERNEL_GRID_PUSH_CONSTANT_SIZE: u32 = 12;
+/// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
+/// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
+pub const KERNEL_DISPATCH_PUSH_CONSTANT_SIZE: u32 = 48;
 
-/// Default byte offset of the per-dispatch kernel grid when callers do not select another
-/// dispatch contract. This safe default keeps one pipeline per kernel and requires the host to
-/// populate the exact effective grid before every dispatch.
-pub const DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET: u32 = 0;
+/// Vulkan specialization-constant ids which select the exact local size of a decomposed dispatch
+/// region. Consumers must specialize all three values when creating each region pipeline.
+pub const KERNEL_LOCAL_SIZE_SPEC_IDS: [u32; 3] = [0, 1, 2];
+
+/// Default byte offset of the exact-thread dispatch-region payload.
+pub const DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET: u32 = 0;
 
 /// Reflected byte range occupied by the dynamic kernel grid in Vulkan push-constant storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct KernelGridPushConstantRange {
+pub struct KernelDispatchPushConstantRange {
     pub offset: u32,
     pub size: u32,
 }
 
 /// How a translated compute kernel obtains the exact Metal execution grid.
 ///
-/// Vulkan dispatches whole workgroups. Metal `dispatchThreads` can launch a partial workgroup, so
-/// its exact thread count must be supplied separately and the translated entry point must cull
-/// rounded-up Vulkan invocations. This one contract drives both that cull and any AIR
-/// `[[threads_per_grid]]` parameter.
+/// Vulkan gives one pipeline a fixed workgroup size. Metal `dispatchThreads` can make each boundary
+/// workgroup smaller, so exact-thread launches are decomposed into at most eight rectangular
+/// regions. Each region gets its exact local size plus logical thread and threadgroup bases.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum KernelDispatch {
     /// The caller used whole workgroups. `[[threads_per_grid]]` is derived as
     /// `NumWorkgroups * LocalSize`, and no invocation cull is needed.
     Workgroups,
-    /// A fixed Metal `dispatchThreads` grid baked into this module. This is appropriate when the
-    /// caller intentionally creates a pipeline variant for the grid.
+    /// A fixed Metal `dispatchThreads` grid baked into this module.
     ThreadsFixed { threads_per_grid: [u32; 3] },
-    /// A Metal `dispatchThreads` grid read at dispatch time from three tightly packed `u32` push
-    /// constants at `offset`, `offset + 4`, and `offset + 8`.
-    ThreadsPushConstant { offset: u32 },
+    /// A Metal `dispatchThreads` grid selected at dispatch time.
+    ThreadsDynamic { offset: u32 },
 }
 
 impl KernelDispatch {
     /// Safe default for a kernel whose per-dispatch launch form is not fixed at translation time.
     pub const fn safe_default() -> Self {
-        Self::ThreadsPushConstant {
-            offset: DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+        Self::ThreadsDynamic {
+            offset: DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
         }
     }
 }
 
 impl KernelDispatch {
     pub fn validate(self) -> Result<(), String> {
-        let Self::ThreadsPushConstant { offset } = self else {
-            return Ok(());
+        let offset = match self {
+            Self::Workgroups => return Ok(()),
+            Self::ThreadsFixed { .. } => DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
+            Self::ThreadsDynamic { offset } => offset,
         };
         if offset % 4 != 0 {
             return Err(format!(
@@ -125,25 +128,129 @@ impl KernelDispatch {
             ));
         }
         offset
-            .checked_add(KERNEL_GRID_PUSH_CONSTANT_SIZE)
+            .checked_add(KERNEL_DISPATCH_PUSH_CONSTANT_SIZE)
             .ok_or_else(|| "kernel grid push-constant range overflows u32".to_string())?;
         Ok(())
     }
 
     /// Push-constant byte range the consumer must make visible to the compute stage.
-    pub const fn push_constant_range(self) -> Option<KernelGridPushConstantRange> {
+    pub const fn push_constant_range(self) -> Option<KernelDispatchPushConstantRange> {
         match self {
-            Self::ThreadsPushConstant { offset }
-                if offset.checked_add(KERNEL_GRID_PUSH_CONSTANT_SIZE).is_some() =>
+            Self::ThreadsDynamic { offset }
+                if offset
+                    .checked_add(KERNEL_DISPATCH_PUSH_CONSTANT_SIZE)
+                    .is_some() =>
             {
-                Some(KernelGridPushConstantRange {
+                Some(KernelDispatchPushConstantRange {
                     offset,
-                    size: KERNEL_GRID_PUSH_CONSTANT_SIZE,
+                    size: KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
                 })
             }
-            Self::Workgroups | Self::ThreadsFixed { .. } => None,
-            Self::ThreadsPushConstant { .. } => None,
+            Self::ThreadsFixed { .. } => Some(KernelDispatchPushConstantRange {
+                offset: DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
+                size: KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
+            }),
+            Self::Workgroups => None,
+            Self::ThreadsDynamic { .. } => None,
         }
+    }
+
+    /// Build the exact sequence of Vulkan dispatch regions for this Metal launch.
+    pub fn plan(
+        self,
+        nominal_local_size: [u32; 3],
+        dynamic_threads_per_grid: Option<[u32; 3]>,
+    ) -> Result<KernelDispatchPlan, String> {
+        if nominal_local_size.contains(&0) {
+            return Err("kernel local-size dimensions must be non-zero".to_string());
+        }
+        let threads_per_grid = match self {
+            Self::Workgroups => {
+                return Err("whole-workgroup dispatches do not use an exact-thread plan".to_string())
+            }
+            Self::ThreadsFixed { threads_per_grid } => {
+                if dynamic_threads_per_grid.is_some_and(|grid| grid != threads_per_grid) {
+                    return Err(
+                        "runtime thread grid does not match fixed kernel dispatch".to_string()
+                    );
+                }
+                threads_per_grid
+            }
+            Self::ThreadsDynamic { .. } => dynamic_threads_per_grid
+                .ok_or_else(|| "dynamic kernel dispatch requires a thread grid".to_string())?,
+        };
+        KernelDispatchPlan::new(threads_per_grid, nominal_local_size)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct KernelDispatchRegion {
+    pub local_size: [u32; 3],
+    pub group_count: [u32; 3],
+    pub thread_base: [u32; 3],
+    pub threadgroup_base: [u32; 3],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct KernelDispatchPlan {
+    pub threads_per_grid: [u32; 3],
+    pub threadgroups_per_grid: [u32; 3],
+    pub regions: Vec<KernelDispatchRegion>,
+}
+
+impl KernelDispatchPlan {
+    /// Encode one returned region's complete push-constant payload.
+    pub fn push_constants(&self, region: KernelDispatchRegion) -> [u32; 12] {
+        let mut words = [0; 12];
+        words[0..3].copy_from_slice(&self.threads_per_grid);
+        words[3..6].copy_from_slice(&region.thread_base);
+        words[6..9].copy_from_slice(&region.threadgroup_base);
+        words[9..12].copy_from_slice(&self.threadgroups_per_grid);
+        words
+    }
+
+    fn new(threads_per_grid: [u32; 3], nominal_local_size: [u32; 3]) -> Result<Self, String> {
+        let threadgroups_per_grid = std::array::from_fn(|dimension| {
+            threads_per_grid[dimension].div_ceil(nominal_local_size[dimension])
+        });
+        let mut regions = Vec::with_capacity(8);
+        for mask in 0_u8..8 {
+            let mut local_size = nominal_local_size;
+            let mut group_count = [0; 3];
+            let mut thread_base = [0; 3];
+            let mut threadgroup_base = [0; 3];
+            let mut nonempty = true;
+            for dimension in 0..3 {
+                let full = threads_per_grid[dimension] / nominal_local_size[dimension];
+                let tail = threads_per_grid[dimension] % nominal_local_size[dimension];
+                if mask & (1 << dimension) == 0 {
+                    group_count[dimension] = full;
+                } else if tail == 0 {
+                    nonempty = false;
+                } else {
+                    local_size[dimension] = tail;
+                    group_count[dimension] = 1;
+                    thread_base[dimension] = full * nominal_local_size[dimension];
+                    threadgroup_base[dimension] = full;
+                }
+                nonempty &= group_count[dimension] != 0;
+            }
+            if nonempty {
+                regions.push(KernelDispatchRegion {
+                    local_size,
+                    group_count,
+                    thread_base,
+                    threadgroup_base,
+                });
+            }
+        }
+        Ok(Self {
+            threads_per_grid,
+            threadgroups_per_grid,
+            regions,
+        })
     }
 }
 
@@ -898,6 +1005,7 @@ pub enum RuntimeStorageImageFormat {
     Bgra8Unorm,
     R16Float,
     Rg16Float,
+    Rg32Float,
     Rgba16Float,
     R32Float,
     Rgba32Float,
@@ -920,6 +1028,7 @@ impl RuntimeStorageImageFormat {
             | Self::Bgra8Unorm
             | Self::R16Float
             | Self::Rg16Float
+            | Self::Rg32Float
             | Self::Rgba16Float
             | Self::R32Float
             | Self::Rgba32Float => TextureComponent::Float,
@@ -939,6 +1048,7 @@ impl RuntimeStorageImageFormat {
             Self::Rgba8Unorm => Some(TextureFormat::Rgba8),
             Self::R16Float => Some(TextureFormat::R16f),
             Self::Rg16Float => Some(TextureFormat::Rg16f),
+            Self::Rg32Float => Some(TextureFormat::Rg32f),
             Self::Rgba16Float => Some(TextureFormat::Rgba16f),
             Self::R32Float => Some(TextureFormat::R32f),
             Self::Rgba32Float => Some(TextureFormat::Rgba32f),
@@ -1356,9 +1466,9 @@ fn tessellation_system_attribute(
 /// Consumer-shaped reflection of one translated shader.
 ///
 /// Interface declarations are built from parser-shaped AIR metadata and the translator's shared
-/// descriptor ABI. Successful reflected translation additionally audits the final adopted SPIR-V
-/// for conservative buffer footprints. Every reported binding number matches the module returned
-/// alongside this value.
+/// descriptor ABI. Successful reflected translation additionally analyzes the final constructed
+/// SPIR-V for conservative buffer footprints before releasing its owned carrier. Every reported
+/// binding number matches the module returned alongside this value.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ShaderReflection {
@@ -1763,9 +1873,9 @@ impl ShaderReflection {
         Ok(())
     }
 
-    /// Enrich descriptor-backed buffer bindings from the final adopted SPIR-V module.
-    pub(crate) fn add_buffer_footprints(&mut self, spv: &[u8]) -> Result<(), String> {
-        footprint::attach_buffer_footprints(self, spv)
+    /// Enrich descriptor-backed buffer bindings from the final constructed SPIR-V module.
+    pub(crate) fn add_buffer_footprints(&mut self, module: &Module) -> Result<(), String> {
+        footprint::attach_buffer_footprints(self, module)
     }
 
     pub(crate) fn add_buffer_address_table(&mut self) -> Result<(), String> {
@@ -1883,6 +1993,7 @@ impl ShaderReflection {
                 | FragRole::PrimitiveId
                 | FragRole::SampleId
                 | FragRole::ViewportArrayIndex
+                | FragRole::RenderTargetArrayIndex
                 | FragRole::Varying(_)
                 | FragRole::ImageblockData
                 | FragRole::Other => {
@@ -2052,6 +2163,11 @@ impl ShaderReflection {
             };
             bindings.push(binding);
         }
+        append_embedded_resources(
+            &mut bindings,
+            &meta.embedded_textures,
+            &meta.embedded_arguments,
+        );
         let vertex_attributes = meta
             .vertex_input_types
             .keys()

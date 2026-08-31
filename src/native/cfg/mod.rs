@@ -1,29 +1,14 @@
-// Dominator/loop-forest analysis backing the structured-by-construction path (`structured_plan`,
-// the DEFAULT structurizer in `emitter::functions::emit_function`; a function it rejects emits its
-// inferred merges unrepaired and ships via the relooper retry — the post-hoc repair roster that used
-// to be the fallback was deleted at W4).
+// Dominator/loop-forest analysis backing the structured-by-construction path (`structured_plan`).
+// A rejected local plan is recorded as an owned construction fact so the module can select its raw
+// CFG representation before serialization.
 // Low-level source-CFG graph primitives (successor/predecessor adjacency + CHK
 // dominator tree) shared by the loop-forest and structurizer analyses.
 pub(in crate::native) mod graph;
 pub(super) mod loopforest;
-// Cross-arm node-splitting (single-entry tail duplication) for the structured path. Not on the
-// default path; invoked behind the failure-triggered `inline_sroa_raw_cfg_restructure` retry
-// (adopt-if-validates) and the `historical cfg-clone probes` probe, so the floor is
-// byte-identical by construction.
+// Cross-arm node-splitting (single-entry tail duplication) used while constructing structured CFGs.
 pub(super) mod clone_crossarm;
-mod repair;
-// Compact immediate-dominator analysis over the emitted CFG, shared by late rewrites and emitter
-// phi-materialization repair.
+// Compact immediate-dominator analysis over the emitted CFG, shared by late rewrites.
 mod exit_check;
-// Loop-closed-SSA repair on the emitted module: register-demote a value whose def block no longer
-// dominates a use (the `synth_multi_exit_merge` funnel gap), so the PRIMARY structured emit validates
-// instead of shipping only via the relooper retry. Self-gating / floor-safe (no violation => no-op).
-mod ssa_demote;
-// Post-emit multi-entry-loop split: node-split a loop whose header is entered from two different
-// selections' arms (the irreducible shape `structured_plan` over-admits), so the PRIMARY structured
-// emit validates instead of shipping only via the relooper retry. Self-gating / floor-safe (a valid
-// loop is single-entry => no-op).
-mod loop_split;
 // Forest-driven emission consumer: loop-merge computation + merge==continue overlap split for
 // `structured_plan`, the live default structurization path.
 pub(super) mod structured_emit;
@@ -31,27 +16,34 @@ pub(super) mod structured_emit;
 mod blocks;
 pub(super) mod structured_order;
 
-pub(super) use clone_crossarm::{
-    clone_cross_arm_shared, lower_unreachable_to_ret, privatize_region_cross_arm, rename_tokens,
-    unify_returns,
-};
+pub(super) use clone_crossarm::rename_tokens;
 pub(in crate::native) use exit_check::EmittedDominators;
-pub(super) use loop_split::split_multientry_loop_selection_exits;
-pub(super) use ssa_demote::demote_nondominating_values;
 pub(super) use structured_emit::{
     cond_other_witness_lines, cond_phi_shared_witness_lines, construct_tree_gate_witness_lines,
-    construct_tree_reject_reason, renest_cond_phi_shared_own_arm, renest_straddle_loop_merge,
-    restructure_straddle_loop_merges, straddle_witness_lines, structured_plan,
-    structured_plan_construct_tree, structured_reject_reason, CROSS_ARM_EDGE_MAX_BLOCKS,
+    construct_tree_reject_reason, exceeds_local_structured_plan_budget,
+    privatize_reused_emitted_merge_targets, renest_cond_phi_shared_own_arm,
+    renest_loop_exit_sibling, renest_straddle_loop_merge, renest_whole_cfg_dispatch,
+    requires_loop_exit_sibling_dispatch, requires_shared_loop_entry_ownership,
+    straddle_witness_lines, structured_plan, structured_plan_construct_tree,
+    structured_reject_reason, CROSS_ARM_EDGE_MAX_BLOCKS,
 };
 
+#[cfg(test)]
+pub(super) use blocks::split_body_blocks;
 pub(super) use blocks::{
-    funnel_shared_branch_dispatches, implicit_entry_block_name,
+    funnel_shared_branch_dispatches, implicit_entry_block_name, index_branch_merges_by_header,
     infer_bounded_branch_merges_by_header, infer_branch_merges, infer_direct_branch_merges,
     infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
-    lower_unstructured_switches, refunnel_one_deep_shared_arm, split_body_blocks,
+    lower_unstructured_switches, refunnel_one_deep_shared_arm, split_source_body_blocks,
+    switch_default_is_inferred_merge,
 };
-pub(super) use repair::{block_index_by_label, id_ref_operand};
+#[cfg(test)]
+pub(super) fn id_ref_operand(operand: &crate::spirv_module::Operand) -> Option<spirv::Word> {
+    let crate::spirv_module::Operand::IdRef(id) = operand else {
+        return None;
+    };
+    Some(*id)
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct LoopMergeInfo {

@@ -4,10 +4,27 @@
 //! every consumer runs before final id canonicalization.
 
 use spirv::Word;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EmitSidecar {
+    /// The emitter intentionally modeled every device/constant buffer through the raw byte/word
+    /// representation. Interface construction uses this typed fact to preserve that representation's
+    /// established closure ordering rather than applying the default typed-buffer fallback early.
+    pub(crate) all_device_buffers_raw: bool,
+    /// Final interface construction must represent any remaining cross-binding StorageBuffer
+    /// closure in the address domain. Both all-raw constructors set this before passes begin so the
+    /// resource phase owns the complete descriptor-pointer graph.
+    pub(crate) construct_cross_binding_addresses: bool,
+    /// Functions whose exact source CFG was rejected by the ordinary ownership planner. Same-CFG
+    /// representation retries reuse this immutable result before trying construct-tree ownership.
+    pub(crate) ordinary_plan_rejected_functions: HashSet<String>,
+    /// Functions whose exact source CFG was rejected by the complete source-ownership ladder.
+    /// Same-CFG representation retries can proceed directly to the bounded fallback constructor.
+    pub(crate) ownership_plan_rejected_functions: HashSet<String>,
+    /// Surviving functions whose final owned instruction graph contains a conditional or switch
+    /// header without an adjacent merge declaration after source ownership planning and lowering.
+    pub(crate) post_lowering_cfg_construction_functions: HashSet<String>,
     /// Parsed source vector ABI rules, threaded through every retry candidate into final layout.
     pub(crate) air_data_layout: Option<crate::layout::AirDataLayout>,
     /// Emitted `OpTypeStruct` id -> exact AIR member offsets, including backend padding members.
@@ -15,6 +32,10 @@ pub(crate) struct EmitSidecar {
     /// One outcome for every entry buffer carrying `air.struct_type_info`. This keeps an exact AIR
     /// layout that could not be associated with the emitted type graph from disappearing silently.
     pub(crate) air_struct_layout_mappings: Vec<AirStructLayoutMapping>,
+    /// Entry buffer ordinals whose AIR aggregate layout replaced a non-aggregate source pointee.
+    /// Their native raw-word access paths are flat element indices and must be routed through member
+    /// 0 of the existing `{ RuntimeArray<uint> }` interface block.
+    pub(crate) flat_raw_buffer_params: HashSet<u32>,
     pub(crate) buffer_address_words: Vec<BufferAddressWord>,
     /// Exact constant byte address of a GEP result relative to one buffer root. This preserves the
     /// source aggregate layout across the native-emitter → remodeled-interface seam, where an
@@ -37,10 +58,21 @@ pub(crate) struct EmitSidecar {
     pub(crate) local_pointer_field_stores: Vec<LocalPointerFieldStore>,
     pub(crate) local_pointer_field_loads: Vec<LocalPointerFieldLoad>,
     pub(crate) local_pointer_dynamic_field_loads: Vec<LocalPointerDynamicFieldLoad>,
+    /// Exact logical pointer carried by an integer payload slot in a by-value AIR aggregate. The
+    /// aggregate and path survive emitted helper inlining; interface binding remaps `source` to the
+    /// concrete descriptor value before resource-wrapper collapse resolves matching extracts.
+    pub(crate) aggregate_pointer_values: Vec<AggregatePointerValue>,
     /// Result ids emitted as typed sentinels for the stable `llvm.agx2.cluster.num` ABI intrinsic.
     /// The final interface pass replaces each sentinel with the AGX2 physical-cluster number derived
     /// from Vulkan `LocalInvocationId` and the caller-supplied kernel local size.
     pub(crate) agx2_cluster_numbers: Vec<Word>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EmissionFailure {
+    pub(crate) error: String,
+    pub(crate) ordinary_plan_rejected_functions: HashSet<String>,
+    pub(crate) ownership_plan_rejected_functions: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,12 +91,6 @@ pub(crate) enum AirStructLayoutMappingStatus {
     MetadataIsNotStruct,
     EmittedShapeMismatch,
     NonIncreasingOffsets,
-}
-
-impl AirStructLayoutMappingStatus {
-    pub(crate) const fn is_mapped(self) -> bool {
-        matches!(self, Self::MappedNatural | Self::MappedExplicit)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +154,59 @@ pub(crate) struct LocalPointerDynamicFieldLoad {
     pub(crate) suffix: Vec<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AggregatePointerValue {
+    pub(crate) aggregate: Word,
+    pub(crate) source: Word,
+    pub(crate) indices: Vec<u32>,
+}
+
 impl EmitSidecar {
+    /// Every SPIR-V id referenced by a typed fact crossing the emitter-to-passes seam.
+    pub(crate) fn referenced_ids(&self) -> HashSet<Word> {
+        let mut ids = self
+            .buffer_address_words
+            .iter()
+            .map(|fact| fact.id)
+            .collect::<HashSet<_>>();
+        for fact in &self.buffer_access_offsets {
+            ids.extend([fact.id, fact.root]);
+        }
+        for fact in &self.buffer_access_affine_offsets {
+            ids.extend([fact.id, fact.root]);
+            ids.extend(fact.terms.iter().map(|(index, _)| *index));
+        }
+        for fact in &self.buffer_pointer_field_loads {
+            ids.extend([fact.id, fact.root]);
+        }
+        for fact in &self.buffer_pointer_dynamic_field_loads {
+            ids.extend([fact.id, fact.root, fact.index]);
+        }
+        for fact in &self.local_pointer_field_stores {
+            ids.extend([fact.id, fact.source, fact.root]);
+        }
+        for fact in &self.local_pointer_field_loads {
+            ids.extend([fact.id, fact.root]);
+        }
+        for fact in &self.local_pointer_dynamic_field_loads {
+            ids.extend([fact.id, fact.root, fact.index]);
+        }
+        for fact in &self.aggregate_pointer_values {
+            ids.extend([fact.aggregate, fact.source]);
+        }
+        ids.extend(self.agx2_cluster_numbers.iter().copied());
+        ids.extend(self.air_struct_offsets.keys().copied());
+        ids.extend(
+            self.air_struct_layout_mappings
+                .iter()
+                .filter_map(|mapping| mapping.struct_ty),
+        );
+        for (&root, &source_ty) in &self.buffer_root_source_types {
+            ids.extend([root, source_ty]);
+        }
+        ids
+    }
+
     /// Apply a whole-module value-id substitution to every typed fact.
     ///
     /// Typed helper inlining emits cloned bodies against opaque parameter ids, then replaces those
@@ -177,6 +255,10 @@ impl EmitSidecar {
             replace(&mut fact.root);
             replace(&mut fact.index);
         }
+        for fact in &mut self.aggregate_pointer_values {
+            replace(&mut fact.aggregate);
+            replace(&mut fact.source);
+        }
         for id in &mut self.agx2_cluster_numbers {
             replace(id);
         }
@@ -185,13 +267,15 @@ impl EmitSidecar {
                 replace(struct_ty);
             }
         }
-        self.air_struct_offsets = std::mem::take(&mut self.air_struct_offsets)
-            .into_iter()
-            .map(|(id, offsets)| (remap.get(&id).copied().unwrap_or(id), offsets))
+        self.air_struct_offsets = self
+            .air_struct_offsets
+            .iter()
+            .map(|(&id, offsets)| (remap.get(&id).copied().unwrap_or(id), offsets.clone()))
             .collect();
-        self.buffer_root_source_types = std::mem::take(&mut self.buffer_root_source_types)
-            .into_iter()
-            .map(|(root, source_ty)| {
+        self.buffer_root_source_types = self
+            .buffer_root_source_types
+            .iter()
+            .map(|(&root, &source_ty)| {
                 (
                     remap.get(&root).copied().unwrap_or(root),
                     remap.get(&source_ty).copied().unwrap_or(source_ty),
@@ -299,6 +383,18 @@ impl EmitSidecar {
             .collect::<Vec<_>>();
         self.local_pointer_dynamic_field_loads.extend(clones);
         let clones = self
+            .aggregate_pointer_values
+            .iter()
+            .filter_map(|fact| {
+                Some(AggregatePointerValue {
+                    aggregate: remap.get(&fact.aggregate).copied()?,
+                    source: remap.get(&fact.source).copied().unwrap_or(fact.source),
+                    indices: fact.indices.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.aggregate_pointer_values.extend(clones);
+        let clones = self
             .agx2_cluster_numbers
             .iter()
             .filter_map(|id| remap.get(id).copied())
@@ -338,6 +434,9 @@ mod tests {
     #[test]
     fn inlining_clones_load_facts_and_remaps_store_sources() {
         let mut sidecar = EmitSidecar {
+            ordinary_plan_rejected_functions: HashSet::new(),
+            ownership_plan_rejected_functions: HashSet::new(),
+            post_lowering_cfg_construction_functions: HashSet::new(),
             buffer_access_offsets: vec![BufferAccessOffset {
                 id: 82,
                 root: 92,
@@ -496,6 +595,11 @@ mod tests {
     #[test]
     fn whole_module_substitution_remaps_every_sidecar_id_field() {
         let mut sidecar = EmitSidecar {
+            all_device_buffers_raw: false,
+            construct_cross_binding_addresses: false,
+            ordinary_plan_rejected_functions: HashSet::new(),
+            ownership_plan_rejected_functions: HashSet::new(),
+            post_lowering_cfg_construction_functions: HashSet::new(),
             air_data_layout: None,
             air_struct_offsets: HashMap::from([(5, vec![0, 16])]),
             air_struct_layout_mappings: vec![AirStructLayoutMapping {
@@ -503,6 +607,7 @@ mod tests {
                 struct_ty: Some(5),
                 status: AirStructLayoutMappingStatus::MappedNatural,
             }],
+            flat_raw_buffer_params: HashSet::from([2]),
             buffer_address_words: vec![BufferAddressWord {
                 id: 10,
                 param_index: 2,
@@ -549,6 +654,11 @@ mod tests {
                 index: 42,
                 suffix: vec![6],
             }],
+            aggregate_pointer_values: vec![AggregatePointerValue {
+                aggregate: 43,
+                source: 44,
+                indices: vec![1, 0],
+            }],
             agx2_cluster_numbers: vec![50],
         };
         let remap = HashMap::from([
@@ -573,11 +683,21 @@ mod tests {
             (40, 140),
             (41, 141),
             (42, 142),
+            (43, 143),
+            (44, 144),
             (5, 105),
             (50, 150),
         ]);
 
         sidecar.remap_ids(&remap);
+        assert_eq!(
+            sidecar.aggregate_pointer_values,
+            vec![AggregatePointerValue {
+                aggregate: 143,
+                source: 144,
+                indices: vec![1, 0],
+            }]
+        );
         assert_eq!(
             sidecar.buffer_root_source_types,
             HashMap::from([(118, 119)])

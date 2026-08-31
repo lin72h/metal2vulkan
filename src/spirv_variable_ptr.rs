@@ -35,6 +35,20 @@ struct AccessChainDef {
 /// result type. This preserves byte address semantics while avoiding `VariablePointersStorageBuffer`
 /// for address math that is expressible as a normal logical access chain.
 pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Module) -> usize {
+    if !module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .any(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::PtrAccessChain | Op::InBoundsPtrAccessChain
+            )
+        })
+    {
+        return 0;
+    }
     let defs = collect_defs(module);
     let zero_constants = zero_integer_constants(&defs);
     let access_chains = collect_access_chain_defs(module, &defs, &zero_constants);
@@ -176,6 +190,15 @@ pub(crate) fn lower_zero_base_storage_buffer_ptr_access_chains(module: &mut Modu
 }
 
 pub(crate) fn rewrite_storage_buffer_atomic_scopes(module: &mut Module) -> usize {
+    if !module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .any(|inst| atomic_scope_semantics_indices(inst).is_some())
+    {
+        return 0;
+    }
     let mut defs = collect_defs(module);
     let mut rewrites = Vec::new();
     for (fi, function) in module.functions.iter().enumerate() {
@@ -357,7 +380,33 @@ fn get_or_create_integer_constant(
 }
 
 pub(crate) fn variable_pointer_requirement(module: &Module) -> (bool, bool) {
-    let defs = collect_defs(module);
+    if !module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .any(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::Phi | Op::Select | Op::PtrAccessChain | Op::InBoundsPtrAccessChain
+            )
+        })
+    {
+        return (false, false);
+    }
+    let pointer_storage = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| {
+            if inst.class.opcode != Op::TypePointer {
+                return None;
+            }
+            let Operand::StorageClass(storage) = inst.operands.first()? else {
+                return None;
+            };
+            Some((inst.result_id?, *storage))
+        })
+        .collect::<HashMap<_, _>>();
     let mut has_storage_buffer_pointer_merge = false;
     let mut has_other_pointer_merge = false;
     for inst in module
@@ -375,7 +424,7 @@ pub(crate) fn variable_pointer_requirement(module: &Module) -> (bool, bool) {
         let Some(result_type) = inst.result_type else {
             continue;
         };
-        let Some((storage, _)) = ptr_info(&defs, result_type) else {
+        let Some(&storage) = pointer_storage.get(&result_type) else {
             continue;
         };
         if storage == StorageClass::StorageBuffer {
@@ -388,10 +437,52 @@ pub(crate) fn variable_pointer_requirement(module: &Module) -> (bool, bool) {
 }
 
 fn collect_defs(module: &Module) -> HashMap<Word, Instruction> {
-    module
-        .all_inst_iter()
+    let needed_values = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|inst| {
+            matches!(
+                inst.class.opcode,
+                Op::AccessChain
+                    | Op::InBoundsAccessChain
+                    | Op::PtrAccessChain
+                    | Op::InBoundsPtrAccessChain
+            ) || atomic_scope_semantics_indices(inst).is_some()
+        })
+        .flat_map(|inst| &inst.operands)
+        .filter_map(operand_id)
+        .collect::<HashSet<_>>();
+    let mut definitions = module
+        .types_global_values
+        .iter()
         .filter_map(|inst| inst.result_id.map(|id| (id, inst.clone())))
-        .collect()
+        .collect::<HashMap<_, _>>();
+    for function in &module.functions {
+        for parameter in &function.parameters {
+            if let Some(id) = parameter.result_id.filter(|id| needed_values.contains(id)) {
+                definitions.insert(
+                    id,
+                    Instruction::new(
+                        parameter.class.opcode,
+                        parameter.result_type,
+                        Some(id),
+                        Vec::new(),
+                    ),
+                );
+            }
+        }
+        for inst in function.blocks.iter().flat_map(|block| &block.instructions) {
+            if let Some(id) = inst.result_id.filter(|id| needed_values.contains(id)) {
+                definitions.insert(
+                    id,
+                    Instruction::new(inst.class.opcode, inst.result_type, Some(id), Vec::new()),
+                );
+            }
+        }
+    }
+    definitions
 }
 
 fn collect_access_chain_defs(

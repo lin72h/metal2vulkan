@@ -80,7 +80,7 @@ fn eligible_ordinary_helper(
                 instruction.opcode == "alloca"
                     || (is_call_opcode(&instruction.opcode)
                         && instruction
-                            .call
+                            .call()
                             .as_ref()
                             .is_none_or(|call| bodied_functions.contains(&call.callee)))
             })
@@ -134,7 +134,7 @@ fn reachable_functions(
             continue;
         };
         for instruction in function.carrier_insts() {
-            let Some(call) = instruction.call.as_ref() else {
+            let Some(call) = instruction.call().as_ref() else {
                 continue;
             };
             if !is_residual_intrinsic(&call.callee)
@@ -300,7 +300,7 @@ fn function_type_capabilities(
                     TirOperand::Unresolved => {}
                 }
             }
-            if let Some(call) = &instruction.call {
+            if let Some(call) = &instruction.call() {
                 collect_type_capabilities(&call.ret, aliases, &mut visiting, &mut capabilities);
                 for argument in &call.args {
                     collect_type_capabilities(
@@ -317,7 +317,7 @@ fn function_type_capabilities(
                     );
                 }
             }
-            if let Some(gep) = &instruction.gep {
+            if let Some(gep) = &instruction.gep() {
                 collect_type_capabilities(
                     &gep.source_ty,
                     aliases,
@@ -401,7 +401,7 @@ impl LlModule {
         for function in &self.functions {
             for instruction in function.carrier_insts() {
                 if let (Some(result), Some(allocated)) =
-                    (&instruction.result, &instruction.alloca_ty)
+                    (&instruction.result, &instruction.alloca_ty())
                 {
                     source_value_pointees
                         .insert((function.name.clone(), result.clone()), allocated.clone());
@@ -434,7 +434,7 @@ impl LlModule {
                             if !is_call_opcode(&instruction.opcode) {
                                 return None;
                             }
-                            let call = instruction.call.as_ref()?;
+                            let call = instruction.call().as_ref()?;
                             let helper = helpers.get(&call.callee)?.clone();
                             if call.args.len() != helper.params.len() {
                                 return None;
@@ -590,7 +590,7 @@ impl LlModule {
                     }
 
                     let inserted = typed.insts.len();
-                    let replacement = typed.insts.drain(..);
+                    let replacement = typed.insts.clone();
                     self.functions[function_index].blocks[block_index]
                         .typed_mut()
                         .expect("call site came from a typed block")

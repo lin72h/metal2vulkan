@@ -4,7 +4,9 @@ When metal2vulkan translates Metal AIR or sanitized LLVM IR, it has two authorit
 consumer information:
 
 - AIR metadata plus the translator's shared descriptor ABI define resources and stage interfaces.
-- Read-only analysis of the final adopted SPIR-V defines conservative buffer byte footprints.
+- Read-only analysis of the final constructed SPIR-V module defines conservative buffer byte
+  footprints. It consumes the same owned module that supplies the returned bytes; it does not parse
+  serialized output back into a second module.
 
 Both are exposed as [`ShaderReflection`](../src/reflect/mod.rs), so a host does not need to reparse
 AIR or build a second general-purpose SPIR-V reflection path. Reflection remains **byte-neutral**:
@@ -41,6 +43,7 @@ Other entry points:
 | `translate_reflected` / `translate_reflected_with_options` | Path to `.air` or `.ll` + stage |
 | `translate_sanitized_native_reflected` | You already have sanitized LLVM IR text and `TransformOptions` |
 | `reflect_sanitized` | You need metadata for link-time tooling even when executable translation is not yet possible; buffer footprints remain absent |
+| `reflect_sanitized_specialized` | You need metadata for exact function-constant values that can select resources or outputs; buffer footprints remain absent |
 | `ShaderReflection::from_{fragment,vertex,kernel}` | You already have `meta::{Frag,Vert,Kern}Meta`; IR-derived fields and buffer footprints remain absent |
 
 Path-based optional transforms use `translate_reflected_with_options`. The sanitized reflected
@@ -174,8 +177,8 @@ Top-level fields:
 | `render_targets` | Fragment color attachments (member index + location + type name) |
 | `depth_members` / `stencil_members` | Fragment return members tagged depth/stencil |
 | `depth_qualifier` | Fragment depth comparison contract (`Any`, `Less`, or `Greater`) |
-| `local_size` | Kernel GLCompute local size `[x,y,z]` when known |
-| `kernel_dispatch` | Kernel grid source: whole workgroups, fixed exact threads, or the reflected per-dispatch push-constant offset |
+| `local_size` | Nominal Metal kernel local size `[x,y,z]`; exact-thread regions specialize boundary dimensions |
+| `kernel_dispatch` | Whole-workgroup launch or the fixed/dynamic exact-thread region-planning contract |
 | `vertex_builtins` | Whether vertex uses `VertexIndex` / `InstanceIndex` / writes `Position` |
 | `tessellation` | Post-tessellation patch domain, control-point count, locations, and synthesized system-value carriers |
 | `imageblock_layouts` | Kernel `[[imageblock]]` tiles (param index + AIR struct layout; no descriptor) |
@@ -242,11 +245,11 @@ classification is retained.
 
 ### Buffer byte footprints
 
-Successful reflected translation derives each supported descriptor-backed buffer's `footprint` from the
-**final adopted SPIR-V module**. This is intentionally later than AIR metadata reflection: if the
-validator selects a raw-buffer, pointer-value, or CFG retry tier, the footprint describes the bytes
-that tier actually executes. Metadata-only `reflect_sanitized` leaves `footprint: null` because no
-executable module exists to audit.
+Successful reflected translation derives each supported descriptor-backed buffer's `footprint`
+from the **final constructed SPIR-V module**. This is intentionally later than AIR metadata
+reflection: if owned structural facts select a raw-buffer, pointer-value, or CFG representation,
+the footprint describes the bytes that representation actually executes. Metadata-only
+`reflect_sanitized` leaves `footprint: null` because no executable module exists to audit.
 
 Footprints are populated for `Buffer`, `KernelStageInput`, and `AccelerationStructureShadow` when
 they have a descriptor. Other resource kinds leave the field null.
@@ -399,14 +402,17 @@ choice. Create the image view and descriptor from the same runtime state used fo
 8. For vertex: bind attributes from `vertex_attributes` and respect `vertex_builtins`.
 9. For fragment: attach color targets from `render_targets`; attach the reflected depth/stencil
    aspects and derive depth comparison from `depth_qualifier`.
-10. For kernels: set local size from `local_size` and obey `kernel_dispatch`. The default
-    `ThreadsPushConstant` grid begins at `DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET` and occupies
-    `KERNEL_GRID_PUSH_CONSTANT_SIZE` bytes: write three tightly packed `u32` dimensions before each
-    dispatch. Supply the exact thread count for `dispatchThreads`, or `groupCount * local_size` for
-    `dispatchThreadgroups`. `Workgroups` appears only when the caller explicitly proves every launch
-    is complete. Specialize
-    function constants if the host supplies values. Use `specialize_function_constant_bytes` for
-    exact scalar/vector payloads; the `u64`-only helper cannot carry vectors wider than eight bytes.
+10. For kernels: obey `kernel_dispatch`. `ThreadsDynamic` and `ThreadsFixed` require
+    `KernelDispatch::plan`. Create a pipeline for each distinct region `local_size`, specializing
+    the three `KERNEL_LOCAL_SIZE_SPEC_IDS`; write the region's
+    `KernelDispatchPlan::push_constants` payload into the reflected
+    `KERNEL_DISPATCH_PUSH_CONSTANT_SIZE` range; then dispatch its `group_count`. Execute every
+    returned region. `Workgroups` is the only single-pipeline path and appears only when the caller
+    explicitly proves every launch is complete. When the host supplies function constants, use
+    `translate_sanitized_native_specialized_with_options` so exact scalar/vector payloads are baked
+    before metadata, resource-interface, and CFG construction. Post-SPIR-V specialization cannot
+    restore a resource or branch already removed under the default value. Specialized reflection
+    exposes true-gated resources and omits false-gated resources from the descriptor contract.
 
 ## Related APIs
 
@@ -415,8 +421,10 @@ choice. Create the image view and descriptor from the same runtime state used fo
 | `metal2vulkan::reflect` | Public facade (`ShaderReflection`, ABI constants) |
 | `metal2vulkan::meta` | Lower-level AIR metadata parsers (`FragMeta` / `VertMeta` / `KernMeta`) |
 | `metal2vulkan::passes::Stage` | Stage enum for translate |
-| `metal2vulkan::specialize_function_constants` | Specialize FC values on sanitized IR (when needed) |
-| `metal2vulkan::specialize_function_constant_bytes` | Specialize exact-width scalar/vector FC payloads |
+| `metal2vulkan::reflect_sanitized_specialized` | Reflect the same function-constant-specialized AIR resource contract used by translation |
+| `metal2vulkan::translate_sanitized_native_specialized_with_options` | Translate exact-width scalar/vector FC payloads before structural lowering |
+| `metal2vulkan::translate_sanitized_native_linked_specialized_with_options` | Apply the same AIR-level specialization after authored linkage resolution |
+| `metal2vulkan::specialize_function_constant_bytes` | Repoint FC initializers only in an already emitted module that retained the complete specialized structure |
 
 Unit coverage for binding numbers lives in `src/reflect/tests.rs` (the default ABI uses set 0, bases
 0/32/160/192/200/224/480, and a synthetic range beginning at 640; configurable layouts are covered

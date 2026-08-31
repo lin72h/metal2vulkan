@@ -104,23 +104,38 @@ fn run() -> Result<(), String> {
         selected
     };
     eprintln!("# cases selected: {}", cases.len());
+    let mut failures = Vec::new();
     for case in cases {
         let case_id = case.case_id.clone();
         let metal_started = Instant::now();
-        let metal = metal2vulkan_validation::metal::qualify_case(
+        let metal = match metal2vulkan_validation::metal::qualify_case(
             &root,
             case.clone(),
             &metal_environment_id,
-        )?;
+        ) {
+            Ok(metal) => metal,
+            Err(error) => {
+                eprintln!("case {case_id}: metal failed: {error}");
+                failures.push(format!("case {case_id}: Metal: {error}"));
+                continue;
+            }
+        };
         let metal_elapsed = metal_started.elapsed();
         let candidate_started = Instant::now();
-        let candidate = metal2vulkan_validation::candidate::execute_case(
+        let candidate = match metal2vulkan_validation::candidate::execute_case(
             &root,
             case,
             Backend::Moltenvk,
             &metal_environment_id,
             &environment_id,
-        )?;
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                eprintln!("case {case_id}: MoltenVK failed: {error}");
+                failures.push(format!("case {case_id}: MoltenVK: {error}"));
+                continue;
+            }
+        };
         let candidate_elapsed = candidate_started.elapsed();
         println!(
             "{}\tmetal={}\tmoltenvk={:?}\tmetal_seconds={:.3}\tmoltenvk_seconds={:.3}",
@@ -139,6 +154,13 @@ fn run() -> Result<(), String> {
         final_sync.source_shards_scanned,
         final_sync.source_bytes_scanned
     );
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} case execution(s) failed; first: {}",
+            failures.len(),
+            failures[0]
+        ));
+    }
     Ok(())
 }
 

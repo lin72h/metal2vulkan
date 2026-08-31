@@ -1,23 +1,159 @@
 //! Private-resource atomic lowering and shared raw-access analysis.
 
 use super::*;
+use crate::passes::access::direct_scalar_width;
 
-/// Rewrite every `OpAtomic*` in the entry function whose pointer has Private storage class into the
+/// Replace direct loads from an absent-resource Private root with the root's exact zero value.
+///
+/// AIR uses opaque pointers, so a gated buffer parameter may be loaded as a scalar even when its
+/// reconstructed placeholder root is an aggregate containing that scalar. Logical SPIR-V cannot
+/// express that pointer reinterpretation. The resource is statically absent and its Private root
+/// is null-initialized, making a direct load exactly the null value of the requested result type.
+pub(in crate::passes) fn rewrite_private_zero_root_loads(ctx: &mut Ctx, roots: &[Word]) {
+    let mut roots = roots.iter().copied().collect::<HashSet<_>>();
+    let function_parameters = ctx
+        .module
+        .functions
+        .iter()
+        .filter_map(|function| {
+            Some((
+                function.def.as_ref()?.result_id?,
+                function
+                    .parameters
+                    .iter()
+                    .filter_map(|parameter| parameter.result_id)
+                    .collect::<Vec<_>>(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut call_arguments = HashMap::<Word, Vec<Vec<Operand>>>::new();
+    for instruction in ctx
+        .module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == Op::FunctionCall)
+    {
+        let Some(Operand::IdRef(function)) = instruction.operands.first() else {
+            continue;
+        };
+        call_arguments
+            .entry(*function)
+            .or_default()
+            .push(instruction.operands[1..].to_vec());
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut discovered = Vec::new();
+        for instruction in ctx
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+        {
+            let rooted = match instruction.class.opcode {
+                Op::CopyObject | Op::Bitcast => instruction.operands.first().is_some_and(
+                    |operand| matches!(operand, Operand::IdRef(id) if roots.contains(id)),
+                ),
+                Op::Phi => instruction.operands.chunks_exact(2).all(
+                    |pair| matches!(pair.first(), Some(Operand::IdRef(id)) if roots.contains(id)),
+                ),
+                Op::Select => matches!(
+                    instruction.operands.as_slice(),
+                    [_, Operand::IdRef(on_true), Operand::IdRef(on_false), ..]
+                        if roots.contains(on_true) && roots.contains(on_false)
+                ),
+                _ => false,
+            };
+            if rooted {
+                if let Some(result) = instruction.result_id {
+                    discovered.push(result);
+                }
+            }
+        }
+        for (function, parameters) in &function_parameters {
+            let Some(calls) = call_arguments.get(function) else {
+                continue;
+            };
+            for (index, parameter) in parameters.iter().copied().enumerate() {
+                if calls.iter().all(|arguments| {
+                    matches!(arguments.get(index), Some(Operand::IdRef(id)) if roots.contains(id))
+                }) {
+                    discovered.push(parameter);
+                }
+            }
+        }
+        for id in discovered {
+            changed |= roots.insert(id);
+        }
+    }
+    let mut result_types = HashSet::new();
+    for function in &ctx.module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                if instruction.class.opcode == Op::Load
+                    && instruction.operands.first().is_some_and(
+                        |operand| matches!(operand, Operand::IdRef(id) if roots.contains(id)),
+                    )
+                {
+                    if let Some(result_type) = instruction.result_type {
+                        result_types.insert(result_type);
+                    }
+                }
+            }
+        }
+    }
+    let nulls = result_types
+        .into_iter()
+        .map(|ty| (ty, ctx.const_null(ty)))
+        .collect::<HashMap<_, _>>();
+    for function in &mut ctx.module.functions {
+        for block in &mut function.blocks {
+            for instruction in &mut block.instructions {
+                if instruction.class.opcode != Op::Load
+                    || !instruction.operands.first().is_some_and(
+                        |operand| matches!(operand, Operand::IdRef(id) if roots.contains(id)),
+                    )
+                {
+                    continue;
+                }
+                let Some(null) = instruction
+                    .result_type
+                    .and_then(|result_type| nulls.get(&result_type).copied())
+                else {
+                    continue;
+                };
+                instruction.class.opcode = Op::CopyObject;
+                instruction.operands = vec![Operand::IdRef(null)];
+            }
+        }
+    }
+}
+
+/// Rewrite every `OpAtomic*` in the module whose pointer has Private storage class into the
 /// equivalent non-atomic load/op/store. Private memory is per-invocation, so there is no contention
 /// and the rewrite is semantically exact; it is also required, since SPIR-V's universal validation
 /// rules forbid atomics on Private storage. This runs after absent (function-constant-gated) buffer
 /// pointers have been re-classed to Private zero vars, which is the only way a Private atomic arises.
-pub(in crate::passes) fn rewrite_private_pointer_atomics(ctx: &mut Ctx, entry_idx: usize) {
-    // id -> result type and type id -> its OpTypePointer storage class, across globals and the entry
-    // function, so we can test whether an atomic's pointer operand has Private storage.
+pub(in crate::passes) fn rewrite_private_pointer_atomics(ctx: &mut Ctx) {
+    // id -> result type and type id -> its OpTypePointer storage class across the owned module, so
+    // helper functions cannot retain an atomic after their shared resource root becomes Private.
     let mut result_types: HashMap<Word, Word> = HashMap::new();
     let mut ptr_storages: HashMap<Word, StorageClass> = HashMap::new();
+    let mut ptr_pointees: HashMap<Word, Word> = HashMap::new();
+    let mut definitions: HashMap<Word, Instruction> = HashMap::new();
     for inst in ctx
         .module
         .types_global_values
         .iter()
         .chain(ctx.new_globals.iter())
     {
+        if let Some(result) = inst.result_id {
+            definitions.insert(result, inst.clone());
+        }
         if let (Some(rid), Some(rty)) = (inst.result_id, inst.result_type) {
             result_types.insert(rid, rty);
         }
@@ -26,11 +162,22 @@ pub(in crate::passes) fn rewrite_private_pointer_atomics(ctx: &mut Ctx, entry_id
                 (inst.result_id, inst.operands.first())
             {
                 ptr_storages.insert(rid, *sc);
+                if let Some(Operand::IdRef(pointee)) = inst.operands.get(1) {
+                    ptr_pointees.insert(rid, *pointee);
+                }
             }
         }
     }
-    for blk in &ctx.module.functions[entry_idx].blocks {
+    for blk in ctx
+        .module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+    {
         for inst in &blk.instructions {
+            if let Some(result) = inst.result_id {
+                definitions.insert(result, inst.clone());
+            }
             if let (Some(rid), Some(rty)) = (inst.result_id, inst.result_type) {
                 result_types.insert(rid, rty);
             }
@@ -41,33 +188,220 @@ pub(in crate::passes) fn rewrite_private_pointer_atomics(ctx: &mut Ctx, entry_id
     };
 
     let bool_ty = ctx.ty_bool();
-    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
-    for bi in 0..n_blocks {
-        let insts = ctx.module.functions[entry_idx].blocks[bi]
-            .instructions
-            .clone();
-        let mut out = Vec::with_capacity(insts.len());
-        for inst in insts {
-            if atomic_i32_value_operands(inst.class.opcode).is_none() {
-                out.push(inst);
-                continue;
+    let mut superseded_pointer_bitcasts = HashSet::new();
+    for function_index in 0..ctx.module.functions.len() {
+        let n_blocks = ctx.module.functions[function_index].blocks.len();
+        for bi in 0..n_blocks {
+            let insts = ctx.module.functions[function_index].blocks[bi]
+                .instructions
+                .clone();
+            let mut out = Vec::with_capacity(insts.len());
+            for inst in insts {
+                if atomic_i32_value_operands(inst.class.opcode).is_none() {
+                    out.push(inst);
+                    continue;
+                }
+                let Some(&Operand::IdRef(ptr)) = inst.operands.first() else {
+                    out.push(inst);
+                    continue;
+                };
+                if !is_private_ptr(ptr) {
+                    out.push(inst);
+                    continue;
+                }
+                let reinterpreted_source = definitions.get(&ptr).and_then(|definition| {
+                    if definition.class.opcode != Op::Bitcast {
+                        return None;
+                    }
+                    let Operand::IdRef(source) = definition.operands.first()? else {
+                        return None;
+                    };
+                    if !is_private_ptr(*source) {
+                        return None;
+                    }
+                    let source_pointer_type = result_types.get(source)?;
+                    let source_pointee = ptr_pointees.get(source_pointer_type)?;
+                    let atomic_type = inst.result_type?;
+                    let storage_width = direct_scalar_width(ctx, *source_pointee);
+                    (source_pointee != &atomic_type
+                        && storage_width.is_some()
+                        && storage_width == direct_scalar_width(ctx, atomic_type))
+                    .then_some((*source, *source_pointee))
+                });
+                if let Some((source, storage_type)) = reinterpreted_source {
+                    if lower_one_private_reinterpreted_atomic(
+                        ctx,
+                        &inst,
+                        source,
+                        storage_type,
+                        bool_ty,
+                        &mut out,
+                    )
+                    .is_some()
+                    {
+                        superseded_pointer_bitcasts.insert(ptr);
+                        continue;
+                    }
+                }
+                if lower_one_private_atomic(ctx, &inst, ptr, bool_ty, &mut out).is_none() {
+                    // Preserve unsupported semantics (for example CompareExchange). The final owned
+                    // type contract rejects the remaining Private atomic before serialization.
+                    out.push(inst);
+                }
             }
-            let Some(&Operand::IdRef(ptr)) = inst.operands.first() else {
-                out.push(inst);
-                continue;
-            };
-            if !is_private_ptr(ptr) {
-                out.push(inst);
-                continue;
-            }
-            if lower_one_private_atomic(ctx, &inst, ptr, bool_ty, &mut out).is_none() {
-                // Unsupported atomic shape (e.g. CompareExchange) — leave it; spirv-val will flag it
-                // rather than us emitting something wrong.
-                out.push(inst);
+            ctx.module.functions[function_index].blocks[bi].instructions = out;
+        }
+    }
+
+    if superseded_pointer_bitcasts.is_empty() {
+        return;
+    }
+    let mut used = HashSet::new();
+    for instruction in ctx
+        .module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+    {
+        for operand in &instruction.operands {
+            if let Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) =
+                operand
+            {
+                used.insert(*id);
             }
         }
-        ctx.module.functions[entry_idx].blocks[bi].instructions = out;
     }
+    for function in &mut ctx.module.functions {
+        for block in &mut function.blocks {
+            block.instructions.retain(|instruction| {
+                !instruction.result_id.is_some_and(|result| {
+                    superseded_pointer_bitcasts.contains(&result) && !used.contains(&result)
+                })
+            });
+        }
+    }
+}
+
+/// Lower an integer atomic on a same-width non-integer Private slot without constructing a logical
+/// pointer reinterpretation. Private storage is per-invocation, so the atomic is an ordinary
+/// load/modify/store; reinterpret only the loaded and stored values, where `OpBitcast` is legal.
+fn lower_one_private_reinterpreted_atomic(
+    ctx: &mut Ctx,
+    inst: &Instruction,
+    ptr: Word,
+    storage_type: Word,
+    bool_ty: Word,
+    out: &mut Vec<Instruction>,
+) -> Option<()> {
+    if !matches!(
+        inst.class.opcode,
+        Op::AtomicLoad
+            | Op::AtomicExchange
+            | Op::AtomicIAdd
+            | Op::AtomicISub
+            | Op::AtomicSMin
+            | Op::AtomicUMin
+            | Op::AtomicSMax
+            | Op::AtomicUMax
+            | Op::AtomicAnd
+            | Op::AtomicOr
+            | Op::AtomicXor
+    ) {
+        return None;
+    }
+    let value = if inst.class.opcode == Op::AtomicLoad {
+        None
+    } else {
+        match inst.operands.get(3) {
+            Some(Operand::IdRef(value)) => Some(*value),
+            _ => return None,
+        }
+    };
+    let result_type = inst.result_type?;
+    let result = inst.result_id?;
+    let loaded = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Load,
+        Some(storage_type),
+        Some(loaded),
+        vec![Operand::IdRef(ptr)],
+    ));
+    out.push(Instruction::new(
+        Op::Bitcast,
+        Some(result_type),
+        Some(result),
+        vec![Operand::IdRef(loaded)],
+    ));
+    if inst.class.opcode == Op::AtomicLoad {
+        return Some(());
+    }
+
+    let value = value.expect("non-load atomic value checked above");
+    let updated = match inst.class.opcode {
+        Op::AtomicExchange => value,
+        Op::AtomicIAdd | Op::AtomicISub | Op::AtomicAnd | Op::AtomicOr | Op::AtomicXor => {
+            let updated = ctx.module.fresh_id();
+            let op = match inst.class.opcode {
+                Op::AtomicIAdd => Op::IAdd,
+                Op::AtomicISub => Op::ISub,
+                Op::AtomicAnd => Op::BitwiseAnd,
+                Op::AtomicOr => Op::BitwiseOr,
+                Op::AtomicXor => Op::BitwiseXor,
+                _ => unreachable!(),
+            };
+            out.push(Instruction::new(
+                op,
+                Some(result_type),
+                Some(updated),
+                vec![Operand::IdRef(result), Operand::IdRef(value)],
+            ));
+            updated
+        }
+        Op::AtomicSMax | Op::AtomicSMin | Op::AtomicUMax | Op::AtomicUMin => {
+            let condition = ctx.module.fresh_id();
+            let compare = match inst.class.opcode {
+                Op::AtomicSMax => Op::SGreaterThan,
+                Op::AtomicSMin => Op::SLessThan,
+                Op::AtomicUMax => Op::UGreaterThan,
+                Op::AtomicUMin => Op::ULessThan,
+                _ => unreachable!(),
+            };
+            out.push(Instruction::new(
+                compare,
+                Some(bool_ty),
+                Some(condition),
+                vec![Operand::IdRef(value), Operand::IdRef(result)],
+            ));
+            let updated = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::Select,
+                Some(result_type),
+                Some(updated),
+                vec![
+                    Operand::IdRef(condition),
+                    Operand::IdRef(value),
+                    Operand::IdRef(result),
+                ],
+            ));
+            updated
+        }
+        _ => return None,
+    };
+    let stored = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Bitcast,
+        Some(storage_type),
+        Some(stored),
+        vec![Operand::IdRef(updated)],
+    ));
+    out.push(Instruction::new(
+        Op::Store,
+        None,
+        None,
+        vec![Operand::IdRef(ptr), Operand::IdRef(stored)],
+    ));
+    Some(())
 }
 
 /// Emit the non-atomic equivalent of one `OpAtomic*` on a Private pointer into `out`, returning

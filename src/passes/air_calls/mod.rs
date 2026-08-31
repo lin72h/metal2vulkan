@@ -21,8 +21,29 @@ mod reduce_bitops;
 pub(in crate::passes) use reduce_bitops::*;
 mod bfloat_glsl;
 pub(in crate::passes) use bfloat_glsl::*;
+mod tensor;
+pub(in crate::passes) use tensor::*;
 mod agx_emask;
 pub(in crate::passes) use agx_emask::*;
+
+fn copy_or_bitcast_result(
+    result_type: Word,
+    result: Word,
+    source_type: Word,
+    source: Word,
+) -> Instruction {
+    let opcode = if result_type == source_type {
+        Op::CopyObject
+    } else {
+        Op::Bitcast
+    };
+    Instruction::new(
+        opcode,
+        Some(result_type),
+        Some(result),
+        vec![Operand::IdRef(source)],
+    )
+}
 
 /// Build clamp edge operands for FClamp on possibly-vector `rty`. Scalar -> the scalar consts;
 /// vector -> OpConstantComposite splat.

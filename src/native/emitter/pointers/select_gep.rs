@@ -14,6 +14,22 @@ impl Emitter {
         let LlType::Ptr(addrspace) = self.resolve_type(&selected.ty)? else {
             return Ok(false);
         };
+        let pointee = gep_pointee(source_ty, indices)?;
+        if self.selected_value_has_access_tree(&selected.true_value)
+            || self.selected_value_has_access_tree(&selected.false_value)
+        {
+            let tree = self.build_selected_access_tree(
+                selected,
+                source_ty,
+                indices,
+                &mut HashSet::new(),
+                instructions,
+            )?;
+            self.selected_access_trees.insert(name.to_string(), tree);
+            self.pointer_pointees
+                .insert(name.to_string(), pointee.clone());
+            return Ok(true);
+        }
         let true_is_null = matches!(selected.true_value, LlValue::Zero);
         let false_is_null = matches!(selected.false_value, LlValue::Zero);
         let true_storage = (!true_is_null)
@@ -25,7 +41,6 @@ impl Emitter {
         let Some(storage) = true_storage.or(false_storage) else {
             return Ok(false);
         };
-        let pointee = gep_pointee(source_ty, indices)?;
         if let (Some(true_storage), Some(false_storage)) = (true_storage, false_storage) {
             if true_storage != false_storage {
                 let raw_arm = |emitter: &Self, value: &LlValue| match value {
@@ -79,7 +94,6 @@ impl Emitter {
                         pointee: pointee.clone(),
                         true_raw,
                         false_raw,
-                        load_typed: false,
                     },
                 );
                 self.pointer_pointees.insert(name.to_string(), pointee);
@@ -173,7 +187,6 @@ impl Emitter {
                 pointee: pointee.clone(),
                 true_raw,
                 false_raw,
-                load_typed: false,
             },
         );
         self.pointer_storage.insert(name.to_string(), storage);
@@ -183,6 +196,195 @@ impl Emitter {
             self.record_pointer_nullness(name.to_string(), is_null);
         }
         Ok(true)
+    }
+
+    fn selected_value_has_access_tree(&self, value: &LlValue) -> bool {
+        matches!(value, LlValue::Local(name) if self.selected_pointers.contains_key(name) || self.selected_access_trees.contains_key(name))
+    }
+
+    pub(in crate::native::emitter) fn build_selected_access_tree(
+        &mut self,
+        selected: &SelectedPointer,
+        source_ty: &LlType,
+        indices: &[TypedValue],
+        visiting: &mut HashSet<String>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<SelectedAccessTree, String> {
+        let LlType::Ptr(addrspace) = self.resolve_type(&selected.ty)? else {
+            return Err("native emitter: selected access tree source is not a pointer".to_string());
+        };
+        let pointee = gep_pointee(source_ty, indices)?;
+        let shape = SelectedGepShape {
+            source_ty,
+            pointee: &pointee,
+            indices,
+        };
+        let true_arm = self.build_selected_access_arm(
+            &selected.true_value,
+            &selected.ty,
+            addrspace,
+            &shape,
+            visiting,
+            instructions,
+        )?;
+        let false_arm = self.build_selected_access_arm(
+            &selected.false_value,
+            &selected.ty,
+            addrspace,
+            &shape,
+            visiting,
+            instructions,
+        )?;
+        Ok(SelectedAccessTree {
+            cond: selected.cond,
+            true_arm,
+            false_arm,
+            pointee,
+        })
+    }
+
+    fn build_selected_access_arm(
+        &mut self,
+        value: &LlValue,
+        pointer_ty: &LlType,
+        addrspace: u32,
+        shape: &SelectedGepShape<'_>,
+        visiting: &mut HashSet<String>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<SelectedAccessArm, String> {
+        if matches!(value, LlValue::Zero) {
+            return Ok(SelectedAccessArm::Null);
+        }
+        if let LlValue::Local(name) = value {
+            if let Some(nested) = self.selected_pointers.get(name).cloned() {
+                if !visiting.insert(name.clone()) {
+                    return Err("native emitter: cyclic selected access tree".to_string());
+                }
+                let tree = self.build_selected_access_tree(
+                    &nested,
+                    shape.source_ty,
+                    shape.indices,
+                    visiting,
+                    instructions,
+                )?;
+                visiting.remove(name);
+                return Ok(SelectedAccessArm::Nested(Box::new(tree)));
+            }
+            if let Some(tree) = self.selected_access_trees.get(name).cloned() {
+                let tree = self.apply_selected_access_tree_gep(
+                    &tree,
+                    shape.source_ty,
+                    shape.indices,
+                    instructions,
+                )?;
+                return Ok(SelectedAccessArm::Nested(Box::new(tree)));
+            }
+            if let Some(raw) = self.raw_offsets.get(name).cloned() {
+                return Ok(SelectedAccessArm::Raw(self.apply_raw_gep(
+                    raw,
+                    shape.source_ty,
+                    shape.indices,
+                )?));
+            }
+        }
+        let storage = self.pointer_storage_for(value, addrspace)?;
+        let ptr_type = self.ptr_type_id(storage, shape.pointee)?;
+        let ptr = self.emit_selected_pointer_access_chain(
+            ptr_type,
+            value,
+            pointer_ty,
+            shape.source_ty,
+            shape.pointee,
+            storage,
+            shape.indices,
+            instructions,
+        )?;
+        Ok(SelectedAccessArm::Typed { ptr, storage })
+    }
+
+    pub(in crate::native::emitter) fn emit_selected_access_tree_gep(
+        &mut self,
+        name: &str,
+        tree: &SelectedAccessTree,
+        source_ty: &LlType,
+        indices: &[TypedValue],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !types_compatible(&self.resolve_type(&tree.pointee)?, source_ty) {
+            return Ok(false);
+        }
+        let tree = self.apply_selected_access_tree_gep(tree, source_ty, indices, instructions)?;
+        self.pointer_pointees
+            .insert(name.to_string(), tree.pointee.clone());
+        self.selected_access_trees.insert(name.to_string(), tree);
+        Ok(true)
+    }
+
+    fn apply_selected_access_tree_gep(
+        &mut self,
+        tree: &SelectedAccessTree,
+        source_ty: &LlType,
+        indices: &[TypedValue],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<SelectedAccessTree, String> {
+        let pointee = gep_pointee(source_ty, indices)?;
+        let true_arm = self.apply_selected_access_arm_gep(
+            &tree.true_arm,
+            source_ty,
+            &pointee,
+            indices,
+            instructions,
+        )?;
+        let false_arm = self.apply_selected_access_arm_gep(
+            &tree.false_arm,
+            source_ty,
+            &pointee,
+            indices,
+            instructions,
+        )?;
+        Ok(SelectedAccessTree {
+            cond: tree.cond,
+            true_arm,
+            false_arm,
+            pointee,
+        })
+    }
+
+    fn apply_selected_access_arm_gep(
+        &mut self,
+        arm: &SelectedAccessArm,
+        source_ty: &LlType,
+        pointee: &LlType,
+        indices: &[TypedValue],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<SelectedAccessArm, String> {
+        match arm {
+            SelectedAccessArm::Typed { ptr, storage } => {
+                let ptr_type = self.ptr_type_id(*storage, pointee)?;
+                let ptr = self.emit_selected_pointer_access_chain_from_id(
+                    ptr_type,
+                    *ptr,
+                    *storage,
+                    source_ty,
+                    pointee,
+                    indices,
+                    instructions,
+                )?;
+                Ok(SelectedAccessArm::Typed {
+                    ptr,
+                    storage: *storage,
+                })
+            }
+            SelectedAccessArm::Raw(raw) => Ok(SelectedAccessArm::Raw(self.apply_raw_gep(
+                raw.clone(),
+                source_ty,
+                indices,
+            )?)),
+            SelectedAccessArm::Nested(nested) => Ok(SelectedAccessArm::Nested(Box::new(
+                self.apply_selected_access_tree_gep(nested, source_ty, indices, instructions)?,
+            ))),
+            SelectedAccessArm::Null => Ok(SelectedAccessArm::Null),
+        }
     }
 
     pub(in crate::native::emitter) fn emit_selected_load_pointer_gep(
@@ -259,7 +461,6 @@ impl Emitter {
                 pointee: pointee.clone(),
                 true_raw,
                 false_raw,
-                load_typed: false,
             },
         );
         if selected.true_storage == selected.false_storage {
@@ -490,9 +691,13 @@ impl Emitter {
                 return Ok(result);
             }
         }
+        let spirv_indices = gep_spirv_indices(indices)?;
+        if spirv_indices.is_empty() {
+            return Ok(base);
+        }
         let op = pointer_arithmetic_access_chain_op_for_storage(storage, false, pointee, indices);
         let mut ops = vec![Operand::IdRef(base)];
-        for idx in gep_spirv_indices(indices)? {
+        for idx in spirv_indices {
             ops.push(Operand::IdRef(self.value_id(&idx.value, &idx.ty)?));
         }
         let result = self.fresh();
@@ -584,9 +789,13 @@ impl Emitter {
         // Structured path: use pointer-arithmetic opcode selection so a non-zero leading index on a
         // StorageBuffer aggregate arm becomes OpPtrAccessChain (element stride), matching the
         // scalar-arm flatten's relative offset semantics.
+        let spirv_indices = gep_spirv_indices(indices)?;
+        if spirv_indices.is_empty() {
+            return Ok(base);
+        }
         let op = pointer_arithmetic_access_chain_op_for_storage(storage, false, pointee, indices);
         let mut ops = vec![Operand::IdRef(base)];
-        for idx in gep_spirv_indices(indices)? {
+        for idx in spirv_indices {
             ops.push(Operand::IdRef(self.value_id(&idx.value, &idx.ty)?));
         }
         let result = self.fresh();

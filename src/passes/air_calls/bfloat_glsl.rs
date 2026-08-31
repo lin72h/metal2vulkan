@@ -215,7 +215,7 @@ fn select_canonical_bfloat_nan_bits(
 
 /// GLSL.std.450 opcode for the simple unary/binary/ternary math intrinsics.
 pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
-    use GLSLstd450::*;
+    use spirv::GlslStd450Op::*;
     // atan2 is binary; keep it early for clarity. The ExtInst caller forwards all args.
     Some(if is_air_math(name, "atan2") {
         Atan2
@@ -302,59 +302,5 @@ pub(in crate::passes) fn is_air_math(name: &str, stem: &str) -> bool {
     rest.starts_with(stem) && rest.as_bytes().get(stem.len()) == Some(&b'.')
 }
 
-/// GLSL.std.450 extended-instruction numbers (subset we emit).
-#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
-#[derive(Clone, Copy)]
-pub(in crate::passes) enum GLSLstd450 {
-    Round = 1,
-    RoundEven = 2,
-    SAbs = 5,
-    FAbs = 4,
-    FSign = 6,
-    Floor = 8,
-    Ceil = 9,
-    Fract = 10,
-    Sin = 13,
-    Cos = 14,
-    Tan = 15,
-    Asin = 16,
-    Acos = 17,
-    Atan = 18,
-    Sinh = 19,
-    Cosh = 20,
-    Tanh = 21,
-    Asinh = 22,
-    Acosh = 23,
-    Atanh = 24,
-    Atan2 = 25,
-    Pow = 26,
-    Exp = 27,
-    Log = 28,
-    Exp2 = 29,
-    Log2 = 30,
-    Sqrt = 31,
-    InverseSqrt = 32,
-    FMin = 37,
-    UMin = 38,
-    SMin = 39,
-    FMax = 40,
-    UMax = 41,
-    SMax = 42,
-    FClamp = 43,
-    UClamp = 44,
-    SClamp = 45,
-    FMix = 46,
-    Trunc = 3,
-    Fma = 50,
-    Ldexp = 53,
-    PackSnorm4x8 = 54,
-    PackUnorm4x8 = 55,
-    PackSnorm2x16 = 56,
-    PackUnorm2x16 = 57,
-    PackHalf2x16 = 58,
-    UnpackSnorm2x16 = 60,
-    UnpackUnorm2x16 = 61,
-    UnpackHalf2x16 = 62,
-    UnpackSnorm4x8 = 63,
-    UnpackUnorm4x8 = 64,
-}
+/// Khronos-owned GLSL.std.450 opcode vocabulary used by the lowering and owned verifier.
+pub(in crate::passes) type GLSLstd450 = spirv::GlslStd450Op;

@@ -3,25 +3,9 @@
 use super::*;
 
 impl Emitter {
-    /// The instruction's operands as typed values resolved by the typed SSA IR (`tir`), or `None` if the
-    /// graph did not resolve every operand (the caller then falls back to string parsing). This is the
-    /// single entry point for R3 graph-driven emission: an opcode is "migrated" once its emitter reads
-    /// its operands from here instead of re-lexing the instruction text.
-    pub(in crate::native::emitter) fn tir_typed_operands(
-        &self,
-        name: &str,
-    ) -> Option<Vec<TypedValue>> {
-        self.tir_operands
-            .get(name)?
-            .iter()
-            .map(crate::native::tir::TirOperand::as_typed_value)
-            .collect()
-    }
-
-    /// The typed operands of a `TirInst` read STRAIGHT off the instruction (not via the `tir_operands`
-    /// side-table keyed by result name), or `None` if any operand is `Unresolved`. This is the M-A4
-    /// graph-walk operand source — byte-identical to `tir_typed_operands(name)` for a result-bearing
-    /// instruction, since `emit_function` populates that map from this same `inst.operands`.
+    /// The typed operands of a `TirInst` read straight off the instruction, or `None` if any operand is
+    /// `Unresolved`. This direct carrier is the sole M-A4 graph-walk operand source; emission does not
+    /// retain a parallel result-keyed clone.
     pub(in crate::native::emitter) fn tir_inst_typed_operands(
         &self,
         inst: &crate::native::tir::TirInst,
@@ -30,34 +14,6 @@ impl Emitter {
             .iter()
             .map(crate::native::tir::TirOperand::as_typed_value)
             .collect()
-    }
-
-    /// The phi's incoming `(value, predecessor-label)` pairs, with the VALUES sourced from the typed
-    /// graph. `phi` carries an SSA result, so its value operands live in `tir_operands` (one per
-    /// incoming, in source order — `resolve_phi_operands` keeps the first field of each `[ val, pred ]`
-    /// chunk and drops the predecessor label). The predecessor LABELS are control-flow edges that exist
-    /// only in the instruction text, so they always come from `parsed`. When the graph resolved exactly
-    /// one operand per incoming, each parsed value is replaced by the graph's; on any count mismatch or
-    /// unresolved operand the parsed values stand (and the `METAL2VULKAN_TIR_ONLY` gate fires). tir's phi
-    /// operands are proven sound broadly — including the synthetic `%metal2vulkan.lmerge.*` merge phis the
-    /// structurizer adds — so this is byte-identical to parsing; it routes the value sourcing through
-    /// the typed graph rather than the parsed text.
-    pub(in crate::native::emitter) fn phi_incoming_values(
-        &self,
-        name: &str,
-        parsed: Vec<(LlValue, String)>,
-    ) -> Vec<(LlValue, String)> {
-        if let Some(operands) = self.tir_typed_operands(name) {
-            if operands.len() == parsed.len() {
-                return operands
-                    .into_iter()
-                    .zip(parsed)
-                    .map(|(op, (_, label))| (op.value, label))
-                    .collect();
-            }
-        }
-        Self::tir_only_gate(name, "phi");
-        parsed
     }
 
     /// Overlay typed-graph `operands` onto a direct call's parsed argument values, returning whether it
@@ -80,30 +36,21 @@ impl Emitter {
         true
     }
 
-    /// Source a result-bearing direct call's argument values from the typed graph (keyed by the SSA
-    /// result `name`, as the straight-line ops are), falling back to the parsed args on any count
-    /// mismatch or unresolved operand. Byte-identical to parsing by tir's call-operand soundness.
-    pub(in crate::native::emitter) fn apply_tir_call_args(&self, name: &str, call: &mut LlCall) {
-        match self.tir_typed_operands(name) {
-            Some(ops) if Self::overlay_call_args(&mut call.args, &ops) => {}
-            _ => Self::tir_only_gate(name, "call"),
-        }
-    }
-
-    /// Source a result-LESS (void) direct call's argument values STRAIGHT off the `TirInst.operands` in the
-    /// graph walk (a void call has no SSA result, so it cannot be keyed in `tir_operands`). Byte-identical
-    /// to parsing by tir's call-operand soundness: the same `overlay_call_args` runs on the same operands.
+    /// Source a direct call's argument values straight off `TirInst.operands` in the graph walk.
+    /// Byte-identical to parsing by tir's call-operand soundness: the same `overlay_call_args` runs on
+    /// the same operands for result-bearing and result-less calls.
     /// Falls back to the parsed args on any count mismatch or unresolved operand (the `METAL2VULKAN_TIR_ONLY`
     /// gate fires). The former text-walk analogue (`apply_tir_void_call_args`, popping a per-block
     /// `tir_call_queue`) is retired — the text-walk fallback just uses the parsed args.
-    pub(in crate::native::emitter) fn apply_tir_inst_void_call_args(
+    pub(in crate::native::emitter) fn apply_tir_inst_call_args(
         &self,
         inst: &crate::native::tir::TirInst,
+        diagnostic_name: &str,
         call: &mut LlCall,
     ) {
         match self.tir_inst_typed_operands(inst) {
             Some(ops) if Self::overlay_call_args(&mut call.args, &ops) => {}
-            _ => Self::tir_only_gate("void", "call"),
+            _ => Self::tir_only_gate(diagnostic_name, "call"),
         }
     }
 

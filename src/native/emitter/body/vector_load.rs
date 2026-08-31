@@ -778,7 +778,7 @@ impl Emitter {
         Ok(types_compatible(
             &gep_pointee(&provenance.source_ty, &provenance.indices)?,
             elem,
-        ))
+        ) && self.gep_provenance_strides_contiguous(ptr, elem)?)
     }
 
     pub(in crate::native::emitter) fn emit_gep_provenance_lane_ptr(

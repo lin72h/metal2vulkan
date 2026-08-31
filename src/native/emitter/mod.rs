@@ -1,8 +1,9 @@
 use super::cfg::{
-    block_index_by_label, funnel_shared_branch_dispatches, id_ref_operand,
+    funnel_shared_branch_dispatches, index_branch_merges_by_header,
     infer_bounded_branch_merges_by_header, infer_branch_merges, infer_direct_branch_merges,
     infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
-    lower_unstructured_switches, refunnel_one_deep_shared_arm, LoopMergeInfo,
+    lower_unstructured_switches, privatize_reused_emitted_merge_targets,
+    refunnel_one_deep_shared_arm, LoopMergeInfo,
 };
 use super::ir::{
     LlDeclaration, LlFunction, LlGep, LlGlobal, LlModule, LlType, LlTypeCapability, LlValue,
@@ -15,18 +16,20 @@ use super::parse::{
     LlLoad,
 };
 use crate::spirv_module::Operand;
-use crate::spirv_module::{Block, Function, Instruction, Module, ModuleHeader};
+use crate::spirv_module::{
+    is_block_terminator, Block, Function, Instruction, Module, ModuleHeader,
+};
 use crate::types::TypeInterner;
 use spirv::{
-    AddressingModel, Capability, FunctionControl, GlslStd450Op, LoopControl, MemoryModel,
-    MemorySemantics, Op, Scope, SelectionControl, SourceLanguage, StorageClass, Word,
+    AddressingModel, Capability, FunctionControl, GlslStd450Op, LoopControl, MemoryAccess,
+    MemoryModel, MemorySemantics, Op, Scope, SelectionControl, SourceLanguage, StorageClass, Word,
 };
 use std::collections::{HashMap, HashSet};
 
 mod air_struct_offsets;
 mod body;
 mod control;
-mod functions;
+pub(super) mod functions;
 mod helpers;
 mod memory;
 mod ops;
@@ -50,6 +53,25 @@ pub(super) struct Emitter {
     interner: TypeInterner,
     glsl_ext: Option<Word>,
     values: HashMap<String, (Word, LlType)>,
+    /// Fast floating-point multiply definitions in the current function. LLVM's `fast` contract
+    /// permits a multiply consumed by a fast add to contract. Retaining the typed operands
+    /// lets emission express that contraction explicitly as GLSL.std.450 `Fma`, independent of a
+    /// downstream SPIR-V consumer's optimizer choices.
+    fast_float_products: HashMap<String, (TypedValue, TypedValue)>,
+    fast_grouped_sums: HashMap<String, (Vec<(TypedValue, bool)>, Vec<(TypedValue, bool)>, bool)>,
+    /// Fast sum trees whose direct-product/difference-product topology requires explicit evaluation
+    /// partitions. Without these boundaries, an MSL round trip flattens the source AIR tree and
+    /// changes cancellation residuals even though both forms permit reassociation.
+    fast_partitioned_sums: HashMap<String, Vec<Vec<TypedValue>>>,
+    fast_grouped_sum_boundaries: HashSet<String>,
+    /// Fast add results belonging to a long multiply-accumulate chain. Short source chains already
+    /// retain AIR's contraction behavior through ordinary MSL expression lowering; explicit `Fma`
+    /// is reserved for chains long enough that downstream expression materialization loses it.
+    fast_contract_adds: HashSet<String>,
+    /// Fast add chains rooted in the sum of two already-rounded products. These are ordinary sum
+    /// trees, not multiply-accumulate trees: preserve their product boundary while allowing a chain
+    /// rooted in a non-product accumulator to contract its single product operands.
+    fast_uncontracted_sums: HashSet<String>,
     global_values: HashMap<String, (Word, LlType)>,
     /// Module globals (kebab here: `@name`) that are the pointer operand of an integer atomic
     /// (`air.atomic.*.i32`) but are declared with a 32-bit-bitcastable *non*-integer scalar pointee
@@ -71,15 +93,34 @@ pub(super) struct Emitter {
     /// and AIR aggregate GEP views linearize to scalar indices from that flat root.
     flat_scalar_reinterpret_globals: HashMap<String, LlType>,
     gep_provenance: HashMap<String, GepProvenance>,
+    /// Byte addresses proven to name only padding in a Workgroup struct. Logical SPIR-V cannot
+    /// materialize the corresponding `uchar*` from the struct pointer, so these remain symbolic
+    /// until a zero-write consumer either proves the complete range is padding or fails visibly.
+    /// No invalid pointer instruction is constructed in either case.
+    workgroup_padding_byte_pointers: HashMap<String, WorkgroupPaddingBytePointer>,
     selected_pointers: HashMap<String, SelectedPointer>,
     selected_load_pointers: HashMap<String, SelectedLoadPointer>,
+    /// A deferred pointer-select tree after a GEP has been applied independently to every concrete
+    /// leaf. This preserves each leaf's requested pointee type through nested load/store replay.
+    selected_access_trees: HashMap<String, SelectedAccessTree>,
     vector_word_roots: HashMap<Word, VectorWordRoot>,
     vector_word_pointers: HashMap<String, VectorWordPointer>,
     local_pointer_fields: HashMap<LocalPointerField, TypedValue>,
+    /// Exact source replayed by each load from a statically identified local pointer field.
+    /// Pointer merges use this to see through repeated field loads without relying on SSA names.
+    pointer_forward_values: HashMap<String, TypedValue>,
     raw_memcpy_shadows: HashMap<String, Vec<(u64, Word)>>,
     imageblock_data_scratch: Option<(Word, LlType)>,
     dynamic_pointer_tables: HashMap<String, DynamicPointerTable>,
     forward_geps: HashMap<String, LlGep>,
+    /// Pointer-select arms from the finalized typed graph, available before block-order emission.
+    /// Loop-header pointer phis use this to recognize a backedge carried by a later select and reserve
+    /// the corresponding index SSA values before either the select or its GEP arm is emitted.
+    forward_pointer_selects: HashMap<String, (TypedValue, TypedValue)>,
+    /// Conditions for the pointer selects above. BDA address phis may consume a select defined on a
+    /// later predecessor edge, so address-domain construction needs the complete select expression,
+    /// not only its two pointer arms.
+    forward_pointer_select_conditions: HashMap<String, TypedValue>,
     pointer_storage: HashMap<String, StorageClass>,
     pointer_pointees: HashMap<String, LlType>,
     local_alloca_pointees: HashMap<String, LlType>,
@@ -88,10 +129,49 @@ pub(super) struct Emitter {
     /// typed graph before block emission so a loop-header address phi can reserve a backedge value
     /// whose `inttoptr` definition appears in the latch.
     bda_inttoptr_sources: HashMap<String, TypedValue>,
+    /// Integer payload loads whose sole consumer reconstructs an opaque AIR resource pointer.
+    /// AIR sometimes spells a texture-array handle load as `load i64` + `inttoptr`; retaining that
+    /// exact def/use fact lets emission construct the logical resource load directly.
+    opaque_resource_payload_loads: HashMap<String, String>,
+    /// Exact source values for pointer operations that preserve the underlying device address.
+    /// Collected before block emission so an address phi may follow an alias defined in a later
+    /// structurized block.
+    bda_forward_sources: HashMap<String, TypedValue>,
+    /// Device-pointer loads whose result id becomes an integer address in the BDA construction
+    /// phase. Kept separately from identity forwards because the load result itself is the address
+    /// carrier, even when its definition is emitted after an address phi that uses it.
+    bda_address_loads: HashSet<String>,
+    /// Pointer definitions whose typed dependency chain is rooted in a direct device address.
+    /// Computed before block emission so construct-tree header phis can reserve address results for
+    /// concrete GEP/load definitions that appear in later dispatcher cases.
+    bda_forward_addresses: HashSet<String>,
     /// Runtime 64-bit addresses for descriptor-rooted direct buffer parameters. In BDA mode these
     /// are materialized once in the entry block from the reflected buffer-address sidecar, then used
     /// as ordinary dominating integer values by address-domain pointer merges.
     bda_direct_addresses: HashMap<String, Word>,
+    /// Every emitted SSA value that represents a runtime BDA address. Per-function name maps are
+    /// cleared between functions, but aggregate field legalization runs after all helper bodies are
+    /// emitted and therefore needs the module-wide value identities.
+    bda_address_values: HashSet<Word>,
+    /// Logical pointer SSA ids whose exact runtime representation is a separately emitted 64-bit
+    /// device address. Aggregate construction uses this module-wide map after helper emission so a
+    /// pointer-shaped insert is replaced by its address before the containing field is retyped.
+    bda_pointer_addresses: HashMap<Word, Word>,
+    /// BDA address carriers nested in by-value aggregate SSA values, keyed by the aggregate's AIR
+    /// value name and exact constant member path. This preserves the distinction between the
+    /// address of a device-pointer table and an address loaded from that table while aggregates
+    /// cross an inlined helper boundary.
+    bda_aggregate_addresses: HashMap<String, HashMap<Vec<u32>, Word>>,
+    /// Pointer carriers nested in by-value aggregate SSA values, keyed by exact constant member
+    /// path. The SPIR-V aggregate stores only its non-pointer data representation; extraction
+    /// restores the original typed pointer/raw cursor directly from this carrier.
+    aggregate_pointer_values: HashMap<String, HashMap<Vec<u32>, TypedValue>>,
+    /// Pointer values whose complete typed use closure is an opaque AIR texture contract. A module
+    /// may use physical device addresses and argument-buffer textures simultaneously; these values
+    /// must retain logical handle construction instead of being converted to addresses.
+    opaque_resource_pointer_values: HashMap<String, HashSet<String>>,
+    opaque_resource_pointers: HashSet<String>,
+    opaque_resource_ids: HashSet<Word>,
     /// The two little-endian 32-bit words of a serialized 64-bit pointer loaded through a raw
     /// buffer view. Logical SPIR-V pointers cannot represent or compare this wire payload, so raw
     /// pointer equality and stores operate on these integer words instead.
@@ -138,20 +218,21 @@ pub(super) struct Emitter {
     branch_merges_by_header: HashMap<String, String>,
     /// The current function was planned by the construct tree, whose merge ownership is keyed by
     /// header rather than by a potentially shared target pair. This is per-function provenance:
-    /// enabling the construct-tree retry for the module does not change how normally planned helper
-    /// functions look up their merges.
+    /// a construct-tree-owned function does not change how normally planned helpers look up merges.
     branch_merges_header_only: bool,
     loop_merges: HashMap<String, LoopMergeInfo>,
     switch_merges: HashMap<String, String>,
     current_block: Option<String>,
-    /// R3 graph-driven emission: the current function's instruction operands resolved by the typed SSA
-    /// IR (`tir`), keyed by result `%name`. Emission for the opcode shapes tir lowers (binary ops) reads
-    /// its operands from here instead of re-lexing the instruction text; absent/`Unresolved` entries
-    /// fall back to the string path. Rebuilt per function in `emit_function` (empty if
-    /// `build_from_blocks` fails, so emission degrades to the string path — floor-safe).
-    tir_operands: HashMap<String, Vec<crate::native::tir::TirOperand>>,
+    /// Instructions needed to materialize an `OpPhi` incoming value, owned by the source edge's
+    /// predecessor block. Phi lowering records these while visiting the destination block; function
+    /// assembly inserts them before the named predecessor's merge/terminator.
+    phi_edge_instructions: HashMap<Word, Vec<Instruction>>,
+    /// Instructions that materialize values represented by leading phis (currently logical pointers
+    /// represented as index phis). They are emitted immediately after every phi in the current block,
+    /// so later source phis cannot be displaced from SPIR-V's required leading-phi region.
+    phi_result_instructions: Vec<Instruction>,
     /// R3 graph-driven emission: the typed SSA IR's resolved RESULT TYPE for each `%name`, keyed by
-    /// result name (the dual of `tir_operands`, which carries operand types). Emitters that today
+    /// result name. Emitters that today
     /// re-lex a result/destination type from the instruction text (e.g. the `<conv> .. to <dstty>`
     /// destination type) read it from here instead, retiring that text parse. Byte-neutral: tir
     /// computes the same `parse_type(dst)` the text path does, so `resolve_type` of either is identical.
@@ -169,18 +250,18 @@ pub(super) struct Emitter {
     /// re-lexing the trailing `, align N` field, retiring that structural-literal parse. Byte-neutral:
     /// tir computes it via the same `parse_memory_alignment` the text path uses. Absent entries fall
     /// back to the parsed `LlLoad.align`. In the graph walk `store` (result-LESS) sources its alignment
-    /// straight from `inst.mem_align` at the dispatch site instead.
+    /// straight from `inst.mem_align()` at the dispatch site instead.
     tir_aligns: HashMap<String, Option<u64>>,
     /// R3 graph-driven emission: the typed SSA IR's `getelementptr` SOURCE element type for each gep
-    /// result, keyed by result name. The `getelementptr` emitter builds its `LlGep` from this (plus the
-    /// base/index operands in `tir_operands`) instead of re-parsing the line with `parse_gep`, retiring
+    /// result, keyed by result name. The `getelementptr` emitter builds its `LlGep` from this and the
+    /// instruction's direct typed carrier instead of re-parsing the line with `parse_gep`, retiring
     /// that emit-time re-lex on the R4-critical pointer path. Byte-identical: tir computes the source_ty
     /// via the same `parse_gep`. Absent entries fall back to the string parse. Rebuilt per function in
     /// `emit_function`.
     tir_gep_source_types: HashMap<String, crate::native::ir::LlType>,
     /// M1 (pointer-typing rewrite): the USE-based pointee carried on every pointer SSA value, keyed by
     /// result `%name`. Sourced once per function from the structurized typed-IR graph
-    /// (`tir::build_from_blocks(..).use_pointees`, the SAME graph `tir_operands` is built from), it gives
+    /// (`tir::build_from_blocks(..).use_pointees`), it gives
     /// emission the pointee a pointer is actually *dereferenced* as — a `load`/`store` type, a GEP source
     /// element type, an atomic element type — propagated across `select`/`phi`/`freeze` pointer merges to
     /// a fixpoint (see [`crate::native::tir::TirFunction::use_pointees`]). This is the data carrier the
@@ -194,14 +275,18 @@ pub(super) struct Emitter {
     /// slices widen consumption to the divergence set behind the BC byte-drift gate / the frontier
     /// battery. Rebuilt per function in `emit_function`.
     tir_use_pointees: HashMap<String, crate::native::ir::LlType>,
-    /// The pointers `tir_use_pointees` resolved that ALSO carry a byte (`i8`) view — a byte-cursor
-    /// `getelementptr i8` / `i8` load-store / byte atomic (see
-    /// [`crate::native::tir::TirFunction::byte_view_pointers`]). The M2 byte→real pointee upgrade in
-    /// `pointer_pointee_for_value` must skip these: their carrier is wider than `i8`, but the emitter
-    /// still emits their byte cursor as a `uchar`-result `OpPtrAccessChain`, so upgrading the pointee
-    /// strands it (globally-invalid SPIR-V). Only the pure-widening subset (absent from this set) is
-    /// safe to flip. Rebuilt per function in `emit_function`.
-    tir_byte_view_pointers: std::collections::HashSet<String>,
+    /// Pointer SSA values whose complete typed-IR use set consists of direct loads. A select in this
+    /// set may be represented by independently loading its concrete arms and selecting the resulting
+    /// values when opaque-pointer provenance gives those arms incompatible provisional pointees.
+    /// Values used by stores, calls, GEPs, or any other instruction are deliberately excluded.
+    tir_direct_load_pointers: HashSet<String>,
+    /// Pointers whose concrete representation carries a byte (`i8`) view. Seeded from the typed IR's
+    /// byte-cursor/load/store/atomic census, then extended when GEP construction deliberately emits a
+    /// `uchar` pointer for a wider logical source and propagated through transparent pointer aliases.
+    /// The M2 byte→real pointee upgrade in `pointer_pointee_for_value` must skip these: their use
+    /// carrier can be wider than `i8`, but upgrading the recorded pointee would strand an emitted
+    /// `uchar` pointer and make a later typed load invalid. Rebuilt per function in `emit_function`.
+    byte_view_pointers: std::collections::HashSet<String>,
     /// M-A2 def-site network-pointee recording: the uniform pointee to record at every def
     /// site of a pointer network (connected component over phi/select edges) whose tir-carrier
     /// granularity is consistent across the component. Consulted by `pointer_meta_for_value` for a
@@ -209,18 +294,22 @@ pub(super) struct Emitter {
     /// `Int(8)` the raw recording flattens the byte-addressed arm to. Rebuilt per function in
     /// `emit_function`; empty (no effect) unless the flag is set.
     network_pointees: HashMap<String, crate::native::ir::LlType>,
-    /// When true, `emit_function` attempts the R2 cross-arm restructure (full-closure tail duplication
-    /// + return unification) for a function `structured_plan` rejects, taking the transformed blocks if
-    ///   they then admit a structured plan. This produces a CANDIDATE that the caller (the
-    ///   `inline_sroa_raw_cfg_restructure` retry tier) keeps ONLY if the whole module then passes
-    ///   spirv-val — the adopt-if-VALIDATES discipline. The DEFAULT emit path leaves this false so a
-    ///   reject emits its inferred merges unrepaired and the unsafe in-emit adopt-if-ADMITS can never
-    ///   hijack an admitting case. Set via [`with_cfg_restructure`].
-    cfg_restructure: bool,
-    /// When true, `emit_function` attempts the reject-only construct-tree own-arm candidate for a
-    /// function `structured_plan` rejects. The default emitter leaves this false; the retry cascade sets
-    /// it only after the primary module fails CFG validation and adopts only a validating module.
-    construct_tree: bool,
+    /// Closed pointer components whose only concrete leaves are null/undef. Their pointer payload is
+    /// unobservable in every defined execution; nullness remains a separate exact SSA carrier.
+    null_rooted_pointer_values: HashSet<String>,
+    null_rooted_pointer_peers: HashMap<String, Vec<String>>,
+    /// Whether the current function is being emitted from a construct-tree ownership plan. This is
+    /// reset before planning each function and permits forward SSA ids only for the reordered graph
+    /// that needs them; ordinary admitted functions keep their stricter source-order contract.
+    construct_tree_active: bool,
+    /// Exact same-CFG functions already rejected by the ordinary source ownership planner.
+    known_ordinary_plan_rejections: HashSet<String>,
+    /// Structural CFG shapes rejected earlier in this emission. Template specializations commonly
+    /// repeat the same control-flow and opcode shape under different symbol identities; one pure
+    /// planner rejection is sufficient for all exact-shape peers.
+    ordinary_plan_rejected_shapes: HashSet<String>,
+    /// Exact same-CFG functions already rejected by the complete source-ownership ladder.
+    known_ownership_plan_rejections: HashSet<String>,
     /// When true, `emit_function` SKIPS the structured-plan attempt entirely — even for a function
     /// `structured_plan` WOULD admit — emitting the raw blocks without branch/loop inferred merge
     /// hints or structuring. Switches still need a merge target to encode `OpSwitch`; the W2 relooper
@@ -252,9 +341,9 @@ pub(super) struct Emitter {
     /// it (address + struct/array offset). This is the honest lowering of the "BDA" frontier class
     /// (Apple BVH builders that load/store/deref a device pointer): byte-correct by construction (the
     /// stored bytes are the exact loaded address; the deref is `address + offset` with no tag-bit
-    /// manipulation), valid SPIR-V under `buffer_device_address`. Off by default (the default Logical
-    /// emit is byte-identical); set via [`with_bda_device_pointers`] for the adopt-if-validates BDA
-    /// retry tier. See [`RawBufferOffset::device_addr_base`].
+    /// manipulation), valid SPIR-V under `buffer_device_address`. The primary entry selects it from
+    /// typed pointer-producing instructions; BDA+CFG retries preserve the same model while changing
+    /// only structurization. See [`RawBufferOffset::device_addr_base`].
     bda_device_pointers: bool,
     /// Set true the first time a device-address (`device_addr_base`) leaf load/store is emitted, so
     /// [`emit`] flips the module to the `PhysicalStorageBuffer64` addressing model (+ `Int64` /
@@ -271,6 +360,16 @@ struct GepProvenance {
     indices: Vec<TypedValue>,
     root_indices: Option<Vec<TypedValue>>,
     root_is_indexed_container: bool,
+}
+
+fn bda_address_name(name: &str) -> String {
+    format!("{name}.metal2vulkan.bda_address")
+}
+
+#[derive(Clone, Debug)]
+struct WorkgroupPaddingBytePointer {
+    struct_ty: LlType,
+    byte_offset: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -291,10 +390,28 @@ struct SelectedLoadPointer {
     pointee: LlType,
     true_raw: Option<RawBufferOffset>,
     false_raw: Option<RawBufferOffset>,
-    /// The arms are already-typed pointers whose modeled pointee is unknown (e.g. a select between
-    /// pointers into distinct buffers, which cannot be a legal Logical-SPIR-V `OpSelect`). The load
-    /// drives the value type: load each arm with the load's result type and select the values.
-    load_typed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SelectedAccessTree {
+    cond: Word,
+    true_arm: SelectedAccessArm,
+    false_arm: SelectedAccessArm,
+    pointee: LlType,
+}
+
+#[derive(Clone, Debug)]
+enum SelectedAccessArm {
+    Typed { ptr: Word, storage: StorageClass },
+    Raw(RawBufferOffset),
+    Nested(Box<SelectedAccessTree>),
+    Null,
+}
+
+struct SelectedGepShape<'a> {
+    source_ty: &'a LlType,
+    pointee: &'a LlType,
+    indices: &'a [TypedValue],
 }
 
 #[derive(Clone, Debug)]
@@ -412,7 +529,10 @@ impl Emitter {
     pub(super) fn new(mut ir: LlModule) -> Self {
         ir.inline_simple_static_initializers();
         ir.fold_static_initializer_constants();
+        ir.prune_unreachable_function_bodies();
         ir.inline_ordinary_leaf_helpers();
+        let opaque_resource_pointer_values =
+            functions::opaque_resource_pointer_values_by_function(&ir);
         let air_data_layout = ir.air_data_layout.clone();
         let mut module = Module::new();
         module.capabilities.push(Instruction::new(
@@ -447,26 +567,48 @@ impl Emitter {
             interner: TypeInterner::new(),
             glsl_ext: None,
             values: HashMap::new(),
+            fast_float_products: HashMap::new(),
+            fast_grouped_sums: HashMap::new(),
+            fast_partitioned_sums: HashMap::new(),
+            fast_grouped_sum_boundaries: HashSet::new(),
+            fast_contract_adds: HashSet::new(),
+            fast_uncontracted_sums: HashSet::new(),
             global_values: HashMap::new(),
             int_atomic_reinterpret_globals: HashSet::new(),
             byte_view_reinterpret_globals: HashSet::new(),
             flat_scalar_reinterpret_globals: HashMap::new(),
             gep_provenance: HashMap::new(),
+            workgroup_padding_byte_pointers: HashMap::new(),
             selected_pointers: HashMap::new(),
             selected_load_pointers: HashMap::new(),
+            selected_access_trees: HashMap::new(),
             vector_word_roots: HashMap::new(),
             vector_word_pointers: HashMap::new(),
             local_pointer_fields: HashMap::new(),
+            pointer_forward_values: HashMap::new(),
             raw_memcpy_shadows: HashMap::new(),
             imageblock_data_scratch: None,
             dynamic_pointer_tables: HashMap::new(),
             forward_geps: HashMap::new(),
+            forward_pointer_selects: HashMap::new(),
+            forward_pointer_select_conditions: HashMap::new(),
             pointer_storage: HashMap::new(),
             pointer_pointees: HashMap::new(),
             local_alloca_pointees: HashMap::new(),
             pointer_nullness: HashMap::new(),
             bda_inttoptr_sources: HashMap::new(),
+            opaque_resource_payload_loads: HashMap::new(),
+            bda_forward_sources: HashMap::new(),
+            bda_address_loads: HashSet::new(),
+            bda_forward_addresses: HashSet::new(),
             bda_direct_addresses: HashMap::new(),
+            bda_address_values: HashSet::new(),
+            bda_pointer_addresses: HashMap::new(),
+            bda_aggregate_addresses: HashMap::new(),
+            aggregate_pointer_values: HashMap::new(),
+            opaque_resource_pointer_values,
+            opaque_resource_pointers: HashSet::new(),
+            opaque_resource_ids: HashSet::new(),
             pointer_payload_words: HashMap::new(),
             pointer_payload_values: HashSet::new(),
             pointer_phi_values: HashSet::new(),
@@ -495,16 +637,22 @@ impl Emitter {
             loop_merges: HashMap::new(),
             switch_merges: HashMap::new(),
             current_block: None,
-            tir_operands: HashMap::new(),
+            phi_edge_instructions: HashMap::new(),
+            phi_result_instructions: Vec::new(),
             tir_result_types: HashMap::new(),
             tir_predicates: HashMap::new(),
             tir_aligns: HashMap::new(),
             tir_gep_source_types: HashMap::new(),
             tir_use_pointees: HashMap::new(),
+            tir_direct_load_pointers: HashSet::new(),
             network_pointees: HashMap::new(),
-            tir_byte_view_pointers: std::collections::HashSet::new(),
-            cfg_restructure: false,
-            construct_tree: false,
+            null_rooted_pointer_values: HashSet::new(),
+            null_rooted_pointer_peers: HashMap::new(),
+            byte_view_pointers: std::collections::HashSet::new(),
+            construct_tree_active: false,
+            known_ordinary_plan_rejections: HashSet::new(),
+            ordinary_plan_rejected_shapes: HashSet::new(),
+            known_ownership_plan_rejections: HashSet::new(),
             relooper_feed: false,
             capture_storage: false,
             storage_snapshots: Vec::new(),
@@ -515,26 +663,20 @@ impl Emitter {
         }
     }
 
-    /// Enable BDA device-pointer modeling (see [`Self::bda_device_pointers`]). The caller marks device
-    /// buffers raw and adopts the result only if it independently passes spirv-val, so the default
-    /// Logical emission is never altered.
+    /// Enable BDA device-pointer modeling (see [`Self::bda_device_pointers`]). The caller has already
+    /// established the address-domain requirement structurally and marks device buffers raw.
     pub(super) fn with_bda_device_pointers(mut self) -> Self {
         self.bda_device_pointers = true;
         self
     }
 
-    /// Enable the R2 cross-arm restructure retry for this emitter (see [`Self::cfg_restructure`]). Used
-    /// by the `inline_sroa_raw_cfg_restructure` emit variant the translate pipeline drives as an
-    /// adopt-if-validates fallback; the default emitter leaves it off.
-    pub(super) fn with_cfg_restructure(mut self) -> Self {
-        self.cfg_restructure = true;
-        self
-    }
-
-    /// Enable the construct-tree own-arm retry for this emitter. Used only by an adopt-if-validates
-    /// retry tier; the default emitter leaves it off.
-    pub(super) fn with_construct_tree(mut self) -> Self {
-        self.construct_tree = true;
+    pub(super) fn with_known_plan_rejections(
+        mut self,
+        ordinary: &HashSet<String>,
+        ownership: &HashSet<String>,
+    ) -> Self {
+        self.known_ordinary_plan_rejections.clone_from(ordinary);
+        self.known_ownership_plan_rejections.clone_from(ownership);
         self
     }
 
@@ -581,10 +723,10 @@ impl Emitter {
         for function in functions {
             let local_pointees = self.local_call_arg_pointees(function)?;
             for inst in function.carrier_insts() {
-                let Some(call_result) = &inst.emit_scan_call else {
+                let Some(call_result) = inst.emit_scan_call() else {
                     continue;
                 };
-                let call = call_result.as_ref().as_ref().map_err(|e| e.clone())?;
+                let call = call_result?;
                 let Some(callee) = functions_by_name.get(&call.callee) else {
                     continue;
                 };
@@ -641,10 +783,10 @@ impl Emitter {
         for function in functions {
             let local_nonnull = self.local_call_arg_nonnull_values(function)?;
             for inst in function.carrier_insts() {
-                let Some(call_result) = &inst.emit_scan_call else {
+                let Some(call_result) = inst.emit_scan_call() else {
                     continue;
                 };
-                let call = call_result.as_ref().as_ref().map_err(|e| e.clone())?;
+                let call = call_result?;
                 let Some(callee) = functions_by_name.get(&call.callee) else {
                     continue;
                 };
@@ -681,7 +823,7 @@ impl Emitter {
         let mut required = HashSet::new();
         for function in functions {
             for inst in function.carrier_insts() {
-                if !matches!(inst.cmp_predicate.as_deref(), Some("eq" | "ne")) {
+                if !matches!(inst.cmp_predicate().as_deref(), Some("eq" | "ne")) {
                     continue;
                 }
                 let operands = inst
@@ -721,7 +863,7 @@ impl Emitter {
             changed = false;
             for function in functions {
                 for inst in function.carrier_insts() {
-                    let Some(call) = inst.call.as_ref() else {
+                    let Some(call) = inst.call().as_ref() else {
                         continue;
                     };
                     for (callee_index, argument) in call.args.iter().enumerate() {
@@ -781,7 +923,7 @@ impl Emitter {
                 }
                 // `bitcast` carries the parsed src + dst TEXT (`convert_dst_type` stays emit-time); re-parse
                 // the dst text to keep the reader's `parse_type(dst_text)? -> resolve_type?` propagation.
-                if let Some((src, dst_text)) = inst.bitcast.as_deref() {
+                if let Some((src, dst_text)) = inst.bitcast() {
                     if matches!(self.resolve_type(&parse_type(dst_text)?)?, LlType::Ptr(_))
                         && self.call_arg_known_nonnull(&src.value, &nonnull)
                     {
@@ -790,7 +932,7 @@ impl Emitter {
                     }
                     continue;
                 }
-                if let Some(gep) = &inst.gep {
+                if let Some(gep) = &inst.gep() {
                     if self.call_arg_known_nonnull(&gep.base.value, &nonnull)
                         || self.inbounds_gep_has_nonzero_constant_offset(gep)?
                     {
@@ -857,7 +999,7 @@ impl Emitter {
                 if pointees.contains_key(name) {
                     continue;
                 }
-                if let Some((src, dst_text)) = inst.bitcast.as_deref() {
+                if let Some((src, dst_text)) = inst.bitcast() {
                     let dst_ty = self.resolve_type(&parse_type(dst_text)?)?;
                     if matches!(dst_ty, LlType::Ptr(_)) {
                         if let LlValue::Local(src_name) = &src.value {
@@ -869,7 +1011,7 @@ impl Emitter {
                     }
                     continue;
                 }
-                if let Some(gep) = &inst.gep {
+                if let Some(gep) = &inst.gep() {
                     let LlValue::Local(base_name) = &gep.base.value else {
                         continue;
                     };
@@ -955,19 +1097,576 @@ impl Emitter {
         mut self,
         buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
         air_data_layout: Option<&crate::layout::AirDataLayout>,
-    ) -> Result<(Module, crate::emit_sidecar::EmitSidecar), String> {
+    ) -> Result<(Module, crate::emit_sidecar::EmitSidecar), crate::emit_sidecar::EmissionFailure>
+    {
         if let Some(air_data_layout) = air_data_layout {
             self.air_data_layout = Some(air_data_layout.clone());
         }
-        self.emit_inner()?;
-        let air_data_layout = self.air_data_layout.clone();
-        self.record_air_struct_offsets(buffer_layouts, air_data_layout.as_ref());
-        self.emit_sidecar.air_data_layout = air_data_layout;
-        if self.used_device_address {
-            self.lower_bda_null_aggregate_pointers()?;
-            self.switch_to_physical_storage_buffer64();
+        let mut this = self.emit_inner()?;
+        // Producer-side inlining can append complete typed instructions through its pass context.
+        // Re-establish the allocator floor from the owned graph before late BDA construction asks
+        // the emitter interner for additional pointer types and constants.
+        this.module.sync_id_bound_from_instructions();
+        this.remove_unreachable_functions();
+        let air_data_layout = this.air_data_layout.clone();
+        this.record_air_struct_offsets(buffer_layouts, air_data_layout.as_ref());
+        this.emit_sidecar.air_data_layout = air_data_layout;
+        if this.used_device_address {
+            if let Err(error) = this.lower_bda_null_aggregate_pointers() {
+                return Err(crate::emit_sidecar::EmissionFailure {
+                    error,
+                    ordinary_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ordinary_plan_rejected_functions
+                        .clone(),
+                    ownership_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ownership_plan_rejected_functions
+                        .clone(),
+                });
+            }
+            if let Err(error) = this.lower_bda_address_operations_module() {
+                return Err(crate::emit_sidecar::EmissionFailure {
+                    error,
+                    ordinary_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ordinary_plan_rejected_functions
+                        .clone(),
+                    ownership_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ownership_plan_rejected_functions
+                        .clone(),
+                });
+            }
+            this.switch_to_physical_storage_buffer64();
         }
-        Ok((self.module, self.emit_sidecar))
+        Ok((this.module, this.emit_sidecar))
+    }
+
+    fn lower_bda_address_operations_module(&mut self) -> Result<(), String> {
+        loop {
+            let loads_changed = self.lower_bda_integer_pointer_loads_module()?;
+            let chains_changed = self.lower_bda_integer_address_chains_module()?;
+            if !loads_changed && !chains_changed {
+                return Ok(());
+            }
+        }
+    }
+
+    fn lower_bda_integer_pointer_loads_module(&mut self) -> Result<bool, String> {
+        let address_ty = self.type_id(&LlType::Int(64))?;
+        let physical_address_ptr =
+            self.ptr_type_id(StorageClass::PhysicalStorageBuffer, &LlType::Int(64))?;
+        let pointer_types = self
+            .module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| {
+                (instruction.class.opcode == Op::TypePointer).then_some(instruction.result_id?)
+            })
+            .collect::<HashSet<_>>();
+        let physical_pointer_types = self
+            .module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| {
+                (instruction.class.opcode == Op::TypePointer
+                    && matches!(
+                        instruction.operands.first(),
+                        Some(Operand::StorageClass(StorageClass::PhysicalStorageBuffer))
+                    ))
+                .then_some(instruction.result_id?)
+            })
+            .collect::<HashSet<_>>();
+        let pointer_pointees = self
+            .module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| {
+                if instruction.class.opcode != Op::TypePointer {
+                    return None;
+                }
+                let pointee = match instruction.operands.get(1) {
+                    Some(Operand::IdRef(id)) => *id,
+                    _ => return None,
+                };
+                Some((instruction.result_id?, pointee))
+            })
+            .collect::<HashMap<_, _>>();
+        let opaque_resource_loads = self
+            .emit_sidecar
+            .buffer_pointer_field_loads
+            .iter()
+            .filter(|fact| self.opaque_resource_ids.contains(&fact.id))
+            .map(|fact| fact.id)
+            .chain(
+                self.emit_sidecar
+                    .buffer_pointer_dynamic_field_loads
+                    .iter()
+                    .filter(|fact| self.opaque_resource_ids.contains(&fact.id))
+                    .map(|fact| fact.id),
+            )
+            .collect::<HashSet<_>>();
+        let memory_pointer_values = self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .filter(|instruction| {
+                matches!(
+                    instruction.class.opcode,
+                    Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+                )
+            })
+            .filter_map(|instruction| match instruction.operands.first() {
+                Some(Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut value_types = self
+            .module
+            .types_global_values
+            .iter()
+            .chain(self.module.functions.iter().flat_map(|function| {
+                function.parameters.iter().chain(
+                    function
+                        .blocks
+                        .iter()
+                        .flat_map(|block| block.instructions.iter()),
+                )
+            }))
+            .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+            .collect::<HashMap<_, _>>();
+        let definitions = self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+            .collect::<HashMap<_, _>>();
+        let zero = self.const_uint(0)?;
+        let mut candidates = Vec::new();
+        for (function_index, function) in self.module.functions.iter().enumerate() {
+            for (block_index, block) in function.blocks.iter().enumerate() {
+                for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                    if instruction.class.opcode != Op::Load
+                        || !instruction
+                            .result_type
+                            .is_some_and(|ty| pointer_types.contains(&ty))
+                        || instruction.result_id.is_some_and(|result| {
+                            opaque_resource_loads.contains(&result)
+                                && !memory_pointer_values.contains(&result)
+                        })
+                    {
+                        continue;
+                    }
+                    let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
+                        continue;
+                    };
+                    let pointer_type = value_types.get(pointer).copied();
+                    if pointer_type == Some(address_ty)
+                        || pointer_type.is_some_and(|ty| physical_pointer_types.contains(&ty))
+                    {
+                        candidates.push((
+                            function_index,
+                            block_index,
+                            instruction_index,
+                            *pointer,
+                            pointer_type == Some(address_ty),
+                            None,
+                            pointer_type.is_some_and(|ty| {
+                                physical_pointer_types.contains(&ty)
+                                    && pointer_pointees.get(&ty) != Some(&address_ty)
+                            }),
+                        ));
+                    } else if let Some(definition) = definitions.get(pointer) {
+                        let linear = match definition.operands.as_slice() {
+                            [Operand::IdRef(base), Operand::IdRef(first), Operand::IdRef(index)]
+                                if matches!(
+                                    definition.class.opcode,
+                                    Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+                                ) && *first == zero
+                                    && value_types.get(base) == Some(&address_ty) =>
+                            {
+                                Some((*base, *index))
+                            }
+                            _ => None,
+                        };
+                        if let Some((base, index)) = linear {
+                            candidates.push((
+                                function_index,
+                                block_index,
+                                instruction_index,
+                                base,
+                                true,
+                                Some(index),
+                                false,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        candidates.reverse();
+        let changed = !candidates.is_empty();
+        for (
+            function_index,
+            block_index,
+            instruction_index,
+            address,
+            needs_conversion,
+            linear_index,
+            needs_reinterpretation,
+        ) in candidates
+        {
+            let physical_base = if needs_conversion || needs_reinterpretation {
+                self.fresh()
+            } else {
+                address
+            };
+            let physical_pointer = if linear_index.is_some() {
+                self.fresh()
+            } else {
+                physical_base
+            };
+            let slot_address = if needs_reinterpretation {
+                Some(self.fresh())
+            } else {
+                None
+            };
+            let block = &mut self.module.functions[function_index].blocks[block_index];
+            let result = block.instructions[instruction_index]
+                .result_id
+                .ok_or_else(|| "native emitter: pointer load has no result id".to_string())?;
+            block.instructions[instruction_index] = Self::inst(
+                Op::Load,
+                Some(address_ty),
+                Some(result),
+                vec![
+                    Operand::IdRef(physical_pointer),
+                    Operand::MemoryAccess(MemoryAccess::ALIGNED),
+                    Operand::LiteralBit32(8),
+                ],
+            );
+            if needs_conversion {
+                block.instructions.insert(
+                    instruction_index,
+                    Self::inst(
+                        Op::ConvertUToPtr,
+                        Some(physical_address_ptr),
+                        Some(physical_base),
+                        vec![Operand::IdRef(address)],
+                    ),
+                );
+            }
+            if needs_reinterpretation {
+                let slot_address = slot_address.expect("allocated for reinterpretation");
+                block.instructions.insert(
+                    instruction_index,
+                    Self::inst(
+                        Op::ConvertPtrToU,
+                        Some(address_ty),
+                        Some(slot_address),
+                        vec![Operand::IdRef(address)],
+                    ),
+                );
+                block.instructions.insert(
+                    instruction_index + 1,
+                    Self::inst(
+                        Op::ConvertUToPtr,
+                        Some(physical_address_ptr),
+                        Some(physical_base),
+                        vec![Operand::IdRef(slot_address)],
+                    ),
+                );
+            }
+            if let Some(index) = linear_index {
+                let insertion_index = instruction_index
+                    + usize::from(needs_conversion)
+                    + 2 * usize::from(needs_reinterpretation);
+                block.instructions.insert(
+                    insertion_index,
+                    Self::inst(
+                        Op::PtrAccessChain,
+                        Some(physical_address_ptr),
+                        Some(physical_pointer),
+                        vec![Operand::IdRef(physical_base), Operand::IdRef(index)],
+                    ),
+                );
+            }
+            value_types.insert(result, address_ty);
+            self.bda_address_values.insert(result);
+        }
+        Ok(changed)
+    }
+
+    fn remove_unreachable_functions(&mut self) {
+        let function_calls = self
+            .module
+            .functions
+            .iter()
+            .filter_map(|function| {
+                let function_id = function.def.as_ref()?.result_id?;
+                let calls = function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| block.instructions.iter())
+                    .filter_map(|instruction| {
+                        (instruction.class.opcode == Op::FunctionCall)
+                            .then(|| instruction.operands.first())
+                            .flatten()
+                            .and_then(|operand| match operand {
+                                Operand::IdRef(id) => Some(*id),
+                                _ => None,
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                Some((function_id, calls))
+            })
+            .collect::<HashMap<_, _>>();
+        let mut reachable = self
+            .module
+            .entry_points
+            .iter()
+            .filter_map(|entry| match entry.operands.get(1) {
+                Some(Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut pending = reachable.iter().copied().collect::<Vec<_>>();
+        while let Some(function) = pending.pop() {
+            if let Some(calls) = function_calls.get(&function) {
+                for callee in calls {
+                    if reachable.insert(*callee) {
+                        pending.push(*callee);
+                    }
+                }
+            }
+        }
+        if reachable.is_empty() {
+            return;
+        }
+        let mut removed = HashSet::new();
+        self.module.functions.retain(|function| {
+            let Some(id) = function
+                .def
+                .as_ref()
+                .and_then(|definition| definition.result_id)
+            else {
+                return true;
+            };
+            if reachable.contains(&id) {
+                true
+            } else {
+                removed.insert(id);
+                false
+            }
+        });
+        self.module.debug_names.retain(|instruction| {
+            !matches!(instruction.operands.first(), Some(Operand::IdRef(id)) if removed.contains(id))
+        });
+    }
+
+    fn lower_bda_integer_address_chains_module(&mut self) -> Result<bool, String> {
+        if !self.bda_device_pointers {
+            return Ok(false);
+        }
+        let mut value_types = HashMap::new();
+        for instruction in
+            self.module
+                .types_global_values
+                .iter()
+                .chain(self.module.functions.iter().flat_map(|function| {
+                    function.parameters.iter().chain(
+                        function
+                            .blocks
+                            .iter()
+                            .flat_map(|block| block.instructions.iter()),
+                    )
+                }))
+        {
+            if let (Some(result), Some(result_type)) =
+                (instruction.result_id, instruction.result_type)
+            {
+                value_types.insert(result, result_type);
+            }
+        }
+        let int64_types = self
+            .interner
+            .types
+            .iter()
+            .filter_map(|(ty, id)| matches!(ty, LlType::Int(64)).then_some(*id))
+            .chain(
+                self.interner
+                    .signed_int_types
+                    .iter()
+                    .filter_map(|(ty, id)| matches!(ty, LlType::Int(64)).then_some(*id)),
+            )
+            .collect::<HashSet<_>>();
+        let pointer_pointees = self
+            .interner
+            .ptr_types
+            .iter()
+            .map(|((_, pointee), id)| (*id, pointee.clone()))
+            .collect::<HashMap<_, _>>();
+        let zero = self.const_uint(0)?;
+        let opaque_resource_loads = self
+            .emit_sidecar
+            .buffer_pointer_field_loads
+            .iter()
+            .filter(|fact| self.opaque_resource_ids.contains(&fact.id))
+            .map(|fact| fact.id)
+            .chain(
+                self.emit_sidecar
+                    .buffer_pointer_dynamic_field_loads
+                    .iter()
+                    .filter(|fact| self.opaque_resource_ids.contains(&fact.id))
+                    .map(|fact| fact.id),
+            )
+            .collect::<HashSet<_>>();
+        let opaque_resource_pointers = self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .filter_map(|instruction| {
+                (instruction.class.opcode == Op::Load
+                    && instruction
+                        .result_id
+                        .is_some_and(|result| opaque_resource_loads.contains(&result)))
+                .then(|| instruction.operands.first())
+                .flatten()
+                .and_then(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                })
+            })
+            .collect::<HashSet<_>>();
+        let mut candidates = Vec::new();
+        for (function_index, function) in self.module.functions.iter().enumerate() {
+            for (block_index, block) in function.blocks.iter().enumerate() {
+                for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+                    if !matches!(
+                        instruction.class.opcode,
+                        Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+                    ) {
+                        continue;
+                    }
+                    if instruction
+                        .result_id
+                        .is_some_and(|result| opaque_resource_pointers.contains(&result))
+                    {
+                        continue;
+                    }
+                    let base_and_index = match instruction.operands.as_slice() {
+                        [Operand::IdRef(base), Operand::IdRef(first), Operand::IdRef(index)]
+                            if *first == zero =>
+                        {
+                            Some((*base, *index))
+                        }
+                        [Operand::IdRef(base), Operand::IdRef(index)] => Some((*base, *index)),
+                        _ => None,
+                    };
+                    let Some((base, index)) = base_and_index else {
+                        continue;
+                    };
+                    if !value_types
+                        .get(&base)
+                        .is_some_and(|ty| int64_types.contains(ty))
+                    {
+                        continue;
+                    }
+                    let Some(pointee) = instruction
+                        .result_type
+                        .and_then(|ty| pointer_pointees.get(&ty))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    candidates.push((
+                        function_index,
+                        block_index,
+                        instruction_index,
+                        base,
+                        index,
+                        pointee,
+                    ));
+                }
+            }
+        }
+        candidates.reverse();
+        let changed = !candidates.is_empty();
+        let mut physical_access_alignments = HashMap::new();
+        for (function_index, block_index, instruction_index, base, index, pointee) in candidates {
+            // A pointer loaded from device-address memory is an eight-byte address payload. Build
+            // the slot access with that storage representation directly; a physical pointer whose
+            // pointee is itself a logical pointer gives `OpPtrAccessChain` no faithful Vulkan data
+            // layout and can select the wrong table element even if a later pass reinterprets the
+            // slot address as `ulong*`.
+            let storage_pointee = if matches!(pointee, LlType::Ptr(_)) {
+                LlType::Int(64)
+            } else {
+                pointee
+            };
+            let physical_type =
+                self.ptr_type_id(StorageClass::PhysicalStorageBuffer, &storage_pointee)?;
+            let physical_base = self.fresh();
+            let alignment = self.device_addr_align(&storage_pointee);
+            let block = &mut self.module.functions[function_index].blocks[block_index];
+            let result = block.instructions[instruction_index].result_id;
+            if let Some(result) = result {
+                physical_access_alignments.insert(result, alignment);
+            }
+            block.instructions[instruction_index] = Self::inst(
+                Op::PtrAccessChain,
+                Some(physical_type),
+                result,
+                vec![Operand::IdRef(physical_base), Operand::IdRef(index)],
+            );
+            block.instructions.insert(
+                instruction_index,
+                Self::inst(
+                    Op::ConvertUToPtr,
+                    Some(physical_type),
+                    Some(physical_base),
+                    vec![Operand::IdRef(base)],
+                ),
+            );
+            self.used_device_address = true;
+        }
+        for instruction in self
+            .module
+            .functions
+            .iter_mut()
+            .flat_map(|function| function.blocks.iter_mut())
+            .flat_map(|block| block.instructions.iter_mut())
+        {
+            let pointer_position = match instruction.class.opcode {
+                Op::Load | Op::Store => 0,
+                _ => continue,
+            };
+            let Some(Operand::IdRef(pointer)) = instruction.operands.get(pointer_position) else {
+                continue;
+            };
+            let Some(alignment) = physical_access_alignments.get(pointer).copied() else {
+                continue;
+            };
+            let memory_operand_position = match instruction.class.opcode {
+                Op::Load => 1,
+                Op::Store => 2,
+                _ => unreachable!(),
+            };
+            if instruction.operands.len() == memory_operand_position {
+                instruction
+                    .operands
+                    .push(Operand::MemoryAccess(MemoryAccess::ALIGNED));
+                instruction.operands.push(Operand::LiteralBit32(alignment));
+            }
+        }
+        Ok(changed)
     }
 
     /// Flip the module to the `PhysicalStorageBuffer64` addressing model and declare the capabilities +
@@ -992,6 +1691,23 @@ impl Emitter {
     /// leaves the pointer untouched, so an unsupported live logical-pointer aggregate still fails
     /// validation rather than acquiring invented semantics.
     fn lower_bda_null_aggregate_pointers(&mut self) -> Result<(), String> {
+        for instruction in self
+            .module
+            .functions
+            .iter_mut()
+            .flat_map(|function| function.blocks.iter_mut())
+            .flat_map(|block| block.instructions.iter_mut())
+        {
+            if instruction.class.opcode != Op::CompositeInsert {
+                continue;
+            }
+            let Some(Operand::IdRef(object)) = instruction.operands.first_mut() else {
+                continue;
+            };
+            if let Some(address) = self.bda_pointer_addresses.get(object).copied() {
+                *object = address;
+            }
+        }
         let null_pointers =
             self.module
                 .types_global_values
@@ -1006,7 +1722,10 @@ impl Emitter {
                     })
                 })
                 .collect::<HashMap<_, _>>();
-        if null_pointers.is_empty() {
+        if null_pointers.is_empty()
+            && self.bda_address_values.is_empty()
+            && self.bda_pointer_addresses.is_empty()
+        {
             return Ok(());
         }
 
@@ -1069,17 +1788,13 @@ impl Emitter {
             }
         }
         fields_by_null.retain(|id, fields| !fields.is_empty() && !unsupported_use.contains(id));
-        if fields_by_null.is_empty() {
-            return Ok(());
-        }
-
         let address_ty = self.type_id(&LlType::Int(64))?;
         let zero = self.const_signed_int(64, 0)?;
-        let lowered_nulls = fields_by_null.keys().copied().collect::<HashSet<_>>();
-        let mut address_values = lowered_nulls.clone();
+        let mut lowered_nulls = fields_by_null.keys().copied().collect::<HashSet<_>>();
         let mut lowered_fields = fields_by_null
-            .into_values()
+            .values()
             .flatten()
+            .copied()
             .collect::<HashSet<_>>();
         let result_types = self
             .module
@@ -1095,6 +1810,104 @@ impl Emitter {
             }))
             .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
             .collect::<HashMap<_, _>>();
+        for instruction in self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+        {
+            if instruction.class.opcode != Op::CompositeInsert
+                || !matches!(instruction.operands.first(), Some(Operand::IdRef(object)) if self.bda_address_values.contains(object))
+            {
+                continue;
+            }
+            let Some(mut aggregate_ty) = instruction.result_type else {
+                continue;
+            };
+            let mut target = None;
+            for index in instruction.operands.iter().skip(2) {
+                let Operand::LiteralBit32(member) = index else {
+                    target = None;
+                    break;
+                };
+                let Some(definition) = type_defs.get(&aggregate_ty) else {
+                    target = None;
+                    break;
+                };
+                let Some(Operand::IdRef(member_ty)) = definition.operands.get(*member as usize)
+                else {
+                    target = None;
+                    break;
+                };
+                target = Some((aggregate_ty, *member as usize));
+                aggregate_ty = *member_ty;
+            }
+            if let Some(target) = target {
+                lowered_fields.insert(target);
+            }
+        }
+        let mut mixed_pointer_fields = HashSet::new();
+        for instruction in self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+        {
+            if instruction.class.opcode != Op::CompositeInsert {
+                continue;
+            }
+            let Some(Operand::IdRef(object)) = instruction.operands.first() else {
+                continue;
+            };
+            let Some(mut aggregate_ty) = instruction.result_type else {
+                continue;
+            };
+            let mut target = None;
+            for index in instruction.operands.iter().skip(2) {
+                let Operand::LiteralBit32(member) = index else {
+                    target = None;
+                    break;
+                };
+                let Some(definition) = type_defs.get(&aggregate_ty) else {
+                    target = None;
+                    break;
+                };
+                let Some(Operand::IdRef(member_ty)) = definition.operands.get(*member as usize)
+                else {
+                    target = None;
+                    break;
+                };
+                target = Some((aggregate_ty, *member as usize));
+                aggregate_ty = *member_ty;
+            }
+            if target.is_some_and(|field| lowered_fields.contains(&field))
+                && !lowered_nulls.contains(object)
+                && result_types.get(object).is_some_and(|object_type| {
+                    type_defs.get(object_type).is_some_and(|definition| {
+                        matches!(
+                            definition.class.opcode,
+                            Op::TypePointer
+                                | Op::TypeImage
+                                | Op::TypeSampler
+                                | Op::TypeSampledImage
+                                | Op::TypeAccelerationStructureKHR
+                        )
+                    })
+                })
+            {
+                mixed_pointer_fields.extend(target);
+            }
+        }
+        lowered_fields.retain(|field| !mixed_pointer_fields.contains(field));
+        lowered_nulls.retain(|null| {
+            fields_by_null
+                .get(null)
+                .is_some_and(|fields| fields.iter().all(|field| lowered_fields.contains(field)))
+        });
+        let mut address_values = lowered_nulls.clone();
+        address_values.extend(self.bda_address_values.iter().copied());
         loop {
             let mut changed = false;
             for function in &self.module.functions {
@@ -1186,6 +1999,65 @@ impl Emitter {
                 break;
             }
         }
+        let mut late_mixed_fields = HashSet::new();
+        for instruction in self
+            .module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+        {
+            if instruction.class.opcode != Op::CompositeInsert {
+                continue;
+            }
+            let Some(Operand::IdRef(object)) = instruction.operands.first() else {
+                continue;
+            };
+            let Some(mut aggregate_ty) = instruction.result_type else {
+                continue;
+            };
+            let mut target = None;
+            for index in instruction.operands.iter().skip(2) {
+                let Operand::LiteralBit32(member) = index else {
+                    target = None;
+                    break;
+                };
+                let Some(definition) = type_defs.get(&aggregate_ty) else {
+                    target = None;
+                    break;
+                };
+                let Some(Operand::IdRef(member_ty)) = definition.operands.get(*member as usize)
+                else {
+                    target = None;
+                    break;
+                };
+                target = Some((aggregate_ty, *member as usize));
+                aggregate_ty = *member_ty;
+            }
+            if target.is_some_and(|field| lowered_fields.contains(&field))
+                && !address_values.contains(object)
+                && result_types.get(object).is_some_and(|object_type| {
+                    type_defs
+                        .get(object_type)
+                        .is_some_and(|definition| definition.class.opcode == Op::TypePointer)
+                })
+            {
+                late_mixed_fields.extend(target);
+            }
+        }
+        lowered_fields.retain(|field| !late_mixed_fields.contains(field));
+        self.specialize_mixed_bda_aggregate_chains(
+            &late_mixed_fields,
+            &address_values,
+            &type_defs,
+            address_ty,
+            zero,
+        )?;
+        lowered_nulls.retain(|null| {
+            fields_by_null
+                .get(null)
+                .is_some_and(|fields| fields.iter().all(|field| lowered_fields.contains(field)))
+        });
         for inst in &mut self.module.types_global_values {
             let Some(owner) = inst.result_id else {
                 continue;
@@ -1215,7 +2087,536 @@ impl Emitter {
                 }
             }
         }
+        self.module
+            .types_global_values
+            .retain(|inst| !inst.result_id.is_some_and(|id| lowered_nulls.contains(&id)));
         Ok(())
+    }
+
+    fn specialize_mixed_bda_aggregate_chains(
+        &mut self,
+        mixed_fields: &HashSet<(Word, usize)>,
+        address_values: &HashSet<Word>,
+        type_defs: &HashMap<Word, Instruction>,
+        address_ty: Word,
+        zero: Word,
+    ) -> Result<(), String> {
+        #[derive(Clone)]
+        struct InsertSite {
+            function: usize,
+            block: usize,
+            instruction: usize,
+            result: Word,
+            object: Word,
+            composite: Word,
+            result_type: Word,
+            path: Vec<u32>,
+            target: (Word, usize),
+        }
+
+        let mut sites = Vec::new();
+        for (function, body) in self.module.functions.iter().enumerate() {
+            for (block, basic_block) in body.blocks.iter().enumerate() {
+                for (instruction, inst) in basic_block.instructions.iter().enumerate() {
+                    if inst.class.opcode != Op::CompositeInsert {
+                        continue;
+                    }
+                    let (
+                        Some(result),
+                        Some(result_type),
+                        Some(Operand::IdRef(object)),
+                        Some(Operand::IdRef(composite)),
+                    ) = (
+                        inst.result_id,
+                        inst.result_type,
+                        inst.operands.first(),
+                        inst.operands.get(1),
+                    )
+                    else {
+                        continue;
+                    };
+                    let path = inst
+                        .operands
+                        .iter()
+                        .skip(2)
+                        .map(|operand| match operand {
+                            Operand::LiteralBit32(index) => Some(*index),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(path) = path else { continue };
+                    let Some(target) = aggregate_path_target(result_type, &path, type_defs) else {
+                        continue;
+                    };
+                    sites.push(InsertSite {
+                        function,
+                        block,
+                        instruction,
+                        result,
+                        object: *object,
+                        composite: *composite,
+                        result_type,
+                        path,
+                        target,
+                    });
+                }
+            }
+        }
+        let site_by_result = sites
+            .iter()
+            .enumerate()
+            .map(|(index, site)| (site.result, index))
+            .collect::<HashMap<_, _>>();
+        let module_value_types = self
+            .module
+            .types_global_values
+            .iter()
+            .chain(self.module.functions.iter().flat_map(|function| {
+                function.parameters.iter().chain(
+                    function
+                        .blocks
+                        .iter()
+                        .flat_map(|block| block.instructions.iter()),
+                )
+            }))
+            .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+            .collect::<HashMap<_, _>>();
+        let mut handled = HashSet::new();
+        let mut type_cache = HashMap::new();
+        for seed in sites.iter().filter(|site| {
+            address_values.contains(&site.object) && mixed_fields.contains(&site.target)
+        }) {
+            if handled.contains(&seed.result) {
+                continue;
+            }
+            let mut component = HashSet::from([seed.result]);
+            let mut cursor = seed.composite;
+            while let Some(index) = site_by_result.get(&cursor).copied() {
+                let site = &sites[index];
+                component.insert(site.result);
+                cursor = site.composite;
+            }
+            loop {
+                let mut changed = false;
+                for site in &sites {
+                    if component.contains(&site.composite) {
+                        changed |= component.insert(site.result);
+                    }
+                    if component.contains(&site.result)
+                        && !type_defs.contains_key(&site.composite)
+                        && module_value_types.contains_key(&site.composite)
+                    {
+                        changed |= component.insert(site.composite);
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            loop {
+                let mut changed = false;
+                for instruction in self
+                    .module
+                    .functions
+                    .iter()
+                    .flat_map(|function| function.blocks.iter())
+                    .flat_map(|block| block.instructions.iter())
+                {
+                    if !matches!(
+                        instruction.class.opcode,
+                        Op::Phi | Op::Select | Op::CopyObject
+                    ) || instruction.result_type != Some(seed.result_type)
+                    {
+                        continue;
+                    }
+                    let Some(result) = instruction.result_id else {
+                        continue;
+                    };
+                    let operands = instruction
+                        .operands
+                        .iter()
+                        .filter_map(|operand| match operand {
+                            Operand::IdRef(id)
+                                if module_value_types.get(id) == Some(&seed.result_type) =>
+                            {
+                                Some(*id)
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>();
+                    if component.contains(&result)
+                        || operands.iter().any(|operand| component.contains(operand))
+                    {
+                        changed |= component.insert(result);
+                        for operand in operands {
+                            changed |= component.insert(operand);
+                        }
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            loop {
+                let mut changed = false;
+                for site in &sites {
+                    if component.contains(&site.composite) {
+                        changed |= component.insert(site.result);
+                    }
+                    if component.contains(&site.result)
+                        && !type_defs.contains_key(&site.composite)
+                        && module_value_types.contains_key(&site.composite)
+                    {
+                        changed |= component.insert(site.composite);
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            handled.extend(component.iter().copied());
+            let component_sites = sites
+                .iter()
+                .filter(|site| component.contains(&site.result))
+                .collect::<Vec<_>>();
+            let mut address_paths = component_sites
+                .iter()
+                .filter(|site| address_values.contains(&site.object))
+                .map(|site| site.path.clone())
+                .collect::<HashSet<_>>();
+            let extracted_paths = self
+                .module
+                .functions
+                .iter()
+                .flat_map(|function| function.blocks.iter())
+                .flat_map(|block| block.instructions.iter())
+                .filter(|instruction| instruction.class.opcode == Op::CompositeExtract)
+                .filter_map(|instruction| {
+                    let Operand::IdRef(composite) = instruction.operands.first()? else {
+                        return None;
+                    };
+                    (module_value_types.get(composite) == Some(&seed.result_type)).then(|| {
+                        instruction
+                            .operands
+                            .iter()
+                            .skip(1)
+                            .map(|operand| match operand {
+                                Operand::LiteralBit32(index) => Some(*index),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })?
+                })
+                .collect::<HashSet<_>>();
+            let mut unobserved_pointer_paths = HashSet::new();
+            for pointer_path in aggregate_pointer_leaf_paths(seed.result_type, type_defs) {
+                let observed = extracted_paths
+                    .iter()
+                    .any(|extracted| pointer_path.starts_with(extracted));
+                if !observed {
+                    address_paths.insert(pointer_path.clone());
+                    unobserved_pointer_paths.insert(pointer_path);
+                }
+            }
+            if component_sites.iter().any(|site| {
+                address_paths.contains(&site.path)
+                    && !unobserved_pointer_paths.contains(&site.path)
+                    && !address_values.contains(&site.object)
+            }) {
+                return Err(
+                    "native emitter: one aggregate value chain mixes address and logical-pointer values at the same field"
+                        .to_string(),
+                );
+            }
+            let original_type = seed.result_type;
+            let specialized_type = self.specialize_bda_aggregate_type(
+                original_type,
+                &address_paths,
+                address_ty,
+                type_defs,
+                &mut type_cache,
+            )?;
+            let component_results = component.clone();
+            let mut aggregate_values = component_results.clone();
+            let mut storage_pointers = HashSet::new();
+            loop {
+                let mut changed = false;
+                for instruction in self
+                    .module
+                    .functions
+                    .iter()
+                    .flat_map(|function| function.blocks.iter())
+                    .flat_map(|block| block.instructions.iter())
+                {
+                    match instruction.class.opcode {
+                        Op::Store => {
+                            let [Operand::IdRef(pointer), Operand::IdRef(object), ..] =
+                                instruction.operands.as_slice()
+                            else {
+                                continue;
+                            };
+                            if aggregate_values.contains(object) {
+                                changed |= storage_pointers.insert(*pointer);
+                            }
+                        }
+                        Op::Load => {
+                            let (Some(result), Some(Operand::IdRef(pointer))) =
+                                (instruction.result_id, instruction.operands.first())
+                            else {
+                                continue;
+                            };
+                            if aggregate_values.contains(&result) {
+                                changed |= storage_pointers.insert(*pointer);
+                            }
+                            if storage_pointers.contains(pointer) {
+                                changed |= aggregate_values.insert(result);
+                            }
+                        }
+                        Op::CopyObject => {
+                            let (Some(result), Some(Operand::IdRef(source))) =
+                                (instruction.result_id, instruction.operands.first())
+                            else {
+                                continue;
+                            };
+                            if aggregate_values.contains(source) {
+                                changed |= aggregate_values.insert(result);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !changed {
+                    break;
+                }
+            }
+            let value_types = self
+                .module
+                .types_global_values
+                .iter()
+                .chain(self.module.functions.iter().flat_map(|function| {
+                    function.parameters.iter().chain(
+                        function
+                            .blocks
+                            .iter()
+                            .flat_map(|block| block.instructions.iter()),
+                    )
+                }))
+                .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+                .collect::<HashMap<_, _>>();
+            let mut specialized_pointer_types = HashMap::new();
+            for pointer in &storage_pointers {
+                let Some(pointer_type) = value_types.get(pointer).copied() else {
+                    continue;
+                };
+                let Some(definition) = type_defs.get(&pointer_type) else {
+                    continue;
+                };
+                let Some(Operand::StorageClass(storage)) = definition.operands.first() else {
+                    continue;
+                };
+                let specialized_pointer =
+                    if let Some(existing) = specialized_pointer_types.get(storage).copied() {
+                        existing
+                    } else {
+                        let id = self.fresh();
+                        self.module.types_global_values.push(Self::inst(
+                            Op::TypePointer,
+                            None,
+                            Some(id),
+                            vec![
+                                Operand::StorageClass(*storage),
+                                Operand::IdRef(specialized_type),
+                            ],
+                        ));
+                        specialized_pointer_types.insert(*storage, id);
+                        id
+                    };
+                for instruction in self
+                    .module
+                    .functions
+                    .iter_mut()
+                    .flat_map(|function| function.blocks.iter_mut())
+                    .flat_map(|block| block.instructions.iter_mut())
+                {
+                    if instruction.result_id == Some(*pointer) {
+                        instruction.result_type = Some(specialized_pointer);
+                    }
+                }
+            }
+            for instruction in self
+                .module
+                .functions
+                .iter_mut()
+                .flat_map(|function| function.blocks.iter_mut())
+                .flat_map(|block| block.instructions.iter_mut())
+            {
+                match instruction.class.opcode {
+                    Op::Load if matches!(instruction.operands.first(), Some(Operand::IdRef(pointer)) if storage_pointers.contains(pointer)) =>
+                    {
+                        instruction.result_type = Some(specialized_type);
+                    }
+                    Op::CopyObject
+                        if instruction
+                            .result_id
+                            .is_some_and(|result| aggregate_values.contains(&result)) =>
+                    {
+                        instruction.result_type = Some(specialized_type);
+                    }
+                    Op::Phi | Op::Select
+                        if instruction
+                            .result_id
+                            .is_some_and(|result| aggregate_values.contains(&result)) =>
+                    {
+                        instruction.result_type = Some(specialized_type);
+                    }
+                    _ => {}
+                }
+            }
+            let mut external_composites = HashMap::new();
+            for site in &component_sites {
+                if component_results.contains(&site.composite) {
+                    continue;
+                }
+                let Some(definition) = type_defs.get(&site.composite) else {
+                    return Err(format!(
+                        "native emitter: address aggregate chain has an untyped external root %{} with type {:?}",
+                        site.composite,
+                        module_value_types.get(&site.composite)
+                    ));
+                };
+                if definition.class.opcode != Op::Undef {
+                    return Err(
+                        "native emitter: address aggregate chain requires a non-undef external root"
+                            .to_string(),
+                    );
+                }
+                let replacement = self.fresh();
+                self.module.types_global_values.push(Self::inst(
+                    Op::Undef,
+                    Some(specialized_type),
+                    Some(replacement),
+                    vec![],
+                ));
+                external_composites.insert(site.composite, replacement);
+            }
+            for site in &component_sites {
+                let instruction = &mut self.module.functions[site.function].blocks[site.block]
+                    .instructions[site.instruction];
+                instruction.result_type = Some(specialized_type);
+                if unobserved_pointer_paths.contains(&site.path)
+                    && !address_values.contains(&site.object)
+                {
+                    instruction.operands[0] = Operand::IdRef(zero);
+                }
+                if let Some(replacement) = external_composites.get(&site.composite).copied() {
+                    instruction.operands[1] = Operand::IdRef(replacement);
+                }
+            }
+
+            let specialized_defs = self
+                .module
+                .types_global_values
+                .iter()
+                .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction.clone())))
+                .collect::<HashMap<_, _>>();
+            for function in &mut self.module.functions {
+                for instruction in function
+                    .blocks
+                    .iter_mut()
+                    .flat_map(|block| block.instructions.iter_mut())
+                {
+                    if instruction.class.opcode != Op::CompositeExtract {
+                        continue;
+                    }
+                    let Some(Operand::IdRef(composite)) = instruction.operands.first() else {
+                        continue;
+                    };
+                    if !aggregate_values.contains(composite) {
+                        continue;
+                    }
+                    let path = instruction
+                        .operands
+                        .iter()
+                        .skip(1)
+                        .map(|operand| match operand {
+                            Operand::LiteralBit32(index) => Some(*index),
+                            _ => None,
+                        })
+                        .collect::<Option<Vec<_>>>();
+                    let Some(path) = path else { continue };
+                    let selected =
+                        aggregate_path_leaf_type(specialized_type, &path, &specialized_defs)
+                            .ok_or_else(|| {
+                                "native emitter: specialized aggregate extract has an invalid path"
+                                    .to_string()
+                            })?;
+                    instruction.result_type = Some(selected);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn specialize_bda_aggregate_type(
+        &mut self,
+        original: Word,
+        paths: &HashSet<Vec<u32>>,
+        address_ty: Word,
+        type_defs: &HashMap<Word, Instruction>,
+        cache: &mut HashMap<(Word, Vec<Vec<u32>>), Word>,
+    ) -> Result<Word, String> {
+        if paths.iter().any(Vec::is_empty) {
+            return Ok(address_ty);
+        }
+        let mut normalized = paths.iter().cloned().collect::<Vec<_>>();
+        normalized.sort();
+        let key = (original, normalized.clone());
+        if let Some(existing) = cache.get(&key).copied() {
+            return Ok(existing);
+        }
+        let definition = type_defs.get(&original).ok_or_else(|| {
+            "native emitter: missing aggregate type for BDA specialization".to_string()
+        })?;
+        if !matches!(definition.class.opcode, Op::TypeStruct | Op::TypeArray) {
+            return Err(
+                "native emitter: BDA aggregate specialization reached a non-aggregate type"
+                    .to_string(),
+            );
+        }
+        let mut operands = definition.operands.clone();
+        for member in 0..operands.len() {
+            let child_paths = normalized
+                .iter()
+                .filter(|path| path.first().copied() == Some(member as u32))
+                .map(|path| path[1..].to_vec())
+                .collect::<HashSet<_>>();
+            if child_paths.is_empty() {
+                continue;
+            }
+            let Some(Operand::IdRef(child)) = operands.get(member).cloned() else {
+                return Err(
+                    "native emitter: malformed aggregate type during BDA specialization"
+                        .to_string(),
+                );
+            };
+            let specialized = self.specialize_bda_aggregate_type(
+                child,
+                &child_paths,
+                address_ty,
+                type_defs,
+                cache,
+            )?;
+            operands[member] = Operand::IdRef(specialized);
+        }
+        let result = self.fresh();
+        self.module.types_global_values.push(Self::inst(
+            definition.class.opcode,
+            None,
+            Some(result),
+            operands,
+        ));
+        cache.insert(key, result);
+        Ok(result)
     }
 
     /// Run the full emission for its side effect of populating `storage_snapshots` (one per function's
@@ -1226,8 +2627,8 @@ impl Emitter {
         mut self,
     ) -> Result<Vec<(String, HashMap<String, StorageClass>)>, String> {
         self.capture_storage = true;
-        self.emit_inner()?;
-        Ok(self.storage_snapshots)
+        let this = self.emit_inner().map_err(|failure| failure.error)?;
+        Ok(this.storage_snapshots)
     }
 
     /// Run the full emission for its side effect of populating `pointee_snapshots` (one per function's
@@ -1238,8 +2639,8 @@ impl Emitter {
         mut self,
     ) -> Result<Vec<(String, HashMap<String, LlType>)>, String> {
         self.capture_pointees = true;
-        self.emit_inner()?;
-        Ok(self.pointee_snapshots)
+        let this = self.emit_inner().map_err(|failure| failure.error)?;
+        Ok(this.pointee_snapshots)
     }
 
     /// Run the full emission for its side effect of populating `function_param_pointees` (the
@@ -1247,22 +2648,43 @@ impl Emitter {
     /// pointer-pointee facts) and return it. Discards the module. Mirrors [`emit`] exactly except
     /// that it hands back the sidecar instead of the bytes, so it reflects the production inference.
     pub(super) fn emit_collecting_param_pointees(
-        mut self,
+        self,
     ) -> Result<HashMap<(String, usize), LlType>, String> {
-        self.emit_inner()?;
-        Ok(self.function_param_pointees)
+        let this = self.emit_inner().map_err(|failure| failure.error)?;
+        Ok(this.function_param_pointees)
     }
 
-    fn emit_inner(&mut self) -> Result<(), String> {
+    fn emit_inner(mut self) -> Result<Self, crate::emit_sidecar::EmissionFailure> {
+        macro_rules! attempt {
+            ($expression:expr) => {
+                match $expression {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Err(crate::emit_sidecar::EmissionFailure {
+                            error,
+                            ordinary_plan_rejected_functions: self
+                                .emit_sidecar
+                                .ordinary_plan_rejected_functions
+                                .clone(),
+                            ownership_plan_rejected_functions: self
+                                .emit_sidecar
+                                .ownership_plan_rejected_functions
+                                .clone(),
+                        });
+                    }
+                }
+            };
+        }
         let globals = self.ir.globals.clone();
         let functions = self.ir.functions.clone();
         let declarations = self.ir.declarations.clone();
         self.int_atomic_reinterpret_globals =
             Self::scan_int_atomic_reinterpret_globals(&globals, &functions);
-        self.byte_view_reinterpret_globals = self.scan_byte_view_reinterpret_globals()?;
-        self.flat_scalar_reinterpret_globals = self.scan_flat_scalar_reinterpret_globals()?;
+        self.byte_view_reinterpret_globals = attempt!(self.scan_byte_view_reinterpret_globals());
+        self.flat_scalar_reinterpret_globals =
+            attempt!(self.scan_flat_scalar_reinterpret_globals());
         for global in &globals {
-            self.emit_global(global)?;
+            attempt!(self.emit_global(global));
         }
         for f in &functions {
             let id = self.fresh();
@@ -1273,13 +2695,33 @@ impl Emitter {
             self.function_ids.insert(decl.name.clone(), id);
         }
         for decl in &declarations {
-            self.emit_declaration(decl)?;
+            attempt!(self.emit_declaration(decl));
         }
-        self.infer_function_param_pointees(&functions)?;
-        self.function_param_nonnull = self.infer_function_param_nonnull(&functions)?;
-        self.function_param_nullness = self.infer_function_param_nullness(&functions)?;
-        for f in &functions {
-            self.emit_function_with_raw_retry(f)?;
+        attempt!(self.infer_function_param_pointees(&functions));
+        self.function_param_nonnull = attempt!(self.infer_function_param_nonnull(&functions));
+        self.function_param_nullness = attempt!(self.infer_function_param_nullness(&functions));
+        let entry_name = self
+            .ir
+            .entry_name
+            .clone()
+            .or_else(|| functions.first().map(|function| function.name.clone()));
+        let initializer_names = functions
+            .iter()
+            .filter(|function| {
+                Some(function.name.as_str()) != entry_name.as_deref()
+                    && function.name.starts_with("_GLOBAL__sub_I")
+                    && !self
+                        .ir
+                        .preinlined_static_initializers
+                        .contains(&function.name)
+            })
+            .map(|function| function.name.clone())
+            .collect::<Vec<_>>();
+        // Consume the analysis copy one function at a time. Keeping the complete cloned AIR module
+        // alive while the equally large SPIR-V module grows made peak memory proportional to both
+        // representations; each source body can be released immediately after its own emission.
+        for f in functions {
+            attempt!(self.emit_function(&f));
         }
         // The old residual inliner removed migrated helper bodies and dead types after emission,
         // but left capabilities requested while materializing those types. Replay only declarations
@@ -1302,72 +2744,34 @@ impl Emitter {
         }
         self.rewrite_scalar_pointer_arithmetic_access_chains();
         self.remove_dead_empty_functions();
-        self.inject_static_initializer_calls(&functions)?;
+        attempt!(self.inject_static_initializer_calls(entry_name.as_deref(), &initializer_names));
         let mut header = ModuleHeader::new(self.module.id_bound());
         // Match the SPIR-V version LLVM's Vulkan backend emitted for this pipeline.
         header.set_version(1, 4);
         self.module.header = Some(header);
-        let module = std::mem::take(&mut self.module);
-        let emit_sidecar = std::mem::take(&mut self.emit_sidecar);
-        (self.module, self.emit_sidecar) = crate::passes::inline_all_emitted_helpers(
+        let ordinary_plan_rejected_functions =
+            self.emit_sidecar.ordinary_plan_rejected_functions.clone();
+        let ownership_plan_rejected_functions =
+            self.emit_sidecar.ownership_plan_rejected_functions.clone();
+        let module = self.module;
+        let emit_sidecar = self.emit_sidecar;
+        let inlined = crate::passes::inline_all_emitted_helpers(
             module,
             emit_sidecar,
             self.ir.entry_name.as_deref(),
-        )?;
+        );
+        (self.module, self.emit_sidecar) = match inlined {
+            Ok(inlined) => inlined,
+            Err(error) => {
+                return Err(crate::emit_sidecar::EmissionFailure {
+                    error,
+                    ordinary_plan_rejected_functions,
+                    ownership_plan_rejected_functions,
+                });
+            }
+        };
         self.rewrite_private_scalar_offset_access_chains();
-        self.repair_truncated_access_chain_indices();
-        Ok(())
-    }
-
-    /// Emit a function, and if it fails specifically because the logical pointer model cannot
-    /// represent a buffer access, mark the function's buffer params raw and retry. Two trigger classes,
-    /// both raised ONLY when a buffer access genuinely cannot be lowered logically:
-    /// - **pointer-merge** (`pointer merge pointee mismatch`): a `select`/`phi` merges pointers with
-    ///   incompatible pointees (the aggregate-vs-element reinterpret) — the dominant pointer-merge
-    ///   frontier class.
-    /// - **integer atomic on a float-typed buffer** (`atomic i32 pointer targets ...`): the
-    ///   atomic-float-min/max idiom (`air.atomic.global.{min,max}.s.i32` on a `<3 x float>*` bounding
-    ///   box, reinterpreting the float bits as a signed int) — `atomic_i32_pointer_id` cannot form an
-    ///   `i32*` from a float/vector pointee under Logical addressing, but the raw path (`raw_offsets` →
-    ///   `emit_raw_word_pointer_for_access`) lowers it as a uint-word atomic on the `RuntimeArray<uint>`
-    ///   backing.
-    ///
-    /// This is a *precise* raw trigger: it fires ONLY on a genuine lowering failure, so a function that
-    /// already translates (and therefore can be banked) never reaches it and is never marked raw — the
-    /// over-marking that regressed earlier whole-buffer attempts is impossible by construction. A failed
-    /// first attempt pushes only well-formed, unused type/constant globals (the function's blocks are
-    /// not appended to the module until it fully succeeds), so the retry is safe without snapshotting
-    /// module state; `emit_function` rebuilds `raw_buffer_params` from `self.ir.raw_buffer_params` on
-    /// each call, so the retry observes the new marking.
-    fn emit_function_with_raw_retry(&mut self, f: &LlFunction) -> Result<(), String> {
-        match self.emit_function(f) {
-            Err(e)
-                if e.contains("pointer merge pointee mismatch")
-                    || e.contains("atomic i32 pointer targets") =>
-            {
-                if self.mark_function_buffers_raw(f) {
-                    self.emit_function(f)
-                } else {
-                    Err(e)
-                }
-            }
-            other => other,
-        }
-    }
-
-    /// Mark every device/constant buffer pointer param of `f` raw in `self.ir.raw_buffer_params`.
-    /// Returns whether any param was newly marked (so a retry that would change nothing is skipped).
-    fn mark_function_buffers_raw(&mut self, f: &LlFunction) -> bool {
-        let mut newly_marked = false;
-        for (name, ty) in &f.params {
-            if matches!(ty, LlType::Ptr(1 | 2)) {
-                let key = (f.name.clone(), name.clone());
-                if self.ir.raw_buffer_params.insert(key) {
-                    newly_marked = true;
-                }
-            }
-        }
-        newly_marked
+        Ok(self)
     }
 
     fn rewrite_scalar_pointer_arithmetic_access_chains(&mut self) {
@@ -1604,114 +3008,13 @@ impl Emitter {
                         next_defs.insert(id, updated);
                     }
                     if !insertions.is_empty() {
-                        let pending = std::mem::take(&mut insertions);
                         self.module.functions[fi].blocks[bi]
                             .instructions
-                            .splice(ii..ii, pending);
+                            .splice(ii..ii, insertions.iter().cloned());
+                        insertions.clear();
                         ii += 1;
                     }
                     ii += 1;
-                }
-            }
-        }
-    }
-
-    fn repair_truncated_access_chain_indices(&mut self) {
-        let mut defs = HashMap::new();
-        for inst in &self.module.types_global_values {
-            if let Some(id) = inst.result_id {
-                defs.insert(id, inst.clone());
-            }
-        }
-        for function in &self.module.functions {
-            for param in &function.parameters {
-                if let Some(id) = param.result_id {
-                    defs.insert(id, param.clone());
-                }
-            }
-            for block in &function.blocks {
-                if let Some(label) = &block.label {
-                    if let Some(id) = label.result_id {
-                        defs.insert(id, label.clone());
-                    }
-                }
-                for inst in &block.instructions {
-                    if let Some(id) = inst.result_id {
-                        defs.insert(id, inst.clone());
-                    }
-                }
-            }
-        }
-
-        let mut pointer_info = HashMap::new();
-        for inst in &self.module.types_global_values {
-            if inst.class.opcode == Op::TypePointer {
-                let (
-                    Some(ptr),
-                    Some(Operand::StorageClass(storage)),
-                    Some(Operand::IdRef(pointee)),
-                ) = (inst.result_id, inst.operands.first(), inst.operands.get(1))
-                else {
-                    continue;
-                };
-                pointer_info.insert(ptr, (*storage, *pointee));
-            }
-        }
-
-        for fi in 0..self.module.functions.len() {
-            for bi in 0..self.module.functions[fi].blocks.len() {
-                for ii in 0..self.module.functions[fi].blocks[bi].instructions.len() {
-                    let inst = self.module.functions[fi].blocks[bi].instructions[ii].clone();
-                    if !matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
-                        || inst.operands.len() < 2
-                    {
-                        continue;
-                    }
-                    let Some(result_type) = inst.result_type else {
-                        continue;
-                    };
-                    let Some((_, pointee_ty)) = pointer_info.get(&result_type).copied() else {
-                        continue;
-                    };
-                    let Some(Operand::IdRef(base)) = inst.operands.first() else {
-                        continue;
-                    };
-                    let Some(base_ty) = result_type_of_id(&defs, *base) else {
-                        continue;
-                    };
-                    let Some((_, mut cur_ty)) = pointer_info.get(&base_ty).copied() else {
-                        continue;
-                    };
-                    let mut valid = true;
-                    for index in &inst.operands[1..] {
-                        let Some(next) = access_chain_step_type(&defs, cur_ty, index) else {
-                            valid = false;
-                            break;
-                        };
-                        cur_ty = next;
-                    }
-                    if !valid || cur_ty == pointee_ty {
-                        continue;
-                    }
-                    let Some(extra_count) = zero_tail_indices_to_pointee(&defs, cur_ty, pointee_ty)
-                    else {
-                        continue;
-                    };
-                    if extra_count == 0 {
-                        continue;
-                    }
-                    let Some(index_ty) = inst.operands[1..].iter().rev().find_map(|operand| {
-                        let Operand::IdRef(id) = operand else {
-                            return None;
-                        };
-                        result_type_of_id(&defs, *id)
-                    }) else {
-                        continue;
-                    };
-                    let zero = self.get_or_create_index_const(index_ty, 0);
-                    let mut operands = inst.operands;
-                    operands.extend(std::iter::repeat_n(Operand::IdRef(zero), extra_count));
-                    self.module.functions[fi].blocks[bi].instructions[ii].operands = operands;
                 }
             }
         }
@@ -1791,6 +3094,89 @@ impl Emitter {
     }
 }
 
+fn aggregate_path_target(
+    mut aggregate_type: Word,
+    path: &[u32],
+    definitions: &HashMap<Word, Instruction>,
+) -> Option<(Word, usize)> {
+    let mut target = None;
+    for index in path {
+        let definition = definitions.get(&aggregate_type)?;
+        let member = match definition.class.opcode {
+            Op::TypeStruct => *index as usize,
+            Op::TypeArray => 0,
+            _ => return None,
+        };
+        let Operand::IdRef(child) = definition.operands.get(member)? else {
+            return None;
+        };
+        target = Some((aggregate_type, member));
+        aggregate_type = *child;
+    }
+    target
+}
+
+fn aggregate_path_leaf_type(
+    mut aggregate_type: Word,
+    path: &[u32],
+    definitions: &HashMap<Word, Instruction>,
+) -> Option<Word> {
+    for index in path {
+        let definition = definitions.get(&aggregate_type)?;
+        let member = match definition.class.opcode {
+            Op::TypeStruct => *index as usize,
+            Op::TypeArray => 0,
+            _ => return None,
+        };
+        let Operand::IdRef(child) = definition.operands.get(member)? else {
+            return None;
+        };
+        aggregate_type = *child;
+    }
+    Some(aggregate_type)
+}
+
+fn aggregate_pointer_leaf_paths(
+    aggregate_type: Word,
+    definitions: &HashMap<Word, Instruction>,
+) -> Vec<Vec<u32>> {
+    fn visit(
+        ty: Word,
+        prefix: &mut Vec<u32>,
+        definitions: &HashMap<Word, Instruction>,
+        paths: &mut Vec<Vec<u32>>,
+    ) {
+        let Some(definition) = definitions.get(&ty) else {
+            return;
+        };
+        match definition.class.opcode {
+            Op::TypePointer => paths.push(prefix.clone()),
+            Op::TypeStruct => {
+                for (member, operand) in definition.operands.iter().enumerate() {
+                    let Operand::IdRef(child) = operand else {
+                        continue;
+                    };
+                    prefix.push(member as u32);
+                    visit(*child, prefix, definitions, paths);
+                    prefix.pop();
+                }
+            }
+            Op::TypeArray => {
+                if let Some(Operand::IdRef(child)) = definition.operands.first() {
+                    prefix.push(0);
+                    visit(*child, prefix, definitions, paths);
+                    prefix.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut paths = Vec::new();
+    visit(aggregate_type, &mut Vec::new(), definitions, &mut paths);
+    paths
+}
+
 fn ptr_access_chain_allowed_storage(storage: StorageClass) -> bool {
     matches!(
         storage,
@@ -1840,28 +3226,6 @@ fn spirv_type_is_scalar(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
             Op::TypeBool | Op::TypeFloat | Op::TypeInt
         )
     })
-}
-
-fn zero_tail_indices_to_pointee(
-    defs: &HashMap<Word, Instruction>,
-    mut cur_ty: Word,
-    pointee_ty: Word,
-) -> Option<usize> {
-    let mut count = 0usize;
-    while cur_ty != pointee_ty {
-        let def = defs.get(&cur_ty)?;
-        cur_ty = match def.class.opcode {
-            Op::TypeArray | Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
-                let Operand::IdRef(elem) = def.operands.first()? else {
-                    return None;
-                };
-                *elem
-            }
-            _ => return None,
-        };
-        count += 1;
-    }
-    Some(count)
 }
 
 fn access_chain_step_type(

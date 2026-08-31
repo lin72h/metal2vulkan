@@ -4,34 +4,34 @@ use metal2vulkan_validation::source::{
     corpus_root, for_each_indexed_source_analysis, for_each_indexed_source_analysis_with_stats,
 };
 use metal2vulkan_validation::translation_audit::{
-    select_translation_audit_batch, translation_audit_summary, write_translation_audit_results,
-    SelectionMode, TranslationAuditResult, TranslationAuditStatus,
+    select_translation_audit_batch, translation_audit_summary, translation_tier_summary,
+    write_translation_audit_results, SelectionMode, TranslationAuditResult, TranslationAuditStatus,
 };
 use metal2vulkan_validation::triage::{
     authored_intersection_linkage, authoring_capability_summary, classify, classify_summary,
-    read_cached, reclassify_cached_air_intrinsics, select_cached_audit_target_after,
-    select_uncached, write_cached, AuditTarget, StructuralTriage,
+    read_cached, select_all, select_cached_audit_target_after, select_uncached, write_cached,
+    AuditTarget, StructuralTriage,
 };
 use metal2vulkan_validation::ScratchDir;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
-use wait_timeout::ChildExt as _;
 
 const TRANSLATION_TIMEOUT: Duration = Duration::from_secs(30);
-const TRANSLATION_MEMORY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
-const LARGE_TRANSLATION_SOURCE_BYTES: usize = 1024 * 1024;
-const MAX_LARGE_TRANSLATION_JOBS: usize = 4;
+const TRANSLATION_MEMORY_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
+const LARGE_TRANSLATION_SOURCE_BYTES: usize = 256 * 1024;
+const MAX_LARGE_TRANSLATION_JOBS: usize = 2;
+const SERIALIZED_TRANSLATION_MAX_BYTES: usize = 384 * 1024;
+const SERIALIZED_TRANSLATION_CFG_CALL_WORK: usize = 140_000;
 // Leave headroom inside the resident-memory contract for allocator metadata, fragmentation, stacks,
 // and mapped runtime pages that the live-allocation counter cannot see. The parent independently
-// enforces the full 512 MiB RSS ceiling, so this is an early fail-safe rather than a second contract.
-const TRANSLATION_ALLOCATION_LIMIT_BYTES: usize = 416 * 1024 * 1024;
+// enforces the full 500 MiB RSS ceiling, so this is an early fail-safe rather than a second contract.
+const TRANSLATION_ALLOCATION_LIMIT_BYTES: usize = 240 * 1024 * 1024;
 static LIVE_ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
 static ALLOCATION_LIMIT_BYTES: AtomicUsize = AtomicUsize::new(usize::MAX);
 
@@ -74,12 +74,13 @@ unsafe impl GlobalAlloc for TranslationBudgetAllocator {
 }
 
 fn reserve_allocation(bytes: usize) -> bool {
-    LIVE_ALLOCATED_BYTES
+    let reserved = LIVE_ALLOCATED_BYTES
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
             live.checked_add(bytes)
                 .filter(|next| *next <= ALLOCATION_LIMIT_BYTES.load(Ordering::Relaxed))
         })
-        .is_ok()
+        .ok();
+    reserved.is_some()
 }
 
 fn enable_translation_memory_budget() {
@@ -145,11 +146,11 @@ fn run() -> Result<(), String> {
     let mut after = None;
     let mut current_fingerprint = false;
     let mut retry_failures = false;
+    let mut retry_linkage = false;
+    let mut tier_census = false;
     let mut reclassify_all = false;
     let mut hash_file = None;
-    let mut jobs = std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1);
+    let mut jobs = default_jobs();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -170,11 +171,13 @@ fn run() -> Result<(), String> {
             "--after" => after = Some(required(&mut args, "--after")?),
             "--current-fingerprint" => current_fingerprint = true,
             "--retry-failures" => retry_failures = true,
+            "--retry-linkage" => retry_linkage = true,
+            "--tier-census" => tier_census = true,
             "--reclassify-all" => reclassify_all = true,
             "--hash-file" => hash_file = Some(PathBuf::from(required(&mut args, "--hash-file")?)),
             "-h" | "--help" => {
                 println!(
-                    "usage: corpus-triage [--corpus DIR] [--index PATH] [--limit N] [--jobs N] [--summary-only] [--audit authoring-capabilities [--reclassify-all] | --audit visible-function-tables|ray-intersections|device-address-hierarchy|translation [--after SHA256] [--current-fingerprint | --retry-failures | --hash-file PATH]]\n\n--jobs defaults to all available logical CPU cores; lower it to constrain aggregate worker memory. --hash-file reads a whitespace-delimited SHA-256 from the first field of each non-empty line and audits exactly those indexed sources."
+                    "usage: corpus-triage [--corpus DIR] [--index PATH] [--limit N] [--jobs N] [--summary-only] [--audit authoring-capabilities [--reclassify-all] | --audit visible-function-tables|ray-intersections|device-address-hierarchy|translation [--after SHA256] [--current-fingerprint | --retry-failures | --retry-linkage | --tier-census | --hash-file PATH [--tier-census]]]\n\n--jobs defaults to the host's available logical CPU count (the equivalent of nproc). An explicit --jobs N overrides that default. --retry-linkage resumably revisits rows classified as authored-linkage-required by an older fingerprint. --tier-census measures and caches the adopting product retry tier, either for current-fingerprint rows that do not have one or for an exact --hash-file selection. --hash-file reads a whitespace-delimited SHA-256 from the first field of each non-empty line and audits exactly those indexed sources."
                 );
                 return Ok(());
             }
@@ -196,20 +199,41 @@ fn run() -> Result<(), String> {
     if retry_failures && !matches!(audit, Some(AuditKind::Translation)) {
         return Err("--retry-failures requires --audit translation".into());
     }
+    if retry_linkage && !matches!(audit, Some(AuditKind::Translation)) {
+        return Err("--retry-linkage requires --audit translation".into());
+    }
+    if tier_census && !matches!(audit, Some(AuditKind::Translation)) {
+        return Err("--tier-census requires --audit translation".into());
+    }
     if reclassify_all && !matches!(audit, Some(AuditKind::AuthoringCapabilities)) {
         return Err("--reclassify-all requires --audit authoring-capabilities".into());
     }
     if hash_file.is_some() && !matches!(audit, Some(AuditKind::Translation)) {
         return Err("--hash-file requires --audit translation".into());
     }
-    if hash_file.is_some() && (after.is_some() || current_fingerprint || retry_failures) {
+    if hash_file.is_some()
+        && (after.is_some() || current_fingerprint || retry_failures || retry_linkage)
+    {
         return Err(
-            "--hash-file is mutually exclusive with --after, --current-fingerprint, and --retry-failures"
+            "--hash-file is mutually exclusive with --after, --current-fingerprint, --retry-failures, and --retry-linkage"
                 .into(),
         );
     }
-    if current_fingerprint && retry_failures {
-        return Err("--current-fingerprint and --retry-failures are mutually exclusive".into());
+    if [
+        current_fingerprint,
+        retry_failures,
+        retry_linkage,
+        tier_census,
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count()
+        > 1
+    {
+        return Err(
+            "--current-fingerprint, --retry-failures, --retry-linkage, and --tier-census are mutually exclusive"
+                .into(),
+        );
     }
     if after.as_deref().is_some_and(|hash| {
         hash.len() != 64
@@ -250,6 +274,7 @@ fn run() -> Result<(), String> {
                 &index,
                 jobs,
                 summary_only,
+                tier_census,
                 if let Some(path) = hash_file.as_deref() {
                     TranslationSelection::HashFile(path)
                 } else {
@@ -258,6 +283,10 @@ fn run() -> Result<(), String> {
                         limit,
                         mode: if retry_failures {
                             SelectionMode::RetryCurrentFailures
+                        } else if retry_linkage {
+                            SelectionMode::RetryHistoricalLinkage
+                        } else if tier_census {
+                            SelectionMode::MissingTierCensus
                         } else if current_fingerprint {
                             SelectionMode::CurrentFingerprint
                         } else {
@@ -320,6 +349,12 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(1)
+}
+
 fn audit_authoring_capabilities(
     root: &std::path::Path,
     index: &std::path::Path,
@@ -328,23 +363,15 @@ fn audit_authoring_capabilities(
     reclassify_all: bool,
 ) -> Result<(), String> {
     let started = Instant::now();
-    let hashes = (!reclassify_all)
-        .then(|| select_uncached(index, limit))
-        .transpose()?
-        .unwrap_or_default();
+    let hashes = if reclassify_all {
+        select_all(index, limit)?
+    } else {
+        select_uncached(index, limit)?
+    };
     let selection_elapsed = started.elapsed();
     let source_started = Instant::now();
-    let (selected, read_stats) = if reclassify_all {
-        (
-            reclassify_cached_air_intrinsics(index)?,
-            metal2vulkan_validation::source::IndexedSourceReadStats::default(),
-        )
-    } else {
-        (
-            hashes.len(),
-            classify_and_cache_parallel(root, index, &hashes, jobs)?,
-        )
-    };
+    let selected = hashes.len();
+    let read_stats = classify_and_cache_parallel(root, index, &hashes, jobs)?;
     let source_elapsed = source_started.elapsed();
     let summary = authoring_capability_summary(index)?;
     println!(
@@ -460,8 +487,11 @@ fn audit_translation(
     index: &std::path::Path,
     jobs: usize,
     summary_only: bool,
+    tier_census: bool,
     selection: TranslationSelection<'_>,
 ) -> Result<(), String> {
+    let linked_index =
+        metal2vulkan_validation::library_module::sync_library_module_index(root, index)?;
     let started = Instant::now();
     let hashes = match selection {
         TranslationSelection::Indexed { after, limit, mode } => {
@@ -479,63 +509,113 @@ fn audit_translation(
     let source_elapsed = source_started.elapsed();
 
     let sources = Arc::new(sources);
-    let (large_work, small_work) = translation_work_lanes(&sources);
+    let (serialized_work, large_work, small_work) = translation_work_lanes(&sources);
+    let serialized_work = Arc::new(serialized_work);
     let large_work = Arc::new(large_work);
     let small_work = Arc::new(small_work);
+    let next_serialized = AtomicUsize::new(0);
     let next_large = AtomicUsize::new(0);
     let next_small = AtomicUsize::new(0);
-    let (sender, receiver) = mpsc::channel();
+    let worker_count = jobs.min(sources.len().max(1));
+    // A stalled checkpoint must apply backpressure instead of retaining an unbounded completed-row
+    // backlog. On persistence failure the receiver keeps draining the at-most-one-result-per-worker
+    // channel while the cancellation flag stops workers before they claim another row.
+    let (sender, receiver) = bounded_worker_channel(worker_count);
+    let cancelled = AtomicBool::new(false);
     let mut results = std::iter::repeat_with(|| None)
         .take(sources.len())
         .collect::<Vec<Option<TranslationAuditResult>>>();
     let mut elapsed_ms = vec![0u128; sources.len()];
     let translation_started = Instant::now();
+    let mut checkpoint_error = None;
     std::thread::scope(|scope| {
-        let worker_count = jobs.min(sources.len().max(1));
-        let large_worker_count = MAX_LARGE_TRANSLATION_JOBS
-            .min(large_work.len())
-            .min(worker_count);
+        let (_, serialized_worker_count, large_worker_count) = translation_phase_worker_counts(
+            jobs,
+            sources.len(),
+            serialized_work.len(),
+            large_work.len(),
+        );
+        let phase_barrier = Arc::new(Barrier::new(worker_count));
         for worker_index in 0..worker_count {
             let sources = Arc::clone(&sources);
+            let serialized_work = Arc::clone(&serialized_work);
             let large_work = Arc::clone(&large_work);
             let small_work = Arc::clone(&small_work);
             let sender = sender.clone();
+            let next_serialized = &next_serialized;
             let next_large = &next_large;
             let next_small = &next_small;
-            let handles_large = worker_index < large_worker_count;
-            scope.spawn(move || loop {
-                let source_index = handles_large
-                    .then(|| {
-                        large_work
-                            .get(next_large.fetch_add(1, Ordering::Relaxed))
-                            .copied()
-                    })
-                    .flatten()
-                    .or_else(|| {
-                        small_work
-                            .get(next_small.fetch_add(1, Ordering::Relaxed))
-                            .copied()
-                    });
-                let Some(source_index) = source_index else {
-                    break;
+            let cancelled = &cancelled;
+            let handles_serialized = worker_index < serialized_worker_count;
+            let handles_large = worker_index >= serialized_worker_count
+                && worker_index < serialized_worker_count + large_worker_count;
+            let phase_barrier = Arc::clone(&phase_barrier);
+            scope.spawn(move || {
+                let mut receiver_open = true;
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let Some(source_index) = small_work
+                        .get(next_small.fetch_add(1, Ordering::Relaxed))
+                        .copied()
+                    else {
+                        break;
+                    };
+                    let source = &sources[source_index];
+                    let started = Instant::now();
+                    let result = guarded_translation_audit_source(root, index, source, tier_census);
+                    if sender
+                        .send((source_index, result, started.elapsed().as_millis()))
+                        .is_err()
+                    {
+                        receiver_open = false;
+                        break;
+                    }
+                }
+                // Large rows are individually bounded but compete heavily for CPU and memory
+                // bandwidth with the high-throughput lane. Complete the small phase with all
+                // requested workers, then let only the bounded large-worker subset proceed.
+                phase_barrier.wait();
+                if !receiver_open || cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                let (work, next) = if handles_serialized {
+                    (&serialized_work, next_serialized)
+                } else if handles_large {
+                    (&large_work, next_large)
+                } else {
+                    return;
                 };
-                let source = &sources[source_index];
-                let started = Instant::now();
-                let result = audit_translation_source(source);
-                if sender
-                    .send((source_index, result, started.elapsed().as_millis()))
-                    .is_err()
-                {
-                    break;
+                loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Some(source_index) =
+                        work.get(next.fetch_add(1, Ordering::Relaxed)).copied()
+                    else {
+                        break;
+                    };
+                    let source = &sources[source_index];
+                    let started = Instant::now();
+                    let result = guarded_translation_audit_source(root, index, source, tier_census);
+                    if sender
+                        .send((source_index, result, started.elapsed().as_millis()))
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
             });
         }
         drop(sender);
         let mut checkpoint = Vec::with_capacity(10);
-        for completed in 1..=sources.len() {
-            let (result_index, result, result_elapsed_ms) = receiver
-                .recv()
-                .map_err(|error| format!("translation audit worker stopped: {error}"))?;
+        let mut completed = 0usize;
+        while let Ok((result_index, result, result_elapsed_ms)) = receiver.recv() {
+            if checkpoint_error.is_some() {
+                continue;
+            }
+            completed += 1;
             checkpoint.push(result.clone());
             results[result_index] = Some(result);
             elapsed_ms[result_index] = result_elapsed_ms;
@@ -543,7 +623,12 @@ fn audit_translation(
                 // Persist before reporting progress. A killed or interrupted long-running census
                 // therefore loses at most the current short checkpoint, and its next resumable
                 // selection skips every completed row instead of repeating the whole batch.
-                write_translation_audit_results(index, &checkpoint)?;
+                if let Err(error) = write_translation_audit_results(index, &checkpoint) {
+                    cancelled.store(true, Ordering::Release);
+                    checkpoint_error = Some(error);
+                    checkpoint.clear();
+                    continue;
+                }
                 checkpoint.clear();
                 eprintln!(
                     "# translation-audit progress={completed}/{} jobs={jobs}",
@@ -551,8 +636,16 @@ fn audit_translation(
                 );
             }
         }
-        Ok::<(), String>(())
-    })?;
+        if completed != sources.len() && checkpoint_error.is_none() {
+            checkpoint_error = Some(format!(
+                "translation audit workers stopped after {completed}/{} rows",
+                sources.len()
+            ));
+        }
+    });
+    if let Some(error) = checkpoint_error {
+        return Err(error);
+    }
     let translation_elapsed = translation_started.elapsed();
     let results = results
         .into_iter()
@@ -596,7 +689,7 @@ fn audit_translation(
         .map(|(index, elapsed)| (sources[index].air_sha256.as_str(), *elapsed))
         .unwrap_or(("none", 0));
     println!(
-        "translation-audit-summary\tselected={}\ttranslated={}\tauthored_linkage_required={}\tfailed={}\tfailure_shapes={}\tindex_select_ms={}\tsource_read_ms={}\ttranslate_validate_ms={}\tslowest_air_sha256={}\tslowest_ms={}\tindexed_rows={}\tsource_shards_opened={}\tsource_bytes_read={}\trepair_shards_scanned={}\trepair_bytes_scanned={}\tdiscovery_covered={}\tdiscovery_remaining={}\tcurrent_attempted={}\tcurrent_translated={}\tcurrent_authored_linkage_required={}\tcurrent_failed={}\tcurrent_remaining={}",
+        "translation-audit-summary\tselected={}\ttranslated={}\tauthored_linkage_required={}\tfailed={}\tfailure_shapes={}\tindex_select_ms={}\tsource_read_ms={}\ttranslate_validate_ms={}\tslowest_air_sha256={}\tslowest_ms={}\tindexed_rows={}\tsource_shards_opened={}\tsource_bytes_read={}\trepair_shards_scanned={}\trepair_bytes_scanned={}\tlibrary_module_shards_scanned={}\tlibrary_module_bytes_scanned={}\tdiscovery_covered={}\tdiscovery_remaining={}\tcurrent_attempted={}\tcurrent_translated={}\tcurrent_authored_linkage_required={}\tcurrent_failed={}\tcurrent_remaining={}",
         results.len(),
         translated,
         authored_linkage,
@@ -612,6 +705,8 @@ fn audit_translation(
         read_stats.source_bytes_read,
         read_stats.repair_shards_scanned,
         read_stats.repair_bytes_scanned,
+        linked_index.shards_scanned,
+        linked_index.bytes_scanned,
         census.discovery_covered,
         census.discovery_remaining,
         census.current_attempted,
@@ -622,6 +717,11 @@ fn audit_translation(
     );
     for (shape, count) in failures {
         println!("translation-audit-failure\t{count}\t{shape}");
+    }
+    if tier_census {
+        for (tier, count) in translation_tier_summary(index)? {
+            println!("translation-tier\t{count}\t{tier}");
+        }
     }
     Ok(())
 }
@@ -655,11 +755,14 @@ fn read_hash_file(path: &std::path::Path) -> Result<Vec<String>, String> {
 
 fn translation_work_lanes(
     sources: &[metal2vulkan_validation::source::SourceRow],
-) -> (Vec<usize>, Vec<usize>) {
+) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut serialized = Vec::new();
     let mut large = Vec::new();
     let mut small = Vec::new();
     for (index, source) in sources.iter().enumerate() {
-        if source.air_ll.len() >= LARGE_TRANSLATION_SOURCE_BYTES {
+        if is_serialized_cost_translation_source(source) {
+            serialized.push(index);
+        } else if is_costly_translation_source(source) {
             large.push(index);
         } else {
             small.push(index);
@@ -672,27 +775,121 @@ fn translation_work_lanes(
             .cmp(&sources[*left].air_ll.len())
             .then_with(|| left.cmp(right))
     };
+    serialized.sort_by(largest_first);
     large.sort_by(largest_first);
     small.sort_by(largest_first);
-    (large, small)
+    (serialized, large, small)
+}
+
+fn translation_phase_worker_counts(
+    jobs: usize,
+    source_count: usize,
+    serialized_count: usize,
+    large_count: usize,
+) -> (usize, usize, usize) {
+    let worker_count = jobs.min(source_count.max(1));
+    let serialized_worker_count = usize::from(serialized_count != 0 && worker_count != 0);
+    let large_worker_count = MAX_LARGE_TRANSLATION_JOBS
+        .saturating_sub(serialized_worker_count)
+        .min(large_count)
+        .min(worker_count.saturating_sub(serialized_worker_count));
+    (worker_count, serialized_worker_count, large_worker_count)
+}
+
+fn bounded_worker_channel<T>(worker_count: usize) -> (mpsc::SyncSender<T>, mpsc::Receiver<T>) {
+    mpsc::sync_channel(worker_count)
+}
+
+fn is_costly_translation_source(source: &metal2vulkan_validation::source::SourceRow) -> bool {
+    source.air_ll.len() >= LARGE_TRANSLATION_SOURCE_BYTES
+        || source.air_ll.contains("air.visible_function_table")
+            && (source.air_ll.contains("inttoptr") || source.air_ll.contains("ptrtoint"))
+}
+
+fn is_serialized_cost_translation_source(
+    source: &metal2vulkan_validation::source::SourceRow,
+) -> bool {
+    let (block_count, call_count) = translation_cfg_counts(&source.air_ll);
+    source.air_ll.len() <= SERIALIZED_TRANSLATION_MAX_BYTES
+        && block_count.saturating_mul(call_count) >= SERIALIZED_TRANSLATION_CFG_CALL_WORK
+}
+
+fn translation_cfg_counts(air_ll: &str) -> (usize, usize) {
+    air_ll.lines().fold((0, 0), |(blocks, calls), line| {
+        let is_block = line
+            .split_whitespace()
+            .next()
+            .and_then(|head| head.strip_suffix(':'))
+            .is_some_and(|name| {
+                !name.is_empty()
+                    && name.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || "_.".contains(character)
+                    })
+            });
+        let trimmed = line.trim_start();
+        let is_call = trimmed.starts_with("call ") || trimmed.contains(" call ");
+        (blocks + usize::from(is_block), calls + usize::from(is_call))
+    })
 }
 
 fn audit_translation_source(
+    root: &std::path::Path,
+    index: &std::path::Path,
     source: &metal2vulkan_validation::source::SourceRow,
+    tier_census: bool,
 ) -> TranslationAuditResult {
-    match audit_translation_source_in_worker(source) {
+    match audit_translation_source_in_worker(root, index, source, tier_census) {
         Ok(result) => result,
         Err(error) => TranslationAuditResult {
             air_sha256: source.air_sha256.clone(),
             status: TranslationAuditStatus::Failed,
             failure_shape: Some(normalize_failure_shape(&error)),
             detail: Some(bounded_detail(&error)),
+            adopted_tier: None,
         },
     }
 }
 
-fn audit_translation_source_in_worker(
+fn guarded_translation_audit_source(
+    root: &std::path::Path,
+    index: &std::path::Path,
     source: &metal2vulkan_validation::source::SourceRow,
+    tier_census: bool,
+) -> TranslationAuditResult {
+    guarded_translation_audit_source_with(source, |source| {
+        audit_translation_source(root, index, source, tier_census)
+    })
+}
+
+fn guarded_translation_audit_source_with(
+    source: &metal2vulkan_validation::source::SourceRow,
+    audit: impl FnOnce(&metal2vulkan_validation::source::SourceRow) -> TranslationAuditResult,
+) -> TranslationAuditResult {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| audit(source))) {
+        Ok(result) => result,
+        Err(payload) => {
+            let panic = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic payload");
+            let error = format!("translation audit worker panicked: {panic}");
+            TranslationAuditResult {
+                air_sha256: source.air_sha256.clone(),
+                status: TranslationAuditStatus::Failed,
+                failure_shape: Some(normalize_failure_shape(&error)),
+                detail: Some(bounded_detail(&error)),
+                adopted_tier: None,
+            }
+        }
+    }
+}
+
+fn audit_translation_source_in_worker(
+    root: &std::path::Path,
+    index: &std::path::Path,
+    source: &metal2vulkan_validation::source::SourceRow,
+    tier_census: bool,
 ) -> Result<TranslationAuditResult, String> {
     let scratch = ScratchDir::new("translation-audit-worker")?;
     let translation_tmp = scratch.path().join("translation");
@@ -712,6 +909,8 @@ fn audit_translation_source_in_worker(
     command
         .arg("--translation-worker")
         .arg(&translation_tmp)
+        .arg(root)
+        .arg(index)
         // A regular file lets the child decode arbitrarily large rows under the watchdog without
         // one short-lived parent feeder thread per row. Besides bounding thread count by `jobs`,
         // this avoids eventually exhausting host thread-creation resources during a full census.
@@ -724,6 +923,9 @@ fn audit_translation_source_in_worker(
         .stderr(Stdio::from(fs::File::create(&stderr_path).map_err(
             |error| format!("create {}: {error}", stderr_path.display()),
         )?));
+    if tier_census {
+        command.env("METAL2VULKAN_TIER_CENSUS", "1");
+    }
     configure_process_group(&mut command);
     let started = Instant::now();
     let mut child = command
@@ -777,8 +979,33 @@ fn audit_translation_source_in_worker(
     }
     let output = fs::read(&stdout_path)
         .map_err(|error| format!("read {}: {error}", stdout_path.display()))?;
-    serde_json::from_slice(&output)
-        .map_err(|error| format!("decode translation worker result: {error}"))
+    let mut result: TranslationAuditResult = serde_json::from_slice(&output)
+        .map_err(|error| format!("decode translation worker result: {error}"))?;
+    if tier_census {
+        result.adopted_tier = measured_translation_tier(result.status, &stderr);
+        if result.adopted_tier.is_none() {
+            return Err(format!(
+                "translation worker did not report an adopting tier: {}",
+                bounded_detail(&stderr)
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn measured_translation_tier(status: TranslationAuditStatus, stderr: &str) -> Option<String> {
+    parse_adopted_tier(stderr).map(str::to_string).or_else(|| {
+        (status == TranslationAuditStatus::AuthoredLinkageRequired)
+            .then(|| "authored_linkage_required".to_string())
+    })
+}
+
+fn parse_adopted_tier(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .rev()
+        .find_map(|line| line.strip_prefix("[tier-census] "))
+        .filter(|tier| !tier.is_empty())
 }
 
 fn run_translation_worker() -> Result<(), String> {
@@ -787,87 +1014,278 @@ fn run_translation_worker() -> Result<(), String> {
         .nth(2)
         .map(PathBuf::from)
         .ok_or("translation worker scratch path is unavailable")?;
+    let corpus_root = std::env::args_os()
+        .nth(3)
+        .map(PathBuf::from)
+        .ok_or("translation worker corpus root is unavailable")?;
+    let index = std::env::args_os()
+        .nth(4)
+        .map(PathBuf::from)
+        .ok_or("translation worker index path is unavailable")?;
     let mut source: metal2vulkan_validation::source::SourceRow =
         serde_json::from_reader(std::io::stdin().lock())
             .map_err(|error| format!("decode translation worker input: {error}"))?;
     // Translation consumes sanitized AIR and authored linkage metadata, never the original encoded
     // bitcode. Release that potentially multi-megabyte transport field before parsing the AIR graph.
     source.blob_b64 = None;
-    let result = audit_translation_source_inline(&source, &translation_tmp);
+    let result = audit_translation_source_owned(source, &translation_tmp, &corpus_root, &index);
     serde_json::to_writer(std::io::stdout().lock(), &result)
         .map_err(|error| format!("encode translation worker result: {error}"))?;
     Ok(())
 }
 
-fn audit_translation_source_inline(
-    source: &metal2vulkan_validation::source::SourceRow,
+fn audit_translation_source_owned(
+    source: metal2vulkan_validation::source::SourceRow,
     translation_tmp: &std::path::Path,
+    corpus_root: &std::path::Path,
+    index: &std::path::Path,
 ) -> TranslationAuditResult {
-    let outcome = translate_and_validate_source(source, translation_tmp);
+    let table_linkage_required = source.air_ll.contains("air.visible_function_table")
+        && metal2vulkan_validation::triage::audit_visible_function_tables(&source)
+            .requires_authored_linkage();
+    if table_linkage_required {
+        let hash = source.air_sha256.clone();
+        let outcome = translate_authored_linkage_cases(
+            &source,
+            translation_tmp,
+            corpus_root,
+            AuthoredLinkageRequirement::VisibleTable,
+        );
+        return match outcome {
+            Ok(Some(())) => TranslationAuditResult {
+                air_sha256: hash,
+                status: TranslationAuditStatus::Translated,
+                failure_shape: None,
+                detail: None,
+                adopted_tier: None,
+            },
+            Ok(None) => TranslationAuditResult {
+                air_sha256: hash,
+                status: TranslationAuditStatus::AuthoredLinkageRequired,
+                failure_shape: None,
+                detail: Some(
+                    "AIR visible-function table requires exact authored slot population".into(),
+                ),
+                adopted_tier: None,
+            },
+            Err(error) => TranslationAuditResult {
+                air_sha256: hash,
+                status: TranslationAuditStatus::Failed,
+                failure_shape: Some(normalize_failure_shape(&error)),
+                detail: Some(bounded_detail(&error)),
+                adopted_tier: None,
+            },
+        };
+    }
+    let direct_references = if source.air_ll.contains("!air.visible_function_references") {
+        match metal2vulkan_validation::library_module::resolve_indexed_visible_references(
+            corpus_root,
+            index,
+            &source.air_ll,
+            &source.lib_sha256s,
+        ) {
+            Ok(Some(references)) => references,
+            Ok(None) => {
+                let hash = source.air_sha256.clone();
+                let outcome = translate_authored_linkage_cases(
+                    &source,
+                    translation_tmp,
+                    corpus_root,
+                    AuthoredLinkageRequirement::VisibleReferences,
+                );
+                return match outcome {
+                    Ok(Some(())) => TranslationAuditResult {
+                        air_sha256: hash,
+                        status: TranslationAuditStatus::Translated,
+                        failure_shape: None,
+                        detail: None,
+                        adopted_tier: None,
+                    },
+                    Ok(None) => TranslationAuditResult {
+                        air_sha256: hash,
+                        status: TranslationAuditStatus::AuthoredLinkageRequired,
+                        failure_shape: None,
+                        detail: Some(
+                            "AIR visible-function reference has no unique retained definition across its parent libraries or authored cases"
+                                .into(),
+                        ),
+                        adopted_tier: None,
+                    },
+                    Err(error) => TranslationAuditResult {
+                        air_sha256: hash,
+                        status: TranslationAuditStatus::Failed,
+                        failure_shape: Some(normalize_failure_shape(&error)),
+                        detail: Some(bounded_detail(&error)),
+                        adopted_tier: None,
+                    },
+                };
+            }
+            Err(error) => {
+                return TranslationAuditResult {
+                    air_sha256: source.air_sha256,
+                    status: TranslationAuditStatus::Failed,
+                    failure_shape: Some(normalize_failure_shape(&error)),
+                    detail: Some(bounded_detail(&error)),
+                    adopted_tier: None,
+                };
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let hash = source.air_sha256.clone();
+    let outcome = translate_and_validate_owned_source(source, translation_tmp, direct_references);
     match outcome {
         Ok(()) => TranslationAuditResult {
-            air_sha256: source.air_sha256.clone(),
+            air_sha256: hash,
             status: TranslationAuditStatus::Translated,
             failure_shape: None,
             detail: None,
+            adopted_tier: None,
         },
-        Err(error) if visible_linkage_is_the_only_missing_input(source, &error) => {
-            TranslationAuditResult {
-                air_sha256: source.air_sha256.clone(),
-                status: TranslationAuditStatus::AuthoredLinkageRequired,
-                failure_shape: None,
-                detail: Some(bounded_detail(&error)),
-            }
-        }
         Err(error) => TranslationAuditResult {
-            air_sha256: source.air_sha256.clone(),
+            air_sha256: hash,
             status: TranslationAuditStatus::Failed,
             failure_shape: Some(normalize_failure_shape(&error)),
             detail: Some(bounded_detail(&error)),
+            adopted_tier: None,
         },
     }
 }
 
-fn translate_and_validate_source(
+#[derive(Clone, Copy)]
+enum AuthoredLinkageRequirement {
+    VisibleTable,
+    VisibleReferences,
+}
+
+fn translate_authored_linkage_cases(
     source: &metal2vulkan_validation::source::SourceRow,
     translation_tmp: &std::path::Path,
-) -> Result<(), String> {
-    let stage = match source.stage.as_str() {
-        "Kernel" => metal2vulkan::passes::Stage::Kernel,
-        "Vertex" => metal2vulkan::passes::Stage::Vertex,
-        "Fragment" => metal2vulkan::passes::Stage::Fragment,
-        other => return Err(format!("unknown stage {other:?}")),
-    };
-    let linkage = authored_intersection_linkage(source).unwrap_or_default();
-    let prepared = if linkage.is_empty() {
-        Cow::Borrowed(source.air_ll.as_str())
-    } else {
-        Cow::Owned(
-            metal2vulkan::linked_functions::specialize_opaque_triangle_intersection_tables(
-                &source.air_ll,
-                &source.entry,
-                &linkage,
-            )?,
-        )
-    };
-
-    // `METAL2VULKAN_RETRY_DUMP` promises the first invalid candidate, not whichever later tier
-    // happens to fail last. The primary-only gate owns that diagnostic contract. Keep its extra
-    // emit+validation strictly default-off, then run the ordinary complete cascade unchanged.
-    if metal2vulkan::env_vars::retry_dump().is_some() {
-        let _ = metal2vulkan::translate_native_primary_validated(&prepared, stage, translation_tmp);
+    corpus_root: &std::path::Path,
+    requirement: AuthoredLinkageRequirement,
+) -> Result<Option<()>, String> {
+    let cases = metal2vulkan_validation::store::CorpusStore::new(corpus_root)
+        .find_cases_for_air(&source.air_sha256)?;
+    if cases.is_empty() {
+        return Ok(None);
     }
+    let stage = product_stage(&source.stage)?;
+    for (index, case) in cases.into_iter().enumerate() {
+        let case_id = case.case_id.clone();
+        let checked =
+            metal2vulkan_validation::check::check_case_against_source(corpus_root, case, source)
+                .map_err(|errors| {
+                    format!(
+                        "check authored linkage case {case_id}: {}",
+                        errors.join("; ")
+                    )
+                })?;
+        let linkage = metal2vulkan_validation::check::product_linkage(
+            &checked.reflection,
+            &checked.linked_functions,
+        )?;
+        let has_required_linkage = match requirement {
+            AuthoredLinkageRequirement::VisibleTable => !linkage.visible_tables.is_empty(),
+            AuthoredLinkageRequirement::VisibleReferences => !linkage.visible_references.is_empty(),
+        };
+        if !has_required_linkage {
+            let resource = match requirement {
+                AuthoredLinkageRequirement::VisibleTable => "visible-function table",
+                AuthoredLinkageRequirement::VisibleReferences => "visible-function references",
+            };
+            return Err(format!(
+                "authored linkage case {case_id} does not populate the required {resource}"
+            ));
+        }
+        let options = metal2vulkan_validation::case::product_transform_options_with_reflection(
+            &checked.case,
+            &checked.reflection,
+        )?;
+        let function_constants =
+            metal2vulkan_validation::literal::function_constants(&checked.case)?
+                .into_iter()
+                .map(|constant| (constant.index, constant.bytes))
+                .collect::<Vec<_>>();
+        let case_tmp = translation_tmp.join(format!("authored-{index}"));
+        fs::create_dir(&case_tmp)
+            .map_err(|error| format!("create {}: {error}", case_tmp.display()))?;
+        let spv = metal2vulkan::translate_sanitized_native_linked_specialized_with_options(
+            &source.air_ll,
+            stage,
+            &case_tmp,
+            options,
+            &linkage,
+            &function_constants,
+        )
+        .map_err(|error| format!("translate authored linkage case {case_id}: {error}"))?;
+        metal2vulkan::tools::spirv_val_bytes(&spv, &case_tmp)
+            .map_err(|error| format!("validate authored linkage case {case_id}: {error}"))?;
+    }
+    Ok(Some(()))
+}
 
+fn product_stage(stage: &str) -> Result<metal2vulkan::passes::Stage, String> {
+    match stage {
+        "Kernel" => Ok(metal2vulkan::passes::Stage::Kernel),
+        "Vertex" => Ok(metal2vulkan::passes::Stage::Vertex),
+        "Fragment" => Ok(metal2vulkan::passes::Stage::Fragment),
+        other => Err(format!("unknown stage {other:?}")),
+    }
+}
+
+fn translate_and_validate_owned_source(
+    source: metal2vulkan_validation::source::SourceRow,
+    translation_tmp: &std::path::Path,
+    direct_references: Vec<metal2vulkan_validation::library_module::ResolvedFunctionReference>,
+) -> Result<(), String> {
+    let stage = product_stage(&source.stage)?;
+    let mut linkage = authored_intersection_linkage(&source).unwrap_or_default();
+    linkage.visible_references = direct_references
+        .into_iter()
+        .map(
+            |reference| metal2vulkan::linked_functions::LinkedFunctionReference {
+                symbol: reference.function,
+                module_ll: reference.module.air_ll,
+            },
+        )
+        .collect();
     let options = metal2vulkan::passes::TransformOptions {
         raster_sample_count: (stage == metal2vulkan::passes::Stage::Fragment).then_some(1),
         ..metal2vulkan::passes::TransformOptions::default()
     };
-    let spv = metal2vulkan::translate_sanitized_native_with_options(
-        &prepared,
-        stage,
-        translation_tmp,
-        options,
-    )?;
+    if metal2vulkan::env_vars::retry_dump().is_some() {
+        let diagnostic_source = if linkage.is_empty() {
+            std::borrow::Cow::Borrowed(source.air_ll.as_str())
+        } else {
+            std::borrow::Cow::Owned(metal2vulkan::specialize_linked_module(
+                &source.air_ll,
+                stage,
+                &linkage,
+            )?)
+        };
+        let _ = metal2vulkan::translate_native_primary_validated(
+            &diagnostic_source,
+            stage,
+            translation_tmp,
+        );
+    }
+    let spv = if linkage.is_empty() {
+        metal2vulkan::translate_sanitized_native_owned_with_options(
+            source.air_ll,
+            stage,
+            translation_tmp,
+            options,
+        )?
+    } else {
+        metal2vulkan::translate_sanitized_native_linked_with_options(
+            &source.air_ll,
+            stage,
+            translation_tmp,
+            options,
+            &linkage,
+        )?
+    };
     metal2vulkan::tools::spirv_val_bytes(&spv, translation_tmp)
 }
 
@@ -929,36 +1347,26 @@ fn terminate_child(child: &mut Child) {
     unsafe {
         let _ = libc::kill(group, libc::SIGTERM);
     }
-    if child
-        .wait_timeout(Duration::from_millis(100))
-        .ok()
-        .flatten()
-        .is_none()
-    {
-        unsafe {
-            let _ = libc::kill(group, libc::SIGKILL);
+    let grace_started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if grace_started.elapsed() < Duration::from_millis(100) => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => break,
         }
-        let _ = child.wait();
     }
+    unsafe {
+        let _ = libc::kill(group, libc::SIGKILL);
+    }
+    let _ = child.wait();
 }
 
 #[cfg(not(unix))]
 fn terminate_child(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
-}
-
-fn visible_linkage_is_the_only_missing_input(
-    source: &metal2vulkan_validation::source::SourceRow,
-    error: &str,
-) -> bool {
-    if error.contains("unsupported Metal visible function reference") {
-        return source.air_ll.contains("!air.visible_function_references");
-    }
-    error.contains("unsupported indirect call through function pointer")
-        && source.air_ll.contains("air.visible_function_table")
-        && !metal2vulkan_validation::triage::audit_visible_function_tables(source)
-            .has_unsupported_use()
 }
 
 fn bounded_detail(error: &str) -> String {
@@ -1153,12 +1561,15 @@ fn audit_device_address_hierarchy(
             let sender = sender.clone();
             let next = &next;
             scope.spawn(move || loop {
-                let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some(source) = sources.get(index) else {
+                let source_index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(source) = sources.get(source_index) else {
                     break;
                 };
                 if sender
-                    .send((index, audit_device_address_source(source)))
+                    .send((
+                        source_index,
+                        audit_device_address_source(root, index, source),
+                    ))
                     .is_err()
                 {
                     break;
@@ -1245,9 +1656,11 @@ fn audit_device_address_hierarchy(
 }
 
 fn audit_device_address_source(
+    root: &std::path::Path,
+    index: &std::path::Path,
     source: &metal2vulkan_validation::source::SourceRow,
 ) -> Result<TranslationAuditStatus, String> {
-    let result = audit_translation_source(source);
+    let result = audit_translation_source(root, index, source, false);
     match result.status {
         TranslationAuditStatus::Translated | TranslationAuditStatus::AuthoredLinkageRequired => {
             Ok(result.status)
@@ -1320,20 +1733,269 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_visible_reference_failure_is_an_authored_linkage_input() {
+    fn translation_worker_classifies_structurally_traced_table_before_spawning_tools() {
         let source = metal2vulkan_validation::source::SourceRow {
             air_sha256: "11".repeat(32),
             stage: "Kernel".into(),
             entry: "main".into(),
-            air_ll: "define void @main() { ret void }\n!air.visible_function_references = !{!0}\n!0 = !{!\"air.visible_function_reference\", ptr @linked.MTL_VISIBLE_FN_REF, !\"linked\"}\n".into(),
+            air_ll: "define void @main(ptr addrspace(1) %table) {\nentry:\n %value = call i32 @invoke(ptr addrspace(1) %table)\n ret void\n}\ndefine internal i32 @invoke(ptr addrspace(1) %functions) {\nentry:\n %f = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %functions, i32 0)\n %value = call i32 %f()\n ret i32 %value\n}\n!air.kernel = !{!0}\n!0 = !{ptr @main, !1, !2}\n!1 = !{}\n!2 = !{!3}\n!3 = !{i32 0, !\"air.visible_function_table\", !\"air.location_index\", i32 1, i32 1, !\"air.read\"}\n".into(),
             blob_b64: None,
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: "local/test.ll".into(),
         };
-        assert!(visible_linkage_is_the_only_missing_input(
-            &source,
-            "native emitter: unsupported Metal visible function reference; dynamic linked functions are not expressible in Logical SPIR-V"
-        ));
+        let result = audit_translation_source_owned(
+            source,
+            std::path::Path::new("/unused"),
+            std::path::Path::new("/unused"),
+            std::path::Path::new("/unused"),
+        );
+        assert_eq!(
+            result.status,
+            TranslationAuditStatus::AuthoredLinkageRequired
+        );
+        assert_eq!(result.failure_shape, None);
+    }
+
+    #[test]
+    fn translation_worker_executes_exact_authored_table_linkage() {
+        use metal2vulkan_validation::case::{
+            AuthoredCase, BufferResource, Comparison, Dispatch, ExecutionSafety,
+            FunctionTableEntry, FunctionTableResource, OutputSelection, ResourceRole, Stage,
+        };
+        use metal2vulkan_validation::library_module::LibraryModuleRow;
+
+        let scratch = ScratchDir::new("authored-table-translation").unwrap();
+        let air_ll = r#"
+define void @main(ptr addrspace(1) %output, ptr addrspace(1) %table) {
+entry:
+  %function = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %table, i32 0)
+  %typed = bitcast ptr %function to ptr
+  %value = call i32 %typed()
+  store i32 %value, ptr addrspace(1) %output, align 4
+  ret void
+}
+declare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
+!4 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
+"#;
+        let source = metal2vulkan_validation::source::SourceRow {
+            air_sha256: metal2vulkan_validation::hash::sha256_bytes(air_ll.as_bytes()),
+            stage: "Kernel".into(),
+            entry: "main".into(),
+            air_ll: air_ll.into(),
+            blob_b64: None,
+            lib_sha256s: vec!["11".repeat(32)],
+            label: "local/authored-table.ll".into(),
+        };
+        let module_ll = "define i32 @linked() {\nentry:\n  ret i32 42\n}\n";
+        let module_sha256 = metal2vulkan_validation::hash::sha256_bytes(module_ll.as_bytes());
+        metal2vulkan_validation::library_module::merge_library_module_shards(
+            scratch.path(),
+            [LibraryModuleRow {
+                module_sha256: module_sha256.clone(),
+                air_ll: module_ll.into(),
+                blob_b64: "b3duZWQ=".into(),
+                lib_sha256s: vec!["22".repeat(32)],
+                label: "local/linked.ll".into(),
+            }],
+        )
+        .unwrap();
+        let mut case = AuthoredCase {
+            air_sha256: source.air_sha256.clone(),
+            case_id: String::new(),
+            name: "authored-table".into(),
+            entry: "main".into(),
+            stage: Stage::Kernel,
+            buffers: vec![BufferResource {
+                binding: 0,
+                role: ResourceRole::Output,
+                bytes_b64: None,
+                initial_bytes_b64: Some("q6urqw==".into()),
+            }],
+            argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
+            threadgroup_memory: vec![],
+            imageblock: None,
+            fragment_imageblock: None,
+            acceleration_structures: vec![],
+            visible_function_references: vec![],
+            visible_function_tables: vec![FunctionTableResource {
+                binding: 1,
+                size: 1,
+                entries: vec![FunctionTableEntry {
+                    index: 0,
+                    module_sha256,
+                    function: "linked".into(),
+                }],
+            }],
+            intersection_function_tables: vec![],
+            argument_buffer_intersection_function_tables: vec![],
+            textures: vec![],
+            texture_arrays: vec![],
+            argument_buffer_textures: vec![],
+            samplers: vec![],
+            render_targets: vec![],
+            depth_stencil: None,
+            vertex_inputs: vec![],
+            vertex_observation: None,
+            kernel_stage_inputs: vec![],
+            function_constants: vec![],
+            dispatch: Some(Dispatch {
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            }),
+            draw: None,
+            tessellation: None,
+            output: OutputSelection::Buffer {
+                binding: 0,
+                offset: 0,
+                length: 4,
+            },
+            compare: Comparison::Exact,
+            execution_safety: ExecutionSafety::LoopFree,
+            rationale: None,
+            authored_by: Some("test".into()),
+        };
+        case.case_id = case.computed_case_id().unwrap();
+        metal2vulkan_validation::store::CorpusStore::new(scratch.path())
+            .put_case(case)
+            .unwrap();
+        let translation_tmp = scratch.path().join("translation");
+        fs::create_dir(&translation_tmp).unwrap();
+        let result = audit_translation_source_owned(
+            source,
+            &translation_tmp,
+            scratch.path(),
+            &scratch.path().join("unused.sqlite"),
+        );
+        assert_eq!(
+            result.status,
+            TranslationAuditStatus::Translated,
+            "{result:?}"
+        );
+        assert_eq!(result.failure_shape, None);
+    }
+
+    #[test]
+    fn translation_worker_executes_exact_authored_direct_reference_linkage() {
+        use metal2vulkan_validation::case::{
+            AuthoredCase, BufferResource, Comparison, Dispatch, ExecutionSafety,
+            LinkedFunctionResource, OutputSelection, ResourceRole, Stage,
+        };
+        use metal2vulkan_validation::library_module::LibraryModuleRow;
+
+        let scratch = ScratchDir::new("authored-reference-translation").unwrap();
+        let air_ll = r#"
+define void @main(ptr addrspace(1) %output) {
+entry:
+  %value = call i32 @linked.MTL_VISIBLE_FN_REF()
+  store i32 %value, ptr addrspace(1) %output, align 4
+  ret void
+}
+declare i32 @linked.MTL_VISIBLE_FN_REF() section "air.externally_defined"
+!air.kernel = !{!0}
+!air.visible_function_references = !{!4}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
+!4 = !{!"air.visible_function_reference", ptr @linked.MTL_VISIBLE_FN_REF, !"linked"}
+"#;
+        let source = metal2vulkan_validation::source::SourceRow {
+            air_sha256: metal2vulkan_validation::hash::sha256_bytes(air_ll.as_bytes()),
+            stage: "Kernel".into(),
+            entry: "main".into(),
+            air_ll: air_ll.into(),
+            blob_b64: None,
+            lib_sha256s: vec!["11".repeat(32)],
+            label: "local/authored-reference.ll".into(),
+        };
+        let module_ll = "define i32 @linked() {\nentry:\n  ret i32 42\n}\n";
+        let module_sha256 = metal2vulkan_validation::hash::sha256_bytes(module_ll.as_bytes());
+        metal2vulkan_validation::library_module::merge_library_module_shards(
+            scratch.path(),
+            [LibraryModuleRow {
+                module_sha256: module_sha256.clone(),
+                air_ll: module_ll.into(),
+                blob_b64: "b3duZWQ=".into(),
+                lib_sha256s: vec!["22".repeat(32)],
+                label: "local/linked.ll".into(),
+            }],
+        )
+        .unwrap();
+        let index = scratch.path().join("index.sqlite");
+        metal2vulkan_validation::index::rebuild_index(scratch.path(), &index).unwrap();
+        metal2vulkan_validation::library_module::sync_library_module_index(scratch.path(), &index)
+            .unwrap();
+        let mut case = AuthoredCase {
+            air_sha256: source.air_sha256.clone(),
+            case_id: String::new(),
+            name: "authored-reference".into(),
+            entry: "main".into(),
+            stage: Stage::Kernel,
+            buffers: vec![BufferResource {
+                binding: 0,
+                role: ResourceRole::Output,
+                bytes_b64: None,
+                initial_bytes_b64: Some("q6urqw==".into()),
+            }],
+            argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
+            threadgroup_memory: vec![],
+            imageblock: None,
+            fragment_imageblock: None,
+            acceleration_structures: vec![],
+            visible_function_references: vec![LinkedFunctionResource {
+                module_sha256,
+                function: "linked".into(),
+            }],
+            visible_function_tables: vec![],
+            intersection_function_tables: vec![],
+            argument_buffer_intersection_function_tables: vec![],
+            textures: vec![],
+            texture_arrays: vec![],
+            argument_buffer_textures: vec![],
+            samplers: vec![],
+            render_targets: vec![],
+            depth_stencil: None,
+            vertex_inputs: vec![],
+            vertex_observation: None,
+            kernel_stage_inputs: vec![],
+            function_constants: vec![],
+            dispatch: Some(Dispatch {
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            }),
+            draw: None,
+            tessellation: None,
+            output: OutputSelection::Buffer {
+                binding: 0,
+                offset: 0,
+                length: 4,
+            },
+            compare: Comparison::Exact,
+            execution_safety: ExecutionSafety::LoopFree,
+            rationale: None,
+            authored_by: Some("test".into()),
+        };
+        case.case_id = case.computed_case_id().unwrap();
+        metal2vulkan_validation::store::CorpusStore::new(scratch.path())
+            .put_case(case)
+            .unwrap();
+        let translation_tmp = scratch.path().join("translation");
+        fs::create_dir(&translation_tmp).unwrap();
+        let result =
+            audit_translation_source_owned(source, &translation_tmp, scratch.path(), &index);
+        assert_eq!(
+            result.status,
+            TranslationAuditStatus::Translated,
+            "{result:?}"
+        );
+        assert_eq!(result.failure_shape, None);
     }
 
     #[test]
@@ -1344,7 +2006,7 @@ mod tests {
             entry: "main".into(),
             air_ll: "x".repeat(bytes),
             blob_b64: None,
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: format!("local/{hash}.ll"),
         };
         let sources = vec![
@@ -1353,7 +2015,150 @@ mod tests {
             source("c", LARGE_TRANSLATION_SOURCE_BYTES),
             source("d", 100),
         ];
-        assert_eq!(translation_work_lanes(&sources), (vec![1, 2], vec![3, 0]));
+        assert_eq!(
+            translation_work_lanes(&sources),
+            (vec![], vec![1, 2], vec![3, 0])
+        );
+    }
+
+    #[test]
+    fn translation_work_bounds_sub_megabyte_cfgs_by_serialized_cost() {
+        let source = |hash: &str, bytes: usize| metal2vulkan_validation::source::SourceRow {
+            air_sha256: hash.repeat(64),
+            stage: "Kernel".into(),
+            entry: "main".into(),
+            air_ll: "x".repeat(bytes),
+            blob_b64: None,
+            lib_sha256s: vec!["22".repeat(32)],
+            label: format!("local/{hash}.ll"),
+        };
+        let sources = vec![
+            source("a", LARGE_TRANSLATION_SOURCE_BYTES - 1),
+            source("b", LARGE_TRANSLATION_SOURCE_BYTES),
+        ];
+        assert_eq!(translation_work_lanes(&sources), (vec![], vec![1], vec![0]));
+    }
+
+    #[test]
+    fn translation_work_bounds_device_address_function_table_rows_by_cost() {
+        let source = |hash: &str, air_ll: &str| metal2vulkan_validation::source::SourceRow {
+            air_sha256: hash.repeat(64),
+            stage: "Kernel".into(),
+            entry: "main".into(),
+            air_ll: air_ll.into(),
+            blob_b64: None,
+            lib_sha256s: vec!["22".repeat(32)],
+            label: format!("local/{hash}.ll"),
+        };
+        let sources = vec![
+            source(
+                "a",
+                "call void @air.visible_function_table()\n%p = inttoptr i64 %x to ptr",
+            ),
+            source("b", "call void @air.visible_function_table()"),
+            source("c", "%p = inttoptr i64 %x to ptr"),
+        ];
+        assert_eq!(
+            translation_work_lanes(&sources),
+            (vec![], vec![0], vec![1, 2])
+        );
+        assert!(is_costly_translation_source(&sources[0]));
+        assert!(!is_serialized_cost_translation_source(&sources[0]));
+        assert!(!is_serialized_cost_translation_source(&sources[1]));
+        assert!(!is_serialized_cost_translation_source(&sources[2]));
+    }
+
+    #[test]
+    fn translation_work_serializes_dense_call_cfgs_by_combined_cost() {
+        const BLOCKS: usize = 350;
+        const CALLS: usize = 400;
+        let mut air_ll = String::new();
+        for index in 0..BLOCKS {
+            air_ll.push_str(&format!(
+                "block{index}:\n  call void @helper()\n  br label %block{index}\n"
+            ));
+        }
+        for _ in BLOCKS..CALLS {
+            air_ll.push_str("  call void @helper()\n");
+        }
+        let source = metal2vulkan_validation::source::SourceRow {
+            air_sha256: "11".repeat(32),
+            stage: "Kernel".into(),
+            entry: "main".into(),
+            air_ll,
+            blob_b64: None,
+            lib_sha256s: vec!["22".repeat(32)],
+            label: "local/high-block-count.ll".into(),
+        };
+        assert_eq!(translation_cfg_counts(&source.air_ll), (BLOCKS, CALLS));
+        assert_eq!(BLOCKS * CALLS, SERIALIZED_TRANSLATION_CFG_CALL_WORK);
+        assert!(is_serialized_cost_translation_source(&source));
+        assert_eq!(translation_work_lanes(&[source]), (vec![0], vec![], vec![]));
+    }
+
+    #[test]
+    fn translation_phases_keep_large_work_on_the_bounded_worker_subset() {
+        assert_eq!(translation_phase_worker_counts(16, 203, 0, 3), (16, 0, 2));
+        assert_eq!(translation_phase_worker_counts(16, 203, 3, 20), (16, 1, 1));
+    }
+
+    #[test]
+    fn jobs_default_to_available_parallelism() {
+        assert_eq!(
+            default_jobs(),
+            std::thread::available_parallelism().unwrap().get()
+        );
+    }
+
+    #[test]
+    fn translation_result_backlog_is_bounded_by_worker_count() {
+        let (sender, _receiver) = bounded_worker_channel(2);
+        sender.try_send(1usize).unwrap();
+        sender.try_send(2usize).unwrap();
+        assert!(matches!(
+            sender.try_send(3usize),
+            Err(mpsc::TrySendError::Full(3))
+        ));
+    }
+
+    #[test]
+    fn tier_census_parser_uses_the_final_complete_label() {
+        let stderr = "diagnostic\n[tier-census] val-ptr:raw_retry\nmore\n[tier-census] default\n";
+        assert_eq!(parse_adopted_tier(stderr), Some("default"));
+        assert_eq!(parse_adopted_tier("diagnostic only"), None);
+        assert_eq!(parse_adopted_tier("[tier-census] \n"), None);
+        assert_eq!(
+            measured_translation_tier(
+                TranslationAuditStatus::AuthoredLinkageRequired,
+                "diagnostic only"
+            ),
+            Some("authored_linkage_required".to_string())
+        );
+        assert_eq!(
+            measured_translation_tier(TranslationAuditStatus::Translated, "diagnostic only"),
+            None
+        );
+    }
+
+    #[test]
+    fn translation_worker_panic_is_a_retryable_row_failure() {
+        let source = metal2vulkan_validation::source::SourceRow {
+            air_sha256: "11".repeat(32),
+            stage: "Kernel".into(),
+            entry: "main".into(),
+            air_ll: "define void @main() { ret void }".into(),
+            blob_b64: None,
+            lib_sha256s: vec!["22".repeat(32)],
+            label: "local/panic.ll".into(),
+        };
+        let result =
+            guarded_translation_audit_source_with(&source, |_| panic!("synthetic worker panic"));
+        assert_eq!(result.air_sha256, source.air_sha256);
+        assert_eq!(result.status, TranslationAuditStatus::Failed);
+        assert_eq!(
+            result.failure_shape.as_deref(),
+            Some("translation audit worker panicked: synthetic worker panic")
+        );
     }
 
     #[test]

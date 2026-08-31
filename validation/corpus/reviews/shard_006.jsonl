@@ -1,0 +1,1 @@
+{"air_sha256":"1ac01bd4e27a52d7fe25944b858a771f0053e078eb5c39333341aa4e880bb708","reason":"AIR entry \"unify_u32\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

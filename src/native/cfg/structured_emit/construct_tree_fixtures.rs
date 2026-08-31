@@ -212,7 +212,7 @@ fn llvm_fixture_shell(block_count: usize) -> String {
         params.push(format!("i32 %ct.switch{index}"));
     }
     format!(
-        "target triple = \"spirv-unknown-vulkan1.3\"\n\
+        "target triple = \"spirv-unknown-vulkan1.2\"\n\
          define void @construct_tree_fixture({}) {{\n\
          entry:\n\
            ret void\n\

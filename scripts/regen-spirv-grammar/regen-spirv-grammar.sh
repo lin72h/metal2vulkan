@@ -45,6 +45,7 @@ echo "# running rspirv-autogen..."
 
 echo "# adapting outputs into metal2vulkan..."
 python3 - "$CACHE_DIR/rspirv" "$CRATE_DIR" "$HEADERS_REF" <<'PY'
+import json
 import re
 import sys
 from pathlib import Path
@@ -137,6 +138,139 @@ gram = gram.replace(
     "pub static INSTRUCTION_TABLE: InstructionTable =",
 )
 write_out("src/spirv_binary/grammar_generated.rs", gram)
+
+core_grammar = json.loads(
+    (
+        r
+        / "autogen/external/SPIRV-Headers/include/spirv/unified1/spirv.core.grammar.json"
+    ).read_text()
+)
+enumerant_requirement_groups = []
+operand_arms = []
+for kind in core_grammar["operand_kinds"]:
+    category = kind.get("category")
+    if category not in ("BitEnum", "ValueEnum"):
+        continue
+    kind_name = kind["kind"]
+    value = "value.bits()" if category == "BitEnum" else "*value as u32"
+    kind_requirements = []
+    seen_values = set()
+    for enumerant in kind["enumerants"]:
+        raw_value = enumerant["value"]
+        numeric_value = (
+            int(raw_value, 0) if isinstance(raw_value, str) else raw_value
+        )
+        if numeric_value in seen_values:
+            continue
+        seen_values.add(numeric_value)
+        capabilities = enumerant.get("capabilities", [])
+        extensions = enumerant.get("extensions", [])
+        version = enumerant.get("version")
+        if not capabilities and not extensions and version in (None, "None", "1.0"):
+            continue
+        kind_requirements.append(
+            (kind_name, numeric_value, capabilities, extensions, version)
+        )
+    group_index = len(enumerant_requirement_groups)
+    enumerant_requirement_groups.append(kind_requirements)
+    operand_arms.append(
+        f"        Operand::{kind_name}(value) => EnumerantRequirements::new("
+        f"ENUMERANT_REQUIREMENTS_{group_index}, {value}, "
+        f"{str(category == 'BitEnum').lower()}),"
+    )
+
+requirements = [
+    "#[derive(Clone, Copy, Debug)]",
+    "pub(crate) struct EnumerantRequirement {",
+    "    pub(super) value: u32,",
+    "    pub(crate) capabilities: &'static [spirv::Capability],",
+    "    pub(crate) extensions: &'static [&'static str],",
+    "    pub(crate) min_core_version: Option<(u8, u8)>,",
+    "}",
+    "",
+    "pub(super) struct EnumerantRequirements {",
+    "    remaining: &'static [EnumerantRequirement],",
+    "    value: u32,",
+    "    bit_enum: bool,",
+    "}",
+    "",
+    "impl EnumerantRequirements {",
+    "    fn new(",
+    "        remaining: &'static [EnumerantRequirement],",
+    "        value: u32,",
+    "        bit_enum: bool,",
+    "    ) -> Self {",
+    "        Self { remaining, value, bit_enum }",
+    "    }",
+    "}",
+    "",
+    "impl Iterator for EnumerantRequirements {",
+    "    type Item = &'static EnumerantRequirement;",
+    "",
+    "    fn next(&mut self) -> Option<Self::Item> {",
+    "        while let Some((requirement, remaining)) = self.remaining.split_first() {",
+    "            self.remaining = remaining;",
+    "            let matches = if self.bit_enum {",
+    "                if requirement.value == 0 {",
+    "                    self.value == 0",
+    "                } else {",
+    "                    self.value & requirement.value == requirement.value",
+    "                }",
+    "            } else {",
+    "                self.value == requirement.value",
+    "            };",
+    "            if matches {",
+    "                return Some(requirement);",
+    "            }",
+    "        }",
+    "        None",
+    "    }",
+    "}",
+    "",
+]
+for group_index, group in enumerate(enumerant_requirement_groups):
+    requirements.append(
+        f"static ENUMERANT_REQUIREMENTS_{group_index}: &[EnumerantRequirement] = &["
+    )
+    for kind, value, capabilities, extensions, version in group:
+        caps = ", ".join(f"spirv::Capability::{capability}" for capability in capabilities)
+        exts = ", ".join(f'\"{extension}\"' for extension in extensions)
+        core_version = (
+            f"Some(({version[0]}, {version[2]}))"
+            if version not in (None, "None")
+            else "None"
+        )
+        requirements.extend(
+            [
+                "    EnumerantRequirement {",
+                f"        value: {value},",
+                f"        capabilities: &[{caps}],",
+                f"        extensions: &[{exts}],",
+                f"        min_core_version: {core_version},",
+                "    },",
+            ]
+        )
+    requirements.extend([
+        "];",
+        "",
+    ])
+requirements.extend(
+    [
+        "pub(super) fn operand_declaration_requirements_generated(",
+        "    operand: &Operand,",
+        ") -> EnumerantRequirements {",
+        "    match operand {",
+        *operand_arms,
+        "        _ => EnumerantRequirements::new(&[], 0, false),",
+        "    }",
+        "}",
+        "",
+    ]
+)
+write_out(
+    "src/spirv_binary/enumerant_requirements_generated.rs",
+    "\n".join(requirements),
+)
 print("done")
 PY
 

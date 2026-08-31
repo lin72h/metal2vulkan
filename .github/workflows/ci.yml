@@ -78,10 +78,10 @@ jobs:
         run: cargo doc --workspace --all-features --no-deps
 
       - name: Test metal2vulkan
-        run: cargo test -p metal2vulkan -- --test-threads=1
+        run: cargo test -p metal2vulkan
 
       - name: Test validation suite
-        run: cargo test -p metal2vulkan-validation -- --test-threads=1
+        run: cargo test -p metal2vulkan-validation
 
       # Machine-specific semantic qualification remains explicit. Linux CI has lavapipe, so it can
       # execute the owned public cases against their exact committed Metal observations without a

@@ -44,9 +44,24 @@ fn fragment_flat_varying_metadata() {
 }
 
 #[test]
+fn fragment_render_target_array_index_role() {
+    let ll = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0}
+!3 = !{!4}
+!4 = !{i32 0, !"air.render_target_array_index", !"air.arg_type_name", !"ushort", !"air.arg_name", !"layer"}
+"#;
+    let meta = parse_air_fragment_meta(ll).unwrap();
+    assert_eq!(meta.role_of(0), Some(&FragRole::RenderTargetArrayIndex));
+}
+
+#[test]
 fn fragment_function_constant_location_uses_static_init_default() {
     let ll = r#"
 @_ZL32__metal_implicit_attr_int_expr_1.78 = internal addrspace(2) global i32 0, align 4
+@__metal_implicit_fc_pred_1.80 = internal addrspace(2) global i8 1, align 1
 @_ZN2RB6Shader8Constant13_shader_stateE.MTL_FC_INIT_0_Dv4_j = internal unnamed_addr addrspace(2) externally_initialized constant <4 x i32> undef, section "air.fc_initializer", align 16
 
 define internal void @_GLOBAL__sub_I_shader_filter_distance.metal() section "air.static_init" {
@@ -73,10 +88,11 @@ entry:
 }
 
 #[test]
-fn kernel_function_constant_resource_locations_use_static_defaults() {
+fn kernel_function_constant_texture_with_valid_location_is_bound_when_disabled_by_default() {
     let ll = r#"
 @texture_location = internal addrspace(2) global i32 40, align 4
 @sampler_location = internal addrspace(2) global i32 15, align 4
+@texture_enabled = internal addrspace(2) global i8 0, align 1
 
 define void @K(ptr addrspace(1) %texture, ptr addrspace(2) %sampler) {
   ret void
@@ -93,6 +109,65 @@ define void @K(ptr addrspace(1) %texture, ptr addrspace(2) %sampler) {
     let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
     assert_eq!(meta.role_of(0), Some(&KernRole::Texture(40)));
     assert_eq!(meta.role_of(1), Some(&KernRole::Sampler(15)));
+}
+
+#[test]
+fn function_constant_texture_with_absent_location_is_not_bound() {
+    let ll = r#"
+@texture_location = internal addrspace(2) global i32 -1, align 4
+@texture_enabled = internal addrspace(2) global i8 0, align 1
+
+define void @K(ptr addrspace(1) %texture) {
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @K, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.function_constant", !4, !"air.texture", !"air.location_index", ptr addrspace(2) @texture_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!4 = !{ptr addrspace(2) @texture_enabled, !"bool", !"texture_enabled"}
+"#;
+
+    let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
+    assert_eq!(meta.role_of(0), Some(&KernRole::Other));
+}
+
+#[test]
+fn kernel_function_constant_buffer_locations_preserve_shared_bindings() {
+    let ll = r#"
+!air.kernel = !{!0}
+!0 = !{ptr @K, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.function_constant", !6, !"air.buffer", !"air.location_index", i32 29}
+!4 = !{i32 1, !"air.function_constant", !7, !"air.buffer", !"air.location_index", i32 29}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 30}
+!6 = !{ptr addrspace(2) @float_enabled, !"bool", !"float_enabled"}
+!7 = !{ptr addrspace(2) @half_enabled, !"bool", !"half_enabled"}
+"#;
+
+    let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
+    assert_eq!(
+        meta.function_constant_buffer_locations,
+        HashMap::from([(0, 29), (1, 29)])
+    );
+}
+
+#[test]
+fn device_buffer_array_uses_literal_base_instead_of_static_next_location() {
+    let ll = r#"
+@next_buffer = internal addrspace(2) global i32 1, align 4
+
+!air.kernel = !{!0}
+!0 = !{ptr @K, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+"#;
+    let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
+    assert_eq!(meta.role_of(0), Some(&KernRole::Buffer(0)));
+    assert_eq!(meta.buffer_type_name(0), Some("array_ref<void>"));
 }
 
 #[test]
@@ -271,6 +346,26 @@ fn vertex_builtin_roles() {
     assert_eq!(m.output_role_of(0), Some(&VertOutRole::Position));
     assert_eq!(m.output_role_of(1), Some(&VertOutRole::ViewportArrayIndex));
     assert_eq!(m.output_role_of(2), Some(&VertOutRole::ClipDistance));
+}
+
+#[test]
+fn function_constant_wrapped_function_tables_keep_their_linkage_roles() {
+    let ll = r#"
+!air.vertex = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.function_constant", !5, !"air.visible_function_table", !"air.location_index", i32 7, i32 1, !"air.read"}
+!4 = !{i32 1, !"air.function_constant", !6, !"air.intersection_function_table", !"air.location_index", i32 8, i32 1, !"air.read"}
+!5 = !{ptr addrspace(2) @visible_enabled, !"bool", !"visible_enabled"}
+!6 = !{ptr addrspace(2) @intersection_enabled, !"bool", !"intersection_enabled"}
+"#;
+    let meta = parse_air_vertex_meta(ll).unwrap();
+    assert_eq!(meta.role_of(0), Some(&VertRole::VisibleFunctionTable(7)));
+    assert_eq!(
+        meta.role_of(1),
+        Some(&VertRole::IntersectionFunctionTable(8))
+    );
 }
 
 #[test]

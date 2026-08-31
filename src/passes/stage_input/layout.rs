@@ -201,7 +201,7 @@ impl Ctx {
     }
 
     /// An OpConstantNull of any type — the canonical zero value (handles aggregates, vectors, scalars).
-    fn const_null(&mut self, ty: Word) -> Word {
+    pub(in crate::passes) fn const_null(&mut self, ty: Word) -> Word {
         let id = self.module.fresh_id();
         self.new_globals.push(Instruction::new(
             Op::ConstantNull,

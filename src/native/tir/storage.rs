@@ -47,46 +47,67 @@ pub(in crate::native) fn derive_pointer_storage(
     params: &[(String, LlType)],
     named_types: &HashMap<String, LlType>,
 ) -> HashMap<String, StorageClass> {
-    let mut storage: HashMap<String, StorageClass> = HashMap::new();
+    derive_pointer_storage_from(tir, params, named_types, &HashMap::new())
+}
+
+/// Derive pointer storage while preserving storage facts already established by the emitter for
+/// parameters and globals. Pointer identity operations are solved to a fixpoint: structurization can
+/// introduce a cyclic pair of state phis whose only concrete arm is an alloca-derived pointer later in
+/// block order, so a forward-only walk would incorrectly assign the LLVM address-space default before
+/// reaching that arm.
+pub(in crate::native) fn derive_pointer_storage_from(
+    tir: &TirFunction,
+    params: &[(String, LlType)],
+    named_types: &HashMap<String, LlType>,
+    seeds: &HashMap<String, StorageClass>,
+) -> HashMap<String, StorageClass> {
+    let mut storage = seeds.clone();
     for (name, ty) in params {
         if let LlType::Ptr(addrspace) = ty {
             if let Some(s) = addrspace_default_storage(*addrspace) {
-                storage.insert(name.clone(), s);
+                storage.entry(name.clone()).or_insert(s);
             }
         }
     }
-    for block in &tir.blocks {
-        for inst in &block.insts {
-            let Some(result) = &inst.result else {
-                continue;
-            };
-            let Some(LlType::Ptr(addrspace)) = tir.value_types.get(result) else {
-                continue;
-            };
-            // Every arm now sources its facts from the typed graph — `inst.opcode` for dispatch,
-            // `inst.gep` for the GEP, and `inst.operands` (the same `resolve_operands` resolution
-            // emission consumes) for the cast/freeze/select/phi source values — so this walk no longer
-            // reads `inst.text` at all. Byte-identical to the retired text re-lex on well-formed IR:
-            // the value operands go through the same `parse_value` the old helpers re-lexed
-            // (`operand_from_chunk`/`operand_from_bare` preserve the `%name` verbatim), and only the
-            // `local_storage` lookup of those values matters here (M-A5 text-retirement path).
-            let opcode = inst.opcode.as_str();
-            let derived = match opcode {
-                "alloca" => Some(StorageClass::Function),
-                "getelementptr" => inst
-                    .gep
-                    .as_ref()
-                    .and_then(|gep| gep_base_storage(gep, &storage, named_types)),
-                "bitcast" | "addrspacecast" => cast_source_storage(&inst.operands, &storage),
-                "freeze" => freeze_source_storage(&inst.operands, &storage),
-                "select" => select_arm_storage(&inst.operands, &storage),
-                "phi" => phi_incoming_storage(&inst.operands, &storage),
-                _ => None,
-            };
-            let resolved = derived.or_else(|| addrspace_default_storage(*addrspace));
-            if let Some(s) = resolved {
-                storage.insert(result.clone(), s);
+    loop {
+        let mut changed = false;
+        for block in &tir.blocks {
+            for inst in &block.insts {
+                let Some(result) = &inst.result else {
+                    continue;
+                };
+                if storage.contains_key(result) {
+                    continue;
+                }
+                let Some(LlType::Ptr(addrspace)) = tir.value_types.get(result) else {
+                    continue;
+                };
+                // Identity/merge operations must wait for a concrete source instead of taking the
+                // address-space default. In particular, an addrspace(0) phi carrying an alloca remains
+                // Function storage even when the phi cycle precedes that alloca in emission order.
+                let opcode = inst.opcode.as_str();
+                let resolved = match opcode {
+                    "alloca" => Some(StorageClass::Function),
+                    "getelementptr" => inst
+                        .gep()
+                        .as_ref()
+                        .and_then(|gep| gep_base_storage(gep, &storage, named_types)),
+                    "bitcast" | "addrspacecast" => cast_source_storage(&inst.operands, &storage),
+                    "freeze" => freeze_source_storage(&inst.operands, &storage),
+                    "select" => select_arm_storage(&inst.operands, &storage),
+                    "phi" => inst
+                        .phi_values()
+                        .and_then(|values| phi_incoming_storage(values, &storage)),
+                    _ => addrspace_default_storage(*addrspace),
+                };
+                if let Some(s) = resolved {
+                    storage.insert(result.clone(), s);
+                    changed = true;
+                }
             }
+        }
+        if !changed {
+            break;
         }
     }
     storage
@@ -182,17 +203,16 @@ pub(in crate::native) fn select_arm_storage(
     )
 }
 
-/// Storage of a `phi` result over pointer arms: the common class across known incomings. `phi`'s
-/// operands are exactly its incoming VALUES (the predecessor labels are control-flow edges, not
-/// operands — see [`resolve_phi_operands`]).
-pub(in crate::native) fn phi_incoming_storage(
-    operands: &[TirOperand],
+/// Storage of a `phi` result over pointer arms: the common class across known incoming values. The
+/// predecessor labels remain control-flow edges in the canonical phi carrier and are not visited.
+pub(in crate::native) fn phi_incoming_storage<'a>(
+    values: impl Iterator<Item = &'a LlValue>,
     storage: &HashMap<String, StorageClass>,
 ) -> Option<StorageClass> {
     let mut acc: Option<StorageClass> = None;
     let mut any = false;
-    for op in operands {
-        if let Some(s) = operand_storage(Some(op), storage) {
+    for value in values {
+        if let Some(s) = local_storage(value, storage) {
             acc = if any {
                 merge_storage(acc, Some(s))
             } else {
@@ -215,13 +235,15 @@ pub(in crate::native) fn operand_storage(
         .and_then(|tv| local_storage(&tv.value, storage))
 }
 
-/// The recorded storage of a value, when it is a known local pointer.
+/// The recorded storage of a value, when it is a known pointer root or SSA value. Globals share the
+/// emitter's name-keyed storage map with locals, so a GEP rooted directly at a global must consult the
+/// supplied seed instead of falling back independently from its LLVM address space.
 pub(in crate::native) fn local_storage(
     value: &LlValue,
     storage: &HashMap<String, StorageClass>,
 ) -> Option<StorageClass> {
     match value {
-        LlValue::Local(name) => storage.get(name).copied(),
+        LlValue::Local(name) | LlValue::Global(name) => storage.get(name).copied(),
         _ => None,
     }
 }
@@ -234,7 +256,7 @@ pub(in crate::native) fn merge_storage(
 ) -> Option<StorageClass> {
     match (a, b) {
         (Some(x), Some(y)) if x == y => Some(x),
-        (Some(x), Some(_)) => Some(x),
+        (Some(_), Some(_)) => None,
         (Some(x), None) | (None, Some(x)) => Some(x),
         (None, None) => None,
     }
@@ -245,7 +267,7 @@ pub(in crate::native) fn merge_storage(
 pub(in crate::native) fn deref_implied_pointee(inst: &TirInst) -> Option<(&str, LlType)> {
     // M-A5 reader reduction: dispatch on the graph's `inst.opcode` (the same
     // `rhs.split_whitespace().next()` token computed at build) and read the GEP source element type from
-    // the carrier's `inst.gep_source_ty` (set by `resolve_gep_source_ty` = `parse_gep(...).source_ty`, the
+    // the carrier's `inst.gep_source_ty()` (set by `resolve_gep_source_ty` = `parse_gep(...).source_ty`, the
     // same `parse_type` on the same first comma field this branch used to re-lex). No `inst.text` read.
     match inst.opcode.as_str() {
         // `%r = load <ty>, ptr %p` — the loaded type IS %p's pointee; %p is the sole value operand.
@@ -263,7 +285,7 @@ pub(in crate::native) fn deref_implied_pointee(inst: &TirInst) -> Option<(&str, 
         // `%r = getelementptr [inbounds] <srcty>, ptr %p, ...` — <srcty> is the base pointer's pointee
         // (carried on `gep_source_ty`); the base is the first GEP value operand. Skip a constant base.
         "getelementptr" => {
-            let srcty = inst.gep_source_ty.clone()?;
+            let srcty = inst.gep_source_ty()?.clone();
             let ptr = operand_name(inst.operands.first()?)?;
             Some((ptr, srcty))
         }

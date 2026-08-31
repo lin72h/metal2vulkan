@@ -72,10 +72,13 @@ pub(in crate::native) fn find_deep_shared_continuations(
 }
 
 /// Find a switch-case tail that is shared with another case. Each returned `case_root` is a direct
-/// target of a non-loop switch; `continuation` is reached from its dominated region but is not itself
-/// case-root-dominated, so another case still enters it. A non-case continuation is eligible only when
-/// the natural merge is externally reachable; a direct case-root continuation is eligible regardless,
-/// because entering another case is forbidden by SPIR-V's case-construct rules.
+/// target of a switch; `continuation` is reached from its dominated region but is not itself
+/// case-root-dominated, so another case still enters it. The natural merge itself is excluded, but an
+/// intermediate continuation is illegal even when the eventual merge is switch-dominated: SPIR-V does
+/// not permit one case construct to enter a block shared with another case. For a switch inside a natural
+/// loop, the cloneable region and its boundaries must remain in exactly the switch's loop nest and may
+/// not contain a loop header or latch. This permits ordinary loop-local case suffixes without cloning a
+/// break, continue, or nested-loop construct.
 pub(in crate::native) fn find_switch_case_shared_continuations(
     blocks: &[BodyBlock],
 ) -> Vec<(String, String)> {
@@ -83,10 +86,15 @@ pub(in crate::native) fn find_switch_case_shared_continuations(
     let selection = selection_merges(blocks, &forest);
     let names: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
-    let loop_nodes: HashSet<&str> = forest
+    let loop_latches: HashSet<&str> = forest
         .loops
         .iter()
-        .flat_map(|l| l.body.iter().map(String::as_str))
+        .flat_map(|l| l.latches.iter().map(String::as_str))
+        .collect();
+    let loop_exits: HashSet<&str> = forest
+        .loops
+        .iter()
+        .flat_map(|l| l.exits.iter().map(String::as_str))
         .collect();
 
     let depth = |name: &str| {
@@ -102,7 +110,6 @@ pub(in crate::native) fn find_switch_case_shared_continuations(
         .iter()
         .filter(|b| {
             !loop_headers.contains(b.name.as_str())
-                && !loop_nodes.contains(b.name.as_str())
                 // Switch-terminating detection via the carrier (`is_switch_block`, carrier-first with a
                 // line fallback) instead of re-lexing `.lines.last()` — byte-identical by construction.
                 && crate::native::cfg::structured_emit::is_switch_block(b)
@@ -117,9 +124,27 @@ pub(in crate::native) fn find_switch_case_shared_continuations(
         let Some(natural) = selection.get(&switch.name) else {
             continue;
         };
+        // SPIR-V explicitly permits one case construct to fall through to the immediately following
+        // literal case target. Privatizing that target would replace the legal edge with a cloned
+        // prefix whose boundary can enter a later, non-adjacent case. Preserve the ordered fallthrough
+        // here; genuinely shared or non-adjacent case entries remain privatization candidates.
+        let adjacent_cases = match &switch.typed.as_ref().expect("typed switch").terminator {
+            crate::native::tir::TirTerminator::Switch { cases, .. } => {
+                let mut ordered = Vec::new();
+                let mut unique = HashSet::new();
+                for (_, target) in cases {
+                    if unique.insert(target.as_str()) {
+                        ordered.push(target.as_str());
+                    }
+                }
+                ordered
+                    .windows(2)
+                    .map(|pair| (pair[0], pair[1]))
+                    .collect::<HashSet<_>>()
+            }
+            _ => unreachable!("switch filter guarantees a switch terminator"),
+        };
         let roots = block_successors(switch);
-        let root_set: HashSet<&str> = roots.iter().map(String::as_str).collect();
-        let merge_is_external = !forest.dominates(&switch.name, natural);
         let reaches_natural = reverse_reachable(blocks, natural, &names);
         for case_root in &roots {
             if case_root == natural
@@ -133,11 +158,27 @@ pub(in crate::native) fn find_switch_case_shared_continuations(
                     continue;
                 }
                 for continuation in block_successors(block) {
+                    let is_legal_adjacent_fallthrough = adjacent_cases
+                        .contains(&(case_root.as_str(), continuation.as_str()))
+                        && matches!(
+                            block.typed.as_ref().map(|typed| &typed.terminator),
+                            Some(crate::native::tir::TirTerminator::Br(target))
+                                if target == &continuation
+                        );
                     if continuation == *natural
+                        || is_legal_adjacent_fallthrough
                         || !names.contains(continuation.as_str())
                         || forest.dominates(case_root, &continuation)
                         || !reaches_natural.contains(&continuation)
-                        || (!merge_is_external && !root_set.contains(continuation.as_str()))
+                        || !shared_clone_is_loop_local(
+                            blocks,
+                            &forest,
+                            case_root,
+                            &continuation,
+                            &loop_headers,
+                            &loop_latches,
+                            &loop_exits,
+                        )
                     {
                         continue;
                     }
@@ -150,6 +191,75 @@ pub(in crate::native) fn find_switch_case_shared_continuations(
         }
     }
     found
+}
+
+pub(in crate::native) fn shared_clone_is_loop_local(
+    blocks: &[BodyBlock],
+    forest: &crate::native::cfg::loopforest::LoopForest,
+    owner: &str,
+    continuation: &str,
+    loop_headers: &HashSet<&str>,
+    loop_latches: &HashSet<&str>,
+    loop_exits: &HashSet<&str>,
+) -> bool {
+    let membership = |name: &str| {
+        forest
+            .loops
+            .iter()
+            .filter(|natural_loop| natural_loop.body.iter().any(|node| node == name))
+            .map(|natural_loop| natural_loop.header.as_str())
+            .collect::<HashSet<_>>()
+    };
+    let owner_membership = membership(owner);
+    if membership(continuation) != owner_membership {
+        return false;
+    }
+    // The clone redirects owner-dominated predecessors of `continuation`. A predecessor in a deeper
+    // loop cannot be moved onto a clone outside that loop: values selected on that exit edge would
+    // become merely control-dependent after loop-merge routing and cease to dominate the clone.
+    if blocks.iter().any(|block| {
+        forest.dominates(owner, &block.name)
+            && block_successors(block)
+                .iter()
+                .any(|successor| successor == continuation)
+            && membership(&block.name) != owner_membership
+    }) {
+        return false;
+    }
+
+    let names: HashSet<&str> = blocks.iter().map(|block| block.name.as_str()).collect();
+    let mut region = HashSet::new();
+    let mut stack = vec![continuation.to_string()];
+    while let Some(name) = stack.pop() {
+        if !region.insert(name.clone()) {
+            continue;
+        }
+        if membership(&name) != owner_membership
+            || loop_headers.contains(name.as_str())
+            || loop_latches.contains(name.as_str())
+            || loop_exits.contains(name.as_str())
+        {
+            return false;
+        }
+        let Some(block) = blocks.iter().find(|block| block.name == name) else {
+            continue;
+        };
+        for successor in block_successors(block) {
+            if !names.contains(successor.as_str()) {
+                continue;
+            }
+            if forest.dominates(continuation, &successor) {
+                stack.push(successor);
+            } else if membership(&successor) != owner_membership
+                || loop_headers.contains(successor.as_str())
+                || loop_latches.contains(successor.as_str())
+                || loop_exits.contains(successor.as_str())
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The blocks that can reach `target`, including `target`, computed on the finite in-function CFG.
@@ -188,6 +298,16 @@ pub(in crate::native) fn reverse_reachable(
 pub(in crate::native) fn find_cross_arm_edge(blocks: &[BodyBlock]) -> Option<(String, String)> {
     let forest = analyze(blocks);
     let loop_headers: HashSet<&str> = forest.loops.iter().map(|l| l.header.as_str()).collect();
+    let loop_latches: HashSet<&str> = forest
+        .loops
+        .iter()
+        .flat_map(|natural_loop| natural_loop.latches.iter().map(String::as_str))
+        .collect();
+    let loop_exits: HashSet<&str> = forest
+        .loops
+        .iter()
+        .flat_map(|natural_loop| natural_loop.exits.iter().map(String::as_str))
+        .collect();
     let names: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
     // Selection headers -> their two arm targets (skip loop headers — their conditional is the loop exit
     // test, and a break/continue is a legal exit, not a cross-arm jump).
@@ -226,7 +346,17 @@ pub(in crate::native) fn find_cross_arm_edge(blocks: &[BodyBlock]) -> Option<(St
                         None
                     };
                     if let Some(sib) = sibling {
-                        if forest.dominates(sib, &s) {
+                        if forest.dominates(sib, &s)
+                            && shared_clone_is_loop_local(
+                                blocks,
+                                &forest,
+                                child,
+                                &s,
+                                &loop_headers,
+                                &loop_latches,
+                                &loop_exits,
+                            )
+                        {
                             return Some((child.to_string(), s));
                         }
                     }

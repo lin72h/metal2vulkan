@@ -83,15 +83,18 @@ impl Emitter {
         word_index: Word,
         instructions: &mut Vec<Instruction>,
     ) -> Result<Word, String> {
-        let ptr = self.emit_raw_word_pointer_at_index(raw, word_index, instructions)?;
+        let (ptr, storage) =
+            self.emit_raw_word_pointer_at_index_with_storage(raw, word_index, instructions)?;
         let word_ty = self.type_id(&LlType::Int(32))?;
         let word = self.fresh();
-        instructions.push(Self::inst(
-            Op::Load,
-            Some(word_ty),
-            Some(word),
-            vec![Operand::IdRef(ptr)],
-        ));
+        let mut operands = vec![Operand::IdRef(ptr)];
+        if storage == StorageClass::PhysicalStorageBuffer {
+            operands.extend([
+                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                Operand::LiteralBit32(4),
+            ]);
+        }
+        instructions.push(Self::inst(Op::Load, Some(word_ty), Some(word), operands));
         Ok(word)
     }
 
@@ -127,11 +130,6 @@ impl Emitter {
         let storage = self.raw_access_storage(raw)?;
         let ptr_ty = self.ptr_type_id(storage, &LlType::Int(32))?;
         if let Some(base_address) = raw.device_addr_base {
-            if storage != StorageClass::PhysicalStorageBuffer {
-                return Err(format!(
-                    "native emitter: device-address raw word uses non-physical storage {storage:?}"
-                ));
-            }
             let i64_ty = self.type_id(&LlType::Int(64))?;
             let index64 = self.fresh();
             instructions.push(Self::inst(
@@ -198,6 +196,9 @@ impl Emitter {
         &self,
         raw: &RawBufferOffset,
     ) -> Result<StorageClass, String> {
+        if raw.device_addr_base.is_some() {
+            return Ok(StorageClass::PhysicalStorageBuffer);
+        }
         self.pointer_storage
             .get(&raw.root)
             .copied()
@@ -239,13 +240,16 @@ impl Emitter {
         value: Word,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
-        let ptr = self.emit_raw_word_pointer_at_index(raw, word_index, instructions)?;
-        instructions.push(Self::inst(
-            Op::Store,
-            None,
-            None,
-            vec![Operand::IdRef(ptr), Operand::IdRef(value)],
-        ));
+        let (ptr, storage) =
+            self.emit_raw_word_pointer_at_index_with_storage(raw, word_index, instructions)?;
+        let mut operands = vec![Operand::IdRef(ptr), Operand::IdRef(value)];
+        if storage == StorageClass::PhysicalStorageBuffer {
+            operands.extend([
+                Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED),
+                Operand::LiteralBit32(4),
+            ]);
+        }
+        instructions.push(Self::inst(Op::Store, None, None, operands));
         Ok(())
     }
 

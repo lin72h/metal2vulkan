@@ -140,6 +140,17 @@ impl Emitter {
         pointee: &LlType,
     ) -> Result<(), String> {
         let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+        if crate::env_vars::spi_why() {
+            self.module.debug_names.push(Self::inst(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(result),
+                    Operand::LiteralString(format!("unmodeled pointer {name}")),
+                ],
+            ));
+        }
         self.emit_private_zero_pointer_value_at(
             result,
             pointee,
@@ -163,6 +174,17 @@ impl Emitter {
         addrspace: u32,
     ) -> Result<(), String> {
         let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+        if crate::env_vars::spi_why() {
+            self.module.debug_names.push(Self::inst(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(result),
+                    Operand::LiteralString(format!("unmodeled byte pointer {name}")),
+                ],
+            ));
+        }
         self.emit_private_zero_pointer_value_at(
             result,
             &LlType::Int(8),

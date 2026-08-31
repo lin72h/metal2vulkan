@@ -397,6 +397,21 @@ impl SpirvModule {
         }
     }
 
+    /// Synchronize the allocator with both the serialized header and every definition already
+    /// present in the owned graph. In-memory producer passes can append a fully formed instruction
+    /// graph before handing it across a construction boundary; the receiving allocator must not
+    /// trust a stale header bound and reuse one of those result ids.
+    pub(crate) fn sync_id_bound_from_instructions(&mut self) {
+        let definitions_bound = self
+            .all_inst_iter()
+            .filter_map(|instruction| instruction.result_id)
+            .max()
+            .map_or(1, |id| id.saturating_add(1));
+        let header_bound = self.header.as_ref().map_or(1, |header| header.bound);
+        self.next_id = self.next_id.max(header_bound).max(definitions_bound);
+        self.update_header_bound();
+    }
+
     pub(crate) fn set_id_bound(&mut self, bound: Word) {
         self.next_id = bound;
         self.update_header_bound();
@@ -745,7 +760,9 @@ impl Loader {
             Op::ExtInstImport => self.module.ext_inst_imports.push(instruction),
             Op::MemoryModel => self.module.memory_model = Some(instruction),
             Op::EntryPoint => self.module.entry_points.push(instruction),
-            Op::ExecutionMode => self.module.execution_modes.push(instruction),
+            Op::ExecutionMode | Op::ExecutionModeId => {
+                self.module.execution_modes.push(instruction)
+            }
             Op::String | Op::SourceExtension | Op::Source | Op::SourceContinued => {
                 self.module.debug_string_source.push(instruction);
             }
@@ -818,7 +835,24 @@ impl Loader {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOAD_BYTES_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_load_bytes_count() {
+    LOAD_BYTES_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn load_bytes_count() -> usize {
+    LOAD_BYTES_COUNT.with(std::cell::Cell::get)
+}
+
 pub(crate) fn load_bytes(bytes: impl AsRef<[u8]>) -> Result<SpirvModule, LoadError> {
+    #[cfg(test)]
+    LOAD_BYTES_COUNT.with(|count| count.set(count.get() + 1));
     let parsed = spirv_binary::parse_bytes(bytes.as_ref())?;
     let mut loader = Loader::default();
     loader.consume_header(parsed.header);
@@ -864,6 +898,16 @@ mod tests {
                 Operand::ExecutionModel(ExecutionModel::GLCompute),
                 Operand::IdRef(3),
                 Operand::LiteralString("main".to_string()),
+            ],
+        ));
+        module.execution_modes.push(Instruction::new(
+            Op::ExecutionModeId,
+            None,
+            None,
+            vec![
+                Operand::IdRef(3),
+                Operand::ExecutionMode(spirv::ExecutionMode::SubgroupsPerWorkgroupId),
+                Operand::IdRef(4),
             ],
         ));
         module
@@ -948,6 +992,7 @@ mod tests {
         assert_eq!(module.capabilities.len(), 1);
         assert!(module.memory_model.is_some());
         assert_eq!(module.entry_points.len(), 1);
+        assert_eq!(module.execution_modes.len(), 1);
         assert_eq!(module.types_global_values.len(), 2);
         assert_eq!(module.functions.len(), 1);
         assert_eq!(module.functions[0].blocks.len(), 1);

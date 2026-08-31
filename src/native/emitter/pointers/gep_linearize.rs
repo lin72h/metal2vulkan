@@ -93,14 +93,18 @@ impl Emitter {
             if base_ptr_ty == want_ptr_type {
                 return true;
             }
-            // SPIR-V ground truth: if the base pointer's pointee is already a scalar type, any
-            // multi-index structured chain over-indexes — flatten regardless of TypePointer id
-            // equality (interning can leave distinct Words for the same shape in edge cases).
-            if let Some(pointee_ty) = self.type_pointer_pointee_id(base_ptr_ty) {
-                if self.spirv_type_is_scalar(pointee_ty) {
-                    return true;
-                }
-            }
+            // An `OpPtrAccessChain` strides the base pointee; it cannot reinterpret that pointee.
+            // Once the emitted Word type is available it is authoritative: flatten only when the
+            // base and requested pointer types name the same scalar pointee. A byte pointer and a
+            // wider integer pointer are both scalar, but treating them as interchangeable produces
+            // a structurally invalid result type.
+            return matches!(
+                (
+                    self.type_pointer_pointee_id(base_ptr_ty),
+                    self.type_pointer_pointee_id(want_ptr_type)
+                ),
+                (Some(base_pointee), Some(want_pointee)) if base_pointee == want_pointee
+            );
         }
         if let Some(bp) = base_pointee {
             if let Ok(bp) = self.resolve_type(bp) {
@@ -131,19 +135,6 @@ impl Emitter {
             }
         }
         None
-    }
-
-    /// Whether a SPIR-V type id is a scalar (float/int/bool), not a composite.
-    pub(in crate::native::emitter) fn spirv_type_is_scalar(&self, ty: Word) -> bool {
-        for inst in &self.module.types_global_values {
-            if inst.result_id == Some(ty) {
-                return matches!(
-                    inst.class.opcode,
-                    Op::TypeFloat | Op::TypeInt | Op::TypeBool
-                );
-            }
-        }
-        false
     }
 
     /// Fold structured GEP `indices` through `source_ty` into a single offset in units of `scalar`.

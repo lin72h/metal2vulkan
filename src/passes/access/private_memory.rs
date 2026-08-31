@@ -248,6 +248,8 @@ pub(in crate::passes) fn neutralize_private_placeholder_access_chains(
         }
         ctx.module.functions[entry_idx].blocks[bi].instructions = out;
     }
+    let roots = roots.into_iter().collect::<Vec<_>>();
+    crate::passes::resources::rewrites::rewrite_private_zero_root_loads(ctx, &roots);
     Ok(())
 }
 
@@ -403,19 +405,17 @@ pub(in crate::passes) fn push_null_copy(
 pub(in crate::passes) fn hoist_function_variables(ctx: &mut Ctx, entry_idx: usize) {
     let mut vars = Vec::new();
     for block in &mut ctx.module.functions[entry_idx].blocks {
-        let mut kept = Vec::with_capacity(block.instructions.len());
-        for inst in block.instructions.drain(..) {
-            if is_function_variable(&inst) {
-                vars.push(inst);
+        block.instructions.retain(|inst| {
+            if is_function_variable(inst) {
+                vars.push(inst.clone());
+                false
             } else {
-                kept.push(inst);
+                true
             }
-        }
-        block.instructions = kept;
+        });
     }
     if let Some(first) = ctx.module.functions[entry_idx].blocks.first_mut() {
-        vars.append(&mut first.instructions);
-        first.instructions = vars;
+        first.instructions.splice(0..0, vars);
     }
 }
 
@@ -425,70 +425,6 @@ pub(in crate::passes) fn is_function_variable(inst: &Instruction) -> bool {
             inst.operands.first(),
             Some(Operand::StorageClass(StorageClass::Function))
         )
-}
-
-/// Lower every OpFunctionCall to a residual AIR/LLVM helper inside the entry function into native ops /
-/// GLSL.std.450 ext-insts / image samples / derivatives. Unknown residual calls are a hard error
-/// (caller falls back).
-/// Replace any width-preserving `OpUConvert`/`OpSConvert`/`OpFConvert` in the entry with a legal
-/// identity operation — these are illegal in SPIR-V (the converts REQUIRE differing bit widths). An
-/// exactly matching type uses `OpCopyObject`; equal-width/equal-lane signedness changes use
-/// `OpBitcast`, because `OpCopyObject` requires identical types. They arise when our
-/// interface pass binds a narrower AIR param (`ushort` `[[vertex_id]]`, an `i16` index) to the 32-bit
-/// Vulkan builtin: the body's original `zext i16 -> i32` then compiles to a same-width `OpUConvert
-/// %uint %uint`. A no-op copy is the semantically-correct result. General (a true convert keeps its op).
-pub(in crate::passes) fn fix_noop_width_converts(ctx: &mut Ctx, entry_idx: usize) {
-    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
-    for bi in 0..n_blocks {
-        let n_insts = ctx.module.functions[entry_idx].blocks[bi]
-            .instructions
-            .len();
-        for ii in 0..n_insts {
-            let (rty, src) = {
-                let inst = &ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
-                if !matches!(
-                    inst.class.opcode,
-                    Op::UConvert | Op::SConvert | Op::FConvert
-                ) {
-                    continue;
-                }
-                let Some(rty) = inst.result_type else {
-                    continue;
-                };
-                let Some(Operand::IdRef(src)) = inst.operands.first() else {
-                    continue;
-                };
-                (rty, *src)
-            };
-            let Some(src_ty) = value_result_type(ctx, src) else {
-                continue;
-            };
-            let replacement = if src_ty == rty {
-                Some(Op::CopyObject)
-            } else if scalar_bit_width(ctx, src_ty) == scalar_bit_width(ctx, rty)
-                && type_lane_count(ctx, src_ty) == type_lane_count(ctx, rty)
-            {
-                Some(Op::Bitcast)
-            } else {
-                None
-            };
-            if let Some(replacement) = replacement {
-                let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
-                let res = inst.result_id;
-                *inst = Instruction::new(replacement, Some(rty), res, vec![Operand::IdRef(src)]);
-            }
-        }
-    }
-}
-
-fn type_lane_count(ctx: &Ctx, ty: Word) -> u32 {
-    type_def_of(ctx, ty)
-        .filter(|definition| definition.class.opcode == Op::TypeVector)
-        .and_then(|definition| match definition.operands.get(1) {
-            Some(Operand::LiteralBit32(lanes)) => Some(*lanes),
-            _ => None,
-        })
-        .unwrap_or(1)
 }
 
 /// Integer division/remainder by zero is undefined in SPIR-V. Some AIR comes from guarded source

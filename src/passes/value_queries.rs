@@ -2,8 +2,43 @@
 
 use super::*;
 
+/// Snapshot result types for one function plus module-scope values. Passes that inspect every
+/// instruction in a function use this instead of repeatedly scanning the complete module.
+pub(in crate::passes) fn function_value_types(
+    ctx: &Ctx,
+    function_idx: usize,
+) -> HashMap<Word, Word> {
+    ctx.new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .chain(ctx.module.functions[function_idx].parameters.iter())
+        .chain(
+            ctx.module.functions[function_idx]
+                .blocks
+                .iter()
+                .flat_map(|block| block.instructions.iter()),
+        )
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+        .collect()
+}
+
 /// Find the defining type instruction of `ty` among the module's globals and any synthesized ones.
 pub(in crate::passes) fn type_def_of(ctx: &Ctx, ty: Word) -> Option<Instruction> {
+    if let Some((in_new_globals, index)) = ctx
+        .phase_type_positions
+        .as_ref()
+        .and_then(|positions| positions.get(&ty))
+        .copied()
+    {
+        let definition = if in_new_globals {
+            ctx.new_globals.get(index)
+        } else {
+            ctx.module.types_global_values.get(index)
+        };
+        if definition.is_some_and(|instruction| instruction.result_id == Some(ty)) {
+            return definition.cloned();
+        }
+    }
     ctx.new_globals
         .iter()
         .chain(ctx.module.types_global_values.iter())
@@ -39,6 +74,13 @@ pub(in crate::passes) fn value_def_instruction(ctx: &Ctx, value: Word) -> Option
 
 /// The `result_type` of a value id `v`: search global constants/types and every function body.
 pub(in crate::passes) fn value_result_type(ctx: &Ctx, v: Word) -> Option<Word> {
+    if let Some(result_type) = ctx
+        .phase_value_types
+        .as_ref()
+        .and_then(|types| types.get(&v))
+    {
+        return Some(*result_type);
+    }
     for g in ctx
         .new_globals
         .iter()

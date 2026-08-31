@@ -20,7 +20,7 @@ use std::path::PathBuf;
 #[test]
 fn native_typed_numeric_zero_materializes_float_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @main(i1 %choose) {
 entry:
   %value = select i1 %choose, half 0, half 0xH3C00
@@ -36,9 +36,63 @@ entry:
 }
 
 #[test]
+fn native_byte_array_integer_bitcasts_pack_and_unpack_little_endian() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %b0 = insertvalue [8 x i8] poison, i8 1, 0
+  %b1 = insertvalue [8 x i8] %b0, i8 2, 1
+  %b2 = insertvalue [8 x i8] %b1, i8 3, 2
+  %b3 = insertvalue [8 x i8] %b2, i8 4, 3
+  %b4 = insertvalue [8 x i8] %b3, i8 5, 4
+  %b5 = insertvalue [8 x i8] %b4, i8 6, 5
+  %b6 = insertvalue [8 x i8] %b5, i8 7, 6
+  %bytes = insertvalue [8 x i8] %b6, i8 8, 7
+  %word = bitcast [8 x i8] %bytes to i64
+  %roundtrip = bitcast i64 %word to [8 x i8]
+  %array_result = bitcast [8 x i8] %roundtrip to i64
+  %v0 = insertelement <8 x i8> poison, i8 8, i64 0
+  %v1 = insertelement <8 x i8> %v0, i8 7, i64 1
+  %v2 = insertelement <8 x i8> %v1, i8 6, i64 2
+  %v3 = insertelement <8 x i8> %v2, i8 5, i64 3
+  %v4 = insertelement <8 x i8> %v3, i8 4, i64 4
+  %v5 = insertelement <8 x i8> %v4, i8 3, i64 5
+  %v6 = insertelement <8 x i8> %v5, i8 2, i64 6
+  %vector = insertelement <8 x i8> %v6, i8 1, i64 7
+  %vector_word = bitcast <8 x i8> %vector to i64
+  %vector_roundtrip = bitcast i64 %vector_word to <8 x i8>
+  %vector_result = bitcast <8 x i8> %vector_roundtrip to i64
+  %result = xor i64 %array_result, %vector_result
+  store i64 %result, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_byte_array_bitcast_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let bytes = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&bytes).expect("disassemble");
+    assert!(!asm.contains("OpBitcast"), "{asm}");
+    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
+    assert!(asm.contains("OpShiftRightLogical"), "{asm}");
+    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+    assert!(asm.contains("OpCompositeConstruct"), "{asm}");
+    tools::spirv_val_bytes(&bytes, &tmp).expect("spirv-val");
+}
+
+#[test]
 fn native_llvm_float_minmax_calls_lower_as_extinsts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %mx = tail call fast float @llvm.maxnum.f32(float 1.000000e+00, float 2.000000e+00)
@@ -79,7 +133,7 @@ declare float @llvm.minnum.f32(float, float)
 #[test]
 fn native_air_integer_clamp_uses_integer_extinsts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i32 %x, i32 %y) {
 entry:
   %u = tail call i32 @air.clamp.u.i32(i32 %x, i32 0, i32 255)
@@ -119,7 +173,7 @@ declare i32 @air.clamp.s.i32(i32, i32, i32)
 #[test]
 fn native_air_abs_diff_u8_vector_lowers_to_integer_minmax_sub() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out) {
 entry:
   %a0 = insertelement <3 x i8> poison, i8 9, i64 0
@@ -164,7 +218,7 @@ declare <3 x i8> @air.abs_diff.u.v3i8(<3 x i8>, <3 x i8>)
 #[test]
 fn native_air_unsigned_saturating_add_sub_vectors_lower_to_compare_select() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <3 x i8> @sat_vec(<3 x i8> %a, <3 x i8> %b) {
 entry:
   %sum = call <3 x i8> @air.add_sat.u.v3i8(<3 x i8> %a, <3 x i8> %b)
@@ -186,7 +240,7 @@ declare <3 x i8> @air.sub_sat.u.v3i8(<3 x i8>, <3 x i8>)
 #[test]
 fn native_air_unsigned_i16_rhadd_widens_before_rounding() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i16 @rhadd(i16 %a, i16 %b) {
 entry:
   %avg = call i16 @air.rhadd.u.i16(i16 %a, i16 %b)
@@ -264,7 +318,7 @@ fn native_air_convert_bfloat_widens_and_narrows_through_f32() {
     // spirv-val rejects it with "expected float input". This exercises bf16->sint, bf16->f32, and
     // f32->bf16 in one kernel.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %in, ptr addrspace(1) %outi, ptr addrspace(1) %outbf) {
 entry:
@@ -311,7 +365,7 @@ declare bfloat @air.convert.f.bf16.f.f32(float)
 #[test]
 fn native_air_float_to_narrow_int_convert_clamps_before_convert() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out_u8, ptr addrspace(1) %out_i16, ptr addrspace(1) %out_vu8, ptr addrspace(1) %in_f, ptr addrspace(1) %in_vf) {
 entry:
@@ -363,7 +417,7 @@ declare <2 x i8> @air.convert.u.v2i8.f.v2f32(<2 x float>)
 #[test]
 fn native_air_fast_pow_selects_one_for_zero_to_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out, ptr addrspace(1) %base_in, ptr addrspace(1) %exp_in) {
 entry:
@@ -408,7 +462,7 @@ declare float @air.fast_pow.f32(float, float)
 #[test]
 fn native_air_half_pow_selects_one_for_zero_to_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out, ptr addrspace(1) %base_in, ptr addrspace(1) %exp_in) {
 entry:
@@ -458,7 +512,7 @@ fn native_bfloat_vector_arithmetic_rounds_through_float() {
     // through for a vector, emitting a type-invalid `OpFAdd` on the u16-vector storage type (spirv-val:
     // "Expected floating scalar or vector type as Result Type: FAdd").
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) {
 entry:
@@ -500,7 +554,7 @@ entry:
 #[test]
 fn native_bfloat_comparisons_widen_to_float() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %sa_ptr, ptr addrspace(1) %sb_ptr, ptr addrspace(1) %scalar_out, ptr addrspace(1) %va_ptr, ptr addrspace(1) %vb_ptr, ptr addrspace(1) %vector_out) {
 entry:
   %sa = load bfloat, ptr addrspace(1) %sa_ptr, align 2
@@ -551,7 +605,7 @@ entry:
 #[test]
 fn native_integer_casts_lower_to_spirv_conversions() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @casts(i32 %i) {
 entry:
   %wide = zext i32 %i to i64
@@ -568,7 +622,7 @@ entry:
 #[test]
 fn native_vector_integer_casts_lower_to_spirv_conversions() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <2 x i16> @vector_casts(<2 x i16> %v) {
 entry:
   %wide = zext <2 x i16> %v to <2 x i32>
@@ -585,7 +639,7 @@ entry:
 #[test]
 fn native_air_same_kind_integer_convert_lowers_to_spirv_conversion() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst_u, ptr addrspace(1) %dst_s, ptr addrspace(1) %src) {
 entry:
   %v = load <2 x i16>, ptr addrspace(1) %src, align 4
@@ -629,7 +683,7 @@ declare <2 x i32> @air.convert.s.v2i32.s.v2i16(<2 x i16>)
 #[test]
 fn native_air_mixed_sign_integer_convert_width_change_uses_spirv_conversion() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst_u16, ptr addrspace(1) %dst_s16, ptr addrspace(1) %src) {
 entry:
   %v = load <2 x i32>, ptr addrspace(1) %src, align 8
@@ -675,9 +729,49 @@ declare <2 x i16> @air.convert.s.v2i16.u.v2i32(<2 x i32>)
 }
 
 #[test]
+fn native_air_mixed_sign_same_type_convert_uses_identity_copy() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %dst, ptr addrspace(1) %src) {
+entry:
+  %value = load i16, ptr addrspace(1) %src, align 2
+  %as_unsigned = tail call i16 @air.convert.u.i16.s.i16(i16 %value)
+  %as_signed = tail call i16 @air.convert.s.i16.u.i16(i16 %as_unsigned)
+  store i16 %as_signed, ptr addrspace(1) %dst, align 2
+  ret void
+}
+
+declare i16 @air.convert.u.i16.s.i16(i16)
+declare i16 @air.convert.s.i16.u.i16(i16)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"ushort*", !"air.arg_name", !"dst"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"short*", !"air.arg_name", !"src"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_mixed_sign_identity_convert_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCopyObject"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_ptrtoint_lowers_to_zero_integer_placeholder() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i64 @pointer_address(ptr addrspace(1) %p) {
 entry:
   %addr = ptrtoint ptr addrspace(1) %p to i64
@@ -694,7 +788,7 @@ entry:
 #[test]
 fn native_function_aggregate_scalar_reinterpret_store_targets_first_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Wrapper = type { i64 }
 %Outer = type { float, %Wrapper }
 
@@ -727,7 +821,7 @@ entry:
 #[test]
 fn native_i1_uses_bool_type_for_logic_and_extension() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @bool_to_int(i32 %x) {
 entry:
   %cmp = icmp ne i32 %x, 0
@@ -753,7 +847,7 @@ entry:
 #[test]
 fn native_float_half_conversions_lower_to_fconvert() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <2 x float> @half_roundtrip(float %x, <2 x float> %v) {
 entry:
   %h = fptrunc float %x to half
@@ -772,7 +866,7 @@ entry:
 #[test]
 fn native_integer_to_float_casts_lower_to_spirv_conversions() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <2 x float> @casts(i32 %x, <2 x i32> %v) {
 entry:
   %signed = sitofp i32 %x to float
@@ -792,7 +886,7 @@ entry:
 #[test]
 fn native_bfloat_load_store_uses_u16_storage_and_bit_shifts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
 entry:
   %b = load bfloat, ptr addrspace(1) %src, align 2
@@ -812,7 +906,10 @@ entry:
 "#;
     let spv = emit_vulkan_spirv(ll).expect("native emit");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpCapability Int8"), "{asm}");
+    assert!(
+        !asm.contains("OpCapability Int8"),
+        "the inferred u16 buffer pointees must not retain byte-storage capability: {asm}"
+    );
     assert!(asm.contains("OpCapability Int16"), "{asm}");
     assert!(asm.contains("OpTypeInt 16 0"), "{asm}");
     assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
@@ -828,7 +925,7 @@ entry:
 #[test]
 fn native_float_to_bfloat_canonicalizes_nan_bits() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(float %x, <4 x float> %v) {
 entry:
   %b = fptrunc float %x to bfloat
@@ -849,7 +946,7 @@ entry:
 #[test]
 fn native_bfloat_hex_literal_stores_u16_bits() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst) {
 entry:
   store bfloat 0xR0000, ptr addrspace(1) %dst, align 2
@@ -869,9 +966,26 @@ entry:
 }
 
 #[test]
+fn native_bfloat_integer_bitcasts_use_the_shared_storage_type() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define i16 @roundtrip(bfloat %value) {
+entry:
+  %bits = bitcast bfloat %value to i16
+  %bfloat = bitcast i16 %bits to bfloat
+  %result = bitcast bfloat %bfloat to i16
+  ret i16 %result
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert_eq!(asm.matches("OpCopyObject").count(), 3, "{asm}");
+    assert!(!asm.contains("OpBitcast"), "{asm}");
+}
+
+#[test]
 fn native_llvm_bfloat_fmuladd_lowers_through_f32() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %out = tail call bfloat @llvm.fmuladd.bf16(bfloat 0xR3f80, bfloat 0xR4000, bfloat 0xR4040)
@@ -936,7 +1050,7 @@ declare bfloat @llvm.fmuladd.bf16(bfloat, bfloat, bfloat)
 #[test]
 fn native_bfloat_arithmetic_lowers_through_f32() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %add = fadd bfloat 0xR3f80, 0xR4000
@@ -1001,7 +1115,7 @@ fn native_vector_store_into_byte_remodeled_union_uses_byte_stores() {
     // `[16 x i8]` byte array: the raw store must decompose to byte stores (a word-shaped `[0][k]`
     // chain is type-invalid against the byte-array variable).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.V = type { <4 x i32> }
 define void @k(ptr addrspace(1) %out, i32 %idx) {
 entry:
@@ -1038,7 +1152,7 @@ fn native_scalar_narrowing_load_reads_low_bits_of_wide_slot() {
     // slot's address (little-endian), so the emitter loads the i64, UConvert-truncates to i32, and
     // bitcasts to float — a narrowing scalar reinterpret confined WITHIN the slot (no sibling read).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.U = type { i64 }
 
 define float @i64_slot_as_float() {
@@ -1065,7 +1179,7 @@ fn native_scalar_narrowing_store_preserves_high_bits_of_wide_slot() {
     // the slot's address) may change, so the emitter read-modify-writes — load the i64, clear its low
     // 32 bits (>> 32 then << 32), OR in the zero-extended float bits, store back.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.U = type { i64 }
 
 define void @float_into_i64_slot(float %f) {
@@ -1087,7 +1201,7 @@ entry:
 #[test]
 fn native_fast_float_arithmetic_and_store_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.S = type { float }
 define void @fast_store(ptr addrspace(1) %p, float %x) {
 entry:
@@ -1106,7 +1220,7 @@ entry:
 #[test]
 fn native_vector_float_arithmetic_materializes_literal_operands() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <3 x float> @vector_float_ops(<3 x float> %x) {
 entry:
   %mul = fmul fast <3 x float> %x, <float 0x3FE99999A0000000, float poison, float poison>
@@ -1127,7 +1241,7 @@ entry:
 #[test]
 fn native_one_lane_vectors_lower_as_scalars() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   %shuf = shufflevector <4 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00>, <4 x float> undef, <1 x i32> <i32 3>
@@ -1174,7 +1288,7 @@ join:
 #[test]
 fn native_fneg_lowers_scalar_vector_and_half() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <2 x float> @neg_vec(float %x, <2 x float> %v) {
 entry:
   %sx = fneg fast float %x
@@ -1197,7 +1311,7 @@ entry:
 #[test]
 fn native_record_array_rewrite_uses_interface_element_struct_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic.69" = type { i32 }
 
 define void @k(ptr addrspace(1) %histogram, ptr addrspace(2) %index_ptr) {
@@ -1236,7 +1350,7 @@ entry:
 #[test]
 fn native_vector_literals_materialize_for_insert_and_call_args() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @dotty(float %x) {
 entry:
   %vecinit = insertelement <2 x float> <float undef, float 2.000000e+00>, float %x, i64 0
@@ -1255,7 +1369,7 @@ declare float @air.dot.v2f32(<2 x float>, <2 x float>)
 #[test]
 fn native_typed_hex_float_literals_lower_as_float_constants() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @hex_weights(<3 x float> %x) {
 entry:
   %d = tail call fast float @air.dot.v3f32(<3 x float> %x, <3 x float> <float 0x3FCB333340000000, float 0x3FE6E48E80000000, float 0x3FB2752540000000>)
@@ -1381,7 +1495,7 @@ merge:
 #[test]
 fn native_half_hex_literals_lower_as_float16_constants() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @half_ops(half %x) {
 entry:
   %mul = fmul fast half %x, 0xH4000
@@ -1398,7 +1512,7 @@ entry:
 #[test]
 fn native_flagged_integer_ops_and_negative_literals_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @int_ops(i32 %x) {
 entry:
   %shift = shl nsw i32 %x, 1
@@ -1416,7 +1530,7 @@ entry:
 #[test]
 fn native_bitwise_integer_ops_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @bit_ops(i32 %x) {
 entry:
   %and = and i32 %x, 255
@@ -1436,7 +1550,7 @@ entry:
 #[test]
 fn native_popcount_intrinsic_lowers() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %count = tail call i32 @air.popcount.i32(i32 305419896)
@@ -1470,9 +1584,46 @@ declare i32 @air.popcount.i32(i32)
 }
 
 #[test]
+fn native_llvm_ctpop_intrinsic_lowers_without_a_function_declaration() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @main() {
+entry:
+  %count = tail call i32 @llvm.ctpop.i32(i32 305419896)
+  ret void
+}
+
+declare i32 @llvm.ctpop.i32(i32)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_llvm_ctpop_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("OpBitCount"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert!(!asm.contains("llvm_ctpop"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_popcount_i64_splits_to_i32_bitcounts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %count = tail call i64 @air.popcount.i64(i64 -1)
@@ -1542,7 +1693,7 @@ declare i64 @air.popcount.i64(i64)
 #[test]
 fn native_popcount_v2i64_splits_to_v2i32_bitcounts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %v0 = insertelement <2 x i64> poison, i64 -1, i32 0
@@ -1634,7 +1785,7 @@ declare <2 x i64> @air.popcount.v2i64(<2 x i64>)
 #[test]
 fn native_fast_exp2_log2_vector_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %v0 = insertelement <3 x float> poison, float 1.250000e-01, i32 0
@@ -1680,7 +1831,7 @@ declare <3 x float> @air.fast_log2.v3f32(<3 x float>)
 #[test]
 fn native_air_mix_preserves_exact_vector_endpoints() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(float %t) {
 entry:
   %x0 = insertelement <4 x float> poison, float 0x47EFFFFFE0000000, i32 0
@@ -1730,7 +1881,7 @@ declare <4 x float> @air.mix.v4f32(<4 x float>, <4 x float>, <4 x float>)
 #[test]
 fn native_fast_inverse_tanh_log10_powr_vector_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %v0 = insertelement <4 x float> poison, float 1.250000e-01, i32 0
@@ -1811,7 +1962,7 @@ declare <4 x float> @air.fast_powr.v4f32(<4 x float>, <4 x float>)
 #[test]
 fn native_half_pow_uses_abs_base() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %v0 = insertelement <3 x half> poison, half 0xHBC00, i32 0
@@ -1855,7 +2006,7 @@ declare <3 x half> @air.pow.v3f16(<3 x half>, <3 x half>)
 #[test]
 fn native_fast_round_vector_lowers() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %v0 = insertelement <4 x float> poison, float 1.250000e+00, i32 0
@@ -1897,7 +2048,7 @@ declare <4 x float> @air.fast_round.v4f32(<4 x float>)
 #[test]
 fn native_fast_rint_vector_lowers_to_round_even() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %v0 = insertelement <4 x float> poison, float 1.250000e+00, i32 0
@@ -1939,7 +2090,7 @@ declare <4 x float> @air.fast_rint.v4f32(<4 x float>)
 #[test]
 fn native_round_half_vector_round_trips_through_float() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(<2 x half> %v) {
 entry:
   %rounded = tail call fast <2 x half> @air.round.v2f16(<2 x half> %v)
@@ -1977,7 +2128,7 @@ declare <2 x half> @air.round.v2f16(<2 x half>)
 #[test]
 fn native_integer_division_and_remainder_ops_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @div_rem_ops(i32 %x, i32 %y) {
 entry:
   %sd = sdiv i32 %x, 3
@@ -2006,7 +2157,7 @@ entry:
 #[test]
 fn native_integer_remainder_zero_denominators_are_guarded() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i32 %tid, ptr addrspace(1) %out) {
 entry:
   %zero = sub i32 %tid, %tid
@@ -2054,7 +2205,7 @@ entry:
 #[test]
 fn native_extractvalue_lowers_struct_member_extract() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @extract_color({ <4 x float>, i8 } %r) {
 entry:
   %c = extractvalue { <4 x float>, i8 } %r, 0
@@ -2068,7 +2219,7 @@ entry:
 #[test]
 fn native_splat_constants_materialize_as_vectors() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <2 x float> @splat_ops(<2 x float> %x) {
 entry:
   %mul = fmul fast <2 x float> %x, splat (float 5.000000e-01)
@@ -2083,7 +2234,7 @@ entry:
 #[test]
 fn native_vector_fcmp_returns_vector_bool() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @any_lt(<4 x float> %x) {
 entry:
   %cmp = fcmp fast olt <4 x float> %x, splat (float 5.000000e-01)
@@ -2102,7 +2253,7 @@ declare i1 @air.any.v4i1(<4 x i1>)
 #[test]
 fn native_vector_select_accepts_vector_bool_mask() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @mask(<4 x float> %x, <4 x float> %y) {
 entry:
   %cmp = fcmp fast olt <4 x float> %x, %y
@@ -2118,7 +2269,7 @@ entry:
 #[test]
 fn native_dynamic_vector_extract_insert_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @lane(<4 x float> %x, <4 x float> %y, i32 %idx) {
 entry:
   %v = extractelement <4 x float> %x, i32 %idx
@@ -2134,7 +2285,7 @@ entry:
 #[test]
 fn native_large_dynamic_vector_extract_insert_uses_composite_selects() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <10 x float> @lane(<10 x float> %x, <10 x float> %y, i32 %idx) {
 entry:
   %v = extractelement <10 x float> %x, i32 %idx
@@ -2155,7 +2306,7 @@ entry:
 #[test]
 fn native_integer_comparisons_lower_scalar_and_vector_results() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @scalar_cmp(i8 %x) {
 entry:
   %c = icmp ugt i8 %x, 1
@@ -2178,7 +2329,7 @@ entry:
 #[test]
 fn native_wide_vector_shuffle_uses_composite_construct() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <6 x i32> @wide_shuffle(<4 x i32> %a, <4 x i32> %b) {
 entry:
   %wide_a = shufflevector <4 x i32> %a, <4 x i32> poison, <6 x i32> <i32 0, i32 1, i32 2, i32 3, i32 poison, i32 poison>
@@ -2197,7 +2348,7 @@ entry:
 #[test]
 fn native_select_with_bool_literal_lowers() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @pick(<4 x float> %a, <4 x float> %b) {
 entry:
   %r = select i1 true, <4 x float> %a, <4 x float> %b
@@ -2388,7 +2539,10 @@ merge:
                 .flat_map(|block| &block.instructions)
                 .filter(|inst| inst.class.opcode == Op::Phi)
                 .count();
-            assert!(phi_count >= 1, "expected at least 1 phi instruction, got {phi_count}");
+            assert!(
+                phi_count >= 1,
+                "expected at least 1 phi instruction, got {phi_count}"
+            );
         }
         Err(e) => panic!("emit failed: {}", e),
     }
@@ -2423,7 +2577,10 @@ merge:
                 .flat_map(|block| &block.instructions)
                 .filter(|inst| inst.class.opcode == Op::Phi)
                 .count();
-            assert!(phi_count >= 1, "expected at least 1 phi instruction, got {phi_count}");
+            assert!(
+                phi_count >= 1,
+                "expected at least 1 phi instruction, got {phi_count}"
+            );
         }
         Err(e) => panic!("emit failed: {}", e),
     }

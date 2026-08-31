@@ -99,80 +99,87 @@ pub(super) fn drop_dangling_debug(ctx: &mut Ctx) {
 /// (instruction operands, result-types, decorations, entry-point interface, function bodies). Keeps
 /// variables referenced by the entry interface. Repeats to a fixpoint so chains die cleanly.
 pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
-    loop {
-        // Collect all referenced ids EXCEPT the self-definition in types_global_values.
-        let mut used: HashSet<Word> = HashSet::new();
-        // Local-pointer store sentinels are semantic roots even after their uses have been recovered
-        // and rewritten. The typed sidecar replaces the former OpName reference that kept these
-        // constants serialized through final GC; retaining them makes marker removal debug-only.
-        used.extend(
-            ctx.emit_sidecar
-                .local_pointer_field_stores
-                .iter()
-                .map(|fact| fact.id),
-        );
-        // Raw descriptor reconstruction intentionally replaces an authored aggregate with a byte
-        // transport block. The sidecar's source-layout type remains a semantic oracle until the
-        // post-native-rewrite exact-access repair has consumed every newly exposed carrier, so its
-        // type graph is live even though no serialized instruction refers to its root directly.
-        used.extend(ctx.emit_sidecar.buffer_root_source_types.values().copied());
-        let mut add = |id: &Word, set: &mut HashSet<Word>| {
-            set.insert(*id);
-        };
-        let collect = |inst: &Instruction, set: &mut HashSet<Word>| {
-            if let Some(t) = inst.result_type {
-                set.insert(t);
-            }
-            for op in &inst.operands {
-                if let Operand::IdRef(r) | Operand::IdScope(r) | Operand::IdMemorySemantics(r) = op
-                {
-                    set.insert(*r);
-                }
-            }
-        };
-        for sect in [
-            &ctx.module.entry_points,
-            &ctx.module.execution_modes,
-            &ctx.module.annotations,
-            &ctx.module.debug_names,
-        ] {
-            for inst in sect {
-                collect(inst, &mut used);
+    let collect = |inst: &Instruction, live: &mut HashSet<Word>| {
+        if let Some(ty) = inst.result_type {
+            live.insert(ty);
+        }
+        for operand in &inst.operands {
+            if let Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) =
+                operand
+            {
+                live.insert(*id);
             }
         }
-        for f in &ctx.module.functions {
-            if let Some(d) = &f.def {
-                collect(d, &mut used);
-            }
-            for p in &f.parameters {
-                collect(p, &mut used);
-            }
-            for b in &f.blocks {
-                if let Some(l) = &b.label {
-                    collect(l, &mut used);
-                }
-                for inst in &b.instructions {
-                    collect(inst, &mut used);
-                }
-            }
-        }
-        // A types_global_values entry is live if its result id is used by anything above OR by
-        // another (kept) global. Compute references among globals too.
-        for inst in &ctx.module.types_global_values {
-            // Don't let a dead global keep its own operands alive: only count references FROM a global
-            // that is itself used. Approximate by two-phase: first pass treat all globals' operands as
-            // potential refs, then the fixpoint loop removes the rest.
-            collect(inst, &mut used);
-            let _ = &mut add;
-        }
-        let before = ctx.module.types_global_values.len();
-        ctx.module
-            .types_global_values
-            .retain(|inst| inst.result_id.map(|id| used.contains(&id)).unwrap_or(true));
-        if ctx.module.types_global_values.len() == before {
-            break;
+    };
+
+    // Executable/module linkage, semantic decorations, and typed sidecars own liveness. Debug names
+    // follow those definitions; treating names as roots retains dead constants (including pointer
+    // nulls that Vulkan's Logical addressing model cannot represent) forever.
+    let mut live = HashSet::new();
+    live.extend(
+        ctx.emit_sidecar
+            .local_pointer_field_stores
+            .iter()
+            .map(|fact| fact.id),
+    );
+    live.extend(ctx.emit_sidecar.buffer_root_source_types.values().copied());
+    for section in [&ctx.module.entry_points, &ctx.module.execution_modes] {
+        for instruction in section {
+            collect(instruction, &mut live);
         }
     }
+    for instruction in &ctx.module.annotations {
+        // ArrayStride is metadata owned by its target type, not an independent liveness root. A
+        // late BDA candidate can leave a decorated physical pointer type after its executable
+        // address path is eliminated; rooting the type from this decoration would retain an
+        // otherwise-dead capability-requiring declaration in a Logical module.
+        if instruction.operands.get(1) == Some(&Operand::Decoration(spirv::Decoration::ArrayStride))
+        {
+            continue;
+        }
+        collect(instruction, &mut live);
+    }
+    for function in &ctx.module.functions {
+        if let Some(definition) = &function.def {
+            collect(definition, &mut live);
+        }
+        for parameter in &function.parameters {
+            collect(parameter, &mut live);
+        }
+        for block in &function.blocks {
+            if let Some(label) = &block.label {
+                collect(label, &mut live);
+            }
+            for instruction in &block.instructions {
+                collect(instruction, &mut live);
+            }
+        }
+    }
+
+    let definitions = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
+    let mut pending = live.iter().copied().collect::<Vec<_>>();
+    while let Some(id) = pending.pop() {
+        let Some(definition) = definitions.get(&id) else {
+            continue;
+        };
+        let mut dependencies = HashSet::new();
+        collect(definition, &mut dependencies);
+        for dependency in dependencies {
+            if live.insert(dependency) {
+                pending.push(dependency);
+            }
+        }
+    }
+
+    ctx.module
+        .types_global_values
+        .retain(|instruction| instruction.result_id.is_none_or(|id| live.contains(&id)));
+    drop_dangling_debug(ctx);
 }
 
 /// Remove `OpCapability Int64` when no `OpTypeInt 64` survives (i.e. no genuine 64-bit-int type is
@@ -195,7 +202,7 @@ pub(super) fn drop_unused_int64_capability(ctx: &mut Ctx) {
     });
 }
 
-pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) {
+pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) -> (bool, bool) {
     crate::spirv_variable_ptr::lower_zero_base_storage_buffer_ptr_access_chains(&mut ctx.module);
     crate::spirv_variable_ptr::rewrite_storage_buffer_atomic_scopes(&mut ctx.module);
     let (needs_storage_buffer, needs_other) = needed_variable_pointer_capabilities(ctx);
@@ -208,9 +215,10 @@ pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) {
             Some(Operand::Capability(spirv::Capability::VariablePointers)) => needs_other,
             _ => true,
         });
+    (needs_storage_buffer, needs_other)
 }
 
-pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
+pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requirements: (bool, bool)) {
     use spirv::Capability;
     let mut want: Vec<Capability> = vec![];
     if ctx.module.entry_points.iter().any(|instruction| {
@@ -535,8 +543,7 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx) {
     if int_width(64) {
         want.push(Capability::Int64);
     }
-    let (has_storage_buffer_pointer_merge, has_other_pointer_merge) =
-        needed_variable_pointer_capabilities(ctx);
+    let (has_storage_buffer_pointer_merge, has_other_pointer_merge) = variable_pointer_requirements;
     if has_storage_buffer_pointer_merge {
         want.push(Capability::VariablePointersStorageBuffer);
     }
@@ -651,5 +658,88 @@ mod tests {
         assert!(ids.contains(&ulong));
         assert!(ids.contains(&sentinel));
         assert!(!ids.contains(&dead));
+    }
+
+    #[test]
+    fn gc_drops_dead_global_even_when_debug_metadata_names_it() {
+        let byte = 1;
+        let pointer = 2;
+        let null = 3;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(4));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(byte),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(pointer),
+                vec![
+                    Operand::StorageClass(StorageClass::Private),
+                    Operand::IdRef(byte),
+                ],
+            ),
+            Instruction::new(Op::ConstantNull, Some(pointer), Some(null), vec![]),
+        ];
+        module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(null),
+                Operand::LiteralString("dead pointer".to_string()),
+            ],
+        ));
+        let mut ctx = Ctx::new(module);
+
+        gc_dead_globals(&mut ctx);
+
+        assert!(ctx.module.types_global_values.is_empty());
+        assert!(ctx.module.debug_names.is_empty());
+    }
+
+    #[test]
+    fn gc_drops_dead_pointer_type_owned_only_by_array_stride() {
+        let byte = 1;
+        let pointer = 2;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(3));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(byte),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(pointer),
+                vec![
+                    Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                    Operand::IdRef(byte),
+                ],
+            ),
+        ];
+        module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(pointer),
+                Operand::Decoration(spirv::Decoration::ArrayStride),
+                Operand::LiteralBit32(1),
+            ],
+        ));
+        let mut ctx = Ctx::new(module);
+
+        gc_dead_globals(&mut ctx);
+
+        assert!(ctx.module.types_global_values.is_empty());
+        assert!(ctx.module.annotations.is_empty());
     }
 }

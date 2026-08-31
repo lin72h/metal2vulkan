@@ -56,7 +56,7 @@ fn runtime_storage_image_state(
 }
 
 const RUNTIME_STORAGE_IMAGE_WRITE_PAIR_LL: &str = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst0, ptr addrspace(1) %dst1, <2 x i32> %tid) {
 entry:
   tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dst0, <2 x i32> %tid, <4 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00>, i32 0, i32 2)
@@ -76,7 +76,7 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
 "#;
 
 const RUNTIME_STORAGE_IMAGE_READ_LL: &str = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %src, ptr addrspace(1) %out, <2 x i32> %tid) {
 entry:
   %read = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %src, <2 x i32> %tid, i32 0, i32 3)
@@ -97,7 +97,7 @@ declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i3
 "#;
 
 const UNSIGNED_TEXTURE_ATOMIC_LL: &str = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @textureAtomic(<2 x i16> %coord, ptr addrspace(1) %image) {
 entry:
@@ -417,7 +417,7 @@ attributes #1 = { convergent nounwind memory(argmem: write) }
 #[test]
 fn native_dead_byval_texture_array_copy_is_removed_after_descriptor_binding() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::texture2d" = type { ptr addrspace(1) }
 %"struct.metal::array" = type { [3 x %"struct.metal::texture2d"] }
 %Context = type { i32, %"struct.metal::array" }
@@ -1002,7 +1002,7 @@ declare i1 @air.is_null_texture_2d(ptr addrspace(1))
 #[test]
 fn native_kernel_texture_sampler_metadata_bindings() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler) {
 entry:
   ret void
@@ -1040,9 +1040,58 @@ entry:
 }
 
 #[test]
+fn native_sampler_in_by_value_aggregate_survives_multiblock_helper_inlining() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Fetcher = type { ptr addrspace(1), ptr addrspace(2) }
+
+define void @k(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
+entry:
+  %with_texture = insertvalue %Fetcher poison, ptr addrspace(1) %texture, 0
+  %fetcher = insertvalue %Fetcher %with_texture, ptr addrspace(2) %sampler, 1
+  call fastcc void @sample_helper(%Fetcher %fetcher, ptr addrspace(1) %out)
+  ret void
+}
+
+define internal fastcc void @sample_helper(%Fetcher %fetcher, ptr addrspace(1) %out) {
+entry:
+  br label %body
+body:
+  %texture = extractvalue %Fetcher %fetcher, 0
+  %sampler = extractvalue %Fetcher %fetcher, 1
+  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %texture, ptr addrspace(2) %sampler, <2 x float> zeroinitializer, i1 false, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"texture"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_by_value_sampler_helper_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("translate sampler carried through by-value helper aggregate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpSampledImage"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_texture_and_sampler_binding_bands_cover_high_and_last_abi_indices() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex40, ptr addrspace(1) %tex127, ptr addrspace(2) %sampler8, ptr addrspace(2) %sampler15) {
 entry:
   ret void
@@ -1118,9 +1167,11 @@ entry:
 #[test]
 fn native_sampled_and_storage_views_of_one_metal_texture_use_distinct_bands() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @dest_location = internal addrspace(2) global i32 40, align 4
 @source_location = internal addrspace(2) global i32 40, align 4
+@dest_enabled = internal addrspace(2) global i8 1, align 1
+@source_enabled = internal addrspace(2) global i8 1, align 1
 
 define void @k(ptr addrspace(1) %dest, ptr addrspace(1) %source) {
 entry:
@@ -1177,7 +1228,7 @@ entry:
 #[test]
 fn native_kernel_texture_sample_without_lod_uses_explicit_lod_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %c0 = insertelement <2 x float> poison, float 2.500000e-01, i32 0
@@ -1220,7 +1271,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_kernel_texture_sample_const_offset_uses_image_operand() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %c0 = insertelement <2 x float> poison, float 2.500000e-01, i32 0
@@ -1266,7 +1317,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn runtime_sampler_specialization_switches_the_same_air_between_native_and_pixel_sampling() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> <i32 1, i32 -1>, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -1467,7 +1518,7 @@ fn runtime_pixel_sampler_rejects_unmodeled_pipeline_state() {
 #[test]
 fn runtime_sampler_specialization_uses_fragment_metal_index_not_descriptor_binding() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @frag(ptr addrspace(1) %tex, ptr addrspace(2) %sampler) {
 entry:
   %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -1518,9 +1569,9 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 }
 
 #[test]
-fn runtime_pixel_sampler_refuses_unsupported_sample_dimension() {
+fn runtime_pixel_sampler_linearly_filters_1d_with_two_exact_fetches() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %sample = tail call { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, float 2.500000e+00, i1 true, i32 1, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -1549,7 +1600,7 @@ declare { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1), ptr a
         crate::reflect::SamplerFilter::Linear,
         crate::reflect::SamplerAddressMode::ClampToEdge,
     );
-    let error = crate::translate_sanitized_native_with_options(
+    let spv = crate::translate_sanitized_native_with_options(
         ll,
         Stage::Kernel,
         &tmp,
@@ -1557,14 +1608,18 @@ declare { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1), ptr a
             .with_runtime_sampler(0, state)
             .unwrap(),
     )
-    .expect_err("unsupported pixel-coordinate dimension must be refused");
-    assert!(error.contains("Dim1D"), "{error}");
+    .expect("1D pixel-linear specialization");
+    let asm = disassemble(&spv).expect("disassemble 1D pixel-linear specialization");
+    assert_eq!(asm.matches("OpImageFetch").count(), 2, "{asm}");
+    assert_eq!(asm.matches("OpVectorTimesScalar").count(), 2, "{asm}");
+    assert!(!asm.contains("OpSampledImage"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("1D pixel-linear spirv-val");
 }
 
 #[test]
 fn runtime_pixel_comparison_sampler_fetches_then_compares() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %sample = tail call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, i32 0, <2 x float> <float 2.500000e+00, float -5.000000e-01>, float 5.000000e-01, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
@@ -1626,7 +1681,7 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
 #[test]
 fn runtime_sampler_specialization_refuses_pointer_selected_state_loss() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1, ptr addrspace(1) %out, i32 %lane) {
 entry:
   %condition = icmp eq i32 %lane, 0
@@ -1672,7 +1727,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn runtime_sampler_specialization_refuses_integer_lod_query_pointer_state_loss() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @frag(<4 x float> %position, ptr addrspace(1) %tex, ptr addrspace(2) %sampler0, ptr addrspace(2) %sampler1) {
 entry:
   %x = extractelement <4 x float> %position, i32 0
@@ -1720,7 +1775,7 @@ declare float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly 
 #[test]
 fn runtime_pixel_sampler_specializes_texture_gather() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %gather = tail call { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> <float 2.500000e+00, float -5.000000e-01>, i1 true, <2 x i32> <i32 1, i32 -1>, i32 0, i32 0)
@@ -1769,7 +1824,7 @@ declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_kernel_texture_sample_dynamic_offset_adjusts_coordinate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out, i32 %lane) {
 entry:
   %c0 = insertelement <2 x float> poison, float 2.500000e-01, i32 0
@@ -1822,7 +1877,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_kernel_depth_sample_uses_explicit_lod_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %depth, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
   %c0 = insertelement <2 x float> poison, float 2.500000e-01, i32 0
@@ -1864,7 +1919,7 @@ declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2
 #[test]
 fn native_kernel_pixel_linear_depth_sample_uses_four_addressed_fetches() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601053184, i64 0], align 8
 define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out) {
 entry:
@@ -1948,7 +2003,7 @@ declare { float, i8 } @air.sample_depth_2d_array.f32(ptr addrspace(1), ptr addrs
 #[test]
 fn native_fragment_selected_static_sampler_uses_valid_sampler_operand() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
 @__air_sampler_state.1 = internal addrspace(2) constant i64 -9188470239253755831, align 8
@@ -1999,7 +2054,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_fragment_selected_static_sampler_compare_depth_uses_valid_sampler_operand() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
 @__air_sampler_state.1 = internal addrspace(2) constant i64 -9188470239253755831, align 8
@@ -2053,7 +2108,7 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
 #[test]
 fn native_fragment_compare_depth_2d_array_appends_layer_before_comparison() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant i64 -9188470239254151095, align 8
 
@@ -2102,7 +2157,7 @@ declare { float, i8 } @air.sample_compare_depth_2d_array.f32(ptr addrspace(1), p
 #[test]
 fn native_fragment_selected_texture2d_array_sample_keeps_array_shape() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601036873, i64 0], align 8
 
@@ -2159,9 +2214,59 @@ declare { <4 x float>, i8 } @air.sample_texture_2d_array.v4f32(ptr addrspace(1),
 }
 
 #[test]
+fn native_function_constant_texture_with_binding_keeps_array_shape() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+@predicate = internal addrspace(2) global i8 0, align 1
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020489, i64 0], align 8
+
+define <4 x float> @frag(ptr addrspace(1) %tex) {
+entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_1d_array.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, float 2.500000e-01, i32 2, i1 false, i32 0, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  ret <4 x float> %color
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_1d_array.v4f32(ptr addrspace(1), ptr addrspace(2), float, i32, i1, i32, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!6}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture1d_array<float, sample>", !"air.arg_name", !"tex"}
+!5 = !{ptr addrspace(2) @predicate, !"bool", !"supportsTexture"}
+!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_function_constant_texture_array_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpTypeImage") && line.contains(" 1D 0 1 0 1 ")),
+        "{asm}"
+    );
+    assert!(asm.contains("Binding 1"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn native_fragment_calculate_unclamped_lod_uses_image_query_lod() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601036873, i64 0], align 8
 
@@ -2212,7 +2317,7 @@ declare float @air.calculate_unclamped_lod_texture_2d(ptr addrspace(1) readonly 
 #[test]
 fn native_fragment_calculate_clamped_lod_uses_selected_mipmap_level() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601036873, i64 0], align 8
 
@@ -2260,9 +2365,64 @@ declare float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1) readonly ca
 }
 
 #[test]
+fn native_fragment_calculate_lod_replays_selected_texture_through_helper() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601036873, i64 0], align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %left, ptr addrspace(1) %right) {
+entry:
+  %x = extractelement <4 x float> %position, i32 0
+  %condition = fcmp olt float %x, 0.000000e+00
+  %texture = select i1 %condition, ptr addrspace(1) %left, ptr addrspace(1) %right
+  %lod = call fastcc float @query_lod(ptr addrspace(1) %texture, <2 x float> %coord)
+  %out0 = insertelement <4 x float> zeroinitializer, float %lod, i32 0
+  ret <4 x float> %out0
+}
+
+define internal fastcc float @query_lod(ptr addrspace(1) %texture, <2 x float> %coord) {
+entry:
+  %lod = call float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1) %texture, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i32 0)
+  ret float %lod
+}
+
+declare float @air.calculate_clamped_lod_texture_2d(ptr addrspace(1), ptr addrspace(2), <2 x float>, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!8}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"left"}
+!7 = !{i32 3, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"right"}
+!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_selected_query_lod_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageQueryLod"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_fragment_raster_sample_count_requires_pipeline_contract() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(<4 x float> %position) {
 entry:
@@ -2315,7 +2475,7 @@ declare i32 @air.get_num_samples.i32(i32)
 #[test]
 fn native_depth_cube_num_mip_levels_uses_image_query_levels() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out) {
 entry:
@@ -2342,6 +2502,7 @@ declare i32 @air.get_num_mip_levels_depth_cube(ptr addrspace(1) readonly capture
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpCapability ImageQuery"), "{asm}");
     assert!(asm.contains("OpImageQueryLevels"), "{asm}");
+    assert!(!asm.contains("OpBitcast"), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -2355,7 +2516,7 @@ declare i32 @air.get_num_mip_levels_depth_cube(ptr addrspace(1) readonly capture
 #[test]
 fn native_gather_texture_accepts_null_offset_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2404,7 +2565,7 @@ declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_gather_texture_uint_result_uses_integer_image_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2450,7 +2611,7 @@ declare { <4 x i32>, i8 } @air.gather_texture_2d.u.v4i32(ptr addrspace(1), ptr a
 #[test]
 fn native_gather_texture_from_byval_array_dynamic_field_uses_descriptor_array() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %"struct.metal::texture2d" = type { ptr addrspace(1) }
 
@@ -2510,7 +2671,7 @@ declare void @air.write_texture_2d.u.v4i32(ptr addrspace(1), <2 x i32>, <4 x i32
 #[test]
 fn native_gather_texture_uint_pixel_sampler_extracts_integer_components() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -2561,7 +2722,7 @@ declare { <4 x i32>, i8 } @air.gather_texture_2d.u.v4i32(ptr addrspace(1), ptr a
 #[test]
 fn native_gather_texture_half_result_converts_struct_member() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2608,7 +2769,7 @@ declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr ad
 #[test]
 fn native_gather_texture_2d_array_uses_layer_coordinate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2683,7 +2844,7 @@ declare { <4 x half>, i8 } @air.gather_texture_2d_array.v4f16(ptr addrspace(1), 
 #[test]
 fn native_gather_texture_accepts_splat_offset_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2732,7 +2893,7 @@ declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_gather_texture_accepts_literal_offset_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2781,7 +2942,7 @@ declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_gather_texture_dynamic_offset_adjusts_coordinate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -2837,7 +2998,7 @@ declare { <4 x float>, i8 } @air.gather_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_gather_texture_pixel_sampler_lowers_to_fetches() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant i64 -9188470239253725111, align 8
 
@@ -2892,7 +3053,7 @@ declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr ad
 #[test]
 fn native_gather_texture_pixel_center_sampler_skips_high_bit_bias() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant i64 -9188470239253725111, align 8
 
@@ -2945,7 +3106,7 @@ declare <2 x float> @air.convert.f.v2f32.u.v2i16(<2 x i16>)
 #[test]
 fn native_gather_texture_array_pixel_sampler_integer_coord_uses_half_texel_footprint() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -3001,7 +3162,7 @@ declare <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32>)
 #[test]
 fn native_gather_write_texture_pixel_sampler_uses_storage_reads() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant i64 -9188470239253725111, align 8
 
@@ -3072,7 +3233,7 @@ declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr ad
 #[test]
 fn native_gather_texture_array_pixel_sampler_lowers_to_fetches() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -3120,7 +3281,7 @@ declare { <4 x half>, i8 } @air.gather_texture_2d.v4f16(ptr addrspace(1), ptr ad
 #[test]
 fn native_gather_depth_lowers_to_component_zero_gather() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -3166,7 +3327,7 @@ declare { <4 x float>, i8 } @air.gather_depth_2d.v4f32(ptr addrspace(1), ptr add
 #[test]
 fn native_gather_depth_2d_array_uses_layer_coordinate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
@@ -3229,7 +3390,7 @@ declare { <4 x float>, i8 } @air.gather_depth_2d_array.v4f32(ptr addrspace(1), p
 #[test]
 fn native_kernel_unused_texture1d_uses_metadata_dimension() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %lut, ptr addrspace(1) %out) {
 entry:
@@ -3266,7 +3427,7 @@ entry:
 #[test]
 fn native_kernel_uint_write_texture_uses_uint_storage_image() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <2 x i32> %tid) {
 entry:
   %v0 = insertelement <4 x i32> undef, i32 1, i64 0
@@ -3479,7 +3640,7 @@ fn runtime_storage_image_formatless_capabilities_follow_actual_access() {
 #[test]
 fn runtime_storage_image_formatless_partial_write_requires_read_and_write_features() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <2 x i32> %tid) {
 entry:
   %texel = insertelement <4 x float> undef, float 1.000000e+00, i64 0
@@ -3626,7 +3787,7 @@ fn runtime_storage_image_specialization_refuses_incompatible_or_missing_contract
 #[test]
 fn native_kernel_helper_wrapped_write_texture_uses_single_storage_image() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Out = type <{ %Tex, <2 x i16> }>
 %Tex = type { ptr addrspace(1) }
 
@@ -3680,7 +3841,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 #[test]
 fn native_kernel_helper_wrapped_texture_query_resolves_loaded_image() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Out = type { %Tex }
 %Tex = type { ptr addrspace(1) }
 
@@ -3732,7 +3893,7 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
 #[test]
 fn native_kernel_helper_wrapped_write_texture_query_resolves_loaded_image() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Out = type { %Tex }
 %Tex = type { ptr addrspace(1) }
 
@@ -3784,7 +3945,7 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
 #[test]
 fn native_kernel_helper_wrapped_multi_texture_query_resolves_field_source() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Out = type { %Tex }
 %Tex = type { ptr addrspace(1) }
 
@@ -3838,7 +3999,7 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
 #[test]
 fn native_kernel_selected_texture_query_clones_queries_before_select() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %src0, ptr addrspace(1) %src1, ptr addrspace(1) %out, i32 %tid) {
 entry:
@@ -3871,7 +4032,7 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load native spv");
+    let mut module = load_bytes(&spv).expect("load native spv");
     let pointer_types = module
         .types_global_values
         .iter()
@@ -3889,6 +4050,10 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
     });
     assert!(pointer_select.is_none(), "{pointer_select:?}\n{asm}");
     assert_eq!(asm.matches("OpImageQuerySizeLod").count(), 4, "{asm}");
+    assert!(
+        !crate::native::construct_opaque_image_selects_module(&mut module),
+        "final resource construction must leave no portable opaque-image closure"
+    );
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -3899,9 +4064,73 @@ declare i32 @air.get_height_texture_2d(ptr addrspace(1), i32)
 }
 
 #[test]
+fn native_kernel_nested_texture_phi_query_constructs_integer_tag_tree() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, ptr addrspace(1) %out, i32 %tid) {
+entry:
+  %outer_cond = icmp eq i32 %tid, 0
+  br i1 %outer_cond, label %outer_arm, label %inner_head
+
+inner_head:
+  %inner_cond = icmp eq i32 %tid, 1
+  br i1 %inner_cond, label %inner_left, label %inner_right
+
+inner_left:
+  br label %inner_merge
+
+inner_right:
+  br label %inner_merge
+
+inner_merge:
+  %inner = phi ptr addrspace(1) [ %a, %inner_left ], [ %b, %inner_right ]
+  br label %outer_merge
+
+outer_arm:
+  br label %outer_merge
+
+outer_merge:
+  %texture = phi ptr addrspace(1) [ %c, %outer_arm ], [ %inner, %inner_merge ]
+  %width = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) %texture, i32 0)
+  store i32 %width, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"c"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!7 = !{i32 4, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_texture_phi_query_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert_eq!(asm.matches("OpImageQuerySizeLod").count(), 3, "{asm}");
+    assert!(asm.matches("OpPhi").count() >= 2, "{asm}");
+    let mut module = load_bytes(&spv).expect("load native spv");
+    assert!(
+        !crate::native::construct_opaque_image_selects_module(&mut module),
+        "final resource construction must leave no nested opaque-image phi closure"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_kernel_imageblock_slice_write_uses_private_scratch_and_storage_image() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i32> %gid, <2 x i16> %tid) {
@@ -3993,7 +4222,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
 #[test]
 fn native_implicit_imageblock_uses_indexed_storage_attachment_planes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %block, <2 x i16> %tid) {
@@ -4044,7 +4273,7 @@ declare void @air.store.implicit_imageblock.v2f16(<2 x half>, i32, <2 x i16>, i3
     assert!(asm.contains("R16f"), "{asm}");
     assert!(asm.contains("R32ui"), "{asm}");
     assert!(asm.contains("Rg16f"), "{asm}");
-    assert!(asm.contains("OpBitcast"), "{asm}");
+    assert!(!asm.contains("OpBitcast"), "{asm}");
     assert!(asm.contains("Binding 200"), "{asm}");
     assert!(asm.contains("Binding 206"), "{asm}");
     assert!(!asm.contains("air.load.implicit_imageblock"), "{asm}");
@@ -4116,7 +4345,7 @@ declare void @air.write_imageblock_slice_to_texture_2d_array.i16.v4f16(ptr addrs
 #[test]
 fn native_kernel_imageblock_slice_write_zero_extent_writes_transparent_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4164,7 +4393,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1
 #[test]
 fn native_kernel_imageblock_explicit_oversized_slice_discards_region() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid, <2 x i16> %tg_size) {
@@ -4212,7 +4441,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1
 #[test]
 fn native_kernel_imageblock_slice_write_retypes_byte_offset_half4() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4264,7 +4493,7 @@ fn native_kernel_imageblock_slice_write_two_channel_half_pads_to_v4() {
     // and the <2 x half> texel is converted to <2 x float>, channel-extracted, and padded to the v4
     // OpImageWrite expects (extra channels zero). Was previously rejected "unsupported texel component".
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4316,7 +4545,7 @@ fn native_kernel_imageblock_slice_write_int16_widens_to_v4_sint() {
     // "non-float imageblock write"; validated byte-exact vs the Apple goldens on the two regression cases
     // (10/ae048d1d rwppCornerResponseShort, 13/15ce2819 rwppCornerDetectFirstPass4x4Short).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4363,7 +4592,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1
 #[test]
 fn native_kernel_imageblock_dimensions_lower_to_single_slot_extent() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4402,7 +4631,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f32(ptr addrspace(1
     let asm = disassemble(&spv).expect("disassemble");
     assert!(
         asm.lines()
-            .any(|line| line.contains("OpConstant") && line.trim_end().ends_with(" 1")),
+            .any(|line| line.contains("OpSpecConstant") && line.trim_end().ends_with(" 1")),
         "{asm}"
     );
     assert!(asm.contains("OpImageWrite"), "{asm}");
@@ -4420,7 +4649,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f32(ptr addrspace(1
 #[test]
 fn native_kernel_imageblock_data_uses_metadata_float4_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid) {
@@ -4465,7 +4694,7 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
 #[test]
 fn native_kernel_imageblock_data_calls_share_private_scratch() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4515,7 +4744,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
 #[test]
 fn native_kernel_imageblock_private_byte_view_loads_typed_half_lane() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid) {
@@ -4562,7 +4791,7 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
 #[test]
 fn native_kernel_cross_coordinate_imageblock_uses_shared_workgroup_cells() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid, <2 x i16> %threads) {
@@ -4630,7 +4859,7 @@ declare void @air.wg.barrier(i32, i32)
 #[test]
 fn native_kernel_cross_coordinate_imageblock_write_reads_struct_prefix_without_pointer_bitcast() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid, <2 x i16> %threads) {
@@ -4680,7 +4909,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.f16(ptr addrspace(1),
 #[test]
 fn native_kernel_private_imageblock_byte_field_keeps_complete_cell_layout() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
@@ -4731,7 +4960,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v2f16(ptr addrspace(1
 #[test]
 fn native_kernel_backend_imageblock_dimensions_use_shared_workgroup_cells() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
 define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid) {
@@ -4783,7 +5012,7 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
 #[test]
 fn native_kernel_helper_wrapped_sample_and_write_textures_use_single_images() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Out = type <{ %Tex, %Tex, <2 x i16> }>
 %Tex = type { ptr addrspace(1) }
 
@@ -4852,7 +5081,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 #[test]
 fn native_kernel_separate_helper_wrapped_sample_and_write_textures_recover_field_sources() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %In = type { %Tex }
 %Out = type <{ %Tex, <2 x i16>, i8 }>
 %Tex = type { ptr addrspace(1) }
@@ -4925,7 +5154,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 #[test]
 fn native_kernel_uint_array_write_texture_combines_layer_coord() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <3 x i32> %tid) {
 entry:
   %x = extractelement <3 x i32> %tid, i64 0
@@ -4972,7 +5201,7 @@ declare void @air.write_texture_2d_array.u.v4i32(ptr addrspace(1), <2 x i32>, i3
 #[test]
 fn native_kernel_cube_write_texture_combines_face_coord() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <2 x i32> %xy) {
 entry:
   %v0 = insertelement <4 x float> poison, float 2.500000e-01, i64 0
@@ -5015,7 +5244,7 @@ declare void @air.write_texture_cube.v4f32(ptr addrspace(1), <2 x i32>, i32, <4 
 #[test]
 fn native_kernel_read_texture_array_widens_narrow_coord_before_layer_combine() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst, <2 x i16> %gid) {
 entry:
   %sampler = tail call ptr addrspace(2) @air.get_read_sampler()
@@ -5059,7 +5288,7 @@ declare void @air.write_texture_2d_array.i16.v4f16(ptr addrspace(1), <2 x i16>, 
 #[test]
 fn native_read_depth_2d_i16_with_sampler_uses_vector_coord() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out, <2 x i16> %gid) {
 entry:
   %sampler = tail call ptr addrspace(2) @air.get_read_sampler()
@@ -5125,7 +5354,7 @@ declare { float, i8 } @air.read_depth_2d.i16.f32(ptr addrspace(1), ptr addrspace
 #[test]
 fn native_read_depth_2d_i16_sample_index_uses_vector_coord() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out, <2 x i16> %gid) {
 entry:
   %read = tail call { float, i8 } @air.read_depth_2d.i16.f32(ptr addrspace(1) %depth, i32 1, <2 x i16> %gid, i16 0, i32 1)
@@ -5189,7 +5418,7 @@ declare { float, i8 } @air.read_depth_2d.i16.f32(ptr addrspace(1), i32, <2 x i16
 #[test]
 fn native_kernel_pixel_sampler_array_sample_lowers_to_fetch() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -5238,7 +5467,7 @@ declare void @air.write_texture_2d_array.i16.v4f16(ptr addrspace(1), <2 x i16>, 
 #[test]
 fn native_kernel_pixel_linear_array_sampler_lowers_to_weighted_fetches() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601053184, i64 0], align 8
 
@@ -5293,7 +5522,7 @@ declare void @air.write_texture_2d_array.i16.v4f16(ptr addrspace(1), <2 x i16>, 
 #[test]
 fn native_kernel_integer_pixel_linear_sampler_lowers_to_fetch() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601053257, i64 0], align 8
 
@@ -5348,7 +5577,7 @@ declare void @air.write_texture_2d.i16.u.v4i16(ptr addrspace(1), <2 x i16>, <4 x
 #[test]
 fn native_kernel_pixel_sampler_zero_address_guards_fetch_result() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050624, i64 0], align 8
 
@@ -5403,7 +5632,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 #[test]
 fn native_kernel_pixel_sampler_2d_sample_offset_lowers_to_fetch_coord_add() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -5452,7 +5681,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 #[test]
 fn native_kernel_pixel_sampler_dynamic_offset_lowers_to_fetch_coord_add() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601050697, i64 0], align 8
 
@@ -5505,7 +5734,7 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 #[test]
 fn native_kernel_texture_buffer_write_uses_storage_texel_buffer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, i32 %tid) {
 entry:
   %v0 = insertelement <4 x float> undef, float 2.500000e-01, i64 0
@@ -5550,7 +5779,7 @@ declare void @air.write_texture_buffer_1d.v4f32(ptr addrspace(1), i32, <4 x floa
 #[test]
 fn native_kernel_texture_buffer_read_omits_lod_operand() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %src, ptr addrspace(1) %out, i32 %tid) {
 entry:
   %sample = tail call { <4 x float>, i8 } @air.read_texture_buffer_1d.v4f32(ptr addrspace(1) %src, i32 %tid, i32 1)
@@ -5595,7 +5824,7 @@ declare { <4 x float>, i8 } @air.read_texture_buffer_1d.v4f32(ptr addrspace(1), 
 #[test]
 fn native_kernel_texture1d_write_declares_storage_image1d_capability() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, i16 %x) {
 entry:
   %v0 = insertelement <4 x float> undef, float 2.500000e-01, i64 0
@@ -5638,7 +5867,7 @@ declare void @air.write_texture_1d.i16.v4f32(ptr addrspace(1), i16, <4 x float>,
 #[test]
 fn native_kernel_ushort_texture_read_write_uses_16bit_uint_images() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst, <2 x i16> %tid) {
 entry:
   %coord = shl <2 x i16> %tid, <i16 1, i16 1>
@@ -5804,7 +6033,7 @@ attributes #0 = { nounwind }
 #[test]
 fn native_multisample_texture_size_query_uses_query_size_without_lod() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
 entry:
@@ -5847,7 +6076,7 @@ declare i32 @air.get_height_texture_2d_ms(ptr addrspace(1))
 #[test]
 fn native_dynamic_texture_matrix_read_selects_texel_values() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, ptr addrspace(1) %d, ptr addrspace(1) %out, <2 x i32> %tid) {
 entry:
   %table = alloca [2 x [2 x ptr addrspace(1)]], align 8
@@ -5905,7 +6134,7 @@ declare { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1), <2 x i3
 #[test]
 fn native_dynamic_texture_table_sample_drops_stale_pointer_selects() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(2) %sampler, ptr addrspace(1) %out, i32 %index) {
 entry:
   %table = alloca [2 x ptr addrspace(1)], align 8
@@ -5941,8 +6170,13 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
+    let mut module = load_bytes(&spv).expect("load native spv");
     assert_eq!(asm.matches("OpImageSampleExplicitLod").count(), 2, "{asm}");
     assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(
+        !crate::native::construct_opaque_image_selects_module(&mut module),
+        "final resource construction must leave no sampled-image selection closure"
+    );
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -5956,7 +6190,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 #[test]
 fn native_kernel_undef_texel_lanes_preserve_storage_image_channels() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <2 x i32> %tid) {
 entry:
   %texel = insertelement <4 x i16> undef, i16 7, i64 0
@@ -5999,7 +6233,7 @@ declare void @air.write_texture_2d.u.v4i16(ptr addrspace(1), <2 x i32>, <4 x i16
 #[test]
 fn native_kernel_same_texture_read_write_uses_storage_image_read() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %tex, <2 x i32> %tid) {
 entry:
   %sample = tail call { <4 x float>, i8 } @air.read_texture_2d.v4f32(ptr addrspace(1) %tex, <2 x i32> %tid, i32 0, i32 3)
@@ -6041,7 +6275,7 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
 #[test]
 fn native_kernel_write_texture_size_query_uses_storage_query() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <2 x i32> %tid) {
 entry:
   %w = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) %dst, i32 0)
@@ -6090,7 +6324,7 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
 #[test]
 fn native_kernel_write_texture_mip_query_uses_single_level_constant() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %dst, <2 x i32> %tid) {
 entry:
   %levels = tail call i32 @air.get_num_mip_levels_texture_2d(ptr addrspace(1) %dst)

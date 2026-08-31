@@ -43,6 +43,7 @@ pub(in crate::passes) fn const_int_like(ctx: &mut Ctx, like: Word, value: u64) -
 ///     The base pointer operand (operand 0) is left untouched — only fitting constant indices are
 ///     narrowed.
 pub(in crate::passes) fn narrow_access_chain_indices(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
         let mut new_insts: Vec<Instruction> = vec![];
@@ -64,7 +65,7 @@ pub(in crate::passes) fn narrow_access_chain_indices(ctx: &mut Ctx, entry_idx: u
                     Operand::IdRef(r) => r,
                     _ => continue,
                 };
-                let idx_ty = match value_result_type(ctx, idx) {
+                let idx_ty = match value_types.get(&idx).copied() {
                     Some(t) => t,
                     None => continue,
                 };
@@ -92,126 +93,19 @@ pub(in crate::passes) fn narrow_access_chain_indices(ctx: &mut Ctx, entry_idx: u
     }
 }
 
-/// Enforce the SPIR-V rule that a scalar-integer arithmetic/bitwise op's operands share the result
-/// type's bit width. Lowering can leave an operand at the wrong width: a value widened to `ulong` to
-/// index a `StorageBuffer` runtime array (`%i32 -> OpUConvert %ulong`) is sometimes reused directly in
-/// a 32-bit offset multiply, so the `ulong` id flows into an `OpIMul %uint`, which spirv-val rejects
-/// ("arithmetic operands must have the same bit width as Result Type"). This is purely structural: for
-/// each targeted op whose result is a scalar `OpTypeInt` of width W, any `IdRef` operand whose own
-/// result type is a scalar `OpTypeInt` WIDER than W gets a truncating `OpUConvert` to width W inserted
-/// immediately before the op, and the operand is repointed at it. Truncation recovers exactly the
-/// low-W bits the narrow op is meant to consume (the value was widened FROM that width), so it is
-/// byte-neutral for a correctly-typed module — every operand already matches W, no `OpUConvert` is
-/// inserted, the bytes are identical. Keys on operand vs result bit width alone, never on any name.
-/// Shifts are excluded: their Shift operand may legally differ in width from the result.
-pub(in crate::passes) fn normalize_int_arith_operand_widths(ctx: &mut Ctx) {
-    // scalar OpTypeInt id -> bit width.
-    let mut int_width: HashMap<Word, u32> = HashMap::new();
-    for inst in ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-    {
-        if inst.class.opcode == Op::TypeInt {
-            if let (Some(id), Some(Operand::LiteralBit32(w))) =
-                (inst.result_id, inst.operands.first())
-            {
-                int_width.insert(id, *w);
-            }
-        }
-    }
-    // value id -> result-type id, for every value-producing instruction.
-    let mut id_ty: HashMap<Word, Word> = HashMap::new();
-    for inst in ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-    {
-        if let (Some(r), Some(t)) = (inst.result_id, inst.result_type) {
-            id_ty.insert(r, t);
-        }
-    }
-    for f in &ctx.module.functions {
-        for p in &f.parameters {
-            if let (Some(r), Some(t)) = (p.result_id, p.result_type) {
-                id_ty.insert(r, t);
-            }
-        }
-        for b in &f.blocks {
-            for i in &b.instructions {
-                if let (Some(r), Some(t)) = (i.result_id, i.result_type) {
-                    id_ty.insert(r, t);
-                }
-            }
-        }
-    }
-    let is_target = |op: Op| {
-        matches!(
-            op,
-            Op::IAdd
-                | Op::ISub
-                | Op::IMul
-                | Op::UDiv
-                | Op::SDiv
-                | Op::UMod
-                | Op::SRem
-                | Op::SMod
-                | Op::BitwiseAnd
-                | Op::BitwiseOr
-                | Op::BitwiseXor
-                | Op::SNegate
-                | Op::Not
-        )
-    };
-    for fi in 0..ctx.module.functions.len() {
-        for bi in 0..ctx.module.functions[fi].blocks.len() {
-            // Take the instructions out so `ctx.module.fresh_id()` can allocate ids without a live borrow.
-            let insts = std::mem::take(&mut ctx.module.functions[fi].blocks[bi].instructions);
-            let mut new_insts: Vec<Instruction> = Vec::with_capacity(insts.len());
-            for mut inst in insts {
-                let coerce = is_target(inst.class.opcode)
-                    .then_some(inst.result_type)
-                    .flatten()
-                    .and_then(|rt| int_width.get(&rt).copied().map(|w| (rt, w)));
-                if let Some((res_ty, res_w)) = coerce {
-                    // Dedup within this instruction so a value used twice truncates once.
-                    let mut truncated: HashMap<Word, Word> = HashMap::new();
-                    for oi in 0..inst.operands.len() {
-                        let Operand::IdRef(id) = inst.operands[oi] else {
-                            continue;
-                        };
-                        let too_wide = id_ty
-                            .get(&id)
-                            .and_then(|t| int_width.get(t))
-                            .is_some_and(|&ow| ow > res_w);
-                        if !too_wide {
-                            continue;
-                        }
-                        let narrow = if let Some(&existing) = truncated.get(&id) {
-                            existing
-                        } else {
-                            let fresh = ctx.module.fresh_id();
-                            new_insts.push(Instruction::new(
-                                Op::UConvert,
-                                Some(res_ty),
-                                Some(fresh),
-                                vec![Operand::IdRef(id)],
-                            ));
-                            id_ty.insert(fresh, res_ty);
-                            truncated.insert(id, fresh);
-                            fresh
-                        };
-                        inst.operands[oi] = Operand::IdRef(narrow);
-                    }
-                }
-                new_insts.push(inst);
-            }
-            ctx.module.functions[fi].blocks[bi].instructions = new_insts;
-        }
-    }
-}
-
 pub(in crate::passes) fn lower_scalar_i64_arithmetic_to_u32_halves(ctx: &mut Ctx) {
+    ctx.module.sync_id_bound_from_instructions();
+    if let Some(staged_bound) = ctx
+        .new_globals
+        .iter()
+        .filter_map(|instruction| instruction.result_id)
+        .max()
+        .map(|id| id.saturating_add(1))
+    {
+        if ctx.module.id_bound() < staged_bound {
+            ctx.module.set_id_bound(staged_bound);
+        }
+    }
     let mut int_types: HashMap<Word, (u32, u32)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -265,9 +159,9 @@ pub(in crate::passes) fn lower_scalar_i64_arithmetic_to_u32_halves(ctx: &mut Ctx
 
     for function_idx in 0..ctx.module.functions.len() {
         for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
-            let insts = std::mem::take(
-                &mut ctx.module.functions[function_idx].blocks[block_idx].instructions,
-            );
+            let insts = ctx.module.functions[function_idx].blocks[block_idx]
+                .instructions
+                .clone();
             let mut out = Vec::with_capacity(insts.len());
             for inst in insts {
                 if !matches!(inst.class.opcode, Op::IAdd | Op::ISub | Op::IMul)
@@ -844,14 +738,13 @@ pub(in crate::passes) fn rewrite_scalar_pointer_arithmetic_access_chains(
     }
 }
 
-/// Replace a nullable pointer select used as an access-chain base with its concrete arm.
+/// Replace a nullable pointer select/phi used as a memory base with its concrete arm.
 ///
 /// Dereferencing the null arm is undefined in LLVM, so every defined execution that reaches the
-/// access chain necessarily selected the concrete arm. Removing the select at that use exposes the
-/// original aggregate-rooted chain to the ordinary composition and reinterpret passes. This is
-/// especially important after helper inlining, where a nullable buffer argument can otherwise hide
-/// the aggregate root behind `OpSelect` and strand an invalid scalar-pointee chain.
-pub(in crate::passes) fn expose_nullable_access_chain_bases(ctx: &mut Ctx, entry_idx: usize) {
+/// memory operation necessarily selected the concrete arm. Removing the merge at that use exposes
+/// the original pointer to ordinary memory lowering and lets the now-dead Logical pointer null and
+/// merge disappear during final liveness collection.
+pub(in crate::passes) fn expose_nullable_memory_bases(ctx: &mut Ctx, entry_idx: usize) {
     let null_ids: HashSet<Word> = ctx
         .new_globals
         .iter()
@@ -863,18 +756,35 @@ pub(in crate::passes) fn expose_nullable_access_chain_bases(ctx: &mut Ctx, entry
         .blocks
         .iter()
         .flat_map(|block| block.instructions.iter())
-        .filter(|inst| inst.class.opcode == Op::Select)
         .filter_map(|inst| {
             let result = inst.result_id?;
-            let [_, Operand::IdRef(on_true), Operand::IdRef(on_false)] = inst.operands.as_slice()
-            else {
-                return None;
+            let arms = match inst.class.opcode {
+                Op::Select => {
+                    let [_, Operand::IdRef(on_true), Operand::IdRef(on_false)] =
+                        inst.operands.as_slice()
+                    else {
+                        return None;
+                    };
+                    vec![*on_true, *on_false]
+                }
+                Op::Phi => inst
+                    .operands
+                    .chunks_exact(2)
+                    .filter_map(|pair| match pair.first() {
+                        Some(Operand::IdRef(value)) => Some(*value),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => return None,
             };
-            match (null_ids.contains(on_true), null_ids.contains(on_false)) {
-                (true, false) => Some((result, *on_false)),
-                (false, true) => Some((result, *on_true)),
-                _ => None,
+            if !arms.iter().any(|arm| null_ids.contains(arm)) {
+                return None;
             }
+            let mut concrete = arms
+                .into_iter()
+                .filter(|arm| !null_ids.contains(arm))
+                .collect::<HashSet<_>>();
+            (concrete.len() == 1).then(|| (result, concrete.drain().next().unwrap()))
         })
         .collect();
 
@@ -882,7 +792,31 @@ pub(in crate::passes) fn expose_nullable_access_chain_bases(ctx: &mut Ctx, entry
         for inst in &mut block.instructions {
             if !matches!(
                 inst.class.opcode,
-                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+                Op::AccessChain
+                    | Op::InBoundsAccessChain
+                    | Op::PtrAccessChain
+                    | Op::InBoundsPtrAccessChain
+                    | Op::Load
+                    | Op::Store
+                    | Op::AtomicLoad
+                    | Op::AtomicStore
+                    | Op::AtomicExchange
+                    | Op::AtomicCompareExchange
+                    | Op::AtomicCompareExchangeWeak
+                    | Op::AtomicIIncrement
+                    | Op::AtomicIDecrement
+                    | Op::AtomicIAdd
+                    | Op::AtomicISub
+                    | Op::AtomicSMin
+                    | Op::AtomicUMin
+                    | Op::AtomicSMax
+                    | Op::AtomicUMax
+                    | Op::AtomicAnd
+                    | Op::AtomicOr
+                    | Op::AtomicXor
+                    | Op::AtomicFAddEXT
+                    | Op::AtomicFMinEXT
+                    | Op::AtomicFMaxEXT
             ) {
                 continue;
             }
@@ -892,6 +826,37 @@ pub(in crate::passes) fn expose_nullable_access_chain_bases(ctx: &mut Ctx, entry
             if let Some(concrete) = concrete_arm.get(base) {
                 *base = *concrete;
             }
+        }
+    }
+
+    // Once all dereferences bypass a nullable merge, retire that merge if it has no remaining use.
+    // This is part of the representation change, not general dead-code elimination: leaving the
+    // unused OpPhi/OpSelect would keep its Logical pointer-null arm live at module scope.
+    loop {
+        let used = ctx.module.functions[entry_idx]
+            .blocks
+            .iter()
+            .flat_map(|block| block.instructions.iter())
+            .flat_map(|instruction| instruction.operands.iter())
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        for block in &mut ctx.module.functions[entry_idx].blocks {
+            block.instructions.retain(|instruction| {
+                let dead_nullable_merge = instruction.result_id.is_some_and(|result| {
+                    concrete_arm.contains_key(&result) && !used.contains(&result)
+                });
+                changed |= dead_nullable_merge;
+                !dead_nullable_merge
+            });
+        }
+        if !changed {
+            break;
         }
     }
 }
@@ -904,6 +869,87 @@ pub(in crate::passes) fn expose_nullable_access_chain_bases(ctx: &mut Ctx, entry
 /// rejects the chain. This walks every `OpPtrAccessChain` in the module and adds the missing
 /// `ArrayStride = round_up(sizeof pointee)` to each distinct base pointer type, idempotently.
 pub(in crate::passes) fn decorate_ptr_access_chain_base_strides(ctx: &mut Ctx) {
+    // OpPtrAccessChain's result pointer must stay in the base pointer's storage class. Interface
+    // substitution can expose an already-lowered PhysicalStorageBuffer base underneath a helper
+    // chain whose provisional logical type was UniformConstant; the base is the exact address-domain
+    // contract, so carry its storage through the chain before deriving layout decorations.
+    let query_defs = ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .filter_map(|instruction| Some((instruction.result_id?, instruction)))
+        .collect::<HashMap<_, _>>();
+    let value_types = ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+        .chain(ctx.module.functions.iter().flat_map(|function| {
+            function
+                .parameters
+                .iter()
+                .chain(function.blocks.iter().flat_map(|block| &block.instructions))
+        }))
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+        .collect::<HashMap<_, _>>();
+    let mut storage_plans = Vec::new();
+    for (function_index, function) in ctx.module.functions.iter().enumerate() {
+        for (block_index, block) in function.blocks.iter().enumerate() {
+            for (instruction_index, inst) in block.instructions.iter().enumerate() {
+                if inst.class.opcode != Op::PtrAccessChain {
+                    continue;
+                }
+                let (Some(result_type), Some(Operand::IdRef(base))) =
+                    (inst.result_type, inst.operands.first())
+                else {
+                    continue;
+                };
+                let Some(result_pointer) = query_defs.get(&result_type) else {
+                    continue;
+                };
+                let (Some(Operand::StorageClass(result_storage)), Some(Operand::IdRef(pointee))) = (
+                    result_pointer.operands.first(),
+                    result_pointer.operands.get(1),
+                ) else {
+                    continue;
+                };
+                let Some((base_storage, base_pointee)) = value_types
+                    .get(base)
+                    .and_then(|ty| query_defs.get(ty))
+                    .and_then(|ty| match (ty.operands.first(), ty.operands.get(1)) {
+                        (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) => {
+                            Some((*storage, *pointee))
+                        }
+                        _ => None,
+                    })
+                else {
+                    continue;
+                };
+                // With only Base + Element operands, PtrAccessChain performs pointer arithmetic
+                // over the base pointee and cannot change that pointee type. Additional operands
+                // descend into it and retain the already selected result pointee.
+                let selected_pointee = if inst.operands.len() == 2 {
+                    base_pointee
+                } else {
+                    *pointee
+                };
+                if base_storage != *result_storage || selected_pointee != *pointee {
+                    storage_plans.push((
+                        function_index,
+                        block_index,
+                        instruction_index,
+                        base_storage,
+                        selected_pointee,
+                    ));
+                }
+            }
+        }
+    }
+    for (function_index, block_index, instruction_index, storage, pointee) in storage_plans {
+        let pointer_type = ctx.ty_ptr(storage, pointee);
+        ctx.module.functions[function_index].blocks[block_index].instructions[instruction_index]
+            .result_type = Some(pointer_type);
+    }
+
     let mut defs: HashMap<Word, Instruction> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -946,7 +992,7 @@ pub(in crate::passes) fn decorate_ptr_access_chain_base_strides(ctx: &mut Ctx) {
                     }
                 }
                 if let Some(Operand::IdRef(base)) = inst.operands.first() {
-                    if let Some(t) = value_result_type(ctx, *base) {
+                    if let Some(t) = value_types.get(base).copied() {
                         if !base_ptr_types.contains(&t) {
                             base_ptr_types.push(t);
                         }
@@ -1106,9 +1152,11 @@ pub(in crate::passes) fn walk_into_type_partial(
 /// stops BEFORE consuming every index) are touched, and only when (1) every leftover index is an
 /// `OpConstant 0`, (2) at least one index survives (a 0-index chain is not emitted), and (3) the result
 /// pointee type EQUALS the scalar the surviving prefix reaches (so the truncated chain is valid and the
-/// pointee is unchanged) — a banked/valid module (every chain fully walks) never matches. Decides purely
-/// from IR structure (type walk + constant check), never a shader name.
+/// pointee is unchanged). If no index survives, the result pointer must have the exact base-pointer
+/// type and the identity chain is removed. A banked/valid module (every chain fully walks) never
+/// matches. Decides purely from IR structure (type walk + constant check), never a shader name.
 pub(in crate::passes) fn drop_overindexed_zero_tail(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -1125,6 +1173,18 @@ pub(in crate::passes) fn drop_overindexed_zero_tail(ctx: &mut Ctx, entry_idx: us
     }
 
     let mut edits: Vec<(usize, usize, usize)> = Vec::new();
+    let mut reinterpret_edits: Vec<(usize, usize, usize, Word, StorageClass, Word)> = Vec::new();
+    let mut identities: Vec<(Word, Word)> = Vec::new();
+    let mut uses = HashMap::<Word, Vec<(usize, usize)>>::new();
+    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (ii, instruction) in block.instructions.iter().enumerate() {
+            for operand in &instruction.operands {
+                if let Operand::IdRef(id) = operand {
+                    uses.entry(*id).or_default().push((bi, ii));
+                }
+            }
+        }
+    }
     for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
         for (ii, inst) in block.instructions.iter().enumerate() {
             if !matches!(inst.class.opcode, Op::InBoundsAccessChain | Op::AccessChain) {
@@ -1133,7 +1193,7 @@ pub(in crate::passes) fn drop_overindexed_zero_tail(ctx: &mut Ctx, entry_idx: us
             let Some(result_type) = inst.result_type else {
                 continue;
             };
-            let Some(&(_, result_pointee)) = ptr_info.get(&result_type) else {
+            let Some(&(storage, result_pointee)) = ptr_info.get(&result_type) else {
                 continue;
             };
             let Some(Operand::IdRef(base)) = inst.operands.first() else {
@@ -1143,15 +1203,15 @@ pub(in crate::passes) fn drop_overindexed_zero_tail(ctx: &mut Ctx, entry_idx: us
             if indices.is_empty() {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
                 continue;
             };
             let (reached, consumed) = walk_into_type_partial(ctx, base_pointee, &indices);
-            // Only currently-INVALID chains (a valid one walks every index); keep >= 1 index.
-            if consumed >= indices.len() || consumed == 0 {
+            // Only currently-invalid chains (a valid one walks every index).
+            if consumed >= indices.len() {
                 continue;
             }
             // Every leftover index must be a constant 0 (a member-0 / zero-stride descent).
@@ -1165,16 +1225,339 @@ pub(in crate::passes) fn drop_overindexed_zero_tail(ctx: &mut Ctx, entry_idx: us
             // The surviving prefix must reach exactly the declared result pointee, AND that pointee must
             // be a direct scalar — so the dropped indices were descending INTO a scalar (provably a
             // byte no-op), not shifting a struct member offset.
-            if reached != result_pointee || direct_scalar_width(ctx, reached).is_none() {
+            let reached_width = direct_scalar_width(ctx, reached);
+            let result_width = direct_scalar_width(ctx, result_pointee);
+            if reached != result_pointee
+                && reached_width == result_width
+                && reached_width.is_some()
+                && inst.result_id.is_some_and(|result| {
+                    uses.get(&result).is_some_and(|sites| {
+                        !sites.is_empty()
+                            && sites.iter().all(|&(use_block, use_instruction)| {
+                                let user = &ctx.module.functions[entry_idx].blocks[use_block]
+                                    .instructions[use_instruction];
+                                user.class.opcode == Op::Load
+                                    && user.operands.first() == Some(&Operand::IdRef(result))
+                                    && user.result_type == Some(result_pointee)
+                            })
+                    })
+                })
+            {
+                reinterpret_edits.push((
+                    bi,
+                    ii,
+                    consumed,
+                    inst.result_id.expect("checked above"),
+                    storage,
+                    reached,
+                ));
                 continue;
             }
-            edits.push((bi, ii, consumed));
+            if reached != result_pointee || reached_width.is_none() {
+                continue;
+            }
+            if consumed == 0 {
+                // A scalar base followed only by zero indices is the base pointer itself. SPIR-V
+                // cannot spell the LLVM scalar GEP as an access chain, so remove the identity and
+                // forward its uses to the same-typed base.
+                if value_types.get(base).copied() == Some(result_type) {
+                    if let Some(result) = inst.result_id {
+                        identities.push((result, *base));
+                    }
+                }
+            } else {
+                edits.push((bi, ii, consumed));
+            }
         }
     }
     for (bi, ii, consumed) in edits {
         ctx.module.functions[entry_idx].blocks[bi].instructions[ii]
             .operands
             .truncate(1 + consumed);
+    }
+    let reinterpret_loads = reinterpret_edits
+        .iter()
+        .map(|&(_, _, _, pointer, _, reached)| (pointer, reached))
+        .collect::<HashMap<_, _>>();
+    for &(bi, ii, consumed, _, storage, reached) in &reinterpret_edits {
+        let pointer_type = ctx.ty_ptr(storage, reached);
+        let instruction = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
+        instruction.result_type = Some(pointer_type);
+        instruction.operands.truncate(consumed + 1);
+    }
+    let mut load_edits = Vec::new();
+    for (block_index, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (instruction_index, current) in block.instructions.iter().enumerate() {
+            if current.class.opcode != Op::Load {
+                continue;
+            }
+            let Some(Operand::IdRef(pointer)) = current.operands.first() else {
+                continue;
+            };
+            let (Some(&reached), Some(original_type), Some(original_result)) = (
+                reinterpret_loads.get(pointer),
+                current.result_type,
+                current.result_id,
+            ) else {
+                continue;
+            };
+            load_edits.push((
+                block_index,
+                instruction_index,
+                reached,
+                original_type,
+                original_result,
+            ));
+        }
+    }
+    load_edits.reverse();
+    for (block_index, instruction_index, reached, original_type, original_result) in load_edits {
+        let loaded = ctx.module.fresh_id();
+        let block = &mut ctx.module.functions[entry_idx].blocks[block_index];
+        let mut native_load = block.instructions[instruction_index].clone();
+        native_load.result_type = Some(reached);
+        native_load.result_id = Some(loaded);
+        block.instructions[instruction_index] = native_load;
+        block.instructions.insert(
+            instruction_index + 1,
+            Instruction::new(
+                Op::Bitcast,
+                Some(original_type),
+                Some(original_result),
+                vec![Operand::IdRef(loaded)],
+            ),
+        );
+    }
+    if !identities.is_empty() {
+        let replacements = identities.iter().copied().collect::<HashMap<_, _>>();
+        ctx.emit_sidecar.remap_ids(&replacements);
+        let dead = replacements.keys().copied().collect::<HashSet<_>>();
+        let function = &mut ctx.module.functions[entry_idx];
+        for (from, to) in identities {
+            replace_id_in_function(function, from, to);
+        }
+        for block in &mut function.blocks {
+            block
+                .instructions
+                .retain(|instruction| instruction.result_id.is_none_or(|id| !dead.contains(&id)));
+        }
+    }
+}
+
+/// Collapse a widened Private scalar load when every observable consumer extracts only byte lane
+/// zero. Pointer-selection lowering can temporarily normalize a one-byte private arm to the word
+/// carried by a raw-buffer arm, yielding an unrepresentable `i32*` access chain over an `i8`
+/// variable. If the word is immediately bitcast to a byte vector and only lane zero is observed,
+/// load the declared byte directly and forward those extracts. No adjacent private storage is read.
+pub(in crate::passes) fn lower_private_low_byte_word_load(ctx: &mut Ctx, function_idx: usize) {
+    let value_types = function_value_types(ctx, function_idx);
+    let mut ptr_info = HashMap::<Word, (StorageClass, Word)>::new();
+    for instruction in ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+    {
+        if instruction.class.opcode == Op::TypePointer {
+            if let (Some(id), Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) = (
+                instruction.result_id,
+                instruction.operands.first(),
+                instruction.operands.get(1),
+            ) {
+                ptr_info.insert(id, (*storage, *pointee));
+            }
+        }
+    }
+    let function = &ctx.module.functions[function_idx];
+    let mut definitions = HashMap::<Word, (usize, usize)>::new();
+    let mut users = HashMap::<Word, Vec<(usize, usize)>>::new();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            if let Some(id) = instruction.result_id {
+                definitions.insert(id, (block_index, instruction_index));
+            }
+            for operand in &instruction.operands {
+                if let Operand::IdRef(id) = operand {
+                    users
+                        .entry(*id)
+                        .or_default()
+                        .push((block_index, instruction_index));
+                }
+            }
+        }
+    }
+
+    struct Edit {
+        block: usize,
+        instruction: usize,
+        base: Word,
+        scalar_type: Word,
+        replacement: Word,
+        extracts: Vec<Word>,
+        dead: HashSet<Word>,
+    }
+    let mut edits = Vec::new();
+    for (block_index, block) in function.blocks.iter().enumerate() {
+        for (instruction_index, chain) in block.instructions.iter().enumerate() {
+            if !matches!(
+                chain.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain
+            ) {
+                continue;
+            }
+            let (Some(chain_id), Some(chain_type), Some(Operand::IdRef(base))) =
+                (chain.result_id, chain.result_type, chain.operands.first())
+            else {
+                continue;
+            };
+            if !chain.operands[1..].iter().all(
+                |operand| matches!(operand, Operand::IdRef(id) if const_u32(ctx, *id) == Some(0)),
+            ) {
+                continue;
+            }
+            let Some(base_type) = value_types.get(base).copied() else {
+                continue;
+            };
+            let (
+                Some((StorageClass::Private, scalar_type)),
+                Some((StorageClass::Private, wide_type)),
+            ) = (
+                ptr_info.get(&base_type).copied(),
+                ptr_info.get(&chain_type).copied(),
+            )
+            else {
+                continue;
+            };
+            let (Some(scalar_bits), Some(wide_bits)) = (
+                direct_scalar_width(ctx, scalar_type),
+                direct_scalar_width(ctx, wide_type),
+            ) else {
+                continue;
+            };
+            if scalar_bits != 8 || wide_bits <= scalar_bits {
+                continue;
+            }
+            let Some(chain_users) = users.get(&chain_id) else {
+                continue;
+            };
+            if chain_users.is_empty() {
+                continue;
+            }
+            let mut extracts = Vec::new();
+            let mut dead = HashSet::from([chain_id]);
+            let mut valid = true;
+            for &(load_block, load_index) in chain_users {
+                let load = &function.blocks[load_block].instructions[load_index];
+                let Some(load_id) = load.result_id else {
+                    valid = false;
+                    break;
+                };
+                if load.class.opcode != Op::Load || load.result_type != Some(wide_type) {
+                    valid = false;
+                    break;
+                }
+                dead.insert(load_id);
+                let Some(load_users) = users.get(&load_id) else {
+                    valid = false;
+                    break;
+                };
+                for &(cast_block, cast_index) in load_users {
+                    let cast = &function.blocks[cast_block].instructions[cast_index];
+                    let Some(cast_id) = cast.result_id else {
+                        valid = false;
+                        break;
+                    };
+                    let vector_matches = cast.result_type.and_then(|ty| {
+                        let definition = type_def_of(ctx, ty)?;
+                        match definition.operands.as_slice() {
+                            [Operand::IdRef(element), Operand::LiteralBit32(lanes)]
+                                if definition.class.opcode == Op::TypeVector =>
+                            {
+                                Some((*element, *lanes))
+                            }
+                            _ => None,
+                        }
+                    }) == Some((scalar_type, wide_bits / scalar_bits));
+                    if cast.class.opcode != Op::Bitcast || !vector_matches {
+                        valid = false;
+                        break;
+                    }
+                    dead.insert(cast_id);
+                    let Some(cast_users) = users.get(&cast_id) else {
+                        valid = false;
+                        break;
+                    };
+                    for &(extract_block, extract_index) in cast_users {
+                        let extract = &function.blocks[extract_block].instructions[extract_index];
+                        if extract.class.opcode != Op::CompositeExtract
+                            || extract.result_type != Some(scalar_type)
+                            || extract.operands.get(1) != Some(&Operand::LiteralBit32(0))
+                        {
+                            valid = false;
+                            break;
+                        }
+                        let Some(extract_id) = extract.result_id else {
+                            valid = false;
+                            break;
+                        };
+                        extracts.push(extract_id);
+                        dead.insert(extract_id);
+                    }
+                }
+            }
+            if valid && !extracts.is_empty() {
+                edits.push(Edit {
+                    block: block_index,
+                    instruction: instruction_index,
+                    base: *base,
+                    scalar_type,
+                    replacement: 0,
+                    extracts,
+                    dead,
+                });
+            }
+        }
+    }
+    for edit in &mut edits {
+        edit.replacement = ctx.module.fresh_id();
+    }
+    for edit in &edits {
+        ctx.module.functions[function_idx].blocks[edit.block]
+            .instructions
+            .insert(
+                edit.instruction,
+                Instruction::new(
+                    Op::Load,
+                    Some(edit.scalar_type),
+                    Some(edit.replacement),
+                    vec![Operand::IdRef(edit.base)],
+                ),
+            );
+    }
+    let replacements = edits
+        .iter()
+        .flat_map(|edit| {
+            edit.extracts
+                .iter()
+                .map(move |extract| (*extract, edit.replacement))
+        })
+        .collect::<HashMap<_, _>>();
+    if replacements.is_empty() {
+        return;
+    }
+    ctx.emit_sidecar.remap_ids(&replacements);
+    let dead = edits
+        .into_iter()
+        .flat_map(|edit| edit.dead)
+        .collect::<HashSet<_>>();
+    let function = &mut ctx.module.functions[function_idx];
+    for (from, to) in replacements {
+        replace_id_in_function(function, from, to);
+    }
+    for block in &mut function.blocks {
+        block
+            .instructions
+            .retain(|instruction| instruction.result_id.is_none_or(|id| !dead.contains(&id)));
     }
 }
 
@@ -1202,6 +1585,7 @@ pub(in crate::passes) fn drop_overindexed_zero_tail(ctx: &mut Ctx, entry_idx: us
 /// non-element-0 chain, or an unknown provenance leaf leaves the chain untouched. Decides purely from
 /// IR structure (provenance trace + type compare), never a shader name.
 pub(in crate::passes) fn reroot_demoted_array_element_overindex(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -1239,7 +1623,7 @@ pub(in crate::passes) fn reroot_demoted_array_element_overindex(ctx: &mut Ctx, e
             };
             // CURRENTLY INVALID: base points at a direct SCALAR equal to the result pointee (a pure
             // re-root, not a reinterpret) — indexing a scalar over-runs.
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(base_sc, base_pointee)) = ptr_info.get(&base_ptr_ty) else {

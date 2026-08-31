@@ -20,8 +20,61 @@
 use super::lex::split_top_level;
 use std::collections::{HashMap, HashSet};
 
+/// Inline only internal helper callsites that carry an exact linked function symbol as an
+/// argument. Substituting the helper parameter turns its indirect `%function(...)` call into an
+/// ordinary direct `@function(...)` call before Logical-SPIR-V construction, without attempting to
+/// represent a first-class function pointer.
+pub(super) fn inline_direct_function_pointer_consumers(
+    san_ll: &str,
+    direct_functions: &HashSet<String>,
+) -> String {
+    let mut source = san_ll.to_string();
+    loop {
+        let Some(items) = parse_items(&source) else {
+            return source;
+        };
+        let internal = items
+            .iter()
+            .filter_map(|item| {
+                let Item::Func(function) = item else {
+                    return None;
+                };
+                let signature = parse_def_header(&function.header)?;
+                signature.internal.then_some(signature.name)
+            })
+            .collect::<HashSet<_>>();
+        let selected = items.iter().find_map(|item| {
+            let Item::Func(function) = item else {
+                return None;
+            };
+            function.body.iter().find_map(|line| {
+                let call = parse_call(line)?;
+                if !internal.contains(&call.callee) {
+                    return None;
+                }
+                call.args
+                    .iter()
+                    .find(|argument| direct_functions.contains(*argument))
+                    .map(|argument| (call.callee.clone(), argument.clone()))
+            })
+        });
+        let Some((consumer, function)) = selected else {
+            return source;
+        };
+        let targets = HashSet::from([consumer]);
+        let Some(inlined) = try_inline(&source, Some((&targets, &function, None))) else {
+            return source;
+        };
+        if inlined == source {
+            return source;
+        }
+        source = inlined;
+    }
+}
+
 /// Inline every eligible direct call to a module-local `internal` helper, transitively, to a
 /// fixpoint. Returns the module text unchanged when nothing is eligible or any difficulty is hit.
+#[cfg(test)]
 pub(super) fn inline_nonrecursive_internal_calls(san_ll: &str) -> String {
     match try_inline(san_ll, None) {
         Some(out) => out,
@@ -29,19 +82,37 @@ pub(super) fn inline_nonrecursive_internal_calls(san_ll: &str) -> String {
     }
 }
 
-/// Inline only internal helpers that directly consume the result of a pointer `select`. This is the
-/// bounded repair for a deferred cross-storage pointer reaching a call boundary: it removes exactly
-/// that opaque consumer so ordinary selected-pointer load/store replay can operate inside the cloned
-/// helper body, without expanding the rest of a large module's internal call graph.
-pub(super) fn inline_pointer_select_consumer(
+pub(super) struct PointerConsumerInlining {
+    pub(super) source: String,
+    pub(super) requires_relooper: bool,
+}
+
+/// Inline internal helpers that directly consume pointer-select results before emission. A
+/// deferred select has no standalone Logical-SPIR-V pointer value when its arms name distinct
+/// buffers; moving its consumer into the caller lets loads/stores replay the select in value space.
+/// The returned construction fact selects the bounded whole-CFG path whenever inlining changed the
+/// source, before either emitter attempts to construct a module.
+pub(super) fn inline_pointer_select_consumers(
     san_ll: &str,
     entry_name: Option<&str>,
-    selected_pointer: &str,
-) -> String {
+) -> PointerConsumerInlining {
     let Some(items) = parse_items(san_ll) else {
-        return san_ll.to_string();
+        return PointerConsumerInlining {
+            source: san_ll.to_string(),
+            requires_relooper: false,
+        };
     };
-    let mut targets = HashSet::new();
+    let eligible_callees = items
+        .iter()
+        .filter_map(|item| {
+            let Item::Func(function) = item else {
+                return None;
+            };
+            let signature = parse_def_header(&function.header)?;
+            signature.internal.then_some(signature.name)
+        })
+        .collect::<HashSet<_>>();
+    let mut selected_consumers = Vec::new();
     for item in &items {
         let Item::Func(function) = item else {
             continue;
@@ -54,22 +125,49 @@ pub(super) fn inline_pointer_select_consumer(
                 continue;
             }
         }
-        for call in function.body.iter().filter_map(|line| parse_call(line)) {
-            if call
-                .args
-                .iter()
-                .any(|argument| argument == selected_pointer)
-            {
-                targets.insert(call.callee);
+        let pointer_selects = function
+            .body
+            .iter()
+            .filter_map(|line| {
+                let (true_value, false_value) =
+                    crate::native::tir::resolve_select_arms(line, "select")?;
+                (matches!(true_value.ty, crate::native::ir::LlType::Ptr(_))
+                    && matches!(false_value.ty, crate::native::ir::LlType::Ptr(_)))
+                .then(|| crate::native::tir::result_name(line))
+                .flatten()
+            })
+            .collect::<HashSet<_>>();
+        for call in function
+            .body
+            .iter()
+            .filter_map(|line| parse_call(line))
+            .filter(|call| eligible_callees.contains(&call.callee))
+        {
+            for argument in call.args {
+                if pointer_selects.contains(&argument)
+                    && !selected_consumers.contains(&(argument.clone(), call.callee.clone()))
+                {
+                    selected_consumers.push((argument, call.callee.clone()));
+                }
             }
         }
     }
-    if targets.is_empty() {
-        return san_ll.to_string();
+    let mut source = san_ll.to_string();
+    let mut changed = false;
+    for (selected, consumer) in selected_consumers {
+        let targets = HashSet::from([consumer]);
+        if let Some(inlined) = try_inline(&source, Some((&targets, selected.as_str(), entry_name)))
+        {
+            changed |= inlined != source;
+            source = inlined;
+        }
     }
-    match try_inline(san_ll, Some((&targets, selected_pointer))) {
-        Some(out) => out,
-        None => san_ll.to_string(),
+    PointerConsumerInlining {
+        source,
+        // Inlining may splice a multi-block helper or enlarge an already complex entry. Select the
+        // bounded whole-CFG constructor from that source fact instead of attempting ordinary
+        // emission and waiting for an opaque pointer materialization error.
+        requires_relooper: changed,
     }
 }
 
@@ -106,13 +204,18 @@ struct DefSig {
 fn parse_items(san_ll: &str) -> Option<Vec<Item>> {
     let lines: Vec<&str> = san_ll.lines().collect();
     let mut items: Vec<Item> = Vec::new();
-    let mut raw: Vec<String> = Vec::new();
+    let mut raw_start = 0;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
         if line.starts_with("define") && line.trim_end().ends_with('{') {
-            if !raw.is_empty() {
-                items.push(Item::Raw(std::mem::take(&mut raw)));
+            if raw_start != i {
+                items.push(Item::Raw(
+                    lines[raw_start..i]
+                        .iter()
+                        .map(|line| (*line).to_string())
+                        .collect(),
+                ));
             }
             let start = i + 1;
             let mut j = start;
@@ -127,13 +230,18 @@ fn parse_items(san_ll: &str) -> Option<Vec<Item>> {
                 body: lines[start..j].iter().map(|s| s.to_string()).collect(),
             }));
             i = j + 1;
+            raw_start = i;
         } else {
-            raw.push(line.to_string());
             i += 1;
         }
     }
-    if !raw.is_empty() {
-        items.push(Item::Raw(raw));
+    if raw_start != lines.len() {
+        items.push(Item::Raw(
+            lines[raw_start..]
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect(),
+        ));
     }
     Some(items)
 }
@@ -652,7 +760,10 @@ fn preceded_by_label_keyword(out: &str) -> bool {
 
 /// The whole pass, in the fallible `Option` domain so any bail returns `None` and the caller keeps
 /// the input verbatim.
-fn try_inline(san_ll: &str, targets: Option<(&HashSet<String>, &str)>) -> Option<String> {
+fn try_inline(
+    san_ll: &str,
+    targets: Option<(&HashSet<String>, &str, Option<&str>)>,
+) -> Option<String> {
     let items = parse_items(san_ll)?;
 
     // Collect the internal-function table: name -> (signature, body). Only `define internal`.
@@ -663,7 +774,7 @@ fn try_inline(san_ll: &str, targets: Option<(&HashSet<String>, &str)>) -> Option
             has_any_func = true;
             let sig = parse_def_header(&f.header)?;
             if sig.internal
-                && targets.is_none_or(|(targets, _selected)| targets.contains(&sig.name))
+                && targets.is_none_or(|(targets, _selected, _entry)| targets.contains(&sig.name))
             {
                 // Every param must name a value for us to substitute; reject varargs/unnamed.
                 if sig.params.iter().any(|p| p.is_empty()) {
@@ -708,18 +819,25 @@ fn try_inline(san_ll: &str, targets: Option<(&HashSet<String>, &str)>) -> Option
 
     // Rewrite each function body to a fixpoint. A shared counter gives every inlined site a unique
     // `.inl<K>` prefix across the whole module.
-    let mut counter: usize = 0;
+    let mut counter = next_inline_ordinal(san_ll);
     let mut out_items: Vec<Item> = Vec::with_capacity(items.len());
     for it in items {
         match it {
             Item::Raw(r) => out_items.push(Item::Raw(r)),
             Item::Func(f) => {
-                let new_body = inline_body_to_fixpoint(
-                    f.body,
-                    &internal,
-                    &mut counter,
-                    targets.map(|(_, selected)| selected),
-                )?;
+                let selected_pointer = targets.and_then(|(_, selected, entry_name)| {
+                    let signature = parse_def_header(&f.header)?;
+                    entry_name
+                        .is_none_or(|entry_name| {
+                            signature.name.trim_start_matches('@') == entry_name
+                        })
+                        .then_some(selected)
+                });
+                let new_body = if targets.is_some() && selected_pointer.is_none() {
+                    f.body
+                } else {
+                    inline_body_to_fixpoint(f.body, &internal, &mut counter, selected_pointer)?
+                };
                 out_items.push(Item::Func(FuncBlock {
                     header: f.header,
                     body: new_body,
@@ -736,6 +854,33 @@ fn try_inline(san_ll: &str, targets: Option<(&HashSet<String>, &str)>) -> Option
     // another live internal function.
     let out_items = drop_dead_internal_functions(out_items);
     Some(render(&out_items, san_ll.ends_with('\n')))
+}
+
+/// Return an ordinal above every existing `.inl<N>.` namespace in the input. Pointer-consumer
+/// normalization may invoke the inliner more than once on the progressively rewritten module; a
+/// per-invocation zero counter would then duplicate SSA values and block labels from an earlier
+/// invocation.
+fn next_inline_ordinal(source: &str) -> usize {
+    let bytes = source.as_bytes();
+    let mut next = 0usize;
+    let mut cursor = 0usize;
+    while let Some(relative) = source[cursor..].find(".inl") {
+        let start = cursor + relative + 4;
+        let mut end = start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > start && bytes.get(end) == Some(&b'.') {
+            if let Ok(ordinal) = source[start..end].parse::<usize>() {
+                next = next.max(ordinal.saturating_add(1));
+            }
+        }
+        cursor = start;
+        if cursor >= source.len() {
+            break;
+        }
+    }
+    next
 }
 
 /// Mark-and-sweep the `define internal` functions: roots are the non-internal functions and every
@@ -918,7 +1063,7 @@ fn inline_body_to_fixpoint(
         let Some(idx) = find_inlinable_call(&body, internal, selected_pointer) else {
             return Some(body);
         };
-        body = inline_one(body, idx, internal, counter)?;
+        body = inline_one(body, idx, internal, counter, selected_pointer.is_some())?;
         budget -= 1;
         if budget == 0 {
             return None;
@@ -951,11 +1096,15 @@ fn inline_one(
     idx: usize,
     internal: &HashMap<String, (DefSig, Vec<String>)>,
     counter: &mut usize,
+    preserve_caller_cfg: bool,
 ) -> Option<Vec<String>> {
     let call = parse_call(&body[idx])?;
     let (sig, callee_body) = internal.get(&call.callee)?;
     if sig.params.len() != call.args.len() {
         return None; // arity mismatch (varargs etc.) — refuse
+    }
+    if preserve_caller_cfg && is_single_block_leaf(callee_body) {
+        return inline_single_block_leaf(body, idx, &call, sig, callee_body, counter);
     }
 
     let k = *counter;
@@ -1009,8 +1158,19 @@ fn inline_one(
     let mut returns: Vec<(String, String)> = Vec::new();
     // The current source block label as we walk callee lines. The entry block is `entry_label`.
     let mut cur_block = entry_label.clone();
-    // Emit the entry label line first so the entry block is addressable.
-    renamed.push(format!("{entry_label}:"));
+    // An explicitly labeled source entry is renamed to `entry_label` by `label_map`. Only synthesize
+    // the label for an implicit entry; emitting both would create an empty block followed by a
+    // duplicate label, which is not a valid CFG.
+    let has_explicit_entry = callee_body
+        .iter()
+        .find(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with(';')
+        })
+        .is_some_and(|line| block_label_id(line).is_some());
+    if !has_explicit_entry {
+        renamed.push(format!("{entry_label}:"));
+    }
     for line in callee_body {
         // Track block boundaries: a block-start label line updates cur_block.
         if let Some(bare) = block_label_id(line) {
@@ -1121,6 +1281,78 @@ fn inline_one(
     new_body.extend(after_relabeled);
 
     Some(new_body)
+}
+
+/// Inline a one-block helper without splitting the caller block. This is the selected-pointer
+/// consumer path: preserving the caller CFG is part of its construction contract.
+fn inline_single_block_leaf(
+    body: Vec<String>,
+    idx: usize,
+    call: &CallSite,
+    sig: &DefSig,
+    callee_body: &[String],
+    counter: &mut usize,
+) -> Option<Vec<String>> {
+    let prefix = format!(".inl{}", *counter);
+    *counter += 1;
+    let (local_values, _) = collect_callee_locals(callee_body)?;
+    let mut value_map = HashMap::new();
+    for (parameter, argument) in sig.params.iter().zip(&call.args) {
+        value_map.insert(parameter.clone(), argument.clone());
+    }
+    for value in local_values {
+        value_map.insert(value.clone(), format!("%{prefix}.{}", &value[1..]));
+    }
+    for (parameter, argument) in sig.params.iter().zip(&call.args) {
+        value_map.insert(parameter.clone(), argument.clone());
+    }
+
+    let mut replacement = Vec::new();
+    let mut returned = None;
+    for line in callee_body {
+        if block_label_id(line).is_some() {
+            continue;
+        }
+        if let Some(ret) = parse_ret(line) {
+            returned = Some(match ret {
+                RetKind::Value(_, value) => substitute_value_token(&value, &value_map),
+                RetKind::Void => String::new(),
+            });
+            continue;
+        }
+        replacement.push(rename_line(line, &value_map, &HashMap::new()));
+    }
+    let returned = returned?;
+    let mut after = body[idx + 1..].to_vec();
+    if let Some(result) = &call.result {
+        if returned.is_empty() {
+            return None;
+        }
+        let result_map = HashMap::from([(result.clone(), returned)]);
+        for line in &mut after {
+            *line = rename_line(line, &result_map, &HashMap::new());
+        }
+    }
+    let mut new_body = Vec::with_capacity(body.len() + replacement.len());
+    new_body.extend_from_slice(&body[..idx]);
+    new_body.extend(replacement);
+    new_body.extend(after);
+    Some(new_body)
+}
+
+fn is_single_block_leaf(body: &[String]) -> bool {
+    body.iter()
+        .filter(|line| block_label_id(line).is_some())
+        .count()
+        <= 1
+        && body.iter().filter(|line| parse_ret(line).is_some()).count() == 1
+        && !body.iter().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("br ")
+                || line.starts_with("switch ")
+                || line.starts_with("indirectbr ")
+                || line.starts_with("unreachable")
+        })
 }
 
 /// The `%name` value or literal token substituted through `value_map` (for `ret` operands, which are
@@ -1323,6 +1555,13 @@ fn is_phi_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_inlining_starts_after_existing_namespace() {
+        let source = "%x.inl2.value = add i32 1, 2\n.inl17.block:\n  ret void\n";
+        assert_eq!(next_inline_ordinal(source), 18);
+        assert_eq!(next_inline_ordinal("define void @f() { ret void }\n"), 0);
+    }
 
     // 7. Token-rename edge case: renaming %1 must not touch %10 or %11.
     #[test]
@@ -1734,7 +1973,7 @@ merge:
     }
 
     #[test]
-    fn pointer_select_consumer_inline_is_bounded_to_the_consuming_helper() {
+    fn pointer_select_consumer_inline_is_structurally_planned() {
         let src = r#"
 @fallback = internal addrspace(2) global i32 0
 @fc_default = internal addrspace(2) global i8 0
@@ -1761,15 +2000,26 @@ entry:
   ret i32 %sum
 }
 
+define internal i32 @consume_leaf(ptr addrspace(2) %pointer) {
+entry:
+  %value = load i32, ptr addrspace(2) %pointer
+  ret i32 %value
+}
+
 define i32 @main(ptr addrspace(2) %runtime, i1 %choose) {
 entry:
-  %selected = select i1 %choose, ptr addrspace(2) %runtime, ptr addrspace(2) @fallback
+  %first = select i1 %choose, ptr addrspace(2) %runtime, ptr addrspace(2) @fallback
+  %selected = select i1 %choose, ptr addrspace(2) @fallback, ptr addrspace(2) %first
+  %leaf = call i32 @consume_leaf(ptr addrspace(2) %selected)
   %consumed = call i32 @consume(ptr addrspace(2) %selected, i1 %choose)
-  %other = call i32 @unrelated(i32 %consumed)
+  %sum = add i32 %leaf, %consumed
+  %other = call i32 @unrelated(i32 %sum)
   ret i32 %other
 }
 "#;
-        let out = inline_pointer_select_consumer(src, Some("main"), "%selected");
+        let plan = inline_pointer_select_consumers(src, Some("main"));
+        let out = &plan.source;
+        assert!(plan.requires_relooper);
         assert!(!out.contains("call i32 @consume"), "{out}");
         assert!(out.contains("call i32 @unrelated"), "{out}");
         assert!(out.contains("define internal i32 @unrelated"), "{out}");
@@ -1777,6 +2027,8 @@ entry:
             out.contains("define internal void @_GLOBAL__sub_I_defaults"),
             "implicit constructor root was swept:\n{out}"
         );
-        assert!(out.contains(".inl0.left:"), "{out}");
+        assert!(out.contains(".left:"), "{out}");
+
+        assert!(!out.contains("call i32 @consume_leaf"), "{out}");
     }
 }

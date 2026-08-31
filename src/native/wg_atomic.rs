@@ -13,12 +13,9 @@
 //! pointee TREE shape exactly (every array length and struct field order is kept; only the float LEAVES
 //! become int), so every access-chain index is unchanged — the data sits at the same byte offsets.
 //!
-//! Why post-PSB (not the `passes::lower` Ctx remodel): the device-cross-binding cases that carry this
-//! idiom (the `binFragmentsTemporalSplitKernel` BVH builders) fail the DEFAULT emit path on a device
-//! pointer select and route to the raw/PSB retry, which never runs the lowering pipeline where the Ctx
-//! remodel lives. The WG atomic bitcasts survive into the post-PSB module untouched. Running this
-//! remodel in place on that module is the only path that reaches them. Composed into `lib.rs`'s
-//! raw/PSB tiers, adopt-if-VALIDATES, so it is floor-safe by construction. It decides purely from IR
+//! The ordinary lowering pipeline runs this after interface and memory construction, when every
+//! Workgroup pointer use and its final pointee tree are available. Retry variants share that same
+//! construction boundary; no validator result is needed to select it. It decides purely from IR
 //! structure (a Workgroup variable whose pointee tree is reached only as float/int leaves used as the
 //! atomic-bitcast idiom) — never a shader name.
 
@@ -31,7 +28,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// Retype every Workgroup variable that is accessed ONLY as the float-as-int atomic idiom so its float
 /// leaves become the 32-bit int the atomics use, dropping the illegal pointer `OpBitcast`s. Returns true
 /// if any variable was remodeled.
-pub(super) fn rewrite_workgroup_atomic_floats(module: &mut Module) -> bool {
+pub(super) fn construct_workgroup_atomic_floats(module: &mut Module) -> bool {
     let float_ty = match scalar_type(module, Op::TypeFloat, 32) {
         Some(t) => t,
         None => return false,
@@ -485,7 +482,7 @@ fn rewrite_bodies(
     let int_ty = plan.int_ty;
     for func in module.functions.iter_mut() {
         for block in func.blocks.iter_mut() {
-            let insts = std::mem::take(&mut block.instructions);
+            let insts = block.instructions.clone();
             let mut out = Vec::with_capacity(insts.len());
             for mut inst in insts {
                 // Whole-variable zero-init store: repoint its value to the cloned int tree's null so it
@@ -792,6 +789,7 @@ mod tests {
                 Some(20),
                 vec![Operand::StorageClass(StorageClass::Workgroup)],
             ),
+            i(Op::Undef, Some(9), Some(14), vec![]),
         ];
         let mut block = Block::new();
         block.label = Some(i(Op::Label, None, Some(30), vec![]));
@@ -822,13 +820,45 @@ mod tests {
                     Operand::IdRef(13),
                 ],
             ),
+            // A structurizer may leave a dead pointer phi and its rooted chain after removing every
+            // observable consumer. Liveness closure at the module-construction boundary must remove
+            // this graph before the strict all-uses storage check runs.
+            i(
+                Op::InBoundsAccessChain,
+                Some(9),
+                Some(35),
+                vec![Operand::IdRef(20), Operand::IdRef(11), Operand::IdRef(11)],
+            ),
+            i(
+                Op::Phi,
+                Some(9),
+                Some(36),
+                vec![
+                    Operand::IdRef(14),
+                    Operand::IdRef(30),
+                    Operand::IdRef(35),
+                    Operand::IdRef(30),
+                ],
+            ),
             i(Op::Return, None, None, vec![]),
         ];
         let mut func = Function::new();
         func.blocks = vec![block];
         m.functions = vec![func];
 
-        assert!(rewrite_workgroup_atomic_floats(&mut m));
+        assert!(
+            !construct_workgroup_atomic_floats(&mut m),
+            "a dead pointer escape must not weaken the constructor's all-uses gate"
+        );
+        assert!(crate::native::eliminate_dead_pointer_values_module(
+            &mut m,
+            &HashSet::new()
+        ));
+        assert!(construct_workgroup_atomic_floats(&mut m));
+        assert!(
+            !construct_workgroup_atomic_floats(&mut m),
+            "construction must close the complete Workgroup float-as-int atomic graph"
+        );
 
         let body = &m.functions[0].blocks[0].instructions;
         // The pointer bitcast (%33) is gone.
@@ -906,6 +936,6 @@ mod tests {
         m.functions = vec![func];
 
         // No access chain, no atomic bitcast -> the variable is not in the idiom -> no remodel.
-        assert!(!rewrite_workgroup_atomic_floats(&mut m));
+        assert!(!construct_workgroup_atomic_floats(&mut m));
     }
 }

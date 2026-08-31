@@ -87,9 +87,6 @@ impl MetalObservation {
         let output = base64::engine::general_purpose::STANDARD
             .decode(&self.output_b64)
             .map_err(|error| format!("invalid Metal output_b64: {error}"))?;
-        if output.is_empty() {
-            return Err("Metal output_b64 must not be empty".into());
-        }
         let computed = sha256_bytes(&output);
         if computed != self.metal_output_sha256 {
             return Err(format!(
@@ -147,9 +144,6 @@ impl CandidateObservation {
         let output = base64::engine::general_purpose::STANDARD
             .decode(&self.output_b64)
             .map_err(|error| format!("invalid candidate output_b64: {error}"))?;
-        if output.is_empty() {
-            return Err("candidate output_b64 must not be empty".into());
-        }
         let computed = sha256_bytes(&output);
         if computed != self.candidate_output_sha256 {
             return Err(format!(
@@ -224,6 +218,7 @@ mod tests {
                 initial_bytes_b64: Some("AAAAAA==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -379,6 +374,48 @@ mod tests {
         assert!(row.validate_content().is_ok());
         row.output_b64 = "AgAAAA==".into();
         assert!(row
+            .validate_content()
+            .unwrap_err()
+            .contains("hash mismatch"));
+    }
+
+    #[test]
+    fn canonical_empty_observation_payload_is_hash_checked() {
+        let case = case();
+        let empty_sha256 = sha256_bytes(&[]);
+        let metal = MetalObservation {
+            case_id: case.case_id.clone(),
+            air_sha256: case.air_sha256.clone(),
+            input_sha256: case.computed_input_sha256().unwrap(),
+            metal_output_sha256: empty_sha256.clone(),
+            output_b64: String::new(),
+            environment_id: "metal-env".into(),
+            environment: serde_json::json!({}),
+            oracle_abi: "oracle-v1".into(),
+            status: MetalStatus::Qualified,
+        };
+        assert!(metal.validate_content().is_ok());
+
+        let input_sha256 = case.computed_input_sha256().unwrap();
+        let mut candidate = CandidateObservation {
+            case_id: case.case_id,
+            air_sha256: case.air_sha256,
+            input_sha256,
+            golden_output_sha256: empty_sha256.clone(),
+            spv_sha256: "33".repeat(32),
+            translator_fingerprint: "55".repeat(32),
+            candidate_output_sha256: empty_sha256,
+            output_b64: String::new(),
+            backend: Backend::Vulkan,
+            environment_id: "vk-env".into(),
+            environment: serde_json::json!({}),
+            executor_abi: "executor-v1".into(),
+            comparison: ComparisonResult::Exact,
+            status: CandidateStatus::Match,
+        };
+        assert!(candidate.validate_content().is_ok());
+        candidate.candidate_output_sha256 = "00".repeat(32);
+        assert!(candidate
             .validate_content()
             .unwrap_err()
             .contains("hash mismatch"));

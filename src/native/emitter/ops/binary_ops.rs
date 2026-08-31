@@ -159,6 +159,52 @@ impl Emitter {
                 "native emitter: {op:?} currently supports scalar/vector integer types, got {result_ty:?}"
             ));
         }
+        // Vulkan vectors have at most four components. AIR retains wider LLVM integer vectors,
+        // which `type_id` represents as arrays; scalarize their elementwise operation instead of
+        // applying an integer opcode to an aggregate result type.
+        if let LlType::Vector(element, lanes) = &result_ty {
+            if *lanes > 4 {
+                let element_ty = self.resolve_type(element)?;
+                let element_type = self.type_id(&element_ty)?;
+                let result_type = self.type_id(&result_ty)?;
+                let result = self.result_id(&name, &result_ty)?;
+                let lhs_id = self.value_id_in(&lhs.value, &lhs.ty, instructions)?;
+                let rhs_id = self.value_id_in(&rhs.value, &rhs.ty, instructions)?;
+                let mut values = Vec::with_capacity(*lanes as usize);
+                for lane in 0..*lanes {
+                    let left = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::CompositeExtract,
+                        Some(element_type),
+                        Some(left),
+                        vec![Operand::IdRef(lhs_id), Operand::LiteralBit32(lane)],
+                    ));
+                    let right = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::CompositeExtract,
+                        Some(element_type),
+                        Some(right),
+                        vec![Operand::IdRef(rhs_id), Operand::LiteralBit32(lane)],
+                    ));
+                    let value = self.fresh();
+                    instructions.push(Self::inst(
+                        op,
+                        Some(element_type),
+                        Some(value),
+                        vec![Operand::IdRef(left), Operand::IdRef(right)],
+                    ));
+                    values.push(Operand::IdRef(value));
+                }
+                instructions.push(Self::inst(
+                    Op::CompositeConstruct,
+                    Some(result_type),
+                    Some(result),
+                    values,
+                ));
+                self.record_int_alignment(&name, &result_ty, int_alignment);
+                return Ok(());
+            }
+        }
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
         let lhs_id = self.value_id_in(&lhs.value, &lhs.ty, instructions)?;

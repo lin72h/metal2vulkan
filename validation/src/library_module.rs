@@ -12,11 +12,13 @@ use crate::hash::sha256_bytes;
 use crate::jsonl::to_sorted_json_string;
 use crate::source::{shard_index_for_hash, shard_name};
 use base64::Engine as _;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,10 +38,22 @@ pub struct LibraryModuleMergeStats {
     pub duplicates: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LibraryModuleIndexSyncStats {
+    pub shards_scanned: usize,
+    pub bytes_scanned: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LibraryModuleShardStamp {
+    size: u64,
+    modified_ns: u64,
+}
+
 /// Fully checked function-table dependencies for one authored entry point.
 ///
-/// Case checking resolves these once by content hash and verifies that every implementation came
-/// from the entry point's parent library. Executors consume this object directly, so they cannot
+/// Case checking resolves these once by content hash and verifies that every implementation
+/// defines the exact authored symbol. Executors consume this object directly, so they cannot
 /// accidentally use a different module lookup or silently omit an authored table entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResolvedLinkedFunctions {
@@ -147,7 +161,6 @@ impl ResolvedLinkedFunctions {
 pub fn resolve_linked_functions(
     root: &Path,
     case: &AuthoredCase,
-    parent_library_sha256: &str,
 ) -> Result<ResolvedLinkedFunctions, Vec<String>> {
     let mut modules = HashMap::<String, Result<Option<LibraryModuleRow>, String>>::new();
     let mut defined_functions = HashMap::<String, Vec<String>>::new();
@@ -163,7 +176,6 @@ pub fn resolve_linked_functions(
         root,
         "visible-function",
         &case.visible_function_tables,
-        parent_library_sha256,
         &mut modules,
         &mut defined_functions,
         &mut errors,
@@ -221,7 +233,6 @@ pub fn resolve_linked_functions(
         root,
         "intersection-function",
         &linked_intersection,
-        parent_library_sha256,
         &mut modules,
         &mut defined_functions,
         &mut errors,
@@ -346,7 +357,6 @@ fn resolve_table_kind(
     root: &Path,
     kind: &str,
     tables: &[FunctionTableResource],
-    parent_library_sha256: &str,
     modules: &mut HashMap<String, Result<Option<LibraryModuleRow>, String>>,
     defined_functions: &mut HashMap<String, Vec<String>>,
     errors: &mut Vec<String>,
@@ -375,20 +385,6 @@ fn resolve_table_kind(
                             return None;
                         }
                     };
-                    if !module
-                        .lib_sha256s
-                        .iter()
-                        .any(|hash| hash == parent_library_sha256)
-                    {
-                        errors.push(format!(
-                            "{kind} table binding {} entry {} module {} was not harvested from entry library {}",
-                            table.binding,
-                            entry.index,
-                            entry.module_sha256,
-                            parent_library_sha256
-                        ));
-                        return None;
-                    }
                     let names = defined_functions
                         .entry(module.module_sha256.clone())
                         .or_insert_with(|| defined_function_names(&module.air_ll));
@@ -473,9 +469,21 @@ pub fn library_module_shard_path(root: &Path, shard: usize) -> PathBuf {
 }
 
 pub fn read_library_module_shard(path: &Path) -> Result<Vec<LibraryModuleRow>, String> {
+    let mut rows = Vec::new();
+    for_each_library_module_shard(path, |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+/// Stream fully validated dependency modules while retaining at most one decoded row at a time.
+pub fn for_each_library_module_shard(
+    path: &Path,
+    mut consume: impl FnMut(LibraryModuleRow) -> Result<(), String>,
+) -> Result<(), String> {
     let expected = crate::source::shard_index_from_path(path)?;
     let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let mut rows = Vec::new();
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
         let line =
             line.map_err(|error| format!("read {}:{}: {error}", path.display(), line_index + 1))?;
@@ -497,9 +505,9 @@ pub fn read_library_module_shard(path: &Path) -> Result<Vec<LibraryModuleRow>, S
                 expected
             ));
         }
-        rows.push(row);
+        consume(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Resolve one explicitly authored dependency by its content hash.
@@ -518,6 +526,323 @@ pub fn find_library_module(
     Ok(read_library_module_shard(&path)?
         .into_iter()
         .find(|row| row.module_sha256 == module_sha256))
+}
+
+/// Incrementally index retained dependency-module identities, library memberships, symbols, and
+/// exact JSONL byte locations.
+///
+/// A missing index is an explicit one-time migration. After it is warm, unchanged module shards
+/// are identified from their stamps and are not opened.
+pub fn sync_library_module_index(
+    root: &Path,
+    index: &Path,
+) -> Result<LibraryModuleIndexSyncStats, String> {
+    let mut connection = Connection::open(index)
+        .map_err(|error| format!("open index {}: {error}", index.display()))?;
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE IF NOT EXISTS library_modules (
+               module_sha256 TEXT PRIMARY KEY,
+               shard INTEGER NOT NULL,
+               source_offset INTEGER NOT NULL,
+               source_length INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS library_module_memberships (
+               module_sha256 TEXT NOT NULL REFERENCES library_modules(module_sha256) ON DELETE CASCADE,
+               lib_sha256 TEXT NOT NULL,
+               PRIMARY KEY(module_sha256, lib_sha256)
+             );
+             CREATE TABLE IF NOT EXISTS library_module_symbols (
+               module_sha256 TEXT NOT NULL REFERENCES library_modules(module_sha256) ON DELETE CASCADE,
+               symbol TEXT NOT NULL,
+               PRIMARY KEY(module_sha256, symbol)
+             );
+             CREATE TABLE IF NOT EXISTS indexed_library_module_shards (
+               shard INTEGER PRIMARY KEY,
+               size INTEGER NOT NULL,
+               modified_ns INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS library_memberships_by_library
+               ON library_module_memberships(lib_sha256, module_sha256);
+             CREATE INDEX IF NOT EXISTS library_symbols_by_symbol
+               ON library_module_symbols(symbol, module_sha256);",
+        )
+        .map_err(|error| format!("upgrade library-module index schema: {error}"))?;
+
+    let paths = library_module_shard_paths(root)?;
+    let current_shards = paths
+        .iter()
+        .map(|path| crate::source::shard_index_from_path(path))
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    let transaction = connection
+        .transaction()
+        .map_err(|error| format!("begin library-module index sync: {error}"))?;
+    let tracked_shards = {
+        let mut statement = transaction
+            .prepare("SELECT shard FROM indexed_library_module_shards")
+            .map_err(|error| format!("prepare tracked library-module shards: {error}"))?;
+        let shards = statement
+            .query_map([], |row| row.get::<_, usize>(0))
+            .map_err(|error| format!("query tracked library-module shards: {error}"))?
+            .collect::<Result<std::collections::HashSet<_>, _>>()
+            .map_err(|error| format!("read tracked library-module shards: {error}"))?;
+        shards
+    };
+    for shard in tracked_shards.difference(&current_shards) {
+        transaction
+            .execute("DELETE FROM library_modules WHERE shard=?1", [shard])
+            .map_err(|error| format!("remove library-module shard {shard}: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM indexed_library_module_shards WHERE shard=?1",
+                [shard],
+            )
+            .map_err(|error| format!("remove library-module shard stamp {shard}: {error}"))?;
+    }
+
+    let mut stats = LibraryModuleIndexSyncStats::default();
+    for path in paths {
+        let shard = crate::source::shard_index_from_path(&path)?;
+        let stamp = library_module_shard_stamp(&path)?;
+        let tracked = transaction
+            .query_row(
+                "SELECT size, modified_ns FROM indexed_library_module_shards WHERE shard=?1",
+                [shard],
+                |row| {
+                    Ok(LibraryModuleShardStamp {
+                        size: row.get(0)?,
+                        modified_ns: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("read library-module shard {shard} stamp: {error}"))?;
+        if tracked == Some(stamp) {
+            continue;
+        }
+        transaction
+            .execute("DELETE FROM library_modules WHERE shard=?1", [shard])
+            .map_err(|error| format!("replace library-module shard {shard}: {error}"))?;
+        index_library_module_shard(&transaction, &path, shard)?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO indexed_library_module_shards (shard, size, modified_ns)
+                 VALUES (?1, ?2, ?3)",
+                params![shard, stamp.size, stamp.modified_ns],
+            )
+            .map_err(|error| format!("record library-module shard {shard}: {error}"))?;
+        stats.shards_scanned += 1;
+        stats.bytes_scanned = stats
+            .bytes_scanned
+            .checked_add(stamp.size)
+            .ok_or_else(|| "library-module shard byte count overflow".to_string())?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("commit library-module index sync: {error}"))?;
+    Ok(stats)
+}
+
+/// Resolve direct AIR visible-function references only when the retained module is unique across
+/// every parent library of the entry AIR, including transitive dependency references.
+pub fn resolve_indexed_visible_references(
+    root: &Path,
+    index: &Path,
+    entry_ll: &str,
+    parent_library_sha256s: &[String],
+) -> Result<Option<Vec<ResolvedFunctionReference>>, String> {
+    let mut pending = metal2vulkan::linked_functions::visible_function_reference_symbols(entry_ll)?;
+    if pending.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let connection = Connection::open_with_flags(
+        index,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("open index {}: {error}", index.display()))?;
+    let mut resolved = BTreeMap::<String, ResolvedFunctionReference>::new();
+    while let Some(symbol) = pending.pop() {
+        if resolved.contains_key(&symbol) {
+            continue;
+        }
+        let hashes = indexed_modules_for_symbol(&connection, parent_library_sha256s, &symbol)?;
+        if hashes.len() != 1 {
+            return Ok(None);
+        }
+        let module = find_indexed_library_module(root, &connection, &hashes[0])?
+            .ok_or_else(|| format!("indexed library module {} is unavailable", hashes[0]))?;
+        pending.extend(
+            metal2vulkan::linked_functions::visible_function_reference_symbols(&module.air_ll)?,
+        );
+        resolved.insert(
+            symbol.clone(),
+            ResolvedFunctionReference {
+                function: symbol,
+                module,
+            },
+        );
+    }
+    Ok(Some(resolved.into_values().collect()))
+}
+
+fn indexed_modules_for_symbol(
+    connection: &Connection,
+    libraries: &[String],
+    symbol: &str,
+) -> Result<Vec<String>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT m.module_sha256
+             FROM library_module_memberships m
+             JOIN library_module_symbols s ON s.module_sha256=m.module_sha256
+             WHERE m.lib_sha256=?1 AND s.symbol=?2
+             ORDER BY m.module_sha256",
+        )
+        .map_err(|error| format!("prepare linked-symbol lookup: {error}"))?;
+    let mut hashes = BTreeSet::new();
+    for library in libraries {
+        let rows = statement
+            .query_map(params![library, symbol], |row| row.get(0))
+            .map_err(|error| format!("query linked symbol {symbol:?}: {error}"))?;
+        for hash in rows {
+            hashes.insert(hash.map_err(|error| format!("read linked symbol {symbol:?}: {error}"))?);
+        }
+    }
+    Ok(hashes.into_iter().collect())
+}
+
+fn find_indexed_library_module(
+    root: &Path,
+    connection: &Connection,
+    hash: &str,
+) -> Result<Option<LibraryModuleRow>, String> {
+    let location = connection
+        .query_row(
+            "SELECT shard, source_offset, source_length FROM library_modules WHERE module_sha256=?1",
+            [hash],
+            |row| Ok((row.get::<_, usize>(0)?, row.get::<_, u64>(1)?, row.get::<_, usize>(2)?)),
+        )
+        .optional()
+        .map_err(|error| format!("query library module {hash}: {error}"))?;
+    let Some((shard, offset, length)) = location else {
+        return Ok(None);
+    };
+    let path = library_module_shard_path(root, shard);
+    let mut file =
+        File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| format!("seek {}: {error}", path.display()))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let row: LibraryModuleRow = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("parse indexed library module {hash}: {error}"))?;
+    if row.module_sha256 != hash {
+        return Err(format!(
+            "indexed library-module location for {hash} contains {}",
+            row.module_sha256
+        ));
+    }
+    Ok(Some(row))
+}
+
+fn library_module_shard_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let directory = library_modules_dir(root);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(&directory)
+        .map_err(|error| format!("read {}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
+}
+
+fn library_module_shard_stamp(path: &Path) -> Result<LibraryModuleShardStamp, String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("read metadata {}: {error}", path.display()))?;
+    let modified_ns = metadata
+        .modified()
+        .map_err(|error| format!("read modification time {}: {error}", path.display()))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("invalid modification time {}: {error}", path.display()))?
+        .as_nanos()
+        .try_into()
+        .map_err(|_| format!("modification time overflow for {}", path.display()))?;
+    Ok(LibraryModuleShardStamp {
+        size: metadata.len(),
+        modified_ns,
+    })
+}
+
+fn index_library_module_shard(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    shard: usize,
+) -> Result<(), String> {
+    let mut reader = BufReader::new(
+        File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?,
+    );
+    let mut offset = 0u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let length = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|error| format!("read {}: {error}", path.display()))?;
+        if length == 0 {
+            break;
+        }
+        let row_bytes = line.strip_suffix(b"\n").unwrap_or(&line);
+        if row_bytes.is_empty() {
+            offset += length as u64;
+            continue;
+        }
+        let row: LibraryModuleRow = serde_json::from_slice(row_bytes)
+            .map_err(|error| format!("parse {} at byte {offset}: {error}", path.display()))?;
+        row.validate()
+            .map_err(|error| format!("{} at byte {offset}: {error}", path.display()))?;
+        let actual = shard_index_for_hash(&row.module_sha256)?;
+        if actual != shard {
+            return Err(format!(
+                "library module {} belongs in shard {actual}, not {shard}",
+                row.module_sha256
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO library_modules (module_sha256, shard, source_offset, source_length)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![row.module_sha256, shard, offset, row_bytes.len()],
+            )
+            .map_err(|error| format!("index library module {}: {error}", row.module_sha256))?;
+        for library in &row.lib_sha256s {
+            transaction
+                .execute(
+                    "INSERT INTO library_module_memberships (module_sha256, lib_sha256)
+                     VALUES (?1, ?2)",
+                    params![row.module_sha256, library],
+                )
+                .map_err(|error| format!("index library membership: {error}"))?;
+        }
+        for symbol in defined_function_names(&row.air_ll) {
+            transaction
+                .execute(
+                    "INSERT INTO library_module_symbols (module_sha256, symbol) VALUES (?1, ?2)",
+                    params![row.module_sha256, symbol],
+                )
+                .map_err(|error| format!("index library symbol: {error}"))?;
+        }
+        offset += length as u64;
+    }
+    Ok(())
 }
 
 pub fn defined_function_names(ll: &str) -> Vec<String> {
@@ -744,6 +1069,59 @@ mod tests {
                 .unwrap()[0]
                 .lib_sha256s,
             vec!["11".repeat(32), "33".repeat(32)]
+        );
+    }
+
+    #[test]
+    fn indexed_visible_references_resolve_across_all_entry_library_memberships() {
+        let scratch = ScratchDir::new("indexed-visible-reference").unwrap();
+        let entry_library = "11".repeat(32);
+        let dependency_library = "22".repeat(32);
+        let dependency = row("define void @linked() { ret void }\n", &dependency_library);
+        merge_library_module_shards(scratch.path(), [dependency.clone()]).unwrap();
+        let index = scratch.path().join("index.sqlite");
+        Connection::open(&index).unwrap();
+
+        let cold = sync_library_module_index(scratch.path(), &index).unwrap();
+        assert_eq!(cold.shards_scanned, 1);
+        let warm = sync_library_module_index(scratch.path(), &index).unwrap();
+        assert_eq!(warm, LibraryModuleIndexSyncStats::default());
+
+        let entry = "define void @main() { ret void }\n!air.visible_function_references = !{!0}\n!0 = !{!\"air.visible_function_reference\", ptr @linked.MTL_VISIBLE_FN_REF, !\"linked\"}\n";
+        let resolved = resolve_indexed_visible_references(
+            scratch.path(),
+            &index,
+            entry,
+            &[entry_library, dependency_library],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].function, "linked");
+        assert_eq!(resolved[0].module.module_sha256, dependency.module_sha256);
+    }
+
+    #[test]
+    fn indexed_visible_references_leave_ambiguous_definitions_for_authoring() {
+        let scratch = ScratchDir::new("ambiguous-visible-reference").unwrap();
+        let library = "11".repeat(32);
+        let first = row("define void @linked() { ret void }\n; first\n", &library);
+        let second = row("define void @linked() { ret void }\n; second\n", &library);
+        merge_library_module_shards(scratch.path(), [first, second]).unwrap();
+        let index = scratch.path().join("index.sqlite");
+        Connection::open(&index).unwrap();
+        sync_library_module_index(scratch.path(), &index).unwrap();
+
+        let entry = "define void @main() { ret void }\n!air.visible_function_references = !{!0}\n!0 = !{!\"air.visible_function_reference\", ptr @linked.MTL_VISIBLE_FN_REF, !\"linked\"}\n";
+        assert_eq!(
+            resolve_indexed_visible_references(
+                scratch.path(),
+                &index,
+                entry,
+                std::slice::from_ref(&library),
+            )
+            .unwrap(),
+            None
         );
     }
 

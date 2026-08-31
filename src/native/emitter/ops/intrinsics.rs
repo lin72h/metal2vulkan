@@ -3,6 +3,43 @@
 use super::*;
 
 impl Emitter {
+    pub(in crate::native::emitter) fn emit_llvm_ctpop_call(
+        &mut self,
+        call: &LlCall,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !call.callee.starts_with("llvm.ctpop.") {
+            return Ok(false);
+        }
+        let [value] = call.args.as_slice() else {
+            return Err(format!(
+                "native emitter: {} expects one operand",
+                call.callee
+            ));
+        };
+        let result_ty = self.resolve_type(&call.ret)?;
+        let value_ty = self.resolve_type(&value.ty)?;
+        if !is_integer_type(&result_ty) || value_ty != result_ty {
+            return Err(format!(
+                "native emitter: {} operand/result type mismatch {value_ty:?}, {result_ty:?}",
+                call.callee
+            ));
+        }
+
+        let result_type = self.type_id(&result_ty)?;
+        let value = self.value_id_in(&value.value, &value.ty, instructions)?;
+        let result = self.result_id(name, &result_ty)?;
+        instructions.push(Self::inst(
+            Op::BitCount,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(value)],
+        ));
+        self.record_int_alignment(name, &result_ty, 1);
+        Ok(true)
+    }
+
     pub(in crate::native::emitter) fn emit_llvm_int_minmax_call(
         &mut self,
         call: &LlCall,
@@ -356,40 +393,48 @@ impl Emitter {
         Ok(true)
     }
 
-    pub(in crate::native::emitter) fn emit_llvm_fshl_i32_call(
+    pub(in crate::native::emitter) fn emit_llvm_fshl_call(
         &mut self,
         call: &LlCall,
         name: &str,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if call.callee != "llvm.fshl.i32" {
+        let Some(bits) = call
+            .callee
+            .strip_prefix("llvm.fshl.i")
+            .and_then(|suffix| suffix.parse::<u32>().ok())
+            .filter(|bits| matches!(bits, 8 | 16 | 32 | 64))
+        else {
             return Ok(false);
-        }
+        };
         if call.args.len() != 3 {
-            return Err("native emitter: llvm.fshl.i32 expects three operands".to_string());
+            return Err(format!(
+                "native emitter: llvm.fshl.i{bits} expects three operands"
+            ));
         }
         let result_ty = self.resolve_type(&call.ret)?;
-        if result_ty != LlType::Int(32) {
+        let int_ty = LlType::Int(bits);
+        if result_ty != int_ty {
             return Err(format!(
-                "native emitter: llvm.fshl.i32 returned {result_ty:?}"
+                "native emitter: llvm.fshl.i{bits} returned {result_ty:?}"
             ));
         }
         for arg in &call.args {
             let arg_ty = self.resolve_type(&arg.ty)?;
-            if arg_ty != LlType::Int(32) {
+            if arg_ty != int_ty {
                 return Err(format!(
-                    "native emitter: llvm.fshl.i32 operand is {arg_ty:?}"
+                    "native emitter: llvm.fshl.i{bits} operand is {arg_ty:?}"
                 ));
             }
         }
 
-        let uint = self.type_id(&LlType::Int(32))?;
+        let uint = self.type_id(&int_ty)?;
         let bool_ty = self.type_id(&LlType::Bool)?;
         let result = self.result_id(name, &result_ty)?;
         let lhs = self.value_id_in(&call.args[0].value, &call.args[0].ty, instructions)?;
         let rhs = self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
         let shift = self.value_id_in(&call.args[2].value, &call.args[2].ty, instructions)?;
-        let mask = self.const_uint(31)?;
+        let mask = self.const_int(bits, u64::from(bits - 1))?;
         let normalized_shift = self.fresh();
         instructions.push(Self::inst(
             Op::BitwiseAnd,
@@ -406,7 +451,7 @@ impl Emitter {
             vec![Operand::IdRef(lhs), Operand::IdRef(normalized_shift)],
         ));
 
-        let width = self.const_uint(32)?;
+        let width = self.const_int(bits, u64::from(bits))?;
         let inverse_unmasked = self.fresh();
         instructions.push(Self::inst(
             Op::ISub,
@@ -429,7 +474,7 @@ impl Emitter {
             Some(right_raw),
             vec![Operand::IdRef(rhs), Operand::IdRef(inverse_shift)],
         ));
-        let zero = self.const_uint(0)?;
+        let zero = self.const_int(bits, 0)?;
         let is_zero_shift = self.fresh();
         instructions.push(Self::inst(
             Op::IEqual,

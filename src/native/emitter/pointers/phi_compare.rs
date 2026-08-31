@@ -6,7 +6,7 @@ use super::*;
 impl Emitter {
     /// The operand-resolved core of the `phi` handler. Driven from the parsed (unresolved) phi type + the
     /// `(value, predecessor-label)` pairs — either re-parsed by the text entry above or carried typed on
-    /// `TirInst.phi_incoming`. Byte-identical either way: same `parse_phi` output, and the incoming VALUES
+    /// `TirInst.phi_incoming()`. Byte-identical either way: same `parse_phi` output, and the incoming VALUES
     /// are then overlaid from the typed graph (`phi_incoming_values`), labels kept from the pairs.
     pub(in crate::native::emitter) fn emit_phi_resolved(
         &mut self,
@@ -16,9 +16,18 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let result_ty = self.resolve_type(phi_ty)?;
-        // R3: source the incoming VALUES from the typed graph (labels stay from the parsed pairs).
-        // Byte-identical to the parsed values by tir's phi-operand soundness; falls back on any mismatch.
-        let incoming = self.phi_incoming_values(&name, parsed_incoming);
+        // The typed instruction's canonical phi carrier supplies both values and labels directly.
+        let incoming = if matches!(result_ty, LlType::Ptr(_)) {
+            parsed_incoming
+                .into_iter()
+                .map(|(value, label)| (self.forwarded_pointer_value(&value), label))
+                .collect()
+        } else {
+            parsed_incoming
+        };
+        if self.emit_selected_access_tree_phi(&name, &incoming, &result_ty, instructions)? {
+            return Ok(());
+        }
         if self.emit_bda_address_phi(&name, &incoming, &result_ty, instructions)? {
             return Ok(());
         }
@@ -28,37 +37,190 @@ impl Emitter {
         if self.emit_unmodeled_pointer_phi(&name, &incoming, &result_ty, instructions)? {
             return Ok(());
         }
-        let pointer_meta = self.pointer_merge_meta(
+        let mut pointer_meta = self.pointer_merge_meta(
             &incoming.iter().map(|(value, _)| value).collect::<Vec<_>>(),
             &result_ty,
         )?;
+        if self.null_rooted_pointer_values.contains(&name) {
+            if let Some(meta) = pointer_meta.as_mut() {
+                if meta.pointee.is_none() {
+                    let direct = self
+                        .tir_use_pointees
+                        .get(&name)
+                        .map(|pointee| self.resolve_type(pointee))
+                        .transpose()?;
+                    let peers = self
+                        .null_rooted_pointer_peers
+                        .get(&name)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut recurrence_pointees = Vec::new();
+                    for peer in peers {
+                        let Some(gep) = self.forward_geps.get(&peer).cloned() else {
+                            continue;
+                        };
+                        let source_ty = self.resolve_type(&gep.source_ty)?;
+                        let pointee = gep_pointee(&source_ty, &gep.indices)?;
+                        if !recurrence_pointees.contains(&pointee) {
+                            recurrence_pointees.push(pointee);
+                        }
+                    }
+                    meta.pointee = match (direct, recurrence_pointees.as_slice()) {
+                        (Some(direct), []) => Some(direct),
+                        (Some(direct), [recurrence]) if direct == *recurrence => Some(direct),
+                        (None, [recurrence]) => Some(recurrence.clone()),
+                        (None, []) => Some(LlType::Int(8)),
+                        _ => {
+                            return Err(format!(
+                                "native emitter: null-rooted pointer component has conflicting pointee contracts {recurrence_pointees:?}"
+                            ));
+                        }
+                    };
+                }
+            }
+        }
         let int_alignment = matches!(result_ty, LlType::Int(_))
             .then(|| self.merged_int_alignment(incoming.iter().map(|(value, _)| value.clone())));
-        let pointer_provenance =
-            self.emit_pointer_phi_provenance(&name, &incoming, instructions)?;
+        let pointer_provenance = if self.null_rooted_pointer_values.contains(&name) {
+            None
+        } else {
+            self.emit_pointer_phi_provenance(&name, &incoming, instructions)?
+        };
         self.emit_pointer_nullness_phi(&name, &incoming, &result_ty, instructions)?;
+        if self.null_rooted_pointer_values.contains(&name) {
+            let Some(meta) = pointer_meta.as_ref() else {
+                return Err(
+                    "native emitter: null-rooted pointer phi has no storage contract".into(),
+                );
+            };
+            let Some(pointee) = meta.pointee.as_ref() else {
+                return Err(
+                    "native emitter: null-rooted pointer phi has no pointee contract".into(),
+                );
+            };
+            let result_type = self.ptr_type_id(meta.storage, pointee)?;
+            let result = self.result_id(&name, &result_ty)?;
+            self.module.types_global_values.push(Self::inst(
+                Op::Undef,
+                Some(result_type),
+                Some(result),
+                vec![],
+            ));
+            self.record_pointer_meta(name, meta.clone());
+            return Ok(());
+        }
+        if let Some(meta) = pointer_meta.as_ref().filter(|meta| {
+            pointer_provenance.is_none()
+                && matches!(meta.storage, StorageClass::Private | StorageClass::Function)
+        }) {
+            let Some((first, _)) = incoming.first() else {
+                return Err(format!(
+                    "native emitter: pointer phi {name} has no incoming values"
+                ));
+            };
+            if incoming.iter().all(|(value, _)| value == first) {
+                let result = match first {
+                    LlValue::Zero | LlValue::Undef => {
+                        let pointee = meta.pointee.as_ref().ok_or_else(|| {
+                            format!(
+                                "native emitter: collapsed pointer phi {name} has no pointee contract"
+                            )
+                        })?;
+                        let result_type = self.ptr_type_id(meta.storage, pointee)?;
+                        let result = self.fresh();
+                        self.module.types_global_values.push(Self::inst(
+                            Op::Undef,
+                            Some(result_type),
+                            Some(result),
+                            vec![],
+                        ));
+                        result
+                    }
+                    _ => self.value_id(first, &result_ty)?,
+                };
+                self.values
+                    .insert(name.clone(), (result, result_ty.clone()));
+                self.record_pointer_meta(name, meta.clone());
+                return Ok(());
+            }
+            return Err(format!(
+                "native emitter: {:?} pointer phi {name} has differing structural sources",
+                meta.storage
+            ));
+        }
+        if let (
+            Some(
+                meta @ PointerMeta {
+                    storage,
+                    pointee: Some(pointee),
+                },
+            ),
+            Some(provenance),
+        ) = (pointer_meta.as_ref(), pointer_provenance.as_ref())
+        {
+            // A same-root pointer merge is an index merge in every storage class. Emit the index
+            // phis above and rematerialize one pointer after the leading-phi region. StorageBuffer
+            // and Workgroup used to fall through to a legal pointer OpPhi and rely on the universal
+            // post-validation portability rewrite to discover this same provenance again. Keeping
+            // the source provenance here makes the emitted module portable by construction and
+            // avoids declaring VariablePointersStorageBuffer for an operation that needs no pointer
+            // SSA merge.
+            let result_type = self.ptr_type_id(*storage, pointee)?;
+            let result = self.result_id(&name, &result_ty)?;
+            let op = pointer_arithmetic_access_chain_op_for_storage(
+                *storage,
+                provenance.root_is_indexed_container,
+                pointee,
+                &provenance.indices,
+            );
+            let mut operands = vec![Operand::IdRef(provenance.root)];
+            for index in gep_spirv_indices(&provenance.indices)? {
+                operands.push(Operand::IdRef(self.value_id(&index.value, &index.ty)?));
+            }
+            self.phi_result_instructions.push(Self::inst(
+                op,
+                Some(result_type),
+                Some(result),
+                operands,
+            ));
+            self.record_pointer_meta(name.clone(), meta.clone());
+            self.gep_provenance.insert(name.clone(), provenance.clone());
+            return Ok(());
+        }
+        if matches!(
+            pointer_meta,
+            Some(PointerMeta {
+                storage: StorageClass::Function,
+                ..
+            })
+        ) {
+            return Err(format!(
+                "native emitter: Function pointer phi {name} has no exact index-domain representation from {incoming:?}"
+            ));
+        }
         let result_type = self.pointer_aware_type_id(&result_ty, pointer_meta.as_ref())?;
         let result = self.result_id(&name, &result_ty)?;
         let mut ops = Vec::new();
         let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
         for (value, label) in incoming {
+            let mut edge_instructions = Vec::new();
             let value_id = if let Some(meta) = pointer_meta.as_ref() {
                 self.pointer_phi_value_id(
                     &value,
                     &result_ty,
                     meta,
                     pointer_provenance.as_ref(),
-                    instructions,
+                    &mut edge_instructions,
                 )?
             } else {
-                self.phi_value_id(&value, &result_ty, instructions)?
+                self.phi_value_id(&value, &result_ty, &mut edge_instructions)?
             };
             let label_id = self.label_id(&label)?;
+            self.record_phi_edge_instructions(label_id, edge_instructions);
             if let Some(existing) = seen_incoming.insert(label_id, value_id) {
                 if existing != value_id {
                     return Err(format!(
-                        "native emitter: phi has multiple values from predecessor {}",
-                        label
+                        "native emitter: phi {name} has multiple values from predecessor {label}"
                     ));
                 }
                 continue;
@@ -77,6 +239,219 @@ impl Emitter {
             self.record_int_alignment(&name, &result_ty, alignment);
         }
         Ok(())
+    }
+
+    fn forwarded_pointer_value(&self, value: &LlValue) -> LlValue {
+        let mut value = value.clone();
+        let mut visited = HashSet::new();
+        while let LlValue::Local(name) = &value {
+            if !visited.insert(name.clone()) {
+                break;
+            }
+            let Some(source) = self.pointer_forward_values.get(name) else {
+                break;
+            };
+            value = source.value.clone();
+        }
+        value
+    }
+
+    fn emit_selected_access_tree_phi(
+        &mut self,
+        name: &str,
+        incoming: &[(LlValue, String)],
+        result_ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        let LlType::Ptr(_) = result_ty else {
+            return Ok(false);
+        };
+        let pointee = self
+            .tir_use_pointees
+            .get(name)
+            .cloned()
+            .or_else(|| self.pointer_pointees.get(name).cloned());
+        let Some(pointee) = pointee else {
+            return Ok(false);
+        };
+        let mut trees = Vec::with_capacity(incoming.len());
+        for (value, label) in incoming {
+            let LlValue::Local(local) = value else {
+                return Ok(false);
+            };
+            let tree = if let Some(tree) = self.selected_access_trees.get(local).cloned() {
+                if !types_compatible(&self.resolve_type(&tree.pointee)?, &pointee) {
+                    return Ok(false);
+                }
+                tree
+            } else if let Some(selected) = self.selected_pointers.get(local).cloned() {
+                self.build_selected_access_tree(
+                    &selected,
+                    &pointee,
+                    &[],
+                    &mut HashSet::new(),
+                    instructions,
+                )?
+            } else {
+                return Ok(false);
+            };
+            trees.push((tree, self.label_id(label)?));
+        }
+        let Some(tree) = self.merge_selected_access_tree_phi(&trees, instructions)? else {
+            return Ok(false);
+        };
+        self.pointer_pointees
+            .insert(name.to_string(), tree.pointee.clone());
+        self.selected_access_trees.insert(name.to_string(), tree);
+        Ok(true)
+    }
+
+    fn merge_selected_access_tree_phi(
+        &mut self,
+        trees: &[(SelectedAccessTree, Word)],
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<SelectedAccessTree>, String> {
+        let Some((first, _)) = trees.first() else {
+            return Ok(None);
+        };
+        if trees
+            .iter()
+            .any(|(tree, _)| !types_compatible(&tree.pointee, &first.pointee))
+        {
+            return Ok(None);
+        }
+        let cond = self.merge_selected_phi_ids(
+            trees.iter().map(|(tree, label)| (tree.cond, *label)),
+            &LlType::Bool,
+            instructions,
+        )?;
+        let true_arms = trees
+            .iter()
+            .map(|(tree, label)| (&tree.true_arm, *label))
+            .collect::<Vec<_>>();
+        let false_arms = trees
+            .iter()
+            .map(|(tree, label)| (&tree.false_arm, *label))
+            .collect::<Vec<_>>();
+        let Some(true_arm) =
+            self.merge_selected_access_arm_phi(&true_arms, &first.pointee, instructions)?
+        else {
+            return Ok(None);
+        };
+        let Some(false_arm) =
+            self.merge_selected_access_arm_phi(&false_arms, &first.pointee, instructions)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SelectedAccessTree {
+            cond,
+            true_arm,
+            false_arm,
+            pointee: first.pointee.clone(),
+        }))
+    }
+
+    fn merge_selected_access_arm_phi(
+        &mut self,
+        arms: &[(&SelectedAccessArm, Word)],
+        pointee: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<SelectedAccessArm>, String> {
+        let Some((first, _)) = arms.first() else {
+            return Ok(None);
+        };
+        match first {
+            SelectedAccessArm::Typed { storage, .. }
+                if arms.iter().all(|(arm, _)| {
+                    matches!(arm, SelectedAccessArm::Typed { storage: arm_storage, .. } if arm_storage == storage)
+                }) =>
+            {
+                let ptr_type = self.ptr_type_id(*storage, pointee)?;
+                let ids = arms.iter().map(|(arm, label)| {
+                    let SelectedAccessArm::Typed { ptr, .. } = arm else {
+                        unreachable!("shape checked above");
+                    };
+                    (*ptr, *label)
+                });
+                let ptr = self.merge_selected_phi_ids_with_type(ids, ptr_type, instructions);
+                Ok(Some(SelectedAccessArm::Typed {
+                    ptr,
+                    storage: *storage,
+                }))
+            }
+            SelectedAccessArm::Nested(_) if arms.iter().all(|(arm, _)| {
+                matches!(arm, SelectedAccessArm::Nested(_))
+            }) => {
+                let nested = arms
+                    .iter()
+                    .map(|(arm, label)| {
+                        let SelectedAccessArm::Nested(tree) = arm else {
+                            unreachable!("shape checked above");
+                        };
+                        ((**tree).clone(), *label)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(self
+                    .merge_selected_access_tree_phi(&nested, instructions)?
+                    .map(|tree| SelectedAccessArm::Nested(Box::new(tree))))
+            }
+            SelectedAccessArm::Null
+                if arms
+                    .iter()
+                    .all(|(arm, _)| matches!(arm, SelectedAccessArm::Null)) =>
+            {
+                Ok(Some(SelectedAccessArm::Null))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn merge_selected_phi_ids(
+        &mut self,
+        ids: impl Iterator<Item = (Word, Word)>,
+        ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let result_type = self.type_id(ty)?;
+        Ok(self.merge_selected_phi_ids_with_type(ids, result_type, instructions))
+    }
+
+    fn merge_selected_phi_ids_with_type(
+        &mut self,
+        ids: impl Iterator<Item = (Word, Word)>,
+        result_type: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Word {
+        let ids = ids.collect::<Vec<_>>();
+        if ids.iter().all(|(id, _)| *id == ids[0].0) {
+            return ids[0].0;
+        }
+        let result = self.fresh();
+        let operands = ids
+            .into_iter()
+            .flat_map(|(id, label)| [Operand::IdRef(id), Operand::IdRef(label)])
+            .collect();
+        instructions.push(Self::inst(
+            Op::Phi,
+            Some(result_type),
+            Some(result),
+            operands,
+        ));
+        result
+    }
+
+    pub(in crate::native) fn record_phi_edge_instructions(
+        &mut self,
+        predecessor: Word,
+        instructions: Vec<Instruction>,
+    ) {
+        if instructions.is_empty() {
+            return;
+        }
+        self.phi_edge_instructions
+            .entry(predecessor)
+            .or_default()
+            .extend(instructions);
     }
 
     pub(in crate::native::emitter) fn pointer_phi_value_id(
@@ -137,6 +512,12 @@ impl Emitter {
         }
         let ptr_ty = self.ptr_type_id(meta.storage, pointee)?;
         let result = self.fresh();
+        let op = pointer_arithmetic_access_chain_op_for_storage(
+            meta.storage,
+            provenance.root_is_indexed_container,
+            pointee,
+            &provenance.indices,
+        );
         let mut ops = vec![Operand::IdRef(provenance.root)];
         let mut indices = gep_spirv_indices(&provenance.indices)?;
         if indices.is_empty() && !provenance.indices.is_empty() {
@@ -145,17 +526,12 @@ impl Emitter {
         for idx in indices {
             ops.push(Operand::IdRef(self.value_id(&idx.value, &idx.ty)?));
         }
-        instructions.push(Self::inst(
-            Op::InBoundsAccessChain,
-            Some(ptr_ty),
-            Some(result),
-            ops,
-        ));
+        instructions.push(Self::inst(op, Some(ptr_ty), Some(result), ops));
         Ok(result)
     }
 
     /// The predicate-and-operand-resolved core of the `fcmp` handler — the M-A4 graph walk drives it from
-    /// `TirInst.cmp_predicate` (mapped through `fcmp_predicate`) + `TirInst.operands`, byte-identical to
+    /// `TirInst.cmp_predicate()` (mapped through `fcmp_predicate`) + `TirInst.operands`, byte-identical to
     /// the text path (which sources the same predicate token + operands from the tir carrier).
     pub(in crate::native::emitter) fn emit_fcmp_resolved(
         &mut self,
@@ -242,10 +618,10 @@ impl Emitter {
 
     /// The POINTER core of `emit_icmp`: emit a pointer equality/inequality (direct-param constant fold,
     /// provenance compare, payload-word compare, or null compare) given the resolved predicate + typed
-    /// operands. Split out so the M-A4 graph walk drives it straight from `TirInst.cmp_predicate` +
+    /// operands. Split out so the M-A4 graph walk drives it straight from `TirInst.cmp_predicate()` +
     /// `TirInst.operands` (the pointer form was the last opcode still falling through to the text
     /// substrate). `rest` is the operand TEXT, needed ONLY for the two unsupported-form error diagnostics
-    /// (which BC fingerprints); the graph walk passes it from the diagnostics-only `TirInst.icmp_rest`
+    /// (which BC fingerprints); the graph walk passes it from the diagnostics-only `TirInst.icmp_rest()`
     /// carrier (byte-identical to the text path's `rest`), so no `inst.text` re-lex.
     pub(in crate::native::emitter) fn emit_icmp_ptr_resolved(
         &mut self,
@@ -382,9 +758,9 @@ impl Emitter {
 
     /// The NON-pointer core of `emit_icmp`: emit a scalar/vector integer compare given its resolved
     /// predicate `Op`, typed operands, and (already-resolved) operand type. Extracted so the M-A4 graph
-    /// walk can drive it straight from `TirInst.cmp_predicate` + `TirInst.operands` for the common
+    /// walk can drive it straight from `TirInst.cmp_predicate()` + `TirInst.operands` for the common
     /// (non-pointer) case — byte-identical to the text path. The POINTER icmp forms are driven the same way
-    /// via `emit_icmp_ptr_resolved`, with the operand `rest` supplied from the `TirInst.icmp_rest` carrier
+    /// via `emit_icmp_ptr_resolved`, with the operand `rest` supplied from the `TirInst.icmp_rest()` carrier
     /// for their error diagnostics.
     pub(in crate::native::emitter) fn emit_icmp_int_resolved(
         &mut self,
@@ -429,20 +805,31 @@ impl Emitter {
         ) else {
             return Ok(false);
         };
-        if lhs_raw.root != rhs_raw.root
-            || lhs_raw.addrspace != rhs_raw.addrspace
-            || lhs_raw.device_addr_base != rhs_raw.device_addr_base
-            || lhs_raw.unmodelable
-            || rhs_raw.unmodelable
-        {
+        if lhs_raw.unmodelable || rhs_raw.unmodelable {
             return Ok(false);
         }
 
         let result_ty = LlType::Bool;
         let result_type = self.type_id(&result_ty)?;
         let equal = self.fresh();
-        let lhs_index = self.emit_raw_byte_index(&lhs_raw, 0, instructions)?;
-        let rhs_index = self.emit_raw_byte_index(&rhs_raw, 0, instructions)?;
+        let (lhs_index, rhs_index) = match (
+            lhs_raw.device_addr_base.is_some(),
+            rhs_raw.device_addr_base.is_some(),
+        ) {
+            (true, true) => (
+                self.materialize_device_address(&lhs_raw, instructions)?,
+                self.materialize_device_address(&rhs_raw, instructions)?,
+            ),
+            (false, false)
+                if lhs_raw.root == rhs_raw.root && lhs_raw.addrspace == rhs_raw.addrspace =>
+            {
+                (
+                    self.emit_raw_byte_index(&lhs_raw, 0, instructions)?,
+                    self.emit_raw_byte_index(&rhs_raw, 0, instructions)?,
+                )
+            }
+            _ => return Ok(false),
+        };
         instructions.push(Self::inst(
             Op::IEqual,
             Some(result_type),

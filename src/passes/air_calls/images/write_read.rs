@@ -13,6 +13,7 @@ use super::*;
 /// emitting an invalid OpImageWrite.
 pub(in crate::passes) fn lower_write(
     ctx: &mut Ctx,
+    name: &str,
     args: &[Word],
     v4: Word,
 ) -> Result<Vec<Instruction>, String> {
@@ -35,11 +36,12 @@ pub(in crate::passes) fn lower_write(
     ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Write)?;
     let mut out = vec![];
 
-    let (dim, arrayed) = ctx
-        .image_dims
-        .get(&img)
-        .copied()
-        .unwrap_or((Dim::Dim2D, false));
+    // The stable AIR intrinsic symbol defines the call's operand ABI. A texture handle loaded from
+    // an array or routed through a local carrier can lose the top-level resource side-table entry,
+    // but `_2d_array` still unambiguously says that arg2 is the layer and arg3 is the texel.
+    let (dim, arrayed) = write_intrinsic_shape(name)
+        .ok_or_else(|| format!("unsupported air.write_texture intrinsic shape: {name}"))?;
+    let (_, _, comp) = image_shape_or_recorded(ctx, img);
     if crate::env_vars::tex_dbg() {
         let tys: Vec<String> = args
             .iter()
@@ -68,11 +70,6 @@ pub(in crate::passes) fn lower_write(
 
     let coord32 = build_fetch_coord(ctx, dim, arrayed, coord, layer, &mut out)?;
 
-    let comp = ctx
-        .image_comp
-        .get(&img)
-        .copied()
-        .unwrap_or(crate::passes::ImageComp::Float);
     let texel32 = match comp {
         crate::passes::ImageComp::Float => match vector_shape(ctx, texel) {
             Some((elem, 4)) if is_float_width(ctx, elem, 32) => texel,
@@ -86,7 +83,12 @@ pub(in crate::passes) fn lower_write(
                 ));
                 t
             }
-            _ => return Err("air.write_texture: unsupported texel shape".into()),
+            _ => {
+                return Err(format!(
+                    "air.write_texture: unsupported texel shape id {texel} ({})",
+                    describe_value(ctx, texel)
+                ));
+            }
         },
         crate::passes::ImageComp::Uint | crate::passes::ImageComp::Sint => {
             let texel_ty = value_result_type(ctx, texel)
@@ -118,6 +120,21 @@ pub(in crate::passes) fn lower_write(
         ],
     ));
     Ok(out)
+}
+
+fn write_intrinsic_shape(name: &str) -> Option<(Dim, bool)> {
+    let shape = name.strip_prefix("air.write_texture_")?.split('.').next()?;
+    Some(match shape {
+        "1d" => (Dim::Dim1D, false),
+        "1d_array" => (Dim::Dim1D, true),
+        "2d" => (Dim::Dim2D, false),
+        "2d_array" => (Dim::Dim2D, true),
+        "3d" => (Dim::Dim3D, false),
+        "cube" => (Dim::DimCube, false),
+        "cube_array" => (Dim::DimCube, true),
+        "buffer" | "buffer_1d" => (Dim::DimBuffer, false),
+        _ => return None,
+    })
 }
 
 fn preserve_defined_texel_lanes(
@@ -591,4 +608,29 @@ pub(in crate::passes) fn lower_read_depth(
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_intrinsic_symbol_owns_the_operand_shape() {
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_2d.i16.v4f32"),
+            Some((Dim::Dim2D, false))
+        );
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_2d_array.v4f32"),
+            Some((Dim::Dim2D, true))
+        );
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_cube_array.v4f32"),
+            Some((Dim::DimCube, true))
+        );
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_buffer_1d.u.v4i32"),
+            Some((Dim::DimBuffer, false))
+        );
+    }
 }

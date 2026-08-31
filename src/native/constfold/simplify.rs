@@ -195,16 +195,36 @@ pub(in crate::native) fn prune_unreachable(f: &mut crate::spirv_module::Function
     removed || phi_fixed || merge_fixed
 }
 
-/// Replace single-incoming phis with their value (substituting uses module-wide).
+/// Replace a single-incoming phi only when its listed parent is the block's sole actual CFG
+/// predecessor, then substitute its value throughout the function. A phi with a stale partial arm
+/// list is not an SSA identity: replacing it could expose the listed value along another incoming
+/// edge that its definition does not dominate.
 pub(in crate::native) fn collapse_trivial_phis(f: &mut crate::spirv_module::Function) -> bool {
+    let mut predecessors: HashMap<Word, HashSet<Word>> = HashMap::new();
+    for block in &f.blocks {
+        let Some(parent) = block_id(block) else {
+            continue;
+        };
+        if let Some(terminator) = block.instructions.last() {
+            for successor in successors(terminator) {
+                predecessors.entry(successor).or_default().insert(parent);
+            }
+        }
+    }
     let mut repl: HashMap<Word, Word> = HashMap::new();
     for b in &f.blocks {
+        let Some(block) = block_id(b) else { continue };
         for inst in &b.instructions {
             if inst.class.opcode == Op::Phi && inst.operands.len() == 2 {
-                if let (Some(rid), Some(Operand::IdRef(v))) =
-                    (inst.result_id, inst.operands.first())
+                if let (Some(rid), Some(Operand::IdRef(value)), Some(Operand::IdRef(parent))) =
+                    (inst.result_id, inst.operands.first(), inst.operands.get(1))
                 {
-                    repl.insert(rid, *v);
+                    let is_only_predecessor = predecessors
+                        .get(&block)
+                        .is_some_and(|actual| actual.len() == 1 && actual.contains(parent));
+                    if is_only_predecessor {
+                        repl.insert(rid, *value);
+                    }
                 }
             }
         }
@@ -400,7 +420,7 @@ pub(in crate::native) fn dce_preserving(
     }
 
     // Transitive closure: a live pure result keeps its operands live.
-    let mut live: HashSet<Word> = HashSet::new();
+    let mut live = HashSet::new();
     while let Some(id) = work.pop() {
         if !live.insert(id) {
             continue;
@@ -454,8 +474,16 @@ mod tests {
 
     #[test]
     fn single_incoming_phi_substitutes_its_concrete_value() {
+        let mut entry = Block::new();
+        entry.label = Some(Instruction::new(Op::Label, None, Some(7), vec![]));
+        entry.instructions = vec![Instruction::new(
+            Op::Branch,
+            None,
+            None,
+            vec![Operand::IdRef(8)],
+        )];
         let mut block = Block::new();
-        block.label = Some(Instruction::new(Op::Label, None, Some(7), vec![]));
+        block.label = Some(Instruction::new(Op::Label, None, Some(8), vec![]));
         block.instructions = vec![
             // The deliberately stale result type models an interface-refined image value still
             // wrapped in the pointer carrier recorded before CFG edge splitting.
@@ -473,12 +501,12 @@ mod tests {
             ),
         ];
         let mut function = Function::new();
-        function.blocks.push(block);
+        function.blocks = vec![entry, block];
 
         assert!(collapse_trivial_phis(&mut function));
-        assert_eq!(function.blocks[0].instructions.len(), 1);
+        assert_eq!(function.blocks[1].instructions.len(), 1);
         assert_eq!(
-            function.blocks[0].instructions[0].operands.first(),
+            function.blocks[1].instructions[0].operands.first(),
             Some(&Operand::IdRef(5))
         );
     }

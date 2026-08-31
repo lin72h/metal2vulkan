@@ -1,0 +1,1 @@
+{"air_sha256":"9460bd5ecf993e74253f02e7ac0ec7e2626b44db533602a72286333cb14d721c","reason":"AIR entry \"vst::splat::gs_rasterizer::triangleVertexShader_None\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

@@ -1,0 +1,1 @@
+{"air_sha256":"89da34789ef4e3abbe8ffe5e6086b28f11f818917a7d9111a95f9cfb53f3bf2e","reason":"AIR entry \"gemv_bfloat16_bm4_bn1_sm1_sn32_tm4_tn4_nc0_axpby0\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

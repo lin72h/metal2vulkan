@@ -19,17 +19,23 @@ pub(in crate::passes) fn lower_buffer_address_facts(
     let kern = kern.ok_or("buffer-address facts require kernel metadata")?;
     let mut locations = HashMap::new();
     for (id, (param_index, component)) in &address_words {
-        let Some(
-            KernRole::Buffer(location)
-            | KernRole::AccelerationStructureShadow(location)
-            | KernRole::PrimitiveAccelerationStructureShadow(location),
-        ) = kern.role_of(*param_index)
-        else {
+        let location = match kern.role_of(*param_index) {
+            Some(
+                KernRole::Buffer(location)
+                | KernRole::AccelerationStructureShadow(location)
+                | KernRole::PrimitiveAccelerationStructureShadow(location),
+            ) => Some(*location),
+            _ => kern
+                .function_constant_buffer_locations
+                .get(param_index)
+                .copied(),
+        };
+        let Some(location) = location else {
             return Err(format!(
                 "buffer-address fact {id} references a kernel parameter without a buffer-backed resource {param_index}"
             ));
         };
-        locations.insert(*id, (*location, *component));
+        locations.insert(*id, (location, *component));
     }
 
     let uint_ty = ctx.ty_uint();
@@ -104,8 +110,9 @@ pub(in crate::passes) fn lower_buffer_address_facts(
     let component_constants = [ctx.const_uint(0), ctx.const_uint(1)];
     let block_count = ctx.module.functions[entry_idx].blocks.len();
     for block_index in 0..block_count {
-        let instructions =
-            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[block_index].instructions);
+        let instructions = ctx.module.functions[entry_idx].blocks[block_index]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(instructions.len());
         for inst in instructions {
             let Some(result) = inst.result_id else {

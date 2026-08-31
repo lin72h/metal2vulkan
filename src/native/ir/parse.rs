@@ -47,29 +47,48 @@ impl LlModule {
         let ray_lowered = crate::native::ray_intersection::lower_callback_free_triangle_queries(ll);
         let ll = ray_lowered.as_deref().unwrap_or(ll);
         let mut types = HashMap::new();
-        let lines: Vec<&str> = ll.lines().collect();
-        let mut functions = Vec::new();
-        // Each function's raw body lines, parallel to `functions`, held only until the carriers are
-        // lowered below; `LlFunction` itself has no `Vec<String>` body (T5 — text is read once, here).
-        let mut function_bodies: Vec<Vec<String>> = Vec::new();
-        let mut declarations = Vec::new();
-        let mut globals = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let line = strip_comment(lines[i]).trim();
+        // Named types may appear after a function that uses them. Collect the compact type table in
+        // a first pass, then lower each function body directly into its typed carrier in a streaming
+        // second pass. Only the current function's borrowed body lines are indexed; a generated module
+        // never retains a whole-module line table beside all of its typed carriers.
+        for raw_line in ll.lines() {
+            let line = strip_comment(raw_line).trim();
             if line.starts_with('%') && line.contains(" = type ") {
                 let (name, body) = line
                     .split_once(" = type ")
                     .ok_or_else(|| format!("native emitter: malformed type alias: {line}"))?;
                 types.insert(name.trim().to_string(), parse_type(body.trim())?);
-                i += 1;
+            }
+        }
+        let mut functions = Vec::new();
+        let mut declarations = Vec::new();
+        let mut globals = Vec::new();
+        let mut lines = ll.lines();
+        while let Some(raw_line) = lines.next() {
+            let line = strip_comment(raw_line).trim();
+            if line.starts_with('%') && line.contains(" = type ") {
                 continue;
             }
             if line.starts_with("define ") {
-                let (func, body, next) = parse_function(&lines, i)?;
+                let mut func = parse_function_header(line)?;
+                let mut body = Vec::new();
+                let mut terminated = false;
+                for body_line in lines.by_ref() {
+                    if strip_comment(body_line).trim() == "}" {
+                        terminated = true;
+                        break;
+                    }
+                    body.push(body_line);
+                }
+                if !terminated {
+                    return Err(format!(
+                        "native emitter: unterminated function {}",
+                        func.name
+                    ));
+                }
+                let entry = crate::native::cfg::implicit_entry_block_name(&func);
+                func.blocks = crate::native::cfg::split_source_body_blocks(&body, entry, &types)?;
                 functions.push(func);
-                function_bodies.push(body);
-                i = next;
                 continue;
             }
             if line.starts_with("declare ") {
@@ -77,44 +96,21 @@ impl LlModule {
                 if !is_ignored_intrinsic(&decl.name) {
                     declarations.push(decl);
                 }
-                i += 1;
                 continue;
             }
             if is_ignored_global(line) {
-                i += 1;
                 continue;
             }
             if line.starts_with('@') && (line.contains(" constant ") || line.contains(" global ")) {
                 globals.push(parse_global(line)?);
-                i += 1;
                 continue;
             }
-            i += 1;
         }
         if functions.is_empty() {
             return Err("native emitter: no function definitions found".into());
         }
-        // Parse-once typed IR: lower every function's blocks to carriers now that the module type
-        // table is complete, BEFORE any inference reads a body. This is the SAME `split_body_blocks`
-        // call the emitter runs per function (same immutable `body`, same module `types`); the
-        // carriers do not depend on any inference output, so hoisting the population to the top of
-        // `parse_inner` is byte-neutral. Every body reader — the free-function imageblock scans
-        // below, the parse-time pointee/raw-buffer inferences, the CFG diagnostics, and the emitter's
-        // global-reinterpret scans — reads `f.blocks` (the F-track / T5): `LlFunction.body` is deleted
-        // and the LLVM-IR text is read exactly once (here, at parse).
-        let block_lists: Vec<Vec<crate::native::cfg::BodyBlock>> = functions
-            .iter()
-            .zip(&function_bodies)
-            .map(|(f, body)| {
-                let entry = crate::native::cfg::implicit_entry_block_name(f);
-                crate::native::cfg::split_body_blocks(body, entry, &types)
-            })
-            .collect();
-        for (f, blocks) in functions.iter_mut().zip(block_lists) {
-            f.blocks = blocks;
-        }
-        drop(function_bodies);
-        drop(lines);
+        // Every body reader below consumes the typed carriers. Each borrowed function-body index was
+        // released immediately after that function was lowered.
         let entry_functions = entry_name
             .map(|name| HashSet::from([name.to_string()]))
             .unwrap_or_else(|| infer_entry_functions(ll));
@@ -122,6 +118,10 @@ impl LlModule {
             infer_metadata_byte_buffer_params(kern, entry_name, &functions);
         let metadata_data_buffer_params =
             infer_metadata_data_buffer_params(kern, entry_name, &functions);
+        let metadata_primitive_buffer_pointees =
+            infer_metadata_primitive_buffer_pointees(kern, entry_name, &functions);
+        let metadata_fc_buffer_locations =
+            infer_metadata_fc_buffer_locations(kern, entry_name, &functions);
         let imageblock_dimensions = infer_apv_imageblock_dimensions(ll);
         let cross_coordinate_imageblock =
             infer_cross_coordinate_imageblock(&functions, &entry_functions);
@@ -159,7 +159,7 @@ impl LlModule {
             functions,
             declarations,
             globals,
-            static_init_int_globals: meta::static_init_foldable_int_global_values(ll),
+            static_init_globals: meta::static_init_foldable_global_values(ll),
             entry_name: entry_name.map(str::to_string),
             preinlined_static_initializers: HashSet::new(),
             preinlined_helper_pointer_loads: HashSet::new(),
@@ -175,7 +175,11 @@ impl LlModule {
             metadata_pointee_sizes: HashMap::new(),
             metadata_byte_buffer_params,
             metadata_data_buffer_params,
+            metadata_primitive_buffer_pointees,
+            metadata_fc_buffer_locations,
             raw_buffer_params: HashSet::new(),
+            call_connected_raw_params: HashSet::new(),
+            param_connected_raw_params: HashSet::new(),
         };
         module.infer_metadata_buffer_pointees(kern, entry_name);
         module.infer_pointer_pointees();
@@ -184,7 +188,9 @@ impl LlModule {
         }
         module.infer_local_alloca_pointees();
         module.infer_raw_buffer_params();
+        module.infer_call_connected_raw_buffer_params();
         module.propagate_raw_buffer_params();
+        module.propagate_data_buffer_params();
         Ok(module)
     }
 }
@@ -230,6 +236,18 @@ entry:
         assert_eq!(
             threaded.metadata_data_buffer_params,
             reparsed.metadata_data_buffer_params
+        );
+        assert_eq!(
+            threaded.metadata_primitive_buffer_pointees,
+            reparsed.metadata_primitive_buffer_pointees
+        );
+        assert_eq!(
+            threaded.call_connected_raw_params,
+            reparsed.call_connected_raw_params
+        );
+        assert_eq!(
+            threaded.param_connected_raw_params,
+            reparsed.param_connected_raw_params
         );
         assert_eq!(
             threaded.imageblock_data_pointee,

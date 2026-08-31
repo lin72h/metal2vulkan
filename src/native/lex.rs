@@ -191,6 +191,25 @@ pub(super) fn parse_u64_literal(s: &str) -> Result<u64, String> {
     }
 }
 
+/// Parse LLVM IR special float literals: `+qnan`, `-qnan`, `qnan`, `snan`, `-snan`,
+/// `+inf`, `-inf`, `inf`, `nan`. Returns the IEEE 754 f32 bit pattern.
+pub(super) fn parse_float_special_literal(s: &str) -> Option<u32> {
+    let s = s.trim();
+    // Strip leading + if present
+    let s = s.strip_prefix('+').unwrap_or(s);
+    match s {
+        "qnan" => Some(0x7FC0_0000),  // quiet NaN (positive)
+        "-qnan" => Some(0xFFC0_0000), // quiet NaN (negative)
+        "snan" => Some(0x7F80_0001),  // signaling NaN
+        "-snan" => Some(0xFF80_0001), // signaling NaN (negative)
+        "inf" => Some(0x7F80_0000),   // positive infinity
+        "-inf" => Some(0xFF80_0000),  // negative infinity
+        "nan" => Some(0x7FC0_0000),   // generic NaN
+        "-nan" => Some(0xFFC0_0000),  // generic NaN (negative)
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Leaf-lexer edge cases (refactor T8). This file had zero coverage; these tests pin the
@@ -291,24 +310,5 @@ mod tests {
         assert_eq!(parse_float_literal("1.5").unwrap(), 1.5);
         assert_eq!(parse_float_literal("1e3").unwrap(), 1000.0);
         assert!(parse_float_literal("10").is_err()); // no '.'/'e' => not a float literal
-    }
-}
-
-/// Parse LLVM IR special float literals: `+qnan`, `-qnan`, `qnan`, `snan`, `-snan`,
-/// `+inf`, `-inf`, `inf`, `nan`. Returns the IEEE 754 f32 bit pattern.
-pub(super) fn parse_float_special_literal(s: &str) -> Option<u32> {
-    let s = s.trim();
-    // Strip leading + if present
-    let s = s.strip_prefix('+').unwrap_or(s);
-    match s {
-        "qnan" => Some(0x7FC0_0000),       // quiet NaN (positive)
-        "-qnan" => Some(0xFFC0_0000),       // quiet NaN (negative)
-        "snan" => Some(0x7F80_0001),       // signaling NaN
-        "-snan" => Some(0xFF80_0001),      // signaling NaN (negative)
-        "inf" => Some(0x7F80_0000),         // positive infinity
-        "-inf" => Some(0xFF80_0000),        // negative infinity
-        "nan" => Some(0x7FC0_0000),         // generic NaN
-        "-nan" => Some(0xFFC0_0000),       // generic NaN (negative)
-        _ => None,
     }
 }

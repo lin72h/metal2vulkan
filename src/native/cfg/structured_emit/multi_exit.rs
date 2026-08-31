@@ -30,18 +30,30 @@ pub(in crate::native) fn split_multi_exit_critical_edges(
     exits: &[String],
     counter: &mut usize,
 ) -> Option<Vec<(String, usize)>> {
-    if exits.len() != 2 {
-        return None;
-    }
-    let body: HashSet<&str> = forest
+    let body = forest
         .loop_for_header(header)?
         .body
         .iter()
-        .map(String::as_str)
-        .collect();
+        .cloned()
+        .collect::<HashSet<_>>();
+    split_two_target_critical_edges(blocks, &body, exits, counter)
+}
+
+/// Split a region predecessor that branches to both dispatch targets, preserving destination phis.
+/// The returned edge blocks become the unambiguous predecessor/target pairs consumed by
+/// [`synth_two_target_dispatch`].
+pub(in crate::native) fn split_two_target_critical_edges(
+    blocks: &mut Vec<BodyBlock>,
+    region: &HashSet<String>,
+    exits: &[String],
+    counter: &mut usize,
+) -> Option<Vec<(String, usize)>> {
+    if exits.len() != 2 {
+        return None;
+    }
     let mut splits: Vec<(String, Vec<usize>)> = Vec::new();
 
-    for block in blocks.iter().filter(|b| body.contains(b.name.as_str())) {
+    for block in blocks.iter().filter(|block| region.contains(&block.name)) {
         let successors = block_successors(block);
         let hit: Vec<usize> = exits
             .iter()
@@ -153,10 +165,142 @@ pub(in crate::native) fn synth_multi_exit_merge(
         return None;
     }
 
+    synth_two_target_dispatch(blocks, exits, &preds, counter)
+}
+
+/// Funnel a proved set of predecessor edges to two structural role targets through one typed
+/// dispatch block. The caller owns region discovery; this primitive owns the edge and SSA contract.
+pub(in crate::native) fn synth_two_target_dispatch(
+    blocks: &mut Vec<BodyBlock>,
+    exits: &[String],
+    preds: &[(String, usize)],
+    counter: &mut usize,
+) -> Option<String> {
+    if exits.len() != 2 || preds.is_empty() || preds.iter().any(|(_, exit)| *exit >= exits.len()) {
+        return None;
+    }
     let merge = format!("{SPLIT_PREFIX}{counter}");
     *counter += 1;
     let sel = format!("{EXIT_SEL_PREFIX}{counter}");
     *counter += 1;
+
+    // Redirecting several exits through one dispatch merge changes SSA dominance even though the
+    // selected runtime path is unchanged. A value defined on one exit path used to dominate that
+    // exit directly; after funneling, the other exit paths also reach the dispatch block and make the
+    // original definition non-dominating. Carry each such ordinary live-in through a typed phi in the
+    // dispatch (`undef` on paths selected for the other exit), then rewrite only the dominated target
+    // region's non-phi consumers. Destination phis retain their separate edge-specific funnel below.
+    let forest = analyze(blocks);
+    let mut definitions = HashMap::new();
+    for block in blocks.iter() {
+        let carrier = block.typed.as_ref()?;
+        for instruction in &carrier.insts {
+            if let (Some(result), Some(ty)) = (&instruction.result, &instruction.result_ty) {
+                definitions.insert(result.clone(), (block.name.clone(), ty.clone()));
+            }
+        }
+    }
+    let mut dispatch_live_phis: Vec<(
+        String,
+        crate::native::ir::LlType,
+        Vec<(crate::native::ir::LlValue, String)>,
+    )> = Vec::new();
+    let mut region_substitutions = Vec::new();
+    for (exit_index, exit) in exits.iter().enumerate() {
+        let region = blocks
+            .iter()
+            .filter(|block| forest.dominates(exit, &block.name))
+            .map(|block| block.name.clone())
+            .collect::<HashSet<_>>();
+        let mut used = Vec::new();
+        let mut used_set = HashSet::new();
+        for block in blocks.iter().filter(|block| region.contains(&block.name)) {
+            let carrier = block.typed.as_ref()?;
+            for instruction in carrier
+                .insts
+                .iter()
+                .filter(|instruction| !instruction.is_phi())
+            {
+                instruction.visit_uses(|name| {
+                    if used_set.insert(name.to_string()) {
+                        used.push(name.to_string());
+                    }
+                });
+            }
+            let terminator_use = match &carrier.terminator {
+                crate::native::tir::TirTerminator::Br(_)
+                | crate::native::tir::TirTerminator::Ret(None)
+                | crate::native::tir::TirTerminator::Unreachable => None,
+                crate::native::tir::TirTerminator::BrCond { cond, .. }
+                | crate::native::tir::TirTerminator::Switch { selector: cond, .. }
+                | crate::native::tir::TirTerminator::Ret(Some(cond)) => Some(cond),
+            };
+            if let Some(name) = terminator_use {
+                if used_set.insert(name.clone()) {
+                    used.push(name.clone());
+                }
+            }
+        }
+
+        let mut substitutions = HashMap::new();
+        for value in used {
+            let Some((definition_block, ty)) = definitions.get(&value) else {
+                continue;
+            };
+            if region.contains(definition_block) {
+                continue;
+            }
+            if preds
+                .iter()
+                .all(|(predecessor, _)| forest.dominates(definition_block, predecessor))
+            {
+                continue;
+            }
+            if !preds
+                .iter()
+                .filter(|(_, target)| *target == exit_index)
+                .all(|(predecessor, _)| forest.dominates(definition_block, predecessor))
+                || !dispatch_live_value_type(ty)
+            {
+                return None;
+            }
+            let carried = format!("%metal2vulkan.exitlive.{counter}");
+            *counter += 1;
+            let incoming = preds
+                .iter()
+                .map(|(predecessor, target)| {
+                    let incoming = if *target == exit_index {
+                        crate::native::ir::LlValue::Local(value.clone())
+                    } else {
+                        crate::native::ir::LlValue::Undef
+                    };
+                    (incoming, predecessor.clone())
+                })
+                .collect();
+            substitutions.insert(
+                value,
+                crate::native::ir::TypedValue {
+                    ty: ty.clone(),
+                    value: crate::native::ir::LlValue::Local(carried.clone()),
+                },
+            );
+            dispatch_live_phis.push((carried, ty.clone(), incoming));
+        }
+        region_substitutions.push((region, substitutions));
+    }
+    // Apply only after every region/type/dominance proof succeeds, so a declined dispatch leaves the
+    // caller's owned CFG untouched.
+    for (region, substitutions) in region_substitutions {
+        for block in blocks
+            .iter_mut()
+            .filter(|block| region.contains(&block.name))
+        {
+            block
+                .typed_mut()
+                .expect("dispatch live-in analysis checked every carrier")
+                .substitute_non_phi_values(&substitutions);
+        }
+    }
 
     // Redirect every in-loop exit edge directly to the merge.
     for b in blocks.iter_mut() {
@@ -211,7 +355,7 @@ pub(in crate::native) fn synth_multi_exit_merge(
         if let Some(t) = &blocks[exit_idx].typed {
             for inst in &t.insts {
                 let (Some(dst), Some((cty, inc))) =
-                    (inst.result.clone(), inst.phi_incoming.clone())
+                    (inst.result.clone(), inst.phi_incoming().clone())
                 else {
                     continue;
                 };
@@ -280,6 +424,9 @@ pub(in crate::native) fn synth_multi_exit_merge(
     for (mname, ty, merged_typed) in &typed_value_phis {
         blk.push_value_phi(mname, ty, merged_typed);
     }
+    for (name, ty, incoming) in &dispatch_live_phis {
+        blk.push_value_phi(name, ty, incoming);
+    }
     blk.push_value_phi(&sel, &crate::native::ir::LlType::Int(1), &selector_typed);
     let merge_block = BodyBlock {
         name: merge.clone(),
@@ -294,6 +441,16 @@ pub(in crate::native) fn synth_multi_exit_merge(
     blocks.insert(insert_at, merge_block);
 
     Some(merge)
+}
+
+fn dispatch_live_value_type(ty: &crate::native::ir::LlType) -> bool {
+    use crate::native::ir::LlType;
+    match ty {
+        LlType::Void | LlType::Ptr(_) | LlType::Named(_) => false,
+        LlType::Vector(element, _) | LlType::Array(element, _) => dispatch_live_value_type(element),
+        LlType::Struct(fields) => fields.iter().all(dispatch_live_value_type),
+        LlType::Bool | LlType::Float | LlType::Half | LlType::BFloat | LlType::Int(_) => true,
+    }
 }
 
 /// Unify a loop's multiple back-edges (latches) into ONE synthesized latch so the loop can carry a
@@ -348,7 +505,7 @@ pub(in crate::native) fn synth_multi_latch_continue(
     let mut header_typed_merges: Vec<(String, TypedIncomings)> = Vec::new();
     if let Some(t) = &blocks[hidx].typed {
         for inst in &t.insts {
-            let (Some(dst), Some((cty, inc))) = (inst.result.clone(), inst.phi_incoming.clone())
+            let (Some(dst), Some((cty, inc))) = (inst.result.clone(), inst.phi_incoming().clone())
             else {
                 continue;
             };

@@ -65,7 +65,7 @@ fn descriptor_locations(module: &crate::spirv_module::Module) -> HashSet<(u32, u
 #[test]
 fn caller_selected_layout_separates_independently_translated_vertex_and_fragment_resources() {
     let vertex = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <{ <4 x float> }> @v(ptr addrspace(1) %buffer) {
 entry:
   %value = load <4 x float>, ptr addrspace(1) %buffer, align 16
@@ -80,7 +80,7 @@ entry:
 !4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"buffer"}
 "#;
     let fragment = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <{ <4 x float> }> @f(ptr addrspace(1) %buffer) {
 entry:
   %value = load <4 x float>, ptr addrspace(1) %buffer, align 16
@@ -261,6 +261,54 @@ fn native_vertex_narrow_integer_attributes_use_32_bit_fetch_interface() {
 }
 
 #[test]
+fn native_vertex_signed_int2_attribute_bitcasts_equal_width_body_value() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define <{ <4 x float> }> @vertex_signed_int2(<2 x i32> %corner) {
+entry:
+  %x = extractelement <2 x i32> %corner, i32 0
+  %xf = sitofp i32 %x to float
+  %v0 = insertelement <4 x float> undef, float %xf, i32 0
+  %v1 = insertelement <4 x float> %v0, float 0.000000e+00, i32 1
+  %v2 = insertelement <4 x float> %v1, float 0.000000e+00, i32 2
+  %v3 = insertelement <4 x float> %v2, float 1.000000e+00, i32 3
+  %out = insertvalue <{ <4 x float> }> undef, <4 x float> %v3, 0
+  ret <{ <4 x float> }> %out
+}
+
+!air.vertex = !{!0}
+!0 = !{ptr @vertex_signed_int2, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"int2", !"air.arg_name", !"corner"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_signed_int2_attribute_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Vertex, &tmp).expect("translate");
+    let module = load_bytes(&out).expect("parse transformed");
+    let input = interface_variable_at_location(&module, StorageClass::Input, 0)
+        .expect("location 0 input variable");
+    let input_ty = variable_pointee_type(&module, input).expect("input pointee type");
+    assert!(is_signed_i32_vector(&module, input_ty, 2));
+    assert!(module.functions.iter().any(|function| function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| instruction.class.opcode == Op::Bitcast)));
+    assert!(!module.functions.iter().any(|function| function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| instruction.class.opcode == Op::UConvert)));
+    tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+}
+
+#[test]
 fn native_fragment_depth_return_maps_to_frag_depth() {
     let ll = r#"
 source_filename = "synth_depth"
@@ -410,6 +458,78 @@ attributes #0 = { nounwind }
 }
 
 #[test]
+fn native_narrow_vertex_builtin_preserves_declared_type_at_body_boundary() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define <{ <4 x float>, i32 }> @vmain(i16 %vid) {
+entry:
+  %wide = zext i16 %vid to i32
+  %pos0 = insertelement <4 x float> poison, float 0.000000e+00, i64 0
+  %pos1 = insertelement <4 x float> %pos0, float 0.000000e+00, i64 1
+  %pos2 = insertelement <4 x float> %pos1, float 0.000000e+00, i64 2
+  %pos3 = insertelement <4 x float> %pos2, float 1.000000e+00, i64 3
+  %out0 = insertvalue <{ <4 x float>, i32 }> undef, <4 x float> %pos3, 0
+  %out1 = insertvalue <{ <4 x float>, i32 }> %out0, i32 %wide, 1
+  ret <{ <4 x float>, i32 }> %out1
+}
+
+!air.vertex = !{!0}
+!0 = !{ptr @vmain, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.position", !"air.arg_type_name", !"float4"}
+!3 = !{!"air.vertex_output", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"value"}
+!4 = !{!5}
+!5 = !{i32 0, !"air.vertex_id", !"air.arg_type_name", !"ushort", !"air.arg_name", !"vid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_narrow_vertex_builtin_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Vertex, &tmp).expect("translate");
+    let module = load_bytes(&out).expect("parse transformed");
+    let definitions = module
+        .all_inst_iter()
+        .filter_map(|instruction| Some((instruction.result_id?, instruction)))
+        .collect::<HashMap<_, _>>();
+    let int_width = |ty: Word| {
+        definitions.get(&ty).and_then(|definition| {
+            (definition.class.opcode == Op::TypeInt)
+                .then(|| definition.operands.first())
+                .flatten()
+                .and_then(|operand| match operand {
+                    Operand::LiteralBit32(width) => Some(*width),
+                    _ => None,
+                })
+        })
+    };
+    let conversions = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == Op::UConvert)
+        .map(|instruction| {
+            let result_width = int_width(instruction.result_type.expect("convert result type"))
+                .expect("integer convert result");
+            let source = instruction
+                .operands
+                .first()
+                .and_then(id_ref_operand)
+                .expect("convert source");
+            let source_ty = definitions[&source]
+                .result_type
+                .expect("convert source type");
+            let source_width = int_width(source_ty).expect("integer convert source");
+            (source_width, result_width)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(conversions, vec![(32, 16), (16, 32)]);
+    tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+}
+
+#[test]
 fn native_fragment_viewport_array_index_uses_builtin_input() {
     let ll = r#"
 source_filename = "synth_fragment_viewport_index"
@@ -466,6 +586,55 @@ attributes #0 = { nounwind }
     {
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_fragment_render_target_array_index_uses_builtin_layer_input() {
+    let ll = r#"
+source_filename = "synth_fragment_layer"
+target datalayout = "e-p:64:64:64"
+target triple = "air64-apple-macosx14.0.0"
+
+define i16 @frag(i16 %layer) local_unnamed_addr #0 {
+  ret i16 %layer
+}
+
+attributes #0 = { nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"ushort", !"air.arg_name", !"color"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.render_target_array_index", !"air.arg_type_name", !"ushort", !"air.arg_name", !"layer"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_fragment_layer_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let out = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    let module = load_bytes(&out).expect("parse transformed");
+    let layer_var = module
+        .annotations
+        .iter()
+        .find_map(|inst| match inst.operands.as_slice() {
+            [
+                Operand::IdRef(var),
+                Operand::Decoration(Decoration::BuiltIn),
+                Operand::BuiltIn(BuiltIn::Layer),
+            ] => Some(*var),
+            _ => None,
+        })
+        .expect("Layer builtin decoration");
+    assert!(!module.annotations.iter().any(|inst| {
+        inst.class.opcode == Op::Decorate
+            && inst.operands.first() == Some(&Operand::IdRef(layer_var))
+            && inst.operands.get(1) == Some(&Operand::Decoration(Decoration::Location))
+    }));
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("BuiltIn Layer"), "{asm}");
+    tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
 }
 
 #[test]
@@ -817,7 +986,7 @@ attributes #0 = { nounwind }
 #[test]
 fn native_fragment_color_input_maps_to_input_attachment() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(<4 x float> %color0) {
 entry:
@@ -857,7 +1026,7 @@ entry:
 #[test]
 fn native_fragment_color2_input_maps_to_input_attachment2() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define float @frag(float %color2) {
 entry:
@@ -887,7 +1056,7 @@ entry:
 #[test]
 fn native_fragment_scalar_color_input_reads_vec4_then_extracts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define float @frag(float %color0) {
 entry:
@@ -945,7 +1114,7 @@ entry:
 #[test]
 fn native_air_denorms_disable_f32_stays_portable_and_compact() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(<4 x float> %position) {
 entry:
@@ -986,7 +1155,7 @@ entry:
 #[test]
 fn native_air_denorms_disable_f16_stays_portable_and_compact() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -1028,7 +1197,7 @@ entry:
 #[test]
 fn native_air_denorms_disable_f32_to_f16_convert_stays_portable_and_compact() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x half> @frag(<4 x float> %position) {
 entry:
@@ -1073,7 +1242,7 @@ declare <4 x half> @air.convert.f.v4f16.f.v4f32(<4 x float>)
 #[test]
 fn native_kernel_stage_in_lowers_to_indexed_storage_buffer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(i32 %idx, <3 x i32> %point, ptr addrspace(1) %out) {
 entry:
@@ -1116,7 +1285,7 @@ entry:
 #[test]
 fn native_quoted_kernel_entry_lowers_buffers_to_storage_bindings() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @"re::df::pack"(ptr addrspace(1) readonly captures(none) "air-buffer-no-alias" %0, ptr addrspace(1) writeonly captures(none) "air-buffer-no-alias" %1, ptr addrspace(2) readonly align 4 captures(none) dereferenceable(4) "air-buffer-no-alias" %2, i32 %3) {
 entry:
@@ -1171,7 +1340,7 @@ exit:
 #[test]
 fn native_fragment_bool_input_uses_flat_uint_interface() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(i1 %flag) {
 entry:
@@ -1232,7 +1401,7 @@ entry:
 #[test]
 fn native_fragment_air_flat_float_input_is_decorated_flat() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(<4 x float> %color) {
 entry:
@@ -1275,7 +1444,7 @@ entry:
 #[test]
 fn native_fragment_signed_int_input_uses_signed_interface_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(i32 %index) {
 entry:
@@ -1406,7 +1575,7 @@ define i16 @solid_r16_uint() {
 #[test]
 fn native_static_initializer_runs_before_entry_body() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @flag = internal addrspace(2) global i8 0, align 1
 @sink = internal addrspace(2) global i8 0, align 1
 
@@ -1493,7 +1662,7 @@ entry:
 #[test]
 fn native_chained_multiblock_initializers_complete_in_source_order() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @sink = internal addrspace(2) global i32 0, align 4
 
 define internal void @_GLOBAL__sub_I_first.metal() section "air.static_init" {
@@ -1633,7 +1802,7 @@ entry:
 #[test]
 fn native_kernel_extra_compute_builtins_bind_expected_values() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 	define void @main(i32 %lsize, i32 %lid, i32 %gsize, i32 %gid, i32 %thread_id, i32 %quad_lane, i32 %quad_group, i32 %lane, i32 %simd_group, i32 %simd_width, i32 %num_simd_groups) {
 	entry:
 	  %a = add i32 %lsize, %lid
@@ -1692,6 +1861,7 @@ target triple = "spirv-unknown-vulkan1.3"
     assert!(asm.contains("BuiltIn LocalInvocationIndex"), "{asm}");
     assert_eq!(asm.matches("OpBitwiseAnd").count(), 2, "{asm}");
     assert_eq!(asm.matches("OpShiftRightLogical").count(), 2, "{asm}");
+    assert_eq!(asm.matches("OpIMul").count(), 2, "{asm}");
     assert!(!asm.contains("OpUndef"), "{asm}");
     assert!(
         asm.lines()
@@ -1727,7 +1897,7 @@ target triple = "spirv-unknown-vulkan1.3"
 #[test]
 fn native_kernel_map_screen_to_physical_1x1_map_lowers_to_zero() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(2) %map_data, ptr addrspace(1) %out, <2 x i32> %tid) {
 entry:
@@ -1772,7 +1942,7 @@ declare <2 x float> @air.map_screen_to_physical_coordinates.v2f32.p2i8.i32(<2 x 
 #[test]
 fn native_fragment_array_size_query_extracts_array_layer_count() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @frag(<4 x float> %position, ptr addrspace(1) %tex) {
 entry:
   %layers = tail call i32 @air.get_array_size_texture_2d_array(ptr addrspace(1) %tex)
@@ -1820,7 +1990,7 @@ declare float @air.convert.f.f32.u.i32(i32)
 #[test]
 fn native_kernel_uint2_compute_builtins_validate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(<2 x i32> %tid, <2 x i32> %threads) {
 entry:
   %x = extractelement <2 x i32> %tid, i64 0
@@ -1867,7 +2037,7 @@ entry:
 #[test]
 fn native_fragment_custom_imageblock_reads_and_writes_ordered_half_plane() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Depth = type { half }
 
 define { <4 x half>, %Depth } @f(%Depth %input) {
@@ -1916,7 +2086,7 @@ entry:
 #[test]
 fn native_fragment_direct_imageblock_layout_preserves_vector_and_integer_planes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Tile = type { half, <4 x half>, <4 x i8>, i16 }
 
 define { %Tile } @f(%Tile %input) {

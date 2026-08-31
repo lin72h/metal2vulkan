@@ -441,18 +441,14 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
         .copied()
         .filter(|index| source_forest.dominates(&blocks[work].name, &blocks[*index].name))
         .collect();
-    let work_uses: HashSet<String> = work_nodes
-        .iter()
-        .flat_map(|index| {
-            blocks[*index]
-                .typed
-                .as_ref()
-                .expect("carrier")
-                .insts
-                .iter()
-                .flat_map(|inst| inst.uses.clone())
-        })
-        .collect();
+    let mut work_uses = HashSet::new();
+    for index in &work_nodes {
+        for inst in &blocks[*index].typed.as_ref().expect("carrier").insts {
+            inst.visit_uses(|name| {
+                work_uses.insert(name.to_string());
+            });
+        }
+    }
     for inst in &header_carrier.insts {
         let (Some(result), Some(ty)) = (&inst.result, &inst.result_ty) else {
             continue;
@@ -536,8 +532,8 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
         .filter_map(|inst| {
             Some((
                 inst.result.clone()?,
-                inst.phi_incoming.as_ref()?.0.clone(),
-                inst.phi_incoming.as_ref()?.1.clone(),
+                inst.phi_incoming().as_ref()?.0.clone(),
+                inst.phi_incoming().as_ref()?.1.clone(),
             ))
         })
         .collect::<Vec<_>>();

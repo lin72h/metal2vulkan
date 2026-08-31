@@ -1,0 +1,1 @@
+{"air_sha256":"414af92d46024c88265b8012932f1dedc0caf88eabd0595ad18f0929cc98f0d8","reason":"AIR entry \"kernelComputeNewBlockLevel\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

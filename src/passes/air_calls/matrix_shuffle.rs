@@ -1,7 +1,9 @@
 //! Matrix and subgroup shuffle AIR call lowering.
 
 use super::*;
-use crate::air_intrinsics::{matrix16_intrinsic, Matrix16Element};
+use crate::air_intrinsics::{
+    matrix16_intrinsic, Matrix16Element, Matrix16Intrinsic, Matrix8Intrinsic,
+};
 
 /// True if `ty` is `OpTypeFloat 16`.
 pub(in crate::passes) fn is_half_scalar(ctx: &Ctx, ty: Word) -> bool {
@@ -35,6 +37,8 @@ pub(in crate::passes) fn is_bool_type(ctx: &Ctx, ty: Word) -> bool {
 // accumulation such as `(f32, f16, f32) -> f16` without trusting the mangled suffix.
 pub(in crate::passes) fn lower_simdgroup_matrix_8x8_mac(
     ctx: &mut Ctx,
+    name: &str,
+    signature: Matrix8Intrinsic,
     res: Word,
     rty: Word,
     args: &[Word],
@@ -47,25 +51,28 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_mac(
     }
     let (result_elem, lanes) = composite_shape(ctx, rty)
         .ok_or_else(|| "air.simdgroup_matrix result is not a 64-lane composite".to_string())?;
-    if lanes != 64 || (!is_f32_scalar(ctx, result_elem) && !is_half_scalar(ctx, result_elem)) {
+    if lanes != 64 || !matrix8_storage_matches(ctx, result_elem, signature.result) {
         return Err("air.simdgroup_matrix result is not v64f16 or v64f32".to_string());
     }
+    let kinds = [signature.lhs, signature.rhs, signature.accumulator];
     let mut operand_elems = Vec::with_capacity(3);
-    for (ordinal, arg) in args.iter().enumerate() {
+    for (ordinal, (arg, kind)) in args.iter().zip(kinds).enumerate() {
         let ty = value_result_type(ctx, *arg)
             .ok_or_else(|| format!("air.simdgroup_matrix operand {ordinal} has no type"))?;
         let (elem, arg_lanes) = composite_shape(ctx, ty).ok_or_else(|| {
             format!("air.simdgroup_matrix operand {ordinal} is not a 64-lane composite")
         })?;
-        if arg_lanes != 64 || (!is_f32_scalar(ctx, elem) && !is_half_scalar(ctx, elem)) {
+        if arg_lanes != 64 || !matrix8_storage_matches(ctx, elem, kind) {
             return Err(format!(
-                "air.simdgroup_matrix operand {ordinal} is not v64f16 or v64f32"
+                "{name} operand {ordinal} does not match its ABI element type"
             ));
         }
         operand_elems.push(elem);
     }
-    let arithmetic_elem = if is_f32_scalar(ctx, result_elem)
-        || operand_elems.iter().any(|elem| is_f32_scalar(ctx, *elem))
+    let arithmetic_elem = if kinds
+        .iter()
+        .chain(std::iter::once(&signature.result))
+        .any(|kind| *kind != Matrix16Element::F16)
     {
         ctx.ty_float()
     } else {
@@ -78,17 +85,22 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_mac(
         for col in 0..8 {
             let acc_raw =
                 composite_extract(ctx, &mut insts, operand_elems[2], args[2], row * 8 + col);
-            let mut acc =
-                convert_matrix_lane(ctx, &mut insts, acc_raw, operand_elems[2], arithmetic_elem);
+            let mut acc = matrix16_to_accumulator(
+                ctx,
+                &mut insts,
+                acc_raw,
+                signature.accumulator,
+                arithmetic_elem,
+            );
             for k in 0..8 {
                 let a_raw =
                     composite_extract(ctx, &mut insts, operand_elems[0], args[0], row * 8 + k);
                 let a =
-                    convert_matrix_lane(ctx, &mut insts, a_raw, operand_elems[0], arithmetic_elem);
+                    matrix16_to_accumulator(ctx, &mut insts, a_raw, signature.lhs, arithmetic_elem);
                 let b_raw =
                     composite_extract(ctx, &mut insts, operand_elems[1], args[1], k * 8 + col);
                 let b =
-                    convert_matrix_lane(ctx, &mut insts, b_raw, operand_elems[1], arithmetic_elem);
+                    matrix16_to_accumulator(ctx, &mut insts, b_raw, signature.rhs, arithmetic_elem);
                 let product = ctx.module.fresh_id();
                 insts.push(Instruction::new(
                     Op::FMul,
@@ -121,6 +133,18 @@ pub(in crate::passes) fn lower_simdgroup_matrix_8x8_mac(
         result_lanes,
     ));
     Ok(insts)
+}
+
+fn matrix8_storage_matches(ctx: &Ctx, elem: Word, kind: Matrix16Element) -> bool {
+    match kind {
+        Matrix16Element::F32 => is_f32_scalar(ctx, elem),
+        Matrix16Element::F16 => is_half_scalar(ctx, elem),
+        Matrix16Element::Bf16 => is_int_scalar_width(ctx, elem, 16),
+        Matrix16Element::F8E4M3 | Matrix16Element::F8E4M3Fn | Matrix16Element::F8E5M2 => {
+            is_int_scalar_width(ctx, elem, 8)
+        }
+        Matrix16Element::I8 { .. } => false,
+    }
 }
 
 fn convert_matrix_lane(
@@ -345,6 +369,126 @@ pub(in crate::passes) fn lower_simdgroup_matrix_16x16_mac(
             "{name} has an unsupported 16x16x16 matrix ABI signature"
         ));
     };
+    lower_matrix16_mac(ctx, name, signature, res, rty, args, None)
+}
+
+/// Lower the packed AGX3 signed i8 16x16x16 matrix multiply-accumulate ABI.
+///
+/// The first three constants identify the 16x16x16 operation. Descriptor 75 denotes a signed-i8
+/// input fragment and descriptor 9 denotes an i32 accumulator/result fragment. Each input fragment
+/// is carried in one little-endian i64 rather than the logical eight-byte composite used by AIR's
+/// public matrix ABI. This adapter validates that complete fixed contract, reconstructs the two
+/// distributed fragments, and delegates to the shared 32-lane matrix implementation.
+pub(in crate::passes) fn lower_agx3_igemm_16x16_mac(
+    ctx: &mut Ctx,
+    name: &str,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+) -> Result<Vec<Instruction>, String> {
+    const ABI_CONSTANTS: [(usize, u32); 7] =
+        [(0, 16), (1, 16), (2, 16), (3, 9), (5, 75), (7, 75), (9, 9)];
+    if name != "llvm.agx3.igemm.v8i32.i64.i64.v8i32" {
+        return Err(format!("{name} has an unsupported AGX3 integer matrix ABI"));
+    }
+    if args.len() != 10 {
+        return Err(format!("{name} expects 10 operands, got {}", args.len()));
+    }
+    for (ordinal, expected) in ABI_CONSTANTS {
+        let actual = constant_u32(ctx, args[ordinal]);
+        if actual != Some(expected) {
+            return Err(format!(
+                "{name} operand {ordinal} must be the ABI constant {expected}, got {actual:?}"
+            ));
+        }
+    }
+    let mut packed_types = [0; 2];
+    for (index, ordinal) in [4, 6].into_iter().enumerate() {
+        let ty = value_result_type(ctx, args[ordinal])
+            .ok_or_else(|| format!("{name} packed operand {ordinal} has no type"))?;
+        if !is_int_scalar_width(ctx, ty, 64) {
+            return Err(format!("{name} packed operand {ordinal} is not i64"));
+        }
+        packed_types[index] = ty;
+    }
+
+    let byte = ctx.ty_int8();
+    let fragment = ctx.ty_array(byte, 8);
+    let bool_ty = ctx.ty_bool();
+    let not_transposed = ctx.const_bool_of(bool_ty, false);
+    let mut unpack = Vec::with_capacity(33);
+    let a =
+        unpack_i64_matrix16_fragment(ctx, &mut unpack, fragment, byte, packed_types[0], args[4]);
+    let b =
+        unpack_i64_matrix16_fragment(ctx, &mut unpack, fragment, byte, packed_types[1], args[6]);
+    let matrix_args = [a, not_transposed, b, not_transposed, args[8]];
+    unpack.extend(lower_matrix16_mac(
+        ctx,
+        name,
+        Matrix16Intrinsic {
+            lhs: Matrix16Element::I8 { signed: true },
+            rhs: Matrix16Element::I8 { signed: true },
+            integer: true,
+        },
+        res,
+        rty,
+        &matrix_args,
+        Some((byte, byte)),
+    )?);
+    Ok(unpack)
+}
+
+fn unpack_i64_matrix16_fragment(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    fragment_ty: Word,
+    byte_ty: Word,
+    packed_ty: Word,
+    packed: Word,
+) -> Word {
+    let mut bytes = Vec::with_capacity(8);
+    for index in 0..8 {
+        let shifted = if index == 0 {
+            packed
+        } else {
+            let shifted = ctx.module.fresh_id();
+            let shift = ctx.const_int_of(packed_ty, i64::from(index * 8));
+            out.push(Instruction::new(
+                Op::ShiftRightLogical,
+                Some(packed_ty),
+                Some(shifted),
+                vec![Operand::IdRef(packed), Operand::IdRef(shift)],
+            ));
+            shifted
+        };
+        let byte = ctx.module.fresh_id();
+        out.push(Instruction::new(
+            Op::UConvert,
+            Some(byte_ty),
+            Some(byte),
+            vec![Operand::IdRef(shifted)],
+        ));
+        bytes.push(Operand::IdRef(byte));
+    }
+    let fragment = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::CompositeConstruct,
+        Some(fragment_ty),
+        Some(fragment),
+        bytes,
+    ));
+    fragment
+}
+
+fn lower_matrix16_mac(
+    ctx: &mut Ctx,
+    name: &str,
+    signature: Matrix16Intrinsic,
+    res: Word,
+    rty: Word,
+    args: &[Word],
+    known_fragment_elems: Option<(Word, Word)>,
+) -> Result<Vec<Instruction>, String> {
     let a_kind = signature.lhs;
     let b_kind = signature.rhs;
     let integer = signature.integer;
@@ -364,8 +508,13 @@ pub(in crate::passes) fn lower_simdgroup_matrix_16x16_mac(
             if integer { "v8i32" } else { "v8f32" }
         ));
     }
-    let a_ty = validate_matrix16_fragment(ctx, name, args[0], a_kind, 0)?;
-    let b_ty = validate_matrix16_fragment(ctx, name, args[2], b_kind, 2)?;
+    let (a_ty, b_ty) = match known_fragment_elems {
+        Some(types) => types,
+        None => (
+            validate_matrix16_fragment(ctx, name, args[0], a_kind, 0)?,
+            validate_matrix16_fragment(ctx, name, args[2], b_kind, 2)?,
+        ),
+    };
     let c_ty = value_result_type(ctx, args[4])
         .ok_or_else(|| format!("{name} accumulator has no result type"))?;
     if c_ty != rty {

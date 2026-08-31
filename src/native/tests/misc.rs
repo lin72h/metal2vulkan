@@ -523,7 +523,7 @@ entry:
 #[test]
 fn native_function_constant_defined_lowers_to_false_default() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @_Z1x.MTL_FC_INIT_1_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
 
 define void @main() {
@@ -598,9 +598,122 @@ declare i1 @air.is_function_constant_defined(ptr addrspace(2))
 }
 
 #[test]
+fn air_level_function_constant_specialization_selects_cfg_before_emission() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+@enabled.MTL_FC_INIT_0_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@enabled_copy = internal addrspace(2) global i8 undef, align 1
+
+define internal void @_GLOBAL__sub_I_fc() {
+entry:
+  %value = load i8, ptr addrspace(2) @enabled.MTL_FC_INIT_0_b
+  %defined = call i1 @air.is_function_constant_defined(ptr addrspace(2) @enabled.MTL_FC_INIT_0_b)
+  %selected = select i1 %defined, i8 %value, i8 0
+  store i8 %selected, ptr addrspace(2) @enabled_copy
+  ret void
+}
+
+define i32 @frag() {
+entry:
+  %value = load i8, ptr addrspace(2) @enabled_copy
+  %disabled = icmp eq i8 %value, 0
+  %result = select i1 %disabled, i32 7, i32 9
+  ret i32 %result
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"int"}
+
+declare i1 @air.is_function_constant_defined(ptr addrspace(2))
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_air_fc_specialization_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let default = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("default");
+    let enabled = crate::translate_sanitized_native_specialized_with_options(
+        ll,
+        Stage::Fragment,
+        &tmp,
+        passes::TransformOptions::default(),
+        &[(0, vec![1])],
+    )
+    .expect("specialized");
+
+    let constants = |bytes: &[u8]| {
+        load_bytes(bytes)
+            .expect("load")
+            .types_global_values
+            .into_iter()
+            .filter(|inst| inst.class.opcode == Op::Constant)
+            .filter_map(|inst| match inst.operands.as_slice() {
+                [Operand::LiteralBit32(value)] => Some(*value),
+                _ => None,
+            })
+            .collect::<HashSet<_>>()
+    };
+    let default_constants = constants(&default);
+    let enabled_constants = constants(&enabled);
+    assert!(default_constants.contains(&7), "{default_constants:?}");
+    assert!(!default_constants.contains(&9), "{default_constants:?}");
+    assert!(enabled_constants.contains(&9), "{enabled_constants:?}");
+    assert!(!enabled_constants.contains(&7), "{enabled_constants:?}");
+    tools::spirv_val_bytes(&enabled, &tmp).expect("spirv-val");
+}
+
+#[test]
+fn air_level_vector_function_constant_remains_typed_through_lane_extraction() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+@lanes.MTL_FC_INIT_0_Dv4_j = internal addrspace(2) externally_initialized constant <4 x i32> undef, section "air.fc_initializer", align 16
+
+define i32 @frag() {
+entry:
+  %value = load <4 x i32>, ptr addrspace(2) @lanes.MTL_FC_INIT_0_Dv4_j
+  %x = extractelement <4 x i32> %value, i64 0
+  %y = extractelement <4 x i32> %value, i64 1
+  %z = extractelement <4 x i32> %value, i64 2
+  %w = extractelement <4 x i32> %value, i64 3
+  %xy = add i32 %x, %y
+  %zw = add i32 %z, %w
+  %sum = add i32 %xy, %zw
+  ret i32 %sum
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"uint"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_air_vector_fc_specialization_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let values = [1u32, 2, 3, 4]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+
+    crate::translate_sanitized_native_specialized_with_options(
+        ll,
+        Stage::Fragment,
+        &tmp,
+        passes::TransformOptions::default(),
+        &[(0, values)],
+    )
+    .expect("translate a specialized vector through all lane extractions");
+}
+
+#[test]
 fn native_zero_memset_of_typed_alloca_stores_null_object() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Lighting = type { <3 x float>, <3 x float>, <3 x float>, <3 x float> }
 
 define void @main() {
@@ -640,13 +753,69 @@ declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 }
 
 #[test]
+fn native_workgroup_struct_padding_zero_writes_are_valid_by_construction() {
+    // `%Padded` occupies eight bytes: i32 at 0, i8 at 4, and tail padding at [5, 8). LLVM may
+    // explicitly clear that padding through an i8 GEP, but Logical SPIR-V cannot represent an i8
+    // pointer derived from the struct pointer. The emitter must retain the address symbolically
+    // through a derived GEP and discard the unobservable padding-only clear without first emitting
+    // an invalid pointer that a module-finalization repair would have to remove.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Padded = type { i32, i8 }
+@scratch = internal addrspace(3) global %Padded zeroinitializer, align 4
+
+define void @main() {
+entry:
+  %padding = getelementptr i8, ptr addrspace(3) @scratch, i64 5
+  %tail = getelementptr i8, ptr addrspace(3) %padding, i64 1
+  call void @llvm.memset.p3.i64(ptr addrspace(3) %tail, i8 0, i64 2, i1 false)
+  %padding.word = bitcast ptr addrspace(3) %tail to ptr addrspace(3)
+  store i16 0, ptr addrspace(3) %padding.word, align 2
+  ret void
+}
+
+declare void @llvm.memset.p3.i64(ptr addrspace(3), i8, i64, i1)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_workgroup_padding_memset_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let emitted_asm = disassemble(
+        &module
+            .assemble()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .expect("disassemble native module");
+    assert!(!emitted_asm.contains("OpPtrAccessChain"), "{emitted_asm}");
+    assert!(!emitted_asm.contains("llvm.memset"), "{emitted_asm}");
+
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_partial_zero_memset_of_array_clears_leading_elements() {
     // A zero-memset that clears only the LEADING bytes of a larger array (56 of 60 bytes = the first
     // 14 of 15 floats) must lower to one `OpStore null` per cleared element via typed access chains —
     // not fall through to a generic call to the byte `llvm.memset` declaration (whose pointer param is
     // `uchar`), which is invalid SPIR-V under Logical addressing.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @main() {
 entry:
@@ -684,9 +853,49 @@ declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
 }
 
 #[test]
+fn native_partial_zero_memset_of_struct_clears_complete_prefix_fields() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Prefix = type { i32, [3 x i32], i32 }
+
+define void @main() {
+entry:
+  %value = alloca %Prefix, align 4
+  call void @llvm.memset.p0.i64(ptr %value, i8 0, i64 16, i1 false)
+  ret void
+}
+
+declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_partial_struct_memset_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert_eq!(asm.matches("OpStore").count(), 2, "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert!(!asm.contains("llvm.memset"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_void_command_helpers_lower_to_noops() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   tail call void @air.set_object_buffer_render_command.p1i8(ptr addrspace(1) null, i32 0, ptr addrspace(1) null, i32 2)
@@ -728,7 +937,7 @@ fn native_read_depth_2d_array_combines_layer_into_fetch_coord() {
     // (texture, sampler, sample_index, coord, layer, offset, lod, access). The lowering must combine
     // coord.xy + layer into a 3-component fetch coordinate, mirroring read_texture's array path.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %depth, ptr addrspace(2) %samp, ptr addrspace(1) %out, <2 x i32> %gid) {
 entry:
   %layer = extractelement <2 x i32> %gid, i32 0
@@ -794,7 +1003,7 @@ declare { float, i8 } @air.read_depth_2d_array.f32(ptr addrspace(1), ptr addrspa
 #[test]
 fn native_alloca_lowers_to_function_variable() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @local_slot(i32 %x) {
 entry:
   %slot = alloca i32, align 4
@@ -813,7 +1022,7 @@ entry:
 #[test]
 fn native_freeze_lowers_to_copy_object() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @freeze_scalar(float %x) {
 entry:
   %f = freeze float %x
@@ -840,7 +1049,7 @@ entry:
 #[test]
 fn native_dedupes_matching_function_type_declarations() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @main(float %x) {
 entry:
   %a = tail call fast float @helper_a(float %x, float 1.000000e+00)
@@ -879,7 +1088,7 @@ declare float @helper_b(float, float)
 #[test]
 fn native_shuffle_mask_poison_lanes_become_undef_sentinel() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @shuffle(<2 x float> %v) {
 entry:
   %out = shufflevector <2 x float> %v, <2 x float> poison, <4 x i32> <i32 0, i32 1, i32 poison, i32 poison>
@@ -894,7 +1103,7 @@ entry:
 #[test]
 fn native_quoted_named_types_resolve() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::matrix.21" = type { [1 x <4 x float>] }
 define <4 x float> @matrix(ptr addrspace(2) %m) {
 entry:
@@ -911,7 +1120,7 @@ entry:
 #[test]
 fn native_shuffle_mask_zeroinitializer_expands_to_zero_lanes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @splat(<2 x float> %v) {
 entry:
   %out = shufflevector <2 x float> %v, <2 x float> undef, <4 x i32> zeroinitializer
@@ -926,7 +1135,7 @@ entry:
 #[test]
 fn native_typed_zeroinitializer_lowers_to_constant_null() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <2 x i32> @zero() {
 entry:
   ret <2 x i32> zeroinitializer

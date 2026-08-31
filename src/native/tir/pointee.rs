@@ -65,8 +65,8 @@ pub(in crate::native) fn resolve_gep_pointee(
 ///     signal — a pointer reinterpreted across types — surfaced by the self-check, not an error). On a
 ///     disagreement the richer pointee wins (`pointee_richness`): an aggregate/vector view subsumes a
 ///     scalar view, which subsumes a byte (`i8`) view of the same storage.
-pub(in crate::native) fn infer_use_pointees(
-    blocks: &[TirBlock],
+pub(in crate::native) fn infer_use_pointees<B: AsRef<TirBlock>>(
+    blocks: &[B],
 ) -> (HashMap<String, LlType>, usize, HashSet<String>) {
     let mut map: HashMap<String, LlType> = HashMap::new();
     let mut conflicts = 0usize;
@@ -81,6 +81,7 @@ pub(in crate::native) fn infer_use_pointees(
     // dereferenced as the wider type, no byte cursor). See `pointer_pointee_for_value`.
     let mut byte_viewed: HashSet<String> = HashSet::new();
     for tb in blocks {
+        let tb = tb.as_ref();
         for inst in &tb.insts {
             if let Some((ptr, pointee)) = deref_implied_pointee(inst) {
                 if pointee == LlType::Int(8) {
@@ -126,6 +127,7 @@ pub(in crate::native) fn infer_use_pointees(
     while changed {
         changed = false;
         for tb in blocks {
+            let tb = tb.as_ref();
             for inst in &tb.insts {
                 let Some(result) = &inst.result else { continue };
                 if byte_viewed.contains(result) || !matches!(inst.result_ty, Some(LlType::Ptr(_))) {
@@ -143,7 +145,12 @@ pub(in crate::native) fn infer_use_pointees(
                         matches!(ty, LlType::Ptr(_)) && byte_viewed.contains(name)
                     }
                     _ => false,
-                });
+                }) || (op == "phi"
+                    && inst.phi_values().is_some_and(|values| {
+                        values.into_iter().any(|value| {
+                            matches!(value, LlValue::Local(name) if byte_viewed.contains(name))
+                        })
+                    }));
                 if tainted_operand {
                     byte_viewed.insert(result.clone());
                     changed = true;
@@ -164,6 +171,7 @@ pub(in crate::native) fn infer_use_pointees(
     while changed {
         changed = false;
         for tb in blocks {
+            let tb = tb.as_ref();
             for inst in &tb.insts {
                 let Some(result) = &inst.result else { continue };
                 if !matches!(inst.result_ty, Some(LlType::Ptr(_))) {
@@ -174,10 +182,20 @@ pub(in crate::native) fn infer_use_pointees(
                     continue;
                 }
                 let mut members: Vec<&str> = vec![result.as_str()];
-                for operand in &inst.operands {
-                    if let TirOperand::Value { name, ty } = operand {
-                        if matches!(ty, LlType::Ptr(_)) {
-                            members.push(name.as_str());
+                if op == "phi" {
+                    if let Some(values) = inst.phi_values() {
+                        for value in values {
+                            if let LlValue::Local(name) = value {
+                                members.push(name.as_str());
+                            }
+                        }
+                    }
+                } else {
+                    for operand in &inst.operands {
+                        if let TirOperand::Value { name, ty } = operand {
+                            if matches!(ty, LlType::Ptr(_)) {
+                                members.push(name.as_str());
+                            }
                         }
                     }
                 }
@@ -212,7 +230,7 @@ pub(in crate::native) fn infer_use_pointees(
 /// `(SSA %name, element type)` for each `%`-local pointer argument; a constant/global pointer operand
 /// (e.g. an `@`-symbol threadgroup buffer) is skipped — its pointee is already known from its decl.
 pub(in crate::native) fn atomic_call_pointees(inst: &TirInst) -> Vec<(String, LlType)> {
-    let Some(call) = &inst.call else {
+    let Some(call) = &inst.call() else {
         return Vec::new();
     };
     if !(call.callee.starts_with("air.atomic.global.")

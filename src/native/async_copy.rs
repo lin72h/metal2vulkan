@@ -20,6 +20,8 @@
 //! on a module that CALLS `air.simdgroup_async_copy_2d` — a module the emitter rejects outright today
 //! (`unhandled air.* intrinsic`), so nothing that emits today is altered.
 
+use std::fmt::Write as _;
+
 /// The 12-operand `air.simdgroup_async_copy_2d` call, decoded from its argument list.
 struct AsyncCopyCall {
     /// element size in bytes (operand 0): 4 → i32/float, 2 → i16/half.
@@ -35,15 +37,28 @@ struct AsyncCopyCall {
 }
 
 /// Rewrite every `air.simdgroup_async_copy_2d` / `air.get_null_simdgroup_event` /
-/// `air.is_null_simdgroup_event` / `air.wait_simdgroup_events` in `san_ll`. Returns the text unchanged
-/// when the module does not call the async-copy intrinsic (the common case).
-pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> String {
-    if !san_ll.contains("air.simdgroup_async_copy_2d") {
-        return san_ll.to_string();
+/// `air.is_null_simdgroup_event` / `air.wait_simdgroup_events` in `san_ll`. Borrows the original text
+/// when the module does not call the async-copy intrinsic (the common case), so large modules do not
+/// retain a byte-identical full-source copy beside the typed parser.
+pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> std::borrow::Cow<'_, str> {
+    // The shared product prologue lowers calls before the emitter. It intentionally leaves the
+    // now-dead intrinsic declaration in the module, so retry/emit entry points can see the symbol
+    // without there being any work left to do. Test for an actual call line: treating a declaration
+    // as work would clone and rejoin every line of a large already-lowered module on each emit tier.
+    let has_copy_call = san_ll.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.contains("air.simdgroup_async_copy_2d") && trimmed.contains("call")
+    });
+    if !has_copy_call {
+        return std::borrow::Cow::Borrowed(san_ll);
     }
 
     let mut elem_sizes: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    let mut out: Vec<String> = Vec::new();
+    // A lowered call expands one long intrinsic line into eight short ordinary-LLVM lines. Reserve
+    // bounded growth once so a large module does not cross its original capacity by a few bytes and
+    // make `String` retain an abandoned doubled buffer immediately before the typed parse peak.
+    let rewrite_capacity = san_ll.len().saturating_add(san_ll.len() / 4);
+    let mut out = LineBuffer::with_capacity(rewrite_capacity);
     let mut fresh = fresh_counter(san_ll);
 
     for line in san_ll.lines() {
@@ -58,7 +73,7 @@ pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> String {
                 }
                 None => {
                     // Unrecognized shape — leave it (the emitter will still error, no regression).
-                    out.push(line.to_string());
+                    out.push(line);
                     continue;
                 }
             }
@@ -67,7 +82,7 @@ pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> String {
             // The event is always valid (the copy completed synchronously): is_null = false.
             if let Some(res) = call_result_id(trimmed) {
                 let indent = &line[..line.len() - trimmed.len()];
-                out.push(format!("{indent}{res} = icmp ne i64 0, 0"));
+                out.push_fmt(format_args!("{indent}{res} = icmp ne i64 0, 0"));
                 continue;
             }
         }
@@ -76,73 +91,119 @@ pub(crate) fn lower_simdgroup_async_copy(san_ll: &str) -> String {
             // carrier because event structs store it, while eliminating the now-unsupported call.
             if let Some(res) = call_result_id(trimmed) {
                 let indent = &line[..line.len() - trimmed.len()];
-                out.push(format!("{indent}{res} = inttoptr i64 0 to ptr"));
+                out.push_fmt(format_args!("{indent}{res} = inttoptr i64 0 to ptr"));
                 continue;
             }
         }
         if trimmed.contains("air.wait_simdgroup_events") && trimmed.contains("call") {
             // The copy is already complete in every thread; publish the threadgroup tile with a barrier.
             let indent = &line[..line.len() - trimmed.len()];
-            out.push(format!("{indent}call void @air.wg.barrier(i32 2, i32 1)"));
+            out.push_fmt(format_args!(
+                "{indent}call void @air.wg.barrier(i32 2, i32 1)"
+            ));
             continue;
         }
-        out.push(line.to_string());
+        out.push(line);
     }
 
-    let mut result = out.join("\n");
     if san_ll.ends_with('\n') {
-        result.push('\n');
+        out.text.push('\n');
     }
     // Append the synthesized copy helpers (one per element size) and the barrier declaration if the
     // module did not already declare it.
     for &elem in &elem_sizes {
-        result.push_str(&helper_definition(elem));
+        out.text.push_str(&helper_definition(elem));
     }
     if !san_ll.contains("declare void @air.wg.barrier") {
-        result.push_str("\ndeclare void @air.wg.barrier(i32, i32)\n");
+        out.text
+            .push_str("\ndeclare void @air.wg.barrier(i32, i32)\n");
     }
-    result
+    std::borrow::Cow::Owned(out.text)
+}
+
+/// Owned counterpart used when the caller can relinquish the source buffer. Once rewriting creates
+/// a replacement, returning it drops the superseded input before typed parsing begins; a no-op
+/// preserves and returns the original allocation unchanged.
+pub(crate) fn lower_simdgroup_async_copy_owned(san_ll: String) -> String {
+    match lower_simdgroup_async_copy(&san_ll) {
+        std::borrow::Cow::Borrowed(_) => san_ll,
+        std::borrow::Cow::Owned(lowered) => lowered,
+    }
+}
+
+struct LineBuffer {
+    text: String,
+    has_line: bool,
+}
+
+impl LineBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            text: String::with_capacity(capacity),
+            has_line: false,
+        }
+    }
+
+    fn begin_line(&mut self) {
+        if self.has_line {
+            self.text.push('\n');
+        }
+        self.has_line = true;
+    }
+
+    fn push(&mut self, line: &str) {
+        self.begin_line();
+        self.text.push_str(line);
+    }
+
+    fn push_fmt(&mut self, line: std::fmt::Arguments<'_>) {
+        self.begin_line();
+        let _ = self.text.write_fmt(line);
+    }
 }
 
 /// Emit the extractelements + helper call replacing one async-copy call. `%result` is kept as a dummy
 /// non-null pointer so downstream `store ptr %result` / event plumbing stays well-typed.
-fn emit_copy_call(out: &mut Vec<String>, indent: &str, call: &AsyncCopyCall, fresh: &mut u64) {
+fn emit_copy_call(out: &mut LineBuffer, indent: &str, call: &AsyncCopyCall, fresh: &mut u64) {
     let mut id = || {
         let v = format!("%__ac{}", *fresh);
         *fresh += 1;
         v
     };
     let (dw, dh, sw, sh, ox, oy) = (id(), id(), id(), id(), id(), id());
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}{dw} = extractelement <2 x i64> {}, i64 0",
         call.dst_dims
     ));
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}{dh} = extractelement <2 x i64> {}, i64 1",
         call.dst_dims
     ));
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}{sw} = extractelement <2 x i64> {}, i64 0",
         call.src_dims
     ));
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}{sh} = extractelement <2 x i64> {}, i64 1",
         call.src_dims
     ));
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}{ox} = extractelement <2 x i64> {}, i64 0",
         call.offset
     ));
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}{oy} = extractelement <2 x i64> {}, i64 1",
         call.offset
     ));
-    out.push(format!(
+    out.push_fmt(format_args!(
         "{indent}call void @__metal2vulkan_sac2d_e{}(ptr addrspace(3) {}, i64 {}, i64 {dw}, i64 {dh}, ptr addrspace(1) {}, i64 {}, i64 {sw}, i64 {sh}, i64 {ox}, i64 {oy})",
         call.elem, call.dst, call.dst_epr, call.src, call.src_epr
     ));
     // A non-null dummy for the event value the intrinsic returned.
-    out.push(format!("{indent}{} = inttoptr i64 1 to ptr", call.result));
+    out.push_fmt(format_args!(
+        "{indent}{} = inttoptr i64 1 to ptr",
+        call.result
+    ));
 }
 
 /// The copy-loop helper for a given element size (bytes). Copies `dst_dims` (dw×dh) elements from
@@ -288,6 +349,28 @@ fn fresh_counter(_san_ll: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::lower_simdgroup_async_copy;
+    use std::borrow::Cow;
+
+    #[test]
+    fn no_async_copy_borrows_the_original_module() {
+        let ll = "define void @k() {\nentry:\n  ret void\n}\n";
+        assert!(matches!(
+            lower_simdgroup_async_copy(ll),
+            Cow::Borrowed(value) if std::ptr::eq(value, ll)
+        ));
+    }
+
+    #[test]
+    fn dead_async_copy_declaration_borrows_the_already_lowered_module() {
+        let ll = concat!(
+            "define void @k() {\nentry:\n  ret void\n}\n",
+            "declare ptr @air.simdgroup_async_copy_2d.p3i8.p1i8(i64)\n",
+        );
+        assert!(matches!(
+            lower_simdgroup_async_copy(ll),
+            Cow::Borrowed(value) if std::ptr::eq(value, ll)
+        ));
+    }
 
     #[test]
     fn explicit_null_event_lowers_with_the_async_copy_family() {

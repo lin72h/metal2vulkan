@@ -39,14 +39,31 @@ fn parse_global_name(s: &str) -> Option<String> {
 enum StaticValue {
     Bool(bool),
     Int(u64),
-    Vec4([u64; 4]),
+    Vector(Vec<u64>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum StaticIntValue {
+    Scalar(u32),
+    Vector(Vec<u32>),
 }
 
 /// Best-effort evaluator for AIR static initializers that materialize default function-constant
 /// integer globals. Unknown expressions are ignored so dynamic metadata falls back to its immediate
 /// location index rather than guessing.
 pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
-    let mut globals = parse_integer_global_initializers(ll);
+    static_init_global_values(ll)
+        .into_iter()
+        .filter_map(|(global, value)| match value {
+            StaticValue::Bool(value) => Some((global, u32::from(value))),
+            StaticValue::Int(value) => Some((global, value as u32)),
+            StaticValue::Vector(_) => None,
+        })
+        .collect()
+}
+
+fn static_init_global_values(ll: &str) -> HashMap<String, StaticValue> {
+    let mut globals = parse_static_global_initializers(ll);
     let mut unknown_stores = HashSet::new();
     let mut env: HashMap<String, StaticValue> = HashMap::new();
     let mut in_static_init = false;
@@ -75,10 +92,15 @@ pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
             let Some(global) = parse_global_name(ptr) else {
                 continue;
             };
-            if let Some(value) = eval_int_operand(value, &env, &globals) {
-                let value = value as u32;
+            if let Some(value) = eval_value_token(value_token(value), &env, &globals) {
                 unknown_stores.remove(&global);
-                globals.insert(global, value);
+                globals.insert(
+                    global,
+                    match value {
+                        StaticValue::Int(value) => StaticValue::Int(value & u64::from(u32::MAX)),
+                        value => value,
+                    },
+                );
             } else {
                 globals.remove(&global);
                 unknown_stores.insert(global);
@@ -97,18 +119,17 @@ pub(super) fn static_init_int_global_values(ll: &str) -> HashMap<String, u32> {
         }
     }
 
+    globals.retain(|global, _| !unknown_stores.contains(global));
     globals
-        .into_iter()
-        .filter(|(global, _)| !unknown_stores.contains(global))
-        .collect()
 }
 
-/// Integer mirrors derived from an AIR function-constant initializer and only read afterward. This
+/// Integer scalar/vector mirrors derived from an AIR function-constant initializer and only read
+/// afterward. This
 /// is the product-safe subset of the metadata evaluator above: ordinary constructor state is left
 /// intact, and any non-load use outside a constructor may mutate or escape the cell, so it is
 /// excluded.
-pub(crate) fn static_init_foldable_int_global_values(ll: &str) -> HashMap<String, u32> {
-    let mut values = static_init_int_global_values(ll);
+pub(crate) fn static_init_foldable_global_values(ll: &str) -> HashMap<String, StaticIntValue> {
+    let mut values = static_init_global_values(ll);
     let mut derived_globals = ll
         .lines()
         .filter_map(|raw| {
@@ -118,6 +139,7 @@ pub(crate) fn static_init_foldable_int_global_values(ll: &str) -> HashMap<String
                 .flatten()
         })
         .collect::<HashSet<_>>();
+    let initializer_globals = derived_globals.clone();
     let mut derived_locals = HashSet::<String>::new();
     let mut in_constructor = false;
     for raw in ll.lines() {
@@ -188,7 +210,24 @@ pub(crate) fn static_init_foldable_int_global_values(ll: &str) -> HashMap<String
             parse_global_name(load).as_ref() == Some(global)
         });
     }
+    // Keep the ABI initializer cells and their loads in generic SPIR-V so the public post-emit
+    // specialization helper can still override direct function-constant uses. Only constructor-
+    // derived immutable mirrors are folded under the generic translation's zero/default model;
+    // structure-changing nonzero values use the AIR-level specialization API.
+    values.retain(|global, _| !initializer_globals.contains(global));
     values
+        .into_iter()
+        .map(|(global, value)| {
+            let value = match value {
+                StaticValue::Bool(value) => StaticIntValue::Scalar(u32::from(value)),
+                StaticValue::Int(value) => StaticIntValue::Scalar(value as u32),
+                StaticValue::Vector(values) => {
+                    StaticIntValue::Vector(values.into_iter().map(|value| value as u32).collect())
+                }
+            };
+            (global, value)
+        })
+        .collect()
 }
 
 fn references_symbol(text: &str, symbol: &str) -> bool {
@@ -200,7 +239,7 @@ fn references_symbol(text: &str, symbol: &str) -> bool {
     })
 }
 
-fn parse_integer_global_initializers(ll: &str) -> HashMap<String, u32> {
+fn parse_static_global_initializers(ll: &str) -> HashMap<String, StaticValue> {
     let mut globals = HashMap::new();
     for raw in ll.lines() {
         let line = raw.split(';').next().unwrap_or(raw).trim();
@@ -218,55 +257,121 @@ fn parse_integer_global_initializers(ll: &str) -> HashMap<String, u32> {
     globals
 }
 
-fn integer_initializer(rest: &str) -> Option<u32> {
+fn integer_initializer(rest: &str) -> Option<StaticValue> {
     let typed_init = rest
         .split_once(" global ")
         .map(|(_, init)| init)
         .or_else(|| rest.split_once(" constant ").map(|(_, init)| init))?;
-    let tokens = typed_init.split_whitespace().collect::<Vec<_>>();
-    let ty_pos = tokens
-        .iter()
-        .position(|tok| matches!(*tok, "i8" | "i16" | "i32"))?;
-    let value = tokens.get(ty_pos + 1)?.trim_end_matches(',');
-    if value == "undef" && rest.contains("air.fc_initializer") {
-        return Some(0);
+    if typed_init.starts_with('<') {
+        let type_end = typed_init.find('>')?;
+        let vector_ty = &typed_init[1..type_end];
+        let (lanes, element_ty) = vector_ty.split_once(" x ")?;
+        let lanes = lanes.parse::<usize>().ok()?;
+        let width = element_ty.strip_prefix('i')?.parse::<u32>().ok()?;
+        if width == 0 || width > 32 {
+            return None;
+        }
+        let vector = typed_init[type_end + 1..].trim_start();
+        let vector = if vector.starts_with('<') {
+            &vector[..=vector.find('>')?]
+        } else {
+            vector.split(',').next().unwrap_or(vector).trim()
+        };
+        if vector == "undef" || vector == "zeroinitializer" {
+            return rest
+                .contains("air.fc_initializer")
+                .then(|| StaticValue::Vector(vec![0; lanes]));
+        }
+        let values = vector.strip_prefix('<')?.strip_suffix('>')?;
+        let mask = if width == 32 {
+            u64::from(u32::MAX)
+        } else {
+            (1_u64 << width) - 1
+        };
+        let values = values
+            .split(',')
+            .map(|lane| {
+                let (ty, value) = lane.trim().split_once(' ')?;
+                (ty == element_ty)
+                    .then(|| {
+                        value
+                            .parse::<u64>()
+                            .or_else(|_| value.parse::<i64>().map(|value| value as u64))
+                            .ok()
+                    })
+                    .flatten()
+                    .map(|value| value & mask)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return (values.len() == lanes).then_some(StaticValue::Vector(values));
     }
-    value.parse::<u32>().ok()
+    let mut tokens = typed_init.split_whitespace();
+    let ty = tokens.next()?;
+    let width = ty.strip_prefix('i')?.parse::<u32>().ok()?;
+    if !matches!(width, 8 | 16 | 32) {
+        return None;
+    }
+    let mask = (1_u64 << width) - 1;
+    let value = tokens.next()?.trim_end_matches(',');
+    if value == "undef" && rest.contains("air.fc_initializer") {
+        return Some(StaticValue::Int(0));
+    }
+    value
+        .parse::<u64>()
+        .or_else(|_| value.parse::<i64>().map(|value| value as u64))
+        .ok()
+        .map(|value| StaticValue::Int(value & mask))
 }
 
 fn eval_static_rhs(
     rhs: &str,
     env: &HashMap<String, StaticValue>,
-    globals: &HashMap<String, u32>,
+    globals: &HashMap<String, StaticValue>,
 ) -> Option<StaticValue> {
     if rhs.contains("@air.is_function_constant_defined(") {
         return Some(StaticValue::Bool(false));
     }
-    if rhs.starts_with("load <4 x i32>") {
-        return Some(StaticValue::Vec4([0; 4]));
+    if rhs.contains("@air.normalize_function_constant_predicate.") {
+        let arguments = rhs.split_once('(')?.1.rsplit_once(')')?.0;
+        let value = eval_int_operand(arguments, env, globals)?;
+        return Some(StaticValue::Int(u64::from(value != 0)));
     }
-    if rhs.starts_with("load i") {
+    if rhs.starts_with("load ") {
         let global = parse_global_name(rhs)?;
-        return globals
-            .get(&global)
-            .map(|value| StaticValue::Int(*value as u64));
+        return globals.get(&global).cloned();
     }
     if let Some(rest) = rhs.strip_prefix("extractelement ") {
         let parts = rest.split(',').collect::<Vec<_>>();
         let vector = eval_value_token(parts.first()?.split_whitespace().last()?, env, globals)?;
         let idx = eval_int_operand(parts.get(1)?, env, globals)? as usize;
-        let StaticValue::Vec4(values) = vector else {
+        let StaticValue::Vector(values) = vector else {
             return None;
         };
         return values.get(idx).copied().map(StaticValue::Int);
     }
-    if let Some(rest) = rhs.strip_prefix("lshr ") {
+    if let Some((opcode, rest)) = ["add", "mul", "and", "or", "xor", "shl", "lshr"]
+        .into_iter()
+        .find_map(|opcode| {
+            rhs.strip_prefix(opcode)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .map(|rest| (opcode, rest))
+        })
+    {
         let (lhs, rhs) = eval_binary_int(rest, env, globals)?;
-        return Some(StaticValue::Int(lhs >> rhs));
-    }
-    if let Some(rest) = rhs.strip_prefix("and ") {
-        let (lhs, rhs) = eval_binary_int(rest, env, globals)?;
-        return Some(StaticValue::Int(lhs & rhs));
+        let (width, mask) = integer_result_width_and_mask(rest)?;
+        let lhs = lhs & mask;
+        let value = match opcode {
+            "add" => lhs.wrapping_add(rhs & mask),
+            "mul" => lhs.wrapping_mul(rhs & mask),
+            "and" => lhs & (rhs & mask),
+            "or" => lhs | (rhs & mask),
+            "xor" => lhs ^ (rhs & mask),
+            "shl" if rhs < u64::from(width) => lhs.checked_shl(rhs.try_into().ok()?)?,
+            "lshr" if rhs < u64::from(width) => lhs.checked_shr(rhs.try_into().ok()?)?,
+            "shl" | "lshr" => return None,
+            _ => unreachable!("matched integer opcode"),
+        };
+        return Some(StaticValue::Int(value & mask));
     }
     if let Some(rest) = rhs.strip_prefix("icmp ") {
         let mut fields = rest.splitn(2, ' ');
@@ -313,7 +418,7 @@ fn eval_static_rhs(
 fn eval_binary_int(
     rest: &str,
     env: &HashMap<String, StaticValue>,
-    globals: &HashMap<String, u32>,
+    globals: &HashMap<String, StaticValue>,
 ) -> Option<(u64, u64)> {
     let parts = rest.split(',').collect::<Vec<_>>();
     Some((
@@ -322,34 +427,45 @@ fn eval_binary_int(
     ))
 }
 
+fn integer_result_width_and_mask(text: &str) -> Option<(u32, u64)> {
+    let width = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .find_map(|token| token.strip_prefix('i')?.parse::<u32>().ok())?;
+    match width {
+        1..=63 => Some((width, (1_u64 << width) - 1)),
+        64 => Some((width, u64::MAX)),
+        _ => None,
+    }
+}
+
 fn eval_int_operand(
     text: &str,
     env: &HashMap<String, StaticValue>,
-    globals: &HashMap<String, u32>,
+    globals: &HashMap<String, StaticValue>,
 ) -> Option<u64> {
     match eval_value_token(value_token(text), env, globals)? {
         StaticValue::Bool(value) => Some(u64::from(value)),
         StaticValue::Int(value) => Some(value),
-        StaticValue::Vec4(_) => None,
+        StaticValue::Vector(_) => None,
     }
 }
 
 fn eval_bool_operand(
     text: &str,
     env: &HashMap<String, StaticValue>,
-    globals: &HashMap<String, u32>,
+    globals: &HashMap<String, StaticValue>,
 ) -> Option<bool> {
     match eval_value_token(value_token(text), env, globals)? {
         StaticValue::Bool(value) => Some(value),
         StaticValue::Int(value) => Some(value != 0),
-        StaticValue::Vec4(_) => None,
+        StaticValue::Vector(_) => None,
     }
 }
 
 fn eval_value_token(
     token: &str,
     env: &HashMap<String, StaticValue>,
-    globals: &HashMap<String, u32>,
+    globals: &HashMap<String, StaticValue>,
 ) -> Option<StaticValue> {
     let token = token.trim().trim_end_matches(',');
     if token == "true" {
@@ -362,11 +478,13 @@ fn eval_value_token(
         return env.get(token).cloned();
     }
     if token.starts_with('@') {
-        return globals
-            .get(token)
-            .map(|value| StaticValue::Int(*value as u64));
+        return globals.get(token).cloned();
     }
-    token.parse::<u64>().ok().map(StaticValue::Int)
+    token
+        .parse::<u64>()
+        .or_else(|_| token.parse::<i64>().map(|value| value as u64))
+        .ok()
+        .map(StaticValue::Int)
 }
 
 fn value_token(text: &str) -> &str {
@@ -374,4 +492,120 @@ fn value_token(text: &str) -> &str {
         .last()
         .unwrap_or_else(|| text.trim())
         .trim_end_matches(',')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vector_initializer_is_not_misclassified_as_a_scalar() {
+        let ll = r#"
+@fc.MTL_FC_INIT_3_Dv4_j = internal addrspace(2) externally_initialized constant <4 x i32> <i32 1, i32 2, i32 3, i32 4>, section "air.fc_initializer", align 16
+@mirror = internal addrspace(2) global i32 undef, align 4
+
+define internal void @_GLOBAL__sub_I_vector_fc() {
+entry:
+  %value = load <4 x i32>, ptr addrspace(2) @fc.MTL_FC_INIT_3_Dv4_j
+  %lane = extractelement <4 x i32> %value, i64 2
+  store i32 %lane, ptr addrspace(2) @mirror
+  ret void
+}
+
+define i32 @use() {
+entry:
+  %value = load i32, ptr addrspace(2) @mirror
+  ret i32 %value
+}
+"#;
+
+        let values = static_init_int_global_values(ll);
+        assert_eq!(values.get("@mirror"), Some(&3));
+        assert!(!values.contains_key("@fc.MTL_FC_INIT_3_Dv4_j"));
+        let foldable = static_init_foldable_global_values(ll);
+        assert!(matches!(
+            foldable.get("@mirror"),
+            Some(StaticIntValue::Scalar(3))
+        ));
+        assert!(!foldable.contains_key("@fc.MTL_FC_INIT_3_Dv4_j"));
+    }
+
+    #[test]
+    fn signed_masked_function_constant_initializer_is_foldable() {
+        let ll = r#"
+@fc.MTL_FC_INIT_2_t = internal addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
+@rounded = internal addrspace(2) global i16 undef, align 2
+@negative = internal addrspace(2) global i16 -1, align 2
+
+define internal void @_GLOBAL__sub_I_fc() {
+entry:
+  %value = load i16, ptr addrspace(2) @fc.MTL_FC_INIT_2_t
+  %biased = add i16 %value, 15
+  %masked = and i16 %biased, -16
+  store i16 %masked, ptr addrspace(2) @rounded
+  ret void
+}
+
+define i16 @use() {
+entry:
+  %value = load i16, ptr addrspace(2) @rounded
+  ret i16 %value
+}
+"#;
+
+        let values = static_init_foldable_global_values(ll);
+        assert!(matches!(
+            values.get("@rounded"),
+            Some(StaticIntValue::Scalar(0))
+        ));
+        assert_eq!(
+            static_init_int_global_values(ll).get("@negative"),
+            Some(&65535)
+        );
+    }
+
+    #[test]
+    fn out_of_width_shift_is_not_folded() {
+        let ll = r#"
+@fc.MTL_FC_INIT_2_t = internal addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
+@shifted = internal addrspace(2) global i16 undef, align 2
+
+define internal void @_GLOBAL__sub_I_fc() {
+entry:
+  %value = load i16, ptr addrspace(2) @fc.MTL_FC_INIT_2_t
+  %value.shifted = shl i16 %value, 16
+  store i16 %value.shifted, ptr addrspace(2) @shifted
+  ret void
+}
+
+define i16 @use() {
+entry:
+  %value = load i16, ptr addrspace(2) @shifted
+  ret i16 %value
+}
+"#;
+
+        assert!(!static_init_foldable_global_values(ll).contains_key("@shifted"));
+    }
+
+    #[test]
+    fn function_constant_predicate_normalization_preserves_an_enabled_default() {
+        let ll = r#"
+@fc.MTL_FC_INIT_1_b = internal addrspace(2) externally_initialized constant i8 1, section "air.fc_initializer", align 1
+@predicate = internal addrspace(2) global i8 0, align 1
+
+define internal void @_GLOBAL__sub_I_fc() {
+entry:
+  %value = load i8, ptr addrspace(2) @fc.MTL_FC_INIT_1_b
+  %normalized = tail call i8 @air.normalize_function_constant_predicate.i8(i8 %value)
+  store i8 %normalized, ptr addrspace(2) @predicate
+  ret void
+}
+"#;
+
+        assert_eq!(
+            static_init_int_global_values(ll).get("@predicate"),
+            Some(&1)
+        );
+    }
 }

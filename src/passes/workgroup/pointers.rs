@@ -1,7 +1,11 @@
 //! Workgroup-rooted and interface-rooted pointer materialization.
 
 use super::*;
+use crate::passes::access::{
+    direct_scalar_width, is_unsigned_byte_scalar, single_member_array_scalar_elem,
+};
 use crate::passes::resources::rewrites::*;
+use crate::passes::stage_input::{layout_ty_size_align, round_up};
 
 /// Threadgroup memory params are spliced to fixed-size Workgroup arrays. Access chains rooted at the
 /// param are already valid after `rewrite_pointer_storage`, but a direct AIR load/store or pointer
@@ -21,6 +25,15 @@ pub(in crate::passes) fn rewrite_workgroup_root_access(
     let Some(array_ty) = ptr_pointee(&types, var_ptr_ty) else {
         return;
     };
+    let raw_byte_element = types.get(&array_ty).and_then(|definition| {
+        if definition.class.opcode != Op::TypeArray {
+            return None;
+        }
+        let Operand::IdRef(element) = definition.operands.first()? else {
+            return None;
+        };
+        is_unsigned_byte_scalar(ctx, *element).then_some(*element)
+    });
 
     let mut want: Vec<Word> = vec![];
     for blk in &ctx.module.functions[entry_idx].blocks {
@@ -78,10 +91,20 @@ pub(in crate::passes) fn rewrite_workgroup_root_access(
     let mut leaf_chain: HashMap<Word, Word> = HashMap::new();
     let mut injected: Vec<Instruction> = vec![];
     for target in want {
-        let Some(path) = path_to_leaf(&types, array_ty, target) else {
+        let (pointee, path) = if let Some(path) = path_to_leaf(&types, array_ty, target) {
+            (target, path)
+        } else if let Some(byte) = raw_byte_element
+            .filter(|_| matches!(direct_scalar_width(ctx, target), Some(16 | 32 | 64)))
+        {
+            // A raw Workgroup parameter is serialized as `[N x uchar]`. A direct AIR wide
+            // load/store of that parameter means byte offset zero. Materialize the byte-element
+            // pointer here; the ordinary raw-byte load/store lowering below then reconstructs or
+            // splits the exact little-endian scalar payload.
+            (byte, vec![0])
+        } else {
             continue;
         };
-        let ptr_ty = ctx.ty_ptr(StorageClass::Workgroup, target);
+        let ptr_ty = ctx.ty_ptr(StorageClass::Workgroup, pointee);
         let id = ctx.module.fresh_id();
         let mut ops = vec![Operand::IdRef(var)];
         for _ in &path {
@@ -168,6 +191,7 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
     var: Word,
     block_ty: Word,
     prepend_member0: bool,
+    typed_aliases: &[(Word, Word)],
     defs: &HashMap<Word, Instruction>,
 ) {
     let u0 = ctx.const_uint(0);
@@ -179,9 +203,10 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
             types.entry(id).or_insert_with(|| g.clone());
         }
     }
-
     let value_types = combined_value_types(ctx, entry_idx);
     let desired_pointees = pointer_leaf_use_types(ctx, entry_idx, &value_types);
+    let raw_byte_transport = single_member_array_scalar_elem(ctx, block_ty)
+        .is_some_and(|element| is_unsigned_byte_scalar(ctx, element));
 
     // 1) Access chains based directly at the param: re-root at the buffer var; prepend member-0 only
     //    for the runtime-array wrapping (the original first index then indexes the runtime array).
@@ -199,8 +224,10 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
                 if matches!(
                     inst.class.opcode,
                     Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-                ) && inst.operands.first() == Some(&Operand::IdRef(pid))
-                {
+                ) && matches!(
+                    inst.operands.first(),
+                    Some(Operand::IdRef(base)) if *base == pid || *base == var
+                ) {
                     (
                         inst.operands[1..].to_vec(),
                         inst.result_type,
@@ -214,13 +241,80 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
                 continue;
             }
 
+            let original_pointee = result_type.and_then(|ty| ptr_pointee(&types, ty));
+
+            // A metadata-gated buffer can retain an aggregate LLVM GEP even when its descriptor
+            // interface is necessarily represented as `{ RuntimeArray<scalar> }`. The emitted
+            // access-chain operands still describe the source aggregate (`row, lane`), so merely
+            // prepending the Block member produces an invalid walk into the scalar element. For a
+            // constant GEP the sidecar owns its exact source byte address. Replay that address as
+            // the one scalar-array index, but only when the byte offset divides exactly by the
+            // descriptor element stride and the source/result pointee is that same scalar type.
+            // This preserves the source layout rather than inferring dimensions from operand count.
+            let flattened_scalar_index = (|| {
+                if !prepend_member0 {
+                    return None;
+                }
+                let element = single_member_array_scalar_elem(ctx, block_ty)?;
+                let original = original_pointee?;
+                if original != element && !types_structurally_match(ctx, &types, original, element)
+                {
+                    return None;
+                }
+                let result = result_id?;
+                let fact = ctx.emit_sidecar.buffer_access_offsets.iter().find(|fact| {
+                    fact.id == result && matches!(fact.root, root if root == pid || root == var)
+                })?;
+                let (size, align) = layout_ty_size_align(ctx, element, &types);
+                let stride = u64::from(round_up(size, align));
+                if stride == 0 || !fact.byte_offset.is_multiple_of(stride) {
+                    return None;
+                }
+                let index = u32::try_from(fact.byte_offset / stride).ok()?;
+                Some((element, ctx.const_uint(index)))
+            })();
+            if let Some((element, index)) = flattened_scalar_index {
+                let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, element);
+                let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
+                inst.operands = vec![
+                    Operand::IdRef(var),
+                    Operand::IdRef(u0),
+                    Operand::IdRef(index),
+                ];
+                inst.result_type = Some(ptr_ty);
+                continue;
+            }
+
+            if let Some(alias) = original_pointee.and_then(|pointee| {
+                typed_aliases
+                    .iter()
+                    .find_map(|(element, var)| (*element == pointee).then_some(*var))
+            }) {
+                let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
+                inst.operands[0] = Operand::IdRef(alias);
+                if prepend_member0 {
+                    inst.operands.insert(1, Operand::IdRef(u0));
+                }
+                continue;
+            }
+
             // Some opaque-pointer paths already retain the synthetic block-member selector
             // (`[0, element]`). Classify each use against the chosen block rather than relying only
             // on the parameter-wide prepend hint: mixed direct/indirect uses can make that hint
-            // conservative. A complete type walk proves the existing path needs only a new root.
+            // conservative. A complete type walk that preserves the source pointee proves the
+            // existing path needs only a new root. The canonical raw-byte transport deliberately
+            // keeps its byte-array carrier here; its later typed replay owns the wider leaf view.
             if prepend_member0 {
                 if let Some(pointee) =
-                    type_after_spirv_access_operands(&types, block_ty, &old_indices)
+                    type_after_spirv_access_operands(&types, block_ty, &old_indices).filter(
+                        |pointee| {
+                            raw_byte_transport
+                                || original_pointee.is_some_and(|original| {
+                                    *pointee == original
+                                        || types_structurally_match(ctx, &types, *pointee, original)
+                                })
+                        },
+                    )
                 {
                     let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, pointee);
                     let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
@@ -235,42 +329,66 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
             } else {
                 Some(block_ty)
             };
-            let remapped = direct_root.and_then(|root_ty| {
-                remap_collapsed_direct_air_struct_access(
+            let exact_offset_path = direct_root.and_then(|root_ty| {
+                let result = result_id?;
+                let pointee = original_pointee?;
+                let fact = ctx.emit_sidecar.buffer_access_offsets.iter().find(|fact| {
+                    fact.id == result && matches!(fact.root, root if root == pid || root == var)
+                })?;
+                let byte_offset = u32::try_from(fact.byte_offset).ok()?;
+                let path = air_struct_access_path_at_byte_offset(
                     ctx,
                     &types,
                     root_ty,
-                    &old_indices,
-                    result_type,
-                )
-                .or_else(|| {
-                    result_id
-                        .and_then(|rid| desired_pointees.get(&rid).and_then(|ty| *ty))
-                        .and_then(|desired_pointee| {
-                            remap_direct_air_struct_access_to_pointee(
-                                ctx,
-                                &types,
-                                root_ty,
-                                &old_indices,
-                                desired_pointee,
-                            )
-                        })
+                    byte_offset,
+                    pointee,
+                )?;
+                Some((
+                    path.into_iter()
+                        .map(|member| Operand::IdRef(ctx.const_uint(member)))
+                        .collect(),
+                    pointee,
+                ))
+            });
+            let remapped = exact_offset_path.or_else(|| {
+                direct_root.and_then(|root_ty| {
+                    remap_collapsed_direct_air_struct_access(
+                        ctx,
+                        &types,
+                        root_ty,
+                        &old_indices,
+                        result_type,
+                    )
+                    .or_else(|| {
+                        result_id
+                            .and_then(|rid| desired_pointees.get(&rid).and_then(|ty| *ty))
+                            .and_then(|desired_pointee| {
+                                remap_direct_air_struct_access_to_pointee(
+                                    ctx,
+                                    &types,
+                                    root_ty,
+                                    &old_indices,
+                                    desired_pointee,
+                                )
+                            })
+                    })
                 })
             });
-
             if let Some((indices, pointee)) = remapped {
                 let mut operands = vec![Operand::IdRef(var)];
                 if prepend_member0 {
                     operands.push(Operand::IdRef(u0));
                     // A compact metadata STRUCT is one record in the RuntimeArray and needs its
-                    // record-0 selector before member descent. A scalar/vector runtime element is
-                    // already the indexed object: inserting another zero would descend into that
-                    // scalar and leave the real dynamic index over-indexing it.
-                    if direct_root.is_some_and(|root| {
-                        types
-                            .get(&root)
-                            .is_some_and(|def| def.class.opcode == Op::TypeStruct)
-                    }) {
+                    // record-0 selector before member descent. An empty remapped path likewise
+                    // names the scalar/vector record at byte offset zero, so select record 0;
+                    // non-empty scalar/vector paths already carry their runtime-array index.
+                    if indices.is_empty()
+                        || direct_root.is_some_and(|root| {
+                            types
+                                .get(&root)
+                                .is_some_and(|def| def.class.opcode == Op::TypeStruct)
+                        })
+                    {
                         operands.push(Operand::IdRef(u0));
                     }
                 }
@@ -320,6 +438,25 @@ pub(in crate::passes) fn rewrite_collapsed_buffer(
     let mut leaf_chain: HashMap<Word, Word> = HashMap::new();
     let mut injected: Vec<Instruction> = vec![];
     for t in want {
+        if let Some(alias) = typed_aliases
+            .iter()
+            .find_map(|(element, var)| (*element == t).then_some(*var))
+        {
+            let ptr_ty = ctx.ty_ptr(StorageClass::StorageBuffer, t);
+            let id = ctx.module.fresh_id();
+            injected.push(Instruction::new(
+                Op::AccessChain,
+                Some(ptr_ty),
+                Some(id),
+                vec![
+                    Operand::IdRef(alias),
+                    Operand::IdRef(u0),
+                    Operand::IdRef(u0),
+                ],
+            ));
+            leaf_chain.insert(t, id);
+            continue;
+        }
         let Some(path) = path_to_leaf(&types, block_ty, t) else {
             continue;
         };
@@ -428,12 +565,29 @@ pub(in crate::passes) fn rewrite_pointer_storage(
     target_sc: StorageClass,
     defs: &HashMap<Word, Instruction>,
 ) -> Result<(), String> {
-    let mut roots: HashSet<Word> = root_vars.iter().copied().collect();
-    let direct_roots: HashSet<Word> = root_vars.iter().copied().collect();
+    // A PhysicalStorageBuffer pointer is already the exact address-domain representation of a
+    // loaded device pointer. Logical interface recovery must not reclassify that explicit boundary
+    // as UniformConstant/StorageBuffer merely because the same helper shape also consumes a
+    // descriptor-rooted pointer.
+    let direct_roots: HashSet<Word> = root_vars
+        .iter()
+        .copied()
+        .filter(|root| {
+            target_sc == StorageClass::PhysicalStorageBuffer
+                || value_result_type(ctx, *root)
+                    .and_then(|ty| type_def_of(ctx, ty))
+                    .is_none_or(|ty| {
+                        ty.operands.first()
+                            != Some(&Operand::StorageClass(StorageClass::PhysicalStorageBuffer))
+                    })
+        })
+        .collect();
+    let mut roots = direct_roots.clone();
     // iterate to a fixpoint over access chains so chained derefs are caught.
     let mut changed = true;
     let mut new_ptr_types: HashMap<(Word, Word), Word> = HashMap::new(); // (old ptr ty, pointee) -> new ptr ty
     let mut value_types = combined_value_types(ctx, entry_idx);
+    let desired_pointees = pointer_leaf_use_types(ctx, entry_idx, &value_types);
     let mut value_defs = combined_value_defs(ctx, entry_idx);
     let types = combined_type_defs(ctx, defs);
     let mut scaled_vector_strides = HashSet::new();
@@ -488,7 +642,16 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                 } else {
                     false
                 };
-                if !rooted {
+                let physical_base_boundary = target_sc != StorageClass::PhysicalStorageBuffer
+                    && base
+                        .and_then(|base| value_types.get(&base))
+                        .and_then(|ty| types.get(ty))
+                        .and_then(|ty| match ty.operands.first() {
+                            Some(Operand::StorageClass(storage)) => Some(*storage),
+                            _ => None,
+                        })
+                        == Some(StorageClass::PhysicalStorageBuffer);
+                if !rooted || physical_base_boundary {
                     continue;
                 }
                 // This pointer result is buffer-derived; mark it as a root and rewrite its type.
@@ -519,8 +682,40 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                         && types.get(&old_pointee).is_some_and(|def| {
                             matches!(def.class.opcode, Op::TypeInt | Op::TypeFloat | Op::TypeBool)
                         });
+                    let base_pointee = base
+                        .and_then(|base| value_types.get(&base))
+                        .and_then(|ty| pointer_pointee_including_new(ctx, &types, *ty));
+                    let rooted_vector_stride_pointee = if matches!(
+                        op,
+                        Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+                    ) && operands.len() == 2
+                    {
+                        rid.and_then(|rid| desired_pointees.get(&rid).copied().flatten())
+                            .filter(|desired| {
+                                types.get(desired).is_some_and(|def| {
+                                    def.class.opcode == Op::TypeVector
+                                        && def.operands.first()
+                                            == Some(&Operand::IdRef(old_pointee))
+                                })
+                            })
+                            .filter(|desired| {
+                                base_pointee.is_some_and(|base_pointee| {
+                                    base_pointee == *desired
+                                        || types_structurally_match(
+                                            ctx,
+                                            &types,
+                                            base_pointee,
+                                            *desired,
+                                        )
+                                })
+                            })
+                    } else {
+                        None
+                    };
                     let pointee = if rerooted_flat_struct_scalar {
                         old_pointee
+                    } else if let Some(vector) = rooted_vector_stride_pointee {
+                        vector
                     } else if let Some(pointee) = rewritten_rooted_pointer_pointee(
                         ctx,
                         &types,
@@ -589,7 +784,11 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                     }
                     ctx.module.functions[entry_idx].blocks[bi].instructions[ii].result_type =
                         Some(new_ty);
-                    if rerooted_flat_struct_scalar {
+                    if rooted_vector_stride_pointee.is_some() {
+                        ctx.module.functions[entry_idx].blocks[bi].instructions[ii]
+                            .class
+                            .opcode = Op::PtrAccessChain;
+                    } else if rerooted_flat_struct_scalar {
                         ctx.module.functions[entry_idx].blocks[bi].instructions[ii]
                             .class
                             .opcode = Op::InBoundsAccessChain;

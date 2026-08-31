@@ -1,0 +1,1 @@
+{"air_sha256":"4cd599dd3919065c0bed4d657666156335d94abef40dac836983f4444e8fbf15","reason":"AIR entry \"Histogram_sint2\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

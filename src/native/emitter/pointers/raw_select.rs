@@ -3,6 +3,9 @@
 use super::*;
 
 impl Emitter {
+    /// Replay a direct pointer selection in the value domain. Either arm may be an exact raw or
+    /// PhysicalStorageBuffer address: `emit_selected_direct_load_arm_value` lowers that arm through
+    /// its address model while an ordinary logical arm remains rooted in its own storage class.
     pub(in crate::native::emitter) fn emit_selected_pointer_direct_load(
         &mut self,
         result: Word,
@@ -74,6 +77,24 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<Word, String> {
         if let LlValue::Local(name) = value {
+            // A null-rooted GEP/phi network denotes no memory object. Loading it is undefined in the
+            // source program, but an OpUndef POINTER is not a legal SPIR-V memory operand. When this
+            // network is one arm of value-domain pointer selection, materialize the arm's undefined
+            // VALUE directly; the selected concrete arm still performs its exact load.
+            if self.null_rooted_pointer_values.contains(name) {
+                return self.undef_id(load_ty);
+            }
+            if let Some(selected) = self.selected_pointers.get(name).cloned() {
+                let loaded = self.fresh();
+                self.emit_selected_pointer_direct_load(
+                    loaded,
+                    load_ty,
+                    &selected,
+                    access_align,
+                    instructions,
+                )?;
+                return Ok(loaded);
+            }
             if let Some(raw) = self.raw_offsets.get(name).cloned() {
                 let loaded = self.fresh();
                 self.emit_raw_load(loaded, load_ty, &raw, access_align, instructions)?;
@@ -258,6 +279,271 @@ impl Emitter {
         Ok(())
     }
 
+    pub(in crate::native::emitter) fn emit_selected_access_tree_load(
+        &mut self,
+        result: Word,
+        result_ty: &LlType,
+        tree: &SelectedAccessTree,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let result_ty = self.resolve_type(result_ty)?;
+        let value = self.emit_selected_access_tree_load_value(
+            tree,
+            &result_ty,
+            access_align,
+            instructions,
+        )?;
+        if value != result {
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(self.type_id(&result_ty)?),
+                Some(result),
+                vec![Operand::IdRef(value)],
+            ));
+        }
+        Ok(())
+    }
+
+    fn emit_selected_access_tree_load_value(
+        &mut self,
+        tree: &SelectedAccessTree,
+        result_ty: &LlType,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        if !types_compatible(&self.resolve_type(&tree.pointee)?, result_ty) {
+            return Err(format!(
+                "native emitter: selected access tree load type mismatch {:?} vs {result_ty:?}",
+                tree.pointee
+            ));
+        }
+        let true_value = self.emit_selected_access_arm_load_value(
+            &tree.true_arm,
+            result_ty,
+            access_align,
+            instructions,
+        )?;
+        let false_value = self.emit_selected_access_arm_load_value(
+            &tree.false_arm,
+            result_ty,
+            access_align,
+            instructions,
+        )?;
+        let value = self.fresh();
+        instructions.push(Self::inst(
+            Op::Select,
+            Some(self.type_id(result_ty)?),
+            Some(value),
+            vec![
+                Operand::IdRef(tree.cond),
+                Operand::IdRef(true_value),
+                Operand::IdRef(false_value),
+            ],
+        ));
+        Ok(value)
+    }
+
+    fn emit_selected_access_arm_load_value(
+        &mut self,
+        arm: &SelectedAccessArm,
+        result_ty: &LlType,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        match arm {
+            SelectedAccessArm::Typed { ptr, .. } => {
+                let value = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Load,
+                    Some(self.type_id(result_ty)?),
+                    Some(value),
+                    vec![Operand::IdRef(*ptr)],
+                ));
+                Ok(value)
+            }
+            SelectedAccessArm::Raw(raw) => {
+                let value = self.fresh();
+                self.emit_raw_load(value, result_ty, raw, access_align, instructions)?;
+                Ok(value)
+            }
+            SelectedAccessArm::Nested(nested) => self.emit_selected_access_tree_load_value(
+                nested,
+                result_ty,
+                access_align,
+                instructions,
+            ),
+            SelectedAccessArm::Null => self.const_null(result_ty),
+        }
+    }
+
+    pub(in crate::native::emitter) fn emit_selected_access_tree_store(
+        &mut self,
+        object_ty: &LlType,
+        object: Word,
+        tree: &SelectedAccessTree,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let object_ty = self.resolve_type(object_ty)?;
+        if !types_compatible(&self.resolve_type(&tree.pointee)?, &object_ty) {
+            return Err(format!(
+                "native emitter: selected access tree store type mismatch {:?} vs {object_ty:?}",
+                tree.pointee
+            ));
+        }
+        self.emit_selected_access_tree_store_with_parent(
+            &object_ty,
+            object,
+            tree,
+            None,
+            access_align,
+            instructions,
+        )
+    }
+
+    fn emit_selected_access_tree_store_with_parent(
+        &mut self,
+        object_ty: &LlType,
+        object: Word,
+        tree: &SelectedAccessTree,
+        parent_condition: Option<Word>,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let true_condition =
+            self.selected_access_branch_condition(parent_condition, tree.cond, true, instructions)?;
+        let false_condition = self.selected_access_branch_condition(
+            parent_condition,
+            tree.cond,
+            false,
+            instructions,
+        )?;
+        self.emit_selected_access_arm_store(
+            object_ty,
+            object,
+            &tree.true_arm,
+            true_condition,
+            access_align,
+            instructions,
+        )?;
+        self.emit_selected_access_arm_store(
+            object_ty,
+            object,
+            &tree.false_arm,
+            false_condition,
+            access_align,
+            instructions,
+        )
+    }
+
+    fn selected_access_branch_condition(
+        &mut self,
+        parent: Option<Word>,
+        condition: Word,
+        true_branch: bool,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let bool_ty = self.type_id(&LlType::Bool)?;
+        let branch = if true_branch {
+            condition
+        } else {
+            let negated = self.fresh();
+            instructions.push(Self::inst(
+                Op::LogicalNot,
+                Some(bool_ty),
+                Some(negated),
+                vec![Operand::IdRef(condition)],
+            ));
+            negated
+        };
+        let Some(parent) = parent else {
+            return Ok(branch);
+        };
+        let combined = self.fresh();
+        instructions.push(Self::inst(
+            Op::LogicalAnd,
+            Some(bool_ty),
+            Some(combined),
+            vec![Operand::IdRef(parent), Operand::IdRef(branch)],
+        ));
+        Ok(combined)
+    }
+
+    fn emit_selected_access_arm_store(
+        &mut self,
+        object_ty: &LlType,
+        object: Word,
+        arm: &SelectedAccessArm,
+        condition: Word,
+        access_align: Option<u64>,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        match arm {
+            SelectedAccessArm::Nested(nested) => self.emit_selected_access_tree_store_with_parent(
+                object_ty,
+                object,
+                nested,
+                Some(condition),
+                access_align,
+                instructions,
+            ),
+            SelectedAccessArm::Typed { ptr, storage } => {
+                if !matches!(
+                    storage,
+                    StorageClass::StorageBuffer | StorageClass::UniformConstant
+                ) {
+                    return Err(format!(
+                        "native emitter: selected access store has unsupported storage {storage:?}"
+                    ));
+                }
+                let object_type = self.type_id(object_ty)?;
+                let old = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Load,
+                    Some(object_type),
+                    Some(old),
+                    vec![Operand::IdRef(*ptr)],
+                ));
+                let value = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Select,
+                    Some(object_type),
+                    Some(value),
+                    vec![
+                        Operand::IdRef(condition),
+                        Operand::IdRef(object),
+                        Operand::IdRef(old),
+                    ],
+                ));
+                instructions.push(Self::inst(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(*ptr), Operand::IdRef(value)],
+                ));
+                Ok(())
+            }
+            SelectedAccessArm::Raw(raw) => {
+                let old = self.fresh();
+                self.emit_raw_load(old, object_ty, raw, access_align, instructions)?;
+                let value = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Select,
+                    Some(self.type_id(object_ty)?),
+                    Some(value),
+                    vec![
+                        Operand::IdRef(condition),
+                        Operand::IdRef(object),
+                        Operand::IdRef(old),
+                    ],
+                ));
+                self.emit_raw_store(object_ty, value, raw, access_align, instructions)
+            }
+            SelectedAccessArm::Null => Ok(()),
+        }
+    }
+
     pub(in crate::native::emitter) fn materialize_selected_pointer_value(
         &mut self,
         name: &str,
@@ -305,40 +591,6 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let result_ty = self.resolve_type(result_ty)?;
-        if selected.load_typed {
-            // The arms are already-typed pointers; load each with the load's value type and select.
-            let (Some(true_ptr), Some(false_ptr)) = (selected.true_ptr, selected.false_ptr) else {
-                return Err(
-                    "native emitter: load-typed selected pointer missing an arm".to_string()
-                );
-            };
-            let result_type = self.type_id(&result_ty)?;
-            let true_value = self.fresh();
-            let false_value = self.fresh();
-            instructions.push(Self::inst(
-                Op::Load,
-                Some(result_type),
-                Some(true_value),
-                vec![Operand::IdRef(true_ptr)],
-            ));
-            instructions.push(Self::inst(
-                Op::Load,
-                Some(result_type),
-                Some(false_value),
-                vec![Operand::IdRef(false_ptr)],
-            ));
-            instructions.push(Self::inst(
-                Op::Select,
-                Some(result_type),
-                Some(result),
-                vec![
-                    Operand::IdRef(selected.cond),
-                    Operand::IdRef(true_value),
-                    Operand::IdRef(false_value),
-                ],
-            ));
-            return Ok(());
-        }
         let pointee = self.resolve_type(&selected.pointee)?;
         let reinterpret_raw = pointee == LlType::Int(8) && pointee != result_ty;
         if reinterpret_raw {

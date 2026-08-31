@@ -134,9 +134,9 @@ pub(in crate::passes) fn rewrite_resource_query_selects(ctx: &mut Ctx) -> Result
     let mut rewritten_value_types: HashMap<Word, Word> = HashMap::new();
     for function_idx in 0..ctx.module.functions.len() {
         for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
-            let old = std::mem::take(
-                &mut ctx.module.functions[function_idx].blocks[block_idx].instructions,
-            );
+            let old = ctx.module.functions[function_idx].blocks[block_idx]
+                .instructions
+                .clone();
             let mut new_insts = Vec::with_capacity(old.len());
             for inst in old {
                 let result = inst.result_id;
@@ -218,7 +218,6 @@ pub(in crate::passes) fn rewrite_resource_query_selects(ctx: &mut Ctx) -> Result
             ctx.module.functions[function_idx].blocks[block_idx].instructions = new_insts;
         }
     }
-    repair_sampled_image_result_types(ctx);
     Ok(())
 }
 
@@ -263,37 +262,6 @@ fn image_type_for_sampled_operand(
     type_def_of(ctx, pointee)
         .filter(|pointee_def| pointee_def.class.opcode == Op::TypeImage)
         .map(|_| pointee)
-}
-
-fn repair_sampled_image_result_types(ctx: &mut Ctx) {
-    let mut updates = Vec::new();
-    let empty = HashMap::new();
-    for function_idx in 0..ctx.module.functions.len() {
-        for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
-            for inst_idx in 0..ctx.module.functions[function_idx].blocks[block_idx]
-                .instructions
-                .len()
-            {
-                let inst =
-                    &ctx.module.functions[function_idx].blocks[block_idx].instructions[inst_idx];
-                if inst.class.opcode != Op::SampledImage {
-                    continue;
-                }
-                let Some(Operand::IdRef(image)) = inst.operands.first() else {
-                    continue;
-                };
-                let Some(image_ty) = image_type_for_sampled_operand(ctx, &empty, *image) else {
-                    continue;
-                };
-                updates.push((function_idx, block_idx, inst_idx, image_ty));
-            }
-        }
-    }
-    for (function_idx, block_idx, inst_idx, image_ty) in updates {
-        let sampled_ty = ctx.ty_sampled_image(image_ty);
-        ctx.module.functions[function_idx].blocks[block_idx].instructions[inst_idx].result_type =
-            Some(sampled_ty);
-    }
 }
 
 fn is_duplicable_resource_use(inst: &Instruction, id: Word) -> bool {
@@ -373,4 +341,122 @@ fn pointer_type_storage_classes(module: &Module) -> HashMap<Word, StorageClass> 
             Some((id, storage))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spirv_module::ModuleHeader;
+
+    fn type_instruction(opcode: Op, result: Word, operands: Vec<Operand>) -> Instruction {
+        Instruction::new(opcode, None, Some(result), operands)
+    }
+
+    #[test]
+    fn duplicated_sampled_images_are_typed_from_their_branch_images_at_construction() {
+        let bool_ty = 1;
+        let float_ty = 2;
+        let image_2d_ty = 3;
+        let image_3d_ty = 4;
+        let sampler_ty = 5;
+        let sampled_2d_ty = 6;
+        let sampled_3d_ty = 7;
+        let selected_image_ptr_ty = 8;
+        let condition = 20;
+        let true_image = 21;
+        let false_image = 22;
+        let sampler = 23;
+        let selected_image = 30;
+        let sampled_image = 31;
+
+        let image_type = |result, dim| {
+            type_instruction(
+                Op::TypeImage,
+                result,
+                vec![
+                    Operand::IdRef(float_ty),
+                    Operand::Dim(dim),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(1),
+                    Operand::ImageFormat(spirv::ImageFormat::Unknown),
+                ],
+            )
+        };
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            type_instruction(Op::TypeBool, bool_ty, vec![]),
+            type_instruction(Op::TypeFloat, float_ty, vec![Operand::LiteralBit32(32)]),
+            image_type(image_2d_ty, spirv::Dim::Dim2D),
+            image_type(image_3d_ty, spirv::Dim::Dim3D),
+            type_instruction(Op::TypeSampler, sampler_ty, vec![]),
+            type_instruction(
+                Op::TypeSampledImage,
+                sampled_2d_ty,
+                vec![Operand::IdRef(image_2d_ty)],
+            ),
+            type_instruction(
+                Op::TypeSampledImage,
+                sampled_3d_ty,
+                vec![Operand::IdRef(image_3d_ty)],
+            ),
+            type_instruction(
+                Op::TypePointer,
+                selected_image_ptr_ty,
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(image_2d_ty),
+                ],
+            ),
+        ];
+        module.functions = vec![Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(40), vec![])),
+                instructions: vec![
+                    Instruction::new(Op::Undef, Some(bool_ty), Some(condition), vec![]),
+                    Instruction::new(Op::Undef, Some(image_2d_ty), Some(true_image), vec![]),
+                    Instruction::new(Op::Undef, Some(image_2d_ty), Some(false_image), vec![]),
+                    Instruction::new(Op::Undef, Some(sampler_ty), Some(sampler), vec![]),
+                    Instruction::new(
+                        Op::Select,
+                        Some(selected_image_ptr_ty),
+                        Some(selected_image),
+                        vec![
+                            Operand::IdRef(condition),
+                            Operand::IdRef(true_image),
+                            Operand::IdRef(false_image),
+                        ],
+                    ),
+                    Instruction::new(
+                        Op::SampledImage,
+                        Some(sampled_3d_ty),
+                        Some(sampled_image),
+                        vec![Operand::IdRef(selected_image), Operand::IdRef(sampler)],
+                    ),
+                ],
+            }],
+        }];
+
+        let mut ctx = Ctx::new(module);
+        rewrite_resource_query_selects(&mut ctx).expect("resource select lowering");
+
+        let sampled_images = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::SampledImage)
+            .collect::<Vec<_>>();
+        assert_eq!(sampled_images.len(), 2);
+        assert!(sampled_images
+            .iter()
+            .all(|instruction| instruction.result_type == Some(sampled_2d_ty)));
+        assert!(ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .all(|instruction| instruction.class.opcode != Op::Select));
+    }
 }

@@ -38,7 +38,7 @@ This tree is **not** the paravirtual GPU monorepo. Do not reintroduce monorepo p
 | `validation/` | Authored-case validation tooling (not published to crates.io) |
 | `docs/` | Architecture and consumer guides |
 | `scripts/` | Dev utilities (`mtlb-extract`, SPIR-V grammar regeneration) |
-| `.github/workflows/ci.yml` | Format, warnings-denied clippy/Rustdoc, and serial tests on `ubuntu-26.04` + `macos-26`; public Vulkan qualification on Linux |
+| `.github/workflows/ci.yml` | Format, warnings-denied clippy/Rustdoc, and parallel tests on `ubuntu-26.04` + `macos-26`; public Vulkan qualification on Linux |
 
 Crown-jewel code lives under `src/native/`, `src/passes/`, and `src/reflect/`. Prefer structural
 fixes over one-off workarounds.
@@ -135,13 +135,18 @@ fixes over one-off workarounds.
   and fixed before the affected work is done. A timeout is a safety rail, not an acceptable way
   to classify supported input. Do not meet the ceiling by skipping required validation, reducing
   semantic coverage, or converting an input that was supported before into a premature fallback.
-- **512 MiB is the hard memory budget per translation attempt.** Enforce it at the worker
+- **500 MiB is the hard memory budget per translation attempt.** Enforce it at the worker
   boundary, covering peak translation-attributable live allocations and resident growth. Kill
   the complete worker process group on a time or memory breach and clean up its scratch files.
-  Do not raise either budget without explicit user approval.
+  This explicit 500-MiB ceiling supersedes the former 300/350-MiB escalation contract. Do not raise
+  it again unless a new explicit user instruction supersedes this rule; no automatic increase
+  remains available.
 - **Keep total resource use bounded.** Parallelize only independent rows or phases, cap worker and
-  queue counts, and account for the aggregate worst case (`workers * 512 MiB`). No optimization
+  queue counts, and account for the aggregate worst case (`workers * 500 MiB`). No optimization
   may introduce unbounded threads, processes, queues, caches, retained IR, or candidate modules.
+- **Use host parallelism for corpus runs.** Corpus tooling defaults `jobs` to the host's available
+  logical CPU count (the equivalent of `nproc`). Use that default for full-corpus work; pass an
+  explicit `--jobs N` only when the user requests an override.
 - **Remove work instead of hiding it.** Prefer shard-local incremental indexing, parsing only the
   selected or changed source, caching immutable analysis, reusing still-valid CFG facts, skipping
   equivalent retry states, and releasing failed candidates promptly. Never reuse analysis across
@@ -156,7 +161,7 @@ fixes over one-off workarounds.
   slowest row and the scope measured. Debug-build timing does not verify the ceiling.
 - When a slow or memory-heavy failure class is found, add a deterministic regression check for
   the underlying redundant-work or boundedness property. Avoid machine-fragile microbenchmarks;
-  keep the 30-second and 512-MiB worker guards as hard integration backstops.
+  keep the 30-second and 500-MiB worker guards as hard integration backstops.
 - **Do not normalize known breaches.** An observed over-budget translation is an active correctness
   bug, not acceptable technical debt or a reason to weaken the workload. Profile where its time
   and memory go, remove redundant or global work structurally, and remeasure the same input under
@@ -196,14 +201,14 @@ shards under `validation/corpus/cases/`, and dependency-exact observation shards
 
 ## Build, test, CI
 
-Always run Rust tests **serially**:
+Run Rust tests with Cargo's default available parallelism (the logical CPU count):
 
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
-cargo test -p metal2vulkan -- --test-threads=1
-cargo test -p metal2vulkan-validation -- --test-threads=1
+cargo test -p metal2vulkan
+cargo test -p metal2vulkan-validation
 ```
 
 - **MSRV:** see `rust-version` in `Cargo.toml` (currently 1.87).
@@ -218,6 +223,13 @@ When diagnosing a hang, prefer reading full `cargo test` output over piping thro
 (easy to hide a later failure).
 
 ## Code style
+
+- **No empty-placeholder ownership tricks.** Do not use `std::mem::take`, `mem::replace` with an
+  empty/default sentinel, `swap` with an empty value, or an equivalent helper to move IR, modules,
+  functions, blocks, instructions, or analysis collections out of a borrowed owner. Express the
+  real ownership contract instead: consume and return the owned value, borrow the existing
+  allocation, or redesign the transformation around an explicit result. When touching an existing
+  occurrence, remove it structurally rather than copying the pattern.
 
 - **Format before every commit.** Run `cargo fmt --all` (repo `rustfmt.toml`) on the whole
   workspace so the diff you commit already matches what CI’s `fmt --check` expects. If a change
@@ -250,6 +262,6 @@ When diagnosing a hang, prefer reading full `cargo test` output over piping thro
    when fmt, clippy, and applicable Rustdoc checks are clean.
 
 **Done** = it works under the checks above, claims match evidence, fmt/clippy/Rustdoc are green,
-measured translations in the touched scope stay within 30 seconds and 512 MiB, relevant capability
+measured translations in the touched scope stay within 30 seconds and 500 MiB, relevant capability
 audits remain closed without stale evidence or unrelated source reads, and the tree stays
 publishable as a general AIR→SPIR-V translator.

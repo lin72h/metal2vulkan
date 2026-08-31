@@ -21,17 +21,16 @@
 //!   decorated, required for `OpPtrAccessChain` on a physical pointer);
 //! - loads/stores through the sub-graph get an `Aligned` operand.
 //!
-//! Applied in `lib.rs`'s failure-triggered retry (adopt-if-VALIDATES), so it is floor-safe by
-//! construction: a module that already validates never reaches it, and a rewrite that does not produce
-//! a validating module is discarded. The lowering is general over the element type/stride and decides
-//! purely from IR structure (storage class, access-chain roots, the cross-binding property) — never a
-//! shader name.
+//! Pointer-phi lowering is applied at interface construction, immediately after Metal parameters
+//! acquire their final descriptor roots. The lowering is general over the element
+//! type/stride and decides purely from IR structure (storage class, access-chain roots, the
+//! cross-binding property) — never a shader name.
 
 use crate::spirv_module::Instruction;
 use crate::spirv_module::Module;
 use crate::spirv_module::Operand;
 use spirv::{Capability, Decoration, MemoryModel, Op, StorageClass, Word};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// One leaf of a cross-binding merge closure: a load-reachable pointer that resolves to a single
 /// buffer variable, plus the array-element index its access chain carries (if any).
@@ -133,6 +132,39 @@ fn element_allocation_stride(
     store_size.max(1).checked_next_power_of_two()
 }
 
+/// Physical-storage memory operations require an explicit alignment at least as large as the
+/// accessed scalar component. Preserve any stronger declaration and insert the Aligned operand in
+/// its grammar-defined position when another memory-access flag is already present.
+fn ensure_physical_memory_alignment(instruction: &mut Instruction, required: u32) {
+    let Some(memory_access_index) = instruction
+        .operands
+        .iter()
+        .position(|operand| matches!(operand, Operand::MemoryAccess(_)))
+    else {
+        instruction
+            .operands
+            .push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
+        instruction.operands.push(Operand::LiteralBit32(required));
+        return;
+    };
+    let Operand::MemoryAccess(memory_access) = instruction.operands[memory_access_index] else {
+        unreachable!();
+    };
+    if memory_access.contains(spirv::MemoryAccess::ALIGNED) {
+        if let Some(Operand::LiteralBit32(alignment)) =
+            instruction.operands.get_mut(memory_access_index + 1)
+        {
+            *alignment = (*alignment).max(required);
+        }
+    } else {
+        instruction.operands[memory_access_index] =
+            Operand::MemoryAccess(memory_access | spirv::MemoryAccess::ALIGNED);
+        instruction
+            .operands
+            .insert(memory_access_index + 1, Operand::LiteralBit32(required));
+    }
+}
+
 /// Discovery + lowerability gate (pure): find the cross-binding pointer-merge closure, prove it is
 /// PSB-lowerable, and collect its leaves + per-buffer address-table slots. Returns `None` if there is
 /// nothing to lower or the closure is not lowerable.
@@ -211,9 +243,13 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
         for block in &function.blocks {
             for inst in &block.instructions {
                 if let Some(rid) = inst.result_id {
-                    value_def.insert(rid, inst.clone());
                     if let Some(rty) = inst.result_type {
-                        value_type.insert(rid, rty);
+                        if ptr_info(rty)
+                            .is_some_and(|(storage, _)| storage == StorageClass::StorageBuffer)
+                        {
+                            value_type.insert(rid, rty);
+                            value_def.insert(rid, inst.clone());
+                        }
                     }
                 }
             }
@@ -279,29 +315,61 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
         }
     };
 
-    // Trace a pointer value to its root module-scope buffer variable, if it bottoms out at one
-    // through a single-base access-chain spine. A select/phi (a merge) has no single root.
-    fn trace_root(
-        id: Word,
-        value_def: &HashMap<Word, Instruction>,
-        var_storage: &HashMap<Word, StorageClass>,
-    ) -> Option<Word> {
-        if var_storage.contains_key(&id) {
-            return Some(id);
-        }
-        let def = value_def.get(&id)?;
-        match def.class.opcode {
-            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
-                let Operand::IdRef(base) = def.operands.first()? else {
-                    return None;
-                };
-                trace_root(*base, value_def, var_storage)
+    // Propagate descriptor roots through the complete pointer graph. Construct-tree emission can
+    // express one source switch as a ladder of nested pointer phis, so looking only through a
+    // single access-chain spine misses the cross-binding property once an arm is itself a merge.
+    // The three-state lattice is sufficient here: construction only needs to distinguish no root,
+    // one exact root, and multiple roots. A worklist reaches a fixed point even for loop-carried
+    // pointer phis, while each value can change state at most twice.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum RootState {
+        None,
+        One(Word),
+        Multiple,
+    }
+    impl RootState {
+        fn union(self, other: Self) -> Self {
+            match (self, other) {
+                (Self::Multiple, _) | (_, Self::Multiple) => Self::Multiple,
+                (Self::None, state) | (state, Self::None) => state,
+                (Self::One(left), Self::One(right)) if left == right => Self::One(left),
+                (Self::One(_), Self::One(_)) => Self::Multiple,
             }
-            _ => None,
+        }
+    }
+    let dependencies = value_def
+        .iter()
+        .filter(|(id, _)| is_sb_pointer(**id))
+        .map(|(id, definition)| (*id, pointer_operands(definition)))
+        .collect::<HashMap<_, _>>();
+    let mut dependents = HashMap::<Word, Vec<Word>>::new();
+    for (&value, operands) in &dependencies {
+        for &operand in operands {
+            dependents.entry(operand).or_default().push(value);
+        }
+    }
+    let mut root_states = var_storage
+        .iter()
+        .filter_map(|(&id, &storage)| {
+            (storage == StorageClass::StorageBuffer).then_some((id, RootState::One(id)))
+        })
+        .collect::<HashMap<_, _>>();
+    root_states.extend(dependencies.keys().map(|&id| (id, RootState::None)));
+    let mut root_worklist = dependencies.keys().copied().collect::<VecDeque<_>>();
+    while let Some(value) = root_worklist.pop_front() {
+        let next = dependencies.get(&value).into_iter().flatten().fold(
+            RootState::None,
+            |state, operand| {
+                state.union(root_states.get(operand).copied().unwrap_or(RootState::None))
+            },
+        );
+        if root_states.get(&value).copied() != Some(next) {
+            root_states.insert(value, next);
+            root_worklist.extend(dependents.get(&value).into_iter().flatten().copied());
         }
     }
 
-    // Find cross-binding merges: a select/phi whose pointer arms trace to >=2 distinct buffer roots.
+    // Find every select/phi whose transitive pointer arms reach distinct descriptor roots.
     let mut cross_binding_merges: Vec<Word> = Vec::new();
     for (id, def) in &value_def {
         if !matches!(def.class.opcode, Op::Select | Op::Phi) {
@@ -310,11 +378,7 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
         if !is_sb_pointer(*id) {
             continue;
         }
-        let roots: HashSet<Word> = pointer_operands(def)
-            .iter()
-            .filter_map(|p| trace_root(*p, &value_def, &var_storage))
-            .collect();
-        if roots.len() >= 2 {
+        if root_states.get(id) == Some(&RootState::Multiple) {
             cross_binding_merges.push(*id);
         }
     }
@@ -457,8 +521,13 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
             // indices are unchanged — byte-identical, since the struct's member Offsets / array
             // ArrayStride carry over to the physical pointee). No leaf, no value rewrite.
             Op::AccessChain | Op::InBoundsAccessChain => {}
-            Op::Select | Op::Phi | Op::PtrAccessChain | Op::CopyObject => {}
-            _ => return None, // an op we don't lower in the closure -> bail
+            // Function-local pointer undef is a permitted merge arm, not a descriptor leaf. The
+            // synthesis phase below already replaces nullish/undef arms with a dominating zero
+            // address converted to the exact physical pointer type.
+            Op::Select | Op::Phi | Op::PtrAccessChain | Op::CopyObject | Op::Undef => {}
+            _ => {
+                return None;
+            }
         }
     }
     if leaves.is_empty() {
@@ -535,7 +604,10 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
                 if !in_closure_def {
                     for op in &inst.operands {
                         if let Operand::IdRef(id) = op {
-                            if closure.contains(id) {
+                            // Whole-buffer variables are not retyped or replaced in place. Their
+                            // ordinary descriptor accesses remain valid alongside the synthesized
+                            // physical base address used by the merge closure.
+                            if closure.contains(id) && !is_buffer_var(*id) {
                                 return None;
                             }
                         }
@@ -573,16 +645,17 @@ fn discover_cross_binding_psb(module: &Module) -> Option<PsbDiscovery> {
 /// element pointers and rewrite the merges (mutating).
 #[cfg(test)]
 pub(super) fn rewrite_cross_binding_pointer_merges(module: &mut Module) -> bool {
-    rewrite_cross_binding_pointer_merges_with_layout(
+    construct_cross_binding_pointer_merges_with_layout(
         module,
         crate::reflect::DescriptorLayout::default(),
     )
+    .is_some()
 }
 
-pub(super) fn rewrite_cross_binding_pointer_merges_with_layout(
+pub(super) fn construct_cross_binding_pointer_merges_with_layout(
     module: &mut Module,
     layout: crate::reflect::DescriptorLayout,
-) -> bool {
+) -> Option<Word> {
     rewrite_cross_binding_pointer_merges_inner(module, false, layout)
 }
 
@@ -592,23 +665,24 @@ pub(super) fn rewrite_cross_binding_pointer_merges_with_layout(
 /// accesses cannot be replayed at predecessor edges.
 #[cfg(test)]
 pub(super) fn rewrite_cross_binding_pointer_phis(module: &mut Module) -> bool {
-    rewrite_cross_binding_pointer_phis_with_layout(
+    construct_cross_binding_pointer_phis_with_layout(
         module,
         crate::reflect::DescriptorLayout::default(),
     )
+    .is_some()
 }
 
-pub(super) fn rewrite_cross_binding_pointer_phis_with_layout(
+pub(super) fn construct_cross_binding_pointer_phis_with_layout(
     module: &mut Module,
     layout: crate::reflect::DescriptorLayout,
-) -> bool {
+) -> Option<Word> {
     rewrite_cross_binding_pointer_merges_inner(module, true, layout)
 }
 
 /// True when the module contains a lowerable cross-binding pointer closure with an `OpPhi`.
-/// This is intentionally the same discovery gate as the physical rewrite, but leaves the module
-/// untouched so callers can ask spirv-val whether the phi is the actual primary failure before
-/// changing any bytes.
+/// This is intentionally the same discovery gate as construction, but leaves the module untouched
+/// so the structural tests can verify select-only and phi-containing closures independently.
+#[cfg(test)]
 pub(super) fn has_cross_binding_pointer_phi(module: &Module) -> bool {
     discover_cross_binding_psb(module).is_some_and(|discovery| discovery.has_cross_binding_phi)
 }
@@ -617,13 +691,41 @@ fn rewrite_cross_binding_pointer_merges_inner(
     module: &mut Module,
     require_cross_binding_phi: bool,
     layout: crate::reflect::DescriptorLayout,
-) -> bool {
-    let Some(discovery) = discover_cross_binding_psb(module) else {
-        return false;
-    };
-    if require_cross_binding_phi && !discovery.has_cross_binding_phi {
-        return false;
+) -> Option<Word> {
+    let storage_buffer_pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer
+                && instruction.operands.first()
+                    == Some(&Operand::StorageClass(StorageClass::StorageBuffer)))
+            .then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    let has_pointer_merge = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| {
+            matches!(instruction.class.opcode, Op::Phi | Op::Select)
+                && instruction
+                    .result_type
+                    .is_some_and(|ty| storage_buffer_pointer_types.contains(&ty))
+        });
+    if !has_pointer_merge {
+        return None;
     }
+    let discovery = discover_cross_binding_psb(module)?;
+    if require_cross_binding_phi && !discovery.has_cross_binding_phi {
+        return None;
+    }
+    // Reserve the translator-owned table binding before mutating the module. Descriptor exhaustion
+    // is a construction failure, not permission to leave a partially synthesized physical-pointer
+    // graph behind.
+    let occupied = crate::spirv_module::descriptor_bindings_in_set(module, layout.set);
+    let address_table_binding = (layout.synthetic.start..layout.synthetic.end)
+        .find(|binding| !occupied.contains(binding))?;
     let PsbDiscovery {
         type_defs,
         var_storage,
@@ -790,7 +892,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
         }
         let pointee = match value_type.get(&v).and_then(|t| ptr_info(*t)) {
             Some((_, p)) => p,
-            None => return false,
+            None => return None,
         };
         let psb = match psb_ptr.get(&pointee) {
             Some(p) => *p,
@@ -825,6 +927,153 @@ fn rewrite_cross_binding_pointer_merges_inner(
             }
         };
         retype.insert(v, psb);
+    }
+
+    // LLVM opaque pointers permit a closure pointer's recovered element spelling to differ from the
+    // type of a direct memory operation through it. Once the closure becomes a physical-address
+    // graph, SPIR-V makes that relationship explicit: the pointer consumed by OpLoad/OpStore must
+    // point to the accessed value type. Collect those typed views before rewriting instructions and
+    // construct one PhysicalStorageBuffer pointer type per accessed value type. The instruction
+    // rewrite below preserves the selected byte address and changes only its typed view.
+    let all_value_types = module
+        .all_inst_iter()
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+        .collect::<HashMap<_, _>>();
+    let all_value_defs = module
+        .all_inst_iter()
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.clone())))
+        .collect::<HashMap<_, _>>();
+    let mut memory_view_pointees = HashSet::new();
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
+                    continue;
+                };
+                if !closure.contains(pointer) {
+                    continue;
+                }
+                let accessed_type = match instruction.class.opcode {
+                    Op::Load => instruction.result_type,
+                    Op::Store => instruction
+                        .operands
+                        .get(1)
+                        .and_then(|operand| match operand {
+                            Operand::IdRef(object) => all_value_types.get(object).copied(),
+                            _ => None,
+                        }),
+                    _ => None,
+                };
+                let pointer_pointee = value_type
+                    .get(pointer)
+                    .and_then(|ty| ptr_info(*ty))
+                    .map(|(_, pointee)| pointee);
+                if accessed_type != pointer_pointee {
+                    memory_view_pointees.extend(accessed_type);
+                }
+            }
+        }
+    }
+    for pointee in memory_view_pointees {
+        if psb_ptr.contains_key(&pointee) {
+            continue;
+        }
+        let id = fresh();
+        module.types_global_values.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(id),
+            vec![
+                Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                Operand::IdRef(pointee),
+            ],
+        ));
+        psb_ptr.insert(pointee, id);
+    }
+
+    // Retype null/undef arms at the same construction boundary as their pointer merge. Physical
+    // pointers cannot be OpConstantNull, so refine either source form to address zero and convert it
+    // in the function entry. That value dominates every reachable phi parent/select use and keeps
+    // null semantics while choosing one permitted value for LLVM `undef`.
+    let mut nullish_retype_requests = Vec::new();
+    for (function_index, function) in module.functions.iter().enumerate() {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                let Some(result) = instruction.result_id else {
+                    continue;
+                };
+                let Some(&new_type) = retype.get(&result) else {
+                    continue;
+                };
+                let pointer_arm_indices = match instruction.class.opcode {
+                    Op::Select => (1..instruction.operands.len()).collect::<Vec<_>>(),
+                    Op::Phi => (0..instruction.operands.len()).step_by(2).collect(),
+                    Op::CopyObject => vec![0],
+                    _ => continue,
+                };
+                for index in pointer_arm_indices {
+                    let Some(Operand::IdRef(source)) = instruction.operands.get(index) else {
+                        continue;
+                    };
+                    let Some(definition) = all_value_defs.get(source) else {
+                        continue;
+                    };
+                    if matches!(definition.class.opcode, Op::Undef | Op::ConstantNull)
+                        && definition.result_type != Some(new_type)
+                    {
+                        nullish_retype_requests.push((function_index, *source, new_type));
+                    }
+                }
+            }
+        }
+    }
+    nullish_retype_requests
+        .sort_unstable_by_key(|(function, source, ty)| (*function, *source, *ty));
+    nullish_retype_requests.dedup();
+    let uint_zero = uint_const(module, &mut fresh, 0);
+    let mut nullish_retypes = HashMap::new();
+    let mut nullish_conversions = vec![Vec::new(); module.functions.len()];
+    let mut nullish_zero_addresses = vec![None; module.functions.len()];
+    for (function_index, source, new_type) in nullish_retype_requests {
+        let zero_address = match nullish_zero_addresses[function_index] {
+            Some(id) => id,
+            None => {
+                let id = fresh();
+                nullish_conversions[function_index].push(Instruction::new(
+                    Op::UConvert,
+                    Some(ulong_ty),
+                    Some(id),
+                    vec![Operand::IdRef(uint_zero)],
+                ));
+                nullish_zero_addresses[function_index] = Some(id);
+                id
+            }
+        };
+        let replacement = fresh();
+        nullish_conversions[function_index].push(Instruction::new(
+            Op::ConvertUToPtr,
+            Some(new_type),
+            Some(replacement),
+            vec![Operand::IdRef(zero_address)],
+        ));
+        nullish_retypes.insert((function_index, source, new_type), replacement);
+    }
+    for (function, conversions) in module.functions.iter_mut().zip(nullish_conversions) {
+        if conversions.is_empty() {
+            continue;
+        }
+        let entry = function.blocks.first_mut()?;
+        let insertion = entry
+            .instructions
+            .iter()
+            .position(|instruction| {
+                !matches!(
+                    instruction.class.opcode,
+                    Op::Variable | Op::Line | Op::NoLine
+                )
+            })
+            .unwrap_or(entry.instructions.len());
+        entry.instructions.splice(insertion..insertion, conversions);
     }
 
     // Address-table descriptor: struct { runtimearray u64 } in the translator-owned binding range.
@@ -900,12 +1149,6 @@ fn rewrite_cross_binding_pointer_merges_inner(
         vec![Operand::StorageClass(StorageClass::StorageBuffer)],
     ));
     // Allocate the translator-owned address table within the selected synthetic band.
-    let occupied = crate::spirv_module::descriptor_bindings_in_set(module, layout.set);
-    let Some(address_table_binding) =
-        (layout.synthetic.start..layout.synthetic.end).find(|binding| !occupied.contains(binding))
-    else {
-        return false;
-    };
     module.annotations.push(Instruction::new(
         Op::Decorate,
         None,
@@ -1023,8 +1266,8 @@ fn rewrite_cross_binding_pointer_merges_inner(
 
     // Per closure-pointer `Aligned` operand value: the scalar alignment of its pointee. A load/store
     // through a closure pointer becomes a PhysicalStorageBuffer access and needs a valid `Aligned`
-    // operand (see `scalar_align`); fall back to 4 (the common 32-bit element) if a pointer's pointee
-    // is unexpectedly untyped — adopt-if-validates catches any wrong guess.
+    // operand (see `scalar_align`). An untyped pointee is omitted rather than assigned a guessed
+    // alignment.
     let closure_align: HashMap<Word, u32> = closure_values
         .iter()
         .filter_map(|p| {
@@ -1037,10 +1280,10 @@ fn rewrite_cross_binding_pointer_merges_inner(
         .collect();
 
     // Rewrite instructions.
-    for function in &mut module.functions {
+    for (function_index, function) in module.functions.iter_mut().enumerate() {
         for block in &mut function.blocks {
             let mut new_insts: Vec<Instruction> = Vec::with_capacity(block.instructions.len());
-            for inst in block.instructions.drain(..) {
+            for inst in block.instructions.clone() {
                 let rid = inst.result_id;
                 // Leaf access chain -> address load + ConvertUToPtr.
                 if let Some(r) = rid {
@@ -1184,39 +1427,91 @@ fn rewrite_cross_binding_pointer_merges_inner(
                                 | Op::CopyObject
                         ) {
                             inst.result_type = Some(*new_ty);
+                            let pointer_arm_indices = match inst.class.opcode {
+                                Op::Select => (1..inst.operands.len()).collect::<Vec<_>>(),
+                                Op::Phi => (0..inst.operands.len()).step_by(2).collect(),
+                                Op::CopyObject => vec![0],
+                                _ => Vec::new(),
+                            };
+                            for index in pointer_arm_indices {
+                                let Some(Operand::IdRef(source)) = inst.operands.get_mut(index)
+                                else {
+                                    continue;
+                                };
+                                if let Some(&replacement) =
+                                    nullish_retypes.get(&(function_index, *source, *new_ty))
+                                {
+                                    *source = replacement;
+                                }
+                            }
                         }
+                    }
+                }
+                // A direct memory access can carry an opaque-pointer spelling different from its
+                // accessed value type. Materialize the exact same address with the accessed pointee
+                // type before the memory operation; this makes the physical pointer contract explicit
+                // without changing the selected buffer or byte offset.
+                let closure_memory_pointer = match inst.class.opcode {
+                    Op::Load | Op::Store => {
+                        inst.operands.first().and_then(|operand| match operand {
+                            Operand::IdRef(pointer) if closure.contains(pointer) => Some(*pointer),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                };
+                let accessed_type = match inst.class.opcode {
+                    Op::Load => inst.result_type,
+                    Op::Store => inst.operands.get(1).and_then(|operand| match operand {
+                        Operand::IdRef(object) => all_value_types.get(object).copied(),
+                        _ => None,
+                    }),
+                    _ => None,
+                };
+                if let (Some(pointer), Some(accessed_type)) =
+                    (closure_memory_pointer, accessed_type)
+                {
+                    let pointer_pointee = value_type
+                        .get(&pointer)
+                        .and_then(|ty| ptr_info(*ty))
+                        .map(|(_, pointee)| pointee);
+                    if closure.contains(&pointer) && pointer_pointee != Some(accessed_type) {
+                        let address = fresh();
+                        new_insts.push(Instruction::new(
+                            Op::ConvertPtrToU,
+                            Some(ulong_ty),
+                            Some(address),
+                            vec![Operand::IdRef(pointer)],
+                        ));
+                        let typed_pointer = fresh();
+                        new_insts.push(Instruction::new(
+                            Op::ConvertUToPtr,
+                            Some(*psb_ptr.get(&accessed_type).unwrap()),
+                            Some(typed_pointer),
+                            vec![Operand::IdRef(address)],
+                        ));
+                        inst.operands[0] = Operand::IdRef(typed_pointer);
                     }
                 }
                 // Aligned operand on loads/stores through a closure pointer.
                 match inst.class.opcode {
                     Op::Load => {
-                        if let Some(Operand::IdRef(p)) = inst.operands.first() {
-                            if closure.contains(p)
-                                && !inst
-                                    .operands
-                                    .iter()
-                                    .any(|o| matches!(o, Operand::MemoryAccess(_)))
-                            {
-                                let align = closure_align.get(p).copied().unwrap_or(4);
-                                inst.operands
-                                    .push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
-                                inst.operands.push(Operand::LiteralBit32(align));
-                            }
+                        if let Some(pointer) = closure_memory_pointer {
+                            let align = inst
+                                .result_type
+                                .and_then(scalar_align)
+                                .or_else(|| closure_align.get(&pointer).copied())
+                                .unwrap_or(4);
+                            ensure_physical_memory_alignment(&mut inst, align);
                         }
                     }
                     Op::Store => {
-                        if let Some(Operand::IdRef(p)) = inst.operands.first() {
-                            if closure.contains(p)
-                                && !inst
-                                    .operands
-                                    .iter()
-                                    .any(|o| matches!(o, Operand::MemoryAccess(_)))
-                            {
-                                let align = closure_align.get(p).copied().unwrap_or(4);
-                                inst.operands
-                                    .push(Operand::MemoryAccess(spirv::MemoryAccess::ALIGNED));
-                                inst.operands.push(Operand::LiteralBit32(align));
-                            }
+                        if let Some(pointer) = closure_memory_pointer {
+                            let align = accessed_type
+                                .and_then(scalar_align)
+                                .or_else(|| closure_align.get(&pointer).copied())
+                                .unwrap_or(4);
+                            ensure_physical_memory_alignment(&mut inst, align);
                         }
                     }
                     _ => {}
@@ -1270,7 +1565,7 @@ fn rewrite_cross_binding_pointer_merges_inner(
     if let Some(header) = module.header.as_mut() {
         header.bound = next_id;
     }
-    true
+    Some(addr_var)
 }
 
 #[cfg(test)]
@@ -1537,7 +1832,8 @@ mod tests {
     // whole-buffer leaf path the select's variable arms are filtered out and no merge is detected.
     #[test]
     fn rewrite_whole_buffer_cross_binding_select_lowers_to_physical() {
-        // ids: uint=1 rtarr=2 struct=3 ptrSbStruct=4 ptrSbUint=5 bool=6 | uint_0=10 true=11
+        // ids: uint=1 rtarr=2 struct=3 ptrSbStruct=4 ptrSbUint=5 bool=6 float=7 vec4=8 |
+        //      uint_0=10 true=11 undefPtr=12
         //      bufA=20 bufB=21 | entry=30 select=31 chain=32 load=33
         let mut m = Module::new();
         m.header = Some(ModuleHeader::new(40));
@@ -1579,12 +1875,25 @@ mod tests {
             ),
             inst(Op::TypeBool, None, Some(6), vec![]),
             inst(
+                Op::TypeFloat,
+                None,
+                Some(7),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            inst(
+                Op::TypeVector,
+                None,
+                Some(8),
+                vec![Operand::IdRef(7), Operand::LiteralBit32(4)],
+            ),
+            inst(
                 Op::Constant,
                 Some(1),
                 Some(10),
                 vec![Operand::LiteralBit32(0)],
             ),
             inst(Op::ConstantTrue, Some(6), Some(11), vec![]),
+            inst(Op::Undef, Some(4), Some(12), vec![]),
             inst(
                 Op::Variable,
                 Some(4),
@@ -1662,7 +1971,10 @@ mod tests {
                 Some(32),
                 vec![Operand::IdRef(31), Operand::IdRef(10), Operand::IdRef(10)],
             ),
-            inst(Op::Load, Some(1), Some(33), vec![Operand::IdRef(32)]),
+            // The recovered pointer spelling is uint*, while the opaque-pointer memory operation
+            // accesses a float4. Physical construction must preserve the address and create the
+            // exact float4 pointer view consumed by this load.
+            inst(Op::Load, Some(8), Some(33), vec![Operand::IdRef(32)]),
             inst(Op::Return, None, None, vec![]),
         ];
         let mut func = Function::new();
@@ -1671,6 +1983,34 @@ mod tests {
 
         let mut select_only = m.clone();
         assert!(!has_cross_binding_pointer_phi(&select_only));
+        let mut pointer_invalid = select_only.clone();
+        pointer_invalid.functions[0].blocks[0].instructions.insert(
+            1,
+            inst(Op::Bitcast, Some(4), Some(39), vec![Operand::IdRef(20)]),
+        );
+        let pointer_invalid_before = pointer_invalid.assemble();
+        assert_eq!(
+            super::super::rewrites::construct_interface_cross_binding_pointer_merges_module(
+                &mut pointer_invalid,
+                crate::reflect::DescriptorLayout::default(),
+            ),
+            None
+        );
+        assert_eq!(pointer_invalid.assemble(), pointer_invalid_before);
+        let mut memory_invalid = select_only.clone();
+        memory_invalid.functions[0].blocks[0].instructions.insert(
+            1,
+            inst(Op::Load, Some(1), Some(38), vec![Operand::IdRef(7)]),
+        );
+        let memory_invalid_before = memory_invalid.assemble();
+        assert_eq!(
+            super::super::rewrites::construct_interface_cross_binding_pointer_merges_module(
+                &mut memory_invalid,
+                crate::reflect::DescriptorLayout::default(),
+            ),
+            None
+        );
+        assert_eq!(memory_invalid.assemble(), memory_invalid_before);
         let mut phi = m.clone();
         phi.functions[0].blocks[0].instructions[0] = inst(
             Op::Phi,
@@ -1681,10 +2021,54 @@ mod tests {
                 Operand::IdRef(30),
                 Operand::IdRef(21),
                 Operand::IdRef(30),
+                Operand::IdRef(12),
+                Operand::IdRef(30),
             ],
         );
         assert!(has_cross_binding_pointer_phi(&phi));
+        let mut nested_phi = m.clone();
+        nested_phi.functions[0].blocks[0].instructions[0] = inst(
+            Op::Phi,
+            Some(4),
+            Some(31),
+            vec![
+                Operand::IdRef(20),
+                Operand::IdRef(30),
+                Operand::IdRef(34),
+                Operand::IdRef(30),
+            ],
+        );
+        nested_phi.functions[0].blocks[0].instructions.insert(
+            0,
+            inst(
+                Op::Phi,
+                Some(4),
+                Some(34),
+                vec![
+                    Operand::IdRef(21),
+                    Operand::IdRef(30),
+                    Operand::IdRef(12),
+                    Operand::IdRef(30),
+                ],
+            ),
+        );
+        assert!(has_cross_binding_pointer_phi(&nested_phi));
+        assert!(rewrite_cross_binding_pointer_phis(&mut nested_phi));
         assert!(!rewrite_cross_binding_pointer_phis(&mut select_only));
+        let before_exhaustion = phi.assemble();
+        let exhausted_layout = crate::reflect::DescriptorLayout {
+            synthetic: crate::reflect::DescriptorBindingRange {
+                start: crate::reflect::SYNTHETIC_BINDING_BASE,
+                end: crate::reflect::SYNTHETIC_BINDING_BASE,
+            },
+            ..crate::reflect::DescriptorLayout::default()
+        };
+        assert_eq!(
+            construct_cross_binding_pointer_phis_with_layout(&mut phi, exhausted_layout),
+            None
+        );
+        assert_eq!(phi.assemble(), before_exhaustion);
+        assert!(rewrite_cross_binding_pointer_phis(&mut phi));
         assert!(rewrite_cross_binding_pointer_merges(&mut m));
 
         // Memory model is now PhysicalStorageBuffer64.
@@ -1705,13 +2089,14 @@ mod tests {
             .operands
             .iter()
             .any(|o| matches!(o, Operand::IdRef(20) | Operand::IdRef(21))));
-        // Two ConvertUToPtr base pointers were synthesized (one per merged buffer).
+        // Two base pointers (one per merged buffer) and the load's typed float4 view were
+        // synthesized.
         let n_convert = m.functions[0].blocks[0]
             .instructions
             .iter()
             .filter(|i| i.class.opcode == Op::ConvertUToPtr)
             .count();
-        assert_eq!(n_convert, 2);
+        assert_eq!(n_convert, 3);
         // The post-merge access chain's result type is now a PhysicalStorageBuffer pointer.
         let chain = m.functions[0].blocks[0]
             .instructions
@@ -1728,6 +2113,60 @@ mod tests {
             sc,
             Some(Operand::StorageClass(StorageClass::PhysicalStorageBuffer))
         ));
+        let load = m.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|i| i.result_id == Some(33))
+            .unwrap();
+        let Operand::IdRef(load_pointer) = load.operands[0] else {
+            panic!("load pointer is not an id");
+        };
+        let load_pointer_type = m.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|i| i.result_id == Some(load_pointer))
+            .and_then(|i| i.result_type)
+            .unwrap();
+        let load_pointer_definition = m
+            .types_global_values
+            .iter()
+            .find(|i| i.result_id == Some(load_pointer_type))
+            .unwrap();
+        assert_eq!(
+            load_pointer_definition.operands,
+            [
+                Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                Operand::IdRef(8)
+            ]
+        );
+        let rewritten_phi = phi.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|i| i.result_id == Some(31))
+            .unwrap();
+        let Operand::IdRef(retyped_undef) = rewritten_phi.operands[4] else {
+            panic!("phi undef arm is not an id");
+        };
+        assert_ne!(retyped_undef, 12);
+        let retyped_undef_definition = phi.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|i| i.result_id == Some(retyped_undef))
+            .unwrap();
+        assert_eq!(retyped_undef_definition.class.opcode, Op::ConvertUToPtr);
+        assert_eq!(
+            retyped_undef_definition.result_type,
+            rewritten_phi.result_type
+        );
+        let Operand::IdRef(zero_address) = retyped_undef_definition.operands[0] else {
+            panic!("physical null address is not an id");
+        };
+        let zero_address_definition = phi.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|instruction| instruction.result_id == Some(zero_address))
+            .expect("zero address conversion");
+        assert_eq!(zero_address_definition.class.opcode, Op::UConvert);
     }
 
     // The same whole-buffer cross-binding select, but the post-merge access chain feeds an ATOMIC op

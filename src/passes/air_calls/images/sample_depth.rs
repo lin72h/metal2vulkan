@@ -55,7 +55,7 @@ pub(in crate::passes) fn lower_sample_depth(
         .filter(|state| state.uses_pixel_coordinates());
     let color = if let Some(state) = pixel_state {
         let lod = ctx.const_uint(0);
-        if state.uses_linear_filter() && matches!(dim, Dim::Dim2D | Dim::Dim3D) {
+        if state.uses_linear_filter() && matches!(dim, Dim::Dim1D | Dim::Dim2D | Dim::Dim3D) {
             lower_pixel_linear_sample(
                 ctx,
                 state,

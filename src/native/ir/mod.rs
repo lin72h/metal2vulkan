@@ -1,5 +1,5 @@
 use super::parse::{
-    is_ignored_intrinsic, parse_declaration, parse_function, parse_global, parse_type,
+    is_ignored_intrinsic, parse_declaration, parse_function_header, parse_global, parse_type,
     strip_comment,
 };
 use crate::meta::{self, AirScalar, AirType, KernRole};
@@ -39,7 +39,7 @@ pub(super) enum LlTypeCapability {
     Int64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct TypedValue {
     pub(super) ty: LlType,
     pub(super) value: LlValue,
@@ -70,7 +70,39 @@ pub(super) enum LlValue {
     Undef,
 }
 
-#[derive(Clone, Debug)]
+impl PartialEq for LlValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local(a), Self::Local(b)) | (Self::Global(a), Self::Global(b)) => a == b,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) | (Self::Hex(a), Self::Hex(b)) => a == b,
+            (Self::SignedInt(a), Self::SignedInt(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::HalfBits(a), Self::HalfBits(b)) | (Self::BFloatBits(a), Self::BFloatBits(b)) => {
+                a == b
+            }
+            (Self::Vector(a), Self::Vector(b))
+            | (Self::Array(a), Self::Array(b))
+            | (Self::Struct(a), Self::Struct(b)) => a == b,
+            (Self::Splat(a), Self::Splat(b)) => a == b,
+            (Self::Gep(a), Self::Gep(b)) => a == b,
+            (
+                Self::IntToPtr {
+                    source: a_source,
+                    destination: a_destination,
+                },
+                Self::IntToPtr {
+                    source: b_source,
+                    destination: b_destination,
+                },
+            ) => a_source == b_source && a_destination == b_destination,
+            (Self::Zero, Self::Zero) | (Self::Undef, Self::Undef) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct LlGep {
     pub(super) inbounds: bool,
     pub(super) source_ty: LlType,
@@ -137,7 +169,7 @@ pub(super) struct LlModule {
     pub(super) declarations: Vec<LlDeclaration>,
     pub(super) globals: Vec<LlGlobal>,
     /// Proven immutable integer values materialized by AIR static initializers.
-    static_init_int_globals: HashMap<String, u32>,
+    static_init_globals: HashMap<String, meta::StaticIntValue>,
     /// Stage entry selected by the caller's parsed AIR metadata. `None` preserves the downstream
     /// transform's historical fallback to the first bodied function.
     pub(super) entry_name: Option<String>,
@@ -176,7 +208,48 @@ pub(super) struct LlModule {
     /// Entry params declared `air.buffer` in the kernel metadata (any element type): DATA pointers,
     /// as opposed to `air.texture`/sampler args that also arrive as `ptr addrspace(1)` params.
     pub(super) metadata_data_buffer_params: HashSet<(String, String)>,
+    /// Primitive pointee declared by AIR entry-buffer metadata, retained independently from the
+    /// use-inferred logical pointer type. Representation planning needs this source contract when a
+    /// helper reinterprets a float buffer through an integer atomic view.
+    pub(super) metadata_primitive_buffer_pointees: HashMap<(String, String), LlType>,
+    /// Entry function-constant buffer parameters keyed to their shared Metal buffer location.
+    pub(super) metadata_fc_buffer_locations: HashMap<(String, String), u32>,
     pub(super) raw_buffer_params: HashSet<(String, String)>,
+    /// Buffer parameters whose raw representation was selected because one call-connected object
+    /// has storage-incompatible views. Interface construction must retain that representation
+    /// instead of reconstructing one endpoint's typed view.
+    pub(super) call_connected_raw_params: HashSet<(String, String)>,
+    /// Raw parameters connected through an address-preserving call edge to another function
+    /// parameter. Workgroup memory in this set can share one raw entry allocation; a raw helper fed
+    /// from a typed global cannot and retains its concrete vector-backed lowering.
+    pub(super) param_connected_raw_params: HashSet<(String, String)>,
+}
+
+fn infer_metadata_fc_buffer_locations(
+    kern: Option<&meta::KernMeta>,
+    entry_name: Option<&str>,
+    functions: &[LlFunction],
+) -> HashMap<(String, String), u32> {
+    let Some(kern) = kern else {
+        return HashMap::new();
+    };
+    let Some(entry_name) = entry_name else {
+        return HashMap::new();
+    };
+    let Some(entry) = functions
+        .iter()
+        .find(|function| function.name == entry_name)
+    else {
+        return HashMap::new();
+    };
+    kern.function_constant_buffer_locations
+        .iter()
+        .filter_map(|(index, location)| {
+            let (name, ty) = entry.params.get(*index as usize)?;
+            matches!(ty, LlType::Ptr(1 | 2))
+                .then(|| ((entry.name.clone(), name.clone()), *location))
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -201,9 +274,9 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
     while changed {
         changed = false;
         for inst in f.carrier_insts() {
-            if let Some((res, base)) = &inst.identity_ptr_bitcast {
+            if let Some((res, base)) = inst.identity_ptr_bitcast() {
                 if let Some(root) = roots.get(base).cloned() {
-                    if roots.insert(res.clone(), root).is_none() {
+                    if roots.insert(res.to_string(), root).is_none() {
                         changed = true;
                     }
                 }
@@ -213,7 +286,7 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
             let Some(res) = &inst.result else {
                 continue;
             };
-            if let Some(gep) = &inst.gep {
+            if let Some(gep) = &inst.gep() {
                 let LlValue::Local(base) = &gep.base.value else {
                     continue;
                 };
@@ -241,15 +314,15 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
                 }
                 Some(root)
             };
-            if let Some(incoming) = &inst.phi_incoming_values {
-                if let Some(root) = common_root(incoming.iter().collect()) {
+            if let Some(incoming) = inst.phi_values() {
+                if let Some(root) = common_root(incoming.collect()) {
                     if roots.insert(res.clone(), root).is_none() {
                         changed = true;
                     }
                 }
                 continue;
             }
-            if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
+            if let Some((true_value, false_value)) = inst.select_arms().as_deref() {
                 if !matches!(true_value.ty, LlType::Ptr(_))
                     || !matches!(false_value.ty, LlType::Ptr(_))
                 {
@@ -284,17 +357,17 @@ fn cross_buffer_pointer_phi_gep_sources(f: &LlFunction) -> HashMap<String, HashS
     while changed {
         changed = false;
         for inst in f.carrier_insts() {
-            if let Some((res, base)) = &inst.identity_ptr_bitcast {
+            if let Some((res, base)) = inst.identity_ptr_bitcast() {
                 let Some(base_roots) = roots.get(base).cloned() else {
                     continue;
                 };
                 let base_has_phi = contains_phi.get(base).copied().unwrap_or(false);
-                let result_roots = roots.entry(res.clone()).or_default();
+                let result_roots = roots.entry(res.to_string()).or_default();
                 let old_len = result_roots.len();
                 result_roots.extend(base_roots);
                 changed |= result_roots.len() != old_len;
                 if base_has_phi && !contains_phi.get(res).copied().unwrap_or(false) {
-                    contains_phi.insert(res.clone(), true);
+                    contains_phi.insert(res.to_string(), true);
                     changed = true;
                 }
                 continue;
@@ -303,7 +376,7 @@ fn cross_buffer_pointer_phi_gep_sources(f: &LlFunction) -> HashMap<String, HashS
             let Some(res) = &inst.result else {
                 continue;
             };
-            if let Some(gep) = &inst.gep {
+            if let Some(gep) = &inst.gep() {
                 let LlValue::Local(base) = &gep.base.value else {
                     continue;
                 };
@@ -323,7 +396,7 @@ fn cross_buffer_pointer_phi_gep_sources(f: &LlFunction) -> HashMap<String, HashS
                 continue;
             }
 
-            let (merge_roots, result_has_phi) = if let Some(incoming) = &inst.phi_incoming_values {
+            let (merge_roots, result_has_phi) = if let Some(incoming) = inst.phi_values() {
                 let mut merged = HashSet::new();
                 let mut complete = true;
                 for value in incoming {
@@ -338,7 +411,7 @@ fn cross_buffer_pointer_phi_gep_sources(f: &LlFunction) -> HashMap<String, HashS
                     merged.extend(value_roots.iter().cloned());
                 }
                 (complete.then_some(merged), true)
-            } else if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
+            } else if let Some((true_value, false_value)) = inst.select_arms().as_deref() {
                 if !matches!(true_value.ty, LlType::Ptr(_))
                     || !matches!(false_value.ty, LlType::Ptr(_))
                 {
@@ -382,7 +455,7 @@ fn cross_buffer_pointer_phi_gep_sources(f: &LlFunction) -> HashMap<String, HashS
 
     let mut sources: HashMap<String, HashSet<LlType>> = HashMap::new();
     for inst in f.carrier_insts() {
-        let Some(gep) = &inst.gep else {
+        let Some(gep) = &inst.gep() else {
             continue;
         };
         let LlValue::Local(base) = &gep.base.value else {
@@ -469,9 +542,48 @@ fn infer_metadata_data_buffer_params(
         ) {
             continue;
         }
-        if matches!(ty, LlType::Ptr(1 | 2)) {
+        let device_buffer_array = matches!(ty, LlType::Ptr(0))
+            && kern
+                .buffer_type_name(idx as u32)
+                .is_some_and(meta::is_device_buffer_array_type_name);
+        if matches!(ty, LlType::Ptr(1 | 2)) || device_buffer_array {
             out.insert((entry.name.clone(), name.clone()));
         }
+    }
+    out
+}
+
+fn infer_metadata_primitive_buffer_pointees(
+    kern: Option<&meta::KernMeta>,
+    entry_name: Option<&str>,
+    functions: &[LlFunction],
+) -> HashMap<(String, String), LlType> {
+    let mut out = HashMap::new();
+    let (Some(kern), Some(entry_name)) = (kern, entry_name) else {
+        return out;
+    };
+    let Some(entry) = functions
+        .iter()
+        .find(|function| function.name == entry_name)
+    else {
+        return out;
+    };
+    for (index, (name, ty)) in entry.params.iter().enumerate() {
+        if !matches!(ty, LlType::Ptr(1..=3))
+            || !matches!(kern.role_of(index as u32), Some(KernRole::Buffer(_)))
+        {
+            continue;
+        }
+        let Some(layout) = kern
+            .buffer_type_name(index as u32)
+            .and_then(meta::primitive_air_type_from_name)
+        else {
+            continue;
+        };
+        out.insert(
+            (entry.name.clone(), name.clone()),
+            ll_type_from_air_type(&layout),
+        );
     }
     out
 }
@@ -486,7 +598,7 @@ fn infer_cross_coordinate_imageblock(
     {
         let mut coordinates = HashSet::new();
         for inst in function.carrier_insts() {
-            let Some(call) = &inst.alias_call else {
+            let Some(call) = inst.alias_call() else {
                 continue;
             };
             if call.callee != "air.imageblock_data" {
@@ -520,9 +632,30 @@ fn infer_imageblock_nonzero_byte_field(
     functions: &[LlFunction],
     entry_functions: &HashSet<String>,
 ) -> bool {
+    let function_by_name = functions
+        .iter()
+        .map(|function| (function.name.as_str(), function))
+        .collect::<HashMap<_, _>>();
+    let mut reachable = entry_functions.clone();
+    let mut pending = entry_functions.iter().cloned().collect::<Vec<_>>();
+    while let Some(name) = pending.pop() {
+        let Some(function) = function_by_name.get(name.as_str()) else {
+            continue;
+        };
+        for call in function
+            .carrier_insts()
+            .filter_map(|inst| inst.call().as_deref())
+        {
+            if function_by_name.contains_key(call.callee.as_str())
+                && reachable.insert(call.callee.clone())
+            {
+                pending.push(call.callee.clone());
+            }
+        }
+    }
     for function in functions
         .iter()
-        .filter(|function| entry_functions.contains(&function.name))
+        .filter(|function| reachable.contains(&function.name))
     {
         let mut roots = HashSet::new();
         let mut changed = true;
@@ -540,22 +673,21 @@ fn infer_imageblock_nonzero_byte_field(
                 // `alias_call` on a result-bearing line comes only from the value-call rhs path (the
                 // void fallback needs a `= `-less line), so this is the reader's `strip_call_prefix(rhs)`.
                 if inst
-                    .alias_call
-                    .as_ref()
+                    .alias_call()
                     .is_some_and(|call| call.callee == "air.imageblock_data")
                 {
                     changed |= roots.insert(result.clone());
                     continue;
                 }
 
-                if let Some((alias, base)) = &inst.identity_ptr_bitcast {
+                if let Some((alias, base)) = inst.identity_ptr_bitcast() {
                     if roots.contains(base) {
-                        changed |= roots.insert(alias.clone());
+                        changed |= roots.insert(alias.to_string());
                     }
                     continue;
                 }
 
-                let Some(gep) = &inst.gep else {
+                let Some(gep) = &inst.gep() else {
                     continue;
                 };
                 let LlValue::Local(base) = &gep.base.value else {
@@ -578,6 +710,49 @@ fn infer_imageblock_nonzero_byte_field(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod imageblock_reachability_tests {
+    use super::*;
+
+    fn module(entry_calls_helper: bool) -> LlModule {
+        let call = if entry_calls_helper {
+            "  call void @helper()\n"
+        } else {
+            ""
+        };
+        LlModule::parse(&format!(
+            r#"define void @entry() {{
+entry:
+{call}  ret void
+}}
+define internal void @helper() {{
+entry:
+  %data = call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
+  %field = getelementptr i8, ptr addrspace(4) %data, i64 16
+  ret void
+}}
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+"#
+        ))
+        .expect("module parses")
+    }
+
+    #[test]
+    fn reachable_helper_nonzero_byte_field_requires_complete_imageblock_cell() {
+        let reachable = module(true);
+        assert!(infer_imageblock_nonzero_byte_field(
+            &reachable.functions,
+            &HashSet::from(["entry".to_string()])
+        ));
+
+        let unreachable = module(false);
+        assert!(!infer_imageblock_nonzero_byte_field(
+            &unreachable.functions,
+            &HashSet::from(["entry".to_string()])
+        ));
+    }
 }
 
 fn infer_apv_imageblock_dimensions(ll: &str) -> Option<[u32; 2]> {
@@ -863,6 +1038,64 @@ mod layout_abi_tests {
     }
 
     #[test]
+    fn air_metadata_incompatible_with_vulkan_block_layout_requires_a_byte_view() {
+        let m = module();
+        let overlapping = AirType::Struct(vec![
+            AirMember {
+                offset: 0,
+                ty: AirType::Array {
+                    elem: Box::new(AirType::Scalar(AirScalar::UInt)),
+                    len: 8,
+                },
+            },
+            AirMember {
+                offset: 16,
+                ty: AirType::Array {
+                    elem: Box::new(AirType::Scalar(AirScalar::UInt)),
+                    len: 8,
+                },
+            },
+        ]);
+        assert!(m.air_metadata_requires_byte_view(&overlapping));
+
+        let stride_overlap = AirType::Struct(vec![
+            AirMember {
+                offset: 0,
+                ty: AirType::Array {
+                    elem: Box::new(AirType::Struct(vec![
+                        AirMember {
+                            offset: 0,
+                            ty: AirType::Scalar(AirScalar::UShort),
+                        },
+                        AirMember {
+                            offset: 12,
+                            ty: AirType::Scalar(AirScalar::UChar),
+                        },
+                    ])),
+                    len: 2,
+                },
+            },
+            AirMember {
+                offset: 28,
+                ty: AirType::Scalar(AirScalar::UInt),
+            },
+        ]);
+        assert!(m.air_metadata_requires_byte_view(&stride_overlap));
+
+        let adjacent = AirType::Struct(vec![
+            AirMember {
+                offset: 0,
+                ty: AirType::Scalar(AirScalar::UInt),
+            },
+            AirMember {
+                offset: 4,
+                ty: AirType::Scalar(AirScalar::UInt),
+            },
+        ]);
+        assert!(!m.air_metadata_requires_byte_view(&adjacent));
+    }
+
+    #[test]
     fn differential_calculators_agree_on_scalars_and_scalar_aggregates() {
         // Where the layout rules MUST agree, S4's oracle unification must keep them equal.
         let m = module();
@@ -1006,6 +1239,41 @@ mod raw_buffer_inference_tests {
     }
 
     #[test]
+    fn pointer_value_store_marks_destination_param_raw() {
+        let air = concat!(
+            "define void @k(ptr addrspace(1) %out, ptr addrspace(1) %source) {\n",
+            "entry:\n",
+            "  store ptr addrspace(1) %source, ptr addrspace(1) %out, align 8\n",
+            "  ret void\n",
+            "}\n",
+        );
+        assert!(params(air).contains(&("k".to_string(), "%out".to_string())));
+    }
+
+    #[test]
+    fn nested_select_gep_infers_every_pointer_param_pointee() {
+        let air = concat!(
+            "define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, i1 %x, i1 %y) {\n",
+            "entry:\n",
+            "  %inner = select i1 %x, ptr addrspace(1) %a, ptr addrspace(1) %b\n",
+            "  %outer = select i1 %y, ptr addrspace(1) %inner, ptr addrspace(1) %c\n",
+            "  %element = getelementptr half, ptr addrspace(1) %outer, i64 0\n",
+            "  %value = load half, ptr addrspace(1) %element\n",
+            "  ret void\n",
+            "}\n",
+        );
+        let module = LlModule::parse(air).expect("fixture parses");
+        for param in ["%a", "%b", "%c"] {
+            assert_eq!(
+                module
+                    .ptr_pointees
+                    .get(&("k".to_string(), param.to_string())),
+                Some(&LlType::Half)
+            );
+        }
+    }
+
+    #[test]
     fn single_typed_load_leaves_param_typed() {
         // A param read only ever as one consistent scalar type has a valid typed view — NOT raw.
         let air = concat!(
@@ -1016,6 +1284,55 @@ mod raw_buffer_inference_tests {
             "}\n",
         );
         assert!(!params(air).contains(&("k".to_string(), "%buf".to_string())));
+    }
+
+    #[test]
+    fn opaque_memcpy_source_into_local_aggregate_is_raw() {
+        let air = concat!(
+            "%S = type { <4 x float> }\n",
+            "define void @k(ptr addrspace(2) %src) {\n",
+            "entry:\n",
+            "  %dst = alloca %S\n",
+            "  %field = getelementptr %S, ptr %dst, i64 0, i32 0\n",
+            "  %source = bitcast ptr addrspace(2) %src to ptr addrspace(2)\n",
+            "  call void @llvm.memcpy.p0.p2.i64(ptr %field, ptr addrspace(2) %source, i64 16, i1 false)\n",
+            "  ret void\n",
+            "}\n",
+            "declare void @llvm.memcpy.p0.p2.i64(ptr, ptr addrspace(2), i64, i1)\n",
+        );
+        assert!(params(air).contains(&("k".to_string(), "%src".to_string())));
+    }
+
+    #[test]
+    fn typed_memcpy_source_into_local_aggregate_stays_typed() {
+        let air = concat!(
+            "%S = type { <4 x float> }\n",
+            "define void @k(ptr addrspace(2) %src) {\n",
+            "entry:\n",
+            "  %dst = alloca %S\n",
+            "  %field = getelementptr %S, ptr %dst, i64 0, i32 0\n",
+            "  %source = getelementptr <4 x float>, ptr addrspace(2) %src, i64 0\n",
+            "  call void @llvm.memcpy.p0.p2.i64(ptr %field, ptr addrspace(2) %source, i64 16, i1 false)\n",
+            "  ret void\n",
+            "}\n",
+            "declare void @llvm.memcpy.p0.p2.i64(ptr, ptr addrspace(2), i64, i1)\n",
+        );
+        assert!(!params(air).contains(&("k".to_string(), "%src".to_string())));
+    }
+
+    #[test]
+    fn opaque_memcpy_destination_does_not_imply_local_aggregate_storage() {
+        let air = concat!(
+            "define void @k(ptr addrspace(2) %src) {\n",
+            "entry:\n",
+            "  %dst = call ptr @destination()\n",
+            "  call void @llvm.memcpy.p0.p2.i64(ptr %dst, ptr addrspace(2) %src, i64 16, i1 false)\n",
+            "  ret void\n",
+            "}\n",
+            "declare ptr @destination()\n",
+            "declare void @llvm.memcpy.p0.p2.i64(ptr, ptr addrspace(2), i64, i1)\n",
+        );
+        assert!(!params(air).contains(&("k".to_string(), "%src".to_string())));
     }
 
     #[test]
@@ -1051,9 +1368,80 @@ mod raw_buffer_inference_tests {
             "  ret void\n",
             "}\n",
         );
+        let module = LlModule::parse(air).expect("fixture parses");
+        let entry = ("entry".to_string(), "%buf".to_string());
+        let helper = ("helper".to_string(), "%p".to_string());
+        assert!(module.raw_buffer_params.contains(&entry));
+        assert!(module.raw_buffer_params.contains(&helper));
+        assert!(module.call_connected_raw_params.contains(&entry));
+        assert!(module.call_connected_raw_params.contains(&helper));
+    }
+
+    #[test]
+    fn incompatible_call_connected_aggregate_views_select_raw_buffers() {
+        // One buffer object is a packed-byte view in the entry and an array-of-float view in its
+        // helper. Each function has only one local source type, but the call edge proves that a
+        // single typed SPIR-V pointee cannot represent both views.
+        let air = concat!(
+            "define void @entry(ptr addrspace(1) %buf) {\n",
+            "entry:\n",
+            "  %alias = getelementptr [3 x i8], ptr addrspace(1) %buf, i64 0, i64 0\n",
+            "  call void @helper(ptr addrspace(1) %alias)\n",
+            "  ret void\n",
+            "}\n",
+            "define void @helper(ptr addrspace(1) %p) {\n",
+            "entry:\n",
+            "  %field = getelementptr [3 x float], ptr addrspace(1) %p, i64 0, i64 1\n",
+            "  %value = load float, ptr addrspace(1) %field\n",
+            "  ret void\n",
+            "}\n",
+        );
         let raw = params(air);
         assert!(raw.contains(&("entry".to_string(), "%buf".to_string())));
         assert!(raw.contains(&("helper".to_string(), "%p".to_string())));
+    }
+
+    #[test]
+    fn call_connected_workgroup_reinterpretation_selects_raw_words() {
+        let air = concat!(
+            "define void @entry(ptr addrspace(3) %scratch) {\n",
+            "entry:\n",
+            "  %local = getelementptr float, ptr addrspace(3) %scratch, i64 0\n",
+            "  store float 0.000000e+00, ptr addrspace(3) %local\n",
+            "  call void @write_uint(ptr addrspace(3) %scratch)\n",
+            "  call void @write_float(ptr addrspace(3) %scratch)\n",
+            "  ret void\n",
+            "}\n",
+            "define void @write_uint(ptr addrspace(3) %p) {\n",
+            "entry:\n",
+            "  %slot = getelementptr i32, ptr addrspace(3) %p, i64 0\n",
+            "  store i32 1, ptr addrspace(3) %slot\n",
+            "  ret void\n",
+            "}\n",
+            "define void @write_float(ptr addrspace(3) %p) {\n",
+            "entry:\n",
+            "  %slot = getelementptr float, ptr addrspace(3) %p, i64 0\n",
+            "  store float 1.000000e+00, ptr addrspace(3) %slot\n",
+            "  ret void\n",
+            "}\n",
+            "define void @unrelated(ptr addrspace(3) %typed) {\n",
+            "entry:\n",
+            "  store float 2.000000e+00, ptr addrspace(3) %typed\n",
+            "  ret void\n",
+            "}\n",
+        );
+        let module = LlModule::parse(air).expect("fixture parses");
+        for key in [
+            ("entry".to_string(), "%scratch".to_string()),
+            ("write_uint".to_string(), "%p".to_string()),
+            ("write_float".to_string(), "%p".to_string()),
+        ] {
+            assert!(module.raw_buffer_params.contains(&key));
+            assert!(module.call_connected_raw_params.contains(&key));
+        }
+        assert!(!module
+            .raw_buffer_params
+            .contains(&("unrelated".to_string(), "%typed".to_string())));
     }
 
     #[test]
@@ -1168,6 +1556,23 @@ mod pointee_inference_tests {
             "}\n",
         );
         assert!(parsed(air).ptr_pointees.is_empty());
+    }
+
+    #[test]
+    fn direct_store_value_becomes_pointer_param_pointee() {
+        let air = concat!(
+            "define void @k(ptr addrspace(1) %out, float %value) {\n",
+            "entry:\n",
+            "  store float %value, ptr addrspace(1) %out, align 4\n",
+            "  ret void\n",
+            "}\n",
+        );
+        assert_eq!(
+            parsed(air)
+                .ptr_pointees
+                .get(&("k".to_string(), "%out".to_string())),
+            Some(&LlType::Float)
+        );
     }
 
     #[test]

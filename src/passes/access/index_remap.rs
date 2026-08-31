@@ -95,6 +95,7 @@ pub(in crate::passes) fn trace_to_array_element_zero(
 /// identical byte address with the identical scalar type, so it is a byte no-op, not a reinterpret.
 /// Decides purely from IR structure (type walk + member `Offset` decorations), never a shader name.
 pub(in crate::passes) fn remap_word_index_to_struct_member(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -148,7 +149,7 @@ pub(in crate::passes) fn remap_word_index_to_struct_member(ctx: &mut Ctx, entry_
             if indices.is_empty() {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -250,6 +251,7 @@ pub(in crate::passes) fn remap_overflow_word_index_to_outer_member(
     ctx: &mut Ctx,
     entry_idx: usize,
 ) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -359,7 +361,7 @@ pub(in crate::passes) fn remap_overflow_word_index_to_outer_member(
             if indices.len() < 2 {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -454,6 +456,7 @@ pub(in crate::passes) fn remap_overflow_word_index_to_outer_member(
 /// the floor is provably unchanged. Decides purely from IR structure (type walk + `Offset`/`ArrayStride`
 /// decorations + the `OpIAdd const+dyn` shape), never a shader name.
 pub(in crate::passes) fn remap_dynamic_word_index_to_array_member(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -596,7 +599,7 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_member(ctx: &mut Ctx,
             if indices.len() < 2 {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -702,10 +705,96 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_member(ctx: &mut Ctx,
 /// chain untouched — a banked/valid module never over-indexes, so the floor is provably unchanged.
 /// Decides purely from IR structure (type walk + `Offset`/`ArrayStride` decorations + the
 /// `OpIAdd const + OpIMul(dyn,const)` shape), never a shader name.
+struct ExactWordTarget {
+    path: Vec<u32>,
+    ty: Word,
+}
+
+fn exact_word_path(
+    ctx: &Ctx,
+    member_offset: &HashMap<(Word, u32), u32>,
+    array_stride: &HashMap<Word, u32>,
+    ty: Word,
+    byte_offset: u32,
+) -> Option<ExactWordTarget> {
+    let definition = type_def_of(ctx, ty)?;
+    match definition.class.opcode {
+        Op::TypeInt | Op::TypeFloat
+            if byte_offset == 0
+                && matches!(definition.operands.first(), Some(Operand::LiteralBit32(32))) =>
+        {
+            Some(ExactWordTarget {
+                path: Vec::new(),
+                ty,
+            })
+        }
+        Op::TypeStruct => (0..definition.operands.len()).rev().find_map(|member| {
+            let offset = member_offset.get(&(ty, member as u32)).copied()?;
+            let relative = byte_offset.checked_sub(offset)?;
+            let Operand::IdRef(member_ty) = definition.operands[member] else {
+                return None;
+            };
+            let mut target =
+                exact_word_path(ctx, member_offset, array_stride, member_ty, relative)?;
+            target.path.insert(0, member as u32);
+            Some(target)
+        }),
+        Op::TypeArray => {
+            let (Some(Operand::IdRef(element)), Some(Operand::IdRef(length))) =
+                (definition.operands.first(), definition.operands.get(1))
+            else {
+                return None;
+            };
+            let length = const_u32(ctx, *length)?;
+            let stride = array_stride.get(&ty).copied()?;
+            let index = byte_offset / stride;
+            if index >= length {
+                return None;
+            }
+            let mut target = exact_word_path(
+                ctx,
+                member_offset,
+                array_stride,
+                *element,
+                byte_offset % stride,
+            )?;
+            target.path.insert(0, index);
+            Some(target)
+        }
+        Op::TypeVector => {
+            let (Some(Operand::IdRef(element)), Some(Operand::LiteralBit32(lanes))) =
+                (definition.operands.first(), definition.operands.get(1))
+            else {
+                return None;
+            };
+            let element_definition = type_def_of(ctx, *element)?;
+            let Some(Operand::LiteralBit32(width)) = element_definition.operands.first() else {
+                return None;
+            };
+            let stride = width.checked_div(8)?;
+            let index = byte_offset / stride;
+            if index >= *lanes {
+                return None;
+            }
+            let mut target = exact_word_path(
+                ctx,
+                member_offset,
+                array_stride,
+                *element,
+                byte_offset % stride,
+            )?;
+            target.path.insert(0, index);
+            Some(target)
+        }
+        _ => None,
+    }
+}
+
 pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
     ctx: &mut Ctx,
     entry_idx: usize,
 ) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -861,7 +950,8 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
         cid: Word,
         member: u32,
         elem: Word,
-        field: u32,
+        elem_bias: u32,
+        field_path: Vec<u32>,
         field_ty: Word,
         storage: StorageClass,
     }
@@ -890,7 +980,7 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
             if indices.len() < 2 {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -929,14 +1019,16 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
             let Some(elem_stride_bytes) = stride_words.checked_mul(4) else {
                 continue;
             };
-            // Unique TOP-LEVEL array member whose first element [off, off+stride) contains abs_byte,
-            // with ArrayStride == 4*S and a struct element type.
-            let mut found: Option<(u32, u32, Word)> = None; // (member M, field byte within elem, elem struct type)
+            // Unique TOP-LEVEL array member containing the constant address, with ArrayStride ==
+            // 4*S and a struct element type. Split an address in any element into a constant
+            // element bias plus its byte offset within that element; restricting this to element
+            // zero incorrectly rejected otherwise ordinary affine accesses.
+            let mut found: Option<(u32, u32, u32, Word)> = None; // (member M, element bias, field byte, elem struct type)
             for m in 0..bdef.operands.len() {
                 let Some(&off) = member_offset.get(&(base_pointee, m as u32)) else {
                     continue;
                 };
-                if abs_byte < off || abs_byte >= off + elem_stride_bytes {
+                if abs_byte < off {
                     continue;
                 }
                 let Some(Operand::IdRef(mty)) = bdef.operands.get(m) else {
@@ -951,9 +1043,19 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
                 if array_stride.get(mty).copied() != Some(elem_stride_bytes) {
                     continue;
                 }
-                let Some(Operand::IdRef(elem_ty)) = mdef.operands.first() else {
+                let (Some(Operand::IdRef(elem_ty)), Some(Operand::IdRef(length_id))) =
+                    (mdef.operands.first(), mdef.operands.get(1))
+                else {
                     continue;
                 };
+                let Some(length) = const_u32(ctx, *length_id) else {
+                    continue;
+                };
+                let relative = abs_byte - off;
+                let elem_bias = relative / elem_stride_bytes;
+                if elem_bias >= length {
+                    continue;
+                }
                 let Some(edef) = type_def_of(ctx, *elem_ty) else {
                     continue;
                 };
@@ -964,30 +1066,17 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
                     found = None; // ambiguous — bail rather than guess
                     break;
                 }
-                found = Some((m as u32, abs_byte - off, *elem_ty));
+                found = Some((m as u32, elem_bias, relative % elem_stride_bytes, *elem_ty));
             }
-            let Some((member, field_byte, elem_ty)) = found else {
+            let Some((member, elem_bias, field_byte, elem_ty)) = found else {
                 continue;
             };
-            // Field of the element struct at exactly `field_byte`, a 32-bit scalar.
-            let Some(edef) = type_def_of(ctx, elem_ty) else {
-                continue;
-            };
-            let mut field: Option<(u32, Word)> = None;
-            for f in 0..edef.operands.len() {
-                if member_offset.get(&(elem_ty, f as u32)).copied() != Some(field_byte) {
-                    continue;
-                }
-                let Some(Operand::IdRef(fty)) = edef.operands.get(f) else {
-                    continue;
-                };
-                if !is_word_scalar(ctx, *fty) {
-                    continue;
-                }
-                field = Some((f as u32, *fty));
-                break;
-            }
-            let Some((field_idx, field_ty)) = field else {
+            // Resolve the exact constant path inside the array element. Nested matrix/array/struct
+            // fields are as representable as direct fields; the former one-level lookup discarded
+            // valid addresses inside those aggregates.
+            let Some(target) =
+                exact_word_path(ctx, &member_offset, &array_stride, elem_ty, field_byte)
+            else {
                 continue;
             };
             // Every use of the chain must be an OpLoad (so retyping the pointer is safe).
@@ -1004,8 +1093,9 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
                 cid,
                 member,
                 elem: elem_dyn,
-                field: field_idx,
-                field_ty,
+                elem_bias,
+                field_path: target.path,
+                field_ty: target.ty,
                 storage,
             });
         }
@@ -1044,7 +1134,11 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
     for e in &edits {
         let field_ptr_ty = ctx.ty_ptr(e.storage, e.field_ty);
         let member_id = ctx.const_uint(e.member);
-        let field_id = ctx.const_uint(e.field);
+        let field_ids = e
+            .field_path
+            .iter()
+            .map(|field| ctx.const_uint(*field))
+            .collect::<Vec<_>>();
         let base = match ctx.module.functions[entry_idx].blocks[e.bi].instructions[e.ii]
             .operands
             .first()
@@ -1058,8 +1152,9 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
             Operand::IdRef(base),
             Operand::IdRef(member_id),
             Operand::IdRef(e.elem),
-            Operand::IdRef(field_id),
         ];
+        inst.operands
+            .extend(field_ids.into_iter().map(Operand::IdRef));
     }
 
     // Apply load splits by rebuilding affected blocks (insert a field-typed load before each, and
@@ -1109,5 +1204,45 @@ pub(in crate::passes) fn remap_dynamic_word_index_to_array_struct_field(
             }
         }
         ctx.module.functions[entry_idx].blocks[bi].instructions = out;
+    }
+
+    // Materialize a nonzero constant element bias immediately before the rewritten chain. Locate
+    // by result id after load splitting so inserted field-typed loads cannot stale block indices.
+    for e in edits.iter().filter(|edit| edit.elem_bias != 0) {
+        let Some(elem_ty) = value_result_type(ctx, e.elem) else {
+            continue;
+        };
+        let bias = ctx.const_int_of(elem_ty, i64::from(e.elem_bias));
+        let biased_elem = ctx.module.fresh_id();
+        let Some((block_index, instruction_index)) = ctx.module.functions[entry_idx]
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(block_index, block)| {
+                block
+                    .instructions
+                    .iter()
+                    .position(|instruction| instruction.result_id == Some(e.cid))
+                    .map(|instruction_index| (block_index, instruction_index))
+            })
+        else {
+            continue;
+        };
+        let block = &mut ctx.module.functions[entry_idx].blocks[block_index];
+        block.instructions.insert(
+            instruction_index,
+            Instruction::new(
+                Op::IAdd,
+                Some(elem_ty),
+                Some(biased_elem),
+                vec![Operand::IdRef(e.elem), Operand::IdRef(bias)],
+            ),
+        );
+        if let Some(Operand::IdRef(element)) = block.instructions[instruction_index + 1]
+            .operands
+            .get_mut(2)
+        {
+            *element = biased_elem;
+        }
     }
 }

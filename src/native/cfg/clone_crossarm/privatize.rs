@@ -35,6 +35,14 @@ pub(in crate::native) struct DominatedRegionCloneWitness {
     pub first_empty_phi_block: Option<String>,
 }
 
+/// Result of a dominated-region clone for callers that also own structural metadata keyed by block
+/// label. `renamed` contains every cloned block and SSA definition; labels absent from the map remain
+/// shared boundaries in `blocks`.
+pub(in crate::native) struct DominatedRegionClone {
+    pub blocks: Vec<BodyBlock>,
+    pub renamed: HashMap<String, String>,
+}
+
 pub(in crate::native) fn dominated_region_clone_witness(
     blocks: &[BodyBlock],
     header: &str,
@@ -138,7 +146,7 @@ pub(in crate::native) fn dominated_region_clone_witness(
                 break;
             };
             if src_carrier.insts.iter().any(|inst| {
-                inst.phi_incoming.as_ref().is_some_and(|(_, incoming)| {
+                inst.phi_incoming().as_ref().is_some_and(|(_, incoming)| {
                     !incoming.is_empty() && !incoming.iter().any(|(_, p)| keep(p))
                 })
             }) {
@@ -199,6 +207,7 @@ pub(in crate::native) struct RegionCrossArmFixpointWitness {
 /// Privatize the forward-closed region rooted at `arm` for `header`'s in-construct entries. Returns
 /// the new block list, or `None` if the region is not cleanly single-entry / loop-free-entry /
 /// within budget.
+#[cfg(test)]
 pub(in crate::native) fn privatize_region(
     blocks: &[BodyBlock],
     header: &str,
@@ -264,6 +273,9 @@ pub(in crate::native) fn privatize_region(
         .flatten()
         .any(|p| !redirect.contains(p));
     if !keeps_original {
+        return None;
+    }
+    if cloned_labels_overlap_ssa_values(blocks, &region) {
         return None;
     }
 
@@ -332,7 +344,7 @@ pub(in crate::native) fn privatize_region(
             return None;
         };
         for inst in &src_carrier.insts {
-            if let Some((_, incoming)) = &inst.phi_incoming {
+            if let Some((_, incoming)) = &inst.phi_incoming() {
                 if !incoming.is_empty() && !incoming.iter().any(|(_, p)| keep(p)) {
                     return None;
                 }
@@ -372,12 +384,12 @@ pub(in crate::native) fn privatize_region(
 /// (the boundary has a non-region predecessor). Mirroring the boundary phis therefore closes SSA.
 /// Returns `None` if the region is over budget, `arm` sits in an in-region cycle, or there is no
 /// dominated predecessor to redirect (or none to keep) — the same guards as [`privatize_region`].
-pub(in crate::native) fn privatize_dominated_region(
+pub(in crate::native) fn privatize_dominated_region_with_renames(
     blocks: &[BodyBlock],
     header: &str,
     arm: &str,
     counter: &mut usize,
-) -> Option<Vec<BodyBlock>> {
+) -> Option<DominatedRegionClone> {
     let forest = analyze(blocks);
     let preds = predecessors(blocks);
     let by_name: HashMap<&str, &BodyBlock> = blocks.iter().map(|b| (b.name.as_str(), b)).collect();
@@ -454,6 +466,9 @@ pub(in crate::native) fn privatize_dominated_region(
     if !keeps_original {
         return None;
     }
+    if cloned_labels_overlap_ssa_values(blocks, &region) {
+        return None;
+    }
 
     // Rename every region label + every SSA value defined in the region into a fresh clone namespace.
     let id = *counter;
@@ -521,7 +536,7 @@ pub(in crate::native) fn privatize_dominated_region(
             return None;
         };
         for inst in &src_carrier.insts {
-            if let Some((_, incoming)) = &inst.phi_incoming {
+            if let Some((_, incoming)) = &inst.phi_incoming() {
                 if !incoming.is_empty() && !incoming.iter().any(|(_, p)| keep(p)) {
                     return None;
                 }
@@ -537,7 +552,20 @@ pub(in crate::native) fn privatize_dominated_region(
             typed: Some(c.into()),
         });
     }
-    Some(out)
+    Some(DominatedRegionClone {
+        blocks: out,
+        renamed: rename,
+    })
+}
+
+pub(in crate::native) fn privatize_dominated_region(
+    blocks: &[BodyBlock],
+    header: &str,
+    arm: &str,
+    counter: &mut usize,
+) -> Option<Vec<BodyBlock>> {
+    privatize_dominated_region_with_renames(blocks, header, arm, counter)
+        .map(|cloned| cloned.blocks)
 }
 
 /// Append, to a boundary block's phi, a mirrored incoming for every existing incoming whose
@@ -790,7 +818,7 @@ pub(in crate::native) fn privatize_shared_phi_exit_predecessors(
     cur
 }
 
-/// Privatize a tail shared by two or more cases of a loop-free switch.
+/// Privatize a tail shared by two or more cases of a switch.
 ///
 /// SPIR-V case constructs cannot enter a tail belonging to another case construct. A source switch can
 /// express that compactly by letting cases fall into shared suffixes (`case 3 -> tail1`, `case 2 ->
@@ -803,8 +831,9 @@ pub(in crate::native) fn privatize_shared_phi_exit_predecessors(
 /// case retains the original.
 ///
 /// It uses the same [`privatize_dominated_region`] SSA and boundary guards as conditional deep-tail
-/// privatization. Loop switches, direct merge exits, and large CFGs decline rather than inventing a
-/// multi-level break representation.
+/// privatization. Loop-contained tails are eligible only when the finder proves that the cloned region
+/// stays within one loop nest and avoids loop headers and latches. Direct merge exits and large CFGs
+/// decline rather than inventing a multi-level break representation.
 pub(in crate::native) fn privatize_switch_case_continuations(
     blocks: &[BodyBlock],
 ) -> Vec<BodyBlock> {

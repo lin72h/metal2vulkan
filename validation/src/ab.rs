@@ -674,7 +674,7 @@ mod tests {
             entry: "main".into(),
             air_ll: "air".into(),
             blob_b64: None,
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: "test".into(),
         };
         let mut options = AbOptions {

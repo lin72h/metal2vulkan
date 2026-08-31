@@ -120,6 +120,9 @@ fn passthrough_vertex_spvasm(
         .roles
         .iter()
         .any(|(_, role)| matches!(role, meta::FragRole::ViewportArrayIndex));
+    // This companion always renders one synthesized layer. Vulkan uses the first framebuffer layer
+    // when no pre-rasterization stage exports `Layer`, which preserves layer zero without requiring
+    // the optional Vulkan 1.2 `shaderOutputLayer` feature.
     let mut locs: Vec<u32> = meta
         .roles
         .iter()
@@ -314,7 +317,13 @@ fn assemble_spvasm(asm: &str, tmp: &Path, stem: &str) -> Result<Vec<u8>, String>
     let spvf_s = spvf.to_str().ok_or("passthrough: bad spv path")?;
     let assembled = tools::run(
         "spirv-as",
-        &["--target-env", "vulkan1.3", asmf_s, "-o", spvf_s],
+        &[
+            "--target-env",
+            tools::VULKAN_TARGET_ENV,
+            asmf_s,
+            "-o",
+            spvf_s,
+        ],
     );
     let bytes = match assembled {
         Ok(_) => std::fs::read(&spvf).map_err(|e| format!("read {}: {e}", spvf.display())),
@@ -334,10 +343,32 @@ fn passthrough_sanitized_ll(src: &str, tmp: &Path) -> Result<String, String> {
 /// `[[stage_in]]` inputs. Used when APV pipelines bind a built-in vertex slot rather than AIR vertex code.
 pub fn translate_passthrough(src: &str, tmp: &Path) -> Result<Vec<u8>, String> {
     let san_ll = passthrough_sanitized_ll(src, tmp)?;
-    let frag = meta::parse_air_fragment_meta(&san_ll)
+    translate_passthrough_sanitized(&san_ll, tmp)
+}
+
+/// Generate a fullscreen-triangle vertex shader for the exact fragment interface selected by
+/// Metal function-constant payloads.
+///
+/// Function constants can gate fragment inputs in AIR metadata. The companion vertex interface
+/// must therefore be derived from the same specialized metadata as the fragment translation.
+pub fn translate_passthrough_specialized(
+    src: &str,
+    tmp: &Path,
+    function_constants: &[(u32, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    let san_ll = passthrough_sanitized_ll(src, tmp)?;
+    let specialized =
+        crate::fc_air_specialize::specialize_air_function_constants(&san_ll, function_constants)?;
+    translate_passthrough_sanitized(specialized.as_ref(), tmp)
+}
+
+fn translate_passthrough_sanitized(san_ll: &str, tmp: &Path) -> Result<Vec<u8>, String> {
+    let frag = meta::parse_air_fragment_meta(san_ll)
         .ok_or_else(|| "passthrough: source has no !air.fragment metadata".to_string())?;
-    let asm = passthrough_vertex_spvasm(&frag, fragment_requires_distinct_float3_inputs(&san_ll))?;
-    assemble_spvasm(&asm, tmp, "passthrough")
+    let asm = passthrough_vertex_spvasm(&frag, fragment_requires_distinct_float3_inputs(san_ll))?;
+    let spv = assemble_spvasm(&asm, tmp, "passthrough")?;
+    tools::spirv_val_bytes(&spv, tmp)?;
+    Ok(spv)
 }
 
 fn vertex_observer_fragment_spvasm(
@@ -552,6 +583,42 @@ mod tests {
     }
 
     #[test]
+    fn specialized_passthrough_omits_disabled_fragment_inputs() {
+        let ll = r#"@state.MTL_FC_INIT_0_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@enabled = internal addrspace(2) global i8 0, align 1
+define internal void @_GLOBAL__sub_I_metadata() section "air.static_init" {
+  %state = load i8, ptr addrspace(2) @state.MTL_FC_INIT_0_b
+  store i8 %state, ptr addrspace(2) @enabled
+  ret void
+}
+define <4 x half> @frag(float %conditional, float %always) { ret <4 x half> zeroinitializer }
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !2}
+!1 = !{!3}
+!2 = !{!4, !5}
+!3 = !{i32 0, !"air.render_target", i32 0, !"air.arg_type_name", !"half4"}
+!4 = !{i32 0, !"air.function_constant", !6, !"air.fragment_input", !"air.arg_type_name", !"float"}
+!5 = !{i32 1, !"air.fragment_input", !"air.arg_type_name", !"float"}
+!6 = !{ptr addrspace(2) @enabled, !"bool", !"enabled"}
+"#;
+        let specialized =
+            crate::fc_air_specialize::specialize_air_function_constants(ll, &[(0, vec![0])])
+                .unwrap();
+        let frag = meta::parse_air_fragment_meta(specialized.as_ref()).unwrap();
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
+
+        assert_eq!(
+            frag.roles
+                .iter()
+                .filter(|(_, role)| matches!(role, meta::FragRole::Varying(_)))
+                .count(),
+            1
+        );
+        assert!(asm.contains("OpDecorate %vout0 Location 0"), "{asm}");
+        assert!(!asm.contains("%vout1"), "{asm}");
+    }
+
+    #[test]
     fn passthrough_vertex_separates_duplicate_float3_rsqrt_inputs() {
         let ll = r#"
 define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
@@ -645,6 +712,16 @@ declare float @air.fast_rsqrt.f32(float)
             "{asm}"
         );
         assert!(asm.contains("OpStore %viewport %uint_0"), "{asm}");
+    }
+
+    #[test]
+    fn passthrough_vertex_uses_feature_free_implicit_layer_zero() {
+        let mut frag = meta::FragMeta::default();
+        frag.roles.push((1, meta::FragRole::RenderTargetArrayIndex));
+
+        let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
+        assert!(!asm.contains("ShaderLayer"), "{asm}");
+        assert!(!asm.contains("BuiltIn Layer"), "{asm}");
     }
 
     #[test]

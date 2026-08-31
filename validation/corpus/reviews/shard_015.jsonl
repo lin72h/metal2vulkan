@@ -1,0 +1,1 @@
+{"air_sha256":"3fef737b9f01dada7030e0567d83f2518f999f1d58fe7d7d9cbc0725d1806995","reason":"AIR entry \"edgeDilation_V1\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

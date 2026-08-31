@@ -10,26 +10,76 @@ use super::*;
 fn kernel_dispatch_push_constant_range_is_exact_and_validated() {
     assert_eq!(
         KernelDispatch::safe_default(),
-        KernelDispatch::ThreadsPushConstant {
-            offset: DEFAULT_KERNEL_GRID_PUSH_CONSTANT_OFFSET,
+        KernelDispatch::ThreadsDynamic {
+            offset: DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
         }
     );
-    let dispatch = KernelDispatch::ThreadsPushConstant { offset: 16 };
+    let dispatch = KernelDispatch::ThreadsDynamic { offset: 16 };
     assert_eq!(
         dispatch.push_constant_range(),
-        Some(KernelGridPushConstantRange {
+        Some(KernelDispatchPushConstantRange {
             offset: 16,
-            size: KERNEL_GRID_PUSH_CONSTANT_SIZE,
+            size: KERNEL_DISPATCH_PUSH_CONSTANT_SIZE,
         })
     );
     assert!(dispatch.validate().is_ok());
-    assert!(KernelDispatch::ThreadsPushConstant { offset: 2 }
+    assert!(KernelDispatch::ThreadsDynamic { offset: 2 }
         .validate()
         .is_err());
-    assert!(KernelDispatch::ThreadsPushConstant {
+    assert!(KernelDispatch::ThreadsDynamic {
         offset: u32::MAX - 3,
     }
     .validate()
+    .is_err());
+    assert_eq!(
+        KernelDispatch::ThreadsFixed {
+            threads_per_grid: [21, 3, 1],
+        }
+        .push_constant_range(),
+        Some(KernelDispatchPushConstantRange {
+            offset: DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET,
+            size: 48,
+        })
+    );
+}
+
+#[test]
+fn exact_thread_plan_partitions_interior_and_edges_without_surplus_lanes() {
+    let plan = KernelDispatch::ThreadsDynamic { offset: 16 }
+        .plan([8, 4, 2], Some([17, 6, 3]))
+        .expect("plan");
+    assert_eq!(plan.threadgroups_per_grid, [3, 2, 2]);
+    assert_eq!(plan.regions.len(), 8);
+    let launched = plan
+        .regions
+        .iter()
+        .map(|region| {
+            region
+                .local_size
+                .into_iter()
+                .zip(region.group_count)
+                .map(|(local, groups)| u64::from(local) * u64::from(groups))
+                .product::<u64>()
+        })
+        .sum::<u64>();
+    assert_eq!(launched, 17 * 6 * 3);
+    assert!(plan.regions.contains(&KernelDispatchRegion {
+        local_size: [1, 2, 1],
+        group_count: [1, 1, 1],
+        thread_base: [16, 4, 2],
+        threadgroup_base: [2, 1, 1],
+    }));
+
+    let empty = KernelDispatch::ThreadsDynamic { offset: 0 }
+        .plan([8, 4, 2], Some([0, 6, 3]))
+        .expect("a zero-sized Metal grid is a no-op");
+    assert_eq!(empty.threadgroups_per_grid, [0, 2, 2]);
+    assert!(empty.regions.is_empty());
+
+    assert!(KernelDispatch::ThreadsFixed {
+        threads_per_grid: [17, 6, 3],
+    }
+    .plan([8, 4, 2], Some([18, 6, 3]))
     .is_err());
 }
 use crate::meta::{
@@ -127,7 +177,7 @@ fn fragment_reflection_matches_abi_convention() {
 #[test]
 fn reflected_buffer_footprint_reports_static_and_global_id_strides() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(i32 %gid, ptr addrspace(1) %input, ptr addrspace(1) %output) {
 entry:
@@ -208,7 +258,7 @@ entry:
 #[test]
 fn reflected_buffer_footprint_marks_data_dependent_index_unbounded() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %indices, ptr addrspace(1) %data, ptr addrspace(1) %output) {
 entry:
@@ -265,7 +315,7 @@ entry:
 #[test]
 fn reflected_vertex_buffer_footprints_use_vertex_and_instance_indices() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @v(i32 %vid, i32 %iid, ptr addrspace(1) %vertices, ptr addrspace(1) %instances) {
 entry:
@@ -331,7 +381,7 @@ entry:
 #[test]
 fn reflected_buffer_footprint_preserves_multiaxis_affine_terms() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(<3 x i32> %tid, ptr addrspace(1) %grid, ptr addrspace(1) %output) {
 entry:
@@ -394,7 +444,7 @@ entry:
 #[test]
 fn reflected_buffer_footprint_covers_every_cross_binding_pointer_arm() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(i32 %gid, ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %output) {
 entry:
@@ -450,7 +500,7 @@ entry:
 #[test]
 fn reflected_buffer_footprint_counts_atomic_memory_width() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 
 define void @k(ptr addrspace(1) %counts) {
@@ -499,7 +549,7 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn reflected_static_samplers_stay_in_sampler_band_and_carry_state() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @__air_sampler_state.118 = internal addrspace(2) constant i64 -9188470239253755319, align 8
 @__air_sampler_state.119 = internal addrspace(2) constant i64 -9188470239253757806, align 8
@@ -1418,7 +1468,7 @@ fn reflection_serde_covers_every_reflection_field() {
         depth_qualifier: None,
         stencil_members: vec![2],
         local_size: Some([8, 8, 1]),
-        kernel_dispatch: Some(KernelDispatch::ThreadsPushConstant { offset: 16 }),
+        kernel_dispatch: Some(KernelDispatch::ThreadsDynamic { offset: 16 }),
         vertex_builtins: Some(VertexBuiltins {
             uses_vertex_index: true,
             uses_instance_index: true,
@@ -1657,6 +1707,7 @@ fn runtime_storage_formats_have_complete_component_and_spirv_mappings() {
         (R::Bgra8Unorm, C::Float, None),
         (R::R16Float, C::Float, Some(F::R16f)),
         (R::Rg16Float, C::Float, Some(F::Rg16f)),
+        (R::Rg32Float, C::Float, Some(F::Rg32f)),
         (R::Rgba16Float, C::Float, Some(F::Rgba16f)),
         (R::R32Float, C::Float, Some(F::R32f)),
         (R::Rgba32Float, C::Float, Some(F::Rgba32f)),

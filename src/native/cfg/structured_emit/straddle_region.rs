@@ -1,13 +1,13 @@
-//! Reject-only regional wrapper for bounded `selection:straddle-loop-merge` residue.
+//! Reject-only regional wrapper for bounded selection/loop ownership conflicts.
 //!
 //! The existing straddle split gives the nested loop its own merge, but the live R2 representatives
 //! still expose a second ownership conflict after that local split.  This module derives the smaller
 //! source region measured by `straddle-witness-list`: one external entry into the straddled owner,
 //! two external exits, all escaping values carried only by exit-target phis, and no pointer payloads.
 //! It materializes that region as a local PC-dispatch loop and rewrites the two external exits through
-//! typed payload gateways.  This is diagnostic-only until the live representative follow-on
-//! ownership blockers admit; any future production adoption must remain whole-module `spirv-val`
-//! gated.
+//! typed payload gateways. The same materializer owns a complete selection arm when a nested loop
+//! exits into that selection's sibling. Both paths preserve typed scalar state and decline pointer
+//! state whose provenance cannot be represented faithfully.
 
 use super::*;
 use crate::native::ir::{LlType, LlValue, TypedValue};
@@ -232,6 +232,180 @@ fn derive_witness(blocks: &[BodyBlock]) -> Option<Witness> {
     None
 }
 
+fn derive_loop_exit_sibling_witness(blocks: &[BodyBlock]) -> Option<Witness> {
+    let forest = analyze(blocks);
+    let post_idom = super::super::loopforest::post_idom(blocks);
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    let post_chain = |start: &str| {
+        let mut chain = vec![start.to_string()];
+        let mut current = start;
+        while let Some(next) = post_idom.get(current) {
+            if chain.contains(next) {
+                break;
+            }
+            chain.push(next.clone());
+            current = next;
+        }
+        chain
+    };
+    for owner in blocks {
+        let Some((left, right)) = conditional_branch_targets(owner) else {
+            continue;
+        };
+        let Some(owner_merge) = post_idom.get(&owner.name) else {
+            continue;
+        };
+        for (loop_entry, sibling) in [(&left, &right), (&right, &left)] {
+            for natural_loop in &forest.loops {
+                let exit_chains = natural_loop
+                    .exits
+                    .iter()
+                    .map(|exit| post_chain(exit))
+                    .collect::<Vec<_>>();
+                let Some(loop_merge) = exit_chains.first().and_then(|first| {
+                    first
+                        .iter()
+                        .find(|candidate| {
+                            exit_chains.iter().all(|chain| chain.contains(*candidate))
+                        })
+                        .cloned()
+                }) else {
+                    continue;
+                };
+                if !natural_loop.body.iter().any(|block| block == loop_entry)
+                    || natural_loop.body.iter().any(|block| block == &owner.name)
+                    || natural_loop.body.iter().any(|block| block == sibling)
+                    || !forest.dominates(&owner.name, &natural_loop.header)
+                    || !forest.dominates(&loop_merge, owner_merge)
+                {
+                    continue;
+                }
+                let exits_to_sibling = natural_loop.exits.iter().any(|exit| {
+                    let mut current = exit.clone();
+                    let mut seen = HashSet::new();
+                    loop {
+                        if &current == sibling {
+                            break true;
+                        }
+                        if !seen.insert(current.clone())
+                            || natural_loop.body.iter().any(|block| block == &current)
+                        {
+                            break false;
+                        }
+                        let Some(block) = by_name.get(current.as_str()) else {
+                            break false;
+                        };
+                        let successors = block_successors(block);
+                        let [next] = successors.as_slice() else {
+                            break false;
+                        };
+                        current = next.clone();
+                    }
+                });
+                if !exits_to_sibling {
+                    continue;
+                }
+                if let Some(witness) =
+                    build_selection_arm_witness(blocks, &forest, &owner.name, owner_merge)
+                {
+                    return Some(witness);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn build_selection_arm_witness(
+    blocks: &[BodyBlock],
+    forest: &LoopForest,
+    owner: &str,
+    owner_merge: &str,
+) -> Option<Witness> {
+    let names = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let name_set = blocks
+        .iter()
+        .map(|block| block.name.as_str())
+        .collect::<HashSet<_>>();
+    let mut predecessors: HashMap<String, Vec<String>> = HashMap::new();
+    for block in blocks {
+        for successor in block_successors(block) {
+            if name_set.contains(successor.as_str()) {
+                predecessors
+                    .entry(successor)
+                    .or_default()
+                    .push(block.name.clone());
+            }
+        }
+    }
+    let mut reaches_merge = HashSet::new();
+    let mut stack = vec![owner_merge.to_string()];
+    while let Some(node) = stack.pop() {
+        if !reaches_merge.insert(node.clone()) {
+            continue;
+        }
+        if let Some(incoming) = predecessors.get(&node) {
+            stack.extend(incoming.iter().cloned());
+        }
+    }
+    let closure = blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
+            (block.name != owner_merge
+                && forest.dominates(owner, &block.name)
+                && reaches_merge.contains(&block.name))
+            .then_some(index)
+        })
+        .collect::<HashSet<_>>();
+    if closure.is_empty() || closure.len() > MAX_REGION_BLOCKS {
+        return None;
+    }
+    let mut entries = Vec::new();
+    let mut exits = Vec::new();
+    for (source, block) in blocks.iter().enumerate() {
+        for successor in block_successors(block) {
+            let target = *names.get(successor.as_str())?;
+            match (closure.contains(&source), closure.contains(&target)) {
+                (false, true) => entries.push((source, target)),
+                (true, false) => exits.push((source, target)),
+                _ => {}
+            }
+        }
+    }
+    entries.sort_unstable();
+    entries.dedup();
+    exits.sort_unstable();
+    exits.dedup();
+    if entries.len() != 1 || exits.is_empty() {
+        return None;
+    }
+    let mut ordered = closure.iter().copied().collect::<Vec<_>>();
+    ordered.sort_unstable();
+    let local_of = ordered
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(local, global)| (global, local))
+        .collect::<HashMap<_, _>>();
+    Some(Witness {
+        blocks: blocks.to_vec(),
+        closure,
+        ordered,
+        local_of,
+        entry_from: entries[0].0,
+        entry_to: entries[0].1,
+        exits,
+    })
+}
+
 fn derive_witness_in_mode(
     blocks: &[BodyBlock],
     converge_inloop: bool,
@@ -395,7 +569,10 @@ fn build_witness(
     })
 }
 
-fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
+fn regional_candidate(
+    witness: Witness,
+    require_exit_payload: bool,
+) -> Result<Vec<BodyBlock>, String> {
     let Witness {
         mut blocks,
         closure,
@@ -474,7 +651,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
     for (host_local, &global) in ordered.iter().enumerate() {
         let carrier = blocks[global].typed.as_ref().expect("checked above");
         for inst in &carrier.insts {
-            let Some((ty, incoming)) = &inst.phi_incoming else {
+            let Some((ty, incoming)) = &inst.phi_incoming() else {
                 continue;
             };
             let result = inst.result.as_ref().ok_or_else(|| {
@@ -544,7 +721,7 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
         &exit_by_pair,
         &def_block,
     )?;
-    if exit_payload_slots.is_empty() {
+    if require_exit_payload && exit_payload_slots.is_empty() {
         return Err("construct-tree:straddle-no-exit-payload".to_string());
     }
 
@@ -555,14 +732,14 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
             if inst.is_phi() {
                 continue;
             }
-            for name in &inst.uses {
+            inst.visit_uses(|name| {
                 if def_block
-                    .get(name.as_str())
+                    .get(name)
                     .is_some_and(|(owner, _)| *owner != local)
                 {
-                    cross_values.insert(name.clone());
+                    cross_values.insert(name.to_string());
                 }
-            }
+            });
         }
         for name in terminator_uses(carrier) {
             if def_block
@@ -1015,7 +1192,10 @@ fn regional_candidate(witness: Witness) -> Result<Vec<BodyBlock>, String> {
                 "switch i32 {EXIT_ID}, label {} [ {switch_targets} ]",
                 exit_gateway[external_exit_indices[0]]
             )],
-            BlockRole::ConstructTreeRoute,
+            // This is a real selection header whose routes reconverge in the outside CFG. Marking
+            // the header itself as a route makes construct-tree merge synthesis treat that
+            // reconvergence as an enclosing escape and invent an unreachable merge instead.
+            BlockRole::Normal,
         ));
     }
     for exit_index in external_exit_indices {
@@ -1079,7 +1259,7 @@ fn collect_exit_payload_slots(
             continue;
         };
         for inst in &carrier.insts {
-            if let Some((ty, incoming)) = &inst.phi_incoming {
+            if let Some((ty, incoming)) = &inst.phi_incoming() {
                 let result = inst.result.clone().ok_or_else(|| {
                     format!(
                         "construct-tree:straddle-exit-phi-without-result block={}",
@@ -1126,13 +1306,17 @@ fn collect_exit_payload_slots(
                 }
                 continue;
             }
-            for used in &inst.uses {
-                if def_block.contains_key(used) {
-                    return Err(format!(
-                        "construct-tree:straddle-nonphi-escape block={} value={used}",
-                        block.name
-                    ));
+            let mut escaping = None;
+            inst.visit_uses(|used| {
+                if escaping.is_none() && def_block.contains_key(used) {
+                    escaping = Some(used.to_string());
                 }
+            });
+            if let Some(used) = escaping {
+                return Err(format!(
+                    "construct-tree:straddle-nonphi-escape block={} value={used}",
+                    block.name
+                ));
             }
         }
         for used in terminator_uses(carrier) {
@@ -1148,7 +1332,7 @@ fn collect_exit_payload_slots(
     for (source, target) in exits {
         if !blocks[*target].typed.as_ref().is_some_and(|carrier| {
             carrier.insts.iter().any(|inst| {
-                inst.phi_incoming.as_ref().is_some_and(|(_, incoming)| {
+                inst.phi_incoming().as_ref().is_some_and(|(_, incoming)| {
                     incoming
                         .iter()
                         .any(|(_, predecessor)| names.get(predecessor) == Some(source))
@@ -1220,7 +1404,7 @@ fn rewrite_entry_and_exit_phis(
                 )
             })?;
         let incoming = inst
-            .phi_incoming
+            .phi_incoming()
             .as_ref()
             .map(|(_, incoming)| incoming.clone())
             .ok_or_else(|| {
@@ -1263,6 +1447,24 @@ pub(in crate::native) fn renest_straddle_loop_merge(
     regional_candidate(
         derive_witness(blocks)
             .ok_or_else(|| "construct-tree:straddle-witness-decline".to_string())?,
+        true,
+    )
+    .map(Some)
+}
+
+/// Re-nest a selection arm whose natural loop exits through a linear tail into the selection's
+/// sibling arm. The regional wrapper owns only the conflicted selection/loop closure, carries its
+/// scalar exit payloads through typed gateways, and leaves all outside pointer SSA in place.
+pub(in crate::native) fn renest_loop_exit_sibling(
+    blocks: &[BodyBlock],
+) -> Result<Option<Vec<BodyBlock>>, String> {
+    if !requires_loop_exit_sibling_dispatch(blocks) {
+        return Ok(None);
+    }
+    regional_candidate(
+        derive_loop_exit_sibling_witness(blocks)
+            .ok_or_else(|| "construct-tree:loop-exit-sibling-witness-decline".to_string())?,
+        false,
     )
     .map(Some)
 }
@@ -1331,7 +1533,7 @@ mod tests {
             .clone();
         let witness = build_witness(&source, &forest, &loop_body, "%lmerge", "%owner", "%out0")
             .expect("bounded straddle witness");
-        let candidate = regional_candidate(witness).expect("regional wrapper");
+        let candidate = regional_candidate(witness, true).expect("regional wrapper");
         assert!(candidate.iter().any(|block| block.name == PRE));
         assert!(candidate.iter().any(|block| block.name == EXIT));
         for original in ["%owner", "%loop", "%body", "%lmerge"] {
@@ -1355,7 +1557,7 @@ mod tests {
             .insts
             .iter()
             .find(|inst| inst.result.as_deref() == Some("%x"))
-            .and_then(|inst| inst.phi_incoming.as_ref())
+            .and_then(|inst| inst.phi_incoming().as_ref())
             .map(|(_, incoming)| incoming.clone())
             .expect("rewritten out0 phi");
         assert!(
@@ -1384,7 +1586,7 @@ mod tests {
             .find(|block| block.name == MERGE)
             .expect("wrapper merge");
         for inst in &merge.typed.as_ref().expect("carrier").insts {
-            let Some((_, incoming)) = &inst.phi_incoming else {
+            let Some((_, incoming)) = &inst.phi_incoming() else {
                 continue;
             };
             for (_, predecessor) in incoming {
@@ -1394,5 +1596,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn loop_exit_sibling_wrapper_owns_the_complete_selection_tail() {
+        let source = vec![
+            bb("%entry", &["br label %owner"]),
+            bb("%owner", &["br i1 %direct, label %sibling, label %loop"]),
+            bb(
+                "%loop",
+                &[
+                    "%i = phi i32 [ 0, %owner ], [ %next, %loop_tail ]",
+                    "br label %body",
+                ],
+            ),
+            bb(
+                "%body",
+                &[
+                    "%next = add i32 %i, 1",
+                    "br i1 %leave, label %sibling, label %loop_tail",
+                ],
+            ),
+            bb("%loop_tail", &["br i1 %again, label %loop, label %tail"]),
+            bb(
+                "%sibling",
+                &[
+                    "%value = phi i32 [ 7, %owner ], [ %next, %body ]",
+                    "br label %post",
+                ],
+            ),
+            bb("%tail", &["br label %post"]),
+            bb("%post", &["br label %merge"]),
+            bb("%merge", &["ret void"]),
+        ];
+        assert!(requires_loop_exit_sibling_dispatch(&source));
+        let candidate = renest_loop_exit_sibling(&source)
+            .expect("regional ownership construction")
+            .expect("loop-exit sibling witness");
+        assert!(candidate.iter().any(|block| block.name == PRE));
+        assert!(candidate.iter().any(|block| block.name == "%post"));
+        assert!(candidate.iter().any(|block| block.name == "%merge"));
+        structured_plan_construct_tree(&candidate).unwrap_or_else(|| {
+            panic!(
+                "regional loop-exit sibling candidate should structure, reason={:?}",
+                structured_reject_reason(&candidate)
+            )
+        });
     }
 }

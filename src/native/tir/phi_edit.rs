@@ -1,89 +1,37 @@
 //! The typed phi-restructuring primitives the structurizer applies to a `TirBlock`'s phi instructions
 //! (`rebuild_phi` / `duplicate_phi_incoming` / `mirror_region_incomings` / the incoming extend). Each
 //! mutates a block's phi instructions when the structurizer reorders/clones a region — filtering,
-//! duplicating, or mirroring the `phi_incoming` pairs and keeping the parallel value `operands` and the
-//! `uses` def/use edges consistent — so a mutation site keeps its typed carrier populated instead of
+//! duplicating, or mirroring the canonical `phi_incoming` pairs and keeping the derived def/use edges
+//! consistent — so a mutation site keeps its typed carrier populated instead of
 //! invalidating it (`typed = None`). Byte-identical to the retired text path's re-lowering of the
 //! rewritten phi line by construction (verified per primitive by a `== re-lower` unit test + historical private byte-baseline
-//! drift NONE):
-//! `operands` are 1:1 with `phi_incoming` (both built by iterating the same incoming brackets), and
-//! `uses` are the deduped `%`-local names of the incoming values (the dual of `instruction_uses`).
+//! drift NONE): use traversal yields the deduped `%`-local names of the incoming values. Parsed phis do
+//! not duplicate those values in `operands`; emission consumes the
+//! canonical incoming carrier directly.
 
 use super::*;
-use crate::native::ir::{LlValue, TypedValue};
+use crate::native::ir::LlValue;
 
-/// Collect the `%`-local names an incoming VALUE contributes as def/use edges, in text order — the
-/// structural dual of `collect_value_names` over the value's printed form (only `Local`s carry a
-/// `%`-token; `Global(@name)` and scalar constants do not; aggregates recurse in element order).
-fn collect_locals(v: &LlValue, out: &mut Vec<String>) {
-    match v {
-        LlValue::Local(n) => out.push(n.clone()),
-        LlValue::Vector(vs) | LlValue::Array(vs) | LlValue::Struct(vs) => {
-            for tv in vs {
-                collect_locals(&tv.value, out);
-            }
-        }
-        LlValue::Splat(b) => collect_locals(&b.value, out),
-        LlValue::Gep(g) => {
-            collect_locals(&g.base.value, out);
-            for idx in &g.indices {
-                collect_locals(&idx.value, out);
-            }
-        }
-        LlValue::IntToPtr { source, .. } => collect_locals(&source.value, out),
-        LlValue::Global(_)
-        | LlValue::Bool(_)
-        | LlValue::Int(_)
-        | LlValue::SignedInt(_)
-        | LlValue::Hex(_)
-        | LlValue::Float(_)
-        | LlValue::Float32Bits(_)
-        | LlValue::HalfBits(_)
-        | LlValue::BFloatBits(_)
-        | LlValue::Zero
-        | LlValue::Undef => {}
-    }
-}
-
-/// Recompute `inst.uses` from the current `phi_incoming` values (the dual of `instruction_uses` on a
-/// rewritten phi line: the deduped `%`-local names of every incoming value, excluding the result).
+/// Keep the derived-use views consistent after editing canonical `phi_incoming` values.
 fn recompute_phi_uses(inst: &mut TirInst) {
-    let Some((_, incoming)) = &inst.phi_incoming else {
-        return;
-    };
-    let mut names = Vec::new();
-    for (value, _pred) in incoming {
-        collect_locals(value, &mut names);
-    }
     // Keep the parse-time-inference view `phi_incoming_values` (the incoming VALUES) in step with the
     // edited `phi_incoming`, so an edited phi stays byte-identical to re-lowering its rewritten line
     // (`resolve_phi_incoming_values` returns exactly these values; `phi_incoming` Some ⟹ that parse
     // succeeds too). No parse-time inference reads a structurized block, but the `== re-lower` invariant
     // must hold in every carried field.
-    inst.phi_incoming_values = Some(incoming.iter().map(|(value, _)| value.clone()).collect());
-    inst.uses = dedup_keep_order(names, inst.result.as_deref());
-}
-
-/// Whether an instruction has an emit-consumable per-incoming operand list (one `TirOperand` per phi
-/// incoming, so `operands` can be filtered/extended in parallel with `phi_incoming`). A malformed phi
-/// whose operands did not lower carries a single `Unresolved` placeholder instead — its operands are not
-/// parallel, so a structural edit must leave them alone (and BC drift NONE proves this class does not
-/// occur where a site edits it).
-fn phi_operands_parallel(inst: &TirInst) -> bool {
-    inst.phi_incoming
-        .as_ref()
-        .is_some_and(|(_, incoming)| inst.operands.len() == incoming.len())
+    *inst.phi_incoming_values_mut() = None;
+    inst.uses = None;
 }
 
 impl TirBlock {
     /// Filter every phi's incomings to those whose predecessor label satisfies `keep` — the typed dual
     /// of applying the text `rebuild_phi` to each phi line. A phi with a mix of kept and dropped
-    /// incomings has its `phi_incoming` pairs, parallel value `operands`, and `uses` all recomputed from
-    /// the kept set. A phi whose incomings are ALL kept (identity) or ALL dropped is left untouched — the
+    /// incomings has its canonical pairs updated; use traversal derives from that carrier. A phi whose
+    /// incomings are ALL kept (identity) or ALL dropped is left untouched — the
     /// text `rebuild_phi` returns `None` on an empty keep-set, leaving the line unchanged.
     pub(in crate::native) fn rebuild_phi_incomings(&mut self, keep: impl Fn(&str) -> bool) {
         for inst in &mut self.insts {
-            let Some((_, incoming)) = &inst.phi_incoming else {
+            let Some((_, incoming)) = &inst.phi_incoming() else {
                 continue;
             };
             let keep_idx: Vec<usize> = incoming
@@ -95,12 +43,8 @@ impl TirBlock {
             if keep_idx.len() == incoming.len() || keep_idx.is_empty() {
                 continue;
             }
-            let parallel = phi_operands_parallel(inst);
-            if let Some((_, incoming)) = &mut inst.phi_incoming {
+            if let Some((_, incoming)) = inst.phi_incoming_mut() {
                 *incoming = keep_idx.iter().map(|&i| incoming[i].clone()).collect();
-            }
-            if parallel {
-                inst.operands = keep_idx.iter().map(|&i| inst.operands[i].clone()).collect();
             }
             recompute_phi_uses(inst);
         }
@@ -109,12 +53,9 @@ impl TirBlock {
     /// Append a value phi `<result> = phi <ty> [ v0, p0 ], ...` to this block's instructions, built
     /// directly from typed data — the carrier-direct dual of synthesizing a phi LINE, re-lowering it,
     /// and pushing the block. Byte-identical to lowering the equivalent `%result = phi <ty> [ v, p ], …`
-    /// line by construction: `phi_incoming` holds the `(ty, incoming)` pairs `parse_phi` would produce;
-    /// `operands` is the parallel per-incoming operand list `resolve_phi_operands` builds — a `Local`
-    /// value → a `Value` operand, anything else → a typed `Const` (`operand_from_typed_value`, the exact
-    /// dual of `operand_from_bare` on the value's printed form); `result_ty` is the phi type; and `uses`
-    /// is the deduped `%`-local names of the incoming values (`recompute_phi_uses`). Every non-phi field
-    /// is `None`/empty, matching a re-lowered phi line. Used by the structurizer synthesis sites to build
+    /// line by construction: `phi_incoming` holds the `(ty, incoming)` pairs `parse_phi` would produce,
+    /// `result_ty` is the phi type, and use traversal derives local names from those values. Every
+    /// non-phi field is `None`/empty, matching a re-lowered phi line. Used by structurizer sites to build
     /// a fresh phi from typed incomings without rendering + re-lexing a line (`render_value` cannot print
     /// the `undef`/aggregate incomings these sites funnel).
     pub(in crate::native) fn push_value_phi(
@@ -123,48 +64,21 @@ impl TirBlock {
         ty: &LlType,
         incomings: &[(LlValue, String)],
     ) {
-        let operands = incomings
-            .iter()
-            .map(|(v, _)| {
-                operand_from_typed_value(&TypedValue {
-                    ty: ty.clone(),
-                    value: v.clone(),
-                })
-            })
-            .collect();
         let mut inst = TirInst {
             result: Some(result.to_string()),
             result_ty: Some(ty.clone()),
-            uses: Vec::new(),
-            operands,
-            cmp_predicate: None,
-            mem_align: None,
-            gep_source_ty: None,
-            gep: None,
-            call: None,
-            opcode: "phi".to_string(),
-            alloca_ty: None,
-            phi_incoming: Some((ty.clone(), incomings.to_vec())),
-            phi_parse_error: None,
-            aggregate_indices: None,
-            diag_line: None,
-            shuffle_mask: None,
-            void_call_line: None,
-            value_call_error: None,
-            bitcast: None,
-            icmp_rest: None,
-            pointer_pointee: None,
-            // Parse-time inference views. `identity_ptr_bitcast`/`select_arms`/`load`/`store`/
-            // `alias_call` are `None` for a phi (a phi is none of those). `phi_incoming_values` is set
-            // by the `recompute_phi_uses` call below (to the incoming values), matching a re-lowered
-            // `phi` line so the carrier stays byte-identical to re-lower in every field.
-            identity_ptr_bitcast: None,
-            phi_incoming_values: None,
-            select_arms: None,
-            load: None,
-            store: None,
-            alias_call: None,
-            emit_scan_call: None,
+            uses: None,
+            operands: Vec::new(),
+            opcode: TirOpcode::Phi,
+            // The lighter incoming-values view is filled by `recompute_phi_uses` below.
+            data: Box::new(TirInstDetails {
+                fast_math: false,
+                payload: TirInstData::Phi {
+                    parse_error: None,
+                    incoming: Some((ty.clone(), incomings.to_vec())),
+                    incoming_values: None,
+                },
+            }),
         };
         recompute_phi_uses(&mut inst);
         self.insts.push(inst);
@@ -186,13 +100,12 @@ impl TirBlock {
         rewrites: &HashMap<String, Vec<String>>,
     ) {
         for inst in &mut self.insts {
-            let Some((_, incoming)) = &inst.phi_incoming else {
+            let Some((_, incoming)) = &inst.phi_incoming() else {
                 continue;
             };
             if !incoming.iter().any(|(_, pred)| rewrites.contains_key(pred)) {
                 continue;
             }
-            let parallel = phi_operands_parallel(inst);
             // The expanded plan as (source-index, value, predecessor) in source order.
             let plan: Vec<(usize, LlValue, String)> = incoming
                 .iter()
@@ -205,13 +118,7 @@ impl TirBlock {
                     None => vec![(i, value.clone(), pred.clone())],
                 })
                 .collect();
-            if parallel {
-                inst.operands = plan
-                    .iter()
-                    .map(|(i, _, _)| inst.operands[*i].clone())
-                    .collect();
-            }
-            if let Some((_, inc)) = &mut inst.phi_incoming {
+            if let Some((_, inc)) = inst.phi_incoming_mut() {
                 *inc = plan.into_iter().map(|(_, v, p)| (v, p)).collect();
             }
             recompute_phi_uses(inst);
@@ -219,11 +126,8 @@ impl TirBlock {
     }
 
     /// Append one incoming `[ value, pred ]` to this block's phi named `result` — the carrier-direct dual
-    /// of rewriting that phi's LINE to add a trailing incoming and re-lowering it. Keeps `phi_incoming`,
-    /// the parallel value `operands`, and `uses` all consistent with a re-lower (the appended operand is
-    /// `operand_from_typed_value` of the new value, mirroring `resolve_phi_operands` over the extended
-    /// incoming list). A no-op if the block has no phi with that result (the caller named a phi this block
-    /// does not hold).
+    /// of rewriting that phi's LINE to add a trailing incoming and re-lowering it. The canonical carrier
+    /// remains the sole owner of the values. A no-op if the block has no phi with that result.
     pub(in crate::native) fn append_phi_incoming(
         &mut self,
         result: &str,
@@ -232,22 +136,18 @@ impl TirBlock {
     ) {
         for inst in &mut self.insts {
             if inst.opcode == "phi" && inst.result.as_deref() == Some(result) {
-                let Some((ty, incoming)) = &mut inst.phi_incoming else {
+                let Some((_, incoming)) = inst.phi_incoming_mut() else {
                     return;
                 };
-                let ty = ty.clone();
-                incoming.push((value.clone(), pred.to_string()));
-                inst.operands
-                    .push(operand_from_typed_value(&TypedValue { ty, value }));
+                incoming.push((value, pred.to_string()));
                 recompute_phi_uses(inst);
                 return;
             }
         }
     }
 
-    /// Replace the incoming list of this block's phi named `result` with `incomings`, recomputing the
-    /// parallel value `operands` and `uses` — the carrier-direct dual of rewriting the phi LINE to a new
-    /// incoming list and re-lowering it. Keeps the phi's type/opcode/result untouched (an incoming edit
+    /// Replace the incoming list of this block's phi named `result` with `incomings` — the carrier-direct
+    /// dual of rewriting the phi line and re-lowering it. Keeps the phi's type/opcode/result untouched (an incoming edit
     /// never changes them). A no-op if the block has no phi with that result, or if that phi did not lower
     /// its incomings (`phi_incoming: None`, the degenerate aggregate class that routes to retry — such a
     /// phi carries no typed incoming list to rebuild, so the caller never targets it).
@@ -258,20 +158,10 @@ impl TirBlock {
     ) {
         for inst in &mut self.insts {
             if inst.opcode == "phi" && inst.result.as_deref() == Some(result) {
-                let Some((ty, existing)) = &mut inst.phi_incoming else {
+                let Some((_, existing)) = inst.phi_incoming_mut() else {
                     return;
                 };
-                let ty = ty.clone();
                 *existing = incomings.to_vec();
-                inst.operands = incomings
-                    .iter()
-                    .map(|(v, _)| {
-                        operand_from_typed_value(&TypedValue {
-                            ty: ty.clone(),
-                            value: v.clone(),
-                        })
-                    })
-                    .collect();
                 recompute_phi_uses(inst);
                 return;
             }
@@ -291,10 +181,9 @@ impl TirBlock {
         rename: &HashMap<String, String>,
     ) {
         for inst in &mut self.insts {
-            let Some((ty, incoming)) = inst.phi_incoming.as_ref() else {
+            let Some((_, incoming)) = inst.phi_incoming().as_ref() else {
                 continue;
             };
-            let ty = ty.clone();
             let Some(new_value) = incoming
                 .iter()
                 .find(|(_, p)| p == from)
@@ -302,13 +191,9 @@ impl TirBlock {
             else {
                 continue;
             };
-            if let Some((_, inc)) = &mut inst.phi_incoming {
+            if let Some((_, inc)) = inst.phi_incoming_mut() {
                 inc.push((new_value.clone(), to.to_string()));
             }
-            inst.operands.push(operand_from_typed_value(&TypedValue {
-                ty,
-                value: new_value,
-            }));
             recompute_phi_uses(inst);
         }
     }
@@ -318,8 +203,8 @@ impl TirBlock {
     /// parseable incoming list, each incoming `[ v, %P ]` whose predecessor `%P` is in `region` gains an
     /// interleaved renamed clone `[ rename(v), rename(%P) ]` immediately after it (the cloned region
     /// predecessor `P'` branches to this boundary block too, carrying the renamed region value or the
-    /// unchanged external value). `phi_incoming`, the parallel value `operands`, and `uses` are all
-    /// recomputed from the mirrored list. A phi whose incomings did not lower (`phi_incoming: None` — an
+    /// unchanged external value). The canonical incoming carrier is replaced by the mirrored list. A phi
+    /// whose incomings did not lower (`phi_incoming: None` — an
     /// aggregate incoming) is left untouched: it carries no typed incoming list to mirror, and it fails
     /// primary emit → retry regardless (the boundary carrier is what emits), so the string mirror on it
     /// is emit-irrelevant. Byte-identical to re-lowering the string-mirrored phi lines by construction
@@ -332,7 +217,7 @@ impl TirBlock {
         rename: &HashMap<String, String>,
     ) {
         for inst in &mut self.insts {
-            let Some((ty, incoming)) = inst.phi_incoming.as_ref() else {
+            let Some((ty, incoming)) = inst.phi_incoming().as_ref() else {
                 continue;
             };
             let ty = ty.clone();
@@ -351,16 +236,7 @@ impl TirBlock {
             if !added {
                 continue;
             }
-            inst.operands = mirrored
-                .iter()
-                .map(|(v, _)| {
-                    operand_from_typed_value(&TypedValue {
-                        ty: ty.clone(),
-                        value: v.clone(),
-                    })
-                })
-                .collect();
-            inst.phi_incoming = Some((ty, mirrored));
+            *inst.phi_incoming_mut() = Some((ty, mirrored));
             recompute_phi_uses(inst);
         }
     }
@@ -368,8 +244,8 @@ impl TirBlock {
     /// Replace this block's phi named by `phi_line`'s result with one re-derived from `phi_line` — the
     /// typed dual of a synthesis site that rebuilds a phi's incoming list (drop redirected + append a
     /// `[merged, M]` funnel incoming, mirror a cloned predecessor, or extend a boundary phi) and writes
-    /// the new line. Recomputes the incoming-dependent fields (`phi_incoming`, value `operands`, `uses`)
-    /// with the SAME `phi_incoming_of` / `resolve_operands` / `instruction_uses` a re-lower runs, so the
+    /// the new line. Recomputes the canonical incoming field with the same `phi_incoming_parse` parser a
+    /// re-lower runs (retaining unresolved operands only when that canonical parse fails), so the
     /// carrier's phi is byte-identical to re-lowering the rewritten line — the phi TYPE (hence
     /// `result_ty`, `opcode`, and every non-incoming field) is unchanged by an incoming edit. A no-op if
     /// the block has no phi with that result (the caller's line did not name one of this block's phis).
@@ -380,10 +256,20 @@ impl TirBlock {
         };
         for inst in &mut self.insts {
             if inst.opcode == "phi" && inst.result.as_deref() == Some(result.as_str()) {
-                (inst.phi_incoming, inst.phi_parse_error) = phi_incoming_of(phi_line);
-                inst.phi_incoming_values = resolve_phi_incoming_values(phi_line, "phi");
-                inst.operands = resolve_operands(phi_line);
-                inst.uses = instruction_uses(phi_line, Some(result.as_str()));
+                let incoming = phi_incoming_parse(phi_line).0;
+                let fallback = incoming
+                    .is_none()
+                    .then(|| resolve_phi_incoming_values(phi_line, "phi"))
+                    .flatten();
+                let parsed = incoming.is_some();
+                *inst.phi_incoming_mut() = incoming;
+                *inst.phi_incoming_values_mut() = fallback;
+                inst.operands = if parsed {
+                    Vec::new()
+                } else {
+                    resolve_operands(phi_line)
+                };
+                inst.uses = (!parsed).then(|| instruction_uses(phi_line, Some(result.as_str())));
                 return;
             }
         }
@@ -724,11 +610,36 @@ mod tests {
         }
     }
 
-    /// A phi with a typed vector incoming (e.g. `<2 x i32> <i32 %a, i32 %b>`) now parses
-    /// successfully via `parse_phi_incoming_value` (which tries `parse_typed_value` first).
-    /// The carrier is `Some`, and `emit_phi_resolved` handles the parsed value.
+    /// The reachability boundary for [`TirBlock::push_value_phi`] / [`TirBlock::append_phi_incoming`]: a
+    /// phi with an AGGREGATE incoming lowers to `phi_incoming: None` (`parse_phi` rejects the
+    /// `<N x T> <...>` incoming form) with an `Unresolved` operand, so it fails primary emit and routes
+    /// to retry. A structurizer site therefore never extracts a typed incoming list from such a phi —
+    /// the carrier-direct helpers are only ever fed the parseable (`Some`) incomings the tests above
+    /// cover. This locks that invariant so the helpers are not "fixed" to fake-parse aggregates (which
+    /// would emit where the line path retried — a byte change).
     #[test]
-    fn aggregate_phi_incoming_carrier_populated() {
+    fn malformed_phi_incoming_is_none() {
+        let carrier = lower_block_carrier(
+            "%blk",
+            &[
+                "%r = phi <2 x i32> [ <2 x i32> <i32 %a, i32 %b> %p1 ], [ undef, %M ]".to_string(),
+                "br label %x".to_string(),
+            ],
+            &types(),
+        )
+        .unwrap();
+        let phi = &carrier.insts[0];
+        assert_eq!(phi.opcode, "phi");
+        assert!(
+            phi.phi_incoming().is_none(),
+            "a malformed phi incoming must not parse to a typed incoming list"
+        );
+    }
+
+    /// A vector-constant phi incoming (`<2 x i32> <i32 %a, i32 %b>`) carries an inline type prefix.
+    /// It parses to a typed incoming list, so the phi is editable and the CFG editors may rewrite it.
+    #[test]
+    fn aggregate_phi_incoming_parses() {
         let carrier = lower_block_carrier(
             "%blk",
             &[
@@ -740,10 +651,13 @@ mod tests {
         .unwrap();
         let phi = &carrier.insts[0];
         assert_eq!(phi.opcode, "phi");
-        assert!(
-            phi.phi_incoming.is_some(),
-            "a typed vector phi incoming should parse to a carrier"
-        );
+        let (_, incoming) = phi
+            .phi_incoming()
+            .as_ref()
+            .expect("a typed vector-constant phi incoming parses");
+        assert_eq!(incoming.len(), 2);
+        assert_eq!(incoming[0].1, "%p1");
+        assert_eq!(incoming[1].1, "%M");
     }
 
     /// `duplicate_phi_incoming` must equal re-lowering a block whose phis carry a mirrored

@@ -6,7 +6,7 @@
 //! (see [`passes`]).
 //!
 //! Pipeline: `.air|.ll` -> llvm-dis -> sanitize -> native Vulkan SPIR-V emit -> retained crate
-//! module -> interface+lowering passes -> assemble -> spirv-val (vulkan1.3).
+//! module -> interface+lowering passes -> assemble -> spirv-val (vulkan1.2).
 
 // `too_many_arguments` and `type_complexity` are threshold heuristics that fire pervasively and
 // benignly across this translator: emit/lowering functions legitimately thread many typed
@@ -18,8 +18,10 @@
 
 pub mod air_intrinsics;
 pub mod as_shadow;
+mod construction;
 mod emit_sidecar;
 pub mod env_vars;
+mod fc_air_specialize;
 mod fc_specialize;
 mod layout;
 pub mod linked_functions;
@@ -27,9 +29,7 @@ pub mod meta;
 pub mod native;
 pub mod passes;
 mod passthrough;
-mod primary_retry;
 pub mod reflect;
-mod retry;
 mod spirv_binary;
 mod spirv_module;
 mod spirv_operand;
@@ -41,10 +41,12 @@ pub use fc_specialize::{
     specialize_function_constant_bytes, specialize_function_constants,
     specialize_function_constants_zero,
 };
-pub use passthrough::{translate_passthrough, translate_vertex_observer};
-use primary_retry::*;
+pub use passthrough::{
+    translate_passthrough, translate_passthrough_specialized, translate_vertex_observer,
+};
 
 use crate::spirv_module::{load_bytes as load_owned_module, Module};
+use std::borrow::Cow;
 use std::path::Path;
 
 /// Detect the shader stage from the AIR's own `!air.vertex`/`!air.fragment`/`!air.kernel` metadata
@@ -69,10 +71,11 @@ pub fn detect_stage(src: &str, tmp: &Path) -> Result<passes::Stage, String> {
 
 /// Translate an AIR bitcode or LLVM-IR file to Vulkan SPIR-V for `stage`.
 ///
-/// The final module is validated with `spirv-val` under the Vulkan 1.3 environment. A primary module
-/// that fails validation may enter the validation-gated retry cascade; only a validating candidate
-/// is returned. `tmp` is caller-owned scratch space and may be reused sequentially, but callers
-/// should give concurrent translations separate directories.
+/// Construction selects a representation from AIR structure and owned-module invariants before
+/// serialization. The single resulting module is then validated with `spirv-val` under the Vulkan
+/// 1.2 environment; validator output never selects or repairs another representation. `tmp` is
+/// caller-owned scratch space and may be reused sequentially, but callers should give concurrent
+/// translations separate directories.
 pub fn translate(src: &str, stage: passes::Stage, tmp: &Path) -> Result<Vec<u8>, String> {
     translate_with_options(src, stage, tmp, passes::TransformOptions::default())
 }
@@ -100,12 +103,12 @@ pub fn translate_sanitized_native(
     translate_sanitized_native_with_options(san_ll, stage, tmp, passes::TransformOptions::default())
 }
 
-/// Apply the shared pre-emit AIR lowering before any path derives stage metadata or retries from the
-/// module. Retries re-emit the supplied text directly, so using the original intrinsic-bearing text
-/// after the primary has already lowered it would make the two paths observe different programs.
+/// Apply the shared pre-emit AIR lowering before any representation derives stage metadata or emits
+/// from the module. Alternate constructions re-emit the supplied text directly, so using the
+/// original intrinsic-bearing text would make the representations observe different programs.
 /// Floor-safe: `lower_simdgroup_async_copy` is a no-op unless the module calls
 /// `air.simdgroup_async_copy_2d` (such modules fail the emitter outright otherwise).
-fn lower_async_copy_if_enabled(san_ll: &str) -> String {
+fn lower_async_copy_if_enabled(san_ll: &str) -> Cow<'_, str> {
     native::lower_simdgroup_async_copy(san_ll)
 }
 
@@ -146,15 +149,12 @@ fn options_for_air(
     Ok(options)
 }
 
-/// Per-stage interface metadata parsed once from sanitized AIR and shared by emission, passes,
-/// reflection, and every retry tier. Kernel translation also retains the FC-buffer-promoted
-/// projection used by one adopt-if-validates retry; both projections share one decoded metadata-node
-/// table.
+/// Per-stage interface metadata parsed once from sanitized AIR and shared by emission, passes, and
+/// reflection.
 struct StageMeta {
     frag: Option<meta::FragMeta>,
     vert: Option<meta::VertMeta>,
     kern: Option<meta::KernMeta>,
-    promoted_kern: Option<meta::KernMeta>,
     entry_name: Option<String>,
 }
 
@@ -166,7 +166,6 @@ fn parse_stage_meta(san_ll: &str, stage: passes::Stage) -> StageMeta {
                 frag,
                 vert: None,
                 kern: None,
-                promoted_kern: None,
                 entry_name,
             }
         }
@@ -176,17 +175,15 @@ fn parse_stage_meta(san_ll: &str, stage: passes::Stage) -> StageMeta {
                 frag: None,
                 vert,
                 kern: None,
-                promoted_kern: None,
                 entry_name,
             }
         }
         passes::Stage::Kernel => {
-            let (kern, promoted_kern, entry_name) = meta::parse_air_kernel_meta_variants(san_ll);
+            let (kern, _, entry_name) = meta::parse_air_kernel_meta_variants(san_ll);
             StageMeta {
                 frag: None,
                 vert: None,
                 kern,
-                promoted_kern,
                 entry_name,
             }
         }
@@ -352,45 +349,62 @@ fn validate_reflected_runtime_storage_images(
     Ok(())
 }
 
-/// Diagnostic probe (used by `historical PSB dump probes`): run the exact production
-/// translate path but with the W1 PhysicalStorageBuffer64 retry tiers DISABLED, returning the
-/// pre-PSB emission the cascade would otherwise feed to the PSB rewrite. Lets the `--psb-dump` tool
-/// apply `rewrite_cross_binding_pointer_merges_bytes` by hand for inspection without an env flip
-/// (the retired `METAL2VULKAN_PSB=0`). Not a frontier signal; production always runs with PSB on.
-pub fn translate_pre_psb_probe(
-    san_ll: &str,
-    stage: passes::Stage,
-    tmp: &Path,
-) -> Result<Vec<u8>, String> {
-    let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
-    reject_unsupported_metal_linked_functions(san_ll)?;
-    let stage_meta = parse_stage_meta(san_ll, stage);
-    let options = options_for_air(san_ll, passes::TransformOptions::default())?;
-    let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
-    translate_sanitized_with_meta(
-        san_ll,
-        stage,
-        stage_meta.frag.as_ref(),
-        stage_meta.vert.as_ref(),
-        stage_meta.kern.as_ref(),
-        stage_meta.promoted_kern.as_ref(),
-        stage_meta.entry_name.as_deref(),
-        tmp,
-        options,
-        false,
-        datalayout,
-    )
-}
-
 pub fn translate_sanitized_native_with_options(
     san_ll: &str,
     stage: passes::Stage,
     tmp: &Path,
     options: passes::TransformOptions,
 ) -> Result<Vec<u8>, String> {
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: datalayout parse start");
+    }
     let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: datalayout parse complete");
+    }
     translate_sanitized_native_with_options_and_layout(san_ll, stage, tmp, options, datalayout)
+}
+
+/// Translate sanitized AIR after baking exact Metal function-constant payloads into the AIR
+/// initializer contract.
+///
+/// Specialization happens before metadata parsing, CFG construction, and resource-interface
+/// lowering. This is required when a function constant controls resource presence or removes a CFG
+/// arm: changing a finished SPIR-V initializer cannot faithfully restore structure already folded
+/// under the default value. Each payload is exact little-endian scalar/vector storage for its AIR
+/// `MTL_FC_INIT_<index>` type.
+pub fn translate_sanitized_native_specialized_with_options(
+    san_ll: &str,
+    stage: passes::Stage,
+    tmp: &Path,
+    options: passes::TransformOptions,
+    function_constants: &[(u32, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
+    let specialized =
+        fc_air_specialize::specialize_air_function_constants(san_ll, function_constants)?;
+    translate_sanitized_native_with_options_and_layout(
+        specialized.as_ref(),
+        stage,
+        tmp,
+        options,
+        datalayout,
+    )
+}
+
+/// Translate an owned sanitized AIR module while allowing superseded preprocessing input to be
+/// released before typed parsing. This is byte- and error-equivalent to
+/// [`translate_sanitized_native_with_options`], but lowers peak memory for large modules that need a
+/// source rewrite. Callers that must retain their source should use the borrowed API.
+pub fn translate_sanitized_native_owned_with_options(
+    san_ll: String,
+    stage: passes::Stage,
+    tmp: &Path,
+    options: passes::TransformOptions,
+) -> Result<Vec<u8>, String> {
+    let datalayout = layout::AirDataLayout::from_ir(&san_ll)?;
+    let lowered = native::lower_simdgroup_async_copy_owned(san_ll);
+    translate_sanitized_native_pre_lowered_with_layout(&lowered, stage, tmp, options, datalayout)
 }
 
 fn translate_sanitized_native_with_options_and_layout(
@@ -401,29 +415,48 @@ fn translate_sanitized_native_with_options_and_layout(
     datalayout: Option<layout::AirDataLayout>,
 ) -> Result<Vec<u8>, String> {
     // Lower `air.simdgroup_async_copy_2d` (+ its event/wait pair) to an explicit strided tile copy
-    // BEFORE any meta parse or emit, so every path — the default emit AND every retry tier (which
-    // re-emit from `san_ll`) — sees ordinary LLVM instead of the unhandled intrinsic. This is what lets
-    // the FC-promote/prune/PSB retries fix the SECOND wall these kernels carry (a Private-demoted
-    // pointer arm over-indexed as an array), which they could not before when the lowering lived only
-    // inside `emit_vulkan_spirv` (the retries bypass that entry). Floor-safe by construction: the
-    // rewrite is a no-op unless the module calls `air.simdgroup_async_copy_2d`, and such modules fail
-    // the emitter outright today. See `native::async_copy` and its structural regression tests.
+    // before metadata parsing or emission, so the primary and alternate representations see the
+    // same ordinary LLVM. The rewrite is a no-op unless the module calls the intrinsic, which the
+    // emitter otherwise rejects. See `native::async_copy` and its structural regression tests.
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: AIR pre-lowering start");
+    }
     let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
+    let san_ll = lowered.as_ref();
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: AIR pre-lowering complete");
+    }
+    translate_sanitized_native_pre_lowered_with_layout(san_ll, stage, tmp, options, datalayout)
+}
+
+fn translate_sanitized_native_pre_lowered_with_layout(
+    san_ll: &str,
+    stage: passes::Stage,
+    tmp: &Path,
+    options: passes::TransformOptions,
+    datalayout: Option<layout::AirDataLayout>,
+) -> Result<Vec<u8>, String> {
     reject_unsupported_metal_linked_functions(san_ll)?;
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: stage metadata parse start");
+    }
     let stage_meta = parse_stage_meta(san_ll, stage);
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: stage metadata parse complete");
+    }
     let options = options_for_air(san_ll, options)?;
+    if env_vars::retry_debug() {
+        eprintln!("[retry-debug] translate: construction core start");
+    }
     translate_sanitized_with_meta(
         san_ll,
         stage,
         stage_meta.frag.as_ref(),
         stage_meta.vert.as_ref(),
         stage_meta.kern.as_ref(),
-        stage_meta.promoted_kern.as_ref(),
         stage_meta.entry_name.as_deref(),
         tmp,
         options,
-        true,
         datalayout,
     )
 }
@@ -438,6 +471,18 @@ pub fn translate_sanitized_native_linked_with_options(
     options: passes::TransformOptions,
     linkage: &linked_functions::LinkedFunctionLinkage,
 ) -> Result<Vec<u8>, String> {
+    let specialized = specialize_linked_module(san_ll, stage, linkage)?;
+    translate_sanitized_native_with_options(&specialized, stage, tmp, options)
+}
+
+/// Resolve exact direct references and function-table contents into one ordinary AIR module.
+/// Consumers that need to inspect or diagnose the pre-emission linked program use the same
+/// specialization contract as linked translation.
+pub fn specialize_linked_module(
+    san_ll: &str,
+    stage: passes::Stage,
+    linkage: &linked_functions::LinkedFunctionLinkage,
+) -> Result<String, String> {
     let stage_name = match stage {
         passes::Stage::Kernel => "kernel",
         passes::Stage::Vertex => "vertex",
@@ -454,14 +499,36 @@ pub fn translate_sanitized_native_linked_with_options(
         &entry_name,
         linkage,
     )?;
-    translate_sanitized_native_with_options(&specialized, stage, tmp, options)
+    Ok(specialized)
+}
+
+/// Linked translation with AIR-level function-constant specialization.
+///
+/// Linkage is resolved first so the same exact function-constant values specialize every retained
+/// linked definition carrying the stable AIR initializer index.
+pub fn translate_sanitized_native_linked_specialized_with_options(
+    san_ll: &str,
+    stage: passes::Stage,
+    tmp: &Path,
+    options: passes::TransformOptions,
+    linkage: &linked_functions::LinkedFunctionLinkage,
+    function_constants: &[(u32, Vec<u8>)],
+) -> Result<Vec<u8>, String> {
+    let specialized = specialize_linked_module(san_ll, stage, linkage)?;
+    translate_sanitized_native_specialized_with_options(
+        &specialized,
+        stage,
+        tmp,
+        options,
+        function_constants,
+    )
 }
 
 /// Like [`translate`] but also returns the [`reflect::ShaderReflection`] needed to integrate the
 /// resulting module.
 ///
 /// Interface facts come from AIR metadata and the translator's descriptor ABI. Conservative buffer
-/// footprints come from read-only analysis of the final adopted SPIR-V, after retry selection. The
+/// footprints come from read-only analysis of the final constructed and validated SPIR-V. The
 /// analysis does not mutate the module, so the returned SPIR-V remains byte-identical to
 /// [`translate`] for the same input, stage, and options.
 pub fn translate_reflected(
@@ -509,7 +576,7 @@ pub fn reflect_sanitized(
     options: passes::TransformOptions,
 ) -> Result<reflect::ShaderReflection, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
+    let san_ll = lowered.as_ref();
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, options)?;
     let mut reflection = build_reflection(
@@ -531,6 +598,23 @@ pub fn reflect_sanitized(
     Ok(reflection)
 }
 
+/// Reflect sanitized AIR after baking exact Metal function-constant payloads into its resource
+/// and control-flow contract.
+///
+/// Function constants can gate stage arguments in AIR metadata. Reflection must therefore consume
+/// the same specialized AIR as translation; reflecting the disabled default and specializing only
+/// during emission would omit resources selected by an authored non-default value.
+pub fn reflect_sanitized_specialized(
+    san_ll: &str,
+    stage: passes::Stage,
+    options: passes::TransformOptions,
+    function_constants: &[(u32, Vec<u8>)],
+) -> Result<reflect::ShaderReflection, String> {
+    let specialized =
+        fc_air_specialize::specialize_air_function_constants(san_ll, function_constants)?;
+    reflect_sanitized(specialized.as_ref(), stage, options)
+}
+
 /// [`translate_sanitized_native_with_options`] plus the reflection facade. See [`translate_reflected`].
 pub fn translate_sanitized_native_reflected(
     san_ll: &str,
@@ -550,16 +634,11 @@ fn translate_sanitized_native_reflected_with_layout(
     datalayout: Option<layout::AirDataLayout>,
 ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
+    let san_ll = lowered.as_ref();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, options)?;
-    passes::validate_kernel_dispatch_source(
-        san_ll,
-        stage,
-        options,
-        stage_meta.entry_name.as_deref(),
-    )?;
+    passes::validate_kernel_dispatch_options(stage, options)?;
     let mut reflection = build_reflection(
         stage,
         stage_meta.frag.as_ref(),
@@ -576,32 +655,25 @@ fn translate_sanitized_native_reflected_with_layout(
         reflection.add_buffer_address_table()?;
     }
     reflection.validate_descriptor_abi()?;
-    let spv = translate_sanitized_with_meta_prevalidated(
+    let finished = translate_sanitized_with_meta_prevalidated_carrier(
         san_ll,
         stage,
         stage_meta.frag.as_ref(),
         stage_meta.vert.as_ref(),
         stage_meta.kern.as_ref(),
-        stage_meta.promoted_kern.as_ref(),
         stage_meta.entry_name.as_deref(),
         tmp,
         options,
-        true,
         datalayout,
     )?;
-    reflection.add_buffer_footprints(&spv)?;
-    Ok((spv, reflection))
+    reflection.add_buffer_footprints(&finished.module)?;
+    Ok((finished.bytes, reflection))
 }
 
-/// Emit + passes transform for a sanitized AIR module, stopping BEFORE spirv-val and the retry
-/// cascade — the byte-drift-check (BC) gate's translate path. Returns the canonical SPIR-V bytes the
-/// default path would hand to spirv-val on success (`Ok`), or the emit/passes error (`Err`). No
-/// subprocess and no retry tiers: this is exactly the "primary emit path + passes layer" BC
-/// regression-guards, and it is byte-identical to the pre-spirv-val stage of
-/// [`translate_sanitized_native`] (the same async-copy lowering, meta parse, `emit_vulkan_spirv`, and
-/// `finish_module` the default path runs before it validates). The retry cascade only fires when this
-/// output fails spirv-val, so BC deliberately does NOT see it (retry output needs spirv-val to gate,
-/// which the milestone battery's G4/G5 cover).
+/// Emit and finish the primary representation without invoking `spirv-val`. This is the byte-drift
+/// boundary for the primary emitter: it includes the same AIR lowering, metadata parse, passes, and
+/// owned-module construction checks used by production, but it does not select an alternate
+/// representation when those checks reject the primary one.
 pub fn translate_native_no_retry(san_ll: &str, stage: passes::Stage) -> Result<Vec<u8>, String> {
     // Mirror the pre-spirv-val prologue of `translate_sanitized_native_with_options` exactly so BC
     // measures the bytes production would actually validate: async-copy lowering, then stage meta.
@@ -619,8 +691,8 @@ pub fn translate_native_no_retry(san_ll: &str, stage: passes::Stage) -> Result<V
 }
 
 /// `translate_native_no_retry` after its shared AIR pre-lowering and one stage-meta parse. Keeping
-/// this separate lets the validation-gated primary wrapper reuse both the exact lowered text and the
-/// parsed carrier for its default candidate and retry context.
+/// this separate lets the validating primary wrapper reuse the exact lowered text and parsed
+/// carrier.
 fn translate_native_no_retry_with_meta(
     san_ll: &str,
     stage: passes::Stage,
@@ -630,8 +702,8 @@ fn translate_native_no_retry_with_meta(
     entry_name: Option<&str>,
 ) -> Result<Vec<u8>, String> {
     // `tools::emit_vulkan_spirv` is the in-process native emitter (no subprocess); `finish_module` is
-    // the shared passes tail every translate path runs. Together they are the default path's output
-    // up to (but not including) `spirv_val_bytes` and the tier cascade.
+    // the shared passes tail every translate path runs. Together they are the primary construction
+    // up to (but not including) `spirv_val_bytes`.
     emit_finish_primary_module(
         san_ll,
         stage,
@@ -644,18 +716,52 @@ fn translate_native_no_retry_with_meta(
     .map(|finished| finished.bytes)
 }
 
-/// Return the default-path-aligned PRIMARY candidate without entering the retry cascade. This is
-/// intentionally separate from [`translate_native_no_retry`]: the byte baseline must stay an
-/// in-process, pre-validator gate, while a cross-binding pointer phi can only be adopted after
-/// spirv-val proves that it is the actual failing rule. Callers that measure the primary-validity
-/// floor use this form with a per-worker temporary directory.
+/// Emit and finish the primary construction without invoking the external validator. Shared by the
+/// byte-drift boundary and the primary-validating facade so both observe the exact product module.
+fn emit_finish_primary_module(
+    san_ll: &str,
+    stage: passes::Stage,
+    frag: Option<&meta::FragMeta>,
+    vert: Option<&meta::VertMeta>,
+    kern: Option<&meta::KernMeta>,
+    entry_name: Option<&str>,
+    options: passes::TransformOptions,
+) -> Result<FinishedModule, String> {
+    passes::validate_kernel_dispatch_options(stage, options)?;
+    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)?;
+    tools::emit_vulkan_spirv_with_sidecar(
+        san_ll,
+        Path::new(""),
+        kern,
+        entry_name,
+        stage_buffer_layouts(stage, frag, vert, kern),
+    )
+    .and_then(|emitted| {
+        finish_module(
+            emitted,
+            stage,
+            frag,
+            vert,
+            kern,
+            entry_name,
+            air_data_layout.as_ref(),
+            options,
+            FinishConstruction::Primary,
+        )
+        .map_err(|failure| failure.error)
+    })
+}
+
+/// Construct and validate only the primary representation. This is intentionally separate from
+/// [`translate_native_no_retry`]: callers that measure primary validity use this form with a
+/// per-worker temporary directory.
 pub fn translate_native_primary_validated(
     san_ll: &str,
     stage: passes::Stage,
     tmp: &Path,
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
+    let san_ll = lowered.as_ref();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let finished = emit_finish_primary_module(
@@ -667,122 +773,79 @@ pub fn translate_native_primary_validated(
         stage_meta.entry_name.as_deref(),
         passes::TransformOptions::default(),
     )?;
-    let primary_module = finished.module;
-    let primary = finished.bytes;
-    let Err(validation_error) = tools::spirv_val_bytes(&primary, tmp) else {
-        return Ok(primary);
-    };
-    // The corpus audit calls this primary-only gate before the full retry cascade. Make its existing
-    // default-off dump control capture the actual first-invalid module, so a later retry error cannot
-    // hide where validation first failed. Diagnostics must never affect translation if the requested
-    // dump path itself is unavailable.
     if let Some(path) = env_vars::retry_dump() {
-        let _ = std::fs::write(path, &primary);
+        let _ = std::fs::write(path, &finished.bytes);
     }
-    if let Some(primary) = primary_xbind_phi_psb_for_validation_error(
-        &primary_module,
-        &primary,
-        &validation_error,
-        tmp,
-        reflect::DescriptorLayout::default(),
-    ) {
-        return Ok(primary);
-    }
-    let retry = retry::RetryCtx::new(
-        san_ll,
-        stage,
-        stage_meta.frag.as_ref(),
-        stage_meta.vert.as_ref(),
-        stage_meta.kern.as_ref(),
-        stage_meta.promoted_kern.as_ref(),
-        stage_meta.entry_name.as_deref(),
-        tmp,
-        passes::TransformOptions::default(),
-        true,
-        layout::AirDataLayout::from_ir(san_ll)?,
-    );
-    if let Some(primary) = primary_storage_buffer_raw_feed_if_needed(&validation_error, &retry) {
-        return Ok(primary);
-    }
-    Ok(
-        primary_primitive_phi_metadata_if_needed(&validation_error, &retry)
-            .or_else(|| primary_pointer_typing_raw_if_needed(&validation_error, &retry))
-            .or_else(|| {
-                primary_pointer_typing_wide_raw_guard_chain_if_needed(
-                    &validation_error,
-                    &primary,
-                    &primary_module,
-                    &retry,
-                )
-            })
-            .or_else(|| primary_other_prune_if_needed(&validation_error, &primary, tmp))
-            .or_else(|| {
-                primary_wide_raw_store_guard_cfg_chain_if_needed(
-                    &validation_error,
-                    &primary,
-                    &primary_module,
-                    &retry,
-                )
-            })
-            .or_else(|| primary_construct_tree_if_needed(&validation_error, &retry))
-            // Plain relooper before prune-then-relooper: the latter deliberately declines when the ordinary
-            // relooper already validates (so the full retry cascade keeps the `val-cfg:relooper` tier label).
-            // Primary-validated has no later relooper step, so adopt it here for the residual CFG class
-            // production already ships via relooper (notably banked `09/de938adc`).
-            .or_else(|| primary_relooper_if_needed(&validation_error, &primary, tmp))
-            .or_else(|| primary_cfg_prune_then_relooper_if_needed(&validation_error, &primary, tmp))
-            // When the primary bytes are too broken for an in-place relooper rewrite (e.g. undefined-id SSA
-            // order after an over-admitted structured emit), re-emit through the production raw→relooper→PSB
-            // composition so primary-validated tracks the shipped cascade for frontier cross-arm residuals.
-            .or_else(|| {
-                let original = finished
-                    .original_module
-                    .as_ref()
-                    .map(assemble_finished_module)
-                    .unwrap_or_else(|| primary.clone());
-                primary_cfg_raw_then_relooper_if_needed(&validation_error, &original, &retry)
-            })
-            .or_else(|| {
-                primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
-                    &validation_error,
-                    &retry,
-                )
-            })
-            .or_else(|| {
-                primary_logical_pointer_inline_sroa_raw_if_needed(&validation_error, &retry)
-            })
-            .or_else(|| {
-                primary_opaque_image_select_module_if_needed(
-                    &validation_error,
-                    &primary_module,
-                    &primary,
-                    tmp,
-                )
-            })
-            .unwrap_or(primary),
-    )
+    tools::spirv_val_bytes(&finished.bytes, tmp)?;
+    Ok(finished.bytes)
 }
-
-/// Run the interface+lowering passes on emitted SPIR-V bytes and assemble to a canonical byte
-/// stream — the shared tail of every translate path (default and the R4 raw retry tiers). Extracted
-/// so the probe path ([`translate_raw_tiers_probe`]) re-emits the raw tiers through the EXACT same
-/// transform the retry uses, rather than a divergent approximation.
+/// Run interface and lowering passes on an owned emitted module and assemble one canonical byte
+/// stream. Primary and alternate representations share this construction boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FinishRewrites {
+enum FinishConstruction {
     Plain,
     Primary,
+    RawRelooper,
 }
 
 #[derive(Clone)]
 struct FinishedModule {
-    /// The same module represented by `bytes`, retained so validation-triggered rewrites can clone
-    /// and mutate it without reparsing the serialization that `finish_module` just produced.
+    /// The same module represented by `bytes`, retained for owned construction consumers.
     module: Module,
     bytes: Vec<u8>,
-    /// Canonical module before primary-only rewrites, retained for validation-triggered retry
-    /// rewrites that must start before the speculative primary-only tail. Its bytes are assembled
-    /// lazily only when primary validation fails, so a validating primary assembles once.
-    original_module: Option<Module>,
+}
+
+impl FinishedModule {
+    /// Seal one finished owned module and its only serialized representation together.
+    fn new(module: Module) -> Self {
+        let bytes = assemble_finished_module(&module);
+        Self { module, bytes }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinishFailureKind {
+    Other,
+    RawBufferConstruction,
+    CfgConstruction,
+}
+
+#[derive(Debug)]
+struct FinishFailure {
+    kind: FinishFailureKind,
+    error: String,
+}
+
+impl FinishFailure {
+    fn cfg(error: String) -> Self {
+        Self {
+            kind: FinishFailureKind::CfgConstruction,
+            error,
+        }
+    }
+}
+
+impl From<String> for FinishFailure {
+    fn from(error: String) -> Self {
+        Self {
+            kind: FinishFailureKind::Other,
+            error,
+        }
+    }
+}
+
+impl From<native::OwnedModuleFailure> for FinishFailure {
+    fn from(failure: native::OwnedModuleFailure) -> Self {
+        match failure {
+            native::OwnedModuleFailure::Invalid(error)
+            | native::OwnedModuleFailure::TypeConstruction(error) => Self::from(error),
+            native::OwnedModuleFailure::RawBufferConstruction(error) => Self {
+                kind: FinishFailureKind::RawBufferConstruction,
+                error,
+            },
+            native::OwnedModuleFailure::CfgConstruction(error) => Self::cfg(error),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -821,8 +884,8 @@ fn finish_module(
     entry_name: Option<&str>,
     air_data_layout: Option<&layout::AirDataLayout>,
     options: passes::TransformOptions,
-    rewrites: FinishRewrites,
-) -> Result<FinishedModule, String> {
+    construction: FinishConstruction,
+) -> Result<FinishedModule, FinishFailure> {
     emitted.sidecar.air_data_layout = air_data_layout.cloned();
     let retry_debug = env_vars::retry_debug();
     if retry_debug {
@@ -851,73 +914,17 @@ fn finish_module(
         entry_name,
         options,
     )?;
-    if retry_debug {
-        eprintln!("[retry-debug] finish: passes complete; native rewrites start");
-    }
-    // M4: legalize illegal logical-pointer phis (Private/Function/UniformConstant `OpPhi`) on the
-    // PRIMARY emit path via the phi-the-index rewrite, so those functions validate directly instead of
-    // shipping only via retry rescue. Floor-safe by construction (it touches only already-invalid
-    // logical-pointer phis, never a validating module).
-    let mut native_pointer_changed = native::rewrite_logical_pointer_phis_module(&mut out);
-    // Opaque AIR pointers can select a real StorageBuffer byte view against a typed Private fallback.
-    // Such a pointer select is invalid under Logical addressing regardless of VariablePointers.
-    // Load each concrete arm in its own storage domain and select values; pointer escapes remain an
-    // honest failure.
-    while native::rewrite_mixed_storage_pointer_select_loads_module(&mut out) {
-        native_pointer_changed = true;
-    }
-    // M4: legalize integer-width phi mismatches (a narrow `uint` loop phi fed a wide `ulong` induction
-    // back-edge value) by truncating the wide incoming to the phi's result type. Floor-safe (touches
-    // only already-invalid integer phis). Runs after the pointer-phi rewrite so it can also legalize
-    // any width mismatch that rewrite's synthesized index phis might introduce.
-    native::rewrite_integer_width_phis_module(&mut out);
-    // M4/Keystone-2: repair loop-closed-SSA violations the `MultipleExits` loop funnel leaves behind (a
-    // loop-body value used raw in a post-loop block the restructured CFG can reach without the defining
-    // block), by register-demoting the offending value to a function-scope OpVariable. Floor-safe by
-    // construction — a validating module has every def dominating its uses, so this never fires on one.
-    native_pointer_changed |= native::demote_nondominating_values_module(&mut out);
-    // Workgroup struct-padding clears emitted as byte-addressed `uchar*` stores are not legal
-    // Logical SPIR-V when rooted at a struct pointer. Drop the provably-padding zero stores before
-    // validation so the normal retry cascade only sees semantic failures.
-    native::drop_workgroup_struct_padding_byte_zero_stores_module(&mut out);
-    native::drop_dangling_debug_targets_module(&mut out);
-    // M4/Keystone-2: node-split a multi-entry loop whose header is entered from two different
-    // selections' arms (the irreducible shape `structured_plan` over-admits — the mlx-steel
-    // `steel_attention` family), so the PRIMARY structured emit validates instead of shipping only via
-    // the relooper retry. Floor-safe by construction (a valid loop is single-entry). Runs after the phi
-    // rewrites; the attention rows also need the integer-width phi legalization above.
-    let native_cfg_changed = native::split_multientry_loop_selection_exits_module(&mut out);
-    if native_pointer_changed {
-        passes::repair_exact_raw_byte_loads_after_native_rewrites(&mut out, &sidecar, entry_name)?;
+    native::close_inlined_bda_pointer_tables_module(&mut out);
+    let preserved_pointer_facts = sidecar
+        .local_pointer_field_stores
+        .iter()
+        .map(|fact| fact.id)
+        .collect::<std::collections::HashSet<_>>();
+    if native::lower_unobserved_bda_aggregate_pointer_fields_module(&mut out)? {
+        native::eliminate_dead_values_module(&mut out, &preserved_pointer_facts);
     }
     if retry_debug {
-        eprintln!("[retry-debug] finish: native rewrites complete; cfg repair start");
-    }
-    // The complete-module rewrites above run after the main passes pipeline and can introduce or
-    // redirect CFG edges, or synthesize index phis from pointer phis. Re-establish the shared
-    // merge/continue/phi invariant before ids are canonicalized so late native composition cannot
-    // bypass structured-CFG repair.
-    if native_cfg_changed || native_pointer_changed {
-        out = passes::repair_structured_cfg_after_native_rewrites(out, stage, entry_name)?;
-    }
-    // CFG repair can introduce a forwarding phi after the earlier loop-closed-SSA pass. Re-check the
-    // completed graph at this mutation boundary; the repair is self-gating and touches only a value
-    // whose definition does not dominate its use.
-    if native::demote_nondominating_values_module(&mut out) {
-        out = passes::repair_structured_cfg_after_native_rewrites(out, stage, entry_name)?;
-    }
-    // CFG repair can split an edge and leave a forwarding phi with exactly one incoming pair. Fold
-    // that SSA identity before validation and canonicalization. Besides avoiding redundant phis,
-    // this prevents a stale pre-interface pointer result type from wrapping a refined image value.
-    native::collapse_single_incoming_phis_module(&mut out);
-    while native::rewrite_mixed_storage_pointer_select_loads_module(&mut out) {}
-    native::rewrite_private_vector_word_loads_module(&mut out);
-    native::repair_sampled_image_result_types_module(&mut out);
-    // Complete-module pointer rewrites and their exact-raw repair can rematerialize access chains
-    // after the main transform's null cleanup. Re-close the invariant after the final producer.
-    passes::neutralize_null_access_chains_after_native_rewrites(&mut out, entry_name)?;
-    if retry_debug {
-        eprintln!("[retry-debug] finish: cfg repair complete; canonicalize start");
+        eprintln!("[retry-debug] finish: passes complete; canonicalize start");
     }
     // Renumber all ids into a deterministic, serialized-order canonical form. This format
     // normalization keeps equivalent producer paths directly comparable and SPIR-V-level diffs
@@ -931,76 +938,69 @@ fn finish_module(
     if retry_debug {
         eprintln!("[retry-debug] finish: canonicalize complete");
     }
-    let original_module = (rewrites == FinishRewrites::Primary).then(|| out.clone());
-    if rewrites == FinishRewrites::Primary {
-        let (primary_pointer_changed, primary_cfg_changed) =
-            primary_retry::apply_primary_emit_rewrites_module(
-                &mut out,
-                &mut retained_global_ids,
-                &mut sidecar,
-            );
-        if primary_pointer_changed {
-            passes::repair_exact_raw_byte_loads_after_native_rewrites(
-                &mut out, &sidecar, entry_name,
-            )?;
-        }
-        // Primary-only rewrites deliberately run after canonical id remapping and can perform their
-        // own CFG surgery. They are the final mutation boundary, so close the same structured-CFG
-        // invariant here as well instead of assuming the earlier finish-time repair still applies.
-        if primary_cfg_changed {
-            out = passes::repair_structured_cfg_after_native_rewrites(out, stage, entry_name)?;
-        }
-        if native::demote_nondominating_values_module(&mut out) {
-            out = passes::repair_structured_cfg_after_native_rewrites(out, stage, entry_name)?;
-        }
-        native::collapse_single_incoming_phis_module(&mut out);
-        while native::rewrite_mixed_storage_pointer_select_loads_module(&mut out) {}
-        native::rewrite_private_vector_word_loads_module(&mut out);
-        native::repair_sampled_image_result_types_module(&mut out);
-        passes::neutralize_null_access_chains_after_native_rewrites(&mut out, entry_name)?;
-        native::drop_unused_values_module(&mut out);
+    if construction == FinishConstruction::Primary {
+        // Static conditions are part of the constructed program, not a validator diagnosis. Remove
+        // their unreachable CFG before the primary candidate is assembled, without treating every
+        // otherwise-unused emitted computation as an optimization candidate.
+        native::prune_constant_cfg_module_if_changed(&mut out);
     }
-    // Every late producer above may substitute a pointer carrier after its users were typed. Close
-    // the SPIR-V access-chain contract at the final module boundary: the result pointer keeps its
-    // pointee but always inherits the actual base pointer's storage class.
-    native::reconcile_access_chain_storage_classes_module(&mut out);
+    native::prune_unused_null_and_undef_constants_module(&mut out);
+    // A complete source-ownership rejection chooses the bounded relooper representation after the
+    // ordinary lowering and static-CFG construction have established the final reachable value and
+    // pointer graph. The decision is carried from source-CFG planning; no serialized output is
+    // parsed and no validator failure participates.
+    let mut cfg_construction_functions = sidecar.ownership_plan_rejected_functions.clone();
+    cfg_construction_functions.extend(
+        sidecar
+            .post_lowering_cfg_construction_functions
+            .iter()
+            .cloned(),
+    );
+    native::construct_cfg_functions_module(&mut out, &cfg_construction_functions)
+        .map_err(FinishFailure::cfg)?;
+    native::construct_physical_atomic_pointer_lvalues_module(&mut out);
+    // CFG construction rematerializes values used by the selected representation. Discard any
+    // null/undef constants that become dead in that final graph; under PhysicalStorageBuffer64 an
+    // otherwise unreferenced logical-pointer null is still structurally invalid SPIR-V.
+    native::prune_unused_null_and_undef_constants_module(&mut out);
+    if construction == FinishConstruction::RawRelooper {
+        // CFG construction mints its final ids after the shared pre-CFG canonicalization.
+        // Canonicalize the completed selected representation before its only owned check and
+        // serialization, matching the deterministic output contract without sealing an
+        // intermediate module.
+        passes::canonicalize_ids(&mut out);
+    }
+    if let Some(failure) = native::owned_module_failure(&out) {
+        if let Some(path) = env_vars::retry_dump() {
+            let _ = std::fs::write(path, assemble_finished_module(&out));
+        }
+        return Err(failure.into());
+    }
     passes::validate_descriptor_bindings(&out, options.descriptor_layout)?;
-    let bytes = assemble_finished_module(&out);
+    let finished = FinishedModule::new(out);
     if retry_debug {
         eprintln!("[retry-debug] finish: assembly complete");
     }
-    Ok(FinishedModule {
-        module: out,
-        bytes,
-        original_module,
-    })
+    Ok(finished)
 }
 
-/// Probe-only (used by `historical raw-residual probes`): emit the two R4 raw-retry tiers
-/// for a module and return each tier's emitted+assembled SPIR-V bytes (`Ok`) or its emit error
-/// (`Err`), through the EXACT same `finish_module` transform the production retry applies. The caller
-/// spirv-vals each to measure the TRUE residual blocker once raw byte-offset modeling resolves the
-/// buffer pointer typing: a pointer-merge-classified case whose raw tier emits clean but is then
-/// rejected for a CFG/other reason is MULTIPLY-BLOCKED (R4 + R2/...), not a pure R4 case. Returns
-/// `[tier1, tier2]` where tier1 = device/constant buffers raw, tier2 = + threadgroup buffers raw.
+/// Diagnostic probe: construct both raw-buffer representations through the same `finish_module`
+/// boundary used by production and return their bytes or construction errors. The caller may
+/// validate them independently to inspect whether raw byte-offset modeling closes a type invariant.
+/// Returns `[device_raw, device_and_workgroup_raw]`.
 pub fn translate_raw_tiers_probe(
     san_ll: &str,
     stage: passes::Stage,
     tmp: &Path,
 ) -> Vec<Result<Vec<u8>, String>> {
     let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
+    let san_ll = lowered.as_ref();
     if let Err(error) = reject_unsupported_metal_linked_functions(san_ll) {
         return vec![Err(error.clone()), Err(error)];
     }
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
-    if let Err(error) = passes::validate_kernel_dispatch_source(
-        san_ll,
-        stage,
-        opts,
-        stage_meta.entry_name.as_deref(),
-    ) {
+    if let Err(error) = passes::validate_kernel_dispatch_options(stage, opts) {
         return vec![Err(error.clone()), Err(error)];
     }
     let air_data_layout = layout::AirDataLayout::from_ir(san_ll);
@@ -1016,9 +1016,10 @@ pub fn translate_raw_tiers_probe(
                 stage_meta.entry_name.as_deref(),
                 air_data_layout.as_ref(),
                 opts,
-                FinishRewrites::Plain,
+                FinishConstruction::Plain,
             )
             .map(|finished| finished.bytes)
+            .map_err(|failure| failure.error)
         })
     };
     vec![
@@ -1033,6 +1034,8 @@ pub fn translate_raw_tiers_probe(
                 stage_meta.vert.as_ref(),
                 stage_meta.kern.as_ref(),
             ),
+            &Default::default(),
+            &Default::default(),
         )),
         run(
             tools::emit_vulkan_spirv_all_buffers_raw_with_workgroup_sidecar(
@@ -1046,26 +1049,28 @@ pub fn translate_raw_tiers_probe(
                     stage_meta.vert.as_ref(),
                     stage_meta.kern.as_ref(),
                 ),
+                &Default::default(),
+                &Default::default(),
             ),
         ),
     ]
 }
 
-/// Diagnostic probe: emit the BDA device-pointer tier (`emit_vulkan_spirv_all_buffers_raw_bda`) for a
-/// case and run it through the same `finish_module` finalization the production `bda_retry` applies, so
-/// the surviving spirv-val residual of a `raw store for Ptr(1)` BDA case can be inspected. Mirrors
-/// [`translate_raw_tiers_probe`]; not a frontier signal.
+/// Diagnostic probe: force the BDA device-pointer model
+/// (`emit_vulkan_spirv_all_buffers_raw_bda`) and run it through production finalization so a
+/// surviving validation residual can be inspected. Mirrors [`translate_raw_tiers_probe`]; not a
+/// frontier signal.
 pub fn translate_bda_probe(
     san_ll: &str,
     stage: passes::Stage,
     tmp: &Path,
 ) -> Result<Vec<u8>, String> {
     let lowered = lower_async_copy_if_enabled(san_ll);
-    let san_ll = lowered.as_str();
+    let san_ll = lowered.as_ref();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
     let opts = passes::TransformOptions::default();
-    passes::validate_kernel_dispatch_source(san_ll, stage, opts, stage_meta.entry_name.as_deref())?;
+    passes::validate_kernel_dispatch_options(stage, opts)?;
     let air_data_layout = layout::AirDataLayout::from_ir(san_ll)?;
     tools::emit_vulkan_spirv_all_buffers_raw_bda_with_sidecar(
         san_ll,
@@ -1078,6 +1083,8 @@ pub fn translate_bda_probe(
             stage_meta.vert.as_ref(),
             stage_meta.kern.as_ref(),
         ),
+        &Default::default(),
+        &Default::default(),
     )
     .and_then(|b| {
         finish_module(
@@ -1089,9 +1096,10 @@ pub fn translate_bda_probe(
             stage_meta.entry_name.as_deref(),
             air_data_layout.as_ref(),
             opts,
-            FinishRewrites::Plain,
+            FinishConstruction::Plain,
         )
         .map(|finished| finished.bytes)
+        .map_err(|failure| failure.error)
     })
 }
 
@@ -1101,604 +1109,108 @@ fn translate_sanitized_with_meta(
     frag: Option<&meta::FragMeta>,
     vert: Option<&meta::VertMeta>,
     kern: Option<&meta::KernMeta>,
-    promoted_kern: Option<&meta::KernMeta>,
     entry_name: Option<&str>,
     tmp: &Path,
     options: passes::TransformOptions,
-    psb_retry_enabled: bool,
     datalayout: Option<layout::AirDataLayout>,
 ) -> Result<Vec<u8>, String> {
-    // Shared pre-emission boundary for the ordinary production and diagnostic retry paths. The
+    // Shared pre-emission boundary for the production and diagnostic construction paths. The
     // reflected facade performs this same check before reflection analysis, then enters the
     // prevalidated core below.
-    passes::validate_kernel_dispatch_source(san_ll, stage, options, entry_name)?;
-    translate_sanitized_with_meta_prevalidated(
-        san_ll,
-        stage,
-        frag,
-        vert,
-        kern,
-        promoted_kern,
-        entry_name,
-        tmp,
-        options,
-        psb_retry_enabled,
-        datalayout,
+    passes::validate_kernel_dispatch_options(stage, options)?;
+    translate_sanitized_with_meta_prevalidated_carrier(
+        san_ll, stage, frag, vert, kern, entry_name, tmp, options, datalayout,
     )
+    .map(|finished| finished.bytes)
 }
 
 /// Translation core after the facade has enforced the dispatch contract. The reflected facade runs
-/// the same check before its potentially expensive reflection analysis, then enters here so a
-/// barrier-free module is scanned only once.
-fn translate_sanitized_with_meta_prevalidated(
+/// the same check before its potentially expensive reflection analysis, then enters here so the
+/// dispatch contract is scanned only once.
+fn translate_sanitized_with_meta_prevalidated_carrier(
     san_ll: &str,
     stage: passes::Stage,
     frag: Option<&meta::FragMeta>,
     vert: Option<&meta::VertMeta>,
     kern: Option<&meta::KernMeta>,
-    promoted_kern: Option<&meta::KernMeta>,
     entry_name: Option<&str>,
     tmp: &Path,
     options: passes::TransformOptions,
-    psb_retry_enabled: bool,
     datalayout: Option<layout::AirDataLayout>,
-) -> Result<Vec<u8>, String> {
-    // Build the retry cascade context (S2): the former per-tier closures are now methods on
-    // `RetryCtx`, which captures the same locals (`san_ll`, `tmp`, the meta/stage/options `finish`
-    // threads, and the A/B env gates read once here). `psb_retry_enabled` is always `true` on the
-    // production path; only `translate_pre_psb_probe` passes `false`. Routing stays below.
-    let rc = retry::RetryCtx::new(
-        san_ll,
-        stage,
-        frag,
-        vert,
-        kern,
-        promoted_kern,
-        entry_name,
-        tmp,
-        options,
-        psb_retry_enabled,
-        datalayout,
-    );
-    // Within the relooper's hard cap, a large source CFG is owned by the global structurizers.
-    // Above that cap, speculative construct-tree pre-routing can consume the entire translation
-    // budget before a valid primary is even attempted; try the primary first and let validation
-    // select later retries. Count structural LLVM blocks without parsing instruction bodies.
-    let max_function_blocks = sanitized_max_function_basic_block_count(san_ll);
-    if large_cfg_relooper_eligible(max_function_blocks) {
-        if let Some(relooped) = rc.raw_feed_then_relooper() {
-            return Ok(relooped);
-        }
-        if rc.large_cfg_construct_tree_eligible() {
-            if let Some(constructed) = rc.construct_tree_retry() {
-                return Ok(constructed);
-            }
-        } else if rc.retry_debug_on {
-            eprintln!("[retry-debug] large cfg: construct-tree skipped after non-CFG feed failure");
-        }
+) -> Result<FinishedModule, String> {
+    let retry_debug_on = env_vars::retry_debug();
+    if retry_debug_on {
+        eprintln!("[retry-debug] translate: construction context start");
     }
-    let retry_debug_on = rc.retry_debug_on;
-    let has_device_address_pointer = has_device_address_pointer_load(san_ll);
-    let primary_finished = tools::emit_vulkan_spirv_with_sidecar(
+    let rc = construction::ConstructionCtx::new(
+        san_ll, stage, frag, vert, kern, entry_name, tmp, options, datalayout,
+    );
+    if retry_debug_on {
+        eprintln!("[retry-debug] translate: primary emission start");
+    }
+    let primary_emitted = tools::emit_vulkan_spirv_with_outcome(
         san_ll,
         tmp,
         rc.kern,
         rc.entry_name,
         stage_buffer_layouts(rc.stage, rc.frag, rc.vert, rc.kern),
-    )
-    .and_then(|emitted| rc.finish_primary_carrier(emitted));
-    let translated = match primary_finished {
-        Ok(finished) => {
-            // `finish_module` applies the in-process primary rewrites before assembly. Try the
-            // phi-only PSB candidate only if spirv-val identifies its cross-binding pointer rule.
-            // On any non-validating outcome the canonical pre-rewrite module is serialized lazily
-            // to drive the retry cascade unchanged.
-            let primary_module = finished.module;
-            let primary = finished.bytes;
-            let out_module = finished
-                .original_module
-                .expect("primary finish always retains canonical pre-rewrite module");
-            let primary_validation = tools::spirv_val_bytes(&primary, tmp);
-            if primary_validation.is_ok() {
-                if retry_debug_on {
-                    eprintln!("[retry-debug] default emission validated in-translate");
-                }
-                Ok(primary)
-            } else {
-                let out = assemble_finished_module(&out_module);
-                let validation_error = primary_validation.expect_err("checked above");
-                if retry_debug_on {
-                    eprintln!(
-                        "[retry-debug] primary module spirv-val failed: {}",
-                        validation_error
-                            .lines()
-                            .take(4)
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    );
-                }
-                let primary_block_count = primary_module
-                    .functions
-                    .iter()
-                    .map(|function| function.blocks.len())
-                    .max()
-                    .unwrap_or(0);
-                // The whole-function relooper cannot own an emitted graph beyond its hard cap, but
-                // static function-constant arms can be the only reason it grew past that ceiling.
-                // First prune and reloop the already-built primary; only if it cannot shrink into
-                // the hard budget, give the compact source CFG one construct-tree attempt. Raw and
-                // SROA re-emissions remain skipped for this oversized case.
-                if primary_block_count > native::CFG_EMIT_RELOOPER_MAX_BLOCKS {
-                    primary_cfg_prune_then_relooper_if_needed(&validation_error, &primary, tmp)
-                        .or_else(|| primary_construct_tree_if_needed(&validation_error, &rc))
-                        .ok_or(validation_error)
-                } else if let Some(primary) = primary_xbind_phi_psb_for_validation_error(
-                    &primary_module,
-                    &primary,
-                    &validation_error,
-                    tmp,
-                    options.descriptor_layout,
-                ) {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_storage_buffer_raw_feed_if_needed(&validation_error, &rc)
-                {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_primitive_phi_metadata_if_needed(&validation_error, &rc)
-                {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_pointer_typing_raw_if_needed(&validation_error, &rc)
-                {
-                    Ok(primary)
-                } else if let Some(primary) = primary_pointer_typing_wide_raw_guard_chain_if_needed(
-                    &validation_error,
-                    &primary,
-                    &primary_module,
-                    &rc,
-                ) {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_other_prune_if_needed(&validation_error, &primary, tmp)
-                {
-                    Ok(primary)
-                } else if let Some(primary) = primary_wide_raw_store_guard_cfg_chain_if_needed(
-                    &validation_error,
-                    &primary,
-                    &primary_module,
-                    &rc,
-                ) {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_cfg_prune_if_needed(&validation_error, &primary, &rc)
-                {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_construct_tree_if_needed(&validation_error, &rc)
-                {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_cfg_prune_then_relooper_if_needed(&validation_error, &primary, tmp)
-                {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_dynamic_struct_index_inline_sroa_relooper_if_needed(
-                        &validation_error,
-                        &rc,
-                    )
-                {
-                    Ok(primary)
-                } else if let Some(primary) =
-                    primary_logical_pointer_inline_sroa_raw_if_needed(&validation_error, &rc)
-                {
-                    Ok(primary)
-                } else if let Some(primary) = primary_opaque_image_select_module_if_needed(
-                    &validation_error,
-                    &primary_module,
-                    &primary,
-                    tmp,
-                ) {
-                    Ok(primary)
-                } else {
-                    match tools::spirv_val_bytes(&out, tmp) {
-                        Ok(()) => {
-                            if retry_debug_on {
-                                eprintln!("[retry-debug] default emission validated in-translate");
-                            }
-                            // Variable-pointer-phi portability normalization is applied uniformly to every
-                            // returned module at the end of this function, so the success path just surfaces the
-                            // validated bytes.
-                            Ok(out)
-                        }
-                        // The produced module is structurally valid but mistyped — retry raw, keep the default
-                        // module's bytes if raw does not validate.
-                        Err(e)
-                            if native::classify_validation_error(&e)
-                                == native::ValidationClass::PointerTyping =>
-                        {
-                            let fc_promote_first =
-                                validation_error_may_be_fc_private_placeholder(&e)
-                                    .then(|| {
-                                        rc.census(
-                                            "val-ptr:fc_promote_logical",
-                                            rc.fc_promote_logical(),
-                                        )
-                                    })
-                                    .flatten();
-                            Ok(fc_promote_first
-                                // A descriptor-root/device-address phi reports as pointer typing on
-                                // the Logical primary. Prefer the address-domain BDA emitter before
-                                // the generic raw/CFG ladders, but only when LLVM `inttoptr` proves
-                                // the physical-address mechanism is actually present.
-                                .or_else(|| {
-                                    has_device_address_pointer
-                                        .then(|| rc.census("val-ptr:bda", rc.bda_retry()))
-                                        .flatten()
-                                })
-                                .or_else(|| rc.census("val-ptr:raw_retry", rc.raw_retry()))
-                                .or_else(|| rc.census("val-ptr:prune", rc.prune_retry(&out)))
-                                // A Function scalar-integer alloca reinterpreted as smaller-element lanes (the
-                                // `as_type<uint>(half2)` pack idiom) emits an illegal scalar-indexing access chain
-                                // ("reached non-composite"); retype the variable to a `<N x elem>` vector.
-                                .or_else(|| {
-                                    rc.census(
-                                        "val-ptr:subword_pack",
-                                        rc.subword_pack_retry(&out_module),
-                                    )
-                                })
-                                // Pruning a function-constant-dead arm can leave the surviving CFG unstructured
-                                // (a switch/selection whose removed case breaks the construct nesting); restructure
-                                // the pruned module with the relooper before giving up.
-                                .or_else(|| {
-                                    rc.census(
-                                        "val-ptr:prune_then_relooper",
-                                        rc.prune_then_relooper(&out),
-                                    )
-                                })
-                                // The module is BOTH pointer-mistyped and carries an unstructured switch: the raw
-                                // byte model fixes the typing but its emission still leaves the switch unstructured,
-                                // so structure the raw bytes with the relooper. The raw emission may then still leave
-                                // a cross-binding merge (the pointer mistyping was the surface symptom of a select
-                                // among distinct buffers) — apply the PSB rewrite to it.
-                                .or_else(|| {
-                                    rc.raw_then_psb_chain(
-                                        "val-ptr:raw_then_relooper",
-                                        "val-ptr:raw_psb",
-                                    )
-                                })
-                                // A local union alloca whose conflicting typed views live in a CALLEE emits a
-                                // structurally-typed chain against the caller's byte-array storage (the DecodeETC2
-                                // class: an over-indexed `OpInBoundsAccessChain %uint` on `[N x uchar]`). The text
-                                // inliner collapses all views into one function, where the multi-view byte-array
-                                // remodel + byte-reinterpret GEP lowering handles them. Adopt-if-validates.
-                                .or_else(|| {
-                                    rc.inline_sroa_chain(
-                                        "val-ptr:inline_sroa",
-                                        "val-ptr:inline_sroa_raw",
-                                    )
-                                })
-                                // The TopK multi-destination shape can need BOTH pieces: inline+SROA+raw
-                                // dissolves pointer-valued local aggregate fields, then the expanded helper
-                                // exposes a merge-block overlap that needs the existing cross-arm restructure
-                                // tier before validation can adopt it.
-                                .or_else(|| {
-                                    rc.census(
-                                        "val-ptr:inline_sroa_raw_cfg_restructure",
-                                        rc.inline_sroa_raw_cfg_restructure_retry(),
-                                    )
-                                })
-                                // The FC-multiplexed cross-binding merge whose live buffers were Private-demoted to
-                                // zero placeholders (a70fb990-class `ndArrayConvWinogradWeightsTransform`): the
-                                // default emit surfaces as a pointer-typing wall (an over-indexed Private scalar
-                                // placeholder / a cross-storage pointer merge), so it routes HERE rather than the
-                                // cross-binding arm. Re-parse with the FC-gated buffers bound REAL, prune the dead
-                                // dtype arms, reconcile the raw byte-0 arm to the merge pointee, and PSB-lower. Placed
-                                // LAST so it only fires when every Logical tier above has declined — no
-                                // currently-cleared case's adopted bytes change. Adopt-if-validates, byte-correct by
-                                // construction (real buffers + offset-0 reconcile + byte-proven PSB).
-                                .or_else(|| {
-                                    rc.census("val-ptr:fc_promote_psb", rc.fc_promote_psb())
-                                })
-                                .unwrap_or(out))
-                        }
-                        // The repair fallback produced a module spirv-val rejects for a structured-CFG nesting
-                        // violation — retry with the cross-arm restructure, then the general relooper on the
-                        // emitted bytes. If every validation-gated recovery declines, return an honest
-                        // translation error: known-invalid structured CFG bytes must never be shipped.
-                        Err(e)
-                            if native::classify_validation_error(&e)
-                                == native::ValidationClass::CfgStructurization =>
-                        {
-                            {
-                                if retry_debug_on {
-                                    let head: Vec<&str> = e.lines().take(4).collect();
-                                    eprintln!(
-                                    "[retry-debug] default module failed cfg-class spirv-val: {}",
-                                    head.join(" | ")
-                                );
-                                }
-                                if let Some((blocks, reused_merges)) =
-                                    native::systematic_reused_merges_beyond_relooper(&primary_module)
-                                {
-                                    if retry_debug_on {
-                                        eprintln!(
-                                            "[retry-debug] cfg fast fallback: function blocks={blocks} \
-                                             exceeds relooper cap={} with {reused_merges} reused \
-                                             merge targets",
-                                            native::CFG_EMIT_RELOOPER_MAX_BLOCKS,
-                                        );
-                                    }
-                                    if crate::env_vars::tier_census() {
-                                        eprintln!("[tier-census] fallback");
-                                    }
-                                    return Err(e);
-                                }
-                                rc.census("val-cfg:construct_tree", rc.construct_tree_retry())
-                                    .or_else(|| {
-                                        rc.census("val-cfg:relooper", rc.relooper_retry(&out))
-                                    })
-                            }
-                            .or_else(|| {
-                                rc.census(
-                                    "val-cfg:prune_then_relooper",
-                                    rc.prune_then_relooper(&out),
-                                )
-                            })
-                            // The relooper structures the CFG but its from-scratch rebuild can EXPOSE a
-                            // cross-binding pointer merge (`Variable pointers must point into the same structure`
-                            // on an `OpSelect %_ptr_StorageBuffer_*`) that the repaired form kept off the failing
-                            // path. On the default (repaired) path that same select reaches spirv-val as a clean
-                            // CrossBindingPointerMerge and `value_select_retry` lowers it; here it is stranded on
-                            // the relooped bytes. Route the relooped module through the same value-domain (then PSB)
-                            // lowering the cross-binding arm uses. Adopt-if-validates, floor-safe.
-                            .or_else(|| {
-                                rc.census(
-                                    "val-cfg:relooper_then_value_select",
-                                    rc.relooper_then_value_select(&out),
-                                )
-                            })
-                            // The cfg violation can MASK a pointer-typing error (spirv-val reports one error per
-                            // module): once the relooper structures the CFG, validation trips on the underlying
-                            // mistyped access instead. The raw byte model dissolves the typing error and the
-                            // relooper structures the raw bytes — same composite the pointer-typing arm uses.
-                            .or_else(|| {
-                                rc.census("val-cfg:raw_then_relooper", rc.raw_then_relooper())
-                            })
-                            // The cfg violation can also live in an internal helper whose pointer-parameter
-                            // staging is what breaks downstream (e.g. an atomic CAS loop on a device pointer
-                            // param, staged Private). Inlining the helper chain + SROA dissolves the staging and
-                            // the collapsed body often structures cleanly. Adopt-if-validates, floor-safe.
-                            .or_else(|| {
-                                rc.inline_sroa_chain(
-                                    "val-cfg:inline_sroa",
-                                    "val-cfg:inline_sroa_raw",
-                                )
-                            })
-                            // The straddle-loop-merge + cross-binding-phi cluster (05/MPSRNNBreakUpToOutputVecs):
-                            // the relooper refuses it, `inline_sroa_raw+psb` leaves the CFG untouched (straddle
-                            // reject → naive `infer_*` → invalid structured module), so neither clears it. Emit
-                            // with the cross-arm restructure ENABLED (privatize + return-unify the rejected CFG),
-                            // then PSB-rewrite the cross-binding pointer phi to 64-bit addresses. Adopt-if-
-                            // validates, floor-safe.
-                            .or_else(|| {
-                                rc.census(
-                                    "val-cfg:inline_sroa_raw_cfg_restructure",
-                                    rc.inline_sroa_raw_cfg_restructure_retry(),
-                                )
-                            })
-                            .ok_or(e)
-                        }
-                        // An illegal logical-pointer `OpPhi` (pointer-induction over an aggregate) — retry the
-                        // phi-the-index rewrite, then fall back to FC-dead-arm pruning (the offending phi may
-                        // live entirely in a statically-dead function-constant arm). Keep the default bytes if
-                        // neither validates.
-                        Err(e)
-                            if native::classify_validation_error(&e)
-                                == native::ValidationClass::LogicalPointerPhi =>
-                        {
-                            Ok(rc
-                                .census("val-phi:phi_index", rc.phi_index_retry(&out_module))
-                                .or_else(|| rc.census("val-phi:prune", rc.prune_retry(&out)))
-                                .unwrap_or(out))
-                        }
-                        // A cross-binding pointer merge (OpSelect/OpPhi over distinct bindings) — retry the W1
-                        // PhysicalStorageBuffer64 lowering, then fall back to FC-dead-arm pruning. Keep the
-                        // default bytes if neither validates.
-                        Err(e)
-                            if native::classify_validation_error(&e)
-                                == native::ValidationClass::CrossBindingPointerMerge =>
-                        {
-                            Ok(rc
-                                .census("val-xbind:value_select", rc.value_select_retry(&out))
-                                // The value-domain lowering (load-then-select) stays plain Logical StorageBuffer and
-                                // is MoltenVK-runnable, so it is preferred over the PSB (buffer-device-address) form
-                                // whenever it validates; PSB is the fallback for merges this bails on.
-                                .or_else(|| rc.census("val-xbind:psb", rc.psb_retry(&out)))
-                                // The default module may carry a buffer pointer bitcast PSB cannot model; the raw
-                                // byte-model emission dissolves it, leaving a clean whole-buffer cross-binding select
-                                // the PSB rewrite then lowers to physical addresses.
-                                .or_else(|| rc.census("val-xbind:raw_psb", rc.raw_psb()))
-                                .or_else(|| rc.census("val-xbind:prune", rc.prune_retry(&out)))
-                                .unwrap_or(out))
-                        }
-                        // Any other validation error — last-resort FC-dead-arm pruning, then the Logical
-                        // structured recovery tiers, and the relooper switch-dispatcher only as a final resort.
-                        // All adopt-if-validates / floor-safe.
-                        Err(_) => Ok(rc
-                            .census("val-other:prune", rc.prune_retry(&out))
-                            // A logical pointer type mismatch can be the surface form of a device-
-                            // address hierarchy: one phi arm is a descriptor-rooted buffer and a
-                            // backedge arm is produced by LLVM `inttoptr`. Only try the BDA emitter
-                            // when that structural opcode is actually present; its address-domain phi
-                            // lowering is adopted only after full SPIR-V validation.
-                            .or_else(|| {
-                                has_device_address_pointer
-                                    .then(|| rc.census("val-other:bda", rc.bda_retry()))
-                                    .flatten()
-                            })
-                            // A local union alloca whose conflicting typed views live in a CALLEE emits a
-                            // structurally-typed chain against the caller's byte-array storage (the DecodeETC2
-                            // class: `OpInBoundsAccessChain %uint` with indexes left over on `[N x uchar]`).
-                            // The text inliner collapses all views into one function, where the byte-array
-                            // remodel + byte-reinterpret GEP lowering handles them. Adopt-if-validates.
-                            //
-                            // Ordered BEFORE the relooper tiers below: inlining+SROA lets the collapsed body
-                            // structure through the DEFAULT structurizer into genuine nested `OpLoopMerge` loops,
-                            // whereas the relooper lowers the whole function to one `OpLoopMerge` + giant
-                            // `OpSwitch` state machine that is spirv-val-VALID but SPIRV-Cross/MoltenVK
-                            // miscompiles (nested loops routed through the shared outer merge → zero-trip). Both
-                            // validate; the structured form is byte-portable and the relooper form is not, so a
-                            // validating structured emission must be preferred. Floor-safe: a banked case
-                            // validates on the DEFAULT emit and never enters this retry chain. Clears the 3
-                            // `kern_tiled_da_gather_reduce` rows (default emit fails pointer-typing, lands here).
-                            .or_else(|| {
-                                rc.inline_sroa_chain(
-                                    "val-other:inline_sroa",
-                                    "val-other:inline_sroa_raw",
-                                )
-                            })
-                            // Last-resort structurization (miscompile-prone, see above): the offending construct
-                            // may live in a statically-dead arm (prune shrinks a huge function below the relooper
-                            // cap), or the module may be both pointer-mistyped and carry an unstructured switch.
-                            .or_else(|| {
-                                rc.census(
-                                    "val-other:prune_then_relooper",
-                                    rc.prune_then_relooper(&out),
-                                )
-                            })
-                            .or_else(|| {
-                                rc.census("val-other:raw_then_relooper", rc.raw_then_relooper())
-                            })
-                            // The default error may mask a cross-binding pointer merge: prefer the Logical
-                            // value-select lowering (MoltenVK/Metal-runnable) before any physical-address tier.
-                            .or_else(|| {
-                                rc.census("val-other:value_select", rc.value_select_retry(&out))
-                            })
-                            .unwrap_or(out)),
-                    }
-                }
-            }
+    );
+    let primary_finished = match primary_emitted {
+        Ok(emitted) => {
+            rc.remember_ordinary_plan_rejections(&emitted);
+            rc.finish_primary_carrier(emitted)
         }
-        // A cross-storage select deliberately has no materializable Logical-SPIR-V pointer. If its
-        // first opaque consumer is an internal-helper argument, erase that boundary first: typed
-        // inlining carries the deferred select into the helper and its load/store handlers replay
-        // the concrete arms in value space. This is both the semantically direct repair and far
-        // cheaper than trying whole-module BDA/raw remodelling before the diagnosed mechanism.
-        Err(emit_err)
-            if native::classify_emit_error(&emit_err)
-                == native::EmitErrorClass::DeferredPointerMaterialization =>
-        {
-            let selected_pointer = native::deferred_pointer_materialization_name(&emit_err)
-                .expect("classified deferred pointer error carries its SSA value");
-            rc.census(
-                "emit-deferred-pointer:consumer-inline",
-                rc.pointer_select_consumer_inline_retry(&selected_pointer),
-            )
-            .ok_or(emit_err)
+        Err(failure) => {
+            rc.remember_ordinary_plan_rejection_set(&failure.ordinary_plan_rejected_functions);
+            rc.remember_ownership_plan_rejection_set(&failure.ownership_plan_rejected_functions);
+            Err(failure.error)
         }
-        // The default typed emission FAILED outright with a buffer/pointer-typing emit gap the raw
-        // byte-offset model expresses (a reinterpret-load width mismatch or a missing pointer storage
-        // class). Retry raw and adopt it only if it independently validates; the raw bytes may
-        // themselves carry an unstructured switch, so also try raw-then-relooper before surfacing the
-        // original emit error.
-        Err(emit_err)
-            if native::classify_emit_error(&emit_err) == native::EmitErrorClass::PointerTyping =>
-        {
-            rc.census("emit-ptr:raw_retry", rc.raw_retry())
-                .or_else(|| rc.raw_then_psb_chain("emit-ptr:raw_then_relooper", "emit-ptr:raw_psb"))
-                // A `missing pointer storage` gap can also be an Apple BVH builder that DEREFERENCES a
-                // device pointer derived via `air.get_data_pointer_instance_acceleration_structure` without
-                // ever STORING it (the `getMTLInstanceBounds` kernels) — the raw tiers don't model the
-                // device address but the BDA passthrough does. Adopt-if-validates, so a `missing pointer
-                // storage` case the BDA tier cannot emit (e.g. the TopK array-of-pointers) is untouched.
-                .or_else(|| rc.census("emit-ptr:bda", rc.bda_retry()))
-                .or_else(|| rc.census("emit-ptr:bda_then_relooper", rc.bda_then_relooper()))
-                // The `missing pointer storage` can also be a Function-pointer store staged for a by-value
-                // struct forwarded into an internal helper (the TopK MPS NDArray multi-destination class):
-                // inline the helper chain + SROA the staging so the device pointer is used directly.
-                // `inline_sroa` inlines the helper chain + SROAs the pointer staging; its `_raw`
-                // escalation additionally models the surviving buffers raw so the TopK cases whose
-                // lowered device-pointer array feeds typed byte-offset loads/stores emit legally.
-                .or_else(|| {
-                    rc.inline_sroa_chain("emit-ptr:inline_sroa", "emit-ptr:inline_sroa_raw")
-                })
-                .ok_or(emit_err)
-        }
-        // The default typed emission failed with an emit gap no classifier above matches — notably
-        // `native emitter: raw store for Ptr(1) is not covered yet` (an Apple BVH builder storing/
-        // dereferencing a device pointer), OR `unknown SSA value %N` from an N-way pointer multiplexer
-        // over DISTINCT device buffers passed to an internal helper (the MPSmatrixEmbeddings class): the
-        // typed emit defers each distinct-buffer pointer `select` into the `selected_pointers` side-table
-        // WITHOUT a materialized id, and the call-arg consumption then hits `value_id` on an unmaterialized
-        // select. `bda_retry` (kept FIRST so every case it already clears keeps its exact bytes) does not
-        // model this. The all-buffers-raw re-emission DOES express it — the distinct-buffer multiplexer
-        // becomes a whole-buffer cross-binding `OpSelect` over raw byte-array backings, which the relooper
-        // structures and the PSB PhysicalStorageBuffer64 rewrite lowers to physical addresses
-        // (`raw_then_relooper`'s relooped+psb sub-path). So mirror the pointer-typing emit arm's raw/
-        // relooper/psb cascade here. Every tier is adopt-if-validates, so this is strictly additive
-        // and floor-safe: a case that previously hard-failed can only become a validating pass, never the
-        // reverse (a banked case validates on the default emit and never enters this arm). Clears the three
-        // MPSmatrixEmbeddings chained-multiplexer frontier fails (b511a833/f8b6205d/37967b8c).
-        Err(emit_err) => rc
-            .census("emit-other:bda", rc.bda_retry())
-            .or_else(|| rc.census("emit-other:bda_then_relooper", rc.bda_then_relooper()))
-            .or_else(|| rc.raw_then_psb_chain("emit-other:raw_then_relooper", "emit-other:raw_psb"))
-            .ok_or(emit_err),
     };
-    // M-C1 tier-adoption census (env-gated, pure telemetry): report which cascade invocation site
-    // (if any) produced the adopted bytes, so the regression run yields a per-site adoption histogram —
-    // the named kill-list of never-firing tiers. `default` = the default emission validated or was
-    // kept (no tier adopted); `fallback` = every tier declined and translation FALLBACKs.
+    let translated = match primary_finished {
+        Ok(finished) => Ok(finished),
+        // A complete source-ownership rejection is a construction fact, including when the typed
+        // interface expansion grows beyond the bounded relooper or exposes an incompatible phi
+        // carrier. Select the raw-buffer CFG representation directly while every candidate is still
+        // owned; validate only the one finished construction and never parse it back for repair.
+        Err(emit_err) if rc.needs_raw_construction() => {
+            let constructed = rc.construct_raw().map_err(|construction_error| {
+                format!("{emit_err}; raw construction failed: {construction_error}")
+            })?;
+            Ok(constructed)
+        }
+        Err(emit_err) => Err(emit_err),
+    }
+    .and_then(|constructed| {
+        // This is the sole production validation boundary. Its verdict is returned directly and
+        // cannot select another representation or trigger another construction pass.
+        if let Some(path) = env_vars::retry_dump() {
+            let _ = std::fs::write(path, &constructed.bytes);
+        }
+        tools::spirv_val_bytes(&constructed.bytes, tmp)?;
+        if retry_debug_on {
+            eprintln!("[retry-debug] constructed module validated in-translate");
+        }
+        Ok(constructed)
+    });
+    // Compatibility telemetry now records only whether construction produced a module. It does not
+    // expose representation selection and cannot affect product behavior.
     if crate::env_vars::tier_census() {
         let label = match &translated {
-            Ok(_) => rc.adopted_tier().unwrap_or("default"),
+            Ok(_) => "default",
             Err(_) => "fallback",
         };
         eprintln!("[tier-census] {label}");
     }
-    // Final portability normalization on EVERY validating result, regardless of which arm produced
-    // it. A `StorageBuffer`/`Workgroup` pointer `OpPhi` (a loop-carried pointer walked through one
-    // buffer) is legal SPIR-V under VariablePointersStorageBuffer, so it never trips a retry — but
-    // MoltenVK's SPIRV-Cross MSL backend cannot always express it, failing pipeline creation with
-    // `cannot initialize a variable of type 'device float *' with an lvalue of type 'device float'`
-    // (the MPSLSTM/MPSRNN class). Such a phi can survive not only the untouched success path but any
-    // retry arm (e.g. value_select clears a cross-binding merge yet leaves an intra-buffer pointer
-    // phi standing). A statically-dead arm can also be the only thing keeping a null/placeholder
-    // pointer incoming alive, so run the existing constant-branch prune first when the module already
-    // declares variable-pointer capability. The index-phi/pruned form is semantically identical and
-    // needs no variable pointers, so adopt it whenever it independently validates; keep the arm's bytes
-    // otherwise. Floor-safe by construction (adopt-if-validates).
-    translated.map(|out| {
-        let candidate = load_owned_module(&out).ok().and_then(|mut module| {
-            let has_variable_pointer_capability = module.capabilities.iter().any(|inst| {
-                matches!(
-                    inst.operands.as_slice(),
-                    [spirv_module::Operand::Capability(
-                        spirv::Capability::VariablePointers
-                            | spirv::Capability::VariablePointersStorageBuffer
-                    )]
-                )
-            });
-            let pruned = has_variable_pointer_capability
-                && native::prune_constant_branches_module(&mut module).is_ok();
-            let rewrote = native::rewrite_variable_pointer_phis_module(&mut module).is_ok();
-            if !pruned && !rewrote {
-                return None;
-            }
-            let bytes = module
-                .assemble()
-                .iter()
-                .flat_map(|word| word.to_le_bytes())
-                .collect::<Vec<_>>();
-            rc.validates_dbg("variable_pointer_phi_normalization", &bytes)
-                .then_some(bytes)
-        });
-        candidate.unwrap_or(out)
-    })
+    translated
 }
 
 fn has_device_address_pointer_load(san_ll: &str) -> bool {
+    let has_device_buffer_array = meta::parse_air_kernel_meta(san_ll).is_some_and(|metadata| {
+        metadata
+            .buffer_type_names
+            .values()
+            .any(|name| meta::is_device_buffer_array_type_name(name))
+    });
     san_ll.lines().any(|line| {
         line.split_once('=').is_some_and(|(_, rhs)| {
             let rhs = rhs.trim_start();
@@ -1708,53 +1220,10 @@ fn has_device_address_pointer_load(san_ll: &str) -> bool {
                         let pointer = pointer.trim_start();
                         pointer.starts_with("ptr addrspace(1) ")
                             || pointer.starts_with("ptr addrspace(2) ")
+                            || (has_device_buffer_array && pointer.starts_with("ptr "))
                     }))
         })
     })
-}
-
-fn sanitized_max_function_basic_block_count(san_ll: &str) -> usize {
-    let mut current = None::<(usize, bool)>;
-    let mut maximum = 0usize;
-    let finish_count =
-        |(labels, implicit): (usize, bool)| labels.saturating_add(usize::from(implicit)).max(1);
-    for line in san_ll
-        .lines()
-        .filter_map(|line| line.split(';').next().map(str::trim))
-    {
-        if line.starts_with("define ") {
-            if let Some(state) = current.replace((0, false)) {
-                maximum = maximum.max(finish_count(state));
-            }
-        } else if line == "}" {
-            if let Some(state) = current.take() {
-                maximum = maximum.max(finish_count(state));
-            }
-        } else if line.ends_with(':') {
-            if let Some((labels, _)) = current.as_mut() {
-                *labels += 1;
-            }
-        } else if !line.is_empty() {
-            if let Some((0, implicit)) = current.as_mut() {
-                *implicit = true;
-            }
-        }
-    }
-    maximum.max(current.map(finish_count).unwrap_or_default())
-}
-
-fn large_cfg_relooper_eligible(max_function_blocks: usize) -> bool {
-    max_function_blocks > native::LARGE_CFG_BLOCK_THRESHOLD
-        && max_function_blocks <= native::CFG_EMIT_RELOOPER_MAX_BLOCKS
-}
-
-fn validation_error_may_be_fc_private_placeholder(error: &str) -> bool {
-    error.contains("reached non-composite") && error.contains("_ptr_Private_")
-}
-
-fn validation_error_may_be_storage_buffer_overindex(error: &str) -> bool {
-    error.contains("reached non-composite type while indexes still remain")
-        && error.contains("_ptr_StorageBuffer_")
 }
 
 /// Canonicalize the ids of an emitted SPIR-V byte stream into the deterministic serialized-order form
@@ -1783,39 +1252,78 @@ mod single_meta_parse_tests {
     use super::*;
 
     #[test]
-    fn large_cfg_pretry_uses_the_largest_function_not_module_total() {
-        let many_small = (0..400)
-            .map(|index| {
-                format!(
-                    "define void @f{index}() {{\nentry:\n  br label %exit\nexit:\n  ret void\n}}\n"
-                )
-            })
-            .collect::<String>();
-        assert_eq!(sanitized_max_function_basic_block_count(&many_small), 2);
+    fn specialized_reflection_includes_function_constant_gated_argument_buffer() {
+        let ll = r#"
+@enabled.MTL_FC_INIT_7_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+@enabled_pred = internal addrspace(2) global i8 0, align 1
 
-        let one_large = format!(
-            "define void @large() {{\nentry:\n{}  ret void\n}}\n",
-            (0..350)
-                .map(|index| format!("b{index}:\n  br label %b{}\n", index + 1))
-                .collect::<String>()
-        );
-        assert_eq!(sanitized_max_function_basic_block_count(&one_large), 351);
-    }
+declare i1 @air.is_function_constant_defined(ptr addrspace(2))
 
-    #[test]
-    fn large_cfg_pretry_never_reloads_a_graph_beyond_the_relooper_cap() {
-        assert!(!large_cfg_relooper_eligible(
-            native::LARGE_CFG_BLOCK_THRESHOLD
-        ));
-        assert!(large_cfg_relooper_eligible(
-            native::LARGE_CFG_BLOCK_THRESHOLD + 1
-        ));
-        assert!(large_cfg_relooper_eligible(
-            native::CFG_EMIT_RELOOPER_MAX_BLOCKS
-        ));
-        assert!(!large_cfg_relooper_eligible(
-            native::CFG_EMIT_RELOOPER_MAX_BLOCKS + 1
-        ));
+define internal void @_GLOBAL__sub_I_enabled() section "air.static_init" {
+  %value = load i8, ptr addrspace(2) @enabled.MTL_FC_INIT_7_b
+  %defined = call i1 @air.is_function_constant_defined(ptr addrspace(2) @enabled.MTL_FC_INIT_7_b)
+  %set = icmp ne i8 %value, 0
+  %selected = select i1 %defined, i1 %set, i1 false
+  %byte = zext i1 %selected to i8
+  store i8 %byte, ptr addrspace(2) @enabled_pred
+  ret void
+}
+
+define void @k(ptr addrspace(2) %args) {
+  ret void
+}
+
+!air.vertex = !{!0}
+!air.function_constants = !{!8}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.function_constant", !4, !"air.indirect_buffer", !"air.location_index", i32 30, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"Args"}
+!4 = !{ptr addrspace(2) @enabled_pred, !"bool", !"enabled"}
+!5 = !{i32 0, i32 8, i32 0, !"void", !"data", !"air.indirect_argument", !6}
+!6 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"void"}
+!8 = !{ptr addrspace(2) @enabled.MTL_FC_INIT_7_b, !"bool", !"enabled", i32 7, i1 false}
+"#;
+
+        let default = reflect_sanitized(
+            ll,
+            passes::Stage::Vertex,
+            passes::TransformOptions::default(),
+        )
+        .expect("reflect default");
+        assert!(!default
+            .bindings
+            .iter()
+            .any(|binding| binding.metal_index == 30));
+
+        let disabled = reflect_sanitized_specialized(
+            ll,
+            passes::Stage::Vertex,
+            passes::TransformOptions::default(),
+            &[(7, vec![0])],
+        )
+        .expect("reflect explicitly disabled");
+        assert!(!disabled
+            .bindings
+            .iter()
+            .any(|binding| binding.metal_index == 30));
+
+        let enabled = reflect_sanitized_specialized(
+            ll,
+            passes::Stage::Vertex,
+            passes::TransformOptions::default(),
+            &[(7, vec![1])],
+        )
+        .expect("reflect enabled");
+        assert!(enabled.bindings.iter().any(|binding| {
+            binding.kind == reflect::ResourceKind::Buffer && binding.metal_index == 30
+        }));
+        assert!(enabled.bindings.iter().any(|binding| {
+            binding.kind == reflect::ResourceKind::EmbeddedArgBufferBuffer
+                && binding
+                    .embedded_source
+                    .is_some_and(|source| source.buffer_index == 30 && source.field_offset == 0)
+        }));
     }
 
     #[test]
@@ -1865,28 +1373,6 @@ define void @k(ptr addrspace(1) %out, i64 %address) {
         );
     }
 
-    #[test]
-    fn fc_buffer_promotion_only_routes_private_placeholder_chains() {
-        assert!(validation_error_may_be_fc_private_placeholder(
-            "OpInBoundsAccessChain reached non-composite type; %x = OpInBoundsAccessChain %_ptr_Private_uint"
-        ));
-        assert!(!validation_error_may_be_fc_private_placeholder(
-            "OpInBoundsAccessChain reached non-composite type; %x = OpInBoundsAccessChain %_ptr_StorageBuffer_uint"
-        ));
-    }
-
-    #[test]
-    fn raw_relooper_feed_only_routes_storage_buffer_overindex() {
-        assert!(validation_error_may_be_storage_buffer_overindex(
-            "OpInBoundsAccessChain reached non-composite type while indexes still remain: \
-             %x = OpInBoundsAccessChain %_ptr_StorageBuffer_uint %root %index"
-        ));
-        assert!(!validation_error_may_be_storage_buffer_overindex(
-            "OpInBoundsAccessChain reached non-composite type while indexes still remain: \
-             %x = OpInBoundsAccessChain %_ptr_Private_uint %root %index"
-        ));
-    }
-
     const SIMPLE_KERNEL: &str = r#"
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -1923,11 +1409,21 @@ entry:
     }
 
     #[test]
+    fn owned_type_failure_cannot_select_alternate_construction() {
+        let failure = FinishFailure::from(native::OwnedModuleFailure::TypeConstruction(
+            "invalid owned type graph".to_string(),
+        ));
+        assert_eq!(failure.kind, FinishFailureKind::Other);
+        assert_eq!(failure.error, "invalid owned type graph");
+    }
+
+    #[test]
     fn validating_primary_finish_assembles_once() {
         let tmp =
             std::env::temp_dir().join(format!("metal2vulkan_finish_once_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&tmp);
         reset_finish_assemble_count();
+        spirv_module::reset_load_bytes_count();
         let spv = translate_sanitized_native(SIMPLE_KERNEL, passes::Stage::Kernel, &tmp)
             .expect("simple primary translation validates");
         tools::spirv_val_bytes(&spv, &tmp).expect("simple primary spirv-val");
@@ -1935,6 +1431,84 @@ entry:
             finish_assemble_count(),
             1,
             "a validating primary must not assemble fallback bytes"
+        );
+        assert_eq!(
+            spirv_module::load_bytes_count(),
+            0,
+            "production translation must not parse its serialized output for repair"
+        );
+    }
+
+    #[test]
+    fn selected_raw_relooper_finish_assembles_once() {
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_raw_relooper_finish_once_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let stage_meta = parse_stage_meta(SIMPLE_KERNEL, passes::Stage::Kernel);
+        let construction = construction::ConstructionCtx::new(
+            SIMPLE_KERNEL,
+            passes::Stage::Kernel,
+            stage_meta.frag.as_ref(),
+            stage_meta.vert.as_ref(),
+            stage_meta.kern.as_ref(),
+            stage_meta.entry_name.as_deref(),
+            &tmp,
+            passes::TransformOptions::default(),
+            layout::AirDataLayout::from_ir(SIMPLE_KERNEL).expect("AIR datalayout"),
+        );
+        reset_finish_assemble_count();
+        spirv_module::reset_load_bytes_count();
+        native::reset_address_construction_counts();
+
+        let finished = construction
+            .construct_raw_relooper()
+            .expect("raw relooper construction");
+        tools::spirv_val_bytes(&finished.bytes, &tmp).expect("raw relooper spirv-val");
+        assert_eq!(
+            finish_assemble_count(),
+            1,
+            "the selected raw-relooper representation must have no intermediate assembly"
+        );
+        assert_eq!(
+            spirv_module::load_bytes_count(),
+            0,
+            "raw-relooper construction must remain owned through final assembly"
+        );
+        assert_eq!(
+            native::address_construction_count(),
+            1,
+            "raw-relooper address closure must be owned by interface construction"
+        );
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn reflected_translation_retains_the_finished_owned_module() {
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_reflected_owned_module_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        spirv_module::reset_load_bytes_count();
+
+        let (spv, reflection) = translate_sanitized_native_reflected(
+            SIMPLE_KERNEL,
+            passes::Stage::Kernel,
+            &tmp,
+            passes::TransformOptions::default(),
+        )
+        .expect("simple reflected translation validates");
+
+        assert!(!spv.is_empty());
+        assert!(reflection.bindings.iter().any(|binding| {
+            binding.kind == reflect::ResourceKind::Buffer && binding.footprint.is_some()
+        }));
+        assert_eq!(
+            spirv_module::load_bytes_count(),
+            0,
+            "reflection must analyze the finished owned module without parsing output bytes"
         );
     }
 }

@@ -1,6 +1,6 @@
 use crate::case::{
-    AccelerationStructureKind, AuthoredCase, ExecutionSafety, ResourceRole, Stage, TextureFormat,
-    TextureType, VertexObservation,
+    AccelerationStructureKind, AuthoredCase, ExecutionSafety, OutputSelection, ResourceRole, Stage,
+    TextureFormat, TextureType, VertexObservation,
 };
 use crate::library_module::ResolvedLinkedFunctions;
 use crate::source::{find_source, SourceRow};
@@ -17,7 +17,54 @@ pub struct CheckedCase {
     pub input_sha256: String,
 }
 
+pub struct CheckedCaseContract {
+    pub case: AuthoredCase,
+    pub reflection: ShaderReflection,
+    pub linked_functions: ResolvedLinkedFunctions,
+    pub input_sha256: String,
+}
+
 pub fn check_case(root: &Path, case: AuthoredCase) -> Result<CheckedCase, Vec<String>> {
+    let (mut errors, input_sha256) = check_case_identity(&case);
+    let source = match find_source(root, &case.air_sha256) {
+        Ok(Some(source)) => source,
+        Ok(None) => {
+            errors.push(format!(
+                "AIR {} does not exist in aligned source shards or public fixtures",
+                case.air_sha256
+            ));
+            return Err(errors);
+        }
+        Err(error) => {
+            errors.push(error);
+            return Err(errors);
+        }
+    };
+    let checked =
+        check_case_against_source_with_identity(root, case, &source, errors, input_sha256)?;
+    Ok(CheckedCase {
+        case: checked.case,
+        source,
+        reflection: checked.reflection,
+        linked_functions: checked.linked_functions,
+        input_sha256: checked.input_sha256,
+    })
+}
+
+/// Check an authored case against an already selected exact AIR row.
+///
+/// Translation workers use this boundary so case validation does not reopen or rescan a source
+/// shard after the indexed row has already been handed to the isolated worker.
+pub fn check_case_against_source(
+    root: &Path,
+    case: AuthoredCase,
+    source: &SourceRow,
+) -> Result<CheckedCaseContract, Vec<String>> {
+    let (errors, input_sha256) = check_case_identity(&case);
+    check_case_against_source_with_identity(root, case, source, errors, input_sha256)
+}
+
+fn check_case_identity(case: &AuthoredCase) -> (Vec<String>, String) {
     let mut errors = case.validate_literal_resources().err().unwrap_or_default();
     match case.computed_case_id() {
         Ok(computed) if computed != case.case_id => errors.push(format!(
@@ -34,20 +81,16 @@ pub fn check_case(root: &Path, case: AuthoredCase) -> Result<CheckedCase, Vec<St
             String::new()
         }
     };
-    let source = match find_source(root, &case.air_sha256) {
-        Ok(Some(source)) => source,
-        Ok(None) => {
-            errors.push(format!(
-                "AIR {} does not exist in aligned source shards or public fixtures",
-                case.air_sha256
-            ));
-            return Err(errors);
-        }
-        Err(error) => {
-            errors.push(error);
-            return Err(errors);
-        }
-    };
+    (errors, input_sha256)
+}
+
+fn check_case_against_source_with_identity(
+    root: &Path,
+    case: AuthoredCase,
+    source: &SourceRow,
+    mut errors: Vec<String>,
+    input_sha256: String,
+) -> Result<CheckedCaseContract, Vec<String>> {
     if source.air_sha256 != case.air_sha256 {
         errors.push(format!(
             "AIR hash mismatch: case={} source={}",
@@ -79,17 +122,16 @@ pub fn check_case(root: &Path, case: AuthoredCase) -> Result<CheckedCase, Vec<St
             ));
         }
     }
-    let linked_functions =
-        match crate::library_module::resolve_linked_functions(root, &case, &source.lib_sha256) {
-            Ok(tables) => tables,
-            Err(table_errors) => {
-                errors.extend(table_errors);
-                ResolvedLinkedFunctions::default()
-            }
-        };
+    let linked_functions = match crate::library_module::resolve_linked_functions(root, &case) {
+        Ok(tables) => tables,
+        Err(table_errors) => {
+            errors.extend(table_errors);
+            ResolvedLinkedFunctions::default()
+        }
+    };
     validate_visible_reference_closure(&source.air_ll, &linked_functions, &mut errors);
 
-    let reflection = match reflect(&source.air_ll, &case) {
+    let reflection = match reflect(&source.air_ll, &case, &linked_functions) {
         Ok(reflection) => reflection,
         Err(error) => {
             errors.push(format!("product reflection failed: {error}"));
@@ -106,9 +148,8 @@ pub fn check_case(root: &Path, case: AuthoredCase) -> Result<CheckedCase, Vec<St
     }
     validate_reflection(&case, &reflection, &mut errors);
     if errors.is_empty() {
-        Ok(CheckedCase {
+        Ok(CheckedCaseContract {
             case,
-            source,
             reflection,
             linked_functions,
             input_sha256,
@@ -165,6 +206,169 @@ fn validate_visible_reference_closure(
     }
 }
 
+/// Build the exact product linkage described by checked authored resources and reflection.
+///
+/// Both candidate execution and translation audits use this mapping so table bindings, embedded
+/// table fields, linked callbacks, and opaque intersection entries cannot drift between paths.
+pub fn product_linkage(
+    reflection: &ShaderReflection,
+    linked: &ResolvedLinkedFunctions,
+) -> Result<metal2vulkan::linked_functions::LinkedFunctionLinkage, String> {
+    fn linked_tables(
+        reflection: &ShaderReflection,
+        tables: &[crate::library_module::ResolvedFunctionTable],
+        kind: ResourceKind,
+        label: &str,
+    ) -> Result<Vec<metal2vulkan::linked_functions::LinkedFunctionTable>, String> {
+        tables
+            .iter()
+            .map(|table| {
+                let parameter_index = reflection
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.kind == kind && binding.metal_index == table.binding)
+                    .and_then(|binding| binding.param_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "{label} function table binding {} has no reflected entry parameter",
+                            table.binding,
+                        )
+                    })?;
+                Ok(metal2vulkan::linked_functions::LinkedFunctionTable {
+                    parameter_index,
+                    size: table.size,
+                    entries: table
+                        .entries
+                        .iter()
+                        .map(|entry| metal2vulkan::linked_functions::LinkedFunction {
+                            index: entry.index,
+                            symbol: entry.function.clone(),
+                            module_ll: entry.module.air_ll.clone(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+    let visible_tables = linked_tables(
+        reflection,
+        &linked.visible,
+        ResourceKind::VisibleFunctionTable,
+        "visible",
+    )?;
+    let intersection_tables = linked
+        .intersection
+        .iter()
+        .map(|table| {
+            let source = match table.location {
+                crate::library_module::ResolvedIntersectionFunctionTableLocation::Direct {
+                    binding: table_binding,
+                } => {
+                    let parameter_index = reflection
+                        .bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.kind == ResourceKind::IntersectionFunctionTable
+                                && binding.metal_index == table_binding
+                        })
+                        .and_then(|binding| binding.param_index)
+                        .ok_or_else(|| {
+                            format!(
+                                "intersection function table binding {table_binding} has no reflected entry parameter"
+                            )
+                        })?;
+                    metal2vulkan::linked_functions::IntersectionFunctionTableSource::Parameter {
+                        parameter_index,
+                    }
+                }
+                crate::library_module::ResolvedIntersectionFunctionTableLocation::ArgumentBuffer {
+                    buffer_binding,
+                    field_offset,
+                } => {
+                    let field = reflection
+                        .argument_buffer_fields
+                        .iter()
+                        .find(|field| {
+                            field.buffer_index == buffer_binding
+                                && field.field_offset == field_offset
+                        })
+                        .ok_or_else(|| {
+                            format!(
+                                "argument-buffer intersection function table at buffer {buffer_binding} offset {field_offset} has no reflected field"
+                            )
+                        })?;
+                    metal2vulkan::linked_functions::IntersectionFunctionTableSource::ArgumentBuffer {
+                        buffer_parameter_index: field.buffer_param_index,
+                        field_ordinal: field.field_ordinal,
+                        field_offset,
+                    }
+                }
+            };
+            let entries = table
+                .entries
+                .iter()
+                .map(|entry| match entry {
+                    crate::library_module::ResolvedIntersectionFunctionEntry::Linked(entry) => {
+                        metal2vulkan::linked_functions::IntersectionFunctionEntry::Linked(
+                            metal2vulkan::linked_functions::LinkedFunction {
+                                index: entry.index,
+                                symbol: entry.function.clone(),
+                                module_ll: entry.module.air_ll.clone(),
+                            },
+                        )
+                    }
+                    crate::library_module::ResolvedIntersectionFunctionEntry::OpaqueTriangle {
+                        index,
+                        signature,
+                    } => {
+                        use crate::case::IntersectionFunctionSignature as Source;
+                        use metal2vulkan::linked_functions::IntersectionFunctionSignature as Target;
+                        metal2vulkan::linked_functions::IntersectionFunctionEntry::OpaqueTriangle {
+                            index: *index,
+                            signature: signature
+                                .iter()
+                                .map(|flag| match flag {
+                                    Source::Instancing => Target::Instancing,
+                                    Source::TriangleData => Target::TriangleData,
+                                    Source::WorldSpaceData => Target::WorldSpaceData,
+                                    Source::InstanceMotion => Target::InstanceMotion,
+                                    Source::PrimitiveMotion => Target::PrimitiveMotion,
+                                    Source::ExtendedLimits => Target::ExtendedLimits,
+                                    Source::MaxLevels => Target::MaxLevels,
+                                    Source::IntersectionFunctionBuffer => {
+                                        Target::IntersectionFunctionBuffer
+                                    }
+                                    Source::UserData => Target::UserData,
+                                })
+                                .collect(),
+                        }
+                    }
+                })
+                .collect();
+            Ok(metal2vulkan::linked_functions::IntersectionFunctionTable {
+                source,
+                size: table.size,
+                entries,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let visible_references = linked
+        .references
+        .iter()
+        .map(
+            |reference| metal2vulkan::linked_functions::LinkedFunctionReference {
+                symbol: reference.function.clone(),
+                module_ll: reference.module.air_ll.clone(),
+            },
+        )
+        .collect();
+    Ok(metal2vulkan::linked_functions::LinkedFunctionLinkage {
+        visible_references,
+        visible_tables,
+        intersection_tables,
+    })
+}
+
 fn validate_execution_safety(safety: ExecutionSafety, ll: &str, errors: &mut Vec<String>) {
     if has_cfg_cycle(ll) && safety == ExecutionSafety::LoopFree {
         errors.push(
@@ -174,16 +378,36 @@ fn validate_execution_safety(safety: ExecutionSafety, ll: &str, errors: &mut Vec
     }
 }
 
-fn reflect(air_ll: &str, case: &AuthoredCase) -> Result<ShaderReflection, String> {
-    let unspecialized = metal2vulkan::reflect_sanitized(
+fn reflect(
+    air_ll: &str,
+    case: &AuthoredCase,
+    linked: &ResolvedLinkedFunctions,
+) -> Result<ShaderReflection, String> {
+    let function_constants = crate::literal::function_constants(case)?
+        .into_iter()
+        .map(|constant| (constant.index, constant.bytes))
+        .collect::<Vec<_>>();
+    let initial = metal2vulkan::reflect_sanitized_specialized(
         air_ll,
         case.stage.product(),
         crate::case::product_transform_options(case)?,
+        &function_constants,
     )?;
-    metal2vulkan::reflect_sanitized(
-        air_ll,
+    let linkage = product_linkage(&initial, linked)?;
+    let linked_air = if linkage.is_empty() {
+        std::borrow::Cow::Borrowed(air_ll)
+    } else {
+        std::borrow::Cow::Owned(metal2vulkan::specialize_linked_module(
+            air_ll,
+            case.stage.product(),
+            &linkage,
+        )?)
+    };
+    metal2vulkan::reflect_sanitized_specialized(
+        linked_air.as_ref(),
         case.stage.product(),
-        crate::case::product_transform_options_with_reflection(case, &unspecialized)?,
+        crate::case::product_transform_options_with_reflection(case, &initial)?,
+        &function_constants,
     )
 }
 
@@ -203,8 +427,35 @@ fn validate_reflection(
         .buffers
         .iter()
         .map(|buffer| buffer.binding)
+        .chain(case.device_buffer_arrays.iter().map(|array| array.binding))
         .collect::<HashSet<_>>();
     report_set_difference("buffer", &reflected_buffers, &manifest_buffers, errors);
+    for binding in reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::Buffer)
+    {
+        let is_array = binding
+            .type_name
+            .as_deref()
+            .is_some_and(metal2vulkan::meta::is_device_buffer_array_type_name);
+        let authored_as_array = case
+            .device_buffer_arrays
+            .iter()
+            .any(|array| array.binding == binding.metal_index);
+        if is_array != authored_as_array {
+            errors.push(format!(
+                "buffer {} {} a device-buffer array in AIR metadata, but the manifest {}",
+                binding.metal_index,
+                if is_array { "is" } else { "is not" },
+                if authored_as_array {
+                    "authors it as one"
+                } else {
+                    "does not author it as one"
+                }
+            ));
+        }
+    }
 
     let reflected_argument_buffer_buffers = reflection
         .bindings
@@ -346,6 +597,9 @@ fn validate_reflection(
     }
     validate_implicit_imageblock_attachments(case, reflection, errors);
     validate_fragment_imageblock(case, reflection, errors);
+    if !selected_output_is_reflected_writable(case, reflection) {
+        errors.push("selected output is not reflected as shader-writable".into());
+    }
 
     let reflected_acceleration_structures = reflection
         .bindings
@@ -447,6 +701,16 @@ fn validate_reflection(
     let manifest_textures = case
         .textures
         .iter()
+        .filter(|texture| {
+            !case.texture_arrays.iter().any(|array| {
+                array.overrides_texture_at_base
+                    && array.binding == texture.binding
+                    && reflection.bindings.iter().any(|binding| {
+                        binding.kind == ResourceKind::TextureArray
+                            && binding.metal_index == array.binding
+                    })
+            })
+        })
         .map(|texture| texture.binding)
         .collect::<HashSet<_>>();
     report_set_difference("texture", &reflected_textures, &manifest_textures, errors);
@@ -483,6 +747,15 @@ fn validate_reflection(
     let manifest_texture_arrays = case
         .texture_arrays
         .iter()
+        .filter(|array| {
+            !(array.overrides_texture_at_base
+                && reflection.bindings.iter().any(|binding| {
+                    matches!(
+                        binding.kind,
+                        ResourceKind::Texture | ResourceKind::StorageImage
+                    ) && binding.metal_index == array.binding
+                }))
+        })
         .map(|texture| texture.binding)
         .collect::<HashSet<_>>();
     report_set_difference(
@@ -788,6 +1061,124 @@ fn validate_reflection(
     validate_vertex_observation(case, reflection, errors);
 }
 
+fn selected_output_is_reflected_writable(
+    case: &AuthoredCase,
+    reflection: &ShaderReflection,
+) -> bool {
+    use metal2vulkan::reflect::ResourceAccess;
+
+    let writable = |access: Option<ResourceAccess>| {
+        !matches!(
+            access,
+            Some(ResourceAccess::Unused | ResourceAccess::ReadOnly | ResourceAccess::Sampled)
+        )
+    };
+    match &case.output {
+        OutputSelection::None => {
+            !reflection.bindings.iter().any(|binding| {
+                matches!(
+                    binding.kind,
+                    ResourceKind::Buffer
+                        | ResourceKind::StorageImage
+                        | ResourceKind::TextureArray
+                        | ResourceKind::EmbeddedArgBufferBuffer
+                        | ResourceKind::EmbeddedArgBufferTexture
+                ) && writable(binding.access)
+            }) && reflection.render_targets.is_empty()
+                && reflection.depth_members.is_empty()
+                && reflection.stencil_members.is_empty()
+                && !reflection
+                    .implicit_imageblock_attachments
+                    .iter()
+                    .any(|attachment| writable(Some(attachment.access)))
+                && !reflection
+                    .fragment_imageblock
+                    .as_ref()
+                    .is_some_and(|imageblock| {
+                        imageblock
+                            .members
+                            .iter()
+                            .any(|member| member.binding.is_some() && writable(Some(member.access)))
+                    })
+                && !(case.stage == Stage::Vertex
+                    && (reflection
+                        .vertex_builtins
+                        .is_some_and(|builtins| builtins.writes_position)
+                        || !reflection.varyings.is_empty()))
+        }
+        OutputSelection::Buffer { binding, .. } => reflection.bindings.iter().any(|reflected| {
+            reflected.kind == ResourceKind::Buffer
+                && reflected.metal_index == *binding
+                && writable(reflected.access)
+        }),
+        OutputSelection::ArgumentBufferBuffer {
+            buffer_binding,
+            field_offset,
+            ..
+        } => reflection.bindings.iter().any(|reflected| {
+            reflected.kind == ResourceKind::EmbeddedArgBufferBuffer
+                && reflected.embedded_source.is_some_and(|source| {
+                    source.buffer_index == *buffer_binding && source.field_offset == *field_offset
+                })
+                && writable(reflected.access)
+        }),
+        OutputSelection::DeviceBufferArrayElement { binding, .. } => {
+            reflection.bindings.iter().any(|reflected| {
+                reflected.kind == ResourceKind::Buffer
+                    && reflected.metal_index == *binding
+                    && writable(reflected.access)
+            })
+        }
+        OutputSelection::Texture { binding, .. }
+        | OutputSelection::TextureArrayElement { binding, .. } => {
+            reflection.bindings.iter().any(|reflected| {
+                reflected.metal_index == *binding
+                    && matches!(
+                        reflected.kind,
+                        ResourceKind::StorageImage | ResourceKind::TextureArray
+                    )
+                    && writable(reflected.access)
+            })
+        }
+        OutputSelection::ArgumentBufferTexture {
+            buffer_binding,
+            field_offset,
+            ..
+        } => reflection.bindings.iter().any(|reflected| {
+            reflected.kind == ResourceKind::EmbeddedArgBufferTexture
+                && reflected.embedded_source.is_some_and(|source| {
+                    source.buffer_index == *buffer_binding && source.field_offset == *field_offset
+                })
+                && writable(reflected.access)
+        }),
+        OutputSelection::RenderTarget { index, .. } => {
+            reflection
+                .render_targets
+                .iter()
+                .any(|target| target.location == *index)
+                || reflection
+                    .implicit_imageblock_attachments
+                    .iter()
+                    .any(|attachment| {
+                        attachment.attachment == *index && writable(Some(attachment.access))
+                    })
+                || (case.stage == Stage::Vertex && *index == 0 && case.vertex_observation.is_some())
+        }
+        OutputSelection::Depth { .. } => !reflection.depth_members.is_empty(),
+        OutputSelection::Stencil { .. } => !reflection.stencil_members.is_empty(),
+        OutputSelection::FragmentImageblock { semantic, .. } => reflection
+            .fragment_imageblock
+            .as_ref()
+            .is_some_and(|imageblock| {
+                imageblock.members.iter().any(|member| {
+                    member.semantic == *semantic
+                        && member.binding.is_some()
+                        && writable(Some(member.access))
+                })
+            }),
+    }
+}
+
 fn validate_tessellation(
     case: &AuthoredCase,
     reflection: &ShaderReflection,
@@ -927,6 +1318,7 @@ fn validate_texture_shape(
         ReflectedFormat::R16f => TextureFormat::R16Float,
         ReflectedFormat::R16ui => TextureFormat::R16Uint,
         ReflectedFormat::Rg16f => TextureFormat::Rg16Float,
+        ReflectedFormat::Rg32f => TextureFormat::Rg32Float,
         ReflectedFormat::R32f => TextureFormat::R32Float,
         ReflectedFormat::R32i => TextureFormat::R32Sint,
         ReflectedFormat::R32ui => TextureFormat::R32Uint,
@@ -944,6 +1336,7 @@ fn validate_texture_shape(
                 authored_format,
                 TextureFormat::R8Unorm
                     | TextureFormat::Rgba8Unorm
+                    | TextureFormat::Rg32Float
                     | TextureFormat::Rgba16Float
                     | TextureFormat::R32Float
                     | TextureFormat::Rgba32Float
@@ -1012,6 +1405,7 @@ fn render_target_format_matches_type(format: TextureFormat, type_name: &str) -> 
                 | TextureFormat::Rgba8Unorm
                 | TextureFormat::R16Float
                 | TextureFormat::Rg16Float
+                | TextureFormat::Rg32Float
                 | TextureFormat::Rgba16Float
                 | TextureFormat::R32Float
                 | TextureFormat::Rgba32Float
@@ -1095,6 +1489,7 @@ fn validate_implicit_imageblock_attachments(
         let expected = match attachment.format {
             metal2vulkan::meta::TextureFormat::R16f => TextureFormat::R16Float,
             metal2vulkan::meta::TextureFormat::Rg16f => TextureFormat::Rg16Float,
+            metal2vulkan::meta::TextureFormat::Rg32f => TextureFormat::Rg32Float,
             metal2vulkan::meta::TextureFormat::R32f => TextureFormat::R32Float,
             metal2vulkan::meta::TextureFormat::R32ui => TextureFormat::R32Uint,
             metal2vulkan::meta::TextureFormat::Rgba16f => TextureFormat::Rgba16Float,
@@ -1306,6 +1701,93 @@ mod resource_contract_tests {
     };
 
     #[test]
+    fn selected_identity_output_requires_a_reflected_write() {
+        let ll = include_str!("../fixtures/public/kernel_implicit_imageblock_half2.ll");
+        let case = crate::case::narrow_implicit_imageblock_test_case(
+            crate::hash::sha256_bytes(ll.as_bytes()),
+            "kernel_implicit_imageblock_half2".into(),
+        );
+        let writable = reflect(ll, &case, &ResolvedLinkedFunctions::default()).unwrap();
+        assert!(selected_output_is_reflected_writable(&case, &writable));
+
+        let read_only_ll = ll.replace(
+            "  call void @air.store.implicit_imageblock.v2f16(<2 x half> %value, i32 0, <2 x i16> %position, i32 0, i16 0)\n",
+            "",
+        );
+        let read_only = reflect(&read_only_ll, &case, &ResolvedLinkedFunctions::default()).unwrap();
+        assert!(!selected_output_is_reflected_writable(&case, &read_only));
+    }
+
+    #[test]
+    fn exact_empty_output_requires_no_reflected_write() {
+        let ll = r#"
+define void @no_output() {
+entry:
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @no_output, !1, !1}
+!1 = !{}
+"#;
+        let mut case: AuthoredCase = serde_json::from_value(serde_json::json!({
+            "air_sha256": crate::hash::sha256_bytes(ll.as_bytes()),
+            "case_id": "test-no-output",
+            "name": "no-output",
+            "entry": "no_output",
+            "stage": "kernel",
+            "dispatch": {"grid": [1, 1, 1], "threads_per_threadgroup": [1, 1, 1]},
+            "output": {"kind": "none"},
+            "compare": {"kind": "exact"},
+            "execution_safety": "loop_free"
+        }))
+        .unwrap();
+        case.case_id = case.computed_case_id().unwrap();
+        case.validate_literal_resources().unwrap();
+        let reflection = reflect(ll, &case, &ResolvedLinkedFunctions::default()).unwrap();
+        assert!(selected_output_is_reflected_writable(&case, &reflection));
+
+        let mut vertex_case = case.clone();
+        vertex_case.stage = Stage::Vertex;
+        let mut vertex_output = reflection.clone();
+        vertex_output.vertex_builtins = Some(metal2vulkan::reflect::VertexBuiltins {
+            writes_position: true,
+            ..Default::default()
+        });
+        assert!(!selected_output_is_reflected_writable(
+            &vertex_case,
+            &vertex_output
+        ));
+        vertex_output.vertex_builtins = None;
+        vertex_output.varyings.push(metal2vulkan::reflect::Varying {
+            location: 0,
+            type_name: Some("float4".into()),
+            name: None,
+            user_semantic: None,
+        });
+        assert!(!selected_output_is_reflected_writable(
+            &vertex_case,
+            &vertex_output
+        ));
+
+        let writable_ll = include_str!("../fixtures/public/kernel_vector_function_constant.ll");
+        let mut writable_case = crate::case::vector_function_constant_test_case(
+            crate::hash::sha256_bytes(writable_ll.as_bytes()),
+            "kernel_vector_function_constant".into(),
+        );
+        let writable_reflection = reflect(
+            writable_ll,
+            &writable_case,
+            &ResolvedLinkedFunctions::default(),
+        )
+        .unwrap();
+        writable_case.output = OutputSelection::None;
+        assert!(!selected_output_is_reflected_writable(
+            &writable_case,
+            &writable_reflection
+        ));
+    }
+
+    #[test]
     fn threadgroup_memory_is_authored_and_reflected_without_a_descriptor() {
         let source = crate::source::public_sources()
             .unwrap()
@@ -1325,6 +1807,7 @@ mod resource_contract_tests {
                 initial_bytes_b64: Some("q6urqw==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![ThreadgroupMemoryResource {
                 binding: 0,
                 length: 4,
@@ -1376,11 +1859,12 @@ mod resource_contract_tests {
     }
 
     #[test]
-    fn function_table_entry_resolves_exact_same_library_module_and_symbol() {
+    fn function_table_entry_resolves_exact_cross_library_module_and_symbol() {
         let scratch = crate::ScratchDir::new("function-table-check").unwrap();
         let air_ll = r#"
 define void @main(ptr addrspace(1) %output, ptr addrspace(1) %table) {
 entry:
+  store i32 42, ptr addrspace(1) %output, align 4
   ret void
 }
 !air.kernel = !{!0}
@@ -1390,14 +1874,15 @@ entry:
 !3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"uint"}
 !4 = !{i32 1, !"air.visible_function_table", !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"visible_function_table"}
 "#;
-        let library = "11".repeat(32);
+        let entry_library = "11".repeat(32);
+        let callback_library = "22".repeat(32);
         let source = SourceRow {
             air_sha256: crate::hash::sha256_bytes(air_ll.as_bytes()),
             stage: "Kernel".into(),
             entry: "main".into(),
             air_ll: air_ll.into(),
             blob_b64: None,
-            lib_sha256: library.clone(),
+            lib_sha256s: vec![entry_library],
             label: "local/function-table-entry.ll".into(),
         };
         crate::source::write_source_shards(scratch.path(), [source.clone()]).unwrap();
@@ -1410,7 +1895,7 @@ entry:
                 module_sha256: module_sha256.clone(),
                 air_ll: module_ll.into(),
                 blob_b64: base64::engine::general_purpose::STANDARD.encode(b"owned bitcode"),
-                lib_sha256s: vec![library],
+                lib_sha256s: vec![callback_library.clone()],
                 label: "local/library-module/shade.ll".into(),
             }],
         )
@@ -1428,6 +1913,7 @@ entry:
                 initial_bytes_b64: Some("q6urqw==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -1482,7 +1968,7 @@ entry:
             checked.linked_functions.visible[0].entries[0]
                 .module
                 .lib_sha256s,
-            vec!["11".repeat(32)]
+            vec![callback_library]
         );
         assert!(checked.reflection.bindings.iter().any(|binding| {
             binding.kind == ResourceKind::VisibleFunctionTable

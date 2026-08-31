@@ -16,7 +16,7 @@ fn function<'a>(module: &'a LlModule, name: &str) -> &'a LlFunction {
 fn call_names(function: &LlFunction) -> Vec<&str> {
     function
         .carrier_insts()
-        .filter_map(|instruction| instruction.call.as_ref())
+        .filter_map(|instruction| instruction.call().as_ref())
         .map(|call| call.callee.as_str())
         .collect()
 }
@@ -82,7 +82,7 @@ declare float @air.sqrt(float)
         .carrier_insts()
         .find(|instruction| {
             instruction
-                .call
+                .call()
                 .as_ref()
                 .is_some_and(|call| call.callee == "air.sqrt")
         })

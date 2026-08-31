@@ -1,10 +1,12 @@
-//! Legalize packed 32-bit word reads from Private vectors.
+//! Close packed 32-bit Private-vector views at the memory-lowering boundary.
 //!
 //! Helper inlining can substitute a constant-buffer parameter with a Private fallback array. A
 //! packed `i32` read of two adjacent 16-bit vector lanes may then retain the pre-substitution
-//! access-chain spelling (`vector_ptr, 0, word`), which over-indexes the vector under Logical
-//! addressing. Rebuild that already-invalid memory read as a vector load, two-lane shuffle, and
-//! same-width bitcast. The byte image is identical on Vulkan's little-endian SPIR-V targets.
+//! access-chain spelling (`vector_ptr, 0, word`), which cannot represent the source pointer
+//! arithmetic under Logical addressing. Once every pointer-producing memory transform has run, the
+//! memory phase owns the final spelling and constructs the equivalent vector load, lane selection,
+//! and same-width bitcast before handing the graph to integer lowering and finalization. The byte
+//! image is identical on Vulkan's little-endian SPIR-V targets.
 
 use crate::spirv_module::{Instruction, Module, Operand};
 use spirv::{Op, StorageClass, Word};
@@ -32,7 +34,7 @@ enum Base {
     },
 }
 
-pub(super) fn rewrite_private_vector_word_loads(module: &mut Module) -> bool {
+pub(super) fn close_private_vector_word_views(module: &mut Module) -> bool {
     let mut pointer_info = HashMap::<Word, (StorageClass, Word)>::new();
     let mut vector_info = HashMap::<Word, (Word, u32)>::new();
     let mut scalar_bits = HashMap::<Word, u32>::new();
@@ -314,7 +316,7 @@ pub(super) fn rewrite_private_vector_word_loads(module: &mut Module) -> bool {
     let planned_ids = plans.keys().copied().collect::<HashSet<_>>();
     for function in &mut module.functions {
         for block in &mut function.blocks {
-            let old = std::mem::take(&mut block.instructions);
+            let old = block.instructions.clone();
             let mut rebuilt = Vec::with_capacity(old.len());
             for instruction in old {
                 if instruction
@@ -554,8 +556,28 @@ mod tests {
         let mut function = Function::new();
         function.blocks.push(block);
         module.functions.push(function);
+        module.debug_names = vec![
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(31),
+                    Operand::LiteralString("packed-word-address".into()),
+                ],
+            ),
+            inst(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(63),
+                    Operand::LiteralString("unrelated-dangling".into()),
+                ],
+            ),
+        ];
 
-        assert!(rewrite_private_vector_word_loads(&mut module));
+        assert!(crate::native::rewrites::close_private_vector_word_views_module(&mut module));
         let body = &module.functions[0].blocks[0].instructions;
         assert!(!body.iter().any(|instruction| {
             instruction.class.opcode == Op::InBoundsAccessChain && instruction.result_id == Some(31)
@@ -583,5 +605,7 @@ mod tests {
         assert!(body.iter().any(|instruction| {
             instruction.class.opcode == Op::Load && instruction.result_type == Some(3)
         }));
+        assert_eq!(module.debug_names.len(), 1);
+        assert_eq!(module.debug_names[0].operands[0], Operand::IdRef(63));
     }
 }

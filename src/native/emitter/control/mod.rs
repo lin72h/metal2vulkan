@@ -1,10 +1,6 @@
 use super::*;
-use crate::native::cfg::graph::spirv_block_successors as cloned_block_successors;
 
 mod loop_continue;
-mod merge_helpers;
-mod merges;
-pub(in crate::native::emitter) use merge_helpers::*;
 
 #[cfg(test)]
 mod tests {

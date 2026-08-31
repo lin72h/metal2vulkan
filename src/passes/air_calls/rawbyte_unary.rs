@@ -322,21 +322,29 @@ pub(in crate::passes) fn half_deriv(
     res: Word,
     rty: Word,
     arg: Word,
-) -> Vec<Instruction> {
+) -> Result<Vec<Instruction>, String> {
+    if !is_f32_scalar_or_vector(ctx, rty) && !is_half_scalar_or_vector(ctx, rty) {
+        return Err(format!(
+            "{op:?} AIR result is not a half/float scalar or vector"
+        ));
+    }
+    if value_result_type(ctx, arg) != Some(rty) {
+        return Err(format!("{op:?} AIR operand does not match its result type"));
+    }
     let float_ty = float_equivalent(ctx, rty);
     if float_ty == rty {
         // already a float type -> emit the op directly.
-        return vec![Instruction::new(
+        return Ok(vec![Instruction::new(
             op,
             Some(rty),
             Some(res),
             vec![Operand::IdRef(arg)],
-        )];
+        )]);
     }
     // half: FConvert up, derivative in float, FConvert down.
     let argf = ctx.module.fresh_id();
     let derivf = ctx.module.fresh_id();
-    vec![
+    Ok(vec![
         Instruction::new(
             Op::FConvert,
             Some(float_ty),
@@ -350,7 +358,7 @@ pub(in crate::passes) fn half_deriv(
             Some(res),
             vec![Operand::IdRef(derivf)],
         ),
-    ]
+    ])
 }
 
 /// Lower `op(scale * x)` for a scalar float operand (e.g. `cospi` = `cos(pi*x)`, `exp10` =

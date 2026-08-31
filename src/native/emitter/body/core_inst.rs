@@ -1,6 +1,7 @@
 //! Byte-neutral responsibility split of the former monolith impl; see the parent module.
 
 use super::*;
+use crate::native::emitter::ops::bfloat_lanes;
 
 impl Emitter {
     /// R3 STRUCTURAL / M-A4: the graph-driven emission entry, and the SOLE straight-line dispatcher on
@@ -11,8 +12,8 @@ impl Emitter {
     /// `inttoptr`/`ptrtoint`, `getelementptr`, `load`, `store`, the vector/aggregate element ops
     /// (`extractelement`/`insertelement`/`shufflevector`/`extractvalue`/`insertvalue`), `alloca`, `phi`,
     /// `bitcast`, and `call` (void + value). Byte-identical to the retired text path by construction:
-    /// the operands come from the same `inst.operands` that path re-keyed through `tir_operands`, so the
-    /// same emitter runs with the same `Op` and the same operand values.
+    /// the operands come directly from `inst.operands`, so the same emitter runs with the same `Op` and
+    /// operand values without a parallel result-keyed clone.
     ///
     /// When a migrated op's operands do not resolve to the expected typed arity (an `Unresolved`
     /// operand), or a per-op carrier is absent, the instruction reaches the fail-visible `Err`
@@ -48,6 +49,37 @@ impl Emitter {
                                 self.emit_binary_int_op_resolved(op, lhs, rhs, name, instructions)
                             }
                             BinaryKind::Float => {
+                                if inst.fast_math()
+                                    && self.try_emit_partitioned_fast_sum(
+                                        op,
+                                        &lhs,
+                                        &name,
+                                        instructions,
+                                    )?
+                                {
+                                    return Ok(());
+                                }
+                                if inst.fast_math()
+                                    && self.try_emit_grouped_fast_sum(
+                                        op,
+                                        &lhs,
+                                        &name,
+                                        instructions,
+                                    )?
+                                {
+                                    return Ok(());
+                                }
+                                if inst.fast_math()
+                                    && self.try_emit_fast_fma(
+                                        op,
+                                        &lhs,
+                                        &rhs,
+                                        &name,
+                                        instructions,
+                                    )?
+                                {
+                                    return Ok(());
+                                }
                                 self.emit_binary_float_op_resolved(op, lhs, rhs, name, instructions)
                             }
                             BinaryKind::Signed => self.emit_signed_binary_int_op_resolved(
@@ -81,8 +113,7 @@ impl Emitter {
                 // Conversions need the source operand AND the dest type. The source is
                 // `inst.operands[0]`; the dest is `inst.result_ty` resolved — byte-identical to the text
                 // path's `convert_dst_type`, which reads the same `tir_result_types` entry. Both must be
-                // present, else it reaches the fail-visible unmigrated-opcode `Err` (the retry cascade
-                // owns the raw `.lines` text walk).
+                // present, else it reaches the fail-visible unmigrated-opcode `Err`.
                 if let (Some(operands), Some(result_ty)) =
                     (self.tir_inst_typed_operands(inst), inst.result_ty.as_ref())
                 {
@@ -114,13 +145,12 @@ impl Emitter {
                     }
                 }
             } else if inst.opcode == "fcmp" {
-                // `fcmp` sources its predicate from `inst.cmp_predicate` (mapped to an `Op` by the same
+                // `fcmp` sources its predicate from `inst.cmp_predicate()` (mapped to an `Op` by the same
                 // `fcmp_predicate` the text path uses over the tir token) and its two operands from
                 // `inst.operands`. Reaches the fail-visible unmigrated-opcode `Err` if either is absent,
-                // or if the predicate token maps to no `Op` (the retry cascade owns the raw `.lines`
-                // text walk).
+                // or if the predicate token maps to no `Op`.
                 if let (Some(tok), Some(operands)) = (
-                    inst.cmp_predicate.as_deref(),
+                    inst.cmp_predicate().as_deref(),
                     self.tir_inst_typed_operands(inst),
                 ) {
                     if let [lhs, rhs] = operands.as_slice() {
@@ -134,11 +164,11 @@ impl Emitter {
                 // `icmp` mirrors `fcmp`. BOTH the non-pointer and pointer forms are graph-driven: operands
                 // and predicate ride the typed graph, and the pointer form's two unsupported-shape error
                 // diagnostics (which embed the raw operand `rest` — BC fingerprints error strings) read that
-                // `rest` from the diagnostics-only `TirInst.icmp_rest` carrier (byte-identical to the text
+                // `rest` from the diagnostics-only `TirInst.icmp_rest()` carrier (byte-identical to the text
                 // path's `rest`), not `inst.text`. `resolve_type` is the same resolution the text path
                 // applies to `lhs.ty` before the pointer test. Falls through only if the carrier is absent.
                 if let (Some(tok), Some(operands)) = (
-                    inst.cmp_predicate.as_deref(),
+                    inst.cmp_predicate().as_deref(),
                     self.tir_inst_typed_operands(inst),
                 ) {
                     if let [lhs, rhs] = operands.as_slice() {
@@ -154,7 +184,7 @@ impl Emitter {
                                     name,
                                     instructions,
                                 );
-                            } else if let Some(rest) = &inst.icmp_rest {
+                            } else if let Some(rest) = &inst.icmp_rest() {
                                 let (lhs, rhs, name, rest) =
                                     (lhs.clone(), rhs.clone(), name.clone(), rest.clone());
                                 return self.emit_icmp_ptr_resolved(
@@ -188,17 +218,16 @@ impl Emitter {
                 }
             } else if inst.opcode == "getelementptr" {
                 // gep is already fully graph-driven on the default path: the graph-driven gep lowering builds the whole
-                // `LlGep` from `tir_gep_source_types` (== `inst.gep_source_ty`) + `tir_typed_operands`
+                // `LlGep` from `tir_gep_source_types` (== `inst.gep_source_ty()`) + `tir_typed_operands`
                 // (== `inst.operands`; base = [0], indices = [1..]). Mirror that branch here off the inst;
                 // when source_ty/operands aren't both present it reaches the fail-visible unmigrated-opcode
-                // `Err` (the retry cascade owns the raw `.lines` text walk).
-                if let (Some(source_ty), Some(ops)) = (
-                    inst.gep_source_ty.as_ref(),
-                    self.tir_inst_typed_operands(inst),
-                ) {
+                // `Err`.
+                if let (Some(source_ty), Some(ops)) =
+                    (inst.gep_source_ty(), self.tir_inst_typed_operands(inst))
+                {
                     if !ops.is_empty() {
                         let gep = LlGep {
-                            inbounds: inst.gep.as_ref().is_some_and(|gep| gep.inbounds),
+                            inbounds: inst.gep().as_ref().is_some_and(|gep| gep.inbounds),
                             source_ty: source_ty.clone(),
                             base: ops[0].clone(),
                             indices: ops[1..].to_vec(),
@@ -212,8 +241,7 @@ impl Emitter {
                 // `load` needs the pointer operand (`operands[0]`), the loaded type (`result_ty`), and the
                 // alignment (`mem_align`) — the same three the text path sources from the carrier in the
                 // graph-walk context. Proceed only when the operand resolves and `result_ty` is present,
-                // else reach the fail-visible unmigrated-opcode `Err` (the retry cascade owns the raw
-                // `.lines` text walk).
+                // else reach the fail-visible unmigrated-opcode `Err`.
                 if let (Some(operands), Some(result_ty)) =
                     (self.tir_inst_typed_operands(inst), inst.result_ty.as_ref())
                 {
@@ -222,7 +250,7 @@ impl Emitter {
                         let load = LlLoad {
                             ptr: ptr.clone(),
                             result_ty: result_ty.clone(),
-                            align: inst.mem_align,
+                            align: inst.mem_align(),
                         };
                         let name = name.clone();
                         return self.emit_load_resolved(name, load, result_ty, instructions);
@@ -231,10 +259,10 @@ impl Emitter {
             } else if inst.opcode == "extractelement" {
                 // Both value operands (`[vector, index]`) are lowered by the graph; only the two
                 // post-resolution SEMANTIC errors need the raw line, so read it from the diagnostics-only
-                // `TirInst.diag_line` carrier (the same strip-commented/trimmed line the text path formats)
+                // `TirInst.diag_line()` carrier (the same strip-commented/trimmed line the text path formats)
                 // instead of re-lexing `text`. Falls through when the graph left an operand unresolved.
                 if let (Some(operands), Some(line)) =
-                    (self.tir_inst_typed_operands(inst), &inst.diag_line)
+                    (self.tir_inst_typed_operands(inst), &inst.diag_line())
                 {
                     if let [vector, idx] = operands.as_slice() {
                         let (vector, idx, name, line) =
@@ -250,10 +278,10 @@ impl Emitter {
                 }
             } else if inst.opcode == "insertelement" {
                 // `[vector, object, index]` all come from the graph; the one-lane error embeds the line,
-                // read from the diagnostics-only `TirInst.diag_line` carrier (same strip-commented line)
+                // read from the diagnostics-only `TirInst.diag_line()` carrier (same strip-commented line)
                 // instead of re-lexing `text`. Falls through when the graph left an operand unresolved.
                 if let (Some(operands), Some(line)) =
-                    (self.tir_inst_typed_operands(inst), &inst.diag_line)
+                    (self.tir_inst_typed_operands(inst), &inst.diag_line())
                 {
                     if let [composite, object, idx] = operands.as_slice() {
                         let (composite, object, idx, name, line) = (
@@ -275,11 +303,11 @@ impl Emitter {
                 }
             } else if inst.opcode == "shufflevector" {
                 // The two LEADING operands (source vectors) are graph-lowered; the constant mask rides the
-                // `TirInst.shuffle_mask` carrier (declared lane count + index values, the same parse), and
+                // `TirInst.shuffle_mask()` carrier (declared lane count + index values, the same parse), and
                 // the residual `empty one-lane shuffle` diagnostic reads the strip-commented line from
                 // `diag_line`. So the typed core re-lexes neither the mask nor the text. Reaches the
                 // fail-visible unmigrated-opcode `Err` when an operand, the mask, or the diag line is
-                // absent (the retry cascade owns the raw `.lines` text walk).
+                // absent.
                 if let (Some(a), Some(b), Some((declared, lanes)), Some(line)) = (
                     inst.operands
                         .first()
@@ -287,8 +315,8 @@ impl Emitter {
                     inst.operands
                         .get(1)
                         .and_then(crate::native::tir::TirOperand::as_typed_value),
-                    &inst.shuffle_mask,
-                    &inst.diag_line,
+                    &inst.shuffle_mask(),
+                    &inst.diag_line(),
                 ) {
                     let (name, line, lanes) = (name.clone(), line.clone(), lanes.clone());
                     return self.emit_shufflevector_from_mask(
@@ -303,13 +331,14 @@ impl Emitter {
                 }
             } else if inst.opcode == "extractvalue" {
                 // The aggregate is a graph operand; the trailing constant indices ride the
-                // `TirInst.aggregate_indices` carrier (parsed once at build: rhs after `%r = `, opcode
+                // `TirInst.aggregate_indices()` carrier (parsed once at build: rhs after `%r = `, opcode
                 // token dropped, then `split_top_level` + `parse_u32`), so the typed core needs no `line`.
                 // Reaches the fail-visible unmigrated-opcode `Err` when either the operand or the index
-                // list is unresolved (the retry cascade owns the raw `.lines` text walk).
-                if let (Some(operands), Some(indices)) =
-                    (self.tir_inst_typed_operands(inst), &inst.aggregate_indices)
-                {
+                // list is unresolved.
+                if let (Some(operands), Some(indices)) = (
+                    self.tir_inst_typed_operands(inst),
+                    &inst.aggregate_indices(),
+                ) {
                     if let [composite] = operands.as_slice() {
                         let (composite, name, indices) =
                             (composite.clone(), name.clone(), indices.clone());
@@ -323,13 +352,14 @@ impl Emitter {
                 }
             } else if inst.opcode == "insertvalue" {
                 // `[composite, object]` come from the graph; the trailing constant indices ride the
-                // `TirInst.aggregate_indices` carrier (same parse: rhs after `%r = `, opcode token
+                // `TirInst.aggregate_indices()` carrier (same parse: rhs after `%r = `, opcode token
                 // dropped, then `split_top_level` + `parse_u32`), so the typed core needs no `line`.
                 // Reaches the fail-visible unmigrated-opcode `Err` when either is unresolved (the retry
                 // cascade owns the raw `.lines` text walk).
-                if let (Some(operands), Some(indices)) =
-                    (self.tir_inst_typed_operands(inst), &inst.aggregate_indices)
-                {
+                if let (Some(operands), Some(indices)) = (
+                    self.tir_inst_typed_operands(inst),
+                    &inst.aggregate_indices(),
+                ) {
                     if let [composite, object] = operands.as_slice() {
                         let (composite, object, name, indices) = (
                             composite.clone(),
@@ -347,28 +377,28 @@ impl Emitter {
                     }
                 }
             } else if inst.opcode == "alloca" {
-                // No graph value operands — the allocated type rides the tir as `inst.alloca_ty`
+                // No graph value operands — the allocated type rides the tir as `inst.alloca_ty()`
                 // (parsed at build: rhs after `%r = `, opcode token dropped, then `parse_type`), so
                 // dispatch straight on it, no `inst.text`. When the type did not parse at build
                 // (unreachable in well-formed AIR), it reaches the fail-visible unmigrated-opcode `Err` below.
-                if let Some(alloca_ty) = &inst.alloca_ty {
+                if let Some(alloca_ty) = &inst.alloca_ty() {
                     let name = name.clone();
                     return self.emit_alloca_typed(name, alloca_ty, instructions);
                 }
             } else if inst.opcode == "phi" {
                 // Fully graph-driven: the phi's parsed result type + `(value, predecessor)` pairs ride the
-                // `TirInst.phi_incoming` carrier (built via the same `parse_phi` the text path runs), and
+                // `TirInst.phi_incoming()` carrier (built via the same `parse_phi` the text path runs), and
                 // the incoming VALUES are re-sourced from the graph inside `emit_phi_resolved`. No
                 // `inst.text` re-lex. Reaches the fail-visible unmigrated-opcode `Err` below only when
-                // the carrier is absent (the phi operands did not parse at build — unreachable in well-formed AIR).
-                if let Some((phi_ty, parsed_incoming)) = &inst.phi_incoming {
+                // the carrier is absent (the phi did not parse at build — unreachable in well-formed AIR).
+                if let Some((phi_ty, parsed_incoming)) = &inst.phi_incoming() {
                     let (name, phi_ty, parsed_incoming) =
                         (name.clone(), phi_ty.clone(), parsed_incoming.clone());
                     return self.emit_phi_resolved(name, &phi_ty, parsed_incoming, instructions);
                 }
             } else if inst.opcode == "bitcast" {
                 // Fully graph-driven: the parsed source typed value + destination-type text ride the
-                // `TirInst.bitcast` carrier (built via the same strip_comment + rhs after `%r = ` with
+                // `TirInst.bitcast()` carrier (built via the same strip_comment + rhs after `%r = ` with
                 // the opcode token dropped + split_once(" to ") + parse_typed_value the `bitcast` handler
                 // ran), so no `inst.text` re-lex.
                 // The pointer copy-prop side-tables (pointer_pointees/raw_offsets/gep_provenance/
@@ -376,47 +406,48 @@ impl Emitter {
                 // exactly as before — no side-table ownership move needed. Reaches the fail-visible
                 // unmigrated-opcode `Err` below only when the carrier is absent (a malformed bitcast —
                 // unreachable in well-formed AIR).
-                if let Some((src, dst_text)) = inst.bitcast.as_deref() {
-                    let (name, src, dst_text) = (name.clone(), src.clone(), dst_text.clone());
-                    return self.emit_bitcast_resolved(src, &dst_text, name, instructions);
+                if let Some((src, dst_text)) = inst.bitcast() {
+                    let (name, src) = (name.clone(), src.clone());
+                    return self.emit_bitcast_resolved(src, dst_text, name, instructions);
                 }
             } else if matches!(inst.opcode.as_str(), "call" | "tail") {
-                // Value-producing call. Sourced from the build-time `TirInst.call` carrier — the SAME
+                // Value-producing call. Sourced from the build-time `TirInst.call()` carrier — the SAME
                 // `parse_call(<ret> @callee(args))` the text entry runs (`resolve_call` strips the
                 // `[tail ]call` keyword identically to `strip_call_prefix`), so no `inst.text` re-lex.
                 // The argument VALUES are overlaid from the typed graph inside `emit_value_call_resolved`.
                 // Reaches the fail-visible unmigrated-opcode `Err` below only when the carrier is absent
                 // (an indirect call, which `parse_call` rejects — unreachable in well-formed AIR for a value call).
-                if let Some(call) = &inst.call {
-                    let (name, call) = (name.clone(), (**call).clone());
+                if let Some(call) = &inst.call() {
+                    let (name, mut call) = (name.clone(), (**call).clone());
+                    self.apply_tir_inst_call_args(inst, &name, &mut call);
                     return self.emit_value_call_resolved(name, call, instructions);
                 }
-                if let Some(err) = &inst.value_call_error {
+                if let Some(err) = &inst.value_call_error() {
                     return Err(err.clone());
                 }
             }
         } else if inst.opcode == "store" {
             // The one result-LESS migrated family. Source `[value, pointer]` from `inst.operands` and
-            // the alignment from `inst.mem_align` (the same alignment the retired text path parsed); when
+            // the alignment from `inst.mem_align()` (the same alignment the retired text path parsed); when
             // generic operand lowering cannot express a store object, fall back to the explicit
-            // `TirInst.store` carrier parsed from the same line.
+            // `TirInst.store()` carrier parsed from the same line.
             if let Some(operands) = self.tir_inst_typed_operands(inst) {
                 if let [object, ptr] = operands.as_slice() {
                     let (object, ptr) = (object.clone(), ptr.clone());
-                    return self.emit_store_resolved(object, ptr, inst.mem_align, instructions);
+                    return self.emit_store_resolved(object, ptr, inst.mem_align(), instructions);
                 }
             }
-            if let Some((object, ptr)) = inst.store.as_deref() {
+            if let Some((object, ptr)) = inst.store().as_deref() {
                 let (object, ptr) = (object.clone(), ptr.clone());
-                return self.emit_store_resolved(object, ptr, inst.mem_align, instructions);
+                return self.emit_store_resolved(object, ptr, inst.mem_align(), instructions);
             }
-        } else if let Some(line) = &inst.void_call_line {
+        } else if let Some(line) = &inst.void_call_line() {
             // Result-LESS (void) call, or an ignored debug/lifetime marker. All off the
-            // `TirInst.void_call_line` carrier (the strip-commented/trimmed line): drop the ignored markers
-            // FIRST, then the INDIRECT function-group call (an indirect callee `%fp`, so `inst.call ==
+            // `TirInst.void_call_line()` carrier (the strip-commented/trimmed line): drop the ignored markers
+            // FIRST, then the INDIRECT function-group call (an indirect callee `%fp`, so `inst.call() ==
             // None`) which is dropped as a no-op after materializing its callee/args — from
             // `strip_call_prefix(line)`, then finally drive a
-            // DIRECT call off the `TirInst.call` carrier with its argument VALUES overlaid straight from
+            // DIRECT call off the `TirInst.call()` carrier with its argument VALUES overlaid straight from
             // `inst.operands` (byte-identical to the `tir_call_queue` the text path pops).
             if is_ignored_call_line(line) {
                 return Ok(());
@@ -426,9 +457,9 @@ impl Emitter {
                     return Ok(());
                 }
             }
-            if let Some(call) = &inst.call {
+            if let Some(call) = &inst.call() {
                 let (mut call, line) = ((**call).clone(), line.clone());
-                self.apply_tir_inst_void_call_args(inst, &mut call);
+                self.apply_tir_inst_call_args(inst, "void", &mut call);
                 return self.emit_void_call_body(call, &line, instructions);
             }
         }
@@ -436,17 +467,263 @@ impl Emitter {
         // (0 hits / 16942 byte-baseline + 0 / 15336 banked, `APV_FALLTHROUGH_PROBE`, removed). Rather than
         // re-lex `inst.text` here, fail visibly — the same retired-substrate discipline as the ret/switch
         // `FromText` deletion: a hit (an opcode the typed dispatch left unmigrated, or a carrier absent on a
-        // unreachable in well-formed AIR malformed line) routes to the retry cascade, which still owns the raw
-        // `body_block.lines` text walk. This removes the last graph-walk `inst.text` reader.
+        // unreachable-in-well-formed-AIR malformed line) returns a fail-visible error. This removes
+        // the last graph-walk `inst.text` reader.
         Err(format!(
             "native emitter: instruction not handled by the typed graph walk \
              (reason=graph_walk_unmigrated_opcode, opcode={}, phi_incoming={}, phi_parse_error={:?}, operands={:?}, result={:?})",
             inst.opcode,
-            inst.phi_incoming.is_some(),
-            inst.phi_parse_error,
+            inst.phi_incoming().is_some(),
+            inst.phi_parse_error(),
             inst.operands,
             inst.result
         ))
+    }
+
+    fn try_emit_fast_fma(
+        &mut self,
+        op: Op,
+        lhs: &TypedValue,
+        rhs: &TypedValue,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !self.fast_contract_adds.contains(name) || self.fast_uncontracted_sums.contains(name) {
+            return Ok(false);
+        }
+        let lhs_product = match &lhs.value {
+            LlValue::Local(value) => self.fast_float_products.get(value).cloned(),
+            _ => None,
+        };
+        let rhs_product = match &rhs.value {
+            LlValue::Local(value) => self.fast_float_products.get(value).cloned(),
+            _ => None,
+        };
+        if op != Op::FAdd {
+            return Ok(false);
+        }
+        let (product_lhs, product_rhs, addend) = match (lhs_product, rhs_product) {
+            (_, Some((a, b))) => (a, b, lhs),
+            (Some((a, b)), None) => (a, b, rhs),
+            (None, None) => return Ok(false),
+        };
+        let result_ty = self.resolve_type(&lhs.ty)?;
+        if !is_float_type(&result_ty)
+            || !types_compatible(&result_ty, &self.resolve_type(&product_lhs.ty)?)
+            || !types_compatible(&result_ty, &self.resolve_type(&product_rhs.ty)?)
+            || !types_compatible(&result_ty, &self.resolve_type(&addend.ty)?)
+            || matches!(result_ty, LlType::Vector(_, lanes) if lanes > 4)
+            || bfloat_lanes(&result_ty).is_some()
+        {
+            return Ok(false);
+        }
+
+        let result_type = self.type_id(&result_ty)?;
+        let result = self.result_id(name, &result_ty)?;
+        let a = self.value_id_in(&product_lhs.value, &product_lhs.ty, instructions)?;
+        let b = self.value_id_in(&product_rhs.value, &product_rhs.ty, instructions)?;
+        let c = self.value_id_in(&addend.value, &addend.ty, instructions)?;
+        let glsl = self.glsl_ext_inst_import();
+        instructions.push(Self::inst(
+            Op::ExtInst,
+            Some(result_type),
+            Some(result),
+            vec![
+                Operand::IdRef(glsl),
+                Operand::LiteralExtInstInteger(GlslStd450Op::Fma as u32),
+                Operand::IdRef(a),
+                Operand::IdRef(b),
+                Operand::IdRef(c),
+            ],
+        ));
+        Ok(true)
+    }
+
+    fn try_emit_grouped_fast_sum(
+        &mut self,
+        op: Op,
+        lhs: &TypedValue,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if op != Op::FAdd {
+            return Ok(false);
+        }
+        let Some((positive, negative, materialize_leading_pair)) =
+            self.fast_grouped_sums.get(name).cloned()
+        else {
+            return Ok(false);
+        };
+        let result_ty = self.resolve_type(&lhs.ty)?;
+        if !is_float_type(&result_ty) || bfloat_lanes(&result_ty).is_some() {
+            return Ok(false);
+        }
+        let result_type = self.type_id(&result_ty)?;
+        let mut emit_group = |terms: Vec<(TypedValue, bool)>,
+                              materialize_leading_pair: bool,
+                              this: &mut Self|
+         -> Result<Word, String> {
+            let mut terms = terms.into_iter();
+            let (first, negate) = terms.next().ok_or("empty grouped fast sum")?;
+            let mut sum = this.value_id_in(&first.value, &first.ty, instructions)?;
+            if matches!(&first.value, LlValue::Local(name) if this.fast_grouped_sum_boundaries.contains(name))
+            {
+                sum = this.materialize_float_bits(sum, &result_ty, instructions)?;
+            }
+            if negate {
+                let negated = this.fresh();
+                instructions.push(Self::inst(
+                    Op::FNegate,
+                    Some(result_type),
+                    Some(negated),
+                    vec![Operand::IdRef(sum)],
+                ));
+                sum = negated;
+            }
+            for (index, (term, negate)) in terms.enumerate() {
+                let mut rhs = this.value_id_in(&term.value, &term.ty, instructions)?;
+                if matches!(&term.value, LlValue::Local(name) if this.fast_grouped_sum_boundaries.contains(name))
+                {
+                    rhs = this.materialize_float_bits(rhs, &result_ty, instructions)?;
+                }
+                if negate {
+                    let negated = this.fresh();
+                    instructions.push(Self::inst(
+                        Op::FNegate,
+                        Some(result_type),
+                        Some(negated),
+                        vec![Operand::IdRef(rhs)],
+                    ));
+                    rhs = negated;
+                }
+                let next = this.fresh();
+                instructions.push(Self::inst(
+                    Op::FAdd,
+                    Some(result_type),
+                    Some(next),
+                    vec![Operand::IdRef(sum), Operand::IdRef(rhs)],
+                ));
+                sum = next;
+                if materialize_leading_pair && index == 0 {
+                    sum = this.materialize_float_bits(sum, &result_ty, instructions)?;
+                }
+            }
+            Ok(sum)
+        };
+        let positive = emit_group(positive, materialize_leading_pair, self)?;
+        let negative = emit_group(negative, false, self)?;
+        let positive = self.materialize_float_bits(positive, &result_ty, instructions)?;
+        let negative = self.materialize_float_bits(negative, &result_ty, instructions)?;
+        let result = self.result_id(name, &result_ty)?;
+        instructions.push(Self::inst(
+            Op::FAdd,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(positive), Operand::IdRef(negative)],
+        ));
+        Ok(true)
+    }
+
+    fn try_emit_partitioned_fast_sum(
+        &mut self,
+        op: Op,
+        lhs: &TypedValue,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if op != Op::FAdd {
+            return Ok(false);
+        }
+        let Some(groups) = self.fast_partitioned_sums.get(name).cloned() else {
+            return Ok(false);
+        };
+        let result_ty = self.resolve_type(&lhs.ty)?;
+        if !is_float_type(&result_ty) || bfloat_lanes(&result_ty).is_some() {
+            return Ok(false);
+        }
+        let result_type = self.type_id(&result_ty)?;
+        let mut group_values = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut terms = group.into_iter();
+            let first = terms.next().ok_or("empty partitioned fast sum")?;
+            let mut sum = self.value_id_in(&first.value, &first.ty, instructions)?;
+            for term in terms {
+                let rhs = self.value_id_in(&term.value, &term.ty, instructions)?;
+                let next = self.fresh();
+                instructions.push(Self::inst(
+                    Op::FAdd,
+                    Some(result_type),
+                    Some(next),
+                    vec![Operand::IdRef(sum), Operand::IdRef(rhs)],
+                ));
+                sum = self.materialize_float_bits(next, &result_ty, instructions)?;
+            }
+            group_values.push(self.materialize_float_bits(sum, &result_ty, instructions)?);
+        }
+        let mut groups = group_values.into_iter();
+        let mut sum = groups.next().ok_or("empty partitioned fast sum")?;
+        for rhs in groups {
+            let next = self.fresh();
+            instructions.push(Self::inst(
+                Op::FAdd,
+                Some(result_type),
+                Some(next),
+                vec![Operand::IdRef(sum), Operand::IdRef(rhs)],
+            ));
+            sum = next;
+        }
+        let result = self.result_id(name, &result_ty)?;
+        instructions.push(Self::inst(
+            Op::CopyObject,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(sum)],
+        ));
+        Ok(true)
+    }
+
+    fn materialize_float_bits(
+        &mut self,
+        value: Word,
+        ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let bits_ty = match ty {
+            LlType::Float => LlType::Int(32),
+            LlType::Half => LlType::Int(16),
+            _ => return Ok(value),
+        };
+        let bits_type = self.type_id(&bits_ty)?;
+        let bits = self.fresh();
+        instructions.push(Self::inst(
+            Op::Bitcast,
+            Some(bits_type),
+            Some(bits),
+            vec![Operand::IdRef(value)],
+        ));
+        let reversed = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitReverse,
+            Some(bits_type),
+            Some(reversed),
+            vec![Operand::IdRef(bits)],
+        ));
+        let restored_bits = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitReverse,
+            Some(bits_type),
+            Some(restored_bits),
+            vec![Operand::IdRef(reversed)],
+        ));
+        let result_type = self.type_id(ty)?;
+        let restored = self.fresh();
+        instructions.push(Self::inst(
+            Op::Bitcast,
+            Some(result_type),
+            Some(restored),
+            vec![Operand::IdRef(restored_bits)],
+        ));
+        Ok(restored)
     }
 
     fn bind_inline_parameter(
@@ -456,6 +733,12 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let resolved_ty = self.resolve_type(&argument.ty)?;
+        if let LlValue::Local(source) = &argument.value {
+            if let Some(pointer_values) = self.aggregate_pointer_values.get(source).cloned() {
+                self.aggregate_pointer_values
+                    .insert(name.to_string(), pointer_values);
+            }
+        }
         // A cross-storage pointer select deliberately has no single Logical-SPIR-V pointer value or
         // storage class. Typed helper inlining must therefore forward its deferred carrier, not ask
         // `pointer_storage_for` to fabricate one for the synthetic parameter. The cloned helper's
@@ -465,6 +748,14 @@ impl Emitter {
         if let (LlType::Ptr(_), LlValue::Local(source)) = (&resolved_ty, &argument.value) {
             if let Some(selected) = self.selected_pointers.get(source).cloned() {
                 self.selected_pointers.insert(name.to_string(), selected);
+                self.direct_param_values.insert(name.to_string());
+                self.param_values.insert(name.to_string());
+                return Ok(());
+            }
+            if let Some(tree) = self.selected_access_trees.get(source).cloned() {
+                self.pointer_pointees
+                    .insert(name.to_string(), tree.pointee.clone());
+                self.selected_access_trees.insert(name.to_string(), tree);
                 self.direct_param_values.insert(name.to_string());
                 self.param_values.insert(name.to_string());
                 return Ok(());
@@ -485,17 +776,28 @@ impl Emitter {
         // to that placeholder silently turns helper writes into Private writes.  Root the inline
         // substitution at the descriptor instead and carry the cursor onto the parameter; the
         // callee's existing raw load/store lowering then reapplies the offset structurally.
-        let inline_raw = if self.raw_buffer_params.contains(name) {
-            match &argument.value {
-                LlValue::Local(source) => self
-                    .raw_offsets
-                    .get(source)
-                    .cloned()
-                    .filter(|raw| raw.addrspace == 1 && !raw.unmodelable),
-                _ => None,
-            }
-        } else {
-            None
+        let inline_raw = match (&argument.value, &resolved_ty) {
+            (LlValue::Local(source), LlType::Ptr(addrspace)) => self
+                .raw_offsets
+                .get(source)
+                .cloned()
+                .filter(|raw| {
+                    !raw.unmodelable
+                        && ((self.raw_buffer_params.contains(name) && raw.addrspace == 1)
+                            || (self.bda_device_pointers && raw.device_addr_base.is_some()))
+                })
+                .or_else(|| {
+                    (self.bda_device_pointers)
+                        .then(|| self.bda_direct_addresses.get(source).copied())
+                        .flatten()
+                        .map(|address| {
+                            let mut raw =
+                                RawBufferOffset::root(format!(".bda_inline_{address}"), *addrspace);
+                            raw.device_addr_base = Some(address);
+                            raw
+                        })
+                }),
+            _ => None,
         };
         let inline_raw_storage = inline_raw.as_ref().map(|raw| {
             self.pointer_storage
@@ -515,7 +817,14 @@ impl Emitter {
         } else {
             None
         };
-        let argument_id = if let Some(raw) = inline_raw.as_ref() {
+        let bda_argument_address = inline_raw
+            .as_ref()
+            .filter(|raw| self.bda_device_pointers && raw.device_addr_base.is_some())
+            .map(|raw| self.materialize_device_address(raw, instructions))
+            .transpose()?;
+        let argument_id = if let Some(address) = bda_argument_address {
+            address
+        } else if let Some(raw) = inline_raw.as_ref() {
             self.value_id_in(
                 &LlValue::Local(raw.root.clone()),
                 &argument.ty,
@@ -531,6 +840,14 @@ impl Emitter {
             .push((placeholder_id, argument_id));
         self.direct_param_values.insert(name.to_string());
         self.param_values.insert(name.to_string());
+        if self.bda_device_pointers {
+            if let LlValue::Local(source) = &argument.value {
+                if let Some(addresses) = self.bda_aggregate_addresses.get(source).cloned() {
+                    self.bda_aggregate_addresses
+                        .insert(name.to_string(), addresses);
+                }
+            }
+        }
 
         if let Some((addrspace, storage, pointee, nullness)) = pointer_facts {
             if self.bda_device_pointers {
@@ -580,19 +897,19 @@ impl Emitter {
             if let Some(nullness) = nullness {
                 self.record_pointer_nullness(name.to_string(), nullness);
             }
-            if self.raw_buffer_params.contains(name) {
-                if let Some(mut raw) = inline_raw {
-                    raw.root = name.to_string();
-                    self.raw_offsets.insert(name.to_string(), raw);
-                    if let Some(storage) = inline_raw_storage {
-                        self.pointer_storage.insert(name.to_string(), storage);
-                    }
-                } else {
-                    self.raw_offsets.insert(
-                        name.to_string(),
-                        RawBufferOffset::root(name.to_string(), addrspace),
-                    );
+            if let Some(mut raw) = inline_raw.filter(|raw| {
+                self.raw_buffer_params.contains(name) || raw.device_addr_base.is_some()
+            }) {
+                raw.root = name.to_string();
+                self.raw_offsets.insert(name.to_string(), raw);
+                if let Some(storage) = inline_raw_storage {
+                    self.pointer_storage.insert(name.to_string(), storage);
                 }
+            } else if self.raw_buffer_params.contains(name) {
+                self.raw_offsets.insert(
+                    name.to_string(),
+                    RawBufferOffset::root(name.to_string(), addrspace),
+                );
             }
         }
         Ok(())
@@ -600,7 +917,7 @@ impl Emitter {
 
     /// The typed core of the `alloca` handler. `alloca` has no graph VALUE operands (its allocated type
     /// is a type, not an operand); the M-A5 graph walk passes the parsed allocated type from
-    /// `TirInst.alloca_ty`, the text entry parses it from the line — either way this core resolves it
+    /// `TirInst.alloca_ty()`, the text entry parses it from the line — either way this core resolves it
     /// against the module and applies the pointee/storage overrides keyed off the SSA result `name`.
     pub(in crate::native::emitter) fn emit_alloca_typed(
         &mut self,
@@ -735,7 +1052,7 @@ impl Emitter {
 
     /// The operand-resolved core of the `insertvalue` handler. Driven from `TirInst.operands`
     /// (`[composite, object]`) + the parsed trailing constant `indices` (from the
-    /// `TirInst.aggregate_indices` carrier on the typed path, or the text entry's parse). No `line`.
+    /// `TirInst.aggregate_indices()` carrier on the typed path, or the text entry's parse). No `line`.
     pub(in crate::native::emitter) fn emit_insertvalue_typed(
         &mut self,
         composite: TypedValue,
@@ -745,10 +1062,92 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let result_ty = self.resolve_type(&composite.ty)?;
-        let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
+        let mut pointer_values = match &composite.value {
+            LlValue::Local(composite_name) => self
+                .aggregate_pointer_values
+                .get(composite_name)
+                .cloned()
+                .unwrap_or_default(),
+            _ => HashMap::new(),
+        };
+        pointer_values.retain(|path, _| !path.starts_with(indices));
+        if matches!(object.ty, LlType::Ptr(_)) {
+            pointer_values.insert(indices.to_vec(), object.clone());
+        }
+        if let LlValue::Local(object_name) = &object.value {
+            if let Some(nested) = self.aggregate_pointer_values.get(object_name) {
+                for (path, pointer) in nested {
+                    let mut aggregate_path = indices.to_vec();
+                    aggregate_path.extend(path);
+                    pointer_values.insert(aggregate_path, pointer.clone());
+                }
+            }
+        }
+        if !self.bda_device_pointers {
+            for (path, pointer) in &pointer_values {
+                let source = self.value_id_in(&pointer.value, &pointer.ty, instructions)?;
+                self.emit_sidecar.aggregate_pointer_values.push(
+                    crate::emit_sidecar::AggregatePointerValue {
+                        aggregate: result,
+                        source,
+                        indices: path.clone(),
+                    },
+                );
+            }
+        }
+        if !pointer_values.is_empty() {
+            self.aggregate_pointer_values
+                .insert(name.clone(), pointer_values);
+        }
+        if self.bda_device_pointers {
+            let mut addresses = match &composite.value {
+                LlValue::Local(composite_name) => self
+                    .bda_aggregate_addresses
+                    .get(composite_name)
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => HashMap::new(),
+            };
+            addresses.retain(|path, _| !path.starts_with(indices));
+            if let LlValue::Local(object_name) = &object.value {
+                if let Some(address) = self.bda_direct_addresses.get(object_name).copied() {
+                    addresses.insert(indices.to_vec(), address);
+                }
+                if let Some(nested) = self.bda_aggregate_addresses.get(object_name) {
+                    for (path, address) in nested {
+                        let mut aggregate_path = indices.to_vec();
+                        aggregate_path.extend(path);
+                        addresses.insert(aggregate_path, *address);
+                    }
+                }
+            }
+            if !addresses.is_empty() {
+                self.bda_aggregate_addresses.insert(name.clone(), addresses);
+            }
+        }
+        let result_type = self.type_id(&result_ty)?;
+        let object_id = if matches!(object.ty, LlType::Ptr(_)) {
+            if self.bda_device_pointers {
+                match &object.value {
+                    LlValue::Local(object_name) => self
+                        .bda_direct_addresses
+                        .get(object_name)
+                        .copied()
+                        .unwrap_or(self.const_signed_int(64, 0)?),
+                    _ => self.const_signed_int(64, 0)?,
+                }
+            } else {
+                // The exact logical pointer is retained in `aggregate_pointer_values` above. Its
+                // nested SPIR-V member is deliberately an integer payload slot, never a logical
+                // pointer embedded in an allocatable aggregate.
+                self.const_signed_int(64, 0)?
+            }
+        } else {
+            self.value_id_in(&object.value, &object.ty, instructions)?
+        };
         let mut ops = vec![
-            Operand::IdRef(self.value_id_in(&object.value, &object.ty, instructions)?),
+            Operand::IdRef(object_id),
             Operand::IdRef(self.value_id_in(&composite.value, &composite.ty, instructions)?),
         ];
         ops.extend(indices.iter().copied().map(Operand::LiteralBit32));
@@ -762,7 +1161,7 @@ impl Emitter {
     }
 
     /// The operand-resolved core of the `extractvalue` handler. Driven from `TirInst.operands`
-    /// (`[composite]`) + the parsed trailing constant `indices` (from the `TirInst.aggregate_indices`
+    /// (`[composite]`) + the parsed trailing constant `indices` (from the `TirInst.aggregate_indices()`
     /// carrier on the typed path, or the text entry's parse). No `line`: `extract_value_type` embeds the
     /// resolved types, not the raw text, so the error bytes are text-independent.
     pub(in crate::native::emitter) fn emit_extractvalue_typed(
@@ -773,9 +1172,47 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let result_ty = extract_value_type(&self.resolve_type(&composite.ty)?, indices)?;
+        if matches!(result_ty, LlType::Ptr(_)) {
+            if let LlValue::Local(composite_name) = &composite.value {
+                if let Some(pointer) = self
+                    .aggregate_pointer_values
+                    .get(composite_name)
+                    .and_then(|pointers| pointers.get(indices))
+                    .cloned()
+                {
+                    self.bind_aggregate_pointer_extract(&name, &result_ty, &pointer, instructions)?;
+                    return Ok(());
+                }
+            }
+        }
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
         let composite_id = self.value_id_in(&composite.value, &composite.ty, instructions)?;
+        if self.bda_device_pointers {
+            if let LlValue::Local(composite_name) = &composite.value {
+                if let Some(addresses) = self.bda_aggregate_addresses.get(composite_name).cloned() {
+                    if let Some(address) = addresses.get(indices).copied() {
+                        self.bda_direct_addresses.insert(name.clone(), address);
+                    }
+                    let nested = addresses
+                        .into_iter()
+                        .filter_map(|(path, address)| {
+                            path.strip_prefix(indices)
+                                .filter(|suffix| !suffix.is_empty())
+                                .map(|suffix| (suffix.to_vec(), address))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    if !nested.is_empty() {
+                        self.bda_aggregate_addresses.insert(name.clone(), nested);
+                    }
+                }
+            }
+        }
+        let result_type = if self.bda_direct_addresses.contains_key(&name) {
+            self.type_id(&LlType::Int(64))?
+        } else {
+            result_type
+        };
         let mut ops = vec![Operand::IdRef(composite_id)];
         ops.extend(indices.iter().copied().map(Operand::LiteralBit32));
         instructions.push(Self::inst(
@@ -785,8 +1222,58 @@ impl Emitter {
             ops,
         ));
         if let LlType::Ptr(addrspace) = result_ty {
-            self.pointer_storage
-                .insert(name, llvm_pointer_storage(addrspace)?);
+            if self.bda_direct_addresses.contains_key(&name) {
+                let mut raw = RawBufferOffset::root(format!(".bda_{result}"), addrspace);
+                raw.device_addr_base = Some(result);
+                self.raw_offsets.insert(name.clone(), raw);
+                self.pointer_storage
+                    .insert(name, StorageClass::PhysicalStorageBuffer);
+            } else {
+                self.pointer_storage
+                    .insert(name, llvm_pointer_storage(addrspace)?);
+            }
+        }
+        Ok(())
+    }
+
+    fn bind_aggregate_pointer_extract(
+        &mut self,
+        name: &str,
+        result_ty: &LlType,
+        pointer: &TypedValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let source = self.value_id_in(&pointer.value, &pointer.ty, instructions)?;
+        self.values
+            .insert(name.to_string(), (source, result_ty.clone()));
+        if let LlValue::Local(source_name) = &pointer.value {
+            if let Some(raw) = self.raw_offsets.get(source_name).cloned() {
+                self.raw_offsets.insert(name.to_string(), raw);
+            }
+            if let Some(storage) = self.pointer_storage.get(source_name).copied() {
+                self.pointer_storage.insert(name.to_string(), storage);
+            }
+            if let Some(pointee) = self.pointer_pointees.get(source_name).cloned() {
+                self.pointer_pointees.insert(name.to_string(), pointee);
+            }
+            if let Some(nullness) = self.pointer_nullness.get(source_name).copied() {
+                self.record_pointer_nullness(name.to_string(), nullness);
+            }
+            if let Some(provenance) = self.gep_provenance.get(source_name).cloned() {
+                self.gep_provenance.insert(name.to_string(), provenance);
+            }
+            if let Some(address) = self.bda_direct_addresses.get(source_name).copied() {
+                self.bda_direct_addresses.insert(name.to_string(), address);
+            }
+            if self.unmodeled_pointers.contains(source_name) {
+                self.unmodeled_pointers.insert(name.to_string());
+            }
+            if self.byte_view_pointers.contains(source_name) {
+                self.byte_view_pointers.insert(name.to_string());
+            }
+            if self.param_values.contains(source_name) {
+                self.param_values.insert(name.to_string());
+            }
         }
         Ok(())
     }
@@ -794,7 +1281,7 @@ impl Emitter {
     /// The operand-resolved core of the `extractelement` handler. The graph walk drives it from
     /// `TirInst.operands` (`[vector, index]`, both typed operands the graph lowers). The two error strings
     /// embed the raw `line`, so the caller passes the strip-commented/trimmed instruction line (from
-    /// `inst.diag_line`) unchanged.
+    /// `inst.diag_line()`) unchanged.
     pub(in crate::native::emitter) fn emit_extractelement_resolved(
         &mut self,
         vector: TypedValue,
@@ -1092,6 +1579,9 @@ impl Emitter {
         name: String,
         _instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
+        if self.opaque_resource_pointers.contains(&name) && self.values.contains_key(&name) {
+            return Ok(());
+        }
         let src_ty = self.resolve_type(&src.ty)?;
         let LlType::Int(_) = src_ty else {
             return Err(format!(
@@ -1106,16 +1596,7 @@ impl Emitter {
         let src_id = self.value_id(&src.value, &src.ty)?;
         if self.bda_device_pointers && addrspace == 1 {
             self.used_device_address = true;
-            let bool_ty = self.type_id(&LlType::Bool)?;
-            let zero = self.const_signed_int(64, 0)?;
-            let is_null = self.result_id(&pointer_null_name(&name), &LlType::Bool)?;
-            _instructions.push(Self::inst(
-                Op::IEqual,
-                Some(bool_ty),
-                Some(is_null),
-                vec![Operand::IdRef(src_id), Operand::IdRef(zero)],
-            ));
-            self.pointer_nullness.insert(name.clone(), is_null);
+            self.emit_device_address_nullness(&name, src_id, _instructions)?;
             let mut dev = RawBufferOffset::root(format!(".bda_inttoptr_{src_id}"), 1);
             dev.device_addr_base = Some(src_id);
             self.raw_offsets.insert(name.clone(), dev);
@@ -1128,6 +1609,28 @@ impl Emitter {
         // function-constant-dead command-buffer paths translate without claiming active GPU-address
         // semantics.
         self.define_unmodeled_pointer_value(&name, addrspace, &LlType::Int(8))?;
+        Ok(())
+    }
+
+    /// Construct the Boolean shadow of a physical pointer at the same point as its integer address.
+    /// Logical pointer comparisons consume this shadow instead of constructing an illegal null
+    /// physical pointer solely for `OpPtrEqual`.
+    pub(in crate::native::emitter) fn emit_device_address_nullness(
+        &mut self,
+        name: &str,
+        address: Word,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<(), String> {
+        let bool_ty = self.type_id(&LlType::Bool)?;
+        let zero = self.const_signed_int(64, 0)?;
+        let is_null = self.result_id(&pointer_null_name(name), &LlType::Bool)?;
+        instructions.push(Self::inst(
+            Op::IEqual,
+            Some(bool_ty),
+            Some(is_null),
+            vec![Operand::IdRef(address), Operand::IdRef(zero)],
+        ));
+        self.record_pointer_nullness(name.to_string(), is_null);
         Ok(())
     }
 
@@ -1259,8 +1762,8 @@ impl Emitter {
 
     /// The operand-resolved core of the `store` handler. `store` is result-LESS, so the graph walk reads its
     /// `(object, ptr)` straight off `TirInst.operands` (`[value, pointer]`) and its `align` off
-    /// `inst.mem_align`, and calls here; the text-walk fallback parses the same from the line. Byte-
-    /// identical by construction — `inst.operands`/`inst.mem_align` are lowered from the same store line.
+    /// `inst.mem_align()`, and calls here; the text-walk fallback parses the same from the line. Byte-
+    /// identical by construction — `inst.operands`/`inst.mem_align()` are lowered from the same store line.
     pub(in crate::native::emitter) fn emit_store_resolved(
         &mut self,
         object: TypedValue,
@@ -1269,9 +1772,41 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         if let LlValue::Local(ptr_name) = &ptr.value {
+            if let Some(padding) = self.workgroup_padding_byte_pointers.get(ptr_name).cloned() {
+                let object_ty = self.resolve_type(&object.ty)?;
+                let (store_size, _) = self.raw_type_size_align(&object_ty)?;
+                if !typed_value_is_zero(&object) {
+                    return Err(
+                        "native emitter: non-zero store through a symbolic Workgroup padding pointer"
+                            .to_string(),
+                    );
+                }
+                if !self.struct_range_is_padding(
+                    &padding.struct_ty,
+                    padding.byte_offset,
+                    store_size,
+                )? {
+                    return Err(format!(
+                        "native emitter: zero store from Workgroup struct padding offset {} spans non-padding bytes",
+                        padding.byte_offset
+                    ));
+                }
+                return Ok(());
+            }
             if let Some(vector_word) = self.vector_word_pointers.get(ptr_name).cloned() {
                 let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
                 self.emit_vector_word_store(&vector_word, &object.ty, object_id, instructions)?;
+                return Ok(());
+            }
+            if let Some(tree) = self.selected_access_trees.get(ptr_name).cloned() {
+                let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
+                self.emit_selected_access_tree_store(
+                    &object.ty,
+                    object_id,
+                    &tree,
+                    align,
+                    instructions,
+                )?;
                 return Ok(());
             }
             if let Some(selected) = self.selected_load_pointers.get(ptr_name).cloned() {
@@ -1377,6 +1912,38 @@ impl Emitter {
         if let Some(pointee) = self.pointer_pointee_for_value(&ptr.value)? {
             let pointee = self.resolve_type(&pointee)?;
             let object_ty = self.resolve_type(&object.ty)?;
+            if self.bda_device_pointers && pointee == LlType::Int(64) && object_ty == LlType::Ptr(1)
+            {
+                if let LlValue::Local(object_name) = &object.value {
+                    let address = if let Some(address) =
+                        self.bda_direct_addresses.get(object_name).copied()
+                    {
+                        Some(address)
+                    } else if let Some(raw) = self.raw_offsets.get(object_name).cloned() {
+                        raw.device_addr_base
+                            .map(|_| self.materialize_device_address(&raw, instructions))
+                            .transpose()?
+                    } else if self.direct_param_indices.contains_key(object_name) {
+                        let (low, high) =
+                            self.emit_direct_buffer_address_payload(object_name, instructions)?;
+                        self.pointer_payload_words
+                            .insert(object_name.clone(), (low, high));
+                        Some(self.combine_pointer_payload_words(low, high, instructions)?)
+                    } else {
+                        None
+                    };
+                    if let Some(address) = address {
+                        let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+                        instructions.push(Self::inst(
+                            Op::Store,
+                            None,
+                            None,
+                            vec![Operand::IdRef(pointer), Operand::IdRef(address)],
+                        ));
+                        return Ok(());
+                    }
+                }
+            }
             if !types_compatible(&pointee, &object_ty)
                 && self.emit_i64_to_i32_pair_struct_store(&object, &ptr, &pointee, instructions)?
             {
@@ -1502,9 +2069,9 @@ impl Emitter {
         Ok(())
     }
 
-    /// The resolved core of the void-call handler. Driven by the graph walk from the `TirInst.call`
+    /// The resolved core of the void-call handler. Driven by the graph walk from the `TirInst.call()`
     /// carrier with args overlaid from `inst.operands` (`apply_tir_inst_void_call_args`). `line` is read
-    /// only by the `non-void call without result` diagnostic (fed from `TirInst.void_call_line`).
+    /// only by the `non-void call without result` diagnostic (fed from `TirInst.void_call_line()`).
     pub(in crate::native::emitter) fn emit_void_call_body(
         &mut self,
         call: LlCall,
@@ -1553,30 +2120,29 @@ impl Emitter {
     }
 
     /// The operand-resolved core of the value-producing call handler. Driven either from the text entry's
-    /// `parse_call` or, on the typed path, from `TirInst.call` — byte-identical, both are the same
+    /// `parse_call` or, on the typed path, from `TirInst.call()` — byte-identical, both are the same
     /// `parse_call` on the same `<ret> @callee(args)` remainder. The argument values are overlaid from the
     /// typed graph keyed by the SSA result `name`, then the special-case intrinsic/AIR emitters run before
     /// the generic call.
     pub(in crate::native::emitter) fn emit_value_call_resolved(
         &mut self,
         name: String,
-        mut call: LlCall,
+        call: LlCall,
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
-        // R3 graph-driven: source the call's ARGUMENT values from the typed graph (keyed by the
-        // SSA result `name`; callee + return type stay from text). Done before the special-case
-        // emitters so they consume the graph operands too. Byte-identical by tir's operand soundness.
-        self.apply_tir_call_args(&name, &mut call);
         if self.emit_mtl_force_not_checked_load_call(&call, &name, instructions)? {
             return Ok(());
         }
         if self.emit_visible_function_table_placeholder_call(&call, &name, instructions)? {
             return Ok(());
         }
-        if self.emit_llvm_fshl_i32_call(&call, &name, instructions)? {
+        if self.emit_llvm_fshl_call(&call, &name, instructions)? {
             return Ok(());
         }
         if self.emit_llvm_cttz_i32_call(&call, &name, instructions)? {
+            return Ok(());
+        }
+        if self.emit_llvm_ctpop_call(&call, &name, instructions)? {
             return Ok(());
         }
         if self.emit_llvm_abs_call(&call, &name, instructions)? {
@@ -1626,7 +2192,7 @@ impl Emitter {
     }
 
     /// The typed core of `bitcast`: everything past the `<src> to <dst>` split, driven by the parsed
-    /// source typed value + destination-type TEXT. Driven straight off the `TirInst.bitcast` carrier
+    /// source typed value + destination-type TEXT. Driven straight off the `TirInst.bitcast()` carrier
     /// by the graph walk. The pointer
     /// copy-prop side-tables are keyed on `src.value`'s local name, so this needs no `inst.text`.
     pub(in crate::native::emitter) fn emit_bitcast_resolved(
@@ -1640,6 +2206,24 @@ impl Emitter {
         let src_ty = self.resolve_type(&src.ty)?;
         if matches!((&src_ty, &dst_ty), (LlType::Ptr(_), LlType::Ptr(_))) {
             if let LlValue::Local(src_name) = &src.value {
+                if let Some(padding) = self.workgroup_padding_byte_pointers.get(src_name).cloned() {
+                    self.workgroup_padding_byte_pointers
+                        .insert(name.clone(), padding);
+                    self.pointer_storage
+                        .insert(name.clone(), StorageClass::Workgroup);
+                    self.pointer_pointees.insert(name, LlType::Int(8));
+                    return Ok(());
+                }
+                if let Some(tree) = self.selected_access_trees.get(src_name).cloned() {
+                    self.selected_access_trees.insert(name.clone(), tree);
+                    if let Some(pointee) = self.pointer_pointees.get(src_name).cloned() {
+                        self.pointer_pointees.insert(name.clone(), pointee);
+                    }
+                    if self.param_values.contains(src_name) {
+                        self.param_values.insert(name.clone());
+                    }
+                    return Ok(());
+                }
                 if let Some(selected) = self.selected_load_pointers.get(src_name).cloned() {
                     self.selected_load_pointers.insert(name.clone(), selected);
                     if let Some(storage) = self.pointer_storage.get(src_name).copied() {
@@ -1677,6 +2261,9 @@ impl Emitter {
                             self.materialize_reserved_raw_word_index(&name, &raw, instructions)?;
                         }
                     }
+                    if raw.device_addr_base.is_some() {
+                        self.materialize_reserved_bda_address(&name, &raw, instructions)?;
+                    }
                     self.raw_offsets.insert(name.clone(), raw);
                     let addrspace = match dst_ty {
                         LlType::Ptr(addrspace) => addrspace,
@@ -1697,6 +2284,58 @@ impl Emitter {
             }
         }
         let src_id = self.value_id(&src.value, &src.ty)?;
+        if let (LlType::Ptr(src_addrspace), LlType::Ptr(dst_addrspace)) = (&src_ty, &dst_ty) {
+            if src_addrspace == dst_addrspace {
+                // Opaque-pointer LLVM spells some no-op pointer aliases as `bitcast ptr %p to ptr`.
+                // The source and result are the same pointer value; its later load/store type is a
+                // separate use-side fact. Giving the alias a freshly typed SPIR-V `OpCopyObject`
+                // is not equivalent because Logical pointers encode their pointee in the result
+                // type. Keep the source id and propagate its structural pointer facts so a
+                // mismatched use is lowered as a value reinterpretation at the dereference.
+                self.values.insert(name.clone(), (src_id, dst_ty.clone()));
+                if let LlValue::Local(src_name) = &src.value {
+                    // A same-address-space pointer bitcast is an address identity under LLVM's
+                    // opaque-pointer model. Preserve an already exact device address as well as
+                    // the logical pointer id so a later BDA phi/GEP can consume the alias without
+                    // inventing a second, undefined address result.
+                    if let Some(address) = self.bda_direct_addresses.get(src_name).copied() {
+                        self.bda_direct_addresses.insert(name.clone(), address);
+                    }
+                    if let Some(storage) = self.pointer_storage.get(src_name).copied() {
+                        self.pointer_storage.insert(name.clone(), storage);
+                    }
+                    if let Some(is_null) = self.pointer_nullness.get(src_name).copied() {
+                        self.record_pointer_nullness(name.clone(), is_null);
+                    }
+                    if let Some(pointee) = self.pointer_pointees.get(src_name).cloned() {
+                        self.pointer_pointees.insert(name.clone(), pointee);
+                    }
+                    if let Some(raw) = self.raw_offsets.get(src_name).cloned() {
+                        self.raw_offsets.insert(name.clone(), raw);
+                    }
+                    if let Some(provenance) = self.gep_provenance.get(src_name).cloned() {
+                        self.gep_provenance.insert(name.clone(), provenance);
+                    }
+                    if self.unmodeled_pointers.contains(src_name) {
+                        self.unmodeled_pointers.insert(name.clone());
+                    }
+                    if self.param_values.contains(src_name) {
+                        self.param_values.insert(name);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        let aggregate_result = self.result_id(&name, &dst_ty)?;
+        if self.emit_i8_array_integer_bitcast(
+            src_id,
+            &src_ty,
+            &dst_ty,
+            aggregate_result,
+            instructions,
+        )? {
+            return Ok(());
+        }
         let result = match (&src_ty, &dst_ty) {
             (LlType::Int(32), LlType::Vector(elem, 4)) if **elem == LlType::Int(8) => {
                 self.emit_i32_to_v4i8(src_id, instructions)?
@@ -1716,9 +2355,8 @@ impl Emitter {
             // A pointer→pointer bitcast that is not the same logical type (here, a cross-address-space
             // reinterpret — `LlType::Ptr` carries only the address space, so same-space pointers took
             // the `a == b` CopyObject arm above) would be an `OpBitcast` on a logical pointer, illegal
-            // under Logical addressing. Never part of a valid module, so route to the failure-triggered
-            // raw retry instead of emitting the rejected instruction. Floor-safe: a banked module never
-            // contains this bitcast.
+            // under Logical addressing. Never part of a valid module, so return an error instead of
+            // emitting the rejected instruction.
             (LlType::Ptr(_), LlType::Ptr(_)) => {
                 return Err(format!(
                     "native emitter: cannot reinterpret pointer {name} across address spaces \
@@ -1726,10 +2364,17 @@ impl Emitter {
                 ));
             }
             _ => {
+                // Distinct AIR types can share one storage type (notably bfloat and i16). SPIR-V
+                // forbids OpBitcast when the constructed source and result types are identical.
+                let source_type = self.type_id(&src_ty)?;
                 let result_type = self.type_id(&dst_ty)?;
                 let result = self.result_id(&name, &dst_ty)?;
                 instructions.push(Self::inst(
-                    Op::Bitcast,
+                    if source_type == result_type {
+                        Op::CopyObject
+                    } else {
+                        Op::Bitcast
+                    },
                     Some(result_type),
                     Some(result),
                     vec![Operand::IdRef(src_id)],
@@ -1757,6 +2402,9 @@ impl Emitter {
                 if self.unmodeled_pointers.contains(src_name) {
                     self.unmodeled_pointers.insert(name.clone());
                 }
+                if self.byte_view_pointers.contains(src_name) {
+                    self.byte_view_pointers.insert(name.clone());
+                }
                 if self.param_values.contains(src_name) {
                     self.param_values.insert(name.clone());
                 }
@@ -1768,7 +2416,7 @@ impl Emitter {
 
     /// The operand-resolved core of the `load` handler. The M-A4 graph walk sources the pointer from
     /// `TirInst.operands[0]`, the loaded type from `TirInst.result_ty`, and the alignment from
-    /// `TirInst.mem_align` — the same three values the text path derives (its
+    /// `TirInst.mem_align()` — the same three values the text path derives (its
     /// `load_pointer_operand`/`result_type_of`/`mem_align_of` read them from the tir carrier), so the two
     /// entries are byte-identical. `load` carries the resolved `ptr`+`align`; its
     /// `result_ty` field is unused here (the resolved `result_ty` is passed separately).
@@ -1782,6 +2430,16 @@ impl Emitter {
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
         if let LlValue::Local(ptr_name) = &load.ptr.value {
+            if let Some(tree) = self.selected_access_trees.get(ptr_name).cloned() {
+                self.emit_selected_access_tree_load(
+                    result,
+                    &result_ty,
+                    &tree,
+                    load.align,
+                    instructions,
+                )?;
+                return Ok(());
+            }
             if let Some(selected) = self.selected_load_pointers.get(ptr_name).cloned() {
                 self.emit_selected_pointer_load(
                     result,
@@ -1814,10 +2472,12 @@ impl Emitter {
                 // the store dispatch + `RawBufferOffset::device_addr_base`). The result VALUE id is
                 // intentionally left undefined — a device pointer is only ever used AS a pointer
                 // (GEP/store/deref), all routed through `raw_offsets`, never as a plain value.
-                if self.bda_device_pointers {
+                if self.bda_device_pointers && !self.opaque_resource_pointers.contains(&name) {
                     if let LlType::Ptr(1) = result_ty {
-                        let addr = self.fresh();
+                        let addr = self.result_id(&bda_address_name(&name), &LlType::Int(64))?;
                         self.emit_raw_load(addr, &LlType::Int(64), &raw, load.align, instructions)?;
+                        self.bda_address_values.insert(addr);
+                        self.emit_device_address_nullness(&name, addr, instructions)?;
                         self.used_device_address = true;
                         let mut dev = RawBufferOffset::root(format!(".bda_{addr}"), 1);
                         dev.device_addr_base = Some(addr);
@@ -1936,6 +2596,49 @@ impl Emitter {
             return Ok(());
         }
         let ptr = self.value_id_in(&load.ptr.value, &load.ptr.ty, instructions)?;
+        let pointer_is_undefined = self.module.types_global_values.iter().any(|instruction| {
+            instruction.result_id == Some(ptr) && instruction.class.opcode == Op::Undef
+        });
+        if pointer_is_undefined {
+            // A null-rooted source pointer may be represented symbolically as a typed pointer
+            // OpUndef, but SPIR-V does not permit OpUndef itself as a memory operand. The source load
+            // is undefined in exactly this case, so construct its result as an undefined VALUE and
+            // keep invalid pointer SSA out of executable memory instructions.
+            let undefined = self.undef_id(&result_ty)?;
+            instructions.push(Self::inst(
+                Op::CopyObject,
+                Some(result_type),
+                Some(result),
+                vec![Operand::IdRef(undefined)],
+            ));
+            return Ok(());
+        }
+        if self.emit_trailing_byte_array_integer_load(
+            result,
+            &result_ty,
+            &load.ptr,
+            instructions,
+        )? {
+            return Ok(());
+        }
+        if result_ty == LlType::Int(64)
+            && self
+                .pointer_pointee_for_value(&load.ptr.value)?
+                .is_some_and(|pointee| matches!(pointee, LlType::Ptr(1)))
+        {
+            if let Some(pointer_name) = self.opaque_resource_payload_loads.get(&name).cloned() {
+                let pointer_ty = LlType::Ptr(1);
+                let pointer_type = self.type_id(&pointer_ty)?;
+                let pointer = self.result_id(&pointer_name, &pointer_ty)?;
+                instructions.push(Self::inst(
+                    Op::Load,
+                    Some(pointer_type),
+                    Some(pointer),
+                    vec![Operand::IdRef(ptr)],
+                ));
+                return Ok(());
+            }
+        }
         if let Some(pointee) = self.pointer_pointee_for_value(&load.ptr.value)? {
             let pointee = self.resolve_type(&pointee)?;
             if !types_compatible(&pointee, &result_ty) {
@@ -1950,6 +2653,16 @@ impl Emitter {
                 }
                 if self.emit_aggregate_prefix_integer_reinterpret_load(
                     result,
+                    &pointee,
+                    &result_ty,
+                    &load.ptr,
+                    ptr,
+                    instructions,
+                )? {
+                    return Ok(());
+                }
+                if self.emit_aggregate_prefix_pointer_reinterpret_load(
+                    &name,
                     &pointee,
                     &result_ty,
                     &load.ptr,
@@ -2120,10 +2833,9 @@ impl Emitter {
                     if pointee == LlType::Int(8) {
                         // Reinterpreting the i8 (byte) pointer to the wider result type would need an
                         // `OpBitcast` on a logical pointer (retyping the pointee), illegal under Logical
-                        // addressing. Such a module never validates, so route to the failure-triggered
-                        // raw retry — which models the buffer as a byte/word RuntimeArray and forms the
-                        // load by byte offset, no pointer bitcast. Floor-safe: a banked module never
-                        // contains this bitcast, so it never reaches here.
+                        // addressing. Primary construction returns an error; raw-buffer construction
+                        // models the buffer as a byte/word RuntimeArray and forms the load by byte
+                        // offset, with no pointer bitcast.
                         return Err(format!(
                             "native emitter: cannot reinterpret load of byte pointer to {result_ty:?} without a logical-pointer bitcast"
                         ));

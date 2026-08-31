@@ -24,6 +24,11 @@ impl LlModule {
             let Some(layout) = kern.layout_of(idx as u32) else {
                 continue;
             };
+            let key = (entry.name.clone(), name.clone());
+            if self.air_metadata_requires_byte_view(layout) {
+                self.raw_buffer_params.insert(key);
+                continue;
+            }
             let Some(declared_size) = kern.buffer_type_size(idx as u32) else {
                 continue;
             };
@@ -34,7 +39,6 @@ impl LlModule {
             if size != u64::from(declared_size) {
                 continue;
             }
-            let key = (entry.name.clone(), name.clone());
             if !self.ptr_pointees.contains_key(&key) {
                 self.ptr_pointees.insert(key.clone(), pointee);
                 self.metadata_pointee_sizes

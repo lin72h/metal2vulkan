@@ -1,16 +1,147 @@
 //! Bounded ownership and edge-route analysis for the reject-only construct-tree re-nester.
 //!
-//! This module does not participate in production admission yet. It converts an explicit parent-first
-//! construct claim graph into one owner per original block and one finite ancestor route per original
-//! edge; its `renest` child materializes the bounded typed regional construct used by the R1 fixture
-//! proof. R2+ derives these claims from one live reject class at a time.
+//! It converts an explicit parent-first construct claim graph into one owner per original block and
+//! one finite ancestor route per original edge. Its `renest` child materializes typed regional and
+//! whole-CFG dispatcher constructs before emission; production derives claims structurally from the
+//! current source CFG rather than matching workload identities.
 
-use super::{synthetic_block, BlockRole, BodyBlock};
-use std::collections::HashSet;
+use super::{
+    analyze, block_successors, conditional_branch_targets, synthetic_block, BlockRole, BodyBlock,
+    StructuredPlan, CROSS_ARM_EDGE_MAX_BLOCKS,
+};
+use std::collections::{HashMap, HashSet};
 
 pub(in crate::native) mod renest;
 
 const ROUTE_PREFIX: &str = "%metal2vulkan.ctroute.";
+
+/// Whether a selection arm owns a natural loop that exits directly into the selection's sibling
+/// arm. SPIR-V cannot represent that edge in place: leaving the loop does not license entry into a
+/// sibling selection construct. A typed dispatcher must therefore own this shape even when a local
+/// merge assignment happens to pass the source planner's cheaper checks.
+pub(in crate::native) fn requires_loop_exit_sibling_dispatch(blocks: &[BodyBlock]) -> bool {
+    let forest = analyze(blocks);
+    let by_name = blocks
+        .iter()
+        .map(|block| (block.name.as_str(), block))
+        .collect::<HashMap<_, _>>();
+    blocks.iter().any(|header| {
+        let Some((left, right)) = conditional_branch_targets(header) else {
+            return false;
+        };
+        let requires_dispatch =
+            [(&left, &right), (&right, &left)]
+                .into_iter()
+                .any(|(loop_entry, sibling)| {
+                    forest.loops.iter().any(|natural_loop| {
+                        natural_loop.body.iter().any(|block| block == loop_entry)
+                            && !natural_loop.body.iter().any(|block| block == &header.name)
+                            && !natural_loop.body.iter().any(|block| block == sibling)
+                            && natural_loop.exits.iter().any(|exit| {
+                                let mut current = exit.clone();
+                                let mut seen = HashSet::new();
+                                loop {
+                                    if &current == sibling {
+                                        break true;
+                                    }
+                                    if !seen.insert(current.clone())
+                                        || natural_loop.body.iter().any(|block| block == &current)
+                                    {
+                                        break false;
+                                    }
+                                    let Some(block) = by_name.get(current.as_str()) else {
+                                        break false;
+                                    };
+                                    let successors = block_successors(block);
+                                    let [next] = successors.as_slice() else {
+                                        break false;
+                                    };
+                                    current = next.clone();
+                                }
+                            })
+                    })
+                });
+        requires_dispatch
+    })
+}
+
+/// Derive the complete ownership tree used by the whole-CFG dispatcher and materialize it before
+/// emission. Every original block is owned by one switch arm under one dispatcher loop; every source
+/// edge therefore has one finite arm-to-arm route, including backedges and multi-level exits. The
+/// typed materializer carries phi and cross-block state explicitly. Pointer state remains a pointer
+/// `phi`, allowing the typed emitter's use-pointee propagation to assign one legal SPIR-V pointer type
+/// without converting control flow into a pointer `select`.
+///
+/// This is reject-only and bounded to the same modest CFG domain as the local cross-arm machinery.
+/// Larger graphs continue to use the separately bounded path until their state representation can be
+/// made sparse without retaining `blocks * live_values` incoming pairs.
+pub(in crate::native) fn renest_whole_cfg_dispatch(
+    blocks: &[BodyBlock],
+) -> Result<StructuredPlan, String> {
+    if blocks.is_empty() {
+        return Err("construct-tree:whole-cfg-empty".to_string());
+    }
+    if blocks.len() > CROSS_ARM_EDGE_MAX_BLOCKS {
+        return Err(format!(
+            "construct-tree:whole-cfg-block-limit blocks={} limit={CROSS_ARM_EDGE_MAX_BLOCKS}",
+            blocks.len()
+        ));
+    }
+
+    let mut nodes = vec![
+        ConstructNode {
+            name: "whole-cfg-root".to_string(),
+            parent: None,
+            kind: ConstructKind::Root,
+        },
+        ConstructNode {
+            name: "whole-cfg-loop".to_string(),
+            parent: Some(0),
+            kind: ConstructKind::Loop,
+        },
+        ConstructNode {
+            name: "whole-cfg-switch".to_string(),
+            parent: Some(1),
+            kind: ConstructKind::Switch,
+        },
+    ];
+    let mut claimed = Vec::with_capacity(blocks.len());
+    for (index, block) in blocks.iter().enumerate() {
+        let arm = nodes.len();
+        nodes.push(ConstructNode {
+            name: format!("whole-cfg-arm-{index}"),
+            parent: Some(2),
+            kind: ConstructKind::Arm,
+        });
+        claimed.push(ClaimedBlock {
+            name: block.name.clone(),
+            claims: vec![arm],
+        });
+    }
+
+    let by_name = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.name.as_str(), index))
+        .collect::<HashMap<_, _>>();
+    let mut edges = Vec::new();
+    let mut seen = HashSet::new();
+    for (from, block) in blocks.iter().enumerate() {
+        for target in block_successors(block) {
+            let Some(&to) = by_name.get(target.as_str()) else {
+                return Err(format!(
+                    "construct-tree:whole-cfg-unknown-successor from={} to={target}",
+                    block.name
+                ));
+            };
+            if seen.insert((from, to)) {
+                edges.push(OriginalEdge { from, to });
+            }
+        }
+    }
+    let plan = plan_construct_tree(&nodes, &claimed, &edges)?;
+    renest::renest_construct_tree(blocks, &plan)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::native) enum ConstructKind {
@@ -331,6 +462,7 @@ pub(in crate::native) fn materialize_construct_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::ir::{LlType, LlValue, TypedValue};
     use crate::native::tir;
     use std::collections::HashMap;
 
@@ -366,6 +498,95 @@ mod tests {
                 kind: ConstructKind::Selection,
             },
         ]
+    }
+
+    #[test]
+    fn whole_cfg_dispatch_owns_loop_exit_into_selection_sibling() {
+        let blocks = vec![
+            bb("%entry", &["br label %outer"]),
+            bb("%outer", &["br i1 %direct, label %sibling, label %loop"]),
+            bb(
+                "%loop",
+                &[
+                    "%i = phi i32 [ 0, %outer ], [ %next, %body ]",
+                    "br label %body",
+                ],
+            ),
+            bb(
+                "%body",
+                &[
+                    "%next = add i32 %i, 1",
+                    "br i1 %leave, label %sibling, label %loop",
+                ],
+            ),
+            bb(
+                "%sibling",
+                &[
+                    "%value = phi i32 [ 7, %outer ], [ %next, %body ]",
+                    "ret void",
+                ],
+            ),
+        ];
+        assert!(requires_loop_exit_sibling_dispatch(&blocks));
+        let plan = renest_whole_cfg_dispatch(&blocks).expect("whole-CFG ownership plan");
+        assert!(plan
+            .blocks
+            .iter()
+            .any(|block| block.name == "%metal2vulkan.ct.dispatch"));
+        assert!(plan
+            .blocks
+            .iter()
+            .any(|block| block.name == "%metal2vulkan.ct.header"));
+        assert!(super::super::structured_plan_construct_tree(&plan.blocks).is_some());
+    }
+
+    #[test]
+    fn whole_cfg_dispatch_carries_nonvoid_returns_through_typed_state() {
+        let blocks = vec![
+            bb("%entry", &["br i1 %condition, label %left, label %right"]),
+            bb(
+                "%left",
+                &["%left.value = add i32 6, 1", "ret i32 %left.value"],
+            ),
+            bb("%right", &["ret i32 9"]),
+        ];
+
+        let plan = renest_whole_cfg_dispatch(&blocks).expect("whole-CFG ownership plan");
+        let header = plan
+            .blocks
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.header")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher header");
+        let merge = plan
+            .blocks
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.merge")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher merge");
+        let exit = plan
+            .blocks
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.exit")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher exit");
+
+        assert!(header
+            .insts
+            .iter()
+            .any(|inst| inst.result.as_deref() == Some("%metal2vulkan.ct.return")));
+        assert!(merge
+            .insts
+            .iter()
+            .any(|inst| inst.result.as_deref() == Some("%metal2vulkan.ct.nextreturn")));
+        assert!(matches!(
+            &exit.ret,
+            tir::RetEmit::Value(TypedValue {
+                ty: LlType::Int(32),
+                value: LlValue::Local(value),
+            }) if value == "%metal2vulkan.ct.return"
+        ));
+        assert!(super::super::structured_plan_construct_tree(&plan.blocks).is_some());
     }
 
     fn linear_claims() -> Vec<ClaimedBlock> {
@@ -533,7 +754,7 @@ mod tests {
             .insts
             .iter()
             .find(|inst| inst.result.as_deref() == Some("%value"))
-            .and_then(|inst| inst.phi_incoming.as_ref())
+            .and_then(|inst| inst.phi_incoming().as_ref())
             .map(|(_, incoming)| incoming)
             .unwrap();
         assert_eq!(phi[0].1, format!("{ROUTE_PREFIX}2.0"));
@@ -612,8 +833,10 @@ mod tests {
             .iter()
             .find(|inst| inst.result.as_deref() == Some("%y"))
             .unwrap();
+        let mut y_uses = Vec::new();
+        y.visit_uses(|name| y_uses.push(name.to_string()));
         assert_eq!(
-            y.uses,
+            y_uses,
             vec!["%metal2vulkan.ct.vslot.0".to_string()],
             "later cases read the current state slot, not the out-of-scope source SSA name"
         );
@@ -644,7 +867,7 @@ mod tests {
             .insts
             .iter()
             .find(|inst| inst.result.as_deref() == Some("%metal2vulkan.ct.nextvslot.0"))
-            .and_then(|inst| inst.phi_incoming.as_ref())
+            .and_then(|inst| inst.phi_incoming().as_ref())
             .map(|(_, incoming)| incoming)
             .unwrap();
         assert!(
@@ -657,7 +880,35 @@ mod tests {
     }
 
     #[test]
-    fn r1_renester_keeps_cross_case_pointer_values_rejected() {
+    fn r1_renester_carries_cross_case_pointer_values_as_typed_phis() {
+        let nodes = deep_single_owner_nodes();
+        let blocks = vec![
+            bb("%entry", &["br label %def"]),
+            bb("%def", &["%p = freeze ptr null", "br label %use"]),
+            bb("%use", &["%v = load i32, ptr %p, align 4", "ret void"]),
+        ];
+        let edges = vec![
+            OriginalEdge { from: 0, to: 1 },
+            OriginalEdge { from: 1, to: 2 },
+        ];
+        let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+        let out = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap();
+        let header = out
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.header")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher header");
+        let pointer_slot = header
+            .insts
+            .iter()
+            .find(|inst| inst.result.as_deref() == Some("%metal2vulkan.ct.vslot.0"))
+            .expect("pointer state slot");
+        assert_eq!(pointer_slot.result_ty, Some(LlType::Ptr(0)));
+        assert!(super::super::structured_plan_construct_tree(&out).is_some());
+    }
+
+    #[test]
+    fn r1_renester_keeps_function_variables_out_of_pointer_state() {
         let nodes = deep_single_owner_nodes();
         let blocks = vec![
             bb("%entry", &["br label %def"]),
@@ -669,10 +920,262 @@ mod tests {
             OriginalEdge { from: 1, to: 2 },
         ];
         let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+        let out = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap();
+        let header = out
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.header")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher header");
+
+        assert!(!header.insts.iter().any(|inst| {
+            inst.result
+                .as_deref()
+                .is_some_and(|result| result.starts_with("%metal2vulkan.ct.vslot."))
+        }));
+        let use_block = out
+            .iter()
+            .find(|block| block.name == "%use")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed use block");
+        assert!(use_block.insts.iter().any(|inst| {
+            inst.operands.iter().any(|operand| {
+                matches!(operand, tir::TirOperand::Value { name, ty: LlType::Ptr(0) } if name == "%p")
+            })
+        }));
+    }
+
+    #[test]
+    fn r1_renester_hoists_function_pointer_derivations_out_of_state() {
+        let nodes = deep_single_owner_nodes();
+        let blocks = vec![
+            bb("%entry", &["br label %def"]),
+            bb(
+                "%def",
+                &[
+                    "%p = alloca [2 x i32], align 4",
+                    "%alias = bitcast ptr %p to ptr",
+                    "%field = getelementptr [2 x i32], ptr %alias, i64 0, i64 1",
+                    "%device.field = getelementptr i32, ptr addrspace(1) %device, i64 %index",
+                    "br label %use",
+                ],
+            ),
+            bb(
+                "%use",
+                &[
+                    "%v = load i32, ptr %field, align 4",
+                    "%w = load i32, ptr addrspace(1) %device.field, align 4",
+                    "ret void",
+                ],
+            ),
+        ];
+        let edges = vec![
+            OriginalEdge { from: 0, to: 1 },
+            OriginalEdge { from: 1, to: 2 },
+        ];
+        let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+        let out = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap();
+        let preheader = out
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.pre")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher preheader");
+        let preheader_results = preheader
+            .insts
+            .iter()
+            .filter_map(|inst| inst.result.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            preheader_results,
+            ["%p", "%alias", "%field", "%device.field"]
+        );
+
+        let header = out
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.header")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher header");
+        assert!(!header.insts.iter().any(|inst| {
+            inst.result
+                .as_deref()
+                .is_some_and(|result| result.starts_with("%metal2vulkan.ct.vslot."))
+        }));
+        assert_eq!(
+            out.iter()
+                .filter_map(|block| block.typed.as_ref())
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.result.as_deref() == Some("%alias"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            out.iter()
+                .filter_map(|block| block.typed.as_ref())
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.result.as_deref() == Some("%field"))
+                .count(),
+            1
+        );
+        assert!(super::super::structured_plan_construct_tree(&out).is_some());
+    }
+
+    #[test]
+    fn r1_renester_carries_dynamic_function_pointer_indices() {
+        let nodes = deep_single_owner_nodes();
+        let blocks = vec![
+            bb("%entry", &["br label %def"]),
+            bb(
+                "%def",
+                &[
+                    "%p = alloca [4 x i32], align 4",
+                    "%index = add i64 %argument, 1",
+                    "%field = getelementptr [4 x i32], ptr %p, i64 0, i64 %index",
+                    "%same = load i32, ptr %field, align 4",
+                    "br label %use",
+                ],
+            ),
+            bb(
+                "%use",
+                &["store i32 %same, ptr %field, align 4", "ret void"],
+            ),
+        ];
+        let edges = vec![
+            OriginalEdge { from: 0, to: 1 },
+            OriginalEdge { from: 1, to: 2 },
+        ];
+        let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+        let out = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap();
+        let header = out
+            .iter()
+            .find(|block| block.name == "%metal2vulkan.ct.header")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed dispatcher header");
+        assert!(header.insts.iter().any(|inst| {
+            inst.result.as_deref() == Some("%metal2vulkan.ct.vslot.0")
+                && inst.result_ty == Some(LlType::Int(64))
+        }));
+        assert!(header.insts.iter().any(|inst| {
+            inst.result.as_deref() == Some("%metal2vulkan.ct.ptr.0")
+                && inst.opcode == "getelementptr"
+        }));
+        assert!(!header
+            .insts
+            .iter()
+            .any(|inst| { inst.result_ty == Some(LlType::Ptr(0)) && inst.opcode == "phi" }));
+
+        let defining_case = out
+            .iter()
+            .find(|block| block.name == "%def")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed defining case");
+        assert!(defining_case
+            .insts
+            .iter()
+            .any(|inst| inst.result.as_deref() == Some("%field")));
+        let later_case = out
+            .iter()
+            .find(|block| block.name == "%use")
+            .and_then(|block| block.typed.as_ref())
+            .expect("typed later case");
+        assert!(later_case.insts.iter().any(|inst| {
+            inst.operands.iter().any(|operand| {
+                matches!(operand, tir::TirOperand::Value { name, ty: LlType::Ptr(0) }
+                    if name == "%metal2vulkan.ct.ptr.0")
+            })
+        }));
+        assert!(super::super::structured_plan_construct_tree(&out).is_some());
+    }
+
+    #[test]
+    fn r1_renester_rejects_opaque_images_as_generic_pointer_state() {
+        let nodes = deep_single_owner_nodes();
+        let blocks = vec![
+            bb("%entry", &["br label %def"]),
+            bb("%def", &["%table = freeze ptr null", "br label %use"]),
+            bb(
+                "%use",
+                &[
+                    "%image = load ptr addrspace(1), ptr %table",
+                    "call void @air.write_texture_2d(ptr addrspace(1) %image)",
+                    "ret void",
+                ],
+            ),
+        ];
+        let edges = vec![
+            OriginalEdge { from: 0, to: 1 },
+            OriginalEdge { from: 1, to: 2 },
+        ];
+        let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+
         let error = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap_err();
         assert_eq!(
             error,
-            "construct-tree:cross-case-pointer-value owner=%def value=%p"
+            "construct-tree:cross-case-opaque-image owner=%def value=%table"
+        );
+    }
+
+    #[test]
+    fn r1_renester_rejects_opaque_image_phis_as_generic_pointer_state() {
+        let nodes = deep_single_owner_nodes();
+        let blocks = vec![
+            bb("%entry", &["br label %def"]),
+            bb(
+                "%def",
+                &[
+                    "%image = phi ptr addrspace(1) [ null, %entry ]",
+                    "br label %use",
+                ],
+            ),
+            bb(
+                "%use",
+                &[
+                    "call void @air.write_texture_2d(ptr addrspace(1) %image)",
+                    "ret void",
+                ],
+            ),
+        ];
+        let edges = vec![
+            OriginalEdge { from: 0, to: 1 },
+            OriginalEdge { from: 1, to: 2 },
+        ];
+        let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+
+        let error = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap_err();
+        assert_eq!(
+            error,
+            "construct-tree:cross-case-opaque-image owner=%def value=%image"
+        );
+    }
+
+    #[test]
+    fn r1_renester_rejects_unresolved_cross_case_composites() {
+        let nodes = deep_single_owner_nodes();
+        let blocks = vec![
+            bb("%entry", &["br label %def"]),
+            bb(
+                "%def",
+                &[
+                    "%aggregate = insertvalue %\"wrapper\" undef, i32 7, 0",
+                    "br label %use",
+                ],
+            ),
+            bb(
+                "%use",
+                &[
+                    "%value = extractvalue %\"wrapper\" %aggregate, 0",
+                    "ret void",
+                ],
+            ),
+        ];
+        let edges = vec![
+            OriginalEdge { from: 0, to: 1 },
+            OriginalEdge { from: 1, to: 2 },
+        ];
+        let plan = plan_construct_tree(&nodes, &linear_claims(), &edges).unwrap();
+
+        let error = renest::materialize_construct_tree_roles(&blocks, &plan).unwrap_err();
+        assert_eq!(
+            error,
+            "construct-tree:cross-case-unresolved-composite owner=%def value=%aggregate"
         );
     }
 }

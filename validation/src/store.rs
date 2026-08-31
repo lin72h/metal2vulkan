@@ -1,4 +1,4 @@
-use crate::case::AuthoredCase;
+use crate::case::{AuthoredCase, OutputSelection};
 use crate::jsonl::to_sorted_json_string;
 use crate::observation::{Backend, CandidateObservation, MetalObservation};
 use crate::review::ReviewNote;
@@ -31,6 +31,8 @@ struct TransactionManifest {
 struct TransactionEntry {
     staged: String,
     target: String,
+    #[serde(default)]
+    delete: bool,
 }
 
 impl CorpusStore {
@@ -82,10 +84,50 @@ impl CorpusStore {
         Ok(rows)
     }
 
+    /// Read structurally valid legacy cases while deferring uniqueness to an identity migration.
+    pub(crate) fn read_all_cases_for_identity_migration(
+        &self,
+    ) -> Result<Vec<AuthoredCase>, String> {
+        let mut rows = Vec::new();
+        for path in shard_paths(&self.root.join("cases"))? {
+            let expected = shard_index_from_path(&path)?;
+            for row in read_jsonl_if_exists::<AuthoredCase>(&path)? {
+                row.validate_literal_resources()
+                    .map_err(|errors| format!("case {}: {}", row.case_id, errors.join("; ")))?;
+                let computed = row.computed_case_id()?;
+                if computed != row.case_id {
+                    return Err(format!(
+                        "case {} identity mismatch: computed {computed}",
+                        row.case_id
+                    ));
+                }
+                let actual = shard_index_for_hash(&row.air_sha256)?;
+                if actual != expected {
+                    return Err(format!(
+                        "case {} is in shard {}, expected {}",
+                        row.case_id, expected, actual
+                    ));
+                }
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn read_case_shard(&self, index: usize) -> Result<Vec<AuthoredCase>, String> {
         let rows = read_jsonl_if_exists(&self.root.join("cases").join(shard_name(index)))?;
         validate_cases(&rows, Some(index))?;
         Ok(rows)
+    }
+
+    /// Read authored cases for one AIR identity from only its hash-derived case shard.
+    pub fn find_cases_for_air(&self, air_sha256: &str) -> Result<Vec<AuthoredCase>, String> {
+        let shard = shard_index_for_hash(air_sha256)?;
+        Ok(self
+            .read_case_shard(shard)?
+            .into_iter()
+            .filter(|case| case.air_sha256 == air_sha256)
+            .collect())
     }
 
     pub fn find_case(&self, case_id: &str) -> Result<Option<AuthoredCase>, String> {
@@ -320,7 +362,13 @@ impl CorpusStore {
         self.recover_transactions()?;
         row.validate_content()?;
         let index = shard_index_for_hash(&row.air_sha256)?;
-        self.validate_observation_case(index, &row.case_id, &row.air_sha256, &row.input_sha256)?;
+        self.validate_observation_case(
+            index,
+            &row.case_id,
+            &row.air_sha256,
+            &row.input_sha256,
+            &row.output_b64,
+        )?;
         let relative = PathBuf::from("observations/metal").join(shard_name(index));
         let mut rows: Vec<MetalObservation> = read_jsonl_if_exists(&self.root.join(&relative))?;
         validate_aligned_observation_rows(&rows, index)?;
@@ -341,7 +389,13 @@ impl CorpusStore {
         self.recover_transactions()?;
         row.validate_content()?;
         let index = shard_index_for_hash(&row.air_sha256)?;
-        self.validate_observation_case(index, &row.case_id, &row.air_sha256, &row.input_sha256)?;
+        self.validate_observation_case(
+            index,
+            &row.case_id,
+            &row.air_sha256,
+            &row.input_sha256,
+            &row.output_b64,
+        )?;
         let relative = PathBuf::from("observations")
             .join(row.backend.directory())
             .join(shard_name(index));
@@ -371,6 +425,7 @@ impl CorpusStore {
         case_id: &str,
         air_sha256: &str,
         input_sha256: &str,
+        output_b64: &str,
     ) -> Result<(), String> {
         let case = self
             .read_case_shard(index)?
@@ -389,18 +444,29 @@ impl CorpusStore {
                 "observation input {input_sha256} does not match case input {expected}"
             ));
         }
+        validate_observation_output(&case, output_b64)?;
         Ok(())
     }
 
     pub fn read_metal(&self) -> Result<Vec<MetalObservation>, String> {
         let rows: Vec<MetalObservation> =
             read_aligned_observations(&self.root.join("observations/metal"))?;
-        self.validate_observation_cases(
-            rows.iter()
-                .map(|row| (&row.case_id, &row.air_sha256, &row.input_sha256)),
-        )?;
+        self.validate_observation_cases(rows.iter().map(|row| {
+            (
+                &row.case_id,
+                &row.air_sha256,
+                &row.input_sha256,
+                &row.output_b64,
+            )
+        }))?;
         reject_duplicate_metal_slots(&rows)?;
         Ok(rows)
+    }
+
+    pub(crate) fn read_metal_for_identity_migration(
+        &self,
+    ) -> Result<Vec<MetalObservation>, String> {
+        read_aligned_observations(&self.root.join("observations/metal"))
     }
 
     pub fn read_candidates(&self, backend: Backend) -> Result<Vec<CandidateObservation>, String> {
@@ -416,24 +482,43 @@ impl CorpusStore {
                 ));
             }
         }
-        self.validate_observation_cases(
-            rows.iter()
-                .map(|row| (&row.case_id, &row.air_sha256, &row.input_sha256)),
-        )?;
+        self.validate_observation_cases(rows.iter().map(|row| {
+            (
+                &row.case_id,
+                &row.air_sha256,
+                &row.input_sha256,
+                &row.output_b64,
+            )
+        }))?;
         reject_duplicate_candidate_slots(&rows)?;
+        Ok(rows)
+    }
+
+    pub(crate) fn read_candidates_for_identity_migration(
+        &self,
+        backend: Backend,
+    ) -> Result<Vec<CandidateObservation>, String> {
+        let rows: Vec<CandidateObservation> =
+            read_aligned_observations(&self.root.join("observations").join(backend.directory()))?;
+        if rows.iter().any(|row| row.backend != backend) {
+            return Err(format!(
+                "candidate observation is stored outside its {} directory",
+                backend.directory()
+            ));
+        }
         Ok(rows)
     }
 
     fn validate_observation_cases<'a>(
         &self,
-        rows: impl IntoIterator<Item = (&'a String, &'a String, &'a String)>,
+        rows: impl IntoIterator<Item = (&'a String, &'a String, &'a String, &'a String)>,
     ) -> Result<(), String> {
         let cases = self.read_all_cases()?;
         let cases = cases
             .iter()
             .map(|case| (case.case_id.as_str(), case))
             .collect::<std::collections::HashMap<_, _>>();
-        for (case_id, air_sha256, input_sha256) in rows {
+        for (case_id, air_sha256, input_sha256, output_b64) in rows {
             let case = cases
                 .get(case_id.as_str())
                 .ok_or_else(|| format!("observation references unknown case_id {case_id}"))?;
@@ -449,6 +534,7 @@ impl CorpusStore {
                     "observation input {input_sha256} does not match case input {expected}"
                 ));
             }
+            validate_observation_output(case, output_b64)?;
         }
         Ok(())
     }
@@ -480,7 +566,90 @@ impl CorpusStore {
                     .to_str()
                     .ok_or_else(|| format!("non-UTF-8 target {}", target.display()))?
                     .into(),
+                delete: false,
             });
+        }
+        let manifest = TransactionManifest { entries };
+        let manifest_path = transaction.join("manifest.json");
+        let manifest_bytes = serde_json::to_vec(&manifest)
+            .map_err(|error| format!("serialize transaction: {error}"))?;
+        let mut file = File::create(&manifest_path)
+            .map_err(|error| format!("create {}: {error}", manifest_path.display()))?;
+        file.write_all(&manifest_bytes)
+            .map_err(|error| format!("write {}: {error}", manifest_path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("fsync {}: {error}", manifest_path.display()))?;
+        sync_directory(&transaction)?;
+        apply_transaction(&transaction, &self.root, &manifest)
+    }
+
+    /// Atomically publish already-prepared files through the corpus recovery protocol.
+    ///
+    /// Callers can stream large replacements to files under the corpus filesystem instead of
+    /// retaining their bytes in memory. Targets must be relative corpus paths. Once this returns,
+    /// each prepared file has been consumed.
+    pub(crate) fn commit_prepared_files_and_deletions(
+        &self,
+        files: impl IntoIterator<Item = (PathBuf, PathBuf)>,
+        deletions: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<(), String> {
+        self.recover_transactions()?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("system clock: {error}"))?
+            .as_nanos();
+        let transaction = self
+            .root
+            .join(".transactions")
+            .join(format!("{}-{nonce}", std::process::id()));
+        fs::create_dir_all(&transaction)
+            .map_err(|error| format!("create {}: {error}", transaction.display()))?;
+        let mut entries = Vec::new();
+        let mut targets = HashSet::new();
+        for (index, (target, prepared)) in files.into_iter().enumerate() {
+            validate_transaction_target(&target)?;
+            if !targets.insert(target.clone()) {
+                return Err(format!("duplicate transaction target {}", target.display()));
+            }
+            let staged = format!("file-{index:03}");
+            let staged_path = transaction.join(&staged);
+            fs::rename(&prepared, &staged_path).map_err(|error| {
+                format!(
+                    "move prepared {} to {}: {error}",
+                    prepared.display(),
+                    staged_path.display()
+                )
+            })?;
+            File::open(&staged_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("fsync {}: {error}", staged_path.display()))?;
+            entries.push(TransactionEntry {
+                staged,
+                target: target
+                    .to_str()
+                    .ok_or_else(|| format!("non-UTF-8 target {}", target.display()))?
+                    .into(),
+                delete: false,
+            });
+        }
+        for target in deletions {
+            validate_transaction_target(&target)?;
+            if !targets.insert(target.clone()) {
+                return Err(format!("duplicate transaction target {}", target.display()));
+            }
+            entries.push(TransactionEntry {
+                staged: String::new(),
+                target: target
+                    .to_str()
+                    .ok_or_else(|| format!("non-UTF-8 target {}", target.display()))?
+                    .into(),
+                delete: true,
+            });
+        }
+        if entries.is_empty() {
+            fs::remove_dir(&transaction)
+                .map_err(|error| format!("remove {}: {error}", transaction.display()))?;
+            return Ok(());
         }
         let manifest = TransactionManifest { entries };
         let manifest_path = transaction.join("manifest.json");
@@ -503,8 +672,18 @@ fn apply_transaction(
     manifest: &TransactionManifest,
 ) -> Result<(), String> {
     for entry in &manifest.entries {
-        let staged = transaction.join(&entry.staged);
         let target = root.join(&entry.target);
+        if entry.delete {
+            if target.exists() {
+                fs::remove_file(&target)
+                    .map_err(|error| format!("delete {}: {error}", target.display()))?;
+                if let Some(parent) = target.parent() {
+                    sync_directory(parent)?;
+                }
+            }
+            continue;
+        }
+        let staged = transaction.join(&entry.staged);
         if !staged.exists() {
             if target.exists() {
                 continue;
@@ -533,6 +712,20 @@ fn apply_transaction(
         .map_err(|error| format!("remove {}: {error}", transaction.display()))?;
     if let Some(parent) = transaction.parent() {
         sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+fn validate_transaction_target(target: &Path) -> Result<(), String> {
+    if target.is_absolute()
+        || target
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "transaction target must be a relative corpus path: {}",
+            target.display()
+        ));
     }
     Ok(())
 }
@@ -650,6 +843,18 @@ fn validate_aligned_observation_rows<T: AlignedObservation>(
     Ok(())
 }
 
+fn validate_observation_output(case: &AuthoredCase, output_b64: &str) -> Result<(), String> {
+    let expects_empty = matches!(&case.output, OutputSelection::None);
+    if output_b64.is_empty() != expects_empty {
+        return Err(if expects_empty {
+            "output.kind none requires an exact empty observation".into()
+        } else {
+            "an exact empty observation requires output.kind none".into()
+        });
+    }
+    Ok(())
+}
+
 fn reject_duplicate_metal_slots(rows: &[MetalObservation]) -> Result<(), String> {
     let mut slots = std::collections::HashSet::new();
     for row in rows {
@@ -754,6 +959,7 @@ mod tests {
                 initial_bytes_b64: Some(initial.into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -790,6 +996,32 @@ mod tests {
         };
         case.case_id = case.computed_case_id().unwrap();
         case
+    }
+
+    #[test]
+    fn exact_air_case_lookup_does_not_open_unrelated_case_shards() {
+        let scratch = ScratchDir::new("exact-air-case-lookup").unwrap();
+        let store = CorpusStore::new(scratch.path());
+        let first = make_case("first", "q6urqw==");
+        let mut unrelated = make_case("unrelated", "u7u7uw==");
+        unrelated.air_sha256 = "22".repeat(32);
+        unrelated.case_id = unrelated.computed_case_id().unwrap();
+        store.put_case(first.clone()).unwrap();
+        store.put_case(unrelated.clone()).unwrap();
+        let unrelated_shard = shard_index_for_hash(&unrelated.air_sha256).unwrap();
+        fs::write(
+            scratch
+                .path()
+                .join("cases")
+                .join(shard_name(unrelated_shard)),
+            b"not json\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.find_cases_for_air(&first.air_sha256).unwrap(),
+            [first]
+        );
     }
 
     fn candidate(
@@ -901,6 +1133,58 @@ mod tests {
     }
 
     #[test]
+    fn empty_observation_is_coupled_to_none_output_selection() {
+        let scratch = ScratchDir::new("store-empty-observation").unwrap();
+        let store = CorpusStore::new(scratch.path());
+        let mut empty_case = make_case("empty", "AAAAAA==");
+        empty_case.buffers.clear();
+        empty_case.output = OutputSelection::None;
+        empty_case.case_id = empty_case.computed_case_id().unwrap();
+        store.put_case(empty_case.clone()).unwrap();
+
+        let empty_sha256 = crate::hash::sha256_bytes(&[]);
+        let empty_metal = MetalObservation {
+            case_id: empty_case.case_id.clone(),
+            air_sha256: empty_case.air_sha256.clone(),
+            input_sha256: empty_case.computed_input_sha256().unwrap(),
+            metal_output_sha256: empty_sha256.clone(),
+            output_b64: String::new(),
+            environment_id: "env".into(),
+            environment: serde_json::json!({}),
+            oracle_abi: "v1".into(),
+            status: MetalStatus::Qualified,
+        };
+        store.upsert_metal(empty_metal.clone()).unwrap();
+        assert_eq!(store.read_metal().unwrap(), vec![empty_metal]);
+
+        let mut nonempty_for_none = candidate(&empty_case, Backend::Vulkan, "vk-env");
+        nonempty_for_none.golden_output_sha256 = nonempty_for_none.candidate_output_sha256.clone();
+        assert!(store
+            .upsert_candidate(nonempty_for_none)
+            .unwrap_err()
+            .contains("requires an exact empty observation"));
+
+        let nonempty_case = make_case("nonempty", "AAAAAA==");
+        store.put_case(nonempty_case.clone()).unwrap();
+        let nonempty_input_sha256 = nonempty_case.computed_input_sha256().unwrap();
+        let empty_for_buffer = MetalObservation {
+            case_id: nonempty_case.case_id.clone(),
+            air_sha256: nonempty_case.air_sha256,
+            input_sha256: nonempty_input_sha256,
+            metal_output_sha256: empty_sha256,
+            output_b64: String::new(),
+            environment_id: "env".into(),
+            environment: serde_json::json!({}),
+            oracle_abi: "v1".into(),
+            status: MetalStatus::Qualified,
+        };
+        assert!(store
+            .upsert_metal(empty_for_buffer)
+            .unwrap_err()
+            .contains("requires output.kind none"));
+    }
+
+    #[test]
     fn deleting_named_case_cascades_only_its_evidence() {
         let scratch = ScratchDir::new("store-delete").unwrap();
         let store = CorpusStore::new(scratch.path());
@@ -941,6 +1225,7 @@ mod tests {
                 entries: vec![TransactionEntry {
                     staged: "file-000".into(),
                     target: "cases/recovered.txt".into(),
+                    delete: false,
                 }],
             })
             .unwrap(),
@@ -953,6 +1238,48 @@ mod tests {
             b"recovered"
         );
         assert!(!transaction.exists());
+    }
+
+    #[test]
+    fn prepared_files_publish_through_the_recoverable_transaction() {
+        let scratch = ScratchDir::new("store-prepared-files").unwrap();
+        let store = CorpusStore::new(scratch.path());
+        let prepared_dir = scratch.path().join("prepared");
+        fs::create_dir(&prepared_dir).unwrap();
+        let first = prepared_dir.join("first");
+        let second = prepared_dir.join("second");
+        fs::write(&first, b"first replacement").unwrap();
+        fs::write(&second, b"second replacement").unwrap();
+
+        store
+            .commit_prepared_files_and_deletions(
+                [
+                    (PathBuf::from("local/first"), first.clone()),
+                    (PathBuf::from("cases/second"), second.clone()),
+                ],
+                std::iter::empty(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            fs::read(scratch.path().join("local/first")).unwrap(),
+            b"first replacement"
+        );
+        assert_eq!(
+            fs::read(scratch.path().join("cases/second")).unwrap(),
+            b"second replacement"
+        );
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert!(fs::read_dir(scratch.path().join(".transactions"))
+            .unwrap()
+            .next()
+            .is_none());
+
+        store
+            .commit_prepared_files_and_deletions(std::iter::empty(), [PathBuf::from("local/first")])
+            .unwrap();
+        assert!(!scratch.path().join("local/first").exists());
     }
 
     #[test]

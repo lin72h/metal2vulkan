@@ -10,8 +10,8 @@ Product translation uses two external executables:
 
 - `llvm-dis` converts AIR bitcode to LLVM IR. It is not needed when the input is already textual
   `.ll`.
-- `spirv-val` validates every candidate under the Vulkan 1.3 environment. A retry candidate is
-  adopted only after it validates.
+- `spirv-val` validates the single constructed output under the Vulkan 1.2 environment. Its verdict
+  cannot trigger a repair or select another representation.
 
 Put both tools on `PATH`, or set an absolute per-tool override:
 
@@ -55,9 +55,9 @@ These options affect pipeline- or dispatch-dependent lowering:
 | `--raster-samples 1|2|4|8|16|32|64` | Fragment AIR calls `air.get_num_samples.i32`; use the exact graphics-pipeline sample count |
 | `--simd-cluster32` | A caller explicitly needs Metal's 32-lane simdgroup reduction partition on a wider Vulkan subgroup |
 | `--local X,Y,Z` | Kernel dispatches use a threadgroup size other than the default `64,1,1` |
-| `--threads-per-grid X,Y,Z` | Bake one exact Metal `dispatchThreads` grid into a pipeline variant |
-| `--threads-per-grid-push-constant OFFSET` | Move the default per-dispatch exact grid from push-constant offset 0 to `OFFSET` |
-| `--whole-workgroups` | Assert every kernel launch covers complete workgroups and omit the default grid guard |
+| `--threads-per-grid X,Y,Z` | Reflect one fixed Metal `dispatchThreads` grid for region planning |
+| `--threads-per-grid-push-constant OFFSET` | Move the default 48-byte dispatch-region payload from offset 0 to `OFFSET` |
+| `--whole-workgroups` | Assert every kernel launch covers complete workgroups and use one fixed-local-size pipeline |
 
 The translator automatically preserves the 32-lane contract for recognized `air.simd_*` modules.
 Do not use either option as a workaround for an unrelated translation failure.
@@ -177,7 +177,7 @@ their resources are unrelated, and use the returned effective layout rather than
 
 Successful reflected translation attaches `footprint` to descriptor-backed `Buffer`,
 `KernelStageInput`, and `AccelerationStructureShadow` resources. It describes accesses in the final
-SPIR-V module selected by the retry cascade.
+constructed SPIR-V module returned by translation.
 
 Apply this decision in order:
 
@@ -224,15 +224,22 @@ footprint soundness gate. Treat `access: null` conservatively as read-write.
   `depth_qualifier`.
 - Kernel stages use `local_size`. `imageblock_layouts` and threadgroup bindings describe Workgroup
   storage rather than descriptors.
-- For kernels, obey `kernel_dispatch`. The safe default is `ThreadsPushConstant` at offset 0:
-  declare a compute-stage range of `KERNEL_GRID_PUSH_CONSTANT_SIZE` bytes and write three tightly
-  packed `u32` dimensions before every `vkCmdDispatch`. For Metal `dispatchThreads`, write its exact
-  requested thread count; for `dispatchThreadgroups`, write `groupCount * local_size`. The shader
-  uses that same value for both `[[threads_per_grid]]` and surplus-invocation culling.
-  `ThreadsFixed` bakes a grid into a pipeline variant. `Workgroups` needs no extra state but is an
-  explicit proof that partial threadgroups will never reach the kernel.
-- Use `function_constants` to discover exact indices and Metal ABI type encodings. Specialize IR
-  with `specialize_function_constant_bytes` when exact scalar or vector payloads are required.
+- For kernels, obey `kernel_dispatch`. For `ThreadsDynamic` and `ThreadsFixed`, call
+  `KernelDispatch::plan`, create one pipeline per distinct region `local_size` using
+  `KERNEL_LOCAL_SIZE_SPEC_IDS`, and issue every returned region. Before each dispatch, write
+  `KernelDispatchPlan::push_constants` into the reflected
+  `KERNEL_DISPATCH_PUSH_CONSTANT_SIZE` range. Its four `u32[3]` fields are the logical thread grid,
+  thread base, threadgroup base, and logical threadgroup grid. `Workgroups` is the only single
+  fixed-local-size path and asserts that every workgroup is complete.
+- Use `function_constants` to discover exact indices and Metal ABI type encodings. When exact scalar
+  or vector payloads are supplied, translate sanitized AIR with
+  `translate_sanitized_native_specialized_with_options`; specialization must precede metadata,
+  resource-interface, and CFG construction. Metadata-only tooling must pass those same payloads to
+  `reflect_sanitized_specialized`; reflecting the default AIR can omit a resource selected by a
+  non-default value. Exact predicates also remove false-gated resources from the specialized
+  interface, so consumers bind the selected contract rather than the unspecialized union. A
+  generated fullscreen companion must use `translate_passthrough_specialized` with the same
+  payloads so its vertex outputs match the selected fragment inputs.
 
 ## 7. Cache outputs safely
 
@@ -253,7 +260,7 @@ has no final-module footprint and is not a substitute for reflected translation 
 The Rust API returns `Err(String)`. The CLI prints `FALLBACK`, exits nonzero, and writes a self-
 contained repro bundle under `$TMPDIR/metal2vulkan-repros` unless `METAL2VULKAN_REPRO_DIR` overrides
 the base directory. Unsupported input must remain a fallback; do not continue with partial metadata
-or a rejected retry candidate.
+or a construction that returned an error.
 
 For local diagnosis:
 
@@ -262,16 +269,17 @@ METAL2VULKAN_RETRY_DEBUG=1 metal2vulkan input.air output.spv
 METAL2VULKAN_WHY=1 metal2vulkan input.air output.spv
 ```
 
-The first command shows retry-tier attempts. The second reports structured-CFG admission decisions.
-These diagnostics do not authorize a different product translation path.
+The first command traces construction phases (the environment-variable name is retained for
+compatibility). The second reports structured-CFG admission decisions. These diagnostics do not
+authorize a different product translation path.
 
 ## 9. Verify the integration
 
 At minimum:
 
 ```sh
-spirv-val --target-env vulkan1.3 output.spv
-cargo test -p metal2vulkan -- --test-threads=1
+spirv-val --target-env vulkan1.2 output.spv
+cargo test -p metal2vulkan
 ```
 
 `spirv-val` checks structural validity, not Metal equivalence. For a semantic claim, follow the

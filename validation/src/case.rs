@@ -18,6 +18,8 @@ pub struct AuthoredCase {
     #[serde(default)]
     pub argument_buffer_buffers: Vec<ArgumentBufferBufferResource>,
     #[serde(default)]
+    pub device_buffer_arrays: Vec<DeviceBufferArrayResource>,
+    #[serde(default)]
     pub threadgroup_memory: Vec<ThreadgroupMemoryResource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imageblock: Option<ImageblockResource>,
@@ -70,6 +72,65 @@ pub struct AuthoredCase {
 }
 
 #[cfg(test)]
+pub(crate) const ATTACHMENTLESS_FRAGMENT_AIR: &str = r#"target datalayout = "e-p:64:64:64"
+target triple = "air64-apple-macosx14.0.0"
+
+define void @fragment_no_writes() {
+  ret void
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @fragment_no_writes, !1, !2}
+!1 = !{}
+!2 = !{}
+"#;
+
+#[cfg(test)]
+pub(crate) fn attachmentless_fragment_test_case(air_sha256: String, entry: String) -> AuthoredCase {
+    AuthoredCase {
+        air_sha256,
+        case_id: "test-attachmentless-fragment".into(),
+        name: "attachmentless-fragment-smoke".into(),
+        entry,
+        stage: Stage::Fragment,
+        buffers: vec![],
+        argument_buffer_buffers: vec![],
+        device_buffer_arrays: vec![],
+        threadgroup_memory: vec![],
+        imageblock: None,
+        fragment_imageblock: None,
+        acceleration_structures: vec![],
+        visible_function_references: vec![],
+        visible_function_tables: vec![],
+        intersection_function_tables: vec![],
+        argument_buffer_intersection_function_tables: vec![],
+        textures: vec![],
+        texture_arrays: vec![],
+        argument_buffer_textures: vec![],
+        samplers: vec![],
+        render_targets: vec![],
+        depth_stencil: None,
+        vertex_inputs: vec![],
+        vertex_observation: None,
+        kernel_stage_inputs: vec![],
+        function_constants: vec![],
+        dispatch: None,
+        draw: Some(Draw {
+            primitive: Primitive::Triangle,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+        }),
+        tessellation: None,
+        output: OutputSelection::None,
+        compare: Comparison::Exact,
+        execution_safety: ExecutionSafety::LoopFree,
+        rationale: None,
+        authored_by: Some("codex:gpt-5.6-sol".into()),
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn combined_depth_stencil_test_case(air_sha256: String, entry: String) -> AuthoredCase {
     AuthoredCase {
         air_sha256,
@@ -79,6 +140,7 @@ pub(crate) fn combined_depth_stencil_test_case(air_sha256: String, entry: String
         stage: Stage::Fragment,
         buffers: vec![],
         argument_buffer_buffers: vec![],
+        device_buffer_arrays: vec![],
         threadgroup_memory: vec![],
         imageblock: None,
         fragment_imageblock: None,
@@ -138,6 +200,7 @@ pub(crate) fn vector_function_constant_test_case(
             initial_bytes_b64: Some("q6urqw==".into()),
         }],
         argument_buffer_buffers: vec![],
+        device_buffer_arrays: vec![],
         threadgroup_memory: vec![],
         imageblock: None,
         fragment_imageblock: None,
@@ -192,6 +255,7 @@ pub(crate) fn narrow_implicit_imageblock_test_case(
         stage: Stage::Kernel,
         buffers: vec![],
         argument_buffer_buffers: vec![],
+        device_buffer_arrays: vec![],
         threadgroup_memory: vec![],
         imageblock: Some(ImageblockResource {
             dimensions: [16, 16],
@@ -248,6 +312,7 @@ pub(crate) fn fragment_imageblock_test_case(air_sha256: String, entry: String) -
         stage: Stage::Fragment,
         buffers: vec![],
         argument_buffer_buffers: vec![],
+        device_buffer_arrays: vec![],
         threadgroup_memory: vec![],
         imageblock: None,
         fragment_imageblock: Some(FragmentImageblockResource {
@@ -359,11 +424,33 @@ pub struct ArgumentBufferBufferResource {
     pub initial_bytes_b64: Option<String>,
 }
 
+/// A top-level AIR `array_ref<void>` whose backing allocation contains GPU addresses of separately
+/// owned device buffers. Slots may be sparse; every undeclared slot is encoded as a null address.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceBufferArrayResource {
+    pub binding: u32,
+    pub length: u32,
+    pub elements: Vec<DeviceBufferArrayElementResource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceBufferArrayElementResource {
+    pub index: u32,
+    pub role: ResourceRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_bytes_b64: Option<String>,
+}
+
 /// A dynamically sized Metal `threadgroup` buffer argument.
 ///
-/// It occupies the Metal buffer-index namespace but is emitted as descriptor-free Vulkan
-/// `Workgroup` storage. Contents are deliberately not authorable: both APIs leave this memory
-/// uninitialized, so a meaningful case must initialize every byte it reads in the shader.
+/// Its Metal `[[threadgroup(n)]]` index is distinct from `[[buffer(n)]]`; Vulkan emits it as
+/// descriptor-free `Workgroup` storage. Contents are deliberately not authorable: both APIs leave
+/// this memory uninitialized, so a meaningful case must initialize every byte it reads in the
+/// shader.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ThreadgroupMemoryResource {
@@ -639,6 +726,11 @@ pub struct TextureArrayResource {
     pub format: TextureFormat,
     #[serde(default = "default_one", skip_serializing_if = "is_one")]
     pub sample_count: u32,
+    /// The specialized fixed-array path owns the base Metal texture slot shared with its layered
+    /// alternative. Metal binds texture arrays after direct textures, so this declaration makes
+    /// that otherwise ambiguous overwrite explicit and validated.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overrides_texture_at_base: bool,
     pub elements: Vec<TextureArrayElement>,
 }
 
@@ -675,6 +767,20 @@ const fn is_one(value: &u32) -> bool {
     *value == 1
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+const fn texture_type_is_array_alternative(arrayed: TextureType, element: TextureType) -> bool {
+    matches!(
+        (arrayed, element),
+        (TextureType::D1Array, TextureType::D1)
+            | (TextureType::D2Array, TextureType::D2)
+            | (TextureType::D2MultisampleArray, TextureType::D2Multisample)
+            | (TextureType::CubeArray, TextureType::Cube)
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TextureFormat {
@@ -685,6 +791,7 @@ pub enum TextureFormat {
     R16Float,
     R16Uint,
     Rg16Float,
+    Rg32Float,
     Rgba16Float,
     Rgba16Uint,
     R32Uint,
@@ -708,6 +815,7 @@ impl TextureFormat {
             | Self::R32Sint
             | Self::R32Float => 4,
             Self::Rg16Float => 4,
+            Self::Rg32Float => 8,
             Self::Rgba16Float | Self::Rgba16Uint => 8,
             Self::Rgba32Uint | Self::Rgba32Sint | Self::Rgba32Float => 16,
             Self::Depth32Float => 4,
@@ -728,6 +836,7 @@ impl TextureFormat {
             Self::R16Float => RuntimeStorageImageFormat::R16Float,
             Self::R16Uint => RuntimeStorageImageFormat::R16Uint,
             Self::Rg16Float => RuntimeStorageImageFormat::Rg16Float,
+            Self::Rg32Float => RuntimeStorageImageFormat::Rg32Float,
             Self::Rgba16Float => RuntimeStorageImageFormat::Rgba16Float,
             Self::Rgba16Uint => RuntimeStorageImageFormat::Rgba16Uint,
             Self::R32Uint => RuntimeStorageImageFormat::R32Uint,
@@ -848,7 +957,7 @@ pub(crate) fn product_transform_options(
     Ok(options)
 }
 
-pub(crate) fn product_transform_options_with_reflection(
+pub fn product_transform_options_with_reflection(
     case: &AuthoredCase,
     reflection: &metal2vulkan::reflect::ShaderReflection,
 ) -> Result<metal2vulkan::passes::TransformOptions, String> {
@@ -1238,6 +1347,9 @@ pub enum Primitive {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OutputSelection {
+    /// Execute the entry and compare the exact empty byte sequence. The shared checker accepts this
+    /// only when reflection exposes no writable observable output.
+    None,
     Buffer {
         binding: u32,
         offset: u64,
@@ -1246,6 +1358,12 @@ pub enum OutputSelection {
     ArgumentBufferBuffer {
         buffer_binding: u32,
         field_offset: u32,
+        offset: u64,
+        length: u64,
+    },
+    DeviceBufferArrayElement {
+        binding: u32,
+        element: u32,
         offset: u64,
         length: u64,
     },
@@ -1318,6 +1436,8 @@ struct SemanticCase<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     argument_buffer_buffers: Vec<&'a ArgumentBufferBufferResource>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    device_buffer_arrays: Vec<&'a DeviceBufferArrayResource>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     threadgroup_memory: Vec<&'a ThreadgroupMemoryResource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     imageblock: &'a Option<ImageblockResource>,
@@ -1371,6 +1491,9 @@ impl AuthoredCase {
             buffers: sorted_refs(&self.buffers, |resource| resource.binding),
             argument_buffer_buffers: sorted_refs(&self.argument_buffer_buffers, |resource| {
                 (resource.buffer_binding, resource.field_offset)
+            }),
+            device_buffer_arrays: sorted_refs(&self.device_buffer_arrays, |resource| {
+                resource.binding
             }),
             threadgroup_memory: sorted_refs(&self.threadgroup_memory, |resource| resource.binding),
             imageblock: &self.imageblock,
@@ -1430,6 +1553,8 @@ impl AuthoredCase {
             #[serde(skip_serializing_if = "Vec::is_empty")]
             argument_buffer_buffers: Vec<&'a ArgumentBufferBufferResource>,
             #[serde(skip_serializing_if = "Vec::is_empty")]
+            device_buffer_arrays: Vec<&'a DeviceBufferArrayResource>,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
             threadgroup_memory: Vec<&'a ThreadgroupMemoryResource>,
             #[serde(skip_serializing_if = "Option::is_none")]
             imageblock: &'a Option<ImageblockResource>,
@@ -1472,6 +1597,9 @@ impl AuthoredCase {
             buffers: sorted_refs(&self.buffers, |resource| resource.binding),
             argument_buffer_buffers: sorted_refs(&self.argument_buffer_buffers, |resource| {
                 (resource.buffer_binding, resource.field_offset)
+            }),
+            device_buffer_arrays: sorted_refs(&self.device_buffer_arrays, |resource| {
+                resource.binding
             }),
             threadgroup_memory: sorted_refs(&self.threadgroup_memory, |resource| resource.binding),
             imageblock: &self.imageblock,
@@ -1705,6 +1833,86 @@ impl AuthoredCase {
                 &mut errors,
             );
         }
+        let mut device_buffer_array_bindings = HashSet::new();
+        let mut device_buffer_array_ranges = Vec::<(u64, u64)>::new();
+        for array in &self.device_buffer_arrays {
+            if !device_buffer_array_bindings.insert(array.binding) {
+                errors.push(format!(
+                    "duplicate device-buffer-array binding {}",
+                    array.binding
+                ));
+            }
+            if array.length == 0 {
+                errors.push(format!(
+                    "device-buffer-array binding {} length must be nonzero",
+                    array.binding
+                ));
+            }
+            let start = u64::from(array.binding);
+            let end = start + u64::from(array.length);
+            if end > u64::from(u32::MAX) + 1 {
+                errors.push(format!(
+                    "device-buffer-array binding {} length {} overflows the Metal buffer-index namespace",
+                    array.binding, array.length
+                ));
+            }
+            if buffer_bindings
+                .iter()
+                .any(|binding| (start..end).contains(&u64::from(*binding)))
+            {
+                errors.push(format!(
+                    "device-buffer-array binding {} length {} overlaps a buffer binding",
+                    array.binding, array.length
+                ));
+            }
+            if device_buffer_array_ranges
+                .iter()
+                .any(|(other_start, other_end)| start < *other_end && *other_start < end)
+            {
+                errors.push(format!(
+                    "device-buffer-array binding {} length {} overlaps another device-buffer array",
+                    array.binding, array.length
+                ));
+            }
+            device_buffer_array_ranges.push((start, end));
+            let mut previous = None;
+            for element in &array.elements {
+                if element.index >= array.length {
+                    errors.push(format!(
+                        "device-buffer-array binding {} element {} exceeds length {}",
+                        array.binding, element.index, array.length
+                    ));
+                }
+                if previous.is_some_and(|index| element.index <= index) {
+                    errors.push(format!(
+                        "device-buffer-array binding {} elements must be sorted and unique by index",
+                        array.binding
+                    ));
+                }
+                previous = Some(element.index);
+                validate_role_bytes(
+                    &format!(
+                        "device-buffer-array binding {} element {}",
+                        array.binding, element.index
+                    ),
+                    element.role,
+                    element.bytes_b64.as_deref(),
+                    element.initial_bytes_b64.as_deref(),
+                    &mut errors,
+                );
+            }
+            if array.elements.is_empty() {
+                errors.push(format!(
+                    "device-buffer-array binding {} must declare at least one element",
+                    array.binding
+                ));
+            }
+        }
+        let device_buffer_array_owns = |binding: u32| {
+            device_buffer_array_ranges
+                .iter()
+                .any(|(start, end)| (*start..*end).contains(&u64::from(binding)))
+        };
         let mut argument_buffer_buffer_keys = HashSet::new();
         for buffer in &self.argument_buffer_buffers {
             let key = (buffer.buffer_binding, buffer.field_offset);
@@ -1746,12 +1954,6 @@ impl AuthoredCase {
                     resource.binding
                 ));
             }
-            if buffer_bindings.contains(&resource.binding) {
-                errors.push(format!(
-                    "binding {} is declared as both a buffer and threadgroup memory",
-                    resource.binding
-                ));
-            }
         }
         for resource in &self.acceleration_structures {
             if !acceleration_structure_bindings.insert(resource.binding) {
@@ -1766,9 +1968,9 @@ impl AuthoredCase {
                     resource.binding
                 ));
             }
-            if threadgroup_bindings.contains(&resource.binding) {
+            if device_buffer_array_owns(resource.binding) {
                 errors.push(format!(
-                    "binding {} is declared as both threadgroup memory and an acceleration structure",
+                    "binding {} is declared as both a device-buffer-array slot and an acceleration structure",
                     resource.binding
                 ));
             }
@@ -1829,12 +2031,12 @@ impl AuthoredCase {
             for (other, occupied) in [
                 ("buffer", buffer_bindings.contains(&table.binding)),
                 (
-                    "threadgroup memory",
-                    threadgroup_bindings.contains(&table.binding),
-                ),
-                (
                     "acceleration structure",
                     acceleration_structure_bindings.contains(&table.binding),
+                ),
+                (
+                    "device-buffer-array slot",
+                    device_buffer_array_owns(table.binding),
                 ),
             ] {
                 if occupied {
@@ -1892,12 +2094,12 @@ impl AuthoredCase {
             for (other, occupied) in [
                 ("buffer", buffer_bindings.contains(&table.binding)),
                 (
-                    "threadgroup memory",
-                    threadgroup_bindings.contains(&table.binding),
-                ),
-                (
                     "acceleration structure",
                     acceleration_structure_bindings.contains(&table.binding),
+                ),
+                (
+                    "device-buffer-array slot",
+                    device_buffer_array_owns(table.binding),
                 ),
             ] {
                 if occupied {
@@ -2067,12 +2269,44 @@ impl AuthoredCase {
                     ));
                     break;
                 };
-                if !texture_bindings.insert(slot) {
+                let function_constant_texture_alternative = element == 0
+                    && array.overrides_texture_at_base
+                    && !self.function_constants.is_empty()
+                    && self.textures.iter().any(|texture| {
+                        texture.binding == array.binding
+                            && texture.role == ResourceRole::Input
+                            && array.role == ResourceRole::Input
+                            && texture.format == array.format
+                            && texture.sample_count == array.sample_count
+                            && texture_type_is_array_alternative(
+                                texture.texture_type,
+                                array.texture_type,
+                            )
+                    });
+                if !texture_bindings.insert(slot) && !function_constant_texture_alternative {
                     errors.push(format!(
                         "texture-array binding {} element {element} overlaps Metal texture slot {slot}",
                         array.binding
                     ));
                 }
+            }
+            if array.overrides_texture_at_base
+                && !self.textures.iter().any(|texture| {
+                    texture.binding == array.binding
+                        && texture.role == ResourceRole::Input
+                        && array.role == ResourceRole::Input
+                        && texture.format == array.format
+                        && texture.sample_count == array.sample_count
+                        && texture_type_is_array_alternative(
+                            texture.texture_type,
+                            array.texture_type,
+                        )
+                })
+            {
+                errors.push(format!(
+                    "texture-array binding {} overrides_texture_at_base requires a matching input-only layered texture alternative",
+                    array.binding
+                ));
             }
             if array.elements.len()
                 > metal2vulkan::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT as usize
@@ -2361,6 +2595,7 @@ impl AuthoredCase {
 
     fn validate_output_selection(&self, errors: &mut Vec<String>) {
         match &self.output {
+            OutputSelection::None => {}
             OutputSelection::Buffer {
                 binding,
                 offset,
@@ -2416,6 +2651,44 @@ impl AuthoredCase {
                 }
                 if offset.checked_add(*length).is_none() {
                     errors.push("argument-buffer buffer output range overflows".into());
+                }
+            }
+            OutputSelection::DeviceBufferArrayElement {
+                binding,
+                element,
+                offset,
+                length,
+            } => {
+                let Some(resource) = self
+                    .device_buffer_arrays
+                    .iter()
+                    .find(|item| item.binding == *binding)
+                    .and_then(|array| array.elements.iter().find(|item| item.index == *element))
+                else {
+                    errors.push(format!(
+                        "device-buffer-array output binding {binding} element {element} is not declared"
+                    ));
+                    return;
+                };
+                if resource.role == ResourceRole::Input {
+                    errors.push(format!(
+                        "device-buffer-array output binding {binding} element {element} has input-only role"
+                    ));
+                }
+                if *length == 0 {
+                    errors.push("device-buffer-array output length must be nonzero".into());
+                }
+                if let Some(bytes) = initial_bytes(
+                    resource.bytes_b64.as_deref(),
+                    resource.initial_bytes_b64.as_deref(),
+                ) {
+                    if offset.saturating_add(*length) > bytes.len() as u64 {
+                        errors.push(format!(
+                            "device-buffer-array output [{offset}, {}) exceeds binding {binding} element {element} length {}",
+                            offset.saturating_add(*length),
+                            bytes.len()
+                        ));
+                    }
                 }
             }
             OutputSelection::Texture {
@@ -2838,6 +3111,7 @@ mod tests {
                 initial_bytes_b64: Some("q6urqw==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -2906,6 +3180,93 @@ mod tests {
     }
 
     #[test]
+    fn device_buffer_array_elements_are_sparse_bounded_literal_resources() {
+        let mut case = example();
+        case.case_id = "00".repeat(32);
+        case.buffers.clear();
+        case.device_buffer_arrays.push(DeviceBufferArrayResource {
+            binding: 0,
+            length: 3,
+            elements: vec![
+                DeviceBufferArrayElementResource {
+                    index: 0,
+                    role: ResourceRole::Input,
+                    bytes_b64: Some("AQAAAA==".into()),
+                    initial_bytes_b64: None,
+                },
+                DeviceBufferArrayElementResource {
+                    index: 2,
+                    role: ResourceRole::Output,
+                    bytes_b64: None,
+                    initial_bytes_b64: Some("q6urqw==".into()),
+                },
+            ],
+        });
+        case.output = OutputSelection::DeviceBufferArrayElement {
+            binding: 0,
+            element: 2,
+            offset: 0,
+            length: 4,
+        };
+        assert_eq!(case.validate_literal_resources(), Ok(()));
+        case.threadgroup_memory.push(ThreadgroupMemoryResource {
+            binding: 0,
+            length: 8,
+        });
+        assert_eq!(case.validate_literal_resources(), Ok(()));
+
+        case.device_buffer_arrays[0].elements[1].index = 3;
+        assert!(case
+            .validate_literal_resources()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("exceeds length 3")));
+
+        case.device_buffer_arrays[0].elements[1].index = 2;
+        case.buffers.push(BufferResource {
+            binding: 1,
+            role: ResourceRole::Input,
+            bytes_b64: Some("AQAAAA==".into()),
+            initial_bytes_b64: None,
+        });
+        assert!(case
+            .validate_literal_resources()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("overlaps a buffer binding")));
+
+        case.buffers.clear();
+        case.device_buffer_arrays.push(DeviceBufferArrayResource {
+            binding: 2,
+            length: 1,
+            elements: vec![DeviceBufferArrayElementResource {
+                index: 0,
+                role: ResourceRole::Input,
+                bytes_b64: Some("AQAAAA==".into()),
+                initial_bytes_b64: None,
+            }],
+        });
+        assert!(case
+            .validate_literal_resources()
+            .unwrap_err()
+            .iter()
+            .any(|error| error.contains("overlaps another device-buffer array")));
+    }
+
+    #[test]
+    fn rg32_float_has_exact_literal_and_product_format_contracts() {
+        assert_eq!(TextureFormat::Rg32Float.bytes_per_pixel(), 8);
+        let state = TextureFormat::Rg32Float
+            .runtime_storage_specialization()
+            .unwrap();
+        assert_eq!(
+            state.format,
+            metal2vulkan::reflect::RuntimeStorageImageFormat::Rg32Float
+        );
+        assert!(!state.capabilities.storage_image_atomic);
+    }
+
+    #[test]
     fn authored_storage_texture_format_is_the_product_specialization_input() {
         let mut case = example();
         case.textures.push(TextureResource {
@@ -2924,6 +3285,7 @@ mod tests {
             texture_type: TextureType::D2,
             format: TextureFormat::R32Uint,
             sample_count: 1,
+            overrides_texture_at_base: false,
             elements: vec![TextureArrayElement {
                 dimensions: [1, 1, 1],
                 bytes_b64: None,
@@ -3484,6 +3846,7 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
             texture_type: TextureType::D2,
             format: TextureFormat::R32Uint,
             sample_count: 1,
+            overrides_texture_at_base: false,
             elements: vec![
                 TextureArrayElement {
                     dimensions: [1, 1, 1],
@@ -3515,6 +3878,66 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
         });
         let errors = case.validate_literal_resources().unwrap_err().join("\n");
         assert!(errors.contains("overlaps Metal texture slot 5"), "{errors}");
+    }
+
+    #[test]
+    fn function_constant_layered_and_fixed_texture_alternatives_may_share_the_base_slot() {
+        let mut case = example();
+        case.function_constants.push(FunctionConstant {
+            index: 0,
+            scalar_type: ScalarType::U32,
+            lanes: 1,
+            bytes_b64: "AAAAAA==".into(),
+        });
+        case.textures.push(TextureResource {
+            binding: 0,
+            role: ResourceRole::Input,
+            texture_type: TextureType::D2Array,
+            format: TextureFormat::R32Uint,
+            dimensions: [1, 1, 1],
+            sample_count: 1,
+            bytes_b64: Some("BwAAAA==".into()),
+            initial_bytes_b64: None,
+        });
+        case.texture_arrays.push(TextureArrayResource {
+            binding: 0,
+            role: ResourceRole::Input,
+            texture_type: TextureType::D2,
+            format: TextureFormat::R32Uint,
+            sample_count: 1,
+            overrides_texture_at_base: true,
+            elements: vec![TextureArrayElement {
+                dimensions: [1, 1, 1],
+                bytes_b64: Some("BwAAAA==".into()),
+                initial_bytes_b64: None,
+            }],
+        });
+
+        case.case_id = case.computed_case_id().unwrap();
+        case.validate_literal_resources().unwrap();
+        let resources = crate::literal::LiteralResources::prepare(&case).unwrap();
+        assert!(resources.texture_arrays[0].overrides_texture_at_base);
+
+        case.function_constants.clear();
+        case.case_id = case.computed_case_id().unwrap();
+        let errors = case.validate_literal_resources().unwrap_err().join("\n");
+        assert!(errors.contains("overlaps Metal texture slot 0"), "{errors}");
+
+        case.function_constants.push(FunctionConstant {
+            index: 0,
+            scalar_type: ScalarType::U32,
+            lanes: 1,
+            bytes_b64: "AAAAAA==".into(),
+        });
+        case.textures.clear();
+        case.case_id = case.computed_case_id().unwrap();
+        let errors = case.validate_literal_resources().unwrap_err().join("\n");
+        assert!(
+            errors.contains(
+                "overrides_texture_at_base requires a matching input-only layered texture alternative"
+            ),
+            "{errors}"
+        );
     }
 
     #[test]

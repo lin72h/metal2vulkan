@@ -8,63 +8,17 @@ use crate::native::tir::RetTerm;
 /// the base label, its collision-avoidance variants, and the merged-return phi value cannot drift apart.
 pub(in crate::native) const URET_PREFIX: &str = "%metal2vulkan.uret";
 
-/// Lower every `unreachable` terminator to a `ret` (transform #1.5 of the cross-arm cascade, applied
-/// before [`unify_returns`]). An arm ending in `unreachable` never reconverges with its sibling, so
-/// the enclosing selection has no natural merge (`cond-no-natural`) even after return unification.
-/// Executing `unreachable` is UB, so replacing it with a function return is a legal refinement; the
-/// return's type/shape is copied from the function's first real `ret` (`ret void`, or `ret T undef`).
-/// Returns `None` when there is no `unreachable` or no `ret` to model the replacement on.
-pub(in crate::native) fn lower_unreachable_to_ret(blocks: &[BodyBlock]) -> Option<Vec<BodyBlock>> {
-    // Model the replacement `ret` on the function's first real `ret`, read from the typed carrier (the
-    // dual of scanning the trailing `ret` LINE). `Unrenderable` — a value `ret` whose type does not
-    // render injectively (e.g. an anonymous struct return) — declines the transform, mirroring the line
-    // path's `?`-bail on an un-splittable `ret`; a non-`ret` terminator is skipped.
-    let mut model: Option<String> = None;
-    for b in blocks {
-        let Some(t) = &b.typed else { continue };
-        match t.ret_term() {
-            RetTerm::Void => {
-                model = Some("ret void".to_string());
-                break;
-            }
-            RetTerm::Value { ty, .. } => {
-                model = Some(format!("ret {ty} undef"));
-                break;
-            }
-            RetTerm::Unrenderable => return None,
-            RetTerm::NotRet => {}
-        }
-    }
-    let model = model?;
-    let mut hit = false;
-    let mut out = blocks.to_vec();
-    for b in out.iter_mut() {
-        // Detect an `unreachable` terminator from the carrier (the sole substrate).
-        let is_unreachable = b.typed.as_ref().is_some_and(|t| {
-            matches!(t.terminator, crate::native::tir::TirTerminator::Unreachable)
-        });
-        if is_unreachable {
-            // Rewrite the `unreachable` -> `ret` terminator on the carrier.
-            if let Some(t) = &mut b.typed {
-                let t = std::sync::Arc::make_mut(t);
-                t.set_terminator_line(&model);
-            }
-            hit = true;
-        }
-    }
-    hit.then_some(out)
-}
-
-/// Single-exit transform (transform #2 of the cross-arm cascade): route every `ret` through one
+/// Single-exit transform: route every `ret` through one
 /// synthesized exit block, so a divergent selection (arms that `ret` rather than reconverge) gains a
 /// natural merge — the common exit — instead of rejecting `selection:cond-no-natural`. Returns the
 /// rewritten blocks, or `None` if there are fewer than two `ret` blocks (nothing to unify) or the
-/// returns are not uniformly typed.
+/// returns are not uniformly typed. This helper is retained for focused transformation tests;
+/// production divergent-exit construction also includes unreachable exits.
 ///
 /// For a void function the exit block is `ret void`; for a value-returning function it is a phi over
 /// the returned values (`%uret.v = phi T [v_i, %b_i]...`) followed by `ret T %uret.v`. Each original
-/// `ret` block's terminator becomes `br label %exit`. Floor-safe: invoked only behind the
-/// `inline_sroa_raw_cfg_restructure` retry, adopted only if `structured_plan` then admits.
+/// `ret` block's terminator becomes `br label %exit`.
+#[cfg(test)]
 pub(in crate::native) fn unify_returns(blocks: &[BodyBlock]) -> Option<Vec<BodyBlock>> {
     unify_return_like_exits(blocks, false)
 }
@@ -197,6 +151,36 @@ pub(in crate::native) fn separate_divergent_selection_exits(
 pub(in crate::native) fn fresh(orig: &str, id: usize) -> String {
     let stripped = orig.strip_prefix('%').unwrap_or(orig);
     format!("%xa{id}_{stripped}")
+}
+
+/// LLVM's textual block labels and SSA values can carry the same spelling in AIR. A whole-token
+/// rename map cannot distinguish those namespaces, so a clone must decline when one of its labels
+/// is also used or defined as an SSA value anywhere in the function. Another structurization path
+/// can then preserve the two identities instead of accidentally renaming an external value use.
+pub(in crate::native) fn cloned_labels_overlap_ssa_values(
+    blocks: &[BodyBlock],
+    labels: &HashSet<String>,
+) -> bool {
+    for block in blocks {
+        let Some(carrier) = block.typed.as_ref() else {
+            return true;
+        };
+        for instruction in &carrier.insts {
+            if instruction
+                .result
+                .as_ref()
+                .is_some_and(|result| labels.contains(result))
+            {
+                return true;
+            }
+            let mut overlaps = false;
+            instruction.visit_uses(|name| overlaps |= labels.contains(name));
+            if overlaps {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The SSA value a line defines (`%x = ...`), including the `%`, or `None` for a non-defining line.

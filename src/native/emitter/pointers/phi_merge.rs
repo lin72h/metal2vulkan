@@ -3,7 +3,7 @@
 use super::*;
 
 impl Emitter {
-    /// Lower an addrspace(1) pointer phi as a phi of 64-bit byte addresses when every arm has an
+    /// Lower a buffer-addressable pointer phi as a phi of 64-bit byte addresses when every arm has an
     /// exact address-domain representation: either a direct Metal buffer root supplied by the
     /// reflected address sidecar, or an `inttoptr`/BDA raw value. This is the structural shape used
     /// by device-address hierarchies: the root arm starts at a bound acceleration-structure buffer
@@ -15,25 +15,18 @@ impl Emitter {
         result_ty: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        if !self.bda_device_pointers || *result_ty != LlType::Ptr(1) {
+        let Some(result) = self.reserve_bda_address_phi(name, incoming, result_ty)? else {
             return Ok(false);
-        }
-        if !incoming
-            .iter()
-            .all(|(value, _)| self.bda_phi_value_is_addressable(value))
-        {
-            return Ok(false);
-        }
-
+        };
         let address_ty = LlType::Int(64);
         let result_type = self.type_id(&address_ty)?;
-        let result_name = bda_address_name(name);
-        let result = self.result_id(&result_name, &address_ty)?;
         let mut ops = Vec::new();
         let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
         for (value, label) in incoming {
-            let value_id = self.bda_phi_address_id(value)?;
             let label_id = self.label_id(label)?;
+            let mut edge_instructions = Vec::new();
+            let value_id = self.bda_phi_address_id(value, &mut edge_instructions)?;
+            self.record_phi_edge_instructions(label_id, edge_instructions);
             if let Some(existing) = seen_incoming.insert(label_id, value_id) {
                 if existing != value_id {
                     return Err(format!(
@@ -48,21 +41,58 @@ impl Emitter {
         instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
         self.emit_pointer_nullness_phi(name, incoming, result_ty, instructions)?;
         self.used_device_address = true;
-        let mut raw = RawBufferOffset::root(format!(".bda_phi_{name}"), 1);
+        Ok(true)
+    }
+
+    pub(in crate::native::emitter) fn reserve_bda_address_phi(
+        &mut self,
+        name: &str,
+        incoming: &[(LlValue, String)],
+        result_ty: &LlType,
+    ) -> Result<Option<Word>, String> {
+        let LlType::Ptr(addrspace @ 0..=2) = result_ty else {
+            return Ok(None);
+        };
+        if !self.bda_device_pointers
+            || !incoming
+                .iter()
+                .all(|(value, _)| self.bda_phi_value_is_addressable(value))
+        {
+            return Ok(None);
+        }
+
+        let result = self.result_id(&bda_address_name(name), &LlType::Int(64))?;
+        if let Some((logical_result, _)) = self.values.get(name).cloned() {
+            self.phi_result_instructions
+                .retain(|instruction| instruction.result_id != Some(logical_result));
+            self.emit_sidecar
+                .remap_ids(&HashMap::from([(logical_result, result)]));
+        }
+        let mut raw = RawBufferOffset::root(format!(".bda_phi_{name}"), *addrspace);
         raw.device_addr_base = Some(result);
         self.raw_offsets.insert(name.to_string(), raw);
         self.pointer_storage
             .insert(name.to_string(), StorageClass::PhysicalStorageBuffer);
         self.pointer_pointees
             .insert(name.to_string(), LlType::Int(8));
-        Ok(true)
+        self.gep_provenance.remove(name);
+        Ok(Some(result))
     }
 
-    fn bda_phi_value_is_addressable(&self, value: &LlValue) -> bool {
+    pub(in crate::native::emitter) fn bda_phi_value_is_addressable(&self, value: &LlValue) -> bool {
+        self.bda_phi_value_is_addressable_inner(value, &mut HashSet::new())
+    }
+
+    fn bda_phi_value_is_addressable_inner(
+        &self,
+        value: &LlValue,
+        visiting: &mut HashSet<String>,
+    ) -> bool {
         match value {
-            LlValue::Zero => true,
+            LlValue::Zero | LlValue::Undef => true,
             LlValue::Local(name) => {
-                self.bda_inttoptr_sources.contains_key(name)
+                if self.bda_inttoptr_sources.contains_key(name)
+                    || self.bda_forward_addresses.contains(name)
                     || self.bda_direct_addresses.contains_key(name)
                     || self.raw_offsets.get(name).is_some_and(|raw| {
                         raw.const_off == 0
@@ -70,14 +100,38 @@ impl Emitter {
                             && (raw.device_addr_base.is_some()
                                 || self.bda_direct_addresses.contains_key(&raw.root))
                     })
+                {
+                    return true;
+                }
+                let Some(incoming) = self.tir_phi_incomings.get(name) else {
+                    return false;
+                };
+                // Pointer state introduced by construct-tree is a mutually recursive phi network:
+                // the header reads the next-state phi and the next-state phi retains the header on
+                // edges that do not update it. A revisit proves only that this edge stays within the
+                // network; concrete leaves still have to be direct addresses, inttoptr values, zero,
+                // or undef. This is the greatest fixed point over that finite typed network.
+                if !visiting.insert(name.clone()) {
+                    return true;
+                }
+                let addressable = incoming
+                    .iter()
+                    .all(|(value, _)| self.bda_phi_value_is_addressable_inner(value, visiting));
+                visiting.remove(name);
+                addressable
             }
             _ => false,
         }
     }
 
-    fn bda_phi_address_id(&mut self, value: &LlValue) -> Result<Word, String> {
+    fn bda_phi_address_id(
+        &mut self,
+        value: &LlValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
         match value {
             LlValue::Zero => self.const_signed_int(64, 0),
+            LlValue::Undef => self.undef_id(&LlType::Int(64)),
             LlValue::Local(name) => {
                 if let Some(address) = self.bda_direct_addresses.get(name).copied() {
                     return Ok(address);
@@ -92,8 +146,122 @@ impl Emitter {
                         }
                     }
                 }
+                if let Some(raw) = self
+                    .raw_offsets
+                    .get(name)
+                    .filter(|raw| raw.device_addr_base.is_some())
+                    .cloned()
+                {
+                    let address = self.materialize_device_address(&raw, instructions)?;
+                    self.bda_address_values.insert(address);
+                    return Ok(address);
+                }
+                if self.bda_address_loads.contains(name) {
+                    let result_ty = self.tir_result_types.get(name).cloned().ok_or_else(|| {
+                        format!("native emitter: BDA pointer load {name} has no result type")
+                    })?;
+                    let address = self.result_id(name, &result_ty)?;
+                    self.bda_address_values.insert(address);
+                    return Ok(address);
+                }
+                if let Some(source) = self.bda_forward_sources.get(name).cloned() {
+                    return self.bda_phi_address_id(&source.value, instructions);
+                }
+                if let (Some((true_value, false_value)), Some(condition)) = (
+                    self.forward_pointer_selects.get(name).cloned(),
+                    self.forward_pointer_select_conditions.get(name).cloned(),
+                ) {
+                    let true_address = self.bda_phi_address_id(&true_value.value, instructions)?;
+                    let false_address =
+                        self.bda_phi_address_id(&false_value.value, instructions)?;
+                    let condition =
+                        self.value_id_in(&condition.value, &condition.ty, instructions)?;
+                    let address_type = self.type_id(&LlType::Int(64))?;
+                    let address = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::Select,
+                        Some(address_type),
+                        Some(address),
+                        vec![
+                            Operand::IdRef(condition),
+                            Operand::IdRef(true_address),
+                            Operand::IdRef(false_address),
+                        ],
+                    ));
+                    self.bda_address_values.insert(address);
+                    self.bda_direct_addresses.insert(name.clone(), address);
+                    return Ok(address);
+                }
+                if let Some(gep) = self.forward_geps.get(name).cloned() {
+                    let root = match &gep.base.value {
+                        LlValue::Local(base_name) => base_name.clone(),
+                        LlValue::Zero | LlValue::Undef => format!(".bda_forward_gep_{name}"),
+                        other => {
+                            return Err(if crate::env_vars::retry_debug() {
+                                format!(
+                                    "native emitter: forward BDA GEP {name} has an unsupported base {other:?} in {gep:?}"
+                                )
+                            } else {
+                                "native emitter: forward BDA GEP has an unsupported base"
+                                    .to_string()
+                            });
+                        }
+                    };
+                    let base_address = self.bda_phi_address_id(&gep.base.value, instructions)?;
+                    let LlType::Ptr(addrspace) = self.resolve_type(&gep.base.ty)? else {
+                        return Err(
+                            "native emitter: forward BDA GEP base is not a pointer".to_string()
+                        );
+                    };
+                    let source_type = self.resolve_type(&gep.source_ty)?;
+                    let mut raw = RawBufferOffset::root(root, addrspace);
+                    raw.device_addr_base = Some(base_address);
+                    let raw = self.apply_raw_gep(raw, &source_type, &gep.indices)?;
+                    if !raw.unmodelable {
+                        let address = self.materialize_device_address(&raw, instructions)?;
+                        self.bda_address_values.insert(address);
+                        return Ok(address);
+                    }
+                }
+                if let Some((pointer, LlType::Ptr(_))) = self.values.get(name).cloned() {
+                    if self.pointer_storage.get(name) == Some(&StorageClass::PhysicalStorageBuffer)
+                    {
+                        let address_type = self.type_id(&LlType::Int(64))?;
+                        let address = self.fresh();
+                        instructions.push(Self::inst(
+                            Op::ConvertPtrToU,
+                            Some(address_type),
+                            Some(address),
+                            vec![Operand::IdRef(pointer)],
+                        ));
+                        self.bda_address_values.insert(address);
+                        return Ok(address);
+                    }
+                }
                 if let Some(source) = self.bda_inttoptr_sources.get(name).cloned() {
                     return self.phi_value_id(&source.value, &source.ty, &mut Vec::new());
+                }
+                // A construct-tree header may reference its next-state phi before that block is
+                // emitted. Reserve the typed phi's address result now; its OpPhi definition is
+                // emitted at the ordinary block position and SPIR-V permits this forward edge use.
+                if let (Some(incoming), Some(result_ty)) = (
+                    self.tir_phi_incomings.get(name).cloned(),
+                    self.tir_result_types.get(name).cloned(),
+                ) {
+                    if self
+                        .reserve_bda_address_phi(name, &incoming, &result_ty)?
+                        .is_some()
+                    {
+                        return self
+                            .raw_offsets
+                            .get(name)
+                            .and_then(|raw| raw.device_addr_base)
+                            .ok_or_else(|| {
+                                format!(
+                                    "native emitter: reserved BDA pointer {name} has no address result"
+                                )
+                            });
+                    }
                 }
                 Err(format!(
                     "native emitter: pointer {name} has no exact BDA address representation"
@@ -138,7 +306,7 @@ impl Emitter {
             };
             if saw_meta && merged.storage != meta.storage {
                 return Err(format!(
-                    "native emitter: pointer merge storage mismatch {:?} vs {:?} at {value:?}",
+                    "native emitter: pointer merge storage mismatch {:?} vs {:?} at {value:?} across {values:?}",
                     merged.storage, meta.storage
                 ));
             }
@@ -148,7 +316,7 @@ impl Emitter {
                 match &merged.pointee {
                     Some(existing) if existing != &pointee => {
                         return Err(format!(
-                            "native emitter: pointer merge pointee mismatch {existing:?} vs {pointee:?}"
+                            "native emitter: pointer merge pointee mismatch {existing:?} vs {pointee:?} across {values:?}"
                         ));
                     }
                     None => merged.pointee = Some(pointee),
@@ -258,7 +426,7 @@ impl Emitter {
                     // fallback the emitter doc names as debt, without touching the raw-addressing path.
                     //
                     // Also EXCLUDE any pointer that carries a byte (`i8`) view in its uses
-                    // (`tir_byte_view_pointers`): a pointer dereferenced BOTH as a byte cursor
+                    // (`byte_view_pointers`): a pointer dereferenced BOTH as a byte cursor
                     // (`getelementptr i8` → `uchar`-result `OpPtrAccessChain`) AND as a wider type. Its
                     // carrier resolves to the wider type, but the byte cursor still expects a
                     // `uchar`-pointee base, so upgrading the pointee strands it and emits globally-invalid
@@ -269,7 +437,7 @@ impl Emitter {
                     if *pointee == LlType::Int(8)
                         && !self.raw_offsets.contains_key(name)
                         && !self.unmodeled_pointers.contains(name)
-                        && !self.tir_byte_view_pointers.contains(name)
+                        && !self.byte_view_pointers.contains(name)
                     {
                         if let Some(carrier) = self.tir_use_pointees.get(name) {
                             let carrier = self.resolve_type(carrier)?;
@@ -299,7 +467,7 @@ impl Emitter {
                         && is_scalar_pointee(pointee)
                         && !self.raw_offsets.contains_key(name)
                         && !self.unmodeled_pointers.contains(name)
-                        && !self.tir_byte_view_pointers.contains(name)
+                        && !self.byte_view_pointers.contains(name)
                         && !self.pointer_in_pointer_merge(name)
                     {
                         if let Some(carrier) = self.tir_use_pointees.get(name) {
@@ -327,7 +495,7 @@ impl Emitter {
                         && is_scalar_pointee(pointee)
                         && !self.raw_offsets.contains_key(name)
                         && !self.unmodeled_pointers.contains(name)
-                        && !self.tir_byte_view_pointers.contains(name)
+                        && !self.byte_view_pointers.contains(name)
                         && !self.pointer_in_pointer_merge(name)
                     {
                         if let Some(carrier) = self.tir_use_pointees.get(name) {
@@ -392,6 +560,9 @@ impl Emitter {
             self.forward_geps
                 .get(incoming_name)
                 .is_some_and(|gep| matches!(&gep.base.value, LlValue::Local(base) if base == name))
+                || self
+                    .forward_select_recurrence_gep(incoming_name, name)
+                    .is_some()
         })
     }
 
@@ -457,7 +628,9 @@ impl Emitter {
         let result_type = self.type_id(&index_ty)?;
         let mut ops = Vec::new();
         let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
+        let mut pending_edges = Vec::new();
         for (value, label) in incoming {
+            let mut edge_instructions = Vec::new();
             let value_id = match value {
                 LlValue::Local(incoming_name) => {
                     if let Some(raw) = self.raw_offsets.get(incoming_name).cloned() {
@@ -476,9 +649,9 @@ impl Emitter {
                         if self.values.contains_key(&incoming_index_name) {
                             self.value_id(&LlValue::Local(incoming_index_name), &LlType::Int(32))?
                         } else if word_indexed && raw.dyn_terms.is_empty() {
-                            self.emit_raw_word_index(&raw, 0, instructions)?
+                            self.emit_raw_word_index(&raw, 0, &mut edge_instructions)?
                         } else if !word_indexed {
-                            self.emit_raw_byte_index(&raw, 0, instructions)?
+                            self.emit_raw_byte_index(&raw, 0, &mut edge_instructions)?
                         } else {
                             return Ok(false);
                         }
@@ -492,13 +665,14 @@ impl Emitter {
                                 raw_byte_index_name(incoming_name)
                             }),
                             &index_ty,
-                            instructions,
+                            &mut edge_instructions,
                         )?
                     }
                 }
                 _ => return Ok(false),
             };
             let label_id = self.label_id(label)?;
+            pending_edges.push((label_id, edge_instructions));
             if let Some(existing) = seen_incoming.insert(label_id, value_id) {
                 if existing != value_id {
                     return Err(format!(
@@ -509,6 +683,9 @@ impl Emitter {
             }
             ops.push(Operand::IdRef(value_id));
             ops.push(Operand::IdRef(label_id));
+        }
+        for (predecessor, edge_instructions) in pending_edges {
+            self.record_phi_edge_instructions(predecessor, edge_instructions);
         }
         instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
         self.pointer_storage
@@ -548,9 +725,7 @@ impl Emitter {
         };
         let has_unmodeled = incoming.iter().any(|(value, _)| match value {
             LlValue::Local(name) => {
-                self.unmodeled_pointers.contains(name)
-                    || (self.pointer_phi_values.contains(name) && !self.values.contains_key(name))
-                    || self.forward_gep_base_is_unmodeled(name)
+                self.unmodeled_pointers.contains(name) || self.forward_gep_base_is_unmodeled(name)
             }
             _ => false,
         });
@@ -609,55 +784,239 @@ impl Emitter {
         let Some(template) = self.pointer_phi_template_provenance(name, incoming)? else {
             return Ok(None);
         };
-        if template.indices.len() != 1 {
-            return Ok(None);
-        }
-        let index_ty = template.indices[0].ty.clone();
-        let index_name = pointer_index_name(name);
-        let result = self.result_id(&index_name, &index_ty)?;
-        let result_type = self.type_id(&index_ty)?;
-        let mut ops = Vec::new();
-        let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
-        for (value, label) in incoming {
+        let first_index_is_pointer_arithmetic = template.indices.len() == 1
+            && incoming.iter().any(|(value, _)| {
+                let LlValue::Local(incoming_name) = value else {
+                    return false;
+                };
+                self.forward_geps.get(incoming_name).is_some_and(
+                    |gep| matches!(&gep.base.value, LlValue::Local(base) if base == name),
+                ) || self
+                    .forward_select_recurrence_gep(incoming_name, name)
+                    .is_some()
+            });
+        let forward_index_ty = (template.indices.len() == 1).then(|| &template.indices[0].ty);
+        let mut provenances = vec![None; incoming.len()];
+        // Resolve already-defined arms before creating any forward reservation. Such an arm cannot
+        // acquire new provenance later in block order, so a failure here rejects this representation
+        // without leaving a speculative index id for another pointer merge to consume.
+        for (position, (value, _)) in incoming.iter().enumerate() {
+            let LlValue::Local(value_name) = value else {
+                continue;
+            };
+            if !self.values.contains_key(value_name) {
+                continue;
+            }
             let Some(provenance) =
-                self.provenance_for_pointer_value(value, Some(&template), Some(&index_ty))?
+                self.provenance_for_pointer_value(value, Some(&template), forward_index_ty)?
             else {
                 return Ok(None);
             };
             if !compatible_pointer_provenance(&template, &provenance)
-                || provenance.indices.len() != 1
+                || provenance
+                    .indices
+                    .iter()
+                    .zip(&template.indices)
+                    .any(|(index, template_index)| index.ty != template_index.ty)
             {
                 return Ok(None);
             }
-            let index = &provenance.indices[0];
-            let value_id = self.phi_value_id(&index.value, &index.ty, instructions)?;
-            let label_id = self.label_id(label)?;
-            if let Some(existing) = seen_incoming.insert(label_id, value_id) {
-                if existing != value_id {
-                    return Err(format!(
-                        "native emitter: pointer index phi has multiple values from predecessor {label}"
-                    ));
+            provenances[position] = Some(provenance);
+        }
+        let prior_provenance = self.gep_provenance.get(name).cloned();
+        let index_names = if template.indices.len() == 1 {
+            vec![pointer_index_name(name)]
+        } else {
+            (0..template.indices.len())
+                .map(|position| format!("{}.{position}", pointer_index_name(name)))
+                .collect::<Vec<_>>()
+        };
+        let prior_index_values = index_names
+            .iter()
+            .map(|index_name| (index_name.clone(), self.values.get(index_name).cloned()))
+            .collect::<Vec<_>>();
+        // Reserve the phi's index carrier before resolving a forward GEP/select backedge. Those
+        // definitions are emitted later, but their structural provenance is expressed relative to
+        // this index result; without the reservation they appear ungrounded and the emitter falls
+        // through to an illegal Function/Private pointer OpPhi.
+        if self
+            .reserve_pointer_provenance_from_template(
+                name,
+                &template,
+                first_index_is_pointer_arithmetic,
+            )?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let mut resolved_provenances = Vec::with_capacity(incoming.len());
+        for ((value, label), preflight) in incoming.iter().zip(provenances) {
+            let provenance = if let Some(provenance) = preflight {
+                provenance
+            } else if let Some(provenance) =
+                self.provenance_for_pointer_value(value, Some(&template), forward_index_ty)?
+            {
+                provenance
+            } else {
+                self.restore_pointer_phi_reservation(name, prior_provenance, &prior_index_values);
+                return Ok(None);
+            };
+            if !compatible_pointer_provenance(&template, &provenance)
+                || provenance
+                    .indices
+                    .iter()
+                    .zip(&template.indices)
+                    .any(|(index, template_index)| index.ty != template_index.ty)
+            {
+                self.restore_pointer_phi_reservation(name, prior_provenance, &prior_index_values);
+                return Ok(None);
+            }
+            resolved_provenances.push((provenance, label));
+        }
+        let mut merged_indices = Vec::with_capacity(template.indices.len());
+        let mut selected_ty = template.source_ty.clone();
+        for (position, template_index) in template.indices.iter().enumerate() {
+            let Some(structural_literal) = structural_pointer_index(
+                position,
+                &mut selected_ty,
+                template_index,
+                first_index_is_pointer_arithmetic,
+            ) else {
+                self.restore_pointer_phi_reservation(name, prior_provenance, &prior_index_values);
+                return Ok(None);
+            };
+            if structural_literal {
+                if resolved_provenances.iter().any(|(provenance, _)| {
+                    provenance.indices[position].value != template_index.value
+                }) {
+                    self.restore_pointer_phi_reservation(
+                        name,
+                        prior_provenance,
+                        &prior_index_values,
+                    );
+                    return Ok(None);
                 }
+                merged_indices.push(template_index.clone());
                 continue;
             }
-            ops.push(Operand::IdRef(value_id));
-            ops.push(Operand::IdRef(label_id));
+            let index_name = if template.indices.len() == 1 {
+                pointer_index_name(name)
+            } else {
+                format!("{}.{position}", pointer_index_name(name))
+            };
+            if resolved_provenances
+                .iter()
+                .all(|(provenance, _)| provenance.indices[position].value == template_index.value)
+                && !self.values.contains_key(&index_name)
+            {
+                merged_indices.push(template_index.clone());
+                continue;
+            }
+            let result = self.result_id(&index_name, &template_index.ty)?;
+            let result_type = self.type_id(&template_index.ty)?;
+            let mut ops = Vec::new();
+            let mut seen_incoming: HashMap<Word, Word> = HashMap::new();
+            let mut pending_edges = Vec::new();
+            for (provenance, label) in &resolved_provenances {
+                let index = &provenance.indices[position];
+                let mut edge_instructions = Vec::new();
+                let value_id =
+                    self.phi_value_id(&index.value, &index.ty, &mut edge_instructions)?;
+                let label_id = self.label_id(label)?;
+                pending_edges.push((label_id, edge_instructions));
+                if let Some(existing) = seen_incoming.insert(label_id, value_id) {
+                    if existing != value_id {
+                        return Err(format!(
+                            "native emitter: pointer index phi has multiple values from predecessor {label}"
+                        ));
+                    }
+                    continue;
+                }
+                ops.push(Operand::IdRef(value_id));
+                ops.push(Operand::IdRef(label_id));
+            }
+            for (predecessor, edge_instructions) in pending_edges {
+                self.record_phi_edge_instructions(predecessor, edge_instructions);
+            }
+            instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
+            merged_indices.push(TypedValue {
+                ty: template_index.ty.clone(),
+                value: LlValue::Local(index_name),
+            });
         }
-        instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
         Ok(Some(GepProvenance {
             root: template.root,
             addrspace: template.addrspace,
             source_ty: template.source_ty,
-            indices: vec![TypedValue {
-                ty: index_ty,
-                value: LlValue::Local(index_name),
-            }],
+            indices: merged_indices,
             root_indices: None,
             root_is_indexed_container: template.root_is_indexed_container,
         }))
     }
+
+    fn restore_pointer_phi_reservation(
+        &mut self,
+        name: &str,
+        prior_provenance: Option<GepProvenance>,
+        prior_index_values: &[(String, Option<(Word, LlType)>)],
+    ) {
+        if let Some(provenance) = prior_provenance {
+            self.gep_provenance.insert(name.to_string(), provenance);
+        } else {
+            self.gep_provenance.remove(name);
+        }
+        for (index_name, prior_value) in prior_index_values {
+            if let Some(value) = prior_value {
+                self.values.insert(index_name.clone(), value.clone());
+            } else {
+                self.values.remove(index_name);
+            }
+        }
+    }
 }
 
-fn bda_address_name(name: &str) -> String {
-    format!("{name}.metal2vulkan.bda_address")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incompatible_defined_phi_arm_does_not_leave_reserved_index() {
+        let ir = LlModule::parse("define void @k() {\nentry:\n  ret void\n}\n")
+            .expect("minimal module parses");
+        let mut emitter = Emitter::new(ir);
+        let pointer_ty = LlType::Ptr(1);
+        emitter
+            .values
+            .insert("%modeled".into(), (10, pointer_ty.clone()));
+        emitter.values.insert("%unmodeled".into(), (11, pointer_ty));
+        emitter.gep_provenance.insert(
+            "%modeled".into(),
+            GepProvenance {
+                root: 12,
+                addrspace: 1,
+                source_ty: LlType::Int(16),
+                indices: vec![TypedValue {
+                    ty: LlType::Int(64),
+                    value: LlValue::Int(0),
+                }],
+                root_indices: None,
+                root_is_indexed_container: false,
+            },
+        );
+
+        let result = emitter
+            .emit_pointer_phi_provenance(
+                "%merged",
+                &[
+                    (LlValue::Local("%modeled".into()), "left".into()),
+                    (LlValue::Local("%unmodeled".into()), "right".into()),
+                ],
+                &mut Vec::new(),
+            )
+            .expect("unsupported provenance declines cleanly");
+
+        assert!(result.is_none());
+        assert!(!emitter.values.contains_key(&pointer_index_name("%merged")));
+        assert!(!emitter.gep_provenance.contains_key("%merged"));
+    }
 }

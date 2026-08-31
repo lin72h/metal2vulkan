@@ -13,7 +13,7 @@ use crate::spirv_module::load_bytes;
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Block, Instruction};
 use crate::{disassemble, meta, tools};
-use spirv::{Decoration, Op, Scope, SelectionControl, StorageClass, Word};
+use spirv::{Capability, Decoration, Op, Scope, SelectionControl, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -30,7 +30,7 @@ fn carriered_block(name: &str, lines: &[&str]) -> BodyBlock {
 }
 
 #[test]
-fn construct_tree_mode_keeps_normal_plan_merges_per_function() {
+fn default_construct_tree_keeps_normal_plan_merges_per_function() {
     let ll = r#"
 define void @k() {
 entry:
@@ -48,9 +48,228 @@ merge:
 }
 "#;
 
-    let spv = crate::native::emit_vulkan_spirv_construct_tree(ll).expect("construct-tree emit");
+    let spv = crate::native::emit_vulkan_spirv(ll).expect("default emit");
     let asm = disassemble(&spv).expect("disassemble");
     assert_eq!(asm.matches("OpSelectionMerge").count(), 1, "{asm}");
+}
+
+#[test]
+fn construct_tree_with_symbolic_raw_cursor_selects_raw_relooper() {
+    // Two selection-owned entries into one loop require construct-tree ownership. The byte GEP is
+    // represented by an exact raw offset plus a non-semantic Private placeholder; carrying that
+    // placeholder through synthesized pointer phis would lose the descriptor root. The emission
+    // sidecar must therefore retain the source-ownership rejection that selects the raw relooper.
+    let ll = r#"
+%S = type { i32 }
+
+define void @k(ptr addrspace(1) %bytes, i1 %outer, i1 %inner, i1 %done) {
+entry:
+  br i1 %outer, label %inner_header, label %outer_else
+inner_header:
+  br i1 %inner, label %inner_then, label %inner_else
+inner_then:
+  br label %exit
+inner_else:
+  br label %loop
+outer_else:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %inner_else ], [ 0, %outer_else ], [ %next, %latch ]
+  %cursor = getelementptr i8, ptr addrspace(1) %bytes, i64 %i
+  %field = getelementptr %S, ptr addrspace(1) %cursor, i64 0, i32 0
+  %value = load i32, ptr addrspace(1) %field, align 1
+  %next = add i64 %i, 1
+  br i1 %done, label %exit, label %latch
+latch:
+  br label %loop
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"bytes"}
+"#;
+
+    let emitted = crate::native::emit_vulkan_spirv_with_outcome(ll, None, Some("k"), None)
+        .expect("construct-tree emission remains an owned intermediate");
+    assert_eq!(
+        emitted.sidecar.ownership_plan_rejected_functions,
+        HashSet::from(["k".to_string()])
+    );
+}
+
+#[test]
+fn nested_selection_entries_into_one_loop_are_structured_by_construction() {
+    let ll = r#"
+define void @k() {
+entry:
+  %outer = icmp eq i32 0, 0
+  %inner = icmp eq i32 1, 1
+  %done = icmp eq i32 2, 2
+  br i1 %outer, label %inner_header, label %outer_else
+
+inner_header:
+  br i1 %inner, label %inner_then, label %inner_else
+
+inner_then:
+  br label %inner_merge
+
+inner_else:
+  br label %loop
+
+inner_merge:
+  br label %outer_merge
+
+outer_else:
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %inner_else ], [ 0, %outer_else ], [ %next, %latch ]
+  %next = add i32 %i, 1
+  br i1 %done, label %loop_exit, label %latch
+
+latch:
+  br label %loop
+
+loop_exit:
+  br label %outer_merge
+
+outer_merge:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{}
+"#;
+    let module = load_bytes(crate::native::emit_vulkan_spirv(ll).expect("default structured emit"))
+        .expect("load native spv");
+    let spv = passes::transform(module, Stage::Kernel, None, None, None, Some("k"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpLoopMerge"), "{asm}");
+    assert!(asm.matches("OpSelectionMerge").count() >= 2, "{asm}");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_selection_loop_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp).expect("create scratch");
+    if let Err(error) = tools::spirv_val_bytes(&spv, &tmp) {
+        panic!("producer output must validate: {error}\n{asm}");
+    }
+    std::fs::remove_dir_all(&tmp).expect("remove scratch");
+}
+
+#[test]
+fn loop_exit_into_selection_sibling_is_structured_by_construction() {
+    let ll = r#"
+define void @k() {
+entry:
+  %direct = icmp eq i32 0, 1
+  %leave = icmp eq i32 1, 1
+  %again = icmp eq i32 2, 3
+  br label %owner
+
+owner:
+  br i1 %direct, label %sibling, label %loop
+
+loop:
+  %i = phi i32 [ 0, %owner ], [ %next, %loop_tail ]
+  br label %body
+
+body:
+  %next = add i32 %i, 1
+  br i1 %leave, label %sibling, label %loop_tail
+
+loop_tail:
+  br i1 %again, label %loop, label %tail
+
+sibling:
+  %value = phi i32 [ 7, %owner ], [ %next, %body ]
+  br label %post
+
+tail:
+  br label %post
+
+post:
+  br label %merge
+
+merge:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{}
+"#;
+    let module = load_bytes(crate::native::emit_vulkan_spirv(ll).expect("default structured emit"))
+        .expect("load native spv");
+    let spv = passes::transform(module, Stage::Kernel, None, None, None, Some("k"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpLoopMerge"), "{asm}");
+    assert!(asm.contains("OpSwitch"), "{asm}");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_loop_exit_sibling_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&tmp).expect("create scratch");
+    if let Err(error) = tools::spirv_val_bytes(&spv, &tmp) {
+        panic!("producer output must validate: {error}\n{asm}");
+    }
+    std::fs::remove_dir_all(&tmp).expect("remove scratch");
+}
+
+#[test]
+fn emission_failure_carries_complete_same_cfg_planner_rejections() {
+    // A phi cannot assign two different values to the same predecessor. Both ownership planners
+    // reject that source contract. Its instruction-emission error must retain their completed
+    // analysis for same-CFG representation retries.
+    let ll = r#"
+define void @k() {
+entry:
+  br label %head
+head:
+  %conflict = phi i32 [ 0, %entry ], [ 1, %entry ]
+  %choose = icmp eq i32 0, 0
+  br i1 %choose, label %a, label %b
+a:
+  br label %head
+b:
+  br label %head
+}
+"#;
+
+    let failure = crate::native::emit_vulkan_spirv_with_outcome(ll, None, Some("k"), None)
+        .expect_err("conflicting phi must fail after CFG planning");
+    assert!(
+        failure
+            .error
+            .contains("phi %conflict has multiple values from predecessor %entry"),
+        "{}",
+        failure.error
+    );
+    assert_eq!(
+        failure.ordinary_plan_rejected_functions,
+        HashSet::from(["k".to_string()])
+    );
+    assert_eq!(
+        failure.ownership_plan_rejected_functions,
+        HashSet::from(["k".to_string()])
+    );
 }
 
 #[test]
@@ -150,7 +369,7 @@ exit:
 #[test]
 fn native_air_fmax3_fmin3_and_fmedian3_lower_as_nested_binary_extinsts() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %mx = tail call fast float @air.fast_fmax3.f32(float 1.000000e+00, float 2.000000e+00, float 3.000000e+00)
@@ -199,7 +418,7 @@ declare float @air.fast_fmedian3.f32(float, float, float)
 #[test]
 fn native_loop_latch_can_precede_phi_header() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -244,7 +463,7 @@ exit:
 #[test]
 fn native_implicit_entry_with_mixed_numeric_params_resolves_phi_predecessor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @main(i32 %0, i32 %named, i32 %6) {
   br label %8
 
@@ -255,13 +474,14 @@ define i32 @main(i32 %0, i32 %named, i32 %6) {
 "#;
     let spv = emit_vulkan_spirv(ll).expect("native emit");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpPhi"), "{asm}");
+    assert!(!asm.contains("OpPhi"), "{asm}");
+    assert!(asm.contains("OpReturnValue"), "{asm}");
 }
 
 #[test]
 fn native_loop_continue_branch_does_not_reuse_entry_branch_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i32 %x) {
 entry:
   %enter = icmp slt i32 %x, 4
@@ -310,7 +530,7 @@ exit:
 #[test]
 fn native_loop_body_branch_merges_at_continue_target() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i32 %x) {
 entry:
   br label %loop
@@ -379,7 +599,7 @@ exit:
 #[test]
 fn native_loop_merge_block_can_precede_loop_textually() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -426,7 +646,7 @@ cont:
 #[test]
 fn native_loop_merge_repair_rechecks_single_predecessor_targets() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -477,7 +697,7 @@ exit:
 #[test]
 fn native_switch_loop_header_splits_switch_under_loop_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -518,7 +738,8 @@ exit:
         .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(asm.contains("OpLoopMerge"), "{asm}");
-    assert!(asm.contains("OpSwitch"), "{asm}");
+    assert!(!asm.contains("OpSwitch"), "{asm}");
+    assert!(asm.contains("OpSelectionMerge"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -531,7 +752,7 @@ exit:
 #[test]
 fn native_loop_exit_can_precede_value_defining_body() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @main(float %x) {
 entry:
   br label %loop
@@ -585,7 +806,7 @@ fn native_entry_metadata_gep_keeps_member_isomorphic_padding_fields() {
     // path for non-isomorphic layouts is locked by
     // `native_record_array_metadata_gep_remaps_padding_fields`.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Constants = type <{ i32, i32, i32, i32, i32, i32, i32, i32, i32, [4 x i8], <2 x i32> }>
 
@@ -647,7 +868,7 @@ entry:
 #[test]
 fn native_nested_record_metadata_gep_remaps_matrix_padding_fields() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Top = type { %Conv, %Conv, %Conv, %Conv }
 %Conv = type <{ i32, [12 x i8], %Matrix, i8, [15 x i8] }>
@@ -696,7 +917,7 @@ entry:
 #[test]
 fn native_raw_loop_carried_byte_offset_pointer_phi_stores_to_buffer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(i32 %byte_off, ptr addrspace(1) %out) {
 entry:
@@ -790,7 +1011,7 @@ fn native_memcpy_from_void_buffer_to_nested_struct_alloca_copies_raw_leaves() {
     // lower it to per-leaf stores with no OpCopyMemory residual. Mirrors the createBVHNodesKernelMotion
     // `device MTLBVHSplitMotion*` memcpy.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Inner = type { [3 x float], float }
 %Outer = type { i32, %Inner, i32 }
 
@@ -821,8 +1042,8 @@ declare void @llvm.memcpy.p0.p1.i64(ptr, ptr addrspace(1), i64, i1)
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    // Drive the all-buffers-raw emit — the production raw-retry tier the createBVHNodesKernelMotion
-    // case is adopted through (the default typed emit does not model a memcpy-only void* src raw).
+    // Drive all-buffers-raw construction (the primary typed representation does not model a
+    // memcpy-only void* source as raw).
     let module =
         load_bytes(super::super::emit_vulkan_spirv_all_buffers_raw(ll).expect("native raw emit"))
             .expect("load native spv");
@@ -861,7 +1082,7 @@ declare void @llvm.memcpy.p0.p1.i64(ptr, ptr addrspace(1), i64, i1)
 #[test]
 fn native_loop_i8_buffer_bitcast_vector_load_uses_raw_phi() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %bytes, ptr addrspace(1) %out, i32 %limit) {
 entry:
   %start = getelementptr inbounds i8, ptr addrspace(1) %bytes, i64 0
@@ -949,7 +1170,7 @@ exit:
 #[test]
 fn native_device_atomic_float_slot_retypes_for_i32_cas_loop() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %slot, i32 %idx) {
 entry:
@@ -1001,7 +1222,7 @@ declare i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1), ptr, i32, i32,
 #[test]
 fn native_threadgroup_scalarized_struct_phi_gep_keeps_scalar_pointer_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Atomic = type { i32 }
 @tg = internal addrspace(3) global [128 x i32] undef, align 4
 
@@ -1102,7 +1323,7 @@ exit:
 #[test]
 fn native_kernel_threadgroup_scalarized_struct_phi_rewrites_param_root_access() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Atomic = type { i32 }
 
 define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out) {
@@ -1158,7 +1379,7 @@ exit:
 #[test]
 fn native_pointer_bitcast_load_reads_low_word_from_nested_i64_aggregate() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.ETCBlock = type { %struct.Bits }
 %struct.Bits = type { i64 }
 define i32 @load_low_word(ptr %block) {
@@ -1225,7 +1446,7 @@ m:
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     // The wider load is assembled from bytes (zero-extend + shift/or), not a direct OpLoad %float
     // off a uchar pointer, and never a logical-pointer OpBitcast.
@@ -1245,6 +1466,77 @@ m:
     }
 }
 
+/// A finalized switch can have one actual predecessor even though LLVM repeats that predecessor in
+/// the phi carrier. The pointer identity is substituted before emission. When the same buffer is then
+/// viewed as bytes and as `float4`, interface discovery must retain both typed descriptor views
+/// instead of retyping the byte chain to the vector pointer and leaving invalid byte loads.
+#[test]
+fn native_single_predecessor_pointer_alias_preserves_mixed_buffer_views() {
+    let ll = r#"
+target triple = "air64-apple-macosx14.0.0"
+define void @mixed_alias(ptr addrspace(1) %src, ptr addrspace(1) %out, i32 %selector) {
+entry:
+  switch i32 %selector, label %merge [ i32 0, label %merge ]
+merge:
+  %p = phi ptr addrspace(1) [ %src, %entry ], [ %src, %entry ]
+  %offset = zext i32 %selector to i64
+  %byte = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %offset
+  %byte_alias = bitcast ptr addrspace(1) %byte to ptr addrspace(1)
+  %fp = getelementptr inbounds float, ptr addrspace(1) %byte_alias, i64 0
+  %scalar = load float, ptr addrspace(1) %fp, align 4
+  %vp = getelementptr inbounds <4 x float>, ptr addrspace(1) %p, i64 %offset
+  %vector = load <4 x float>, ptr addrspace(1) %vp, align 16
+  %lane = extractelement <4 x float> %vector, i64 0
+  %sum = fadd float %scalar, %lane
+  store float %sum, ptr addrspace(1) %out, align 4
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @mixed_alias, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!5 = !{i32 2, !"air.thread_index_in_threadgroup", !"air.arg_type_name", !"uint", !"air.arg_name", !"selector"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_mixed_pointer_alias_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    let uchar = module
+        .types_global_values
+        .iter()
+        .find(|inst| {
+            inst.class.opcode == Op::TypeInt
+                && inst.operands == [Operand::LiteralBit32(8), Operand::LiteralBit32(0)]
+        })
+        .and_then(|inst| inst.result_id);
+    assert!(
+        !asm.lines().any(|line| line.contains("OpPhi %_ptr")),
+        "{asm}"
+    );
+    assert!(
+        uchar.is_none_or(|uchar| module.functions.iter().all(|function| function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .all(|inst| inst.class.opcode != Op::Load || inst.result_type != Some(uchar)))),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn native_raw_phi_mixes_word_and_byte_indices_for_device_atomic() {
     // The inner phi starts from the raw buffer root while its backedge is a forward GEP, so it is
@@ -1253,7 +1545,7 @@ fn native_raw_phi_mixes_word_and_byte_indices_for_device_atomic() {
     // choosing word indices from only the root arm loses the join cursor and sends the atomic to
     // the unmodeled Workgroup stand-in instead of the StorageBuffer.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @nested_raw_atomic(ptr addrspace(1) %out, i1 %take_inner) {
 entry:
@@ -1330,7 +1622,7 @@ declare i32 @air.atomic.global.load.i32(ptr addrspace(1), i32, i32, i1)
 #[test]
 fn native_raw_pointer_phi_accepts_aligned_dynamic_byte_offset() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @walk_raw_buffer(ptr addrspace(2) %p, i1 %wide, i32 %limit) {
 entry:
   %tag = load i32, ptr addrspace(2) %p
@@ -1359,9 +1651,84 @@ exit:
 }
 
 #[test]
+fn native_reinterpret_mix_uses_selective_raw_roots_without_retry() {
+    let ll = r#"
+target triple = "air64-apple-macosx14.0.0"
+define void @k(ptr addrspace(2) %floats, ptr addrspace(2) %halves, ptr addrspace(1) %out, ptr addrspace(2) %control) {
+entry:
+  %flag = load i32, ptr addrspace(2) %control, align 4
+  %cond = icmp eq i32 %flag, 0
+  %float_root = getelementptr float, ptr addrspace(2) %floats, i64 0
+  %half_root = getelementptr half, ptr addrspace(2) %halves, i64 0
+  %float_view = bitcast ptr addrspace(2) %float_root to ptr addrspace(2)
+  %half_view = bitcast ptr addrspace(2) %half_root to ptr addrspace(2)
+  %selected = select i1 %cond, ptr addrspace(2) %half_view, ptr addrspace(2) %float_view
+  br i1 %cond, label %left, label %right
+
+left:
+  %left_ptr = getelementptr <4 x float>, ptr addrspace(2) %selected, i64 1
+  br label %merge
+
+right:
+  %right_ptr = getelementptr <4 x float>, ptr addrspace(2) %selected, i64 2
+  br label %merge
+
+merge:
+  %source = phi ptr addrspace(2) [ %left_ptr, %left ], [ %right_ptr, %right ]
+  %value = load <4 x float>, ptr addrspace(2) %source, align 16
+  store <4 x float> %value, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.function_constant", !7, !"air.buffer", !"air.location_index", i32 29, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"floats"}
+!4 = !{i32 1, !"air.function_constant", !8, !"air.buffer", !"air.location_index", i32 29, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"halves"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"control"}
+!7 = !{ptr addrspace(2) @float_enabled, !"bool", !"float_enabled"}
+!8 = !{ptr addrspace(2) @half_enabled, !"bool", !"half_enabled"}
+"#;
+    let parsed = super::super::ir::LlModule::parse(ll).expect("parse AIR");
+    assert_eq!(
+        parsed.metadata_fc_buffer_locations,
+        HashMap::from([
+            (("k".to_string(), "%floats".to_string()), 29),
+            (("k".to_string(), "%halves".to_string()), 29),
+        ])
+    );
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpTypeRuntimeArray"), "{asm}");
+    assert!(!asm.contains("PhysicalStorageBuffer"), "{asm}");
+    let module = load_bytes(&spv).expect("load native spv");
+    assert!(!module.all_inst_iter().any(|inst| {
+        inst.class.opcode == Op::Bitcast
+            && inst
+                .result_type
+                .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
+    }));
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_reinterpret_mix_selective_raw_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_modeled_pointer_phi_materializes_gep_backedge_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @walk_modeled_float(ptr addrspace(1) %p, i32 %base, i32 %limit) {
 entry:
   %start = getelementptr inbounds float, ptr addrspace(1) %p, i32 %base
@@ -1405,9 +1772,252 @@ exit:
 }
 
 #[test]
+fn native_function_pointer_phi_is_an_index_phi_by_construction() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define float @walk_private(i32 %limit) {
+entry:
+  %values = alloca [8 x float], align 16
+  %start = getelementptr inbounds [8 x float], ptr %values, i32 0, i32 0
+  br label %loop
+
+loop:
+  %cursor = phi ptr [ %start, %entry ], [ %next, %body ]
+  %i = phi i32 [ 0, %entry ], [ %inc, %body ]
+  %value = load float, ptr %cursor, align 4
+  %inc = add i32 %i, 1
+  %done = icmp eq i32 %inc, %limit
+  br i1 %done, label %exit, label %body
+
+body:
+  %next = getelementptr inbounds float, ptr %cursor, i32 1
+  br label %loop
+
+exit:
+  ret float %value
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load native spv");
+    let function_pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer
+                && instruction.operands.first()
+                    == Some(&Operand::StorageClass(StorageClass::Function)))
+            .then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert!(module.all_inst_iter().any(|instruction| {
+        instruction.class.opcode == Op::Phi
+            && instruction
+                .result_type
+                .is_some_and(|ty| !function_pointer_types.contains(&ty))
+    }));
+    assert!(!module.all_inst_iter().any(|instruction| {
+        instruction.class.opcode == Op::Phi
+            && instruction
+                .result_type
+                .is_some_and(|ty| function_pointer_types.contains(&ty))
+    }));
+    for block in &module.functions.first().expect("function").blocks {
+        let phi_count = block
+            .instructions
+            .iter()
+            .take_while(|instruction| instruction.class.opcode == Op::Phi)
+            .count();
+        assert!(block.instructions[phi_count..]
+            .iter()
+            .all(|instruction| instruction.class.opcode != Op::Phi));
+    }
+}
+
+#[test]
+fn native_multi_index_function_pointer_phi_is_built_from_differing_index_phis() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define float @choose_private(i1 %choose) {
+entry:
+  %values = alloca [2 x [4 x float]], align 16
+  %left = getelementptr inbounds [2 x [4 x float]], ptr %values, i32 0, i32 0, i32 1
+  %right = getelementptr inbounds [2 x [4 x float]], ptr %values, i32 0, i32 1, i32 2
+  br i1 %choose, label %take_left, label %take_right
+
+take_left:
+  br label %merge
+
+take_right:
+  br label %merge
+
+merge:
+  %cursor = phi ptr [ %left, %take_left ], [ %right, %take_right ]
+  %value = load float, ptr %cursor, align 4
+  ret float %value
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load native spv");
+    let function_pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer
+                && instruction.operands.first()
+                    == Some(&Operand::StorageClass(StorageClass::Function)))
+            .then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert!(!module.all_inst_iter().any(|instruction| {
+        instruction.class.opcode == Op::Phi
+            && instruction
+                .result_type
+                .is_some_and(|ty| function_pointer_types.contains(&ty))
+    }));
+    let integer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypeInt).then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        module
+            .all_inst_iter()
+            .filter(|instruction| {
+                instruction.class.opcode == Op::Phi
+                    && instruction
+                        .result_type
+                        .is_some_and(|ty| integer_types.contains(&ty))
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn native_workgroup_phi_materializes_incoming_pointers_on_predecessor_edges() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @merge_workgroup(ptr addrspace(3) %p, i1 %choose) {
+entry:
+  br i1 %choose, label %left, label %right
+
+left:
+  br label %merge
+
+right:
+  br label %merge
+
+merge:
+  %selected = phi ptr addrspace(3) [ %p, %left ], [ %p, %right ]
+  store i32 7, ptr addrspace(3) %selected, align 4
+  ret void
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load native spv");
+    let function = module.functions.first().expect("function");
+    let mut definitions = HashMap::new();
+    for block in &function.blocks {
+        let label = block
+            .label
+            .as_ref()
+            .and_then(|label| label.result_id)
+            .expect("block label");
+        let mut saw_non_phi = false;
+        for inst in &block.instructions {
+            if inst.class.opcode == Op::Phi {
+                assert!(!saw_non_phi, "phi after ordinary instruction: {block:?}");
+            } else {
+                saw_non_phi = true;
+            }
+            if let Some(result) = inst.result_id {
+                definitions.insert(result, (label, inst.class.opcode));
+            }
+        }
+    }
+
+    let mut materialized_incomings = 0;
+    for block in &function.blocks {
+        for phi in block
+            .instructions
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Phi)
+        {
+            for pair in phi.operands.chunks(2) {
+                let [Operand::IdRef(value), Operand::IdRef(predecessor)] = pair else {
+                    continue;
+                };
+                let Some((definition_block, opcode)) = definitions.get(value) else {
+                    continue;
+                };
+                assert_eq!(definition_block, predecessor, "{phi:?}");
+                if matches!(
+                    opcode,
+                    Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+                ) {
+                    materialized_incomings += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(materialized_incomings, 2);
+}
+
+#[test]
+fn native_structured_merges_are_constructed_next_to_their_terminators() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define float @selection_and_loop(i1 %choose, i32 %limit, float %x) {
+entry:
+  %neg = fneg float %x
+  br i1 %choose, label %left, label %right
+
+left:
+  br label %join
+
+right:
+  br label %join
+
+join:
+  %initial = phi float [ %x, %left ], [ %neg, %right ]
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %join ], [ %next, %body ]
+  %value = phi float [ %initial, %join ], [ %sum, %body ]
+  %done = icmp eq i32 %i, %limit
+  br i1 %done, label %exit, label %body
+
+body:
+  %next = add i32 %i, 1
+  %sum = fadd float %value, %x
+  br label %loop
+
+exit:
+  ret float %value
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load native spv");
+    let mut merge_count = 0;
+    for block in &module.functions.first().expect("function").blocks {
+        for (index, instruction) in block.instructions.iter().enumerate() {
+            if !matches!(instruction.class.opcode, Op::SelectionMerge | Op::LoopMerge) {
+                continue;
+            }
+            merge_count += 1;
+            assert_eq!(index + 2, block.instructions.len(), "{block:?}");
+        }
+    }
+    assert_eq!(merge_count, 2);
+}
+
+#[test]
 fn native_pointer_phi_uses_zero_index_for_root_bypass() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @merge_with_root_bypass(ptr addrspace(1) %p, i1 %advance, i1 %again) {
 entry:
   br label %loop
@@ -1447,9 +2057,51 @@ merge:
 }
 
 #[test]
+fn native_pointer_phi_undef_arm_merges_branch_local_dynamic_index() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Buffer = type { [64 x float] }
+
+define float @main(ptr addrspace(1) %buffer, i1 %present, i64 %base) {
+entry:
+  br i1 %present, label %concrete, label %merge
+
+concrete:
+  %branch.index = add i64 %base, 1
+  %pointer = getelementptr inbounds %Buffer, ptr addrspace(1) %buffer, i64 0, i32 0, i64 %branch.index
+  br label %merge
+
+merge:
+  %selected = phi ptr addrspace(1) [ %pointer, %concrete ], [ undef, %entry ]
+  %value = load float, ptr addrspace(1) %selected, align 4
+  ret float %value
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let mut module = load_bytes(&spv).expect("load native spv");
+    module.capabilities.push(Instruction::new(
+        Op::Capability,
+        None,
+        None,
+        vec![Operand::Capability(Capability::Linkage)],
+    ));
+    let failure = super::super::owned_module_failure(&module).map(|failure| match failure {
+        super::super::OwnedModuleFailure::Invalid(error)
+        | super::super::OwnedModuleFailure::CfgConstruction(error)
+        | super::super::OwnedModuleFailure::TypeConstruction(error)
+        | super::super::OwnedModuleFailure::RawBufferConstruction(error) => error,
+    });
+    assert!(
+        failure.is_none(),
+        "{failure:?}\n{}",
+        disassemble(&spv).expect("disassemble")
+    );
+}
+
+#[test]
 fn native_buffer_pointer_phi_root_and_gep_backedge_share_result_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Atomic = type { i32 }
 
 define void @k(ptr addrspace(1) %histogram, i32 %stride) {
@@ -1509,7 +2161,7 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn native_phi_gep_infers_buffer_param_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out, ptr addrspace(1) %wt, i32 %limit) {
 entry:
   br label %loop
@@ -1538,7 +2190,7 @@ exit:
 #[test]
 fn native_scalar_pointer_vector_load_from_phi_root() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @load_vec_from_phi_root(ptr addrspace(1) %p, i1 %advance) {
 entry:
   br label %loop
@@ -1577,7 +2229,7 @@ exit:
 #[test]
 fn native_workgroup_phi_scalar_pointer_vector_load_uses_lane_loads() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @load_workgroup_vec_from_phi(ptr addrspace(3) %scratch, i1 %done) {
 entry:
   %seed = getelementptr inbounds float, ptr addrspace(3) %scratch, i64 0
@@ -1610,7 +2262,7 @@ exit:
 #[test]
 fn native_kernel_threadgroup_vector_phi_uses_scalar_backing_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out, i32 %done) {
 entry:
   %seed = getelementptr inbounds float, ptr addrspace(3) %scratch, i64 0
@@ -1666,7 +2318,7 @@ exit:
 #[test]
 fn native_kernel_threadgroup_helper_vector_phi_uses_callsite_scalar_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out, i32 %done) {
 entry:
   %seed = getelementptr inbounds float, ptr addrspace(3) %scratch, i64 0
@@ -1728,7 +2380,7 @@ exit:
 #[test]
 fn native_pointer_phi_eq_null_uses_tracked_nullness() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @is_null(i1 %cond, ptr addrspace(1) %p) {
 entry:
   br i1 %cond, label %null, label %nonnull
@@ -1754,7 +2406,7 @@ merge:
 #[test]
 fn native_guard_branch_with_blank_line_gets_selection_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @guard(float %x) {
 entry:
   %c = fcmp oeq float %x, 0.000000e+00
@@ -1778,7 +2430,7 @@ declare void @air.discard_fragment()
 #[test]
 fn native_conditional_branch_ignores_metadata_operands() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @guard(float %x) {
 entry:
   %c = fcmp ogt float %x, 0.000000e+00
@@ -1800,7 +2452,7 @@ exit:
 #[test]
 fn native_multiblock_branch_phi_and_fcmp_lower() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @pick(float %x) {
 entry:
   %c = fcmp ogt float %x, 5.000000e-01
@@ -1826,7 +2478,7 @@ merge:
 #[test]
 fn native_switch_lowers_to_structured_op_switch() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @pick(i8 %tag, float %x) {
 entry:
   switch i8 %tag, label %default [
@@ -1855,7 +2507,7 @@ merge:
 #[test]
 fn native_switch_default_unreachable_uses_live_case_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @pick(i32 %tag, half %x) {
 entry:
   switch i32 %tag, label %bad [
@@ -1925,12 +2577,12 @@ fn native_switch_bypass_phi_carrier_rewrites_incomings() {
             .insts
             .iter()
             .find(|inst| inst.result.as_deref() == Some(phi))
-            .and_then(|inst| inst.phi_incoming.as_ref())
+            .and_then(|inst| inst.phi_incoming().as_ref())
             .map(|(_, incoming)| incoming.iter().map(|(_, pred)| pred.clone()).collect())
             .unwrap_or_default()
     }
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @pick(i32 %tag, half %x, i1 %cond) {
 entry:
   switch i32 %tag, label %bad [
@@ -2000,7 +2652,7 @@ merge:
 #[test]
 fn native_switch_merge_skips_intermediate_phi_when_case_can_bypass_it() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @pick(i32 %tag, half %x, i1 %cond) {
 entry:
   switch i32 %tag, label %bad [
@@ -2060,9 +2712,9 @@ merge:
 }
 
 #[test]
-fn native_switch_default_branch_to_case_target_lowers_to_ladder() {
+fn native_switch_default_branch_to_case_target_is_renested_as_a_valid_switch() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @pick(i32 %tag, i1 %outer, float %x) {
 entry:
   br i1 %outer, label %sw, label %outer_merge
@@ -2113,7 +2765,7 @@ outer_merge:
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
-    assert!(!asm.contains("OpSwitch"), "{asm}");
+    assert!(asm.contains("OpSwitch"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -2124,9 +2776,65 @@ outer_merge:
 }
 
 #[test]
-fn native_switch_default_nested_switch_to_shared_case_lowers_to_ladder() {
+fn native_switch_adjacent_case_chain_remains_valid_by_construction() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
+define i32 @pick(i32 %tag) {
+entry:
+  switch i32 %tag, label %merge [
+i32 3, label %a
+i32 2, label %b
+i32 1, label %c
+  ]
+
+a:
+  %av = add i32 %tag, 1
+  br label %b
+
+b:
+  %bin = phi i32 [ 0, %entry ], [ %av, %a ]
+  %bv = add i32 %bin, 2
+  br label %c
+
+c:
+  %cin = phi i32 [ 0, %entry ], [ %bv, %b ]
+  %cv = add i32 %cin, 3
+  br label %merge
+
+merge:
+  %result = phi i32 [ 0, %entry ], [ %cv, %c ]
+  ret i32 %result
+}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_adjacent_switch_cases_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("pick"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("OpSwitch"), "{asm}");
+    assert!(asm.contains("OpSelectionMerge"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    std::fs::remove_dir_all(&tmp).expect("remove validation scratch");
+}
+
+#[test]
+fn native_switch_default_nested_switch_to_shared_case_is_renested_as_valid_switches() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i32 %outer, i32 %inner) {
 entry:
   switch i32 %outer, label %default [
@@ -2163,7 +2871,7 @@ merge:
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
-    assert!(asm.contains("OpBranchConditional"), "{asm}");
+    assert_eq!(asm.matches("OpSwitch").count(), 2, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -2213,7 +2921,7 @@ fn native_branch_merge_skips_shared_tail_with_external_case_entry() {
 #[test]
 fn native_nested_switches_do_not_redeclare_shared_merge_block() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   switch i8 1, label %merge [
@@ -2245,7 +2953,7 @@ merge:
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
-    assert_eq!(asm.matches("OpSwitch").count(), 2, "{asm}");
+    assert_eq!(asm.matches("OpSwitch").count(), 0, "{asm}");
     let merges = asm
         .lines()
         .filter(|line| line.contains("OpSelectionMerge"))
@@ -2265,7 +2973,7 @@ merge:
 #[test]
 fn native_nested_loop_latch_can_precede_exit_block() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(float %x) {
 entry:
   br label %outer
@@ -2320,7 +3028,7 @@ inner:
 #[test]
 fn native_loop_header_emits_loop_merge_for_latch_backedge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -2368,7 +3076,7 @@ exit:
 #[test]
 fn native_nested_loop_latch_to_outer_continue_validates() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %outer
@@ -2429,7 +3137,7 @@ exit:
 #[test]
 fn native_early_loop_continue_moves_after_late_phi_predecessor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -2486,10 +3194,11 @@ exit:
 #[test]
 fn native_early_single_predecessor_target_moves_after_late_phi_join() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
-  br i1 true, label %then, label %else
+  %condition = icmp eq i32 0, 0
+  br i1 %condition, label %then, label %else
 
 target:
   ret void
@@ -2510,7 +3219,7 @@ join:
         "metal2vulkan_native_late_single_pred_{}",
         std::process::id()
     ));
-    let _ = std::fs::create_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create validation scratch");
     let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
     let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
         .expect("interface transform")
@@ -2527,12 +3236,13 @@ join:
     {
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
     }
+    std::fs::remove_dir_all(&tmp).expect("remove validation scratch");
 }
 
 #[test]
 fn native_loop_header_selection_is_split_to_body_block() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -2584,7 +3294,7 @@ exit:
 #[test]
 fn native_loop_header_else_if_selection_uses_shared_join() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %loop
@@ -2659,7 +3369,7 @@ exit:
 #[test]
 fn native_nested_latch_selection_does_not_create_spurious_loop_header() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   br label %outer
@@ -2861,7 +3571,7 @@ fn native_branch_inference_skips_bypassable_early_exit() {
 #[test]
 fn native_switch_merge_with_bypass_predecessor_is_split() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %skip = icmp eq i32 0, 0
@@ -2905,7 +3615,7 @@ merge:
 #[test]
 fn native_split_switch_merge_rewrites_nested_branch_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %skip = icmp eq i32 0, 0
@@ -2963,7 +3673,7 @@ merge:
 #[test]
 fn native_selection_with_shared_branch_target_clones_target() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i1 %outer, i1 %inner, float %x) {
 entry:
   br i1 %outer, label %shared, label %inner_header
@@ -3011,7 +3721,7 @@ merge:
 #[test]
 fn native_selection_or_chain_shared_target_is_cloned() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i1 %first, i1 %second, float %x) {
 entry:
   br i1 %first, label %shared, label %check_second
@@ -3049,7 +3759,7 @@ merge:
 #[test]
 fn native_selection_with_shared_branch_target_clones_reachable_region() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i1 %outer, i1 %inner, i1 %deep, float %x) {
 entry:
   br i1 %outer, label %shared, label %inner_header
@@ -3101,7 +3811,7 @@ merge:
 }
 
 #[test]
-fn native_pre_phi_pointer_materialization_moves_to_incoming_predecessor() {
+fn native_phi_edge_materializations_attach_before_predecessor_merge() {
     let mut blocks = vec![
         Block {
             label: Some(Instruction::new(Op::Label, None, Some(1), vec![])),
@@ -3217,7 +3927,7 @@ fn native_pre_phi_pointer_materialization_moves_to_incoming_predecessor() {
         },
     ];
     let ir = super::super::ir::LlModule::parse(
-        r#"target triple = "spirv-unknown-vulkan1.3"
+        r#"target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   ret void
@@ -3227,7 +3937,23 @@ entry:
     .expect("parse empty module");
     let mut emitter = Emitter::new(ir);
 
-    emitter.repair_pre_phi_incoming_materializations(&mut blocks);
+    let target = blocks
+        .iter_mut()
+        .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(4))
+        .expect("target block");
+    let mut edge_instructions = Vec::new();
+    target.instructions.retain(|inst| {
+        if matches!(inst.result_id, Some(70 | 80)) {
+            edge_instructions.push(inst.clone());
+            false
+        } else {
+            inst.result_id != Some(75)
+        }
+    });
+    emitter.record_phi_edge_instructions(1, edge_instructions);
+    emitter
+        .attach_phi_edge_instructions(&mut blocks)
+        .expect("attach phi edges");
 
     let pred = blocks
         .iter()
@@ -3271,7 +3997,7 @@ entry:
 #[test]
 fn native_conditional_continue_backedge_validates() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i1 %skip, i1 %done, i1 %exit, float %x) {
 entry:
   br i1 %skip, label %merge, label %loop
@@ -3318,7 +4044,7 @@ merge:
 #[test]
 fn native_inner_branch_to_switch_merge_gets_own_synthetic_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   switch i32 0, label %merge [
@@ -3365,7 +4091,7 @@ merge:
 #[test]
 fn native_nested_branch_reuses_inner_conditional_merge() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %outer = icmp eq i32 0, 0
@@ -3412,7 +4138,7 @@ exit:
 #[test]
 fn native_selection_with_nested_shared_branch_target_clones_target() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i1 %outer, i1 %skip, i1 %inner, float %x) {
 entry:
   br i1 %outer, label %shared, label %top
@@ -3469,7 +4195,7 @@ merge:
 #[test]
 fn native_selection_phi_passthrough_target_with_external_pred_is_cloned() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %outer = icmp eq i32 0, 0
@@ -3517,7 +4243,7 @@ merge:
 #[test]
 fn native_branch_merge_can_be_later_reachable_target() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %skip = icmp eq i32 0, 0
@@ -3559,7 +4285,7 @@ exit:
 #[test]
 fn native_branch_merge_skips_bypassable_early_exit() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %outer = icmp eq i32 0, 0
@@ -3609,7 +4335,7 @@ merge:
 #[test]
 fn native_nested_branch_merge_can_be_shared_later_target() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %outer = icmp eq i32 0, 0
@@ -3673,7 +4399,7 @@ merge:
 #[test]
 fn native_loop_merge_with_bypass_predecessor_is_split() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %skip = icmp eq i32 0, 0
@@ -3722,7 +4448,7 @@ merge:
 #[test]
 fn native_backward_layout_loop_merge_with_bypass_is_split() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %skip = icmp eq i32 0, 0
@@ -3771,7 +4497,7 @@ cont:
 #[test]
 fn native_switch_accepts_signed_case_literals() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @signed_pick(i8 %tag) {
 entry:
   switch i8 %tag, label %zero [
@@ -3797,7 +4523,7 @@ merge:
 #[test]
 fn native_switch_rejects_out_of_range_negative_case_literals() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @signed_pick(i8 %tag) {
 entry:
   switch i8 %tag, label %zero [
@@ -3822,7 +4548,7 @@ merge:
 #[test]
 fn native_phi_splat_constant_uses_constant_composite() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @phi_splat(float %s, <4 x float> %x) {
 entry:
   %c = fcmp ogt float %s, 0.000000e+00
@@ -3848,7 +4574,7 @@ merge:
 #[test]
 fn native_phi_vector_literal_with_undef_lane_uses_constant_composite() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @phi_vector_undef_lane(i1 %c) {
 entry:
   br i1 %c, label %a, label %b
@@ -3874,7 +4600,7 @@ merge:
 #[test]
 fn native_phi_accepts_forward_backedge_values() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x float> @loop_phi(<4 x float> %x) {
 entry:
   br label %loop
@@ -3902,7 +4628,7 @@ exit:
 #[test]
 fn native_branch_condition_accepts_forward_predecessor_value() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @forward_branch_condition(i1 %c) {
 entry:
   br label %producer
@@ -3977,9 +4703,9 @@ no:
 }
 
 #[test]
-fn native_phi_dedupes_identical_incoming_from_same_predecessor() {
+fn native_phi_canonicalizes_identical_incoming_from_same_predecessor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @same_pred_phi(i8 %tag) {
 entry:
   switch i8 %tag, label %merge [
@@ -3992,17 +4718,14 @@ merge:
 }
 "#;
     let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
-    let phi = asm
-        .lines()
-        .find(|line| line.contains("OpPhi"))
-        .unwrap_or_else(|| panic!("missing OpPhi in {asm}"));
-    assert_eq!(phi.split_whitespace().count(), 6, "{asm}");
+    assert!(!asm.contains("OpPhi"), "{asm}");
+    assert!(asm.contains("OpReturnValue"), "{asm}");
 }
 
 #[test]
 fn native_bool_phi_dedupes_identical_incoming_from_same_predecessor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @same_pred_bool_phi(i8 %tag) {
 entry:
   switch i8 %tag, label %default [
@@ -4029,7 +4752,7 @@ merge:
 #[test]
 fn native_small_int_phi_dedupes_identical_incoming_from_same_predecessor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i8 @same_pred_i8_phi(i8 %tag) {
 entry:
   switch i8 %tag, label %default [
@@ -4056,7 +4779,7 @@ merge:
 #[test]
 fn native_vector_zero_phi_dedupes_identical_incoming_from_same_predecessor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <4 x i32> @same_pred_vec_phi(i8 %tag) {
 entry:
   switch i8 %tag, label %default [
@@ -4083,7 +4806,7 @@ merge:
 #[test]
 fn native_nested_quoted_named_types_resolve_for_gep() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.RB::Shader::Globals.23" = type { %"struct.RB::Shader::PrimitiveGlobals" }
 %"struct.RB::Shader::PrimitiveGlobals" = type { [2 x float], half }
 define half @primitive_field(ptr addrspace(2) %g) {
@@ -4293,7 +5016,7 @@ def:
 #[test]
 fn native_i24_constant_legalizes_and_validates() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(i32 %x) {
 entry:
   %n = trunc i32 %x to i24
@@ -4301,6 +5024,7 @@ entry:
   %z = zext i24 %a to i32
   ret void
 }
+
 "#;
     let tmp = std::env::temp_dir().join(format!("metal2vulkan_native_i24_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp);
@@ -4318,6 +5042,10 @@ entry:
         !asm.contains("OpTypeInt 24 "),
         "i24 must legalize away:\n{asm}"
     );
+    assert!(
+        !asm.contains("OpUConvert"),
+        "i24 and i32 share one emitted storage type, so conversion must be valid at construction:\n{asm}"
+    );
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -4325,4 +5053,38 @@ entry:
     {
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
     }
+}
+
+#[test]
+fn native_i24_signed_extension_restores_logical_sign_bit() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @main(i32 %x) {
+entry:
+  %n = trunc i32 %x to i24
+  %s = sext i24 %n to i32
+  ret void
+}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_i24_sext_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let raw = emit_vulkan_spirv(ll).expect("native emit i24 sext");
+    let module = load_bytes(&raw).expect("load");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble");
+    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
+    assert!(asm.contains("OpShiftRightArithmetic"), "{asm}");
+    assert!(
+        !asm.contains("OpSConvert"),
+        "i24 and i32 share one emitted storage type:\n{asm}"
+    );
+    tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
 }

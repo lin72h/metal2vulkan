@@ -35,7 +35,7 @@ impl Emitter {
                 let false_label = f.trim();
                 if let Some(loop_merge) = self.current_loop_merge() {
                     self.emit_loop_merge(&loop_merge, instructions)?;
-                } else if !self.current_branch_is_loop_continue(true_label, false_label) {
+                } else {
                     let header_merge = self
                         .current_block
                         .as_ref()
@@ -109,7 +109,7 @@ impl Emitter {
             // `value_id_in` the text path ran). `FromText` (the ret operand did not `parse_typed_value`
             // at build) is a fail-visible error — the emission substrate `terminator_text` is retired, and
             // this fallback is measured dead broadly (0 / 16942 frontier + 0 / 15,336 banked), so a
-            // hit routes to the retry cascade, which re-parses the sanitized AIR from scratch.
+            // hit is returned as an unsupported typed-carrier error.
             TirTerminator::Ret(v) => match ret {
                 RetEmit::Void => {
                     instructions.push(Self::inst(Op::Return, None, None, vec![]));
@@ -133,7 +133,7 @@ impl Emitter {
             // `switch` emits entirely from the typed `LlSwitch` carrier (built via the byte-identical
             // text-path `parse_switch`). `None` (the operands did not strict-parse at build) is a
             // fail-visible error for the same retired-substrate reason as `ret` above — measured dead
-            // broadly, routes to the retry cascade.
+            // broadly.
             TirTerminator::Switch {
                 selector, default, ..
             } => match switch {
@@ -149,19 +149,6 @@ impl Emitter {
     pub(in crate::native::emitter) fn current_loop_merge(&self) -> Option<LoopMergeInfo> {
         let block = self.current_block.as_ref()?;
         self.loop_merges.get(block).cloned()
-    }
-
-    fn current_branch_is_loop_continue(&self, true_label: &str, false_label: &str) -> bool {
-        let Some(block) = self.current_block.as_ref() else {
-            return false;
-        };
-        self.loop_merges
-            .get(true_label)
-            .is_some_and(|info| info.merge == false_label && info.continue_target == *block)
-            || self
-                .loop_merges
-                .get(false_label)
-                .is_some_and(|info| info.merge == true_label && info.continue_target == *block)
     }
 
     pub(in crate::native::emitter) fn emit_loop_merge(

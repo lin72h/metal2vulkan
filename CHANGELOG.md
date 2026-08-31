@@ -9,12 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Bounded translation censuses now consume exact authored visible-function-table populations inside
+  the isolated worker, using hash-local case lookup and the same checked linkage mapping as Vulkan
+  candidate execution; only rows with no authored population remain linkage-required.
 - Public `specialize_function_constants_zero` helper for baking discovered Metal function
   constants to their zero/default values, including branch pruning and removal of now-dead entry
   interface globals.
 - Public byte-exact function-constant specialization, reflection-only AIR inspection, authored
   linked-function/table specialization, and vertex-observer generation APIs.
-- Reflection schema v29: consumer metadata now covers decoded static samplers, texture shape and
+- AIR-level scalar/vector function-constant translation APIs that specialize stable
+  `air.fc_initializer` globals before metadata, resource-interface, and CFG construction.
+- Reflection schema v30: consumer metadata now covers decoded static samplers, texture shape and
   access, argument-buffer resources, kernel stage inputs, tessellation, imageblocks, exact function-
   constant ABI types, buffer extent/access classification, and conservative final-module static and
   invocation-strided buffer footprints, plus runtime sampler/storage-image specialization and the
@@ -24,15 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   existing layout as the explicit default.
 - Runtime pipeline-state specialization by Metal resource index for dynamically bound samplers and
   writable storage images, including embedded argument-buffer textures, exact reflected sampler and
-  image-format state, and host storage-image feature checks.
-- A typed kernel dispatch-grid ABI that safely defaults every kernel to a per-dispatch push-constant
-  grid, with fixed and explicitly proven whole-workgroup forms reflected for consumers and exposed
-  through matching CLI options.
+  image-format state (including two-channel `Rg32Float`), and host storage-image feature checks.
+- A typed exact-thread dispatch ABI that decomposes Metal boundary workgroups into at most eight
+  Vulkan regions, with specialized local sizes, logical grid bases, public planning helpers, and
+  fixed, dynamic, and explicitly proven whole-workgroup forms.
 - A task-oriented translation and reflection integration guide plus a compiled serde reflection
   example.
-- Additional stage-interface support for fragment `[[point_coord]]`, `[[primitive_id]]`, and
-  `[[sample_id]]`, flat varyings, framebuffer-fetch color inputs, vertex builtins, and fragment
-  outputs with nonzero render-target locations.
+- Additional stage-interface support for fragment `[[point_coord]]`, `[[primitive_id]]`,
+  `[[sample_id]]`, and `[[render_target_array_index]]`, flat varyings, framebuffer-fetch color
+  inputs, vertex builtins, and fragment outputs with nonzero render-target locations.
 - Broader native translation support for texture arrays, storage-image arrays, texture
   gather/sample/read/write variants, half/integer render-target formats, scalar 64-bit integer
   arithmetic, and Workgroup memory patterns used by shared-memory reductions.
@@ -44,12 +49,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transpose operands and 32-lane tile ownership.
 - Authored validation contracts and executable Metal/Vulkan cases for tessellation, depth/stencil
   attachments, framebuffer fetch, multisample and buffer textures, narrow vertex attributes,
-  vertex side effects, function constants, argument buffers, imageblocks, and ray intersections.
+  vertex side effects, function constants, argument buffers, imageblocks, ray intersections, and
+  exact empty observations for entries with no reflected writable output, including rejection of
+  vertex positions and varyings as observable outputs.
+- Byte-exact Metal/MoltenVK evidence now covers every public synthetic AIR fixture, including vector
+  function-constant lanes, barrier-bearing boundary workgroups, narrow vertex attributes, combined
+  depth/stencil, and custom and implicit imageblocks, plus indexed local identities for
+  unconditional word stores, signed min/max initialization, grid-indexed byte clears, and exact
+  grid-index sequence generation, parameter-free scalar and vector fragment returns (including a
+  sparse color-location-2 target and scalar half targets), and constant-zero vertex positions
+  observed through their exact non-rasterizing framebuffer result, plus two-channel float fragment
+  targets, fragment position-depth extraction, and a pixel-coordinate sampled vertical convolution
+  with explicit sampler state, weights, bounds, and bias. Constant scalar/vector fragment evidence
+  now also covers half, float, and uint targets, while dual-output fragment clears qualify both
+  attachments independently for half4 and float4 formats. Authored Vulkan draws now mirror Metal's
+  default clockwise front-face winding, with byte-exact coverage for `[[front_facing]]`, primitive
+  IDs, generated float/half fragment varyings across additional independently indexed AIR
+  identities, scalar float-to-half varying conversion, and constant outputs whose unused stage
+  inputs include viewport indices. Additional authored vertex evidence observes generated
+  ushort-ID positions and independently captures passthrough position and float2 varying outputs;
+  fragment evidence also covers flat uint varyings, scalar depth expansion, and independently
+  selected sparse color attachments. Exact vertex observation now additionally covers forced-zero
+  clip-space depth, paired position/float2 passthrough outputs, and deterministic position results
+  beside explicitly undefined return members; fragment coverage includes alpha-to-half4 conversion,
+  aggregate flat-uint returns, and viewport-bearing varying passthrough.
+  The indexed evidence set additionally covers float2/float3 clip-position expansion, paired
+  float2 vertex varyings, scalar and vector float-to-half fragment conversion, flat-boolean color
+  selection, fog-alpha multiplication, empty texture kernels that preserve their selected bytes,
+  and a rasterization-disabled vertex side-effect store.
+  A complete indexed texture-copy family now has byte-exact coverage for flat and array-layer
+  half-texture reads, including explicit function-constant specialization of the flat alternative.
+  The complete indexed `backgroundFragment` family now has fresh byte-exact Metal/MoltenVK evidence
+  for constant and sampled outputs, including two function-constant-selected gradient textures.
+  The complete eight-identity `Clear::clear_fragment{,2,3,4}` suite now has byte-exact evidence for
+  constant-buffer float-to-half conversion and aggregate output mapping through four render targets.
+  Attachmentless fragment draws now execute on Metal with explicit render-pass dimensions, without
+  synthesizing an observable attachment. The two-identity `Clear::clear_depth_stencil_fragment`
+  family has exact empty-output Metal/MoltenVK evidence for its structural void-return contract.
+  The complete four-identity `Clear::clear_vertex{,_mrt}` family has exact Metal/MoltenVK position
+  observations for float2 vertex attributes expanded with buffer-supplied clip-space depth.
+  The complete six-identity `FullscreenFragment{DepthStencil,Overlay,Texture}` suite has exact
+  Metal/MoltenVK evidence for static-sampler half-texture reads, including red-lane replication,
+  uniform-color multiplication, and RGB widening to RGBA32Float outputs.
+  The complete six-identity `ARMesh::{mesh_depth_fragment,ar_mesh_shadow_fragment,ar_mesh_fragment}`
+  suite has exact Metal/MoltenVK evidence for literal depth, edge-weighted shadow colors, and the
+  full 2D/cube sampled-texture lighting path.
+  A complete indexed tracking-area family now covers layered textures, fixed texture arrays, and
+  function-constant-selected alternatives through eight-SIMD-group shared-memory reductions with
+  barrier-synchronized exact uint output. Complete indexed vertex families now also cover
+  vertex-ID-generated fullscreen positions across plain, viewport-indexed,
+  render-target-layer-indexed, and single-view amplification interfaces.
 - A sharded validation workflow with dependency-exact observations, an incremental SQLite source
   index, focused hash/shard selection, explicit full reclassification, capability audits, native
   Metal and Vulkan/MoltenVK A/B execution, and optional OpenRouter-authored case proposals.
 
 ### Changed
+
+- Vulkan 1.2 is now the mandatory translation and validation baseline; newer Vulkan features may
+  only be exposed as optional performance paths with faithful Vulkan 1.2 fallbacks.
+- Structured CFG plans now finalize loop-continue selection ownership before their completeness,
+  ordering, and ownership checks; typed emission no longer runs detached continue, selection-arm,
+  bypass, or reused-merge normalization after plan admission.
+- Nested loop planning now materializes inner multi-exit dispatches before recomputing enclosing
+  loop ownership, so newly synthesized exits are validly owned without a construct-tree retry.
+- A nested natural loop that exits into its enclosing selection's sibling is now owned by a typed
+  regional dispatcher before emission. Bounded scalar-only CFG rejects can use the same ownership
+  contract across the whole function, while pointer state still declines rather than being guessed;
+  terminal switches retain real dominated reconvergences and conflicting phi ownership rejects
+  before instruction emission.
+- Loop-local switches that target an enclosing loop role now lower to branch ladders before plan
+  admission, preventing source-dominance false positives from emitting invalid case constructs.
+- Imageblock scratch layout inference now follows reachable internal calls, preserving complete
+  cells when a helper byte-addresses a nonzero field instead of relying on an inlining retry.
+- Integer-width phi legalization now happens while pointer-phi transformations construct their
+  replacement index phis; retained modules are no longer rescanned or repaired after emission or
+  scalar-i64 lowering.
+- Vulkan validation uploads every sampled-only literal through a staging buffer into an
+  optimal-tiled image, so cube and other sampled shapes do not depend on optional linear-image
+  support for their exact create flags.
+- Authored output qualification now requires the shared checker to map the selection to a reflected
+  shader write, then accepts deterministic byte-identical transformations instead of requiring
+  every byte to differ from its initial value.
+- The Metal validation executor now derives render-pipeline input topology from each authored draw
+  and constructs matching array attachments and active-layer render passes for layered rendering.
+- Generated Vulkan fragment companions preserve their authored layer-zero contract through the
+  core first-layer rule, without requiring the optional Vulkan 1.2 `shaderOutputLayer` feature.
+- Authored Vulkan execution now applies function constants before AIR translation, so nondefault
+  values faithfully retain selected resources and CFG arms instead of trying to restore structure
+  after default-valued SPIR-V emission.
+- Exact Metal `dispatchThreads` kernels no longer round up and cull surplus lanes. The default
+  contract now preserves partial-workgroup barriers by dispatching true boundary workgroup sizes;
+  consumers must follow the reflected region plan and 48-byte dispatch payload.
 
 - Native emitter wrapper APIs under `tools` now use `emit_vulkan_spirv*` names that match their
   implementation.
@@ -60,17 +150,193 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Buffer, pointer, control-flow, and access-chain lowering handles more structural cases, reducing
   fallbacks and invalid SPIR-V for shaders that use dynamic indices, pointer selects, aggregate
   copies, raw subword loads/stores, and local pointer tables.
+- Opaque Metal buffers used through multiple scalar element types now retain each typed view as a
+  descriptor alias at the same binding, while genuine array element-zero accesses gain their block
+  descent and vector-stride pointers retain their vector pointee during interface construction;
+  these preserve exact byte strides without late load/store pointer repairs.
+- Exact byte-address provenance now composes through resource-wrapper collapse to the final buffer
+  descriptor, so raw 32-bit vector loads are constructed from their word lanes before validation.
+- Exact raw-word replay now derives synthesized access-chain pointer types from the concrete root's
+  storage class, eliminating detached final access-chain storage-class repairs.
+- Finalized typed CFG construction now recognizes a phi as an SSA identity only when its block has
+  one actual predecessor and every incoming pair names that predecessor with the same structural
+  value. All identities, including pointers, are substituted before SPIR-V IDs and representation
+  sidecars are constructed. This eliminates the detached phi collapse and its access-chain and
+  sampled-image type repairs.
+- Buffer-interface discovery now follows transparent pointer aliases, includes pointer-arithmetic
+  chains as typed element views, and gives mixed numeric scalar/vector views descriptor aliases at
+  the same binding. Each logical pointer is therefore valid by construction instead of being
+  retyped away from its byte loads during interface specialization.
+- Null-derived access chains are neutralized once in the main access transform; redundant
+  whole-module cleanup passes after native pointer rewrites have been removed.
+- Exact raw-byte access is replayed at the descriptor-reconstruction boundary, eliminating the
+  detached post-native replay and releasing source-only layout type graphs before final cleanup.
+- Nondominating-value demotion now explicitly preserves the CFG successor contract, eliminating
+  redundant whole-CFG repair passes after register spills.
+- Pointer-phi legalization and mixed-storage value lowering now explicitly preserve CFG successors,
+  so late structured-CFG repair runs only for an actual edge-producing loop split.
+- Multi-entry loop splitting now owns its cloned region, header phis, redirected entry, and selection
+  exit as one transaction, eliminating its detached whole-CFG repair pass.
+- Multi-exit funnels, deep shared-arm refunnelling, and multi-entry loop splitting now preserve SSA
+  dominance at their typed construction boundaries, eliminating the final emitted-module
+  nondominating-value demotion pass.
+- Construct-tree planning now assigns unreachable merge declarations for fully terminal selections
+  alongside every other header, eliminating the late missing-terminal-header completion sweep.
+- Dominated-region cloning now carries nested selection ownership through its structural rename map,
+  so enclosing-route selections are materialized locally instead of dropped and rediscovered by a
+  final missing-selection sweep.
+- Construct-tree selection construction now preserves the local live-arm ownership of direct
+  terminal guards through generic merge normalization, eliminating its repeated enclosing-escape
+  and terminal-live repair sweeps.
+- Ordinary selection construction now derives nested exits from the complete immutable source
+  ownership map and materializes their private enclosing boundaries innermost-first, eliminating
+  the late enclosing-region escape repair fixed point.
+- Construct-tree selection construction now retains complete merge ownership through enclosing
+  synthesis, eliminating its three post-construction nondominance, pass-through promotion, and
+  bypass-refunneling repair stages from the product path.
+- Construct-tree source ownership now includes nested terminal selections in its initial
+  innermost-first header census, eliminating late post-synthesis terminal-convergence completion.
+- Direct terminal ownership now consumes the complete proved linear tail before selection analysis,
+  eliminating post-construction direct-guard refunneling from the product path.
+- Selection construction now privatizes shared terminal returns when each merge owner is created,
+  eliminating the later whole-owner terminal-return fixed-point sweeps.
+- Innermost-first terminal-tail ownership now closes enclosing parents directly, removing the late
+  parent/nested merge-composition pass from production.
+- Switch merge construction now collapses proved terminal case tails when each switch owner is
+  recorded, removing the late all-switch terminal finalization sweep from production.
+- Loop-free terminal guards whose live convergence enters a later loop now defer a return shared
+  with that loop's exit to the terminal owner, which privatizes both boundaries instead of admitting
+  overlapping merge ownership.
+- Loop-exit switch lowering now includes loop headers and multi-exit loops, producing a conditional
+  ladder before planning so one block never needs both loop and selection merge ownership.
+- Switch construction now privatizes intermediate continuations shared by a subset of cases even
+  when the eventual switch merge is dominated, including loop-local suffixes whose clone does not
+  cross a loop header, latch, exit, or nested-loop boundary.
+- Construct-tree ownership now runs by default after an ordinary source-CFG planning rejection,
+  while forward SSA allocation is scoped only to functions using that reordered plan. This removes
+  a redundant emit, finish, validation, and source reparse from structurally owned large functions.
+- Switch-tail ownership now preserves SPIR-V's legal fallthrough into the immediately following case,
+  and shared-region cloning declines edges whose redirected predecessor crosses a natural-loop
+  boundary, preventing non-adjacent case entries and non-dominating loop-exit values by construction.
+- Enclosing selection owners now finish only their indexed dependent routes when the owner is
+  recorded, removing the late whole-CFG enclosing-route materialization fixed point.
+- Indexed translations retain natural emitted-loop ownership through the typed edge-producing
+  transforms, allowing the detached stale-loop reclassification adapter to leave production.
+- Translation audits now finish the 16-worker ordinary lane before starting the bounded costly-row
+  lane, including sub-megabyte CFGs whose serialized AIR reaches 256 KiB. The costly lane is capped
+  at two workers, with ≤384-KiB, 370-block/400-call CFGs isolated on one sublane while unrelated
+  large and device-address/function-table rows continue on the other, so sustained concurrency does
+  not consume the per-attempt 20-second budget. Cached outcomes now fingerprint the audit harness
+  as well as the product translator.
+- Translation audits can now resume a per-fingerprint retry-tier census in the disposable SQLite
+  index, measure exact hash-file selections, and report the complete adoption histogram without
+  reopening warm source shards.
+- Resumable translation selection now materializes the historical-failure priority set once per
+  uncursored batch instead of probing the complete audit history once for every indexed source.
+- Function-constant-wrapped visible and intersection tables now retain their shared authored-linkage
+  roles, and validation traces visible-table handles through internal helper parameters. A full
+  `--reclassify-all` authoring census now reads every indexed source under the current analyzer ABI;
+  the ordinary warm pass remains a zero-source-read incremental check. Translation workers classify
+  these structurally proven authored-linkage dependencies before spawning the product/tool cascade.
+- Direct AIR visible-function references now resolve automatically through an incremental
+  same-library symbol index when the retained definition is unique, including transitive linked
+  references; exact module byte locations keep warm and targeted lookups shard-local, while missing
+  or ambiguous definitions remain explicit authored inputs. Translation audits can resumably replay
+  historical linkage rows with `--retry-linkage`.
+- Authored visible and intersection table slots now accept exact functions from separately
+  harvested Metal libraries, matching the linked-functions API instead of imposing a false
+  same-metallib provenance rule; exact module hashes, symbol definitions, and globally unique linked
+  names remain mandatory.
+- Partial zero-initialization of typed aggregates now lowers recursively into null stores for fully
+  covered prefix subobjects, and final SPIR-V construction dependency-orders late synthesized
+  module-scope types before existing users. Linked declaration/body pairs also select the bodied
+  definition consistently during emitted-helper inlining, removing the associated empty-callee
+  panic.
+- Same-width scalar-array/vector reinterpret loads now rebuild the vector lane-by-lane with scalar
+  bitcasts, preserving logical pointer types instead of requiring the all-buffer raw retry.
+- Function-constant buffer alternatives that share one binding and mix scalar families through a
+  recurrent pointer carrier now choose byte-addressed storage plus typed construct-tree planning
+  during primary construction, instead of relying on the all-buffer raw and relooper retry cascade.
+- Function-constant pruning now owns branch folding, reachability, phi, and loop-merge closure, which
+  removes the final finish-time whole-module structured-CFG repair adapter.
+- Primary construction now checks owned selection entry/exit, loop back-edge declarations,
+  conditional merge declarations, and dominator serialization after function-constant CFG pruning,
+  choosing bounded relooper form for only the affected functions before the first assembly while
+  preserving unrelated functions and the hard downstream-driver state-machine cap. Relooper switch
+  lowering now preserves both 32-bit and 64-bit selector literals.
+- Function-constant pruning and entry-interface rebuilding now also own specialized Workgroup
+  aggregate-stride access lowering instead of invoking a detached pointer repair afterward.
+- The inline, SROA, and raw-access retry lowers dynamic typed accesses before constructing its
+  relooper module, eliminating its post-relooper access-chain repair adapter.
+- Helper inlining now completes address-preserving zero-offset aggregate descent once at its
+  self-contained entry-closure boundary, eliminating the emitter's detached whole-module repair scan.
+- Resource-select lowering assigns each duplicated `OpSampledImage` its branch image's exact type at
+  construction, eliminating its final whole-module sampled-image type repair scan.
+- Pointer-phi lowering now assigns synthesized incoming values directly to their predecessor edges,
+  eliminating the final post-emission access-chain relocation and phi-order repair scan.
+- Finalized typed CFG construction now redirects external entries around loop continue constructs,
+  moves their exact phi values onto loop-header edges, and restores dominator serialization before
+  emission, eliminating the corresponding numeric SPIR-V repair fixpoint.
+- Emitted loop, selection, and switch merges that are reachable from outside their owning construct
+  now get phi-aware private boundaries in the finalized typed CFG, eliminating the matching
+  post-emission dominance repair.
+- Instruction-local control flow is now materialized as real blocks inside the native emitter; when
+  it splits a loop header, a dedicated source header retains the loop phis and ownership while any
+  nested selection receives a private merge, eliminating the post-emission stale-loop downgrade.
+- Finalized typed CFG construction now owns every loop header required by indexed inputs, eliminating
+  both post-emission unmarked-loop synthesis and product-wide dominator-order normalization;
+  structural loop tests define membership by dominated CFG predecessor edges rather than
+  serialization order. Instruction-local control flow now carries each source block's real emitted
+  exit into successor phis, eliminating final numeric-SPIR-V phi reconciliation and the product CFG
+  repair module altogether.
+- Selection boundaries that collide with a loop continue are now resolved in the finalized typed
+  CFG, including enclosing selections, direct break/continue branches, and phi-carrying in-loop
+  reconvergence; inner construct merges are likewise privatized in the typed plan, and emitted
+  helper inlining now preserves the enclosing continue while giving its nested selection a private
+  pass-through, eliminating both matching post-emission repairs.
+- Structured emission now retains merge markers immediately before their terminators throughout
+  lowering, eliminating the permissive pass that reordered already-malformed merge blocks.
+- Direct-arm cloning and external loop-entry rewrites now preserve their newly established
+  dominator order at the owning structural boundary.
+- Loop plans now resolve emission-empty continue pass-through chains from the finalized typed CFG
+  before emitting `OpLoopMerge`, eliminating the corresponding post-emission label repair.
+- Finalized emission plans now give nested constructs phi-aware private merge targets while
+  preserving loop-header backedges, eliminating the retained-SPIR-V shared-merge ownership pass.
+- Finalized typed CFG emission now funnels selection/switch bypass edges through their declared
+  phi-aware pass-through merges, eliminating that retained-SPIR-V product repair.
+- Finalized typed CFG emission now clones shared direct arms only for headers with declared merges,
+  then routes each clone through the merge with exact phi synthesis, eliminating the numeric-label
+  shared-arm product repair.
 - AIR `target datalayout` vector alignment and exact `air.struct_type_info` member offsets now flow
   through the primary emitter, aggregate byte walkers, reflection, and every retry tier instead of
   being reconstructed from generic SPIR-V layout assumptions.
 - The default descriptor ABI now uses checked, non-overlapping bands for buffers, sampled textures,
   samplers, color inputs, imageblocks, storage textures, and translator-owned resources. Final
   modules reject descriptors outside their selected class range or set.
-- Structured control-flow retries are bounded more tightly, improving behavior on large shaders and
-  avoiding unnecessary fallback to slower emission paths.
-- Corpus translation and classification use bounded parallel workers, a 30-second per-item
-  watchdog, a 512 MiB per-item memory ceiling, size-aware scheduling, and incremental index/cache
-  reuse. Warm audits avoid reopening unchanged source shards; forced audits remain explicit.
+- Structured control-flow retries are bounded more tightly and reuse exact ordinary-planner
+  rejection facts across the primary and construct-tree attempts, improving behavior on large
+  shaders without reusing an accepting plan across retry semantics.
+- Corpus translation and classification use bounded parallel workers, a 20-second per-item
+  watchdog, a 500 MiB per-item memory ceiling, source-size and structural-cost-aware scheduling, and
+  incremental index/cache reuse. Watchdog cleanup polls its own child instead of installing a
+  process-global signal handler, and worker panics remain hash-attributed retryable failures instead
+  of aborting a resumable census. Warm audits avoid reopening unchanged source shards; forced audits
+  remain explicit.
+- Large-module translation now streams function bodies into typed blocks, borrows unchanged
+  normalization input, shares immutable block carriers, interns repeated instruction opcodes, and
+  keeps mutually exclusive instruction and phi facts in one canonical representation. Resolved
+  instructions derive def/use edges from those operands instead of allocating parallel name lists, and
+  the emitter no longer clones every typed operand into a result-keyed table. Async-copy lowering
+  streams into one bounded-growth buffer, skips dead declarations, and lets owned callers release
+  superseded source text before typed parsing. Together these changes substantially reduce the
+  measured largest local rows without changing their translated classification or skipping SPIR-V
+  validation.
+- Function-variable hoisting and integer-width normalization now preserve each block's instruction
+  allocation, moving only matched variables and snapshotting only the instruction being rewritten.
+  This removes full-block clones from universal large-module paths while preserving emitted order.
+- Integer conversions now select their opcode from the actual emitted SPIR-V storage types. Legalized
+  widths such as LLVM `i24` are masked at their producer, signed extensions restore the logical sign
+  bit, and equal-width signed vertex inputs use bitcasts, eliminating the late width-convert repair.
 - Validation capability checks, authored schema validation, backend execution gates, and cache
   identities now share one typed contract so a clean audit cannot hide a later executor rejection.
 - Corpus capability audits now use the product's canonical AIR-call inventory and report every
@@ -79,7 +345,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Full AIR-intrinsic reclassification now updates every cached source in bounded keyset batches,
   independent of `--limit`, without reopening source shards; matrix capability recognition and
   lowering share one exact ABI parser.
-- Reflection documentation now describes the complete schema v29 descriptor, argument-buffer,
+- Translation census results now flow through a worker-count-bounded queue. A checkpoint failure
+  cancels unclaimed rows and drains only in-flight results instead of allowing workers to retain an
+  unbounded completed-row backlog while the scoped parent unwinds.
+- Reflection documentation now describes the complete schema v30 descriptor, argument-buffer,
   runtime specialization, stage-interface, and conservative buffer-staging contracts.
 
 ### Removed
@@ -89,9 +358,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   commands.
 - Removed obsolete emitter naming and compatibility terminology; the product and tooling describe
   only the native AIR-to-SPIR-V pipeline.
+- Removed the universal post-validation StorageBuffer/Workgroup pointer-phi rewrite, successful-
+  module constant-branch reparse, and scalar-i64 module wrapper; same-root pointer merges and literal
+  dead arms are now resolved on the typed source graph before emission.
 
 ### Fixed
 
+- Opaque buffer sources copied into local aggregates are now inferred as byte-addressed even when
+  the destination is not another buffer parameter. AIR aggregate metadata whose explicit member
+  offsets overlap Vulkan's naturally aligned block extents also selects the faithful byte view.
+- Large CFGs now attempt their structurally valid primary emission before any retry. Missing switch
+  merges and phi/predecessor mismatches route by their typed CFG failure class to the whole-CFG
+  constructor, replacing the former block-count-triggered raw/relooper and construct-tree pre-route.
+- Runtime device pointers now select the Vulkan 1.2 buffer-device-address model from typed AIR
+  producer/use structure during primary emission. Opaque resource handles remain in the logical
+  resource domain, and the redundant validation-triggered plain-BDA retries have been removed.
+- Packed 32-bit reads through Private vector-backed helper views are now completed inside the
+  memory-lowering transaction, so finalization no longer needs a repeated post-pass legalization.
+- Interface binding now materializes direct loads selected between descriptor-backed and Private
+  placeholder arms in the value domain, eliminating the corresponding module-wide finalizer repair.
+- Descriptor-backed pointer-select closures, including dynamically indexed local pointer tables,
+  are now constructed in the Logical value domain on the primary path instead of relying on
+  validation-triggered value-select or physical-address repairs.
+- Same-root pointer phis and selects now merge their integer access-chain indices and rematerialize
+  one pointer for every storage class. Typed forward-select facts cover loop backedges whose
+  advancing arm is a later chain of GEPs, so these recurrences need neither pointer SSA nor
+  `VariablePointersStorageBuffer`.
+- Scalar and vector function-constant initializer expressions are folded on the owned typed CFG
+  before merge planning. Literal edges are pruned independently, surviving phi predecessor sets are
+  rebuilt, and single-predecessor phis are substituted without letting an unrelated opaque aggregate
+  phi suppress safe pruning. AGX execution-mask lowering now keeps loop ownership on the original
+  backedge target and gives the lowered exit test a private structured merge.
+- Function-constant-gated texture inputs with real Metal locations now retain their own descriptor
+  and exact image shape even when their predicate defaults false, so later SPIR-V specialization
+  cannot sample or write an unrelated texture. Only the `-1` location sentinel remains absent.
+  Arrayed texture writes take their operand shape from the stable AIR intrinsic symbol even after
+  the image handle passes through a local carrier.
+- Scalar StorageBuffer remodeling now replays exact source GEP byte offsets as one stride-checked
+  runtime-array index, preserving aggregate row/lane addresses after metadata collapses the
+  descriptor element type.
+- Unsupported image-texel value shapes now bypass buffer/CFG retry tiers that preserve the rejected
+  SSA value, returning an honest fallback within the translation budget instead of repeatedly
+  emitting the same large module.
+- Added structural lowering for one-dimensional linear pixel sampling, logical pointer aliases,
+  little-endian byte-aggregate/integer reinterpretation, and the packed signed-i8 AGX3 16x16x16
+  matrix-MAC ABI. The matrix adapter validates its complete fixed descriptor contract and reuses
+  the common distributed 32-lane matrix implementation.
 - Unsupported Metal visible function references now fail fast with an explicit fallback instead of
   being treated as ordinary functions.
 - Multiple `OpReturnValue` sites are rewritten consistently to stage outputs, and undefined
@@ -118,6 +430,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   phis use ordinary access chains instead of invalid `OpPtrAccessChain` pointer-stride forms.
 - Fixed function-constant-gated fragment outputs so the default-zero AIR predicate model does not
   advertise mutually exclusive render-target formats at the same Vulkan location.
+- Fixed static-initializer evaluation so a specialized integer vector is retained as a typed vector
+  and only a genuinely scalar value can enter the scalar global-fold map.
 - Fixed fragment `[[sample_id]]` lowering to use `BuiltIn SampleId` with the required
   `SampleRateShading` capability, and lowered AIR `texture2d_ms` reads to MS `OpTypeImage` fetches
   with a `Sample` operand instead of treating the sample id as a mip LOD.
@@ -140,9 +454,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capability checks in executable and metadata-only reflection paths.
 - Vulkan validation now binds every compatible reflected sampled/storage texture alias to the same
   allocation and validates texture-array and argument-buffer alternatives as complete sets.
-- Exact Metal `dispatchThreads` grids now use one typed fixed or per-dispatch push-constant source
-  for both `[[threads_per_grid]]` and a structured surplus-invocation cull. Partial grids with source
-  control barriers fail honestly instead of emitting an unsafe divergent return.
+- Exact Metal `dispatchThreads` grids share one typed region payload across every logical grid
+  builtin, including synthesized stage-input indexing and reflected buffer footprints.
+- Module, function, block, instruction, and analysis transformations now express ownership by
+  consuming values, returning replacements, mutating existing allocations transactionally, or
+  appending directly. Fallible late SPIR-V repairs return their module explicitly, so no path can
+  leave caller-visible state replaced by an empty/default ownership placeholder. ID-deleting native
+  rewrite adapters now remove debug and annotation records only for the exact result IDs deleted by
+  their own transaction, eliminating detached product cleanup sweeps without masking unrelated
+  invalid metadata.
+- Removed the late module-wide integer arithmetic width repair; packed scalar-slot addressing now
+  scales dynamic indices in their declared integer type, so 64-bit access-chain indices remain
+  valid and value-preserving without after-the-fact truncation.
+- Deep shared-arm refunneling now gives every synthesized value phi an explicit incoming on every
+  join predecessor, using an unobservable `undef` only on edges whose route branches to the other
+  target.
+  Value-domain pointer lowering likewise proves post-merge indices and its complete planned value-phi
+  graph satisfy every predecessor dominance edge before commit. These construction contracts remove
+  the duplicate post-primary non-dominating-value demotion scan.
+- Cross-binding pointer-phi lowering now runs before the whole-function relooper size gate. The
+  bounded in-memory address rewrite does not depend on CFG re-emission and remains available to large
+  functions whose refunnelled value flow produces a complete cross-binding phi.
 - Reduced worst-case translation time and memory growth by caching retry verdicts, pruning dead CFG
   before source re-emission, using linear CFG ordering and candidate scans, bounding generated CFG
   growth, and applying resource limits from worker startup.

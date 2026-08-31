@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-pub const ANALYZER_ABI: &str = "structural-triage-v36";
+pub const ANALYZER_ABI: &str = "structural-triage-v38";
 
 const RESOURCE_KINDS: [&str; 13] = [
     "air.buffer",
@@ -124,6 +124,20 @@ impl VisibleFunctionTableAudit {
             .keys()
             .any(|kind| kind.contains(".unsupported_"))
             || self.table_operands.contains_key("derived")
+    }
+
+    /// Whether exact authored table contents are a semantic input to this source.
+    ///
+    /// A dead lookup has no observable table dependency. Queries, calls, nullness/sentinel probes,
+    /// and helper-threaded callbacks do; they can be specialized exactly only after the caller
+    /// supplies the table size and populated linked modules.
+    pub fn requires_authored_linkage(&self) -> bool {
+        !self.has_unsupported_use()
+            && (!self.queries.is_empty()
+                || self
+                    .lookup_uses
+                    .keys()
+                    .any(|kind| !kind.ends_with(".unused")))
     }
 }
 
@@ -949,23 +963,52 @@ fn ray_call_arguments(instruction: &str) -> Option<Vec<&str>> {
 
 pub fn audit_visible_function_tables(source: &SourceRow) -> VisibleFunctionTableAudit {
     let entry_parameters = entry_parameter_values(&source.air_ll, &source.entry);
+    let table_flow = visible_table_parameter_flow(source);
     let defined_functions = defined_function_globals(&source.air_ll);
     let mut result = VisibleFunctionTableAudit::default();
     let mut pointers = HashMap::<String, VisiblePointerTrace>::new();
     let mut sentinel_integers = HashMap::<String, VisiblePointerTrace>::new();
     let mut lookups = Vec::<VisibleLookup>::new();
+    let mut current_function = None::<String>;
     for line in source.air_ll.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("define ") || trimmed == "}" {
+        if trimmed.starts_with("define ") {
+            current_function = definition_global(trimmed);
             pointers.clear();
             sentinel_integers.clear();
             continue;
         }
+        if trimmed == "}" {
+            current_function = None;
+            pointers.clear();
+            sentinel_integers.clear();
+            continue;
+        }
+        let rooted_tables = current_function
+            .as_ref()
+            .and_then(|function| table_flow.get(function));
+        let in_entry = current_function
+            .as_deref()
+            .is_some_and(|function| function_matches_entry(function, &source.entry));
         if trimmed.contains("call ") && trimmed.contains("@air.get_size_visible_function_table(") {
-            record_table_query(&mut result, "size", trimmed, &entry_parameters);
+            record_table_query(
+                &mut result,
+                "size",
+                trimmed,
+                &entry_parameters,
+                rooted_tables,
+                in_entry,
+            );
         }
         if trimmed.contains("call ") && trimmed.contains("@air.is_null_visible_function_table(") {
-            record_table_query(&mut result, "is_null", trimmed, &entry_parameters);
+            record_table_query(
+                &mut result,
+                "is_null",
+                trimmed,
+                &entry_parameters,
+                rooted_tables,
+                in_entry,
+            );
         }
 
         let Some((defined, instruction)) = trimmed.split_once(" = ") else {
@@ -996,8 +1039,10 @@ pub fn audit_visible_function_tables(source: &SourceRow) -> VisibleFunctionTable
                 continue;
             }
             let table = audit_value_operand(arguments[0]);
-            let table_kind = if entry_parameters.contains(table) {
+            let table_kind = if in_entry && entry_parameters.contains(table) {
                 "direct_entry_parameter"
+            } else if rooted_tables.is_some_and(|tables| tables.contains(table)) {
+                "threaded_entry_parameter"
             } else {
                 "derived"
             };
@@ -1159,13 +1204,17 @@ fn record_table_query(
     query: &str,
     instruction: &str,
     entry_parameters: &HashSet<String>,
+    rooted_tables: Option<&HashSet<String>>,
+    in_entry: bool,
 ) {
     let table_kind = audit_call_arguments(instruction)
         .and_then(|arguments| arguments.first().copied())
         .map(audit_value_operand)
         .map_or("malformed", |table| {
-            if entry_parameters.contains(table) {
+            if in_entry && entry_parameters.contains(table) {
                 "direct_entry_parameter"
+            } else if rooted_tables.is_some_and(|tables| tables.contains(table)) {
+                "threaded_entry_parameter"
             } else {
                 "derived"
             }
@@ -1344,6 +1393,52 @@ fn entry_parameter_values(ll: &str, entry: &str) -> HashSet<String> {
         .collect()
 }
 
+fn visible_table_parameter_flow(source: &SourceRow) -> HashMap<String, HashSet<String>> {
+    let roots = match source.stage.as_str() {
+        "Kernel" => metal2vulkan::meta::parse_air_kernel_meta(&source.air_ll)
+            .into_iter()
+            .flat_map(|meta| meta.roles)
+            .filter_map(|(index, role)| {
+                matches!(role, metal2vulkan::meta::KernRole::VisibleFunctionTable(_))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>(),
+        "Vertex" => metal2vulkan::meta::parse_air_vertex_meta(&source.air_ll)
+            .into_iter()
+            .flat_map(|meta| meta.roles)
+            .filter_map(|(index, role)| {
+                matches!(role, metal2vulkan::meta::VertRole::VisibleFunctionTable(_))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>(),
+        "Fragment" => metal2vulkan::meta::parse_air_fragment_meta(&source.air_ll)
+            .into_iter()
+            .flat_map(|meta| meta.roles)
+            .filter_map(|(index, role)| {
+                matches!(role, metal2vulkan::meta::FragRole::VisibleFunctionTable(_))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+    metal2vulkan::linked_functions::trace_visible_function_table_parameters(
+        &source.air_ll,
+        &source.entry,
+        &roots,
+    )
+    .unwrap_or_default()
+}
+
+fn definition_global(line: &str) -> Option<String> {
+    let at = line.find('@')?;
+    let open = line[at..].find('(')? + at;
+    Some(line[at..open].trim_end().to_string())
+}
+
+fn function_matches_entry(global: &str, entry: &str) -> bool {
+    global == format!("@{entry}") || global == format!("@\"{}\"", entry.replace('"', "\\22"))
+}
+
 fn audit_call_arguments(instruction: &str) -> Option<Vec<&str>> {
     let open = instruction.find('(')?;
     let close = audit_matching_paren(instruction, open)?;
@@ -1421,7 +1516,7 @@ mod tests {
             entry: "main".into(),
             air_ll: ll.into(),
             blob_b64: None,
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: "local/test.ll".into(),
         }
     }
@@ -1469,6 +1564,7 @@ mod tests {
         );
         let result = classify(&row);
         assert!(result.tooling_requirements.is_empty());
+        assert!(!audit_visible_function_tables(&row).requires_authored_linkage());
     }
 
     #[test]
@@ -1481,6 +1577,7 @@ mod tests {
         assert_eq!(audit.lookup_uses["constant.null_compare"], 1);
         assert_eq!(audit.table_operands["direct_entry_parameter"], 1);
         assert!(!audit.has_unsupported_use());
+        assert!(audit.requires_authored_linkage());
     }
 
     #[test]
@@ -1492,6 +1589,7 @@ mod tests {
         assert_eq!(audit.lookup_uses["dynamic.direct_call"], 1);
         assert_eq!(audit.lookup_uses["dynamic.unsupported_select"], 1);
         assert!(audit.has_unsupported_use());
+        assert!(!audit.requires_authored_linkage());
         assert_eq!(
             classify(&row).tooling_requirements,
             [ToolingRequirement::VisibleFunctionTable]
@@ -1584,6 +1682,19 @@ declare void @air.set_buffer_intersection_function_table.p1i8(ptr addrspace(1), 
         let audit = audit_visible_function_tables(&row);
         assert_eq!(audit.lookup_uses["dynamic.helper_parameter"], 1);
         assert!(!audit.has_unsupported_use());
+    }
+
+    #[test]
+    fn visible_table_audit_traces_the_table_through_an_internal_helper() {
+        let row = source(
+            "define void @main(ptr addrspace(1) %table, i32 %slot) {\nentry:\n %value = call i32 @invoke(ptr addrspace(1) %table, i32 %slot)\n ret void\n}\ndefine internal i32 @invoke(ptr addrspace(1) %functions, i32 %slot) {\nentry:\n %f = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %functions, i32 %slot)\n %value = call i32 %f()\n ret i32 %value\n}\ndeclare ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1), i32)\n!air.kernel = !{!0}\n!0 = !{ptr @main, !1, !2}\n!1 = !{}\n!2 = !{!3}\n!3 = !{i32 0, !\"air.visible_function_table\", !\"air.location_index\", i32 1, i32 1, !\"air.read\"}",
+        );
+        let audit = audit_visible_function_tables(&row);
+        assert_eq!(audit.table_operands["threaded_entry_parameter"], 1);
+        assert_eq!(audit.lookup_uses["dynamic.direct_call"], 1);
+        assert!(!audit.has_unsupported_use());
+        assert!(audit.requires_authored_linkage());
+        assert!(classify(&row).tooling_requirements.is_empty());
     }
 
     #[test]

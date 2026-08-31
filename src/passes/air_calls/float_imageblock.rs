@@ -48,7 +48,7 @@ pub(in crate::passes) fn lower_implicit_imageblock_load(
         Some(read_result),
         vec![Operand::IdRef(image), Operand::IdRef(coord)],
     ));
-    let converted_source = if lanes == 1 {
+    let (converted_source, converted_source_ty) = if lanes == 1 {
         let component = if conversion != ImageblockConversion::None {
             ctx.module.fresh_id()
         } else {
@@ -65,7 +65,7 @@ pub(in crate::passes) fn lower_implicit_imageblock_load(
             Some(component),
             vec![Operand::IdRef(read_result), Operand::LiteralBit32(0)],
         ));
-        component
+        (component, component_ty)
     } else if lanes < 4 {
         let prefix = ctx.module.fresh_id();
         let prefix_ty = match comp {
@@ -82,22 +82,24 @@ pub(in crate::passes) fn lower_implicit_imageblock_load(
                 .chain((0..lanes).map(Operand::LiteralBit32))
                 .collect(),
         ));
-        prefix
+        (prefix, prefix_ty)
     } else {
-        read_result
+        (read_result, storage_ty)
     };
     if conversion != ImageblockConversion::None {
-        let opcode = match conversion {
-            ImageblockConversion::Float => Op::FConvert,
-            ImageblockConversion::Bitcast => Op::Bitcast,
+        let instruction = match conversion {
+            ImageblockConversion::Float => Instruction::new(
+                Op::FConvert,
+                Some(result_ty),
+                Some(result),
+                vec![Operand::IdRef(converted_source)],
+            ),
+            ImageblockConversion::Bitcast => {
+                copy_or_bitcast_result(result_ty, result, converted_source_ty, converted_source)
+            }
             ImageblockConversion::None => unreachable!(),
         };
-        out.push(Instruction::new(
-            opcode,
-            Some(result_ty),
-            Some(result),
-            vec![Operand::IdRef(converted_source)],
-        ));
+        out.push(instruction);
     }
     Ok(out)
 }
@@ -159,17 +161,19 @@ pub(in crate::passes) fn lower_implicit_imageblock_store(
             storage_ty
         };
         let converted = ctx.module.fresh_id();
-        let opcode = match conversion {
-            ImageblockConversion::Float => Op::FConvert,
-            ImageblockConversion::Bitcast => Op::Bitcast,
+        let instruction = match conversion {
+            ImageblockConversion::Float => Instruction::new(
+                Op::FConvert,
+                Some(storage_value_ty),
+                Some(converted),
+                vec![Operand::IdRef(args[0])],
+            ),
+            ImageblockConversion::Bitcast => {
+                copy_or_bitcast_result(storage_value_ty, converted, value_ty, args[0])
+            }
             ImageblockConversion::None => unreachable!(),
         };
-        out.push(Instruction::new(
-            opcode,
-            Some(storage_value_ty),
-            Some(converted),
-            vec![Operand::IdRef(args[0])],
-        ));
+        out.push(instruction);
         converted
     } else {
         args[0]
@@ -1436,10 +1440,8 @@ fn gate_imageblock_region_in_bounds(
     let has_size_flag = value_def_instruction(ctx, args[2]).map(|def| def.class.opcode);
     let explicit_size_def = value_def_instruction(ctx, args[4]).map(|def| def.class.opcode);
     let explicit_usable = !matches!(explicit_size_def, Some(Op::Undef) | None);
-    let implicit = [
-        ctx.const_uint(ctx.kernel_local_size[0]),
-        ctx.const_uint(ctx.kernel_local_size[1]),
-    ];
+    let local_size = ctx.kernel_local_size_ids();
+    let implicit = [local_size[0], local_size[1]];
     let explicit = if explicit_usable && !matches!(has_size_flag, Some(Op::ConstantFalse)) {
         // args[4] is a `<2 x i16>` size; widen to uint2 and split into components.
         let src_ty = value_result_type(ctx, args[4])

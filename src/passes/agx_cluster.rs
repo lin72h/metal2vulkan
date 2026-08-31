@@ -44,15 +44,19 @@ pub(in crate::passes) fn lower_agx2_cluster_numbers(
     let uint = ctx.ty_uint();
     let v3uint = ctx.ty_vec_uint(3);
     let local_id_var = stage_input::bind_kernel_v3uint_builtin(ctx, BuiltIn::LocalInvocationId);
-    let padded_x = ctx.kernel_local_size[0].div_ceil(16) * 16;
-    let stride_x = ctx.const_uint(padded_x);
-    let stride_y = ctx.const_uint(ctx.kernel_local_size[1]);
+    let [local_x, local_y, _] = ctx.kernel_local_size_ids();
+    let fifteen = ctx.const_uint(15);
+    let sixteen = ctx.const_uint(16);
 
     let mut found = HashSet::new();
-    let mut blocks = std::mem::take(&mut ctx.module.functions[entry_idx].blocks);
-    for block in &mut blocks {
-        let old = std::mem::take(&mut block.instructions);
-        let mut rewritten = Vec::with_capacity(old.len() + marker_ids.len() * 7);
+    let block_count = ctx.module.functions[entry_idx].blocks.len();
+    for block_idx in 0..block_count {
+        // Build the replacement from a stable snapshot. The original block remains intact if a
+        // sentinel contract check fails, and its borrow does not overlap fresh-id allocation.
+        let old = ctx.module.functions[entry_idx].blocks[block_idx]
+            .instructions
+            .clone();
+        let mut rewritten = Vec::with_capacity(old.len() + marker_ids.len() * 11);
         for instruction in old {
             let Some(result) = instruction.result_id.filter(|id| marker_ids.contains(id)) else {
                 rewritten.push(instruction);
@@ -72,6 +76,9 @@ pub(in crate::passes) fn lower_agx2_cluster_numbers(
             let z_rows = ctx.module.fresh_id();
             let row = ctx.module.fresh_id();
             let row_offset = ctx.module.fresh_id();
+            let rounded_x = ctx.module.fresh_id();
+            let x_chunks = ctx.module.fresh_id();
+            let stride_x = ctx.module.fresh_id();
             rewritten.extend([
                 Instruction::new(
                     Op::Load,
@@ -82,15 +89,17 @@ pub(in crate::passes) fn lower_agx2_cluster_numbers(
                 composite_extract(uint, x, local_id, 0),
                 composite_extract(uint, y, local_id, 1),
                 composite_extract(uint, z, local_id, 2),
-                binary(Op::IMul, uint, z_rows, z, stride_y),
+                binary(Op::IAdd, uint, rounded_x, local_x, fifteen),
+                binary(Op::UDiv, uint, x_chunks, rounded_x, sixteen),
+                binary(Op::IMul, uint, stride_x, x_chunks, sixteen),
+                binary(Op::IMul, uint, z_rows, z, local_y),
                 binary(Op::IAdd, uint, row, y, z_rows),
                 binary(Op::IMul, uint, row_offset, row, stride_x),
                 binary(Op::IAdd, uint, result, x, row_offset),
             ]);
         }
-        block.instructions = rewritten;
+        ctx.module.functions[entry_idx].blocks[block_idx].instructions = rewritten;
     }
-    ctx.module.functions[entry_idx].blocks = blocks;
 
     debug_assert_eq!(found, marker_ids);
     ctx.emit_sidecar.agx2_cluster_numbers.clear();

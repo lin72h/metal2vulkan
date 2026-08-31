@@ -245,7 +245,9 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_reinterpret(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut newv: Vec<Instruction> = Vec::with_capacity(old.len() + 4);
         for (ii, inst) in old.into_iter().enumerate() {
             if let Some(p) = ac_at.get(&(bi, ii)) {
@@ -502,7 +504,9 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len() + 10);
         for (ii, inst) in old.into_iter().enumerate() {
             if chain_at.contains(&(bi, ii)) {
@@ -877,7 +881,9 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_wide_word_reinterpret(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len() + 10);
         for (ii, inst) in old.into_iter().enumerate() {
             if chain_at.contains(&(bi, ii)) {
@@ -1277,7 +1283,9 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_vector_reinterpret(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len() + 8);
         for (ii, inst) in old.into_iter().enumerate() {
             if chain_at.contains_key(&(bi, ii)) {
@@ -1412,6 +1420,7 @@ pub(in crate::passes) fn rewrite_dynamic_homogeneous_struct_index_load(
     ctx: &mut Ctx,
     entry_idx: usize,
 ) -> Result<(), String> {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -1517,13 +1526,13 @@ pub(in crate::passes) fn rewrite_dynamic_homogeneous_struct_index_load(
             if const_u32(ctx, *dyn_idx).is_some() {
                 continue;
             }
-            let Some(index_ty) = value_result_type(ctx, *dyn_idx) else {
+            let Some(index_ty) = value_types.get(dyn_idx).copied() else {
                 continue;
             };
             if type_def_of(ctx, index_ty).is_none_or(|def| def.class.opcode != Op::TypeInt) {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -1609,7 +1618,9 @@ pub(in crate::passes) fn rewrite_dynamic_homogeneous_struct_index_load(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len() + 16);
         for (ii, inst) in old.into_iter().enumerate() {
             if chain_at.contains_key(&(bi, ii)) {
@@ -2006,7 +2017,9 @@ pub(in crate::passes) fn rewrite_chained_element_reinterpret(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut newv: Vec<Instruction> = Vec::with_capacity(old.len() + 4);
         for (ii, inst) in old.into_iter().enumerate() {
             if let Some(p) = ac_at.get(&(bi, ii)) {
@@ -2390,7 +2403,9 @@ pub(in crate::passes) fn rewrite_byte_buffer_chained_reinterpret(
 
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut newv: Vec<Instruction> = Vec::with_capacity(old.len() + 8);
         for (ii, inst) in old.into_iter().enumerate() {
             // The original `%out` chain becomes the `sum = inner_idx + out_idx*ratio` computation.

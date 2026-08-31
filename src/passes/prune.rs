@@ -1,6 +1,6 @@
 //! Unreachable-block pruning.
 //!
-//! The native emitter's structured-CFG repair can clone a selection/switch target region and then
+//! Typed CFG restructuring can clone a selection/switch target region and then
 //! rewire the original's incoming edge, leaving the whole cloned construct (header + cases + merge)
 //! with no predecessor. spirv-val accepts such orphaned code, but SPIRV-Cross (MoltenVK's MSL
 //! frontend) walks it during CFG analysis and throws (`Variant::get` "nullptr"), failing pipeline

@@ -2,35 +2,6 @@
 
 use super::*;
 
-/// Try to make `blocks` structurable by privatizing cross-arm shared regions via single-entry tail
-/// duplication. Applies up to [`MAX_ROUNDS`] privatizations (re-detecting each round). Returns the
-/// transformed block list IFF at least one clone was applied; otherwise `None` (no cleanly-cloneable
-/// cross-arm region was found). The caller decides whether to adopt it (it adopts only when
-/// [`crate::native::cfg::structured_emit::structured_plan`] then admits the result — floor-safe).
-pub(in crate::native) fn clone_cross_arm_shared(blocks: &[BodyBlock]) -> Option<Vec<BodyBlock>> {
-    let mut cur: Vec<BodyBlock> = blocks.to_vec();
-    let mut changed = false;
-    let mut counter = 0usize;
-    for _ in 0..MAX_ROUNDS {
-        if crate::native::cfg::structured_emit::structured_plan(&cur).is_some() {
-            break;
-        }
-        let Some((header, arm)) = find_cross_arm(&cur) else {
-            break;
-        };
-        let Some(next) = privatize_region(&cur, &header, &arm, &mut counter) else {
-            break;
-        };
-        cur = next;
-        changed = true;
-    }
-    if changed {
-        Some(cur)
-    } else {
-        None
-    }
-}
-
 /// Predecessor map: block name -> the blocks that branch to it.
 pub(in crate::native) fn predecessors(blocks: &[BodyBlock]) -> HashMap<String, Vec<String>> {
     let mut preds: HashMap<String, Vec<String>> = HashMap::new();

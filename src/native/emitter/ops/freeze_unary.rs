@@ -57,12 +57,18 @@ impl Emitter {
         if let Some(selected) = self.selected_pointers.get(src_name).cloned() {
             self.selected_pointers.insert(name.to_string(), selected);
         }
+        if let Some(tree) = self.selected_access_trees.get(src_name).cloned() {
+            self.selected_access_trees.insert(name.to_string(), tree);
+        }
         if let Some(selected) = self.selected_load_pointers.get(src_name).cloned() {
             self.selected_load_pointers
                 .insert(name.to_string(), selected);
         }
         if self.unmodeled_pointers.contains(src_name) {
             self.unmodeled_pointers.insert(name.to_string());
+        }
+        if self.byte_view_pointers.contains(src_name) {
+            self.byte_view_pointers.insert(name.to_string());
         }
         if self.param_values.contains(src_name) {
             self.param_values.insert(name.to_string());

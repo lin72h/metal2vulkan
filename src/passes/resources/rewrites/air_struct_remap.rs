@@ -347,7 +347,9 @@ fn rewrite_flattened_record_array_indices(
     let types = combined_type_defs(ctx, defs);
     let value_types = combined_value_types(ctx, entry_idx);
     for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len());
         for mut instruction in old {
             let plan = flattened_record_array_index_plan(
@@ -792,6 +794,103 @@ pub(in crate::passes) fn remap_collapsed_direct_air_struct_access(
     // cannot distinguish a compact path from a valid padded path. Require uniqueness so repeated
     // same-shaped fields remain ambiguous rather than being silently redirected.
     unique_compact_root_member_access(ctx, types, root_ty, indices, result_pointee)
+}
+
+/// Recover the exact constant member path that reaches `target` at `byte_offset` in a reflected
+/// aggregate. Native emission can represent a homogeneous nested constant buffer as a flat scalar
+/// pointer, so its access chain carries a word index rather than the nested member ordinals required
+/// after interface construction restores the AIR struct. The emitter sidecar owns the source byte
+/// address; walking the final laid-out type by that address is therefore exact and independent of
+/// field names.
+pub(in crate::passes) fn air_struct_access_path_at_byte_offset(
+    ctx: &Ctx,
+    types: &HashMap<Word, Instruction>,
+    root_ty: Word,
+    byte_offset: u32,
+    target: Word,
+) -> Option<Vec<u32>> {
+    fn walk(
+        ctx: &Ctx,
+        types: &HashMap<Word, Instruction>,
+        ty: Word,
+        byte_offset: u32,
+        target: Word,
+    ) -> Option<Vec<u32>> {
+        if byte_offset == 0 && (ty == target || types_structurally_match(ctx, types, ty, target)) {
+            return Some(Vec::new());
+        }
+        let definition = types.get(&ty)?;
+        match definition.class.opcode {
+            Op::TypeStruct => {
+                for (member, operand) in definition.operands.iter().enumerate() {
+                    let Operand::IdRef(member_ty) = operand else {
+                        return None;
+                    };
+                    let member_offset = ctx
+                        .air_struct_offsets
+                        .get(&ty)
+                        .and_then(|offsets| offsets.get(member))
+                        .copied()
+                        .or_else(|| {
+                            crate::layout::spirv_struct_member(
+                                ty,
+                                member,
+                                types,
+                                crate::layout::SpirvLayout::natural(ctx.air_data_layout.as_ref()),
+                            )
+                            .map(|(offset, _)| offset)
+                        })?;
+                    let (size, align) = layout_ty_size_align(ctx, *member_ty, types);
+                    let extent = round_up(size, align);
+                    if byte_offset < member_offset
+                        || byte_offset >= member_offset.checked_add(extent)?
+                    {
+                        continue;
+                    }
+                    let mut suffix =
+                        walk(ctx, types, *member_ty, byte_offset - member_offset, target)?;
+                    suffix.insert(0, member as u32);
+                    return Some(suffix);
+                }
+                None
+            }
+            Op::TypeArray | Op::TypeRuntimeArray | Op::TypeVector | Op::TypeMatrix => {
+                let Operand::IdRef(element_ty) = definition.operands.first()? else {
+                    return None;
+                };
+                let (size, align) = layout_ty_size_align(ctx, *element_ty, types);
+                let stride = match definition.class.opcode {
+                    Op::TypeVector => size,
+                    _ => round_up(size, align),
+                };
+                if stride == 0 {
+                    return None;
+                }
+                let element = byte_offset / stride;
+                if definition.class.opcode == Op::TypeArray {
+                    let Operand::IdRef(length) = definition.operands.get(1)? else {
+                        return None;
+                    };
+                    if element >= const_u32(types, *length)? {
+                        return None;
+                    }
+                } else if matches!(definition.class.opcode, Op::TypeVector | Op::TypeMatrix) {
+                    let Operand::LiteralBit32(length) = definition.operands.get(1)? else {
+                        return None;
+                    };
+                    if element >= *length {
+                        return None;
+                    }
+                }
+                let mut suffix = walk(ctx, types, *element_ty, byte_offset % stride, target)?;
+                suffix.insert(0, element);
+                Some(suffix)
+            }
+            _ => None,
+        }
+    }
+
+    walk(ctx, types, root_ty, byte_offset, target)
 }
 
 pub(in crate::passes) fn unique_compact_root_member_access(

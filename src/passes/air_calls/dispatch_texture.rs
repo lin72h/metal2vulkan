@@ -731,8 +731,9 @@ pub(in crate::passes) fn lower_unpack(
 
 /// `air.get_{width,height,depth,array_size}_{texture,depth}_<dim>(texture, lod)`: an image size
 /// query. Sampled images use `OpImageQuerySizeLod`; storage images (no sampler LOD) use
-/// `OpImageQuerySize`. AIR's result is `i32`; the query yields a same-width uint component, bitcast
-/// to the result. The wanted component index is derived from the intrinsic name.
+/// `OpImageQuerySize`. AIR's result is `i32`; the query yields a same-width uint component, copied
+/// when integer canonicalization made the types identical and bitcast otherwise. The wanted
+/// component index is derived from the intrinsic name.
 pub(in crate::passes) fn lower_image_size_query(
     ctx: &mut Ctx,
     name: &str,
@@ -821,13 +822,7 @@ pub(in crate::passes) fn lower_image_size_query(
         ));
         c
     };
-    // Bitcast the uint component to the AIR result type (i32, same width).
-    out.push(Instruction::new(
-        Op::Bitcast,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(comp_u)],
-    ));
+    out.push(copy_or_bitcast_result(rty, res, uint, comp_u));
     Ok(out)
 }
 
@@ -877,23 +872,15 @@ pub(in crate::passes) fn lower_get_num_mip_levels(
         if let Some(query_img) = single_image_for_private_query(ctx, img) {
             img = query_img;
         } else {
+            let uint = ctx.ty_uint();
             let one = ctx.const_uint(1);
-            return Ok(vec![Instruction::new(
-                Op::Bitcast,
-                Some(rty),
-                Some(res),
-                vec![Operand::IdRef(one)],
-            )]);
+            return Ok(vec![copy_or_bitcast_result(rty, res, uint, one)]);
         }
     }
     if image_is_storage(ctx, img) {
+        let uint = ctx.ty_uint();
         let one = ctx.const_uint(1);
-        return Ok(vec![Instruction::new(
-            Op::Bitcast,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(one)],
-        )]);
+        return Ok(vec![copy_or_bitcast_result(rty, res, uint, one)]);
     }
     let uint = ctx.ty_uint();
     let levels = ctx.module.fresh_id();
@@ -904,12 +891,7 @@ pub(in crate::passes) fn lower_get_num_mip_levels(
             Some(levels),
             vec![Operand::IdRef(img)],
         ),
-        Instruction::new(
-            Op::Bitcast,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(levels)],
-        ),
+        copy_or_bitcast_result(rty, res, uint, levels),
     ])
 }
 
@@ -923,13 +905,9 @@ pub(in crate::passes) fn lower_get_num_samples_texture(
 ) -> Result<Vec<Instruction>, String> {
     let res = res.ok_or_else(|| format!("{name} has no result"))?;
     let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
+    let uint = ctx.ty_uint();
     let one = ctx.const_uint(1);
-    Ok(vec![Instruction::new(
-        Op::Bitcast,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(one)],
-    )])
+    Ok(vec![copy_or_bitcast_result(rty, res, uint, one)])
 }
 
 /// `air.get_num_samples.i32(flags)` returns graphics pipeline state, not a property of an image
@@ -956,13 +934,9 @@ pub(in crate::passes) fn lower_raster_sample_count(
             "{name} raster sample count {samples} is not a Vulkan sample-count value"
         ));
     }
+    let uint = ctx.ty_uint();
     let value = ctx.const_uint(samples);
-    Ok(vec![Instruction::new(
-        Op::Bitcast,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(value)],
-    )])
+    Ok(vec![copy_or_bitcast_result(rty, res, uint, value)])
 }
 
 /// `air.calculate_{clamped,unclamped}_lod_texture_2d(texture, sampler, coord, flags)` returns
@@ -988,8 +962,9 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
 
     let mut img = resolve_image_value(ctx, args[0]);
     if texture_operand_is_private_pointer(ctx, img) {
-        img = single_sampled_image_for_private_read(ctx, img)
-            .ok_or_else(|| format!("{name} private texture operand is ambiguous"))?;
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
+            img = sampled_img;
+        }
     }
     if image_is_storage(ctx, img) {
         return Err(format!("{name} requires a sampled texture"));
@@ -1167,9 +1142,14 @@ pub(in crate::passes) fn lower_get_imageblock_extent(
     let res = res.ok_or_else(|| format!("{name} has no result"))?;
     let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
     let axis = usize::from(name == "air.get_imageblock_height");
-    let extent = ctx.const_int_of(rty, i64::from(ctx.kernel_local_size[axis]));
+    let extent = ctx.kernel_local_size_ids()[axis];
+    let uint_ty = ctx.ty_uint();
     Ok(vec![Instruction::new(
-        Op::CopyObject,
+        if rty == uint_ty {
+            Op::CopyObject
+        } else {
+            Op::UConvert
+        },
         Some(rty),
         Some(res),
         vec![Operand::IdRef(extent)],

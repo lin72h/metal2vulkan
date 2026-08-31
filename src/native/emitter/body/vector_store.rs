@@ -67,13 +67,29 @@ impl Emitter {
         else {
             return Ok(false);
         };
-        if array_len != vector_len || !types_compatible(array_elem, vector_elem) {
+        if array_len != vector_len
+            || !is_scalar_storage_type(array_elem)
+            || !is_scalar_storage_type(vector_elem)
+        {
             return Ok(false);
+        }
+        let elements_are_compatible = types_compatible(array_elem, vector_elem);
+        if !elements_are_compatible {
+            let (Some(array_elem_bits), Some(vector_elem_bits)) =
+                (bitcast_width(array_elem), bitcast_width(vector_elem))
+            else {
+                return Ok(false);
+            };
+            if array_elem_bits != vector_elem_bits {
+                return Ok(false);
+            }
         }
 
         // LLVM permits a vector load through an opaque pointer whose allocation is an equivalent
         // fixed scalar array. Logical SPIR-V cannot bitcast the pointer or the aggregate value, so
-        // load the array and rebuild the vector lane-for-lane.
+        // load the array and rebuild the vector lane-for-lane. When the scalar interpretations
+        // differ, reinterpret each same-width lane rather than changing the pointer's storage
+        // model or attempting an illegal aggregate bitcast.
         let array_type = self.type_id(pointee)?;
         let loaded = self.fresh();
         instructions.push(Self::inst(
@@ -82,16 +98,30 @@ impl Emitter {
             Some(loaded),
             vec![Operand::IdRef(ptr)],
         ));
-        let elem_type = self.type_id(vector_elem)?;
+        let array_elem_type = self.type_id(array_elem)?;
+        let vector_elem_type = self.type_id(vector_elem)?;
+        let elements_need_bitcast = !elements_are_compatible && array_elem_type != vector_elem_type;
         let mut lanes = Vec::with_capacity(*vector_len as usize);
         for lane in 0..*vector_len {
             let value = self.fresh();
             instructions.push(Self::inst(
                 Op::CompositeExtract,
-                Some(elem_type),
+                Some(array_elem_type),
                 Some(value),
                 vec![Operand::IdRef(loaded), Operand::LiteralBit32(lane)],
             ));
+            let value = if elements_need_bitcast {
+                let reinterpreted = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Bitcast,
+                    Some(vector_elem_type),
+                    Some(reinterpreted),
+                    vec![Operand::IdRef(value)],
+                ));
+                reinterpreted
+            } else {
+                value
+            };
             lanes.push(Operand::IdRef(value));
         }
         let vector_type = self.type_id(result_ty)?;

@@ -115,6 +115,11 @@ pub fn rebuild_index(root: &Path, destination: &Path) -> Result<(), String> {
                source_offset INTEGER,
                source_length INTEGER
              );
+             CREATE TABLE source_library_memberships (
+               air_sha256 TEXT NOT NULL REFERENCES sources(air_sha256) ON DELETE CASCADE,
+               lib_sha256 TEXT NOT NULL,
+               PRIMARY KEY(air_sha256, lib_sha256)
+             );
              CREATE TABLE cases (
                case_id TEXT PRIMARY KEY,
                air_sha256 TEXT NOT NULL REFERENCES sources(air_sha256),
@@ -177,17 +182,24 @@ pub fn rebuild_index(root: &Path, destination: &Path) -> Result<(), String> {
                 "INSERT INTO sources (air_sha256, stage, entry, label, shard, source_offset, source_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .map_err(|error| format!("prepare source insert: {error}"))?;
+        let mut insert_membership = transaction
+            .prepare(
+                "INSERT OR IGNORE INTO source_library_memberships (air_sha256, lib_sha256)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(|error| format!("prepare source-membership insert: {error}"))?;
         let mut public_hashes = HashSet::new();
         for source in public_sources()? {
             let air_sha256 = source.air_sha256;
             insert_source(
                 &mut insert,
+                &mut insert_membership,
                 &SourceIndexRow {
                     air_sha256: air_sha256.clone(),
                     stage: source.stage,
                     entry: source.entry,
                     label: source.label,
-                    lib_sha256: source.lib_sha256,
+                    lib_sha256s: source.lib_sha256s,
                     source_offset: None,
                     source_length: None,
                 },
@@ -222,7 +234,12 @@ pub fn rebuild_index(root: &Path, destination: &Path) -> Result<(), String> {
                         return Err(format!("duplicate private source {}", source.air_sha256));
                     }
                     if !public_hashes.contains(&source.air_sha256) {
-                        insert_source(&mut insert, &source, Some(actual_shard))?;
+                        insert_source(
+                            &mut insert,
+                            &mut insert_membership,
+                            &source,
+                            Some(actual_shard),
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -329,6 +346,11 @@ pub fn sync_index_with_stats(root: &Path, destination: &Path) -> Result<IndexSyn
                size INTEGER NOT NULL,
                modified_ns INTEGER NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS source_library_memberships (
+               air_sha256 TEXT NOT NULL REFERENCES sources(air_sha256) ON DELETE CASCADE,
+               lib_sha256 TEXT NOT NULL,
+               PRIMARY KEY(air_sha256, lib_sha256)
+             );
              CREATE TABLE IF NOT EXISTS index_metadata (
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
@@ -406,15 +428,22 @@ pub fn sync_index_with_stats(root: &Path, destination: &Path) -> Result<IndexSyn
             "INSERT OR IGNORE INTO sources (air_sha256, stage, entry, label, shard, source_offset, source_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .map_err(|error| format!("prepare source sync insert: {error}"))?;
+    let mut insert_membership = transaction
+        .prepare(
+            "INSERT OR IGNORE INTO source_library_memberships (air_sha256, lib_sha256)
+             VALUES (?1, ?2)",
+        )
+        .map_err(|error| format!("prepare source-membership sync insert: {error}"))?;
     for source in public_sources()? {
         insert_source(
             &mut insert,
+            &mut insert_membership,
             &SourceIndexRow {
                 air_sha256: source.air_sha256,
                 stage: source.stage,
                 entry: source.entry,
                 label: source.label,
-                lib_sha256: source.lib_sha256,
+                lib_sha256s: source.lib_sha256s,
                 source_offset: None,
                 source_length: None,
             },
@@ -470,7 +499,7 @@ pub fn sync_index_with_stats(root: &Path, destination: &Path) -> Result<IndexSyn
                     source.air_sha256, actual, shard
                 ));
             }
-            insert_source(&mut insert, &source, Some(shard))
+            insert_source(&mut insert, &mut insert_membership, &source, Some(shard))
         })?;
         transaction
             .execute(
@@ -479,6 +508,7 @@ pub fn sync_index_with_stats(root: &Path, destination: &Path) -> Result<IndexSyn
             )
             .map_err(|error| format!("record source shard {shard} stamp: {error}"))?;
     }
+    drop(insert_membership);
     drop(insert);
     transaction
         .execute(
@@ -512,6 +542,7 @@ pub(crate) fn record_source_shard_write(
     let mut connection = Connection::open(&destination)
         .map_err(|error| format!("open index {}: {error}", destination.display()))?;
     ensure_source_location_columns(&connection)?;
+    ensure_source_membership_table(&connection)?;
     connection
         .execute_batch(
             "PRAGMA foreign_keys=ON;
@@ -525,6 +556,21 @@ pub(crate) fn record_source_shard_write(
     let transaction = connection
         .transaction()
         .map_err(|error| format!("begin source-shard index update: {error}"))?;
+    transaction
+        .execute_batch(
+            "CREATE TEMP TABLE source_shard_replacement_hashes (
+               air_sha256 TEXT PRIMARY KEY
+             );",
+        )
+        .map_err(|error| format!("prepare source-shard replacement set: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM source_library_memberships WHERE air_sha256 IN (
+               SELECT air_sha256 FROM sources WHERE shard=?1
+             )",
+            [shard],
+        )
+        .map_err(|error| format!("clear source memberships for shard {shard}: {error}"))?;
     {
         let mut upsert = transaction
             .prepare(
@@ -541,7 +587,19 @@ pub(crate) fn record_source_shard_write(
                  WHERE sources.shard IS NOT NULL",
             )
             .map_err(|error| format!("prepare source-shard index update: {error}"))?;
+        let mut retain = transaction
+            .prepare("INSERT INTO source_shard_replacement_hashes VALUES (?1)")
+            .map_err(|error| format!("prepare retained source hash insert: {error}"))?;
+        let mut insert_membership = transaction
+            .prepare(
+                "INSERT OR IGNORE INTO source_library_memberships (air_sha256, lib_sha256)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(|error| format!("prepare source-shard membership update: {error}"))?;
         for location in locations {
+            retain
+                .execute([&location.air_sha256])
+                .map_err(|error| format!("retain source {}: {error}", location.air_sha256))?;
             upsert
                 .execute(params![
                     location.air_sha256,
@@ -553,8 +611,29 @@ pub(crate) fn record_source_shard_write(
                     location.length,
                 ])
                 .map_err(|error| format!("index source {}: {error}", location.air_sha256))?;
+            for library in &location.lib_sha256s {
+                insert_membership
+                    .execute(params![location.air_sha256, library])
+                    .map_err(|error| {
+                        format!(
+                            "index source {} parent library: {error}",
+                            location.air_sha256
+                        )
+                    })?;
+            }
         }
     }
+    transaction
+        .execute(
+            "DELETE FROM sources
+             WHERE shard=?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM source_shard_replacement_hashes replacement
+                 WHERE replacement.air_sha256=sources.air_sha256
+               )",
+            [shard],
+        )
+        .map_err(|error| format!("remove stale sources from shard {shard}: {error}"))?;
     transaction
         .execute(
             "INSERT OR REPLACE INTO indexed_source_shards (shard, size, modified_ns)
@@ -627,7 +706,7 @@ struct SourceIndexRow {
     air_sha256: String,
     stage: String,
     entry: String,
-    lib_sha256: String,
+    lib_sha256s: Vec<String>,
     label: String,
     source_offset: Option<i64>,
     source_length: Option<i64>,
@@ -655,18 +734,28 @@ impl SourceIndexRow {
         if self.label.trim().is_empty() {
             return Err("source label must not be empty".into());
         }
-        if self.lib_sha256 != "owned-synthetic"
-            && (self.lib_sha256.len() != 64
-                || !self.lib_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || self
-                    .lib_sha256
-                    .bytes()
-                    .any(|byte| byte.is_ascii_uppercase()))
-        {
-            return Err(format!(
-                "source {} lib_sha256 must be lowercase SHA-256",
-                self.label
-            ));
+        if self.lib_sha256s.is_empty() {
+            return Err(format!("source {} has no parent library", self.label));
+        }
+        let mut previous = None;
+        for hash in &self.lib_sha256s {
+            if hash != "owned-synthetic"
+                && (hash.len() != 64
+                    || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || hash.bytes().any(|byte| byte.is_ascii_uppercase()))
+            {
+                return Err(format!(
+                    "source {} parent library must be lowercase SHA-256",
+                    self.label
+                ));
+            }
+            if previous.is_some_and(|value: &String| value >= hash) {
+                return Err(format!(
+                    "source {} parent libraries must be sorted and unique",
+                    self.label
+                ));
+            }
+            previous = Some(hash);
         }
         Ok(())
     }
@@ -732,10 +821,44 @@ fn source_index_row_from_canonical_json(line: &[u8]) -> Result<SourceIndexRow, S
         air_sha256: extract_json_string(metadata, b"air_sha256")?,
         stage: extract_json_string(metadata, b"stage")?,
         entry: extract_json_string(metadata, b"entry")?,
-        lib_sha256: extract_json_string(metadata, b"lib_sha256")?,
+        lib_sha256s: extract_json_string_array_or_legacy_scalar(
+            metadata,
+            b"lib_sha256s",
+            b"lib_sha256",
+        )?,
         label: extract_json_string(metadata, b"label")?,
         source_offset: None,
         source_length: None,
+    })
+}
+
+fn extract_json_string_array_or_legacy_scalar(
+    bytes: &[u8],
+    array_key: &[u8],
+    scalar_key: &[u8],
+) -> Result<Vec<String>, String> {
+    let mut pattern = Vec::with_capacity(array_key.len() + 4);
+    pattern.push(b'"');
+    pattern.extend_from_slice(array_key);
+    pattern.extend_from_slice(b"\":[");
+    let Some(start) = memmem::find(bytes, &pattern).map(|offset| offset + pattern.len() - 1) else {
+        return extract_json_string(bytes, scalar_key).map(|value| vec![value]);
+    };
+    let end = bytes[start..]
+        .iter()
+        .position(|byte| *byte == b']')
+        .map(|offset| start + offset + 1)
+        .ok_or_else(|| {
+            format!(
+                "canonical source row has unterminated {}",
+                String::from_utf8_lossy(array_key)
+            )
+        })?;
+    serde_json::from_slice(&bytes[start..end]).map_err(|error| {
+        format!(
+            "canonical source row has invalid {}: {error}",
+            String::from_utf8_lossy(array_key)
+        )
     })
 }
 
@@ -785,6 +908,7 @@ fn extract_json_string(bytes: &[u8], key: &[u8]) -> Result<String, String> {
 
 fn insert_source(
     statement: &mut rusqlite::Statement<'_>,
+    membership_statement: &mut rusqlite::Statement<'_>,
     source: &SourceIndexRow,
     shard: Option<usize>,
 ) -> Result<(), String> {
@@ -799,6 +923,11 @@ fn insert_source(
             source.source_length,
         ])
         .map_err(|error| format!("index source: {error}"))?;
+    for library in &source.lib_sha256s {
+        membership_statement
+            .execute(params![source.air_sha256, library])
+            .map_err(|error| format!("index source parent library: {error}"))?;
+    }
     Ok(())
 }
 
@@ -823,6 +952,19 @@ fn ensure_source_location_columns(connection: &Connection) -> Result<(), String>
             .map_err(|error| format!("add source_length index column: {error}"))?;
     }
     Ok(())
+}
+
+fn ensure_source_membership_table(connection: &Connection) -> Result<(), String> {
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE IF NOT EXISTS source_library_memberships (
+               air_sha256 TEXT NOT NULL REFERENCES sources(air_sha256) ON DELETE CASCADE,
+               lib_sha256 TEXT NOT NULL,
+               PRIMARY KEY(air_sha256, lib_sha256)
+             );",
+        )
+        .map_err(|error| format!("upgrade source-membership index: {error}"))
 }
 
 fn ensure_candidate_fingerprint_column(connection: &Connection) -> Result<(), String> {
@@ -863,6 +1005,7 @@ pub(crate) fn index_source_shard_locations(
     let mut connection = Connection::open(index_path)
         .map_err(|error| format!("open index {}: {error}", index_path.display()))?;
     ensure_source_location_columns(&connection)?;
+    ensure_source_membership_table(&connection)?;
     let transaction = connection
         .transaction()
         .map_err(|error| format!("begin source-location update: {error}"))?;
@@ -872,6 +1015,14 @@ pub(crate) fn index_source_shard_locations(
             [shard],
         )
         .map_err(|error| format!("clear source locations for shard {shard}: {error}"))?;
+    transaction
+        .execute(
+            "DELETE FROM source_library_memberships WHERE air_sha256 IN (
+               SELECT air_sha256 FROM sources WHERE shard=?1
+             )",
+            [shard],
+        )
+        .map_err(|error| format!("clear source memberships for shard {shard}: {error}"))?;
     {
         let mut update = transaction
             .prepare(
@@ -886,6 +1037,12 @@ pub(crate) fn index_source_shard_locations(
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .map_err(|error| format!("prepare source-location insert: {error}"))?;
+        let mut insert_membership = transaction
+            .prepare(
+                "INSERT OR IGNORE INTO source_library_memberships (air_sha256, lib_sha256)
+                 VALUES (?1, ?2)",
+            )
+            .map_err(|error| format!("prepare source-membership repair: {error}"))?;
         read_source_index_shard(&path, |source| {
             update
                 .execute(params![
@@ -898,7 +1055,7 @@ pub(crate) fn index_source_shard_locations(
                     shard,
                 ])
                 .map_err(|error| format!("record source location: {error}"))?;
-            insert_source(&mut insert, &source, Some(shard))?;
+            insert_source(&mut insert, &mut insert_membership, &source, Some(shard))?;
             Ok(())
         })?;
     }
@@ -1320,6 +1477,7 @@ mod tests {
                 initial_bytes_b64: Some("AAAAAA==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -1445,14 +1603,14 @@ mod tests {
         let mut source = public_sources().unwrap().into_iter().next().unwrap();
         source.air_ll.push_str("\n; private index fixture\n");
         source.air_sha256 = crate::hash::sha256_bytes(source.air_ll.as_bytes());
-        source.lib_sha256 = "owned-synthetic".into();
+        source.lib_sha256s = vec!["owned-synthetic".into()];
         source.label = "private/before".into();
         crate::source::write_source_shards(scratch.path(), [source.clone()]).unwrap();
         let index = scratch.path().join("index.sqlite");
         rebuild_index(scratch.path(), &index).unwrap();
 
         source.label = "private/after-a-changed-shard".into();
-        source.lib_sha256 = "00".repeat(32);
+        source.lib_sha256s = vec!["00".repeat(32)];
         crate::source::merge_source_shards(scratch.path(), [source.clone()]).unwrap();
         let stats = sync_index_with_stats(scratch.path(), &index).unwrap();
         assert_eq!(stats.source_shards_scanned, 1);
@@ -1483,15 +1641,30 @@ mod tests {
             .air_ll
             .push_str("\n; indexed merge handoff fixture\n");
         source.air_sha256 = crate::hash::sha256_bytes(source.air_ll.as_bytes());
-        source.lib_sha256 = "owned-synthetic".into();
+        source.lib_sha256s = vec!["owned-synthetic".into()];
         source.label = "private/before".into();
         crate::source::write_source_shards(scratch.path(), [source.clone()]).unwrap();
         let index = default_index_path(scratch.path());
         rebuild_index(scratch.path(), &index).unwrap();
+        let connection = Connection::open(&index).unwrap();
+        connection
+            .execute(
+                "INSERT INTO cases (case_id, air_sha256, name, input_sha256) \
+                 VALUES ('retained-case', ?1, 'retained', 'input')",
+                [&source.air_sha256],
+            )
+            .unwrap();
+        drop(connection);
 
         source.label = "private/after-direct-handoff".into();
-        source.lib_sha256 = "00".repeat(32);
+        source.lib_sha256s = vec!["00".repeat(32)];
         crate::source::merge_source_shards(scratch.path(), [source.clone()]).unwrap();
+
+        let connection = Connection::open(&index).unwrap();
+        connection
+            .execute("DELETE FROM cases WHERE case_id='retained-case'", [])
+            .unwrap();
+        drop(connection);
 
         let stats = sync_index_with_stats(scratch.path(), &index).unwrap();
         assert_eq!(stats.source_shards_scanned, 0);
@@ -1513,6 +1686,19 @@ mod tests {
         assert_eq!(indexed.0, source.label);
         assert!(indexed.1.is_some());
         assert!(indexed.2.is_some());
+        assert_eq!(
+            connection
+                .prepare(
+                    "SELECT lib_sha256 FROM source_library_memberships \
+                     WHERE air_sha256=?1 ORDER BY lib_sha256",
+                )
+                .unwrap()
+                .query_map([&source.air_sha256], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            vec!["00".repeat(32), "owned-synthetic".into()]
+        );
         let read_stats = crate::source::for_each_indexed_source_analysis_with_stats(
             scratch.path(),
             &index,
@@ -1529,6 +1715,76 @@ mod tests {
     }
 
     #[test]
+    fn source_shard_handoff_removes_rows_absent_from_the_replacement() {
+        let scratch = ScratchDir::new("index-source-replacement").unwrap();
+        let mut retained = public_sources().unwrap().into_iter().next().unwrap();
+        retained.air_ll.push_str("\n; retained private fixture\n");
+        retained.air_sha256 = crate::hash::sha256_bytes(retained.air_ll.as_bytes());
+        retained.lib_sha256s = vec!["11".repeat(32), "22".repeat(32)];
+        retained.label = "private/retained".into();
+        let shard = crate::source::shard_index_for_hash(&retained.air_sha256).unwrap();
+        let mut stale = retained.clone();
+        for nonce in 0..u32::MAX {
+            stale.air_ll = format!("{}\n; stale private fixture {nonce}\n", retained.air_ll);
+            stale.air_sha256 = crate::hash::sha256_bytes(stale.air_ll.as_bytes());
+            if crate::source::shard_index_for_hash(&stale.air_sha256).unwrap() == shard {
+                break;
+            }
+        }
+        assert_ne!(stale.air_sha256, retained.air_sha256);
+        stale.lib_sha256s = vec!["33".repeat(32)];
+        stale.label = "private/stale".into();
+        crate::source::write_source_shards(scratch.path(), [retained.clone(), stale.clone()])
+            .unwrap();
+        let index = default_index_path(scratch.path());
+        rebuild_index(scratch.path(), &index).unwrap();
+
+        let source_path = crate::source::source_shard_path(scratch.path(), shard);
+        let encoded = format!(
+            "{}\n",
+            crate::jsonl::to_sorted_json_string(&retained).unwrap()
+        );
+        fs::write(&source_path, encoded.as_bytes()).unwrap();
+        record_source_shard_write(
+            scratch.path(),
+            shard,
+            &[crate::source::SourceIndexLocation {
+                air_sha256: retained.air_sha256.clone(),
+                stage: retained.stage.clone(),
+                entry: retained.entry.clone(),
+                label: retained.label.clone(),
+                lib_sha256s: retained.lib_sha256s.clone(),
+                offset: 0,
+                length: encoded.len().try_into().unwrap(),
+            }],
+        )
+        .unwrap();
+
+        let connection = Connection::open(&index).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sources WHERE air_sha256=?1",
+                    [&stale.air_sha256],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM source_library_memberships WHERE air_sha256=?1",
+                    [&stale.air_sha256],
+                    |row| row.get::<_, usize>(0),
+                )
+                .unwrap(),
+            0
+        );
+        check_index(scratch.path(), &index).unwrap();
+    }
+
+    #[test]
     fn legacy_migration_and_lookup_never_open_an_unrelated_shard() {
         let scratch = ScratchDir::new("index-lazy-locations").unwrap();
         let mut source = public_sources().unwrap().into_iter().next().unwrap();
@@ -1536,7 +1792,7 @@ mod tests {
             .air_ll
             .push_str("\n; private lazy-location fixture\n");
         source.air_sha256 = crate::hash::sha256_bytes(source.air_ll.as_bytes());
-        source.lib_sha256 = "owned-synthetic".into();
+        source.lib_sha256s = vec!["owned-synthetic".into()];
         source.label = "private/lazy".into();
         let source_shard = crate::source::shard_index_for_hash(&source.air_sha256).unwrap();
         let mut other = source.clone();

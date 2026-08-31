@@ -221,6 +221,93 @@ mod tests {
     }
 
     #[test]
+    fn raw_workgroup_root_wide_store_rewrites_to_byte_zero_pointer() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(3),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(4),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(4),
+                Some(5),
+                vec![Operand::LiteralBit32(512)],
+            ),
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(6),
+                vec![Operand::IdRef(2), Operand::IdRef(5)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(7),
+                vec![
+                    Operand::StorageClass(StorageClass::Workgroup),
+                    Operand::IdRef(6),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(7),
+                Some(8),
+                vec![Operand::StorageClass(StorageClass::Workgroup)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(3),
+                Some(9),
+                vec![Operand::LiteralBit32(0)],
+            ),
+        ];
+        module
+            .functions
+            .push(one_block_function(vec![Instruction::new(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(8), Operand::IdRef(9)],
+            )]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        rewrite_workgroup_root_access(&mut ctx, 0, 8, &defs);
+
+        let instructions = &ctx.module.functions[0].blocks[0].instructions;
+        let store = instructions
+            .iter()
+            .find(|instruction| instruction.class.opcode == Op::Store)
+            .expect("store");
+        let pointer = id_ref(store.operands.first().expect("store pointer")).expect("pointer id");
+        assert_ne!(pointer, 8);
+        let decay = instructions
+            .iter()
+            .find(|instruction| instruction.result_id == Some(pointer))
+            .expect("byte-zero pointer");
+        assert_eq!(decay.class.opcode, Op::InBoundsAccessChain);
+        assert_eq!(decay.operands[0], Operand::IdRef(8));
+        assert_eq!(decay.operands.len(), 2);
+    }
+
+    #[test]
     fn flattened_workgroup_struct_store_rewrites_to_leaf_indices() {
         let mut module = Module::new();
         module.header = Some(ModuleHeader::new(100));
@@ -779,7 +866,7 @@ mod tests {
         let mut ctx = Ctx::new(module);
         ctx.air_struct_offsets.insert(9, vec![0, 4, 8, 9, 16, 80]);
         rewrite_record_array_buffer(&mut ctx, 0, 50, 13, 11, 9, &defs);
-        rewrite_structural_load_result_types(&mut ctx, 0, &defs);
+        rewrite_structural_result_types(&mut ctx, 0, &defs);
 
         let access = ctx.module.functions[0].blocks[0]
             .instructions
@@ -1204,8 +1291,8 @@ mod tests {
         let defs = defs_from_module(&module);
         let mut ctx = Ctx::new(module);
         ctx.air_struct_offsets.insert(9, vec![0, 4, 8, 9, 16, 80]);
-        rewrite_collapsed_buffer(&mut ctx, 0, 50, 13, 11, true, &defs);
-        rewrite_structural_load_result_types(&mut ctx, 0, &defs);
+        rewrite_collapsed_buffer(&mut ctx, 0, 50, 13, 11, true, &[], &defs);
+        rewrite_structural_result_types(&mut ctx, 0, &defs);
 
         let access = ctx.module.functions[0].blocks[0]
             .instructions
@@ -1236,6 +1323,411 @@ mod tests {
             .find(|inst| inst.result_id == Some(61))
             .expect("load");
         assert_eq!(load.result_type, Some(8));
+    }
+
+    #[test]
+    fn collapsed_scalar_buffer_replays_exact_source_byte_offset() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(3),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(Op::TypeRuntimeArray, None, Some(4), vec![Operand::IdRef(3)]),
+            Instruction::new(Op::TypeStruct, None, Some(5), vec![Operand::IdRef(4)]),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(5),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(6),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(8),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(2),
+                Some(9),
+                vec![Operand::LiteralBit32(1)],
+            ),
+        ];
+        module
+            .functions
+            .push(one_block_function(vec![Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(8),
+                Some(20),
+                vec![Operand::IdRef(50), Operand::IdRef(9), Operand::IdRef(9)],
+            )]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        ctx.emit_sidecar
+            .buffer_access_offsets
+            .push(crate::emit_sidecar::BufferAccessOffset {
+                id: 20,
+                root: 50,
+                byte_offset: 16,
+            });
+        rewrite_collapsed_buffer(&mut ctx, 0, 50, 7, 5, true, &[], &defs);
+
+        let types = combined_type_defs(&ctx, &defs);
+        let access = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|inst| inst.result_id == Some(20))
+            .expect("access chain");
+        assert_eq!(access.operands.len(), 3);
+        assert_eq!(access.operands[0], Operand::IdRef(7));
+        assert_eq!(
+            const_u32(&types, id_ref(&access.operands[1]).unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            const_u32(&types, id_ref(&access.operands[2]).unwrap()),
+            Some(4)
+        );
+        assert_eq!(
+            pointer_pointee_including_new(&ctx, &defs, access.result_type.unwrap()),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn collapsed_struct_buffer_replays_flat_word_offset_as_nested_member_path() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeStruct,
+                None,
+                Some(2),
+                vec![Operand::IdRef(1), Operand::IdRef(1)],
+            ),
+            Instruction::new(
+                Op::TypeStruct,
+                None,
+                Some(3),
+                vec![Operand::IdRef(1), Operand::IdRef(1), Operand::IdRef(1)],
+            ),
+            Instruction::new(
+                Op::TypeStruct,
+                None,
+                Some(4),
+                vec![Operand::IdRef(2), Operand::IdRef(3), Operand::IdRef(1)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(4),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(5),
+                Some(6),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(7),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(1),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(1),
+                Some(8),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(1),
+                Some(9),
+                vec![Operand::LiteralBit32(3)],
+            ),
+        ];
+        module
+            .functions
+            .push(one_block_function(vec![Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(7),
+                Some(20),
+                vec![Operand::IdRef(6), Operand::IdRef(8), Operand::IdRef(9)],
+            )]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        ctx.emit_sidecar
+            .buffer_access_offsets
+            .push(crate::emit_sidecar::BufferAccessOffset {
+                id: 20,
+                root: 6,
+                byte_offset: 12,
+            });
+        assert_eq!(
+            body_buf_flat_scalar_element_type(&ctx, &ctx.module.functions[0], 6),
+            Some(1)
+        );
+        rewrite_collapsed_buffer(&mut ctx, 0, 50, 6, 4, false, &[], &defs);
+
+        let types = combined_type_defs(&ctx, &defs);
+        let access = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|instruction| instruction.result_id == Some(20))
+            .expect("access chain");
+        assert_eq!(access.operands[0], Operand::IdRef(6));
+        assert_eq!(access.operands.len(), 3);
+        assert_eq!(
+            const_u32(&types, id_ref(&access.operands[1]).unwrap()),
+            Some(1)
+        );
+        assert_eq!(
+            const_u32(&types, id_ref(&access.operands[2]).unwrap()),
+            Some(1)
+        );
+        assert_eq!(
+            pointer_pointee_including_new(&ctx, &defs, access.result_type.unwrap()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn collapsed_buffer_routes_each_scalar_view_to_its_typed_descriptor_alias() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(16)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(3),
+                vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(Op::TypeRuntimeArray, None, Some(4), vec![Operand::IdRef(2)]),
+            Instruction::new(Op::TypeStruct, None, Some(5), vec![Operand::IdRef(4)]),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(5),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(6),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(Op::TypeRuntimeArray, None, Some(8), vec![Operand::IdRef(3)]),
+            Instruction::new(Op::TypeStruct, None, Some(9), vec![Operand::IdRef(8)]),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(10),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(9),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(10),
+                Some(11),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(12),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(2),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(13),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(1),
+                Some(14),
+                vec![Operand::LiteralBit32(3)],
+            ),
+        ];
+        module.functions.push(one_block_function(vec![
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(12),
+                Some(20),
+                vec![Operand::IdRef(50), Operand::IdRef(14)],
+            ),
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(13),
+                Some(21),
+                vec![Operand::IdRef(50), Operand::IdRef(14)],
+            ),
+        ]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        rewrite_collapsed_buffer(&mut ctx, 0, 50, 7, 5, true, &[(3, 11)], &defs);
+
+        let body = &ctx.module.functions[0].blocks[0].instructions;
+        let half_access = body.iter().find(|inst| inst.result_id == Some(20)).unwrap();
+        let bfloat_access = body.iter().find(|inst| inst.result_id == Some(21)).unwrap();
+        assert_eq!(half_access.operands[0], Operand::IdRef(7));
+        assert_eq!(bfloat_access.operands[0], Operand::IdRef(11));
+        assert_eq!(half_access.operands.len(), 3);
+        assert_eq!(bfloat_access.operands.len(), 3);
+        assert_eq!(half_access.result_type, Some(12));
+        assert_eq!(bfloat_access.result_type, Some(13));
+    }
+
+    #[test]
+    fn collapsed_buffer_does_not_confuse_element_zero_with_wrapper_member_zero() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(3),
+                vec![Operand::IdRef(2), Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(Op::TypeRuntimeArray, None, Some(4), vec![Operand::IdRef(3)]),
+            Instruction::new(Op::TypeStruct, None, Some(5), vec![Operand::IdRef(4)]),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(5),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(6),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(8),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(1),
+                Some(9),
+                vec![Operand::LiteralBit32(0)],
+            ),
+        ];
+        module
+            .functions
+            .push(one_block_function(vec![Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(8),
+                Some(20),
+                vec![Operand::IdRef(50), Operand::IdRef(9)],
+            )]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        rewrite_collapsed_buffer(&mut ctx, 0, 50, 7, 5, true, &[], &defs);
+
+        let all_defs = combined_type_defs(&ctx, &defs);
+        let access = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .find(|inst| inst.result_id == Some(20))
+            .unwrap();
+        assert_eq!(access.operands[0], Operand::IdRef(7));
+        assert_eq!(access.operands.len(), 3);
+        assert!(matches!(
+            access.operands.get(1),
+            Some(Operand::IdRef(id)) if const_u32(&all_defs, *id) == Some(0)
+        ));
+        assert_eq!(access.operands[2], Operand::IdRef(9));
+        assert_eq!(
+            pointer_pointee_including_new(&ctx, &defs, access.result_type.unwrap()),
+            Some(3)
+        );
     }
 
     #[test]
@@ -1328,6 +1820,85 @@ mod tests {
             .expect("factor constant");
         assert_eq!(factor_def.result_type, Some(3));
         assert_eq!(factor_def.operands, vec![Operand::LiteralBit64(4)]);
+    }
+
+    #[test]
+    fn rooted_vector_load_constructs_vector_stride_pointer() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(3),
+                vec![Operand::IdRef(2), Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(4),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::StorageBuffer),
+                    Operand::IdRef(3),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(6),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(2),
+                ],
+            ),
+            Instruction::new(
+                Op::Variable,
+                Some(5),
+                Some(7),
+                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(4),
+                Some(8),
+                vec![Operand::LiteralBit32(2)],
+            ),
+        ];
+        module.functions.push(one_block_function(vec![
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(6),
+                Some(20),
+                vec![Operand::IdRef(7), Operand::IdRef(8)],
+            ),
+            Instruction::new(Op::Load, Some(3), Some(21), vec![Operand::IdRef(20)]),
+        ]));
+
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+        rewrite_pointer_storage(&mut ctx, 0, &[7], StorageClass::StorageBuffer, &defs)
+            .expect("rewrite pointer storage");
+
+        let chain = &ctx.module.functions[0].blocks[0].instructions[0];
+        assert_eq!(chain.class.opcode, Op::PtrAccessChain);
+        assert_eq!(
+            pointer_pointee_including_new(&ctx, &defs, chain.result_type.unwrap()),
+            Some(3)
+        );
+        assert_eq!(chain.operands, [Operand::IdRef(7), Operand::IdRef(8)]);
     }
 
     #[test]
@@ -1503,5 +2074,54 @@ mod tests {
 
         ctx.air_struct_offsets.insert(3, vec![0, 8]);
         assert_eq!(remap_air_struct_member_index(&ctx, &defs, 3, 5), Some(1));
+    }
+
+    #[test]
+    fn structural_extract_follows_the_bound_composite_alias() {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(30));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(2),
+                Some(3),
+                vec![Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(4),
+                vec![Operand::IdRef(2), Operand::IdRef(3)],
+            ),
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(5),
+                vec![Operand::IdRef(2), Operand::IdRef(3)],
+            ),
+            Instruction::new(Op::TypeStruct, None, Some(6), vec![Operand::IdRef(4)]),
+        ];
+        module.functions.push(one_block_function(vec![
+            Instruction::new(Op::Undef, Some(6), Some(10), vec![]),
+            Instruction::new(
+                Op::CompositeExtract,
+                Some(5),
+                Some(11),
+                vec![Operand::IdRef(10), Operand::LiteralBit32(0)],
+            ),
+        ]));
+        let defs = defs_from_module(&module);
+        let mut ctx = Ctx::new(module);
+
+        rewrite_structural_result_types(&mut ctx, 0, &defs);
+
+        let extract = &ctx.module.functions[0].blocks[0].instructions[1];
+        assert_eq!(extract.result_type, Some(4));
     }
 }

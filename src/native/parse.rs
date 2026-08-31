@@ -7,6 +7,8 @@ pub(super) use super::lex::{
 };
 use crate::spirv_module::Operand;
 use spirv::Op;
+#[cfg(test)]
+use std::ops::Range;
 
 #[derive(Clone, Debug)]
 pub(super) struct LlCall {
@@ -30,11 +32,26 @@ pub(super) struct LlSwitch {
     pub(super) cases: Vec<(LlValue, String)>,
 }
 
+#[cfg(test)]
 pub(super) fn parse_function(
     lines: &[&str],
     start: usize,
-) -> Result<(LlFunction, Vec<String>, usize), String> {
+) -> Result<(LlFunction, Range<usize>, usize), String> {
     let head = strip_comment(lines[start]).trim();
+    let function = parse_function_header(head)?;
+    let name = function.name.clone();
+    let mut i = start + 1;
+    while i < lines.len() {
+        let line = strip_comment(lines[i]).trim();
+        if line == "}" {
+            return Ok((function, start + 1..i, i + 1));
+        }
+        i += 1;
+    }
+    Err(format!("native emitter: unterminated function {name}"))
+}
+
+pub(super) fn parse_function_header(head: &str) -> Result<LlFunction, String> {
     let at = head
         .find('@')
         .ok_or_else(|| format!("native emitter: define without function name: {head}"))?;
@@ -43,35 +60,13 @@ pub(super) fn parse_function(
         .ok_or_else(|| format!("native emitter: unmatched params in define: {head}"))?;
     let ret = parse_return_type(&head["define".len()..at])?;
     let (params, byval_param_pointees) = parse_params(&head[open + 1..close])?;
-    let mut body = Vec::new();
-    let mut i = start + 1;
-    while i < lines.len() {
-        let line = strip_comment(lines[i]).trim();
-        if line == "}" {
-            return Ok((
-                LlFunction {
-                    name,
-                    ret,
-                    params,
-                    byval_param_pointees,
-                    // Lowered to carriers by `LlModule::parse_inner` from the returned `body` lines,
-                    // once the module type table is complete; the text is then dropped.
-                    blocks: Vec::new(),
-                },
-                body,
-                i + 1,
-            ));
-        }
-        if line.starts_with("switch ") {
-            let (switch_line, next) = collect_switch(lines, i)?;
-            body.push(switch_line);
-            i = next;
-            continue;
-        }
-        body.push(lines[i].to_string());
-        i += 1;
-    }
-    Err(format!("native emitter: unterminated function {name}"))
+    Ok(LlFunction {
+        name,
+        ret,
+        params,
+        byval_param_pointees,
+        blocks: Vec::new(),
+    })
 }
 
 pub(super) fn collect_switch(lines: &[&str], start: usize) -> Result<(String, usize), String> {
@@ -716,7 +711,7 @@ pub(super) fn parse_memory_alignment(parts: &[&str]) -> Result<Option<u64>, Stri
 
 /// Parse a `phi`'s operand text (`<ty> [ v0, %pred0 ], [ v1, %pred1 ], ...` — the rhs AFTER the `phi`
 /// opcode) into the phi's (unresolved) result type and its `(value, predecessor-label)` incoming pairs.
-/// Feeds the build-time `TirInst.phi_incoming` carrier so it derives values/labels from that input — the
+/// Feeds the build-time `TirInst.phi_incoming()` carrier so it derives values/labels from that input — the
 /// values are then overlaid from the typed graph by
 /// `phi_incoming_values`, but the predecessor LABELS exist only here (control-flow edges, not operands).
 pub(super) fn parse_phi(rest: &str) -> Result<(LlType, Vec<(LlValue, String)>), String> {

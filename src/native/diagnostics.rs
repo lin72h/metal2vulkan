@@ -301,11 +301,11 @@ fn accumulate_tir_soundness(
     }
     for tb in &tir.blocks {
         for inst in &tb.insts {
-            for u in &inst.uses {
-                if !defined.contains(u.as_str()) {
+            inst.visit_uses(|u| {
+                if !defined.contains(u) {
                     stats.dangling_uses += 1;
                 }
-            }
+            });
         }
     }
     // Resolved-operand coverage + typed-graph soundness: every `Value` operand's use-site type must
@@ -375,8 +375,8 @@ fn accumulate_tir_soundness(
 /// operands, so its `Value` operands and synthetic-phi incomings reference the SSA universe emission
 /// actually sees. Built and validated alongside the string path; NOT yet consumed by emission (the
 /// byte gate guards consumption). Mirrors `emit_function`'s pre-loop exactly: split → lower
-/// unstructured switches → `structured_plan` (and on a structurizer reject, validate the lowered blocks
-/// the fallback merge-repair path would walk).
+/// unstructured switches → `structured_plan` (and on a structurizer reject, validate the lowered
+/// blocks retained for raw-CFG construction).
 pub fn tir_structured_self_check(san_ll: &str) -> Result<TirCheckStats, String> {
     let parsed = LlModule::parse(san_ll)?;
     let mut stats = TirCheckStats::default();

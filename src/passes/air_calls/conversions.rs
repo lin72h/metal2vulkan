@@ -48,6 +48,97 @@ pub(super) fn lower_convert(
     rty: Word,
     args: &[Word],
 ) -> Result<Vec<Instruction>, String> {
+    // AIR vectors wider than four lanes are represented as SPIR-V arrays. Conversion instructions
+    // do not accept aggregate types, so replay the scalar conversion independently for every exact
+    // lane and reconstruct the wide value.
+    if args.len() == 1
+        && type_def_of(ctx, rty).is_some_and(|definition| definition.class.opcode == Op::TypeArray)
+    {
+        let source_ty = value_result_type(ctx, args[0])
+            .ok_or_else(|| format!("{name} wide source has no result type"))?;
+        let (result_element, result_lanes) = composite_shape(ctx, rty)
+            .ok_or_else(|| format!("{name} wide result has no fixed element shape"))?;
+        let (source_element, source_lanes) = composite_shape(ctx, source_ty)
+            .ok_or_else(|| format!("{name} wide source has no fixed element shape"))?;
+        if source_lanes != result_lanes {
+            return Err(format!(
+                "{name} wide source/result lane mismatch: {source_lanes} vs {result_lanes}"
+            ));
+        }
+        let parts = name
+            .trim_start_matches("air.convert.")
+            .split('.')
+            .collect::<Vec<_>>();
+        let kinds = parts
+            .iter()
+            .filter(|part| part.len() == 1)
+            .filter_map(|part| match part.chars().next()? {
+                kind @ ('f' | 's' | 'u') => Some(kind),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (Some(&dst), Some(&src)) = (kinds.first(), kinds.last()) else {
+            return Err(format!("cannot parse wide convert kinds from {name}"));
+        };
+        let opcode = match (dst, src) {
+            ('f', 'u') => Op::ConvertUToF,
+            ('f', 's') => Op::ConvertSToF,
+            ('u', 'f') => Op::ConvertFToU,
+            ('s', 'f') => Op::ConvertFToS,
+            ('u', 'u') => Op::UConvert,
+            ('s', 's') => Op::SConvert,
+            ('f', 'f') => Op::FConvert,
+            ('u', 's') | ('s', 'u') => Op::Bitcast,
+            _ => {
+                return Err(format!(
+                    "unhandled wide convert kinds {src}->{dst} in {name}"
+                ))
+            }
+        };
+        let mut out = Vec::new();
+        let mut converted = Vec::with_capacity(result_lanes as usize);
+        for lane in 0..result_lanes {
+            let source = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::CompositeExtract,
+                Some(source_element),
+                Some(source),
+                vec![Operand::IdRef(args[0]), Operand::LiteralBit32(lane)],
+            ));
+            let result = ctx.module.fresh_id();
+            let source = if src == 's' {
+                let signed_ty = integer_type_like(ctx, source_element, true)?;
+                if signed_ty == source_element {
+                    source
+                } else {
+                    let signed = ctx.module.fresh_id();
+                    out.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(signed_ty),
+                        Some(signed),
+                        vec![Operand::IdRef(source)],
+                    ));
+                    signed
+                }
+            } else {
+                source
+            };
+            out.push(Instruction::new(
+                opcode,
+                Some(result_element),
+                Some(result),
+                vec![Operand::IdRef(source)],
+            ));
+            converted.push(Operand::IdRef(result));
+        }
+        out.push(Instruction::new(
+            Op::CompositeConstruct,
+            Some(rty),
+            Some(res),
+            converted,
+        ));
+        return Ok(out);
+    }
     // `air.convert` names are `air.convert.<dstkind>.<dsttype>.<srckind>.<srctype>`. An `i1` token is a
     // BOOL; whether it is the DEST type or the SOURCE type decides the lowering direction.
     // e.g. air.convert.f.v3f32.u.v3i1 (i1 = src) / air.convert.u.i1.f.f32 (i1 = dst).
@@ -144,21 +235,19 @@ pub(super) fn lower_convert(
         let signed_source = src == 's';
         let (input, input_ty) =
             bitcast_to_integer_signedness(ctx, &mut out, args[0], signed_source)?;
-        let op = if scalar_bit_width(ctx, input_ty) == scalar_bit_width(ctx, rty)
-            && vector_len(ctx, input_ty) == vector_len(ctx, rty)
-        {
-            Op::Bitcast
-        } else if signed_source {
-            Op::SConvert
+        let same_shape = scalar_bit_width(ctx, input_ty) == scalar_bit_width(ctx, rty)
+            && vector_len(ctx, input_ty) == vector_len(ctx, rty);
+        let instruction = if same_shape {
+            copy_or_bitcast_result(rty, res, input_ty, input)
         } else {
-            Op::UConvert
+            let opcode = if signed_source {
+                Op::SConvert
+            } else {
+                Op::UConvert
+            };
+            Instruction::new(opcode, Some(rty), Some(res), vec![Operand::IdRef(input)])
         };
-        out.push(Instruction::new(
-            op,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(input)],
-        ));
+        out.push(instruction);
         return Ok(out);
     }
     if matches!((dst, src), ('u' | 's', 'f')) {

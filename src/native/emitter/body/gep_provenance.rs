@@ -19,6 +19,112 @@ impl Emitter {
         };
         let parsed_source_ty = self.resolve_type(&gep.source_ty)?;
         if let LlValue::Local(base_name) = &gep.base.value {
+            if self.pointer_phi_values.contains(base_name)
+                && !self.raw_offsets.contains_key(base_name)
+            {
+                if let Some(incoming) = self.tir_phi_incomings.get(base_name).cloned() {
+                    let base_ty = self.resolve_type(&gep.base.ty)?;
+                    self.reserve_bda_address_phi(base_name, &incoming, &base_ty)?;
+                }
+            }
+        }
+        let network_base_pointee = match &gep.base.value {
+            LlValue::Local(base) => self.network_pointees.get(base),
+            _ => None,
+        };
+        let base_pointee = if let Some(pointee) = network_base_pointee {
+            Some(self.resolve_type(pointee)?)
+        } else {
+            self.pointer_pointee_for_value(&gep.base.value)?
+                .as_ref()
+                .map(|ty| self.resolve_type(ty))
+                .transpose()?
+        };
+        if self.null_rooted_pointer_values.contains(name)
+            && matches!(&gep.base.value, LlValue::Local(base) if self.null_rooted_pointer_values.contains(base))
+        {
+            let storage = self.pointer_storage_for(&gep.base.value, addrspace)?;
+            let pointee = self
+                .network_pointees
+                .get(name)
+                .cloned()
+                .unwrap_or(gep_pointee(&parsed_source_ty, &gep.indices)?);
+            let result_type = self.ptr_type_id(storage, &pointee)?;
+            let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+            self.module.types_global_values.push(Self::inst(
+                Op::Undef,
+                Some(result_type),
+                Some(result),
+                vec![],
+            ));
+            self.pointer_storage.insert(name.to_string(), storage);
+            self.pointer_pointees.insert(name.to_string(), pointee);
+            return Ok(Some(result));
+        }
+        // A byte GEP into Workgroup struct padding has no representation in Logical SPIR-V: an
+        // `OpPtrAccessChain %uchar*` cannot reinterpret a `%struct*`. Keep that address symbolic
+        // instead of constructing an instruction which a later pass must delete. Its only supported
+        // consumer is a zero store or memset, which proves the complete written range remains padding
+        // before discarding the unobservable write. Any other consumer fails visibly when it asks for
+        // an id.
+        if parsed_source_ty == LlType::Int(8) && gep.indices.len() == 1 {
+            if let Some(relative) = const_index_i64(&gep.indices[0]) {
+                let deferred = match &gep.base.value {
+                    LlValue::Local(base_name) => self
+                        .workgroup_padding_byte_pointers
+                        .get(base_name)
+                        .cloned()
+                        .map(|base| {
+                            let byte_offset = i128::from(base.byte_offset) + i128::from(relative);
+                            (base.struct_ty, byte_offset)
+                        }),
+                    _ => None,
+                };
+                let direct = if deferred.is_none()
+                    && self.pointer_storage_for(&gep.base.value, addrspace).ok()
+                        == Some(StorageClass::Workgroup)
+                    && matches!(base_pointee, Some(LlType::Struct(_)))
+                {
+                    Some((
+                        base_pointee.clone().expect("matched struct pointee"),
+                        i128::from(relative),
+                    ))
+                } else {
+                    None
+                };
+                if let Some((struct_ty, byte_offset)) = deferred.or(direct) {
+                    let byte_offset = u64::try_from(byte_offset).map_err(|_| {
+                        "native emitter: Workgroup padding byte GEP has a negative offset"
+                            .to_string()
+                    })?;
+                    if self.struct_range_is_padding(&struct_ty, byte_offset, 1)? {
+                        self.pointer_storage
+                            .insert(name.to_string(), StorageClass::Workgroup);
+                        self.pointer_pointees
+                            .insert(name.to_string(), LlType::Int(8));
+                        self.workgroup_padding_byte_pointers.insert(
+                            name.to_string(),
+                            WorkgroupPaddingBytePointer {
+                                struct_ty,
+                                byte_offset,
+                            },
+                        );
+                        return Ok(None);
+                    }
+                    if matches!(
+                        &gep.base.value,
+                        LlValue::Local(base_name)
+                            if self.workgroup_padding_byte_pointers.contains_key(base_name)
+                    ) {
+                        return Err(
+                            "native emitter: byte GEP escapes a symbolic Workgroup padding range"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+        if let LlValue::Local(base_name) = &gep.base.value {
             if let Some(raw_base) = self.raw_offsets.get(base_name).cloned() {
                 let base_storage = self.pointer_storage_for(&gep.base.value, addrspace)?;
                 let raw = self.apply_raw_gep(raw_base, &parsed_source_ty, &gep.indices)?;
@@ -39,25 +145,69 @@ impl Emitter {
                         self.materialize_reserved_raw_word_index(name, &raw, instructions)?;
                     }
                 }
+                if raw.device_addr_base.is_some() {
+                    self.materialize_reserved_bda_address(name, &raw, instructions)?;
+                }
                 self.raw_offsets.insert(name.to_string(), raw);
                 if !matches!(pointee, LlType::Ptr(_)) {
-                    self.define_unmodeled_pointer_value(name, addrspace, &pointee)?;
+                    if let Some(raw) =
+                        self.raw_offsets.get(name).cloned().filter(|raw| {
+                            self.bda_device_pointers && raw.device_addr_base.is_some()
+                        })
+                    {
+                        let result = self.result_id(name, &LlType::Ptr(addrspace))?;
+                        let address = self.materialize_device_address(&raw, instructions)?;
+                        let pointer_type =
+                            self.ptr_type_id(StorageClass::PhysicalStorageBuffer, &pointee)?;
+                        instructions.push(Self::inst(
+                            Op::ConvertUToPtr,
+                            Some(pointer_type),
+                            Some(result),
+                            vec![Operand::IdRef(address)],
+                        ));
+                        self.pointer_storage
+                            .insert(name.to_string(), StorageClass::PhysicalStorageBuffer);
+                        self.pointer_pointees
+                            .insert(name.to_string(), pointee.clone());
+                        self.used_device_address = true;
+                    } else {
+                        self.define_unmodeled_pointer_value(name, addrspace, &pointee)?;
+                    }
                 }
                 return Ok(self.values.get(name).map(|(id, _)| *id));
             }
             if self.unmodeled_pointers.contains(base_name) {
-                let pointee = gep_pointee(&parsed_source_ty, &gep.indices)?;
-                if matches!(pointee, LlType::Ptr(_)) {
-                    self.define_unmodeled_byte_pointer_value(name, addrspace)?;
-                } else {
-                    self.define_unmodeled_pointer_value(name, addrspace, &pointee)?;
+                let recoverable_field_base = self.values.get(base_name).is_some_and(|(id, _)| {
+                    self.emit_sidecar
+                        .local_pointer_field_loads
+                        .iter()
+                        .any(|fact| fact.id == *id)
+                });
+                if !recoverable_field_base {
+                    let pointee = gep_pointee(&parsed_source_ty, &gep.indices)?;
+                    if matches!(pointee, LlType::Ptr(_)) {
+                        self.define_unmodeled_byte_pointer_value(name, addrspace)?;
+                    } else {
+                        self.define_unmodeled_pointer_value(name, addrspace, &pointee)?;
+                    }
+                    return Ok(self.values.get(name).map(|(id, _)| *id));
                 }
-                return Ok(self.values.get(name).map(|(id, _)| *id));
             }
             if let Some(selected) = self.selected_pointers.get(base_name).cloned() {
                 if self.emit_selected_pointer_gep(
                     name,
                     &selected,
+                    &parsed_source_ty,
+                    &gep.indices,
+                    instructions,
+                )? {
+                    return Ok(None);
+                }
+            }
+            if let Some(tree) = self.selected_access_trees.get(base_name).cloned() {
+                if self.emit_selected_access_tree_gep(
+                    name,
+                    &tree,
                     &parsed_source_ty,
                     &gep.indices,
                     instructions,
@@ -91,11 +241,6 @@ impl Emitter {
         }
         let parsed_base = self.value_id_in(&gep.base.value, &gep.base.ty, instructions)?;
         let base_storage = self.pointer_storage_for(&gep.base.value, addrspace)?;
-        let base_pointee = self
-            .pointer_pointee_for_value(&gep.base.value)?
-            .as_ref()
-            .map(|ty| self.resolve_type(ty))
-            .transpose()?;
         let base_points_to_aggregate = base_pointee
             .as_ref()
             .is_some_and(|ty| matches!(ty, LlType::Array(_, _) | LlType::Struct(_)));
@@ -599,16 +744,17 @@ impl Emitter {
         for idx in &access_indices {
             ops.push(Operand::IdRef(self.value_id(&idx.value, &idx.ty)?));
         }
-        instructions.push(Self::inst(
-            if use_ptr_access_chain {
-                Op::PtrAccessChain
-            } else {
-                Op::InBoundsAccessChain
-            },
-            Some(ptr_type),
-            Some(result),
-            ops,
-        ));
+        // A zero-offset LLVM GEP can lower to no SPIR-V indices after its logical root index is
+        // removed. Every SPIR-V access-chain grammar requires at least one index/element operand,
+        // so preserve that identity explicitly instead of serializing a truncated access chain.
+        let opcode = if access_indices.is_empty() {
+            Op::CopyObject
+        } else if use_ptr_access_chain {
+            Op::PtrAccessChain
+        } else {
+            Op::InBoundsAccessChain
+        };
+        instructions.push(Self::inst(opcode, Some(ptr_type), Some(result), ops));
         self.pointer_storage
             .insert(name.to_string(), access_storage);
         self.pointer_pointees
@@ -748,6 +894,7 @@ impl Emitter {
         self.pointer_storage.insert(name.to_string(), base_storage);
         self.pointer_pointees
             .insert(name.to_string(), LlType::Int(8));
+        self.byte_view_pointers.insert(name.to_string());
         if !self.pointer_phi_values.is_empty() {
             let is_null = self.const_bool(false)?;
             self.record_pointer_nullness(name.to_string(), is_null);

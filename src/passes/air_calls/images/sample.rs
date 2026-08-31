@@ -56,7 +56,7 @@ pub(in crate::passes) fn lower_sample(
         // the pipeline/descriptor pairing at dispatch).
         let pixel_linear = comp == crate::passes::ImageComp::Float
             && sampler_state.uses_linear_filter()
-            && matches!(dim, Dim::Dim2D | Dim::Dim3D);
+            && matches!(dim, Dim::Dim1D | Dim::Dim2D | Dim::Dim3D);
         let pixel_bicubic = comp == crate::passes::ImageComp::Float
             && sampler_state.uses_bicubic_filter()
             && matches!(dim, Dim::Dim1D | Dim::Dim2D);
@@ -638,6 +638,7 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
     out: &mut Vec<Instruction>,
 ) -> Result<Word, String> {
     let spatial: usize = match dim {
+        Dim::Dim1D => 1,
         Dim::Dim2D => 2,
         Dim::Dim3D => 3,
         _ => return Err("air.sample_texture pixel linear sample unsupported dimension".into()),
@@ -673,7 +674,14 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
         let Operand::IdRef(comp) = comp else {
             return Err("air.sample_texture pixel coord component is not an id".into());
         };
-        let comp = clamp_pixel_coord_component_finite(ctx, comp, size, true, idx as u32, out);
+        let comp = clamp_pixel_coord_component_finite(
+            ctx,
+            comp,
+            size,
+            spatial > 1 || arrayed,
+            idx as u32,
+            out,
+        );
         let biased_coord = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::FSub,

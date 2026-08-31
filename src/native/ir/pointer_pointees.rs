@@ -29,7 +29,7 @@ impl LlModule {
                 let Some(result) = &inst.result else {
                     continue;
                 };
-                let Some((true_value, false_value)) = inst.select_arms.as_deref() else {
+                let Some((true_value, false_value)) = inst.select_arms().as_deref() else {
                     continue;
                 };
                 if !matches!(true_value.ty, LlType::Ptr(_))
@@ -47,7 +47,7 @@ impl LlModule {
             }
 
             for inst in f.carrier_insts() {
-                if let Some(gep) = &inst.gep {
+                if let Some(gep) = &inst.gep() {
                     if let LlValue::Local(name) = &gep.base.value {
                         if params.contains(name) {
                             let key = (f.name.clone(), name.clone());
@@ -61,9 +61,14 @@ impl LlModule {
                             }
                         }
                         if let Some(arms) = pointer_select_arms.get(name) {
-                            for arm in arms {
-                                if params.contains(arm) {
-                                    let key = (f.name.clone(), arm.clone());
+                            let mut pending = arms.clone();
+                            let mut visited = HashSet::new();
+                            while let Some(arm) = pending.pop() {
+                                if !visited.insert(arm.clone()) {
+                                    continue;
+                                }
+                                if params.contains(&arm) {
+                                    let key = (f.name.clone(), arm);
                                     if self.gep_source_should_override(&key, &gep.source_ty) {
                                         self.metadata_pointee_params.remove(&key);
                                         self.ptr_pointees.insert(key, gep.source_ty.clone());
@@ -72,18 +77,30 @@ impl LlModule {
                                             .entry(key)
                                             .or_insert_with(|| gep.source_ty.clone());
                                     }
+                                } else if let Some(nested) = pointer_select_arms.get(&arm) {
+                                    pending.extend(nested.iter().cloned());
                                 }
                             }
                         }
                     }
                     continue;
                 }
-                if let Some(load) = &inst.load {
+                if let Some(load) = &inst.load() {
                     if let LlValue::Local(name) = &load.ptr.value {
                         if params.contains(name) {
                             self.ptr_pointees
                                 .entry((f.name.clone(), name.clone()))
                                 .or_insert_with(|| load.result_ty.clone());
+                        }
+                    }
+                    continue;
+                }
+                if let Some((object, pointer)) = inst.store().as_deref() {
+                    if let LlValue::Local(name) = &pointer.value {
+                        if params.contains(name) {
+                            self.ptr_pointees
+                                .entry((f.name.clone(), name.clone()))
+                                .or_insert_with(|| object.ty.clone());
                         }
                     }
                 }
@@ -98,19 +115,30 @@ impl LlModule {
             while changed {
                 changed = false;
                 for inst in f.carrier_insts() {
-                    if let Some((res, base)) = &inst.identity_ptr_bitcast {
+                    if let Some((res, base)) = inst.identity_ptr_bitcast() {
                         if let Some(root) = roots.get(base).cloned() {
-                            if roots.insert(res.clone(), root).is_none() {
+                            if roots.insert(res.to_string(), root).is_none() {
                                 changed = true;
                             }
                         }
                         continue;
                     }
 
+                    if let Some((object, pointer)) = inst.store().as_deref() {
+                        if let LlValue::Local(name) = &pointer.value {
+                            if let Some(root) = roots.get(name).cloned() {
+                                sources
+                                    .entry(root)
+                                    .or_default()
+                                    .insert(self.resolve_known_type(&object.ty));
+                            }
+                        }
+                    }
+
                     let Some(res) = &inst.result else {
                         continue;
                     };
-                    if let Some(gep) = &inst.gep {
+                    if let Some(gep) = &inst.gep() {
                         let LlValue::Local(base) = &gep.base.value else {
                             continue;
                         };
@@ -126,7 +154,7 @@ impl LlModule {
                         }
                         continue;
                     }
-                    if let Some(incoming) = &inst.phi_incoming_values {
+                    if let Some(incoming) = inst.phi_values() {
                         let mut root: Option<String> = None;
                         for value in incoming {
                             let LlValue::Local(name) = value else {
@@ -151,7 +179,7 @@ impl LlModule {
                         }
                         continue;
                     }
-                    if let Some((true_value, false_value)) = inst.select_arms.as_deref() {
+                    if let Some((true_value, false_value)) = inst.select_arms().as_deref() {
                         let (LlValue::Local(true_name), LlValue::Local(false_name)) =
                             (&true_value.value, &false_value.value)
                         else {
@@ -178,9 +206,15 @@ impl LlModule {
                 let [pointee] = seen.as_slice() else {
                     continue;
                 };
-                self.ptr_pointees
-                    .entry((f.name.clone(), param))
-                    .or_insert_with(|| pointee.clone());
+                let key = (f.name.clone(), param);
+                if self.gep_source_should_override(&key, pointee) {
+                    self.metadata_pointee_params.remove(&key);
+                    self.ptr_pointees.insert(key, pointee.clone());
+                } else {
+                    self.ptr_pointees
+                        .entry(key)
+                        .or_insert_with(|| pointee.clone());
+                }
             }
         }
 
@@ -290,29 +324,38 @@ impl LlModule {
     ) -> HashMap<String, HashSet<LlType>> {
         let mut table_roots: HashMap<String, String> = HashMap::new();
         let mut table_params: HashMap<String, HashSet<String>> = HashMap::new();
+        let mut field_params: HashMap<String, HashSet<String>> = HashMap::new();
         let mut loaded_tables: HashMap<String, String> = HashMap::new();
+        let mut loaded_params: HashMap<String, HashSet<String>> = HashMap::new();
         let mut sources: HashMap<String, HashSet<LlType>> = HashMap::new();
 
         for inst in f.carrier_insts() {
             if let Some(res) = &inst.result {
-                if let Some(ty) = &inst.alloca_ty {
+                if let Some(ty) = &inst.alloca_ty() {
                     if self.type_contains_pointer(ty) {
                         table_roots.insert(res.clone(), res.clone());
                     }
                     continue;
                 }
-                if let Some((bres, base)) = &inst.identity_ptr_bitcast {
+                if let Some((bres, base)) = inst.identity_ptr_bitcast() {
                     if let Some(root) = table_roots.get(base).cloned() {
-                        table_roots.insert(bres.clone(), root);
+                        table_roots.insert(bres.to_string(), root);
                     }
                     continue;
                 }
-                if let Some(gep) = &inst.gep {
+                if let Some(gep) = &inst.gep() {
                     let LlValue::Local(base) = &gep.base.value else {
                         continue;
                     };
                     if let Some(root) = table_roots.get(base).cloned() {
                         table_roots.insert(res.clone(), root);
+                    } else if let Some(params) = loaded_params.get(base) {
+                        for param in params {
+                            sources
+                                .entry(param.clone())
+                                .or_default()
+                                .insert(self.resolve_known_type(&gep.source_ty));
+                        }
                     } else if let Some(root) = loaded_tables.get(base) {
                         if let Some(params) = table_params.get(root) {
                             for param in params {
@@ -325,21 +368,23 @@ impl LlModule {
                     }
                     continue;
                 }
-                if let Some(load) = &inst.load {
+                if let Some(load) = &inst.load() {
                     if !matches!(load.result_ty, LlType::Ptr(_)) {
                         continue;
                     }
                     let LlValue::Local(ptr_name) = &load.ptr.value else {
                         continue;
                     };
-                    if let Some(root) = table_roots.get(ptr_name).cloned() {
+                    if let Some(params) = field_params.get(ptr_name).cloned() {
+                        loaded_params.insert(res.clone(), params);
+                    } else if let Some(root) = table_roots.get(ptr_name).cloned() {
                         loaded_tables.insert(res.clone(), root);
                     }
                 }
                 continue;
             }
 
-            let Some((object, ptr)) = inst.store.as_deref() else {
+            let Some((object, ptr)) = inst.store().as_deref() else {
                 continue;
             };
             let LlValue::Local(param) = &object.value else {
@@ -356,9 +401,61 @@ impl LlModule {
                     .entry(root.clone())
                     .or_default()
                     .insert(param.clone());
+                field_params
+                    .entry(ptr_name.clone())
+                    .or_default()
+                    .insert(param.clone());
             }
         }
 
         sources
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_pointer_field_access_replaces_equal_size_metadata_placeholder() {
+        let ll = r#"
+%Holder = type { ptr addrspace(2), ptr addrspace(2) }
+%Payload = type { [2 x <4 x float>] }
+%Other = type { [8 x i32] }
+
+define void @k(ptr addrspace(2) %buffer, ptr addrspace(2) %other) {
+entry:
+  %holder = alloca %Holder, align 8
+  %field = getelementptr inbounds %Holder, ptr %holder, i64 0, i32 0
+  store ptr addrspace(2) %buffer, ptr %field, align 8
+  %other_field = getelementptr inbounds %Holder, ptr %holder, i64 0, i32 1
+  store ptr addrspace(2) %other, ptr %other_field, align 8
+  %loaded = load ptr addrspace(2), ptr %field, align 8
+  %element = getelementptr inbounds %Payload, ptr addrspace(2) %loaded, i64 0, i32 0, i64 1
+  %value = load <4 x float>, ptr addrspace(2) %element, align 16
+  %other_loaded = load ptr addrspace(2), ptr %other_field, align 8
+  %other_element = getelementptr inbounds %Other, ptr addrspace(2) %other_loaded, i64 0, i32 0, i64 1
+  %other_value = load i32, ptr addrspace(2) %other_element, align 4
+  ret void
+}
+"#;
+        let mut module = LlModule::parse(ll).expect("parse pointer field closure");
+        let key = ("k".to_string(), "%buffer".to_string());
+        module
+            .ptr_pointees
+            .insert(key.clone(), LlType::Array(Box::new(LlType::Int(8)), 32));
+        module.metadata_pointee_params.insert(key.clone());
+        module.metadata_pointee_sizes.insert(key.clone(), 32);
+
+        module.infer_pointer_pointees();
+
+        assert_eq!(
+            module.ptr_pointees.get(&key),
+            Some(&LlType::Struct(vec![LlType::Array(
+                Box::new(LlType::Vector(Box::new(LlType::Float), 4)),
+                2,
+            )]))
+        );
+        assert!(!module.metadata_pointee_params.contains(&key));
     }
 }

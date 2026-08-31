@@ -1,0 +1,1 @@
+{"air_sha256":"c3f809a7e66d4c153ccdff15832162a9c9740d767dc2ca9d9ab513ced80c4858","reason":"AIR entry \"refitBoundingBoxLeafNodeInPlaceKernel\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

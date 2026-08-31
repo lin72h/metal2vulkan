@@ -1,6 +1,7 @@
 //! Byte-neutral responsibility split of the former monolith; see the parent module.
 
 use super::*;
+use crate::passes::rewrites::combined_type_defs;
 
 #[derive(Clone, Debug)]
 pub(in crate::passes) struct AccessChainProvenance {
@@ -23,6 +24,7 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
     if store_markers.is_empty() || load_markers.is_empty() {
         return;
     }
+    let type_defs = combined_type_defs(ctx, &HashMap::new());
 
     let mut access_keys: HashMap<Word, LocalPointerFieldKey> = HashMap::new();
     let mut stored_fields: HashMap<LocalPointerFieldKey, Word> = HashMap::new();
@@ -53,13 +55,43 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
     let mut replacements = Vec::new();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
+            if !matches!(inst.class.opcode, Op::Load | Op::CopyObject | Op::Undef) {
+                continue;
+            }
+            if !inst.result_type.is_some_and(|result_type| {
+                type_defs.get(&result_type).is_some_and(|definition| {
+                    matches!(
+                        definition.class.opcode,
+                        Op::TypePointer
+                            | Op::TypeImage
+                            | Op::TypeSampler
+                            | Op::TypeSampledImage
+                            | Op::TypeAccelerationStructureKHR
+                    )
+                })
+            }) {
+                continue;
+            }
             let Some(result) = inst.result_id else {
                 continue;
             };
-            let Some(key) = load_markers.get(&result) else {
+            let Some(marker_key) = load_markers.get(&result) else {
                 continue;
             };
-            let Some(source) = stored_fields.get(key).copied() else {
+            // An inlined helper parameter can itself be an access chain into the caller's local
+            // aggregate. Compose that caller-side prefix with the field path recorded inside the
+            // helper so loads and stores compare in one root-relative key space.
+            let key = if let Some(root) = access_keys.get(&marker_key.root) {
+                let mut indices = root.indices.clone();
+                indices.extend_from_slice(&marker_key.indices);
+                LocalPointerFieldKey {
+                    root: root.root,
+                    indices,
+                }
+            } else {
+                marker_key.clone()
+            };
+            let Some(source) = stored_fields.get(&key).copied() else {
                 continue;
             };
             replacements.push((result, source));
@@ -79,6 +111,84 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
     }
 }
 
+/// Replace integer placeholder stores for inlined local pointer fields once interface binding has
+/// assigned the stored source its final representation. Before that boundary a buffer parameter is
+/// still pointer-typed even when its eventual BDA representation is `ulong`, so emitting the source
+/// directly would make the intermediate module ill typed. The exact root/member key prevents a
+/// shared zero marker from routing one field's source into another field.
+pub(in crate::passes) fn materialize_inlined_local_pointer_field_stores(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+) {
+    let mut sources = HashMap::<(Word, LocalPointerFieldKey), Option<Word>>::new();
+    for fact in &ctx.emit_sidecar.local_pointer_field_stores {
+        let key = (
+            fact.id,
+            LocalPointerFieldKey {
+                root: fact.root,
+                indices: fact.indices.clone(),
+            },
+        );
+        sources
+            .entry(key)
+            .and_modify(|source| {
+                if *source != Some(fact.source) {
+                    *source = None;
+                }
+            })
+            .or_insert(Some(fact.source));
+    }
+    if sources.is_empty() {
+        return;
+    }
+
+    let value_types = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+        .chain(ctx.module.functions.iter().flat_map(|function| {
+            function
+                .parameters
+                .iter()
+                .chain(function.blocks.iter().flat_map(|block| &block.instructions))
+        }))
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+        .collect::<HashMap<_, _>>();
+    let mut access_keys = HashMap::<Word, LocalPointerFieldKey>::new();
+    let mut replacements = Vec::new();
+    for (block_index, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
+        for (instruction_index, instruction) in block.instructions.iter().enumerate() {
+            if let Some((result, key)) =
+                local_pointer_field_access_key(ctx, &access_keys, instruction)
+            {
+                access_keys.insert(result, key);
+            }
+            if instruction.class.opcode != Op::Store {
+                continue;
+            }
+            let (Some(Operand::IdRef(pointer)), Some(Operand::IdRef(marker))) =
+                (instruction.operands.first(), instruction.operands.get(1))
+            else {
+                continue;
+            };
+            let Some(key) = access_keys.get(pointer) else {
+                continue;
+            };
+            let Some(source) = sources.get(&(*marker, key.clone())).copied().flatten() else {
+                continue;
+            };
+            if source != *marker && value_types.get(&source) == value_types.get(marker) {
+                replacements.push((block_index, instruction_index, source));
+            }
+        }
+    }
+    for (block_index, instruction_index, source) in replacements {
+        ctx.module.functions[entry_idx].blocks[block_index].instructions[instruction_index]
+            .operands[1] = Operand::IdRef(source);
+    }
+}
+
 /// Rebuild a runtime-indexed local pointer table from its exact typed store facts.
 ///
 /// A helper can receive a pointer to element zero of a local `[N x ptr]`, index it dynamically, and
@@ -94,6 +204,10 @@ pub(in crate::passes) fn recover_inlined_local_dynamic_pointer_fields(
     let mut facts = ctx.emit_sidecar.local_pointer_dynamic_field_loads.clone();
     let store_markers = local_pointer_field_store_markers(ctx);
     let store_keys = local_pointer_field_store_keys(ctx);
+    let local_table_roots = store_keys
+        .values()
+        .map(|key| key.root)
+        .collect::<HashSet<_>>();
     if store_markers.is_empty() {
         return Ok(());
     }
@@ -289,9 +403,25 @@ pub(in crate::passes) fn recover_inlined_local_dynamic_pointer_fields(
     if replacements.is_empty() {
         return Ok(());
     }
+    let replacement_ids = replacements.keys().copied().collect::<HashSet<_>>();
+    let retired_load_pointers = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            instruction.class.opcode == Op::Load
+                && instruction
+                    .result_id
+                    .is_some_and(|result| replacement_ids.contains(&result))
+        })
+        .filter_map(|instruction| match instruction.operands.first() {
+            Some(Operand::IdRef(pointer)) => Some(*pointer),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
 
     for block in &mut ctx.module.functions[entry_idx].blocks {
-        let old = std::mem::take(&mut block.instructions);
+        let old = block.instructions.clone();
         let mut rebuilt = Vec::with_capacity(old.len());
         for inst in old {
             if let Some(replacement) = inst
@@ -326,6 +456,11 @@ pub(in crate::passes) fn recover_inlined_local_dynamic_pointer_fields(
             .collect::<Vec<_>>();
         crate::passes::workgroup::rewrite_pointer_storage(ctx, entry_idx, &roots, storage, &defs)?;
     }
+    crate::passes::resources::retire_dead_pointer_projections(
+        ctx,
+        entry_idx,
+        retired_load_pointers.into_iter().chain(local_table_roots),
+    );
     Ok(())
 }
 
@@ -340,6 +475,10 @@ pub(in crate::passes) fn recover_inlined_local_dynamic_pointer_fields(
 /// ambiguous and leaves it untouched.
 pub(in crate::passes) fn recover_unique_local_pointer_field_loads(ctx: &mut Ctx, entry_idx: usize) {
     let store_markers = local_pointer_field_store_markers(ctx);
+    let local_table_roots = local_pointer_field_store_keys(ctx)
+        .into_values()
+        .map(|key| key.root)
+        .collect::<HashSet<_>>();
     if store_markers.is_empty() {
         return;
     }
@@ -424,6 +563,21 @@ pub(in crate::passes) fn recover_unique_local_pointer_field_loads(ctx: &mut Ctx,
         .iter()
         .map(|(result, _)| *result)
         .collect::<HashSet<_>>();
+    let retired_load_pointers = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            instruction.class.opcode == Op::Load
+                && instruction
+                    .result_id
+                    .is_some_and(|result| dead.contains(&result))
+        })
+        .filter_map(|instruction| match instruction.operands.first() {
+            Some(Operand::IdRef(pointer)) => Some(*pointer),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     for (from, to) in replacements {
         replace_id_in_function(&mut ctx.module.functions[entry_idx], from, to);
     }
@@ -433,6 +587,11 @@ pub(in crate::passes) fn recover_unique_local_pointer_field_loads(ctx: &mut Ctx,
                 && inst.result_id.is_some_and(|result| dead.contains(&result)))
         });
     }
+    crate::passes::resources::retire_dead_pointer_projections(
+        ctx,
+        entry_idx,
+        retired_load_pointers.into_iter().chain(local_table_roots),
+    );
 }
 
 fn dynamic_pointer_field_entries(
@@ -577,6 +736,9 @@ pub(in crate::passes) fn const_u32(ctx: &Ctx, id: Word) -> Option<u32> {
 /// chains and rewrite those derived chains back to the original root with a composed final index.
 pub(in crate::passes) fn compose_derived_access_chains(ctx: &mut Ctx, entry_idx: usize) {
     let mut provenance: HashMap<Word, AccessChainProvenance> = HashMap::new();
+    // This pass visits every access chain in very large generated functions. Resolve result types
+    // once for the selected function instead of rescanning every function body for each root.
+    let mut value_types = function_value_types(ctx, entry_idx);
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
         let insts = ctx.module.functions[entry_idx].blocks[bi]
@@ -643,9 +805,13 @@ pub(in crate::passes) fn compose_derived_access_chains(ctx: &mut Ctx, entry_idx:
                     }
                 }
 
-                if let Some(prov) = provenance_for_access_chain(ctx, &inst) {
+                if let Some(prov) = provenance_for_access_chain_with_types(ctx, &value_types, &inst)
+                {
                     provenance.insert(result, prov);
                 }
+            }
+            if let (Some(result), Some(result_type)) = (inst.result_id, inst.result_type) {
+                value_types.insert(result, result_type);
             }
             new_insts.extend(pre);
             new_insts.push(inst);
@@ -846,15 +1012,27 @@ pub(in crate::passes) fn derived_access_offset(ctx: &Ctx, operands: &[Operand]) 
     }
 }
 
-pub(in crate::passes) fn provenance_for_access_chain(
+fn provenance_for_access_chain_with_types(
     ctx: &Ctx,
+    value_types: &HashMap<Word, Word>,
     inst: &Instruction,
 ) -> Option<AccessChainProvenance> {
-    let ptr_ty = inst.result_type?;
     let root = match inst.operands.first() {
         Some(Operand::IdRef(root)) => *root,
         _ => return None,
     };
+    let root_type = value_types.get(&root).copied()?;
+    provenance_for_access_chain_with_root_type(ctx, inst, root, root_type)
+}
+
+fn provenance_for_access_chain_with_root_type(
+    ctx: &Ctx,
+    inst: &Instruction,
+    root: Word,
+    root_type: Word,
+) -> Option<AccessChainProvenance> {
+    let ptr_ty = inst.result_type?;
+    pointer_pointee(ctx, root_type)?;
     let indices = inst.operands[1..]
         .iter()
         .map(|op| match op {
@@ -907,6 +1085,96 @@ pub(in crate::passes) fn compose_access_index(
 mod tests {
     use super::*;
     use crate::spirv_module::{Block, Function, Module, ModuleHeader};
+
+    #[test]
+    fn materializes_type_correct_local_pointer_field_store_source() {
+        let ulong = 1;
+        let uint = 2;
+        let ptr_function_ulong = 3;
+        let zero = 4;
+        let marker = 5;
+        let root = 10;
+        let source = 11;
+        let slot = 12;
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(ulong),
+                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(uint),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(ptr_function_ulong),
+                vec![
+                    Operand::StorageClass(StorageClass::Function),
+                    Operand::IdRef(ulong),
+                ],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(uint),
+                Some(zero),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(Op::ConstantNull, Some(ulong), Some(marker), vec![]),
+        ];
+        module.functions.push(Function {
+            def: None,
+            parameters: vec![
+                Instruction::new(
+                    Op::FunctionParameter,
+                    Some(ptr_function_ulong),
+                    Some(root),
+                    vec![],
+                ),
+                Instruction::new(Op::FunctionParameter, Some(ulong), Some(source), vec![]),
+            ],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::AccessChain,
+                        Some(ptr_function_ulong),
+                        Some(slot),
+                        vec![Operand::IdRef(root), Operand::IdRef(zero)],
+                    ),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(slot), Operand::IdRef(marker)],
+                    ),
+                ],
+            }],
+            end: None,
+        });
+        let mut ctx = Ctx::new(module);
+        ctx.emit_sidecar.local_pointer_field_stores.push(
+            crate::emit_sidecar::LocalPointerFieldStore {
+                id: marker,
+                source,
+                root,
+                indices: vec![0],
+            },
+        );
+
+        materialize_inlined_local_pointer_field_stores(&mut ctx, 0);
+
+        assert_eq!(
+            ctx.module.functions[0].blocks[0].instructions[1].operands,
+            vec![Operand::IdRef(slot), Operand::IdRef(source)]
+        );
+    }
 
     #[test]
     fn unique_entry_marker_store_repairs_successor_pointer_load() {

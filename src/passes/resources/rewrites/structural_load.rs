@@ -94,8 +94,9 @@ pub(in crate::passes) fn rewrite_flattened_workgroup_leaf_accesses(
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
 
     for bi in 0..n_blocks {
-        let old_insts =
-            std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old_insts = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut new_insts = Vec::with_capacity(old_insts.len());
         for mut inst in old_insts {
             let mut prefix = vec![];
@@ -407,7 +408,7 @@ pub(in crate::passes) fn scaled_record_index(
     None
 }
 
-pub(in crate::passes) fn rewrite_structural_load_result_types(
+pub(in crate::passes) fn rewrite_structural_result_types(
     ctx: &mut Ctx,
     entry_idx: usize,
     defs: &HashMap<Word, Instruction>,
@@ -422,7 +423,7 @@ pub(in crate::passes) fn rewrite_structural_load_result_types(
         for ii in 0..n_inst {
             let replacement = {
                 let inst = &ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
-                structural_load_result_replacement(ctx, &types, &value_types, inst)
+                structural_result_replacement(ctx, &types, &value_types, inst)
             };
             if let Some(replacement) = replacement {
                 let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
@@ -435,24 +436,52 @@ pub(in crate::passes) fn rewrite_structural_load_result_types(
     }
 }
 
-pub(in crate::passes) fn structural_load_result_replacement(
+pub(in crate::passes) fn structural_result_replacement(
     ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     value_types: &HashMap<Word, Word>,
     inst: &Instruction,
 ) -> Option<Word> {
-    if inst.class.opcode != Op::Load {
-        return None;
-    }
-    let load_ty = inst.result_type?;
-    let ptr = inst.operands.first().and_then(|operand| match operand {
-        Operand::IdRef(ptr) => Some(*ptr),
-        _ => None,
-    })?;
-    let ptr_ty = value_types.get(&ptr).copied()?;
-    let pointee = pointer_pointee_including_new(ctx, types, ptr_ty)?;
-    (load_ty != pointee && types_structurally_match(ctx, types, load_ty, pointee))
-        .then_some(pointee)
+    let result_ty = inst.result_type?;
+    let replacement = match inst.class.opcode {
+        Op::Load => {
+            let ptr = inst.operands.first().and_then(|operand| match operand {
+                Operand::IdRef(ptr) => Some(*ptr),
+                _ => None,
+            })?;
+            let ptr_ty = value_types.get(&ptr).copied()?;
+            pointer_pointee_including_new(ctx, types, ptr_ty)?
+        }
+        Op::CompositeExtract => {
+            let Operand::IdRef(composite) = inst.operands.first()? else {
+                return None;
+            };
+            let mut selected = value_types.get(composite).copied()?;
+            for index in inst.operands.iter().skip(1) {
+                let Operand::LiteralBit32(index) = index else {
+                    return None;
+                };
+                let definition = type_def_including_new(ctx, types, selected)?;
+                selected = match definition.class.opcode {
+                    Op::TypeStruct => match definition.operands.get(*index as usize)? {
+                        Operand::IdRef(member) => *member,
+                        _ => return None,
+                    },
+                    Op::TypeArray | Op::TypeVector | Op::TypeMatrix => {
+                        match definition.operands.first()? {
+                            Operand::IdRef(element) => *element,
+                            _ => return None,
+                        }
+                    }
+                    _ => return None,
+                };
+            }
+            selected
+        }
+        _ => return None,
+    };
+    (result_ty != replacement && types_structurally_match(ctx, types, result_ty, replacement))
+        .then_some(replacement)
 }
 
 pub(in crate::passes) fn pointer_pointee_including_new(

@@ -538,14 +538,34 @@ pub fn specialize_visible_function_references(
         )?;
         append_dependency_module(&mut output, &rewritten);
     }
-
-    Ok(output)
+    let direct_functions = used
+        .into_iter()
+        .map(llvm_global)
+        .collect::<Result<HashSet<_>, _>>()?;
+    Ok(crate::native::inline_direct_function_pointer_consumers(
+        &output,
+        &direct_functions,
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AirVisibleFunctionReference {
     stub_global: String,
     symbol: String,
+}
+
+/// Return the logical callback symbols named by AIR's direct visible-function-reference metadata.
+///
+/// The order follows the metadata, with repeated mappings of the same stub reported once. This is
+/// the structural key a linker needs to resolve retained dependency modules before translating to
+/// Logical SPIR-V.
+pub fn visible_function_reference_symbols(module: &str) -> Result<Vec<String>, String> {
+    air_visible_function_references(module).map(|references| {
+        references
+            .into_iter()
+            .map(|reference| reference.symbol)
+            .collect()
+    })
 }
 
 fn rewrite_visible_reference_stubs<'a>(
@@ -678,27 +698,52 @@ fn decode_llvm_string(encoded: &str) -> Result<String, String> {
     String::from_utf8(decoded).map_err(|_| format!("non-UTF-8 LLVM symbol in {encoded:?}"))
 }
 
-/// Resolve visible-function-table lookups and append their exact dependency modules.
+/// Trace entry visible-function-table parameters through direct calls to internal helpers.
 ///
-/// Literal slots become direct calls. Dynamic slots become a direct call to a generated switch
-/// dispatcher containing one arm per authored table entry. Calls not derived from an authored table
-/// are left for the native emitter's ordinary indirect-call error.
-pub fn specialize_visible_function_tables(
+/// This exposes the exact table-flow contract used by [`specialize_visible_function_tables`] so
+/// validation and authoring tools can decide whether a helper-local lookup has an authored entry
+/// root without maintaining a second LLVM call-flow parser. A helper parameter reached from two
+/// distinct table roots is rejected just as it is during specialization.
+pub fn trace_visible_function_table_parameters(
     entry_ll: &str,
     entry_name: &str,
-    linkage: &LinkedFunctionLinkage,
-) -> Result<String, String> {
-    if linkage.visible_tables.is_empty() {
-        return Ok(entry_ll.to_string());
+    parameter_indices: &[u32],
+) -> Result<HashMap<String, HashSet<String>>, String> {
+    let tables = parameter_indices
+        .iter()
+        .map(|parameter_index| LinkedFunctionTable {
+            parameter_index: *parameter_index,
+            size: 1,
+            entries: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let (signatures, flow) = visible_table_flow(entry_ll, entry_name, &tables)?;
+    let mut values = HashMap::<String, HashSet<String>>::new();
+    for ((function, ordinal), _) in flow.table_parameters {
+        let parameter = signatures
+            .get(&function)
+            .and_then(|signature| signature.parameters.get(ordinal))
+            .ok_or_else(|| format!("missing parameter {ordinal} of {function}"))?;
+        values
+            .entry(function)
+            .or_default()
+            .insert(parameter.clone());
     }
-    validate_linkage(linkage)?;
+    Ok(values)
+}
+
+fn visible_table_flow<'a>(
+    entry_ll: &str,
+    entry_name: &str,
+    tables: &'a [LinkedFunctionTable],
+) -> Result<(HashMap<String, FunctionSignature>, LinkedFlow<'a>), String> {
     let signatures = function_signatures(entry_ll)?;
     let entry_global = llvm_global(entry_name)?;
     let entry_signature = signatures.get(&entry_global).ok_or_else(|| {
         format!("linked function-table entry function {entry_name:?} is not defined")
     })?;
     let mut flow = LinkedFlow::default();
-    for table in &linkage.visible_tables {
+    for table in tables {
         let parameter = entry_signature
             .parameters
             .get(table.parameter_index as usize)
@@ -726,6 +771,24 @@ pub fn specialize_visible_function_tables(
         }
     }
     propagate_linked_flow(entry_ll, &signatures, &mut flow)?;
+    Ok((signatures, flow))
+}
+
+/// Resolve visible-function-table lookups and append their exact dependency modules.
+///
+/// Literal slots become direct calls. Dynamic slots become a direct call to a generated switch
+/// dispatcher containing one arm per authored table entry. Calls not derived from an authored table
+/// are left for the native emitter's ordinary indirect-call error.
+pub fn specialize_visible_function_tables(
+    entry_ll: &str,
+    entry_name: &str,
+    linkage: &LinkedFunctionLinkage,
+) -> Result<String, String> {
+    if linkage.visible_tables.is_empty() {
+        return Ok(entry_ll.to_string());
+    }
+    validate_linkage(linkage)?;
+    let (signatures, flow) = visible_table_flow(entry_ll, entry_name, &linkage.visible_tables)?;
 
     struct Dispatcher<'a> {
         name: String,
@@ -1907,6 +1970,37 @@ declare i32 @base.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
     }
 
     #[test]
+    fn direct_visible_reference_specializes_internal_function_pointer_consumer() {
+        let entry = r#"define i32 @main(i32 %value) {
+entry:
+  %result = call i32 @apply(ptr @linked.MTL_VISIBLE_FN_REF, i32 %value)
+  ret i32 %result
+}
+define internal i32 @apply(ptr %function, i32 %value) {
+entry:
+  %result = call i32 %function(i32 %value)
+  ret i32 %result
+}
+declare i32 @linked.MTL_VISIBLE_FN_REF(i32) section "air.externally_defined"
+!air.visible_function_references = !{!0}
+!0 = !{!"air.visible_function_reference", ptr @linked.MTL_VISIBLE_FN_REF, !"linked"}
+"#;
+        let linkage = LinkedFunctionLinkage {
+            visible_references: vec![LinkedFunctionReference {
+                symbol: "linked".into(),
+                module_ll: "define i32 @linked(i32 %value) { ret i32 %value }\n".into(),
+            }],
+            visible_tables: vec![],
+            intersection_tables: vec![],
+        };
+
+        let specialized = specialize_visible_function_references(entry, &linkage).unwrap();
+        assert!(specialized.contains("call i32 @linked(i32 %value)"));
+        assert!(!specialized.contains("call i32 %function"));
+        assert!(!specialized.contains("call i32 @apply(ptr @linked"));
+    }
+
+    #[test]
     fn direct_visible_reference_requires_an_exact_authored_symbol() {
         let entry = r#"define void @main() { ret void }
 !air.visible_function_references = !{!0}
@@ -2379,6 +2473,8 @@ entry:
             }],
             intersection_tables: vec![],
         };
+        let traced = trace_visible_function_table_parameters(entry, "main", &[1]).unwrap();
+        assert_eq!(traced["@main"], HashSet::from(["%table".to_string()]));
         let specialized = specialize_visible_function_tables(entry, "main", &linked).unwrap();
         assert!(specialized.contains("call i32 @invoke(ptr %typed, i32 41, i32 %slot)"));
         assert!(specialized.contains(
@@ -2388,6 +2484,26 @@ entry:
             "@metal2vulkan.linked.table.p1.dispatch.0(i32 %metal2vulkan.table.param0.slot, i32 %value)"
         ));
         assert!(!specialized.contains("call i32 %callback("));
+    }
+
+    #[test]
+    fn table_parameter_trace_uses_the_specializers_internal_call_flow() {
+        let entry = r#"
+define void @main(ptr addrspace(1) %table) {
+entry:
+  %value = call i32 @invoke(ptr addrspace(1) %table)
+  ret void
+}
+define internal i32 @invoke(ptr addrspace(1) %functions) {
+entry:
+  %fp = call ptr @air.get_function_pointer_visible_function_table(ptr addrspace(1) %functions, i32 0)
+  %value = call i32 %fp()
+  ret i32 %value
+}
+"#;
+        let traced = trace_visible_function_table_parameters(entry, "main", &[0]).unwrap();
+        assert_eq!(traced["@main"], HashSet::from(["%table".to_string()]));
+        assert_eq!(traced["@invoke"], HashSet::from(["%functions".to_string()]));
     }
 
     #[test]

@@ -124,17 +124,25 @@ pub(in crate::native) fn compute_global_consts(
     let mut store_count: HashMap<Word, usize> = HashMap::new();
     // (function index, block index, instruction index, value operand id)
     let mut single_store: HashMap<Word, (usize, usize, usize, Word)> = HashMap::new();
+    let mut load_functions: HashMap<Word, HashSet<usize>> = HashMap::new();
     for (fi, f) in module.functions.iter().enumerate() {
         for (bi, blk) in f.blocks.iter().enumerate() {
             for (ii, inst) in blk.instructions.iter().enumerate() {
-                if inst.class.opcode != Op::Store {
-                    continue;
-                }
-                if let Some(g) = direct_global(inst, &global_vars) {
-                    *store_count.entry(g).or_default() += 1;
-                    if let Some(Operand::IdRef(v)) = inst.operands.get(1) {
-                        single_store.insert(g, (fi, bi, ii, *v));
+                match inst.class.opcode {
+                    Op::Store => {
+                        if let Some(g) = direct_global(inst, &global_vars) {
+                            *store_count.entry(g).or_default() += 1;
+                            if let Some(Operand::IdRef(v)) = inst.operands.get(1) {
+                                single_store.insert(g, (fi, bi, ii, *v));
+                            }
+                        }
                     }
+                    Op::Load => {
+                        if let Some(g) = direct_global(inst, &global_vars) {
+                            load_functions.entry(g).or_default().insert(fi);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -154,7 +162,7 @@ pub(in crate::native) fn compute_global_consts(
 
     // (b) single-store forwarding fixpoint.
     loop {
-        let mut changed = false;
+        let mut candidates = Vec::new();
         for (&g, &(fi, bi, ii, vid)) in &single_store {
             if gc.contains_key(&g) || store_count.get(&g).copied().unwrap_or(0) != 1 {
                 continue;
@@ -175,18 +183,40 @@ pub(in crate::native) fn compute_global_consts(
             // The store's dominance only covers loads in its OWN function; if any other function
             // loads `g`, the forwarded constant is not guaranteed there. (Post-inline this is a
             // single function, but guard it so the rule stays sound for multi-function modules.)
-            let loaded_elsewhere = module.functions.iter().enumerate().any(|(other, of)| {
-                other != fi
-                    && of.blocks.iter().flat_map(|b| &b.instructions).any(|i| {
-                        i.class.opcode == Op::Load && direct_global(i, &global_vars) == Some(g)
-                    })
-            });
+            let loaded_elsewhere = load_functions
+                .get(&g)
+                .is_some_and(|functions| functions.iter().any(|&other| other != fi));
             if loaded_elsewhere {
                 continue;
             }
-            // Evaluate the stored value with the constants known so far.
-            let vals = forward_eval(f, consts, &gc, widths, &HashMap::new(), vec_globals);
-            if let Some(c) = vals.get(&vid) {
+            candidates.push((g, fi, vid));
+        }
+        if candidates.is_empty() {
+            break;
+        }
+        let function_indices = candidates
+            .iter()
+            .map(|(_, fi, _)| *fi)
+            .collect::<HashSet<_>>();
+        let evaluations = function_indices
+            .into_iter()
+            .map(|fi| {
+                (
+                    fi,
+                    forward_eval(
+                        &module.functions[fi],
+                        consts,
+                        &gc,
+                        widths,
+                        &HashMap::new(),
+                        vec_globals,
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut changed = false;
+        for (g, fi, vid) in candidates {
+            if let Some(c) = evaluations.get(&fi).and_then(|values| values.get(&vid)) {
                 gc.insert(g, *c);
                 changed = true;
             }

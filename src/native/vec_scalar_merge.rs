@@ -24,6 +24,7 @@
 //! decides purely from IR structure (pointer flow + gep/load/store element shapes), never a name.
 
 use super::lex::split_top_level;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Rewrite every function in `san_ll` that carries a scalar/vector pointer-merge into its scalarized
@@ -36,15 +37,19 @@ use std::collections::{HashMap, HashSet, VecDeque};
 /// validated), i.e. on the primary path this pass is BC-COVERED. The def-flow path (a shape the
 /// emitter rejects) is always on and floor-safe. The `widen` seeding is threaded to `lower_impl` as an
 /// explicit parameter (always `true` in production) so unit tests can exercise both modes.
-pub(super) fn lower_vector_scalar_pointer_merge(san_ll: &str) -> String {
+pub(super) fn lower_vector_scalar_pointer_merge(san_ll: &str) -> Cow<'_, str> {
     lower_impl(san_ll, true)
 }
 
 /// Core rewrite with the whole-vs-part use-width seeding threaded as an explicit `widen` parameter so
 /// unit tests exercise both modes without racing on the process-global env var.
-fn lower_impl(san_ll: &str, widen: bool) -> String {
+fn lower_impl(san_ll: &str, widen: bool) -> Cow<'_, str> {
     let lines: Vec<&str> = san_ll.lines().collect();
-    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    // Stay allocation-free at the source-text level until the first function that actually needs a
+    // rewrite. Large generated modules commonly contain none of these pointer networks; eagerly
+    // cloning every line in that case leaves hundreds of thousands of freed small allocations in the
+    // system allocator immediately before the typed parser reaches its own peak.
+    let mut out: Option<Vec<String>> = None;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
@@ -54,22 +59,40 @@ fn lower_impl(san_ll: &str, widen: bool) -> String {
             while j < lines.len() && lines[j] != "}" {
                 j += 1;
             }
-            out.push(line.to_string());
-            out.extend(rewrite_function_body(&lines[start..j], widen));
-            if j < lines.len() {
-                out.push(lines[j].to_string());
+            if let Some(rewritten) = rewrite_function_body(&lines[start..j], widen) {
+                let output = out.get_or_insert_with(|| {
+                    let mut prefix = Vec::with_capacity(lines.len());
+                    prefix.extend(lines[..i].iter().map(|line| (*line).to_string()));
+                    prefix
+                });
+                output.push(line.to_string());
+                output.extend(rewritten);
+                if j < lines.len() {
+                    output.push(lines[j].to_string());
+                }
+            } else if let Some(output) = &mut out {
+                output.extend(
+                    lines[i..j.min(lines.len() - 1) + 1]
+                        .iter()
+                        .map(|line| (*line).to_string()),
+                );
             }
             i = j + 1;
         } else {
-            out.push(line.to_string());
+            if let Some(output) = &mut out {
+                output.push(line.to_string());
+            }
             i += 1;
         }
     }
+    let Some(out) = out else {
+        return Cow::Borrowed(san_ll);
+    };
     let mut result = out.join("\n");
     if san_ll.ends_with('\n') {
         result.push('\n');
     }
-    result
+    Cow::Owned(result)
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -710,7 +733,7 @@ impl Rewriter {
     }
 }
 
-fn rewrite_function_body(body: &[&str], widen: bool) -> Vec<String> {
+fn rewrite_function_body(body: &[&str], widen: bool) -> Option<Vec<String>> {
     let defs: HashMap<String, Def> = body
         .iter()
         .filter_map(|line| parse_def(line))
@@ -738,11 +761,11 @@ fn rewrite_function_body(body: &[&str], widen: bool) -> Vec<String> {
     }
 
     if comp_elem.is_empty() {
-        return body.iter().map(|l| l.to_string()).collect();
+        return None;
     }
     // Reserved fresh-name prefix must not already appear (it never does in llvm-dis output).
     if body.iter().any(|l| l.contains(VSM_NAME_PREFIX)) {
-        return body.iter().map(|l| l.to_string()).collect();
+        return None;
     }
     let mut rw = Rewriter { counter: 0 };
     let mut out: Vec<String> = Vec::with_capacity(body.len());
@@ -753,7 +776,7 @@ fn rewrite_function_body(body: &[&str], widen: bool) -> Vec<String> {
             out.push(line.to_string());
         }
     }
-    out
+    Some(out)
 }
 
 /// The single scalar element the def-flow mismatch merges narrow to, or `None` when there are no
@@ -832,7 +855,7 @@ fn rewrite_line(
 /// `emit_vulkan_spirv` path.
 #[cfg(test)]
 pub(in crate::native) fn lower_with_widen_for_test(san_ll: &str) -> String {
-    lower_impl(san_ll, true)
+    lower_impl(san_ll, true).into_owned()
 }
 
 #[cfg(test)]
@@ -1112,6 +1135,9 @@ entry:
   ret void
 }
 ";
-        assert_eq!(lower_vector_scalar_pointer_merge(src), src);
+        assert!(matches!(
+            lower_vector_scalar_pointer_merge(src),
+            Cow::Borrowed(value) if std::ptr::eq(value, src)
+        ));
     }
 }

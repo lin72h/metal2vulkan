@@ -16,6 +16,7 @@ pub const CORPUS_DIR_ENV: &str = "METAL2VULKAN_CORPUS_DIR";
 pub struct SourceMergeStats {
     pub affected_shards: usize,
     pub inserted: usize,
+    pub merged_memberships: usize,
     pub replaced: usize,
     pub duplicates: usize,
 }
@@ -37,6 +38,7 @@ pub(crate) struct SourceIndexLocation {
     pub stage: String,
     pub entry: String,
     pub label: String,
+    pub lib_sha256s: Vec<String>,
     pub offset: i64,
     pub length: i64,
 }
@@ -50,7 +52,11 @@ pub struct SourceRow {
     pub air_ll: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blob_b64: Option<String>,
-    pub lib_sha256: String,
+    #[serde(
+        alias = "lib_sha256",
+        deserialize_with = "deserialize_library_memberships"
+    )]
+    pub lib_sha256s: Vec<String>,
     pub label: String,
 }
 
@@ -60,7 +66,11 @@ struct AnalysisRow {
     stage: String,
     entry: String,
     air_ll: String,
-    lib_sha256: String,
+    #[serde(
+        alias = "lib_sha256",
+        deserialize_with = "deserialize_library_memberships"
+    )]
+    lib_sha256s: Vec<String>,
     label: String,
 }
 
@@ -99,18 +109,28 @@ impl SourceRow {
         if self.label.trim().is_empty() {
             return Err("source label must not be empty".into());
         }
-        if self.lib_sha256 != "owned-synthetic"
-            && (self.lib_sha256.len() != 64
-                || !self.lib_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-                || self
-                    .lib_sha256
-                    .bytes()
-                    .any(|byte| byte.is_ascii_uppercase()))
-        {
-            return Err(format!(
-                "source {} lib_sha256 must be lowercase SHA-256",
-                self.label
-            ));
+        if self.lib_sha256s.is_empty() {
+            return Err(format!("source {} has no parent library", self.label));
+        }
+        let mut previous = None;
+        for hash in &self.lib_sha256s {
+            if hash != "owned-synthetic"
+                && (hash.len() != 64
+                    || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    || hash.bytes().any(|byte| byte.is_ascii_uppercase()))
+            {
+                return Err(format!(
+                    "source {} parent library must be lowercase SHA-256",
+                    self.label
+                ));
+            }
+            if previous.is_some_and(|value: &String| value >= hash) {
+                return Err(format!(
+                    "source {} parent libraries must be sorted and unique",
+                    self.label
+                ));
+            }
+            previous = Some(hash);
         }
         if let Some(blob) = &self.blob_b64 {
             let decoded = base64::engine::general_purpose::STANDARD
@@ -122,6 +142,23 @@ impl SourceRow {
         }
         Ok(())
     }
+}
+
+fn deserialize_library_memberships<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Memberships {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    Ok(match Memberships::deserialize(deserializer)? {
+        Memberships::One(hash) => vec![hash],
+        Memberships::Many(hashes) => hashes,
+    })
 }
 
 pub fn corpus_root() -> PathBuf {
@@ -232,6 +269,51 @@ pub fn indexed_source_hashes(root: &Path) -> Result<std::collections::HashSet<St
     Ok(hashes)
 }
 
+/// Load indexed parent-library memberships without opening source storage.
+///
+/// A legacy index can return no memberships for an existing AIR identity. Harvest treats that as
+/// unknown and merges the rediscovered row through its exact hash-derived shard, which fills the
+/// compact membership facts without a corpus scan.
+pub fn indexed_source_memberships(
+    root: &Path,
+) -> Result<std::collections::HashMap<String, std::collections::HashSet<String>>, String> {
+    let index = root.join(".index.sqlite");
+    if !index.is_file() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let connection = rusqlite::Connection::open(&index)
+        .map_err(|error| format!("open source index {}: {error}", index.display()))?;
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE IF NOT EXISTS source_library_memberships (
+               air_sha256 TEXT NOT NULL REFERENCES sources(air_sha256) ON DELETE CASCADE,
+               lib_sha256 TEXT NOT NULL,
+               PRIMARY KEY(air_sha256, lib_sha256)
+             );",
+        )
+        .map_err(|error| format!("upgrade source-membership index: {error}"))?;
+    let mut statement = connection
+        .prepare("SELECT air_sha256, lib_sha256 FROM source_library_memberships")
+        .map_err(|error| format!("prepare indexed source memberships: {error}"))?;
+    let mut memberships =
+        std::collections::HashMap::<String, std::collections::HashSet<String>>::new();
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("query indexed source memberships: {error}"))?;
+    for row in rows {
+        let (air_sha256, lib_sha256) =
+            row.map_err(|error| format!("read indexed source membership: {error}"))?;
+        memberships
+            .entry(air_sha256)
+            .or_default()
+            .insert(lib_sha256);
+    }
+    Ok(memberships)
+}
+
 pub fn write_source_shards(
     root: &Path,
     rows: impl IntoIterator<Item = SourceRow>,
@@ -290,19 +372,38 @@ pub fn merge_source_shards(
             .map(|row| (row.air_sha256.clone(), row))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut changed = false;
-        for row in new_rows {
-            match by_hash.get(&row.air_sha256) {
+        for mut row in new_rows {
+            match by_hash.get_mut(&row.air_sha256) {
                 None => {
                     stats.inserted += 1;
                     changed = true;
                     by_hash.insert(row.air_sha256.clone(), row);
                 }
-                Some(previous) if row.lib_sha256 < previous.lib_sha256 => {
-                    stats.replaced += 1;
-                    changed = true;
-                    by_hash.insert(row.air_sha256.clone(), row);
+                Some(previous) => {
+                    let before = previous.lib_sha256s.len();
+                    previous.lib_sha256s.append(&mut row.lib_sha256s);
+                    previous.lib_sha256s.sort();
+                    previous.lib_sha256s.dedup();
+                    let added_memberships = previous.lib_sha256s.len() - before;
+                    stats.merged_memberships += added_memberships;
+                    let blob_changed = source_blob_is_preferred(
+                        previous.blob_b64.as_deref(),
+                        row.blob_b64.as_deref(),
+                    );
+                    if blob_changed {
+                        previous.blob_b64 = row.blob_b64;
+                    }
+                    let label_changed = row.label < previous.label;
+                    if label_changed {
+                        previous.label = row.label;
+                    }
+                    if added_memberships > 0 || blob_changed || label_changed {
+                        stats.replaced += usize::from(blob_changed || label_changed);
+                        changed = true;
+                    } else {
+                        stats.duplicates += 1;
+                    }
                 }
-                Some(_) => stats.duplicates += 1,
             }
         }
         if !changed {
@@ -313,6 +414,15 @@ pub fn merge_source_shards(
         crate::index::record_source_shard_write(root, index, &locations)?;
     }
     Ok(stats)
+}
+
+/// Return whether a candidate optional AIR blob preserves more deterministic source information.
+pub fn source_blob_is_preferred(current: Option<&str>, candidate: Option<&str>) -> bool {
+    match (current, candidate) {
+        (None, Some(_)) => true,
+        (Some(current), Some(candidate)) => candidate < current,
+        (None, None) | (Some(_), None) => false,
+    }
 }
 
 fn write_source_bucket(
@@ -343,6 +453,7 @@ fn write_source_bucket(
                 stage: row.stage.clone(),
                 entry: row.entry.clone(),
                 label: row.label.clone(),
+                lib_sha256s: row.lib_sha256s.clone(),
                 offset: offset
                     .try_into()
                     .map_err(|_| format!("source offset in {} is too large", path.display()))?,
@@ -399,9 +510,21 @@ fn sync_directory(path: &Path) -> Result<(), String> {
 }
 
 pub fn read_source_shard(path: &Path) -> Result<Vec<SourceRow>, String> {
+    let mut rows = Vec::new();
+    for_each_source_shard(path, |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+/// Stream fully validated source rows while retaining at most one decoded row at a time.
+pub fn for_each_source_shard(
+    path: &Path,
+    mut consume: impl FnMut(SourceRow) -> Result<(), String>,
+) -> Result<(), String> {
     let expected_shard = shard_index_from_path(path)?;
     let file = File::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let mut rows = Vec::new();
     for (index, line) in BufReader::new(file).lines().enumerate() {
         let line =
             line.map_err(|error| format!("read {}:{}: {error}", path.display(), index + 1))?;
@@ -423,9 +546,9 @@ pub fn read_source_shard(path: &Path) -> Result<Vec<SourceRow>, String> {
                 expected_shard
             ));
         }
-        rows.push(row);
+        consume(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Stream the authoring-relevant projection of a canonical harvested shard.
@@ -655,7 +778,7 @@ fn analysis_source_from_json(bytes: &[u8], expected_shard: usize) -> Result<Sour
         entry: row.entry,
         air_ll: row.air_ll,
         blob_b64: None,
-        lib_sha256: row.lib_sha256,
+        lib_sha256s: row.lib_sha256s,
         label: row.label,
     })
 }
@@ -840,7 +963,7 @@ fn public_source_row(path: PathBuf) -> Result<SourceRow, String> {
         entry,
         air_ll,
         blob_b64: None,
-        lib_sha256: "owned-synthetic".into(),
+        lib_sha256s: vec!["owned-synthetic".into()],
         label: format!(
             "public/{}",
             path.file_name()
@@ -917,7 +1040,7 @@ mod tests {
             entry: "main".into(),
             air_ll: ll.into(),
             blob_b64: Some("YmxvYg==".into()),
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: "local/test.ll".into(),
         };
         write_source_shards(scratch.path(), [row.clone()]).unwrap();
@@ -946,7 +1069,7 @@ mod tests {
         let mut selected = public_sources().unwrap().remove(0);
         selected.air_ll.push_str("\n; selected private source\n");
         selected.air_sha256 = sha256_bytes(selected.air_ll.as_bytes());
-        selected.lib_sha256 = "22".repeat(32);
+        selected.lib_sha256s = vec!["22".repeat(32)];
         selected.label = "local/selected.ll".into();
         let selected_shard = shard_index_for_hash(&selected.air_sha256).unwrap();
         let mut unrelated = selected.clone();
@@ -966,14 +1089,15 @@ mod tests {
         let unreadable_canonical_data = vec![b'x'; unrelated_bytes.len()];
         fs::write(&unrelated_path, &unreadable_canonical_data).unwrap();
 
-        selected.lib_sha256 = "11".repeat(32);
+        selected.lib_sha256s = vec!["11".repeat(32)];
         let stats = merge_source_shards(scratch.path(), [selected.clone()]).unwrap();
         assert_eq!(
             stats,
             SourceMergeStats {
                 affected_shards: 1,
                 inserted: 0,
-                replaced: 1,
+                merged_memberships: 1,
+                replaced: 0,
                 duplicates: 0,
             }
         );
@@ -985,8 +1109,8 @@ mod tests {
             read_source_shard(&source_shard_path(scratch.path(), selected_shard))
                 .unwrap()
                 .remove(0)
-                .lib_sha256,
-            selected.lib_sha256
+                .lib_sha256s,
+            vec!["11".repeat(32), "22".repeat(32)]
         );
     }
 
@@ -1016,6 +1140,37 @@ mod tests {
     }
 
     #[test]
+    fn indexed_parent_libraries_are_compact_and_legacy_safe() {
+        let scratch = ScratchDir::new("source-library-memberships").unwrap();
+        let index = scratch.path().join(".index.sqlite");
+        let hash = "11".repeat(32);
+        let connection = rusqlite::Connection::open(&index).unwrap();
+        connection
+            .execute_batch("CREATE TABLE sources (air_sha256 TEXT PRIMARY KEY);")
+            .unwrap();
+        connection
+            .execute("INSERT INTO sources VALUES (?1)", [&hash])
+            .unwrap();
+        drop(connection);
+
+        assert!(indexed_source_memberships(scratch.path())
+            .unwrap()
+            .is_empty());
+        let connection = rusqlite::Connection::open(&index).unwrap();
+        connection
+            .execute(
+                "INSERT INTO source_library_memberships VALUES (?1, ?2)",
+                rusqlite::params![hash, "22".repeat(32)],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            indexed_source_memberships(scratch.path()).unwrap()[&hash],
+            ["22".repeat(32)].into_iter().collect()
+        );
+    }
+
+    #[test]
     fn duplicate_merge_does_not_replace_an_unchanged_shard_file() {
         use std::os::unix::fs::MetadataExt as _;
 
@@ -1023,7 +1178,7 @@ mod tests {
         let mut row = public_sources().unwrap().remove(0);
         row.air_ll.push_str("\n; duplicate no-rewrite fixture\n");
         row.air_sha256 = sha256_bytes(row.air_ll.as_bytes());
-        row.lib_sha256 = "11".repeat(32);
+        row.lib_sha256s = vec!["11".repeat(32)];
         row.label = "local/duplicate.ll".into();
         write_source_shards(scratch.path(), [row.clone()]).unwrap();
         let path = source_shard_path(
@@ -1037,6 +1192,33 @@ mod tests {
         assert_eq!(stats.replaced, 0);
         assert_eq!(stats.duplicates, 1);
         assert_eq!(fs::metadata(path).unwrap().ino(), inode);
+    }
+
+    #[test]
+    fn duplicate_merge_preserves_an_available_original_blob() {
+        let scratch = ScratchDir::new("source-blob-preservation").unwrap();
+        let mut row = public_sources().unwrap().remove(0);
+        row.air_ll
+            .push_str("\n; source blob preservation fixture\n");
+        row.air_sha256 = sha256_bytes(row.air_ll.as_bytes());
+        row.lib_sha256s = vec!["11".repeat(32)];
+        row.label = "local/blob.ll".into();
+        row.blob_b64 = None;
+        write_source_shards(scratch.path(), [row.clone()]).unwrap();
+
+        row.blob_b64 = Some("YmxvYg==".into());
+        let stats = merge_source_shards(scratch.path(), [row.clone()]).unwrap();
+        assert_eq!(stats.replaced, 1);
+        assert_eq!(
+            read_source_shard(&source_shard_path(
+                scratch.path(),
+                shard_index_for_hash(&row.air_sha256).unwrap(),
+            ))
+            .unwrap()
+            .remove(0)
+            .blob_b64,
+            row.blob_b64
+        );
     }
 
     #[test]
@@ -1067,7 +1249,7 @@ mod tests {
             entry: "main".into(),
             air_ll: ll.into(),
             blob_b64: None,
-            lib_sha256: "22".repeat(32),
+            lib_sha256s: vec!["22".repeat(32)],
             label: "local/test.ll".into(),
         };
         let actual = shard_index_for_hash(&row.air_sha256).unwrap();

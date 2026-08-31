@@ -1,6 +1,7 @@
 //! Byte-neutral responsibility split of the former monolith; see the parent module.
 
 use super::*;
+use crate::native::cfg::loopforest::post_idom;
 
 /// Synthesized pass-through merge-block name prefix (kept distinct from any AIR label).
 pub(in crate::native) const SPLIT_PREFIX: &str = "%metal2vulkan.lmerge.";
@@ -58,8 +59,8 @@ pub(in crate::native) fn role_for_name(name: &str) -> BlockRole {
 }
 
 /// Full structured plan for a function: forest-augmented, structured-ordered blocks plus the
-/// loop/branch/switch merge maps consumed by emission. The retained-module cleanup remains part of
-/// the production pipeline after this primary by-construction plan.
+/// loop/branch/switch merge maps consumed by emission. Instruction-local emission preserves this
+/// source CFG's edge identities through its real emitted block exits.
 pub(in crate::native) struct StructuredPlan {
     pub(in crate::native) blocks: Vec<BodyBlock>,
     pub(in crate::native) loop_merges: HashMap<String, LoopMergeInfo>,
@@ -74,7 +75,7 @@ pub(in crate::native) struct StructuredPlan {
 /// loop merges + merge==continue split), `unique_selection_merges` (module 2: per-construct selection
 /// merges), and `structured_order` (module 1: dominator-tree, merge-last ordering). When `Some`, every
 /// loop and every conditional/switch header has a unique merge, so the emitter emits a complete
-/// structured CFG; the kept post-hoc repair then normalizes rather than repairs.
+/// structured CFG without a retained-module control-flow rewrite.
 /// Block-count ceiling for the cross-arm-EDGE machinery (self-check 3 + the 9th-attempt clone). A pure
 /// PERFORMANCE bound for cross-arm cloning and its repeated planner invocations. The final
 /// cross-arm correctness check itself is never size-gated: a large function must reject an invalid
@@ -85,7 +86,7 @@ pub(in crate::native) const CROSS_ARM_EDGE_MAX_BLOCKS: usize = 300;
 /// Reject-only loop-exit selection planning is intentionally bounded to modest CFGs. It walks a
 /// candidate's complete in-loop region to prove that every path either reaches the candidate or exits
 /// through an enclosing loop role; the bound keeps that proof from becoming a quadratic retry cost on
-/// giant descriptor-index functions. A skipped graph follows the existing repair path unchanged.
+/// giant descriptor-index functions. A skipped graph follows the existing relooper retry path.
 pub(in crate::native) const LOOP_EXIT_SELECTION_MAX_BLOCKS: usize = 300;
 
 /// Merge-preserving region-cross-arm planning is also bounded to modest CFGs in the default ladder.
@@ -106,15 +107,30 @@ pub(in crate::native) const SHARED_CONTINUATION_LADDER_MAX_BLOCKS: usize = 300;
 /// Selection-merge synthesis can turn compact straight-line decision trees into hundreds of
 /// `%metal2vulkan.lmerge.sel*` pass-through blocks. Keep a fixed allowance for modest CFGs and a
 /// one-block-per-source-block allowance for generated CFGs: a large function can legitimately need
-/// more than 300 private selection merges, while superlinear growth still indicates a runaway retry.
+/// more than 300 private selection merges, while superlinear growth still indicates runaway construction.
 pub(in crate::native) const SELECTION_SYNTH_GROWTH_MAX_BLOCKS: usize = 300;
 
-/// Hard ceiling for the source-CFG structured planner. The ordinary reject path emits inferred merges
-/// and lets the retry cascade's relooper tiers rebuild control flow; on massive functions, proving that
-/// the structured planner cannot help can cost minutes before reaching that same path. This bound is
-/// deliberately far above the targeted retry caps so normal and moderately large CFGs still get the
-/// full ladder.
+/// Hard ceiling for the source-CFG structured planner. A rejection selects raw-CFG construction;
+/// on massive functions, proving that the local planner cannot help can cost minutes before reaching
+/// that representation. This bound remains far above the local construction caps.
 pub(in crate::native) const STRUCTURED_PLAN_MAX_BLOCKS: usize = 3000;
+
+/// Bound repeated local-planner work by graph shape, not only by block count. The attempt ladder
+/// recomputes ownership for each branching header; dense generated CFGs below the block ceiling can
+/// otherwise exceed the end-to-end translation budget before reaching the linear whole-CFG owner.
+const LOCAL_STRUCTURED_PLAN_WORK_BUDGET: usize = 4096;
+const LOCAL_STRUCTURED_PLAN_MAX_BLOCKS: usize = 128;
+
+pub(in crate::native) fn exceeds_local_structured_plan_budget(blocks: &[BodyBlock]) -> bool {
+    if blocks.len() > LOCAL_STRUCTURED_PLAN_MAX_BLOCKS {
+        return true;
+    }
+    let branching = blocks
+        .iter()
+        .filter(|block| block_successors(block).len() > 1)
+        .count();
+    blocks.len().saturating_mul(branching.max(1)) > LOCAL_STRUCTURED_PLAN_WORK_BUDGET
+}
 
 /// Whether a structural retry actually changed its source CFG. `BodyBlock` deliberately does not need
 /// a public `PartialEq`; the planner only needs this local name/carrier comparison to distinguish a
@@ -129,6 +145,65 @@ pub(in crate::native) fn blocks_changed(before: &[BodyBlock], after: &[BodyBlock
             .iter()
             .zip(after)
             .any(|(left, right)| left.name != right.name || block_body_changed(left, right))
+}
+
+/// Whether a natural loop is entered from both inside and outside a still-open nested selection.
+/// Such a selection cannot reconverge before the loop: one arm enters the shared loop while another
+/// path that the selection does not own enters the same header. The loop region therefore needs
+/// whole-CFG ownership construction before merge assignment; assigning a private selection merge on
+/// the unowned shared loop produces a live path that bypasses that merge.
+pub(in crate::native) fn requires_shared_loop_entry_ownership(blocks: &[BodyBlock]) -> bool {
+    let forest = analyze(blocks);
+    let post_idoms = post_idom(blocks);
+    let mut predecessors = HashMap::<String, Vec<&str>>::new();
+    for block in blocks {
+        for successor in block_successors(block) {
+            predecessors
+                .entry(successor)
+                .or_default()
+                .push(block.name.as_str());
+        }
+    }
+    for loop_info in &forest.loops {
+        let loop_body = loop_info
+            .body
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let forward_predecessors = predecessors
+            .get(loop_info.header.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|predecessor| !loop_body.contains(predecessor))
+            .collect::<Vec<_>>();
+        if forward_predecessors.len() < 2 {
+            continue;
+        }
+        for header in blocks {
+            if conditional_branch_targets(header).is_none() {
+                continue;
+            }
+            let Some(natural_merge) = post_idoms.get(&header.name) else {
+                continue;
+            };
+            let owned = forward_predecessors
+                .iter()
+                .filter(|predecessor| forest.dominates(&header.name, predecessor))
+                .copied()
+                .collect::<Vec<_>>();
+            if owned.is_empty() || owned.len() == forward_predecessors.len() {
+                continue;
+            }
+            if owned
+                .iter()
+                .any(|predecessor| !forest.dominates(natural_merge, predecessor))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn block_body_changed(left: &BodyBlock, right: &BodyBlock) -> bool {
@@ -153,10 +228,10 @@ pub(in crate::native) fn structured_plan(blocks: &[BodyBlock]) -> Option<Structu
     let deep_shared = privatize_shared_continuations_for_ladder(blocks);
     if deep_shared.len() != blocks.len() {
         if let Some(plan) = structured_plan_ladder(&deep_shared, false) {
-            return Some(plan);
+            return finalize_loop_role_switches(plan);
         }
         if let Some(plan) = structured_plan_ladder(&deep_shared, true) {
-            return Some(plan);
+            return finalize_loop_role_switches(plan);
         }
     }
     // The helper returns an owned no-op clone when no ladder repair applies. Do not retain that
@@ -175,18 +250,18 @@ pub(in crate::native) fn structured_plan(blocks: &[BodyBlock]) -> Option<Structu
     // residual latch. The second pass is byte-neutral for admitting functions (never reached) and its only
     // new admissions are functions that today fall through to the fallback.
     if blocks.len() > TERMINAL_EXIT_SELECTION_MAX_BLOCKS {
-        // Large generated CFGs go directly to the whole-CFG construct-tree/relooper fallback.
+        // Large generated CFGs go directly to the whole-CFG construct-tree planner in the emitter.
         // Even one speculative source-CFG candidate can coexist with the fallback's ownership graph
         // long enough to exceed the per-translation live-memory budget. The global path is the only
-        // tier capable of resolving compound straddle/cross-arm ownership anyway, so a preliminary
+        // planner capable of resolving compound straddle/cross-arm ownership anyway, so a preliminary
         // local candidate adds cost without broadening support.
         return None;
     } else {
         if let Some(plan) = structured_plan_ladder(blocks, false) {
-            return Some(plan);
+            return finalize_loop_role_switches(plan);
         }
         if let Some(plan) = structured_plan_ladder(blocks, true) {
-            return Some(plan);
+            return finalize_loop_role_switches(plan);
         }
     }
     // Reject-only shared-merge separation: when divergent return-like exits are the structural reason
@@ -195,9 +270,42 @@ pub(in crate::native) fn structured_plan(blocks: &[BodyBlock]) -> Option<Structu
     // structurable; a function that merely contains multiple returns but still rejects is untouched.
     // An already-admitted function never reaches this construction.
     if let Some(plan) = structured_plan_divergent_exit(blocks) {
-        return Some(plan);
+        return finalize_loop_role_switches(plan);
     }
     None
+}
+
+/// A source-valid switch may branch directly to an enclosing loop's continue/merge role while
+/// another arm remains in the loop. Source dominance can admit that graph, but SPIR-V case
+/// constructs cannot borrow an enclosing loop-role block. Inspect the completed ownership map
+/// cheaply and pay for loop analysis/lowering only when a switch actually targets one of its roles.
+fn finalize_loop_role_switches(plan: StructuredPlan) -> Option<StructuredPlan> {
+    if plan.blocks.len() > LOOP_EXIT_SELECTION_MAX_BLOCKS {
+        return Some(plan);
+    }
+    let loop_roles = plan
+        .loop_merges
+        .values()
+        .flat_map(|info| [&info.merge, &info.continue_target])
+        .collect::<HashSet<_>>();
+    let targets_loop_role = plan.blocks.iter().any(|block| {
+        block.typed.as_ref().is_some_and(|typed| {
+            matches!(
+                typed.terminator,
+                crate::native::tir::TirTerminator::Switch { .. }
+            ) && block_successors(block)
+                .iter()
+                .any(|target| loop_roles.contains(target))
+        })
+    });
+    if !targets_loop_role {
+        return Some(plan);
+    }
+    let lowered_switches = super::blocks::lower_loop_exit_switches(&plan.blocks);
+    if !blocks_changed(&plan.blocks, &lowered_switches) {
+        return Some(plan);
+    }
+    structured_plan(&lowered_switches)
 }
 
 /// Final reject-only construction for divergent function exits. Return unification creates the common
@@ -309,7 +417,7 @@ pub(in crate::native) fn structured_plan_ladder(
     // cross-arm attempts could NOT structure reach here, so this is byte-identical for every currently-
     // admitting function; it rescues the dominant `cond-phi-shared/loop-role/merge-inloop` class (07 and
     // the 107-fn bucket) by giving a loop a distinct merge when an IN-LOOP selection shares it. Floor-safe:
-    // the retry cascade adopts the resulting plan only if it independently spirv-val-passes.
+    // the resulting plan is admitted only after the planner's structural self-check.
     if let Some(plan) = structured_plan_inner4(blocks, true, false, false, allow_bare_exit) {
         return Some(plan);
     }
@@ -349,7 +457,7 @@ pub(in crate::native) fn structured_plan_ladder(
     // whose case-construct dominance the source-CFG self-check cannot verify (source-CFG dominance ≠
     // emitted structural dominance — dead-end #6) can emit invalid SPIR-V that the retry path would
     // otherwise handle validly (`Switch header does not structurally dominate its case construct`,
-    // banked `02/387ebaa9` family). Leave only genuine multi-level-break switches to the repair path:
+    // banked `02/387ebaa9` family). Leave only genuine multi-level-break switches to the relooper retry:
     // the M1b default (`switch_gate_excludes`) excludes just an in-loop switch with a loop-exiting arm;
     // a loop-free switch (or an in-loop switch whose arms all stay in the loop) is safe to admit.
     if switch_gate_excludes(blocks) {
@@ -368,8 +476,8 @@ pub(in crate::native) fn structured_plan_ladder(
     // fixing the reject at its SOURCE (unlike LOOP_BREAK_PROTECT, which kept the break edge into the
     // claimed loop merge and over-admitted into `branches to the selection construct` invalidity;
     // dead-end #19). Reached ONLY after all four prior attempts reject, so every currently-admitting
-    // function stays byte-identical; floor-safe since the retry cascade adopts the plan only if it
-    // independently spirv-val-passes.
+    // function stays byte-identical; the resulting plan is admitted only after its structural
+    // self-check.
     if let Some(plan) = structured_plan_inner4(blocks, true, true, false, allow_bare_exit) {
         return Some(plan);
     }
@@ -463,7 +571,7 @@ pub(in crate::native) fn structured_plan_ladder(
     // guard AND (for the `590c6cf2` shape) the region-cross-arm pre-pass privatizes the enclosing
     // selection, so the clone is retried across the same pre-pass combos the ladder uses. The plan
     // self-checks inside `structured_plan_inner4` still gate admission; the switch guard keeps the
-    // dead-end #6 multi-level-break switches on the repair path.
+    // dead-end #6 multi-level-break switches on the relooper retry path.
     if !switch_gate_excludes(blocks) {
         for &(bl, cv, br) in &[
             (blocks, force_converge, false),
@@ -490,7 +598,7 @@ pub(in crate::native) fn structured_plan_ladder(
     // destraddled graph re-runs the inner ladder (base -> converge -> converge+break-aware). Reached
     // ONLY after every prior attempt rejects, so a currently-admitting function stays byte-identical; the
     // plan self-checks (including the cross-arm-edge self-check itself) still gate admission of the
-    // cloned graph, so an unfixable residue rejects honestly and falls to repair.
+    // cloned graph, so an unfixable residue rejects honestly and falls to the relooper retry.
     if blocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {
         let cloned = super::clone_crossarm::privatize_cross_arm_edge(blocks);
         if cloned.len() != blocks.len() && cloned.len() <= CROSS_ARM_EDGE_MAX_BLOCKS {

@@ -87,15 +87,15 @@ pub(in crate::native) fn structured_plan_inner6(
 pub(in crate::native) fn structured_plan_construct_tree(
     blocks: &[BodyBlock],
 ) -> Option<StructuredPlan> {
-    // Prefer the immutable whole-CFG ownership proof. It can close ordinary, loop-exit, and terminal
-    // switch constructs without duplicating their regions. Direct cross-arm privatization is a last
-    // resort: on generated CFGs it can clone several nested copies before discovering that the raw
-    // tree already owned the route, multiplying both planner work and live carrier memory.
+    // Prefer the immutable whole-CFG ownership proof when it already captures the graph without
+    // loop-exit convergence. Besides avoiding needless synthetic roles, this keeps an outer
+    // selection from being stretched across a loop that has entries in both of its arms.
     if let Some(plan) =
         structured_plan_inner7(blocks, false, false, false, true, false, false, true)
     {
         return Some(plan);
     }
+
     for (converge_inloop, break_aware) in [(true, false), (true, true), (false, false)] {
         if let Some(plan) = structured_plan_inner7(
             blocks,
@@ -378,7 +378,7 @@ pub(in crate::native) fn structured_plan_inner8(
             return None;
         }
     }
-    let (sblocks, mut branch, mut branch_merges_by_header, switch) = if construct_tree_owned {
+    let (mut sblocks, mut branch, mut branch_merges_by_header, switch) = if construct_tree_owned {
         unique_selection_merges_with_construct_tree_ownership(
             &lblocks,
             &loop_merges,
@@ -395,6 +395,29 @@ pub(in crate::native) fn structured_plan_inner8(
             &terminal_merges,
         )
     };
+    if !construct_tree_owned {
+        index_branch_merges_by_header(
+            &sblocks,
+            &loop_merges,
+            &branch,
+            &mut branch_merges_by_header,
+        );
+    }
+    normalize_continue_selection_merge_targets(
+        &mut sblocks,
+        &loop_merges,
+        &mut branch_merges_by_header,
+    );
+    if !construct_tree_owned {
+        branch = sblocks
+            .iter()
+            .filter_map(|block| {
+                let (true_target, false_target) = conditional_branch_targets(block)?;
+                let merge = branch_merges_by_header.get(&block.name)?;
+                Some(((true_target, false_target), merge.clone()))
+            })
+            .collect();
+    }
     if selection_synth_growth_exceeds_ladder_cap(lblocks.len(), sblocks.len()) {
         spi_reject!(format!(
             "selection-synth-growth nblk={} from={}",
@@ -430,7 +453,7 @@ pub(in crate::native) fn structured_plan_inner8(
             // (in `forest_loop_merges`) already lifts the GENUINE in-loop case — every switch target an
             // in-loop block — into a fresh successor, so what reaches here is the residue whose switch
             // targets the loop's merge/continue (a `while`-style switch exit test, banked a private capture shard
-            // `423ff479`); that residue has no split yet, so reject and fall back to the repair path.
+            // `423ff479`); that residue has no split yet, so reject and fall back to the relooper retry.
             if is_switch {
                 spi_reject!(format!("loop-header-switch header={}", b.name));
                 return None;
@@ -611,24 +634,59 @@ pub(in crate::native) fn structured_plan_inner8(
     // When a bare-loop-exit skip fired, re-verify that NO block escapes its construct to a non-merge,
     // non-role block (the residual unstructured exit self-checks 2/3 conservatively skip, unmasked by
     // the skip). Scoped to skip-affected functions so the primary emit stays byte-identical.
+    if construct_tree_owned {
+        if let Some(reason) = dominance_loop_exit_escape_reason(&ordered, &loop_merges) {
+            spi_reject!(format!("self-check {reason}"));
+            return None;
+        }
+    }
     if (skipped_bare_exit || loop_exit_selection) && !construct_tree_owned {
         if let Some(reason) = bare_exit_escape_reason(&ordered, &header_merge, &loop_merges) {
             spi_reject!(format!("self-check {reason}"));
             return None;
         }
     }
+    if let Some(reason) = conflicting_phi_predecessor_reason(&ordered) {
+        spi_reject!(format!("self-check {reason}"));
+        return None;
+    }
 
     Some(StructuredPlan {
         blocks: ordered,
         loop_merges,
         branch_merges: branch,
-        branch_merges_by_header: if construct_tree_owned {
-            branch_merges_by_header
-        } else {
-            HashMap::new()
-        },
+        branch_merges_by_header,
         switch_merges: switch,
     })
+}
+
+/// Reject conflicting incoming values after every edge split and merge synthesis. Repeated
+/// byte-identical pairs canonicalize to one SPIR-V operand, but one predecessor cannot select two
+/// different values.
+fn conflicting_phi_predecessor_reason(blocks: &[BodyBlock]) -> Option<String> {
+    for block in blocks {
+        let Some(carrier) = &block.typed else {
+            continue;
+        };
+        for inst in &carrier.insts {
+            let Some((_, incoming)) = inst.phi_incoming() else {
+                continue;
+            };
+            let mut value_by_predecessor = HashMap::new();
+            for (value, predecessor) in incoming {
+                if value_by_predecessor
+                    .insert(predecessor.as_str(), value)
+                    .is_some_and(|existing| existing != value)
+                {
+                    return Some(format!(
+                        "phi-conflicting-predecessor block={} pred={predecessor}",
+                        block.name
+                    ));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Restructure straddling loop merges into an admissible shape — the `selection:straddle-loop-merge`
@@ -641,9 +699,8 @@ pub(in crate::native) fn structured_plan_inner8(
 /// straddle was split, else `None`.
 ///
 /// Pure structural transform (adds pass-through blocks, redirects in-loop exit edges, preserves the
-/// shared merge's phis via [`split_phi_overlap`]). Used ONLY by the `cfg_restructure` retry emit
-/// (adopt-if-validates at the caller), never the default path — so it is floor-safe by construction: a
-/// case that emits + validates on the default path never reaches it.
+/// shared merge's phis via [`split_phi_overlap`]). It is one reject-only planner alternative and is
+/// admitted through the same structural self-check as the ordinary plan.
 pub(in crate::native) fn restructure_straddle_loop_merges(
     blocks: &[BodyBlock],
 ) -> Option<Vec<BodyBlock>> {
@@ -1300,7 +1357,7 @@ fn straddle_closure_stats(
             continue;
         };
         for inst in &carrier.insts {
-            if let Some((_, incoming)) = &inst.phi_incoming {
+            if let Some((_, incoming)) = &inst.phi_incoming() {
                 for (value, predecessor) in incoming {
                     if !closure.contains(predecessor) {
                         continue;
@@ -1332,11 +1389,11 @@ fn straddle_closure_stats(
                 }
                 continue;
             }
-            for used in &inst.uses {
+            inst.visit_uses(|used| {
                 if def_ty.contains_key(used) {
-                    nonphi_escapes.push((used.clone(), block.name.clone()));
+                    nonphi_escapes.push((used.to_string(), block.name.clone()));
                 }
-            }
+            });
         }
         for used in terminator_uses(carrier) {
             if def_ty.contains_key(&used) {
@@ -1518,6 +1575,33 @@ pub(in crate::native) fn find_synthesized_cross_arm_shared(
         })
     };
     let raw: HashSet<&str> = blocks.iter().map(|b| b.name.as_str()).collect();
+    let raw_forest = analyze(blocks);
+    let raw_loop_headers = raw_forest
+        .loops
+        .iter()
+        .map(|natural_loop| natural_loop.header.as_str())
+        .collect::<HashSet<_>>();
+    let raw_loop_latches = raw_forest
+        .loops
+        .iter()
+        .flat_map(|natural_loop| natural_loop.latches.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    let raw_loop_exits = raw_forest
+        .loops
+        .iter()
+        .flat_map(|natural_loop| natural_loop.exits.iter().map(String::as_str))
+        .collect::<HashSet<_>>();
+    let clone_is_loop_local = |owner: &str, continuation: &str| {
+        super::clone_crossarm::shared_clone_is_loop_local(
+            blocks,
+            &raw_forest,
+            owner,
+            continuation,
+            &raw_loop_headers,
+            &raw_loop_latches,
+            &raw_loop_exits,
+        )
+    };
     for b in &sblocks {
         if loop_headers.contains(b.name.as_str()) {
             continue;
@@ -1532,6 +1616,7 @@ pub(in crate::native) fn find_synthesized_cross_arm_shared(
             if !forest.dominates(&b.name, &a)
                 && raw.contains(b.name.as_str())
                 && raw.contains(a.as_str())
+                && clone_is_loop_local(&b.name, &a)
             {
                 return Some((b.name.clone(), a));
             }
@@ -1574,6 +1659,7 @@ pub(in crate::native) fn find_synthesized_cross_arm_shared(
                         if forest.dominates(t1, &s)
                             && raw.contains(child)
                             && raw.contains(s.as_str())
+                            && clone_is_loop_local(child, &s)
                         {
                             return Some((child.to_string(), s));
                         }
@@ -1710,5 +1796,20 @@ mod tests {
         assert!(stats
             .exit_phi_sample
             .contains(&"%after:%x<-%lmerge:%v".to_string()));
+    }
+
+    #[test]
+    fn final_phi_contract_rejects_conflicting_predecessor_values() {
+        let blocks = vec![
+            bb("%entry", &["br label %merge"]),
+            bb(
+                "%merge",
+                &["%v = phi i32 [ 1, %entry ], [ 2, %entry ]", "ret void"],
+            ),
+        ];
+        assert_eq!(
+            conflicting_phi_predecessor_reason(&blocks).as_deref(),
+            Some("phi-conflicting-predecessor block=%merge pred=%entry")
+        );
     }
 }

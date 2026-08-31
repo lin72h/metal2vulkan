@@ -374,23 +374,6 @@ pub(in crate::native) fn spirv_block_successors_by_label(
         .collect()
 }
 
-/// Invert a Word-keyed successor map into predecessors, deduping duplicate (target, pred) edges.
-pub(in crate::native) fn spirv_predecessor_ids_by_label(
-    successors: &HashMap<Word, Vec<Word>>,
-) -> HashMap<Word, Vec<Word>> {
-    let mut predecessors: HashMap<Word, Vec<Word>> = HashMap::new();
-    let mut seen: HashSet<(Word, Word)> = HashSet::new();
-    for (pred, targets) in successors {
-        for target in targets {
-            if !seen.insert((*target, *pred)) {
-                continue;
-            }
-            predecessors.entry(*target).or_default().push(*pred);
-        }
-    }
-    predecessors
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

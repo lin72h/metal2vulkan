@@ -23,12 +23,29 @@ impl Emitter {
             ));
         }
         let cond_id = self.value_id_in(&cond.value, &cond.ty, instructions)?;
-        // Try the raw pointer-select path BEFORE the logical merge-meta, so a buffer marked raw by the
-        // pointer-merge-failure retry (emit_function_with_raw_retry) is not pre-empted by
-        // pointer_merge_meta's pointee-mismatch error on the aggregate-vs-element arms. For a non-raw
-        // buffer emit_raw_pointer_select_index returns false (no raw offsets), so banked selects fall
-        // through to the unchanged logical path below.
+        // Try the raw pointer-select path BEFORE the logical merge-meta. Typed AIR analysis marks an
+        // incompatible multi-root merge raw before emission, so pointer_merge_meta must not pre-empt
+        // that representation with its pointee-mismatch error. For a non-raw buffer
+        // emit_raw_pointer_select_index returns false (no raw offsets), so compatible selects fall
+        // through to the logical path below.
         if let LlType::Ptr(_) = result_ty {
+            let arm_is_deferred = |value: &LlValue| {
+                matches!(value, LlValue::Local(local)
+                    if self.selected_pointers.contains_key(local)
+                        || self.selected_access_trees.contains_key(local))
+            };
+            if arm_is_deferred(&true_value.value) || arm_is_deferred(&false_value.value) {
+                self.selected_pointers.insert(
+                    name.clone(),
+                    SelectedPointer {
+                        cond: cond_id,
+                        true_value: true_value.value.clone(),
+                        false_value: false_value.value.clone(),
+                        ty: result_ty.clone(),
+                    },
+                );
+                return Ok(());
+            }
             if self.emit_raw_pointer_select_index(
                 &name,
                 &result_ty,
@@ -48,9 +65,19 @@ impl Emitter {
             )? {
                 return Ok(());
             }
+            if self.record_incompatible_pointee_load_select(
+                &name,
+                &result_ty,
+                &true_value.value,
+                &false_value.value,
+                cond_id,
+            )? {
+                return Ok(());
+            }
         }
         let pointer_meta =
             self.pointer_merge_meta(&[&true_value.value, &false_value.value], &result_ty)?;
+        let mut pointer_provenance = None;
         if let LlType::Ptr(addrspace) = result_ty {
             if let Some(meta) = pointer_meta.as_ref() {
                 let arm_storage_mismatch = |emitter: &Self,
@@ -91,14 +118,13 @@ impl Emitter {
             )? {
                 return Ok(());
             }
-            if self.record_deferred_load_typed_pointer_select(
+            if self.record_deferred_buffer_pointer_select(
                 &name,
+                &result_ty,
                 &true_value.value,
                 &false_value.value,
-                addrspace,
                 cond_id,
                 pointer_meta.as_ref(),
-                instructions,
             )? {
                 return Ok(());
             }
@@ -111,14 +137,15 @@ impl Emitter {
                 )
             });
             if !can_select_pointer {
-                if let Some(provenance) = self.emit_pointer_select_provenance(
+                pointer_provenance = self.emit_pointer_select_provenance(
                     &name,
                     &result_ty,
                     &true_value.value,
                     &false_value.value,
                     cond_id,
                     instructions,
-                )? {
+                )?;
+                if let Some(provenance) = pointer_provenance.clone() {
                     self.gep_provenance.insert(name.clone(), provenance);
                     if let Some(meta) = pointer_meta {
                         self.record_pointer_meta(name.clone(), meta);
@@ -144,6 +171,45 @@ impl Emitter {
             )? {
                 return Ok(());
             }
+            pointer_provenance = self.emit_pointer_select_provenance(
+                &name,
+                &result_ty,
+                &true_value.value,
+                &false_value.value,
+                cond_id,
+                instructions,
+            )?;
+            if let (
+                Some(
+                    meta @ PointerMeta {
+                        storage,
+                        pointee: Some(pointee),
+                    },
+                ),
+                Some(provenance),
+            ) = (pointer_meta.as_ref(), pointer_provenance.as_ref())
+            {
+                // A select between pointers with one complete root/index provenance is an integer
+                // select followed by one rematerialized pointer, regardless of storage class. The
+                // provenance helper emitted the index select above; constructing the pointer here
+                // keeps pointer SSA out of both ordinary diamonds and select-fed loop recurrences.
+                let result_type = self.ptr_type_id(*storage, pointee)?;
+                let result = self.result_id(&name, &result_ty)?;
+                let op = pointer_arithmetic_access_chain_op_for_storage(
+                    *storage,
+                    provenance.root_is_indexed_container,
+                    pointee,
+                    &provenance.indices,
+                );
+                let mut operands = vec![Operand::IdRef(provenance.root)];
+                for index in gep_spirv_indices(&provenance.indices)? {
+                    operands.push(Operand::IdRef(self.value_id(&index.value, &index.ty)?));
+                }
+                instructions.push(Self::inst(op, Some(result_type), Some(result), operands));
+                self.record_pointer_meta(name.clone(), meta.clone());
+                self.gep_provenance.insert(name, provenance.clone());
+                return Ok(());
+            }
         }
         let result_type = self.pointer_aware_type_id(&result_ty, pointer_meta.as_ref())?;
         let result = self.result_id(&name, &result_ty)?;
@@ -157,14 +223,6 @@ impl Emitter {
         } else {
             self.value_id_in(&false_value.value, &false_value.ty, instructions)?
         };
-        let pointer_provenance = self.emit_pointer_select_provenance(
-            &name,
-            &result_ty,
-            &true_value.value,
-            &false_value.value,
-            cond_id,
-            instructions,
-        )?;
         instructions.push(Self::inst(
             Op::Select,
             Some(result_type),
@@ -234,6 +292,7 @@ impl Emitter {
                 StorageClass::Private
                     | StorageClass::UniformConstant
                     | StorageClass::StorageBuffer
+                    | StorageClass::PhysicalStorageBuffer
                     | StorageClass::Workgroup
             )
         };
@@ -256,6 +315,67 @@ impl Emitter {
         {
             self.define_unmodeled_byte_pointer_value(name, *addrspace)?;
             return Ok(true);
+        }
+        self.selected_pointers.insert(
+            name.to_string(),
+            SelectedPointer {
+                cond: cond_id,
+                true_value: true_value.clone(),
+                false_value: false_value.clone(),
+                ty: result_ty.clone(),
+            },
+        );
+        Ok(true)
+    }
+
+    /// Defer a direct-load-only pointer select whose opaque-pointer arms acquired incompatible
+    /// provisional pointees. LLVM permits that merge because the pointer type carries only an address
+    /// space; SPIR-V does not. Loading each concrete arm with the use-implied type and selecting those
+    /// values preserves the source operation without constructing an invalid pointer cast or select.
+    fn record_incompatible_pointee_load_select(
+        &mut self,
+        name: &str,
+        result_ty: &LlType,
+        true_value: &LlValue,
+        false_value: &LlValue,
+        cond_id: Word,
+    ) -> Result<bool, String> {
+        let LlType::Ptr(addrspace) = result_ty else {
+            return Ok(false);
+        };
+        if !self.tir_direct_load_pointers.contains(name)
+            || matches!(true_value, LlValue::Zero | LlValue::Undef)
+            || matches!(false_value, LlValue::Zero | LlValue::Undef)
+            || self.pointer_phi_incoming_values.contains(name)
+        {
+            return Ok(false);
+        }
+        let Some(true_pointee) = self.pointer_pointee_for_value(true_value)? else {
+            return Ok(false);
+        };
+        let Some(false_pointee) = self.pointer_pointee_for_value(false_value)? else {
+            return Ok(false);
+        };
+        if types_compatible(
+            &self.resolve_type(&true_pointee)?,
+            &self.resolve_type(&false_pointee)?,
+        ) {
+            return Ok(false);
+        }
+        let value_readable = |storage| {
+            matches!(
+                storage,
+                StorageClass::Private
+                    | StorageClass::UniformConstant
+                    | StorageClass::StorageBuffer
+                    | StorageClass::PhysicalStorageBuffer
+                    | StorageClass::Workgroup
+            )
+        };
+        if !value_readable(self.pointer_storage_for(true_value, *addrspace)?)
+            || !value_readable(self.pointer_storage_for(false_value, *addrspace)?)
+        {
+            return Ok(false);
         }
         self.selected_pointers.insert(
             name.to_string(),
@@ -422,9 +542,11 @@ impl Emitter {
     }
 
     /// A `null`/`undef` pointer constant typed to the storage class + pointee a pointer merge resolved,
-    /// not the generic default `value_id_in` would emit. A merge's `null`/`undef` arm must carry the
-    /// merge result's SPIR-V pointer type, or the `OpSelect`/`OpPhi` operand types mismatch the result
-    /// type (the cross-storage `_ptr_UniformConstant_uchar` vs `_ptr_StorageBuffer_*` validation reject).
+    /// not the generic default `value_id_in` would emit. SPIR-V Logical pointer merges admit a null
+    /// pointer arm but not an `OpUndef` pointer arm, so source `undef` is refined to the same typed
+    /// null representation. A merge's nullish arm must carry the merge result's SPIR-V pointer type,
+    /// or the `OpSelect`/`OpPhi` operand types mismatch the result type (the cross-storage
+    /// `_ptr_UniformConstant_uchar` vs `_ptr_StorageBuffer_*` validation reject).
     /// Returns `None` for any other value, so the caller emits it the normal way.
     pub(in crate::native::emitter) fn typed_null_or_undef_pointer_id(
         &mut self,
@@ -433,8 +555,7 @@ impl Emitter {
         pointee: &LlType,
     ) -> Result<Option<Word>, String> {
         let op = match value {
-            LlValue::Zero => Op::ConstantNull,
-            LlValue::Undef => Op::Undef,
+            LlValue::Zero | LlValue::Undef => Op::ConstantNull,
             _ => return Ok(None),
         };
         let ptr_type = self.ptr_type_id(storage, pointee)?;
@@ -537,21 +658,18 @@ impl Emitter {
         Ok(true)
     }
 
-    /// A `select` between two pointers whose common pointee could not be modeled — typically a
-    /// select between pointers into *distinct* buffers (e.g. a tensor `select` op routed through a
-    /// `get_buffer_ptr` helper). A direct pointer `OpSelect` would be illegal in Logical SPIR-V
-    /// ("variable pointers must point into the same structure") and crashes the driver. Instead
-    /// materialize both arm pointers now and defer: the consuming load/store loads each arm with its
-    /// own value type and selects the loaded values. Returns true when it took over the select.
-    pub(in crate::native::emitter) fn record_deferred_load_typed_pointer_select(
+    /// Preserve a `select` between distinct buffer pointers as source structure. A direct pointer
+    /// `OpSelect` would be illegal in Logical SPIR-V, while materializing its arms before a memory
+    /// consumer establishes their pointee can freeze a provisional byte type. GEP/load/store
+    /// lowering instead walks these operands and constructs each concrete leaf at its required type.
+    pub(in crate::native::emitter) fn record_deferred_buffer_pointer_select(
         &mut self,
         name: &str,
+        result_ty: &LlType,
         true_value: &LlValue,
         false_value: &LlValue,
-        addrspace: u32,
         cond_id: Word,
         pointer_meta: Option<&PointerMeta>,
-        instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
         // Engage only for a buffer-storage pointer select whose common pointee is unknown: that is
         // the shape that would otherwise emit an illegal cross-buffer `OpSelect`. A known pointee
@@ -586,25 +704,15 @@ impl Emitter {
             // Deferred load-typed pointers are not modeled across phi edges; let other paths run.
             return Ok(false);
         }
-        let ptr_ty = LlType::Ptr(addrspace);
-        let true_ptr = self.value_id_in(true_value, &ptr_ty, instructions)?;
-        let false_ptr = self.value_id_in(false_value, &ptr_ty, instructions)?;
-        let storage = llvm_pointer_storage(addrspace)?;
-        self.selected_load_pointers.insert(
+        self.selected_pointers.insert(
             name.to_string(),
-            SelectedLoadPointer {
+            SelectedPointer {
                 cond: cond_id,
-                true_ptr: Some(true_ptr),
-                false_ptr: Some(false_ptr),
-                true_storage: storage,
-                false_storage: storage,
-                pointee: LlType::Void,
-                true_raw: None,
-                false_raw: None,
-                load_typed: true,
+                true_value: true_value.clone(),
+                false_value: false_value.clone(),
+                ty: result_ty.clone(),
             },
         );
-        self.pointer_storage.insert(name.to_string(), storage);
         let is_null = self.const_bool(false)?;
         self.record_pointer_nullness(name.to_string(), is_null);
         Ok(true)

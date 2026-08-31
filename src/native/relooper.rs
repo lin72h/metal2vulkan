@@ -35,14 +35,13 @@
 //! never themselves phis). Any other demoted pointer (a function-call result, a non-rematerializable
 //! base) still bails.
 //!
-//! Applied in `lib.rs`'s failure-triggered cfg retry (adopt-if-VALIDATES), so it is floor-safe by
-//! construction: a module that validates on the default path never reaches it, and a relooped module
-//! that does not independently `spirv-val` is discarded. The transform decides purely from IR
-//! structure (block edges, phi membership, value def/use), never a shader name.
+//! Construction selects this representation from source ownership-plan rejection facts while the
+//! module is still owned. Validator output neither selects nor discards it. The transform decides
+//! purely from IR structure (block edges, phi membership, value def/use), never a shader name.
 //!
-//! Conservative bails (leave a function unchanged, so the retry simply yields no win for it): >512
-//! blocks (pathological), a cross-block NON-rematerializable pointer or an opaque-typed value defined
-//! in a NON-entry block (can't be spilled to memory), a 64-bit `OpSwitch` selector, an entry block
+//! Conservative bails (leave a function unchanged, so the retry simply yields no win for it): more
+//! than eight bounded dispatch groups, a cross-block NON-rematerializable pointer or an opaque-typed value defined
+//! in a NON-entry block (can't be spilled to memory), an entry block
 //! that is itself a branch target or has no branch successor, a phi on the entry block, or a
 //! terminator outside the handled set.
 
@@ -55,29 +54,51 @@ use std::collections::{HashMap, HashSet};
 /// Rewrite every eligible multi-block function of `module` into relooper form. Returns true if any
 /// function was rewritten.
 pub(super) fn rewrite_to_relooper(module: &mut Module, max_blocks: usize) -> bool {
+    rewrite_to_relooper_if(module, max_blocks, |_| true)
+}
+
+/// Rewrite only functions whose result id is selected by the caller. Selection is derived from the
+/// source ownership planner before this module is serialized; it is not a validator diagnosis.
+pub(super) fn rewrite_selected_to_relooper(
+    module: &mut Module,
+    max_blocks: usize,
+    selected: &HashSet<Word>,
+) -> bool {
+    rewrite_to_relooper_if(module, max_blocks, |function| {
+        function
+            .def
+            .as_ref()
+            .and_then(|def| def.result_id)
+            .is_some_and(|id| selected.contains(&id))
+    })
+}
+
+fn rewrite_to_relooper_if(
+    module: &mut Module,
+    max_blocks: usize,
+    mut selected: impl FnMut(&Function) -> bool,
+) -> bool {
     let max_blocks = effective_relooper_block_cap(max_blocks);
     // Snapshot the global type/const tables we read while choosing/creating types and constants.
     let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(1);
     let mut tc = TypeCtx::new(module, &mut next_id);
 
-    let mut any = false;
-    // Borrow functions separately from the type table being mutated: collect the new
-    // types/constants tc accumulates and append them after the function rewrites.
-    let mut functions = std::mem::take(&mut module.functions);
+    let mut changed = false;
+    // TypeCtx snapshots the global definitions it needs, so function rewrites can borrow their own
+    // module field directly while newly synthesized globals remain buffered in `pending`.
     if crate::env_vars::reloop_why() {
-        eprintln!("RELOOP-ENTER functions={}", functions.len());
+        eprintln!("RELOOP-ENTER functions={}", module.functions.len());
     }
-    for function in &mut functions {
-        if rewrite_function(function, &mut tc, max_blocks) {
-            any = true;
+    for function in &mut module.functions {
+        if selected(function) && rewrite_function(function, &mut tc, max_blocks) {
+            changed = true;
         }
     }
-    module.functions = functions;
     tc.flush(module);
     if let Some(h) = module.header.as_mut() {
         h.bound = next_id;
     }
-    any
+    changed
 }
 
 /// Find-or-create cache for the integer / bool / pointer types and the integer constants the relooper
@@ -86,67 +107,98 @@ struct TypeCtx<'a> {
     next_id: &'a mut Word,
     /// Existing + pending type/const defs, keyed for lookup.
     int_types: HashMap<(u32, u32), Word>, // (width, signedness) -> id
+    int_widths: HashMap<Word, u32>, // integer type id -> width
     bool_type: Option<Word>,
-    ptr_func: HashMap<Word, Word>, // pointee -> ptr Function pointee
-    int_consts: HashMap<(Word, u64), Word>, // (int type, value) -> const id
+    pointer_types: HashMap<(StorageClass, Word), Word>, // (storage, pointee) -> pointer type
+    int_consts: HashMap<(Word, u64), Word>,             // (int type, value) -> const id
     /// Snapshot of pointee for each pointer type id, and the opcode of each type id (to classify).
     type_op: HashMap<Word, Op>,
     type_defs: HashMap<Word, Instruction>,
+    value_types: HashMap<Word, Word>,
     const_values: HashMap<Word, u64>,
     explicitly_laid_out: HashSet<Word>,
+    array_strides: HashMap<Word, u32>,
     pending: Vec<Instruction>,
+    pending_annotations: Vec<Instruction>,
 }
 
 impl<'a> TypeCtx<'a> {
     fn new(module: &Module, next_id: &'a mut Word) -> Self {
         let mut int_types = HashMap::new();
+        let mut int_widths = HashMap::new();
         let mut bool_type = None;
-        let mut ptr_func = HashMap::new();
+        let mut pointer_types = HashMap::new();
         let mut int_consts = HashMap::new();
         let mut type_op = HashMap::new();
         let mut type_defs = HashMap::new();
+        let mut value_types = HashMap::new();
         let mut const_values = HashMap::new();
         for inst in &module.types_global_values {
             let Some(rid) = inst.result_id else { continue };
             type_op.insert(rid, inst.class.opcode);
             type_defs.insert(rid, inst.clone());
+            if let Some(result_type) = inst.result_type {
+                value_types.insert(rid, result_type);
+            }
             match inst.class.opcode {
                 Op::TypeInt => {
                     if let (Some(Operand::LiteralBit32(w)), Some(Operand::LiteralBit32(s))) =
                         (inst.operands.first(), inst.operands.get(1))
                     {
                         int_types.insert((*w, *s), rid);
+                        int_widths.insert(rid, *w);
                     }
                 }
                 Op::TypeBool => bool_type = Some(rid),
                 Op::TypePointer => {
-                    if let (
-                        Some(Operand::StorageClass(StorageClass::Function)),
-                        Some(Operand::IdRef(p)),
-                    ) = (inst.operands.first(), inst.operands.get(1))
+                    if let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
+                        (inst.operands.first(), inst.operands.get(1))
                     {
-                        ptr_func.insert(*p, rid);
+                        pointer_types.insert((*storage, *pointee), rid);
                     }
                 }
                 Op::Constant => {
-                    if let (Some(ty), Some(Operand::LiteralBit32(v))) =
-                        (inst.result_type, inst.operands.first())
-                    {
-                        int_consts.insert((ty, *v as u64), rid);
-                        const_values.insert(rid, *v as u64);
+                    let value = match inst.operands.first() {
+                        Some(Operand::LiteralBit32(value)) => Some(*value as u64),
+                        Some(Operand::LiteralBit64(value)) => Some(*value),
+                        _ => None,
+                    };
+                    if let (Some(ty), Some(value)) = (inst.result_type, value) {
+                        int_consts.insert((ty, value), rid);
+                        const_values.insert(rid, value);
                     }
                 }
                 _ => {}
             }
         }
+        let array_strides = module
+            .annotations
+            .iter()
+            .filter_map(|inst| {
+                if inst.class.opcode != Op::Decorate
+                    || inst.operands.get(1)
+                        != Some(&Operand::Decoration(spirv::Decoration::ArrayStride))
+                {
+                    return None;
+                }
+                let (Some(Operand::IdRef(pointer)), Some(Operand::LiteralBit32(stride))) =
+                    (inst.operands.first(), inst.operands.get(2))
+                else {
+                    return None;
+                };
+                Some((*pointer, *stride))
+            })
+            .collect();
         TypeCtx {
             next_id,
             int_types,
+            int_widths,
             bool_type,
-            ptr_func,
+            pointer_types,
             int_consts,
             type_op,
             type_defs,
+            value_types,
             const_values,
             explicitly_laid_out: module
                 .annotations
@@ -179,7 +231,9 @@ impl<'a> TypeCtx<'a> {
                     _ => None,
                 })
                 .collect(),
+            array_strides,
             pending: Vec::new(),
+            pending_annotations: Vec::new(),
         }
     }
 
@@ -191,6 +245,10 @@ impl<'a> TypeCtx<'a> {
 
     fn type_opcode(&self, ty: Word) -> Option<Op> {
         self.type_op.get(&ty).copied()
+    }
+
+    fn value_type(&self, value: Word) -> Option<Word> {
+        self.value_types.get(&value).copied()
     }
 
     fn composite_members(&self, ty: Word) -> Option<Vec<Word>> {
@@ -249,6 +307,7 @@ impl<'a> TypeCtx<'a> {
         ));
         self.type_op.insert(id, Op::TypeInt);
         self.int_types.insert((width, signed), id);
+        self.int_widths.insert(id, width);
         id
     }
 
@@ -269,7 +328,21 @@ impl<'a> TypeCtx<'a> {
     }
 
     fn ptr_function(&mut self, pointee: Word) -> Word {
-        if let Some(&id) = self.ptr_func.get(&pointee) {
+        self.ptr(StorageClass::Function, pointee)
+    }
+
+    fn pointer_shape(&self, ty: Word) -> Option<(StorageClass, Word)> {
+        let definition = self.type_defs.get(&ty)?;
+        let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
+            (definition.operands.first(), definition.operands.get(1))
+        else {
+            return None;
+        };
+        Some((*storage, *pointee))
+    }
+
+    fn ptr(&mut self, storage: StorageClass, pointee: Word) -> Word {
+        if let Some(&id) = self.pointer_types.get(&(storage, pointee)) {
             return id;
         }
         let id = self.fresh();
@@ -277,14 +350,37 @@ impl<'a> TypeCtx<'a> {
             Op::TypePointer,
             None,
             Some(id),
-            vec![
-                Operand::StorageClass(StorageClass::Function),
-                Operand::IdRef(pointee),
-            ],
+            vec![Operand::StorageClass(storage), Operand::IdRef(pointee)],
         ));
         self.type_op.insert(id, Op::TypePointer);
-        self.ptr_func.insert(pointee, id);
+        self.type_defs.insert(
+            id,
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(id),
+                vec![Operand::StorageClass(storage), Operand::IdRef(pointee)],
+            ),
+        );
+        self.pointer_types.insert((storage, pointee), id);
         id
+    }
+
+    fn ensure_array_stride(&mut self, pointer: Word, stride: u32) {
+        if self.array_strides.get(&pointer) == Some(&stride) {
+            return;
+        }
+        self.pending_annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(pointer),
+                Operand::Decoration(spirv::Decoration::ArrayStride),
+                Operand::LiteralBit32(stride),
+            ],
+        ));
+        self.array_strides.insert(pointer, stride);
     }
 
     fn int_const(&mut self, ty: Word, value: u64) -> Word {
@@ -296,7 +392,11 @@ impl<'a> TypeCtx<'a> {
             Op::Constant,
             Some(ty),
             Some(id),
-            vec![Operand::LiteralBit32(value as u32)],
+            vec![if self.int_widths.get(&ty) == Some(&64) {
+                Operand::LiteralBit64(value)
+            } else {
+                Operand::LiteralBit32(value as u32)
+            }],
         ));
         self.int_consts.insert((ty, value), id);
         id
@@ -304,6 +404,7 @@ impl<'a> TypeCtx<'a> {
 
     fn flush(self, module: &mut Module) {
         module.types_global_values.extend(self.pending);
+        module.annotations.extend(self.pending_annotations);
     }
 }
 
@@ -311,7 +412,7 @@ impl<'a> TypeCtx<'a> {
 enum Term {
     Branch(Word),
     BranchCond(Word, Word, Word),         // cond, true, false
-    Switch(Word, Word, Vec<(u32, Word)>), // selector, default, (literal, label)
+    Switch(Word, Word, Vec<(u64, Word)>), // selector, default, (literal, label)
     Return,
     ReturnValue(Word),
     Unreachable,
@@ -451,8 +552,8 @@ fn decode_term(inst: &Instruction) -> Option<Term> {
             let mut i = 2;
             while i + 1 < inst.operands.len() {
                 let lit = match &inst.operands[i] {
-                    Operand::LiteralBit32(v) => *v,
-                    // 64-bit selector literal -> bail (None) so the whole function is left unchanged.
+                    Operand::LiteralBit32(v) => *v as u64,
+                    Operand::LiteralBit64(v) => *v,
                     _ => return None,
                 };
                 let Operand::IdRef(lbl) = &inst.operands[i + 1] else {
@@ -478,18 +579,15 @@ fn block_label(block: &Block) -> Option<Word> {
     block.label.as_ref().and_then(|l| l.result_id)
 }
 
-/// Above this block count the relooper bails: a giant function would produce an enormous switch +
-/// register-demotion module that gives pathological spirv-val / downstream compile time for no payoff.
-/// 1024 clears the mid-size emitted-then-rejected cfg family (542–953 blocks, ~1–2s each to reloop +
-/// validate) while still bailing the >1024-block cost-budget cluster (1304–4630 blocks), which is
-/// mostly emit-fail anyway (no module reaches the relooper) and would be pathological to lower.
+/// Maximum cases in one generated dispatch switch. Larger functions are partitioned into nested
+/// dispatch groups so no individual `OpSwitch` exceeds this driver-safety boundary.
 const MAX_RELOOPER_BLOCKS: usize = 1024;
 
-/// Hard product safety ceiling for the whole-function switch/state-machine relooper. Above this
-/// size, valid output has thousands of Function variables and memory operations feeding one giant
-/// switch; real drivers have been observed compiling it for tens of minutes or crashing. Returning
-/// FALLBACK is safer than emitting a module that can wedge a consumer's pipeline compiler.
+/// Hard product safety ceiling for each switch in the state-machine relooper. A bounded number of
+/// nested groups permits large source functions without constructing the giant flat switches that
+/// have pathological downstream compile behavior.
 const MAX_DRIVER_SAFE_RELOOPER_BLOCKS: usize = MAX_RELOOPER_BLOCKS;
+const MAX_RELOOPER_GROUPS: usize = 8;
 
 fn effective_relooper_block_cap(requested: usize) -> usize {
     requested.min(MAX_DRIVER_SAFE_RELOOPER_BLOCKS)
@@ -520,7 +618,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     if function.blocks.len() < 2 {
         return bail("too-few-blocks");
     }
-    if function.blocks.len() > max_blocks {
+    if function.blocks.len() > max_blocks.saturating_mul(MAX_RELOOPER_GROUPS) {
         return bail("too-many-blocks");
     }
 
@@ -532,7 +630,15 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
         };
         match decode_term(last) {
             Some(t) => terms.push(t),
-            None => return bail("unhandled-terminator"),
+            None => {
+                if crate::env_vars::reloop_why() {
+                    eprintln!(
+                        "RELOOP-UNHANDLED-TERMINATOR opcode={:?} operands={:?}",
+                        last.class.opcode, last.operands
+                    );
+                }
+                return bail("unhandled-terminator");
+            }
         }
     }
 
@@ -624,6 +730,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                         | Op::PtrAccessChain
                         | Op::Select
                         | Op::CopyObject
+                        | Op::ConvertUToPtr
                 ) || (inst.class.opcode == Op::Load
                     && matches!(
                         inst.result_type.and_then(|ty| tc.type_opcode(ty)),
@@ -797,6 +904,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                 }
                 Op::Select if ids.len() == 3 => (&ids[1..3], &ids[..1]), // two arm pointers, condition
                 Op::CopyObject if ids.len() == 1 => (&ids[..1], &ids[..0]), // pure pointer alias
+                Op::ConvertUToPtr if ids.len() == 1 => (&ids[..0], &ids[..1]),
                 Op::Load
                     if ids.len() == 1
                         && matches!(
@@ -907,7 +1015,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     // for Function/Private pointers, where an `OpSelect`/phi OF pointers is ILLEGAL (variable pointers
     // cover only StorageBuffer/Workgroup); the no-select invariant form is the only sound
     // rematerialization there. (A non-invariant pointer phi still uses the tag-select, which validates
-    // only for SB/Workgroup pointees — adopt-if-validates discards an illegal Function-pointer select.)
+    // only for SB/Workgroup pointees; construction rejects other pointer domains before emission.)
     let mut remat_phi_invariant: HashSet<Word> = HashSet::new();
     for (&pid, (_, incoming)) in &remat_phi {
         let key_of = |v: Word| -> (u32, Vec<Operand>) {
@@ -947,11 +1055,59 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                             .find(|inst| inst.result_id == Some(*v))
                             .map(|inst| inst.class.opcode)
                     });
+                    let def = def_block.get(v).and_then(|&bi| {
+                        function.blocks[bi]
+                            .instructions
+                            .iter()
+                            .find(|inst| inst.result_id == Some(*v))
+                    });
                     eprintln!(
-                        "RELOOP-BAIL-VALUE id=%{v} type=%{ty} type_op={:?} def_op={:?}",
+                        "RELOOP-BAIL-VALUE id=%{v} type=%{ty} type_op={:?} def_op={:?} operands={:?}",
                         tc.type_opcode(ty),
-                        def_op
+                        def_op,
+                        def.map(|inst| &inst.operands)
                     );
+                    if let Some((_, incoming)) = phis.get(v) {
+                        for (incoming_value, predecessor) in incoming {
+                            let incoming_def = def_block.get(incoming_value).and_then(|&bi| {
+                                function.blocks[bi]
+                                    .instructions
+                                    .iter()
+                                    .find(|inst| inst.result_id == Some(*incoming_value))
+                            });
+                            eprintln!(
+                                "RELOOP-BAIL-PHI-ARM value=%{incoming_value} predecessor=%{predecessor} def_op={:?} operands={:?}",
+                                incoming_def.map(|inst| inst.class.opcode),
+                                incoming_def.map(|inst| &inst.operands)
+                            );
+                        }
+                    }
+                    if let Some(definition) = def {
+                        for operand in &definition.operands {
+                            let Operand::IdRef(dependency) = operand else {
+                                continue;
+                            };
+                            if let Some((_, incoming)) = phis.get(dependency) {
+                                eprintln!(
+                                    "RELOOP-BAIL-DEPENDENCY-PHI id=%{dependency} operands={:?}",
+                                    definition.operands
+                                );
+                                for (incoming_value, predecessor) in incoming {
+                                    let incoming_def =
+                                        def_block.get(incoming_value).and_then(|&bi| {
+                                            function.blocks[bi].instructions.iter().find(|inst| {
+                                                inst.result_id == Some(*incoming_value)
+                                            })
+                                        });
+                                    eprintln!(
+                                        "RELOOP-BAIL-DEPENDENCY-PHI-ARM value=%{incoming_value} predecessor=%{predecessor} def_op={:?} operands={:?}",
+                                        incoming_def.map(|inst| inst.class.opcode),
+                                        incoming_def.map(|inst| &inst.operands)
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 return bail("non-spillable-demote");
             }
@@ -1024,6 +1180,9 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     let sel_merge = tc.fresh();
     let loop_continue = tc.fresh();
     let loop_merge = tc.fresh();
+    let group_count = function.blocks.len().div_ceil(max_blocks);
+    let group_dispatches = (0..group_count).map(|_| tc.fresh()).collect::<Vec<_>>();
+    let group_merges = (0..group_count).map(|_| tc.fresh()).collect::<Vec<_>>();
 
     // Phi results are always loaded from their spill (the phi instruction is stripped), even by users
     // in the phi's own block — unlike a plain SSA value, which stays in scope within its def block.
@@ -1039,6 +1198,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
         spill: &spill,
         demote: &demote,
         def_block: &def_block,
+        value_type: &value_type,
         phi: &phi_ids,
         remat: &remat,
         remat_phi: &remat_phi,
@@ -1051,12 +1211,18 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     // state store + branch to the selection merge). Block 0 (entry) is instead lowered into the
     // synthetic prologue: its body runs once before the loop and its terminator sets the INITIAL state
     // and branches to the loop header.
-    let mut case_blocks: Vec<Block> = Vec::with_capacity(function.blocks.len());
+    let mut case_blocks: Vec<(usize, Block)> = Vec::with_capacity(function.blocks.len());
     let mut entry_processed: Vec<Instruction> = Vec::new();
 
     for (bi, block) in function.blocks.iter().enumerate() {
         let this_label = labels[bi];
-        let exit_target = if bi == 0 { loop_header } else { sel_merge };
+        let exit_target = if bi == 0 {
+            loop_header
+        } else if group_count == 1 {
+            sel_merge
+        } else {
+            group_merges[bi / max_blocks]
+        };
         let mut prelude: Vec<Instruction> = Vec::new();
         // Per-block load substitution for demoted values referenced here (incl. phi results read).
         let mut local_load: HashMap<Word, Word> = HashMap::new();
@@ -1102,6 +1268,52 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                         let l = load_demoted(tc, &mut prelude, &mut local_load, &spill, *id);
                         *op = Operand::IdRef(l);
                     }
+                }
+            }
+            if matches!(
+                inst.class.opcode,
+                Op::AccessChain
+                    | Op::InBoundsAccessChain
+                    | Op::PtrAccessChain
+                    | Op::InBoundsPtrAccessChain
+            ) {
+                let base = inst.operands.first().and_then(|operand| match operand {
+                    Operand::IdRef(id) => Some(*id),
+                    _ => None,
+                });
+                let base_shape = base
+                    .and_then(|id| tc.value_type(id).or_else(|| value_type.get(&id).copied()))
+                    .and_then(|ty| tc.pointer_shape(ty));
+                let result_pointee = inst
+                    .result_type
+                    .and_then(|ty| tc.pointer_shape(ty))
+                    .map(|(_, pointee)| pointee);
+                if let (Some((storage, base_pointee)), Some(pointee)) = (base_shape, result_pointee)
+                {
+                    if storage == StorageClass::PhysicalStorageBuffer && base_pointee != pointee {
+                        let address_type = tc.int_ty(64, 0);
+                        let address = tc.fresh();
+                        body.push(Instruction::new(
+                            Op::ConvertPtrToU,
+                            Some(address_type),
+                            Some(address),
+                            vec![Operand::IdRef(base.expect("access chain has a base"))],
+                        ));
+                        let pointer_type = tc.ptr(storage, pointee);
+                        if tc.int_widths.get(&pointee) == Some(&8) {
+                            tc.ensure_array_stride(pointer_type, 1);
+                        }
+                        let reinterpreted = tc.fresh();
+                        body.push(Instruction::new(
+                            Op::ConvertUToPtr,
+                            Some(pointer_type),
+                            Some(reinterpreted),
+                            vec![Operand::IdRef(address)],
+                        ));
+                        inst.operands[0] = Operand::IdRef(reinterpreted);
+                        tc.value_types.insert(reinterpreted, pointer_type);
+                    }
+                    inst.result_type = Some(tc.ptr(storage, pointee));
                 }
             }
             // A demoted value defined earlier in THIS block stays SSA for in-block readers, but is
@@ -1212,10 +1424,14 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                     );
                 }
                 let selector = resolve(tc, &mut prelude, &mut local_load, &demo, bi, *selv);
-                let sel_ty = value_type.get(selv).copied().unwrap_or(i32_ty);
+                let sel_ty = value_type
+                    .get(selv)
+                    .copied()
+                    .or_else(|| tc.value_type(*selv))
+                    .unwrap_or(i32_ty);
                 let mut cur = case_const[label_index[def]];
                 for (lit, lbl) in cases {
-                    let lit_const = tc.int_const(sel_ty, *lit as u64);
+                    let lit_const = tc.int_const(sel_ty, *lit);
                     let eq = tc.fresh();
                     tail.push(Instruction::new(
                         Op::IEqual,
@@ -1263,10 +1479,13 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
             // variables below); it ends in the initial state store + branch to the loop header.
             entry_processed = instructions;
         } else {
-            case_blocks.push(Block {
-                label: Some(Instruction::new(Op::Label, None, Some(this_label), vec![])),
-                instructions,
-            });
+            case_blocks.push((
+                bi,
+                Block {
+                    label: Some(Instruction::new(Op::Label, None, Some(this_label), vec![])),
+                    instructions,
+                },
+            ));
         }
     }
 
@@ -1305,35 +1524,50 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     // statically reachable. The default cannot target the loop merge directly because SPIR-V requires
     // a switch header to dominate every case/default construct.
     let state_load = tc.fresh();
-    let mut switch_ops = vec![
-        Operand::IdRef(state_load),
-        Operand::IdRef(switch_default_break),
-    ];
-    // Cases are the NON-entry blocks (1..N); the entry is the prologue, never a switch target.
-    for (i, lbl) in labels.iter().enumerate().skip(1) {
-        switch_ops.push(Operand::LiteralBit32(i as u32));
-        switch_ops.push(Operand::IdRef(*lbl));
+    let mut dispatch_instructions = vec![Instruction::new(
+        Op::Load,
+        Some(i32_ty),
+        Some(state_load),
+        vec![Operand::IdRef(state_var)],
+    )];
+    let switch_selector;
+    let mut switch_ops = vec![Operand::IdRef(0), Operand::IdRef(switch_default_break)];
+    if group_count == 1 {
+        switch_selector = state_load;
+        for (i, lbl) in labels.iter().enumerate().skip(1) {
+            switch_ops.push(Operand::LiteralBit32(i as u32));
+            switch_ops.push(Operand::IdRef(*lbl));
+        }
+    } else {
+        let divisor = tc.int_const(i32_ty, max_blocks as u64);
+        switch_selector = tc.fresh();
+        dispatch_instructions.push(Instruction::new(
+            Op::UDiv,
+            Some(i32_ty),
+            Some(switch_selector),
+            vec![Operand::IdRef(state_load), Operand::IdRef(divisor)],
+        ));
+        for (group, label) in group_dispatches.iter().enumerate() {
+            switch_ops.push(Operand::LiteralBit32(group as u32));
+            switch_ops.push(Operand::IdRef(*label));
+        }
     }
+    switch_ops[0] = Operand::IdRef(switch_selector);
+    dispatch_instructions.extend([
+        Instruction::new(
+            Op::SelectionMerge,
+            None,
+            None,
+            vec![
+                Operand::IdRef(sel_merge),
+                Operand::SelectionControl(spirv::SelectionControl::NONE),
+            ],
+        ),
+        Instruction::new(Op::Switch, None, None, switch_ops),
+    ]);
     let dispatch_block = Block {
         label: Some(Instruction::new(Op::Label, None, Some(dispatch), vec![])),
-        instructions: vec![
-            Instruction::new(
-                Op::Load,
-                Some(i32_ty),
-                Some(state_load),
-                vec![Operand::IdRef(state_var)],
-            ),
-            Instruction::new(
-                Op::SelectionMerge,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(sel_merge),
-                    Operand::SelectionControl(spirv::SelectionControl::NONE),
-                ],
-            ),
-            Instruction::new(Op::Switch, None, None, switch_ops),
-        ],
+        instructions: dispatch_instructions,
     };
     let switch_default_block = Block {
         label: Some(Instruction::new(
@@ -1389,14 +1623,73 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
         instructions: vec![merge_terminal],
     };
 
-    // Assemble: synthetic entry, loop header, dispatch, default-break case, all cases, selection
-    // merge, loop continue, loop merge.
-    let mut new_blocks = Vec::with_capacity(case_blocks.len() + 7);
+    // Assemble one flat switch for a bounded function. Larger functions use an outer group switch
+    // and one inner switch per group; both levels converge structurally before the loop back-edge.
+    let mut new_blocks = Vec::with_capacity(case_blocks.len() + 7 + group_count * 2);
     new_blocks.push(entry_block);
     new_blocks.push(header_block);
     new_blocks.push(dispatch_block);
     new_blocks.push(switch_default_block);
-    new_blocks.extend(case_blocks);
+    if group_count == 1 {
+        new_blocks.extend(case_blocks.into_iter().map(|(_, block)| block));
+    } else {
+        let mut cases = case_blocks.into_iter().peekable();
+        for group in 0..group_count {
+            let group_start = group * max_blocks;
+            let group_end = (group_start + max_blocks).min(function.blocks.len());
+            let mut inner_ops = vec![
+                Operand::IdRef(state_load),
+                Operand::IdRef(group_merges[group]),
+            ];
+            for (index, label) in labels
+                .iter()
+                .enumerate()
+                .take(group_end)
+                .skip(group_start.max(1))
+            {
+                inner_ops.push(Operand::LiteralBit32(index as u32));
+                inner_ops.push(Operand::IdRef(*label));
+            }
+            new_blocks.push(Block {
+                label: Some(Instruction::new(
+                    Op::Label,
+                    None,
+                    Some(group_dispatches[group]),
+                    vec![],
+                )),
+                instructions: vec![
+                    Instruction::new(
+                        Op::SelectionMerge,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(group_merges[group]),
+                            Operand::SelectionControl(spirv::SelectionControl::NONE),
+                        ],
+                    ),
+                    Instruction::new(Op::Switch, None, None, inner_ops),
+                ],
+            });
+            while cases.peek().is_some_and(|(index, _)| *index < group_end) {
+                let (_, block) = cases.next().expect("peeked case");
+                new_blocks.push(block);
+            }
+            new_blocks.push(Block {
+                label: Some(Instruction::new(
+                    Op::Label,
+                    None,
+                    Some(group_merges[group]),
+                    vec![],
+                )),
+                instructions: vec![Instruction::new(
+                    Op::Branch,
+                    None,
+                    None,
+                    vec![Operand::IdRef(sel_merge)],
+                )],
+            });
+        }
+    }
     new_blocks.push(sel_merge_block);
     new_blocks.push(continue_block);
     new_blocks.push(merge_block);
@@ -1409,6 +1702,7 @@ struct Demo<'a> {
     spill: &'a HashMap<Word, Spill>,
     demote: &'a HashSet<Word>,
     def_block: &'a HashMap<Word, usize>,
+    value_type: &'a HashMap<Word, Word>,
     phi: &'a HashSet<Word>,
     /// Demoted pointers that are rematerialized (re-emitted) per use-case instead of spilled.
     remat: &'a HashMap<Word, Instruction>,
@@ -1572,12 +1866,38 @@ fn rematerialize(
         }
     }
     let result = tc.fresh();
+    let mut result_type = inst.result_type;
+    if matches!(
+        inst.class.opcode,
+        Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
+    ) {
+        let base = new_ops.first().and_then(|operand| match operand {
+            Operand::IdRef(id) => Some(*id),
+            _ => None,
+        });
+        let base_storage = base
+            .and_then(|id| {
+                tc.value_type(id)
+                    .or_else(|| demo.value_type.get(&id).copied())
+            })
+            .and_then(|ty| tc.pointer_shape(ty))
+            .map(|(storage, _)| storage);
+        let result_pointee = result_type
+            .and_then(|ty| tc.pointer_shape(ty))
+            .map(|(_, pointee)| pointee);
+        if let (Some(storage), Some(pointee)) = (base_storage, result_pointee) {
+            result_type = Some(tc.ptr(storage, pointee));
+        }
+    }
     prelude.push(Instruction::new(
         inst.class.opcode,
-        inst.result_type,
+        result_type,
         Some(result),
         new_ops,
     ));
+    if let Some(result_type) = result_type {
+        tc.value_types.insert(result, result_type);
+    }
     local_remat.insert(v, result);
     result
 }
@@ -1650,7 +1970,7 @@ mod tests {
         dir
     }
 
-    /// Assemble spvasm to a SPIR-V byte module via the local `spirv-as` (Vulkan 1.3). Returns None if
+    /// Assemble spvasm to a SPIR-V byte module via the local `spirv-as` (Vulkan 1.2). Returns None if
     /// the tool is unavailable, so the test no-ops in toolchain-less environments.
     fn assemble(spvasm: &str) -> Option<Vec<u8>> {
         if std::process::Command::new("spirv-as")
@@ -1665,7 +1985,7 @@ mod tests {
         let out = dir.join("in.spv");
         std::fs::write(&src, spvasm).unwrap();
         let st = std::process::Command::new("spirv-as")
-            .args(["--target-env", "vulkan1.3"])
+            .args(["--target-env", crate::tools::VULKAN_TARGET_ENV])
             .arg(&src)
             .arg("-o")
             .arg(&out)
@@ -1684,7 +2004,7 @@ mod tests {
         let p = dir.join("m.spv");
         std::fs::write(&p, spv).unwrap();
         let st = std::process::Command::new("spirv-val")
-            .args(["--target-env", "vulkan1.3"])
+            .args(["--target-env", crate::tools::VULKAN_TARGET_ENV])
             .arg(&p)
             .output()
             .unwrap();
@@ -1720,7 +2040,47 @@ mod tests {
     }
 
     #[test]
-    fn whole_function_relooper_refuses_1025_block_state_machine() {
+    fn selected_relooper_leaves_unselected_function_cfg_unchanged() {
+        let Some(spv) = assemble(
+            r#"OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+OpExecutionMode %main OriginUpperLeft
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%helper = OpFunction %void None %fn
+%h0 = OpLabel
+OpBranch %h1
+%h1 = OpLabel
+OpReturn
+OpFunctionEnd
+%main = OpFunction %void None %fn
+%m0 = OpLabel
+OpBranch %m1
+%m1 = OpLabel
+OpReturn
+OpFunctionEnd
+"#,
+        ) else {
+            return;
+        };
+        let mut module = crate::spirv_module::load_bytes(&spv).expect("load");
+        let helper_id = module.functions[0]
+            .def
+            .as_ref()
+            .and_then(|def| def.result_id)
+            .expect("helper id");
+        assert!(rewrite_selected_to_relooper(
+            &mut module,
+            MAX_RELOOPER_BLOCKS,
+            &HashSet::from([helper_id]),
+        ));
+        assert_ne!(module.functions[0].blocks.len(), 2);
+        assert_eq!(module.functions[1].blocks.len(), 2);
+    }
+
+    #[test]
+    fn whole_function_relooper_partitions_1025_block_state_machine() {
         let mut spvasm = String::from(
             r#"OpCapability Shader
 OpMemoryModel Logical GLSL450
@@ -1745,8 +2105,27 @@ OpExecutionMode %main OriginUpperLeft
             return;
         };
         let mut module = crate::spirv_module::load_bytes(&spv).expect("load");
-
-        assert!(!rewrite_to_relooper(&mut module, 8192));
+        assert!(rewrite_to_relooper(&mut module, 8192));
+        let switch_case_counts = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| instruction.class.opcode == Op::Switch)
+            .map(|instruction| instruction.operands.len().saturating_sub(2) / 2)
+            .collect::<Vec<_>>();
+        assert_eq!(switch_case_counts.len(), 3, "{switch_case_counts:?}");
+        assert!(
+            switch_case_counts
+                .iter()
+                .all(|count| *count <= MAX_DRIVER_SAFE_RELOOPER_BLOCKS),
+            "{switch_case_counts:?}"
+        );
+        let bytes = module
+            .assemble()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert!(validates(&bytes));
     }
 
     fn block_id(block: &Block) -> Word {
@@ -2001,6 +2380,40 @@ OpExecutionMode %main OriginUpperLeft
                %cont = OpLabel
               %inext = OpIAdd %uint %i %u1
                        OpBranch %head
+              %merge = OpLabel
+                       OpReturn
+                       OpFunctionEnd
+        "#;
+        let Some(spv) = assemble(spvasm) else { return };
+        assert!(validates(&spv), "input must validate");
+        let out = relooper_bytes(&spv);
+        assert!(validates(&out), "relooper output must validate");
+    }
+
+    #[test]
+    fn relooper_preserves_64_bit_switch_literals() {
+        let spvasm = r#"
+                       OpCapability Shader
+                       OpCapability Int64
+                       OpMemoryModel Logical GLSL450
+                       OpEntryPoint GLCompute %main "main"
+                       OpExecutionMode %main LocalSize 1 1 1
+               %void = OpTypeVoid
+                 %fn = OpTypeFunction %void
+              %ulong = OpTypeInt 64 0
+                 %u1 = OpConstant %ulong 1
+               %main = OpFunction %void None %fn
+              %entry = OpLabel
+                       OpBranch %switch
+             %switch = OpLabel
+                       OpSelectionMerge %merge None
+                       OpSwitch %u1 %default 0 %zero 1 %one
+               %zero = OpLabel
+                       OpBranch %merge
+                %one = OpLabel
+                       OpBranch %merge
+            %default = OpLabel
+                       OpBranch %merge
               %merge = OpLabel
                        OpReturn
                        OpFunctionEnd

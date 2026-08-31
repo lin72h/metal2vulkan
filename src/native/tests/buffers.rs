@@ -18,6 +18,91 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[test]
+fn native_null_rooted_pointer_recurrence_is_valid_by_construction() {
+    let ll = r#"
+define void @walk(ptr addrspace(1) %flag) {
+entry:
+  %raw = load i32, ptr addrspace(1) %flag, align 4
+  %again = icmp ne i32 %raw, 0
+  br label %loop
+
+loop:
+  %cursor = phi ptr addrspace(2) [ null, %entry ], [ %next, %loop ]
+  %next = getelementptr float, ptr addrspace(2) %cursor, i64 1
+  %isnull = icmp eq ptr addrspace(2) %cursor, null
+  %encoded = zext i1 %isnull to i32
+  store i32 %encoded, ptr addrspace(1) %flag, align 4
+  br i1 %again, label %loop, label %done
+
+done:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @walk, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"flag"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_null_rooted_pointer_recurrence_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = emit_vulkan_spirv(ll).expect("emit null-rooted pointer recurrence");
+    let module = load_bytes(&spv).expect("load spv");
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| {
+            (inst.class.opcode == Op::TypePointer)
+                .then_some(inst.result_id)
+                .flatten()
+        })
+        .collect::<HashSet<_>>();
+    assert!(
+        module.all_inst_iter().all(|inst| {
+            inst.class.opcode != Op::Phi
+                || !inst
+                    .result_type
+                    .is_some_and(|ty| pointer_types.contains(&ty))
+        }),
+        "null-rooted recurrence must not emit a logical pointer OpPhi"
+    );
+    assert!(
+        module.types_global_values.iter().any(|inst| {
+            inst.class.opcode == Op::Undef
+                && inst
+                    .result_type
+                    .is_some_and(|ty| pointer_types.contains(&ty))
+        }),
+        "null-rooted recurrence must use a correctly typed global pointer payload"
+    );
+    let out = passes::transform(
+        module,
+        Stage::Kernel,
+        None,
+        None,
+        meta::parse_air_kernel_meta(ll).as_ref(),
+        meta::entry_name(ll, "kernel").as_deref(),
+    )
+    .expect("interface transform")
+    .assemble()
+    .iter()
+    .flat_map(|word| word.to_le_bytes())
+    .collect::<Vec<_>>();
+
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_kernel_reinterprets_metadata_ulong_field_as_uint2() {
     let ll = r#"
 source_filename = "case.metal"
@@ -71,8 +156,9 @@ attributes #0 = { nounwind }
 }
 
 #[test]
-fn native_bda_device_pointer_load_store_deref_lowers_to_physical() {
-    // BDA mode: a device pointer (`addrspace(1)`) LOADED from a buffer becomes its real 64-bit address.
+fn native_primary_device_pointer_load_store_deref_lowers_to_physical() {
+    // A device pointer (`addrspace(1)`) LOADED from a buffer selects BDA on the primary path and
+    // becomes its real 64-bit address.
     // The kernel loads `%p` from `%in`, STORES it into `%out` (a verbatim 8-byte copy), and
     // DEREFERENCES it (`%p[0]` as float). The store lowers to an Int(64) word write; the deref lowers
     // to `OpConvertUToPtr` of the loaded address to a PhysicalStorageBuffer pointer + an Aligned load.
@@ -81,6 +167,10 @@ fn native_bda_device_pointer_load_store_deref_lowers_to_physical() {
 define void @k(ptr addrspace(1) %out, ptr addrspace(1) %in) {
 entry:
   %p = load ptr addrspace(1), ptr addrspace(1) %in, align 8
+  %isnull = icmp eq ptr addrspace(1) %p, null
+  br i1 %isnull, label %done, label %write
+
+write:
   store ptr addrspace(1) %p, ptr addrspace(1) %out, align 8
   %wide = load i64, ptr addrspace(1) %out, align 8
   %narrow = trunc i64 %wide to i32
@@ -88,6 +178,9 @@ entry:
   %mixed_gep = getelementptr inbounds i8, ptr addrspace(1) %wide_gep, i32 %narrow
   %f = load float, ptr addrspace(1) %mixed_gep, align 4
   store float %f, ptr addrspace(1) %out, align 4
+  br label %done
+
+done:
   ret void
 }
 
@@ -98,7 +191,7 @@ entry:
 !3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"out"}
 !4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"in"}
 "#;
-    let spv = crate::native::emit_vulkan_spirv_all_buffers_raw_bda(ll).expect("bda emit");
+    let spv = emit_vulkan_spirv(ll).expect("primary emit");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(
         asm.contains("PhysicalStorageBuffer64"),
@@ -113,9 +206,731 @@ entry:
         "expected a device-address deref:\n{asm}"
     );
     assert!(
+        asm.contains("OpIEqual"),
+        "loaded device-address nullness must be constructed from its integer value:\n{asm}"
+    );
+    assert!(
         asm.contains("OpSConvert"),
         "mixed-width GEP composition must sign-extend its i32 offset:\n{asm}"
     );
+}
+
+#[test]
+fn native_device_address_model_distinguishes_memory_from_opaque_handles() {
+    let memory = r#"
+define void @k(ptr addrspace(1) %out, ptr addrspace(1) %in) {
+entry:
+  %p = load ptr addrspace(1), ptr addrspace(1) %in, align 8
+  %v = load i32, ptr addrspace(1) %p, align 4
+  store i32 %v, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+"#;
+    let opaque = r#"
+define i32 @k(i64 %handle) {
+entry:
+  %texture = inttoptr i64 %handle to ptr addrspace(1)
+  %width = call i32 @air.get_width_texture_2d(ptr addrspace(1) %texture, i32 0)
+  ret i32 %width
+}
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+"#;
+    let memory = crate::native::ir::LlModule::parse(memory).expect("parse memory pointer");
+    let opaque = crate::native::ir::LlModule::parse(opaque).expect("parse opaque handle");
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &memory
+    ));
+    assert!(!crate::native::emit_tiers::requires_device_address_model(
+        &opaque
+    ));
+}
+
+#[test]
+fn native_device_buffer_array_stores_materialized_direct_address_in_local_aggregate() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%ArrayRef = type { ptr, i64 }
+%State = type { %ArrayRef }
+@next_buffer = internal addrspace(2) global i32 1
+
+define void @k(ptr %buffers) {
+entry:
+  %buffer = load ptr addrspace(1), ptr %buffers, align 8
+  store i32 7, ptr addrspace(1) %buffer, align 4
+  call void @scan(ptr %buffers)
+  ret void
+}
+
+define internal void @scan(ptr %buffers) {
+entry:
+  %state = alloca %State, align 8
+  call void @init(ptr %state, ptr %buffers)
+  ret void
+}
+
+define internal void @init(ptr %state, ptr %buffers) {
+entry:
+  %field = getelementptr inbounds %State, ptr %state, i64 0, i32 0, i32 0
+  store ptr %buffers, ptr %field, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+"#;
+    let parsed = crate::native::ir::LlModule::parse(ll).expect("parse device-buffer-array AIR");
+    assert!(
+        crate::native::emit_tiers::requires_device_address_model(&parsed),
+        "device-buffer-array pointer loads require physical addresses"
+    );
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_device_buffer_array_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let module = load_bytes(&spv).expect("load translated module");
+    let address_table = module
+        .annotations
+        .iter()
+        .find_map(|instruction| match instruction.operands.as_slice() {
+            [
+                Operand::IdRef(id),
+                Operand::Decoration(Decoration::Binding),
+                Operand::LiteralBit32(640),
+            ] => Some(*id),
+            _ => None,
+        })
+        .expect("buffer-address table binding");
+    let constants = module
+        .types_global_values
+        .iter()
+        .filter_map(
+            |instruction| match (instruction.result_id, instruction.operands.as_slice()) {
+                (Some(id), [Operand::LiteralBit32(value)])
+                    if instruction.class.opcode == Op::Constant =>
+                {
+                    Some((id, *value))
+                }
+                _ => None,
+            },
+        )
+        .collect::<HashMap<_, _>>();
+    let slot_zero_pointers = module
+        .all_inst_iter()
+        .filter_map(|instruction| {
+            let operands = instruction.operands.as_slice();
+            (matches!(
+                instruction.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain
+            ) && operands.first() == Some(&Operand::IdRef(address_table))
+                && operands.len() == 4
+                && operands[1..3].iter().all(
+                    |operand| matches!(operand, Operand::IdRef(id) if constants.get(id) == Some(&0)),
+                )
+                && matches!(operands[3], Operand::IdRef(id) if constants.get(&id).is_some_and(|value| *value <= 1)))
+            .then_some(instruction.result_id)
+            .flatten()
+        })
+        .collect::<HashSet<_>>();
+    let address_words = module
+        .all_inst_iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::Load
+                && matches!(instruction.operands.first(), Some(Operand::IdRef(pointer)) if slot_zero_pointers.contains(pointer)))
+            .then_some(instruction.result_id)
+            .flatten()
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(address_words.len(), 2, "{}", disassemble(&spv).unwrap());
+
+    let mut address_dependents = address_words;
+    loop {
+        let newly_dependent = module
+            .all_inst_iter()
+            .filter_map(|instruction| {
+                let result = instruction.result_id?;
+                (!address_dependents.contains(&result)
+                    && instruction.operands.iter().any(
+                        |operand| matches!(operand, Operand::IdRef(id) if address_dependents.contains(id)),
+                    ))
+                .then_some(result)
+            })
+            .collect::<Vec<_>>();
+        if newly_dependent.is_empty() {
+            break;
+        }
+        address_dependents.extend(newly_dependent);
+    }
+    assert!(
+        module.all_inst_iter().any(|instruction| {
+            instruction.class.opcode == Op::Store
+                && matches!(instruction.operands.get(1), Some(Operand::IdRef(value)) if address_dependents.contains(value))
+        }),
+        "direct buffer address was not stored into the local aggregate:\n{}",
+        disassemble(&spv).unwrap()
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn native_device_buffer_array_keeps_direct_buffer_pointer_phi_network_modeled() {
+    // A device-buffer array selects the physical-address model for the module. The outer loop phi
+    // sees the inner loop phi as a forward SSA value. Emission order must not classify that forward
+    // reference as unmodeled: both phis have concrete direct-buffer roots, which the inlined entry
+    // can materialize from the address sidecar. This is the compact form of nested offset walkers
+    // used by NDArray kernels.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+@next_buffer = internal addrspace(2) global i32 1
+
+define void @k(ptr %buffers, ptr addrspace(1) %src, ptr addrspace(1) %dst, i1 %inner_again, i1 %outer_again) {
+entry:
+  %array_buffer = load ptr addrspace(1), ptr %buffers, align 8
+  store i32 9, ptr addrspace(1) %array_buffer, align 4
+  call void @copy_nested(ptr addrspace(1) %src, ptr addrspace(1) %dst, i1 %inner_again, i1 %outer_again)
+  ret void
+}
+
+define internal void @copy_nested(ptr addrspace(1) %src, ptr addrspace(1) %dst, i1 %inner_again, i1 %outer_again) {
+entry:
+  br label %outer
+
+outer:
+  %src_outer = phi ptr addrspace(1) [ %src, %entry ], [ %src_inner, %inner_exit ]
+  %dst_outer = phi ptr addrspace(1) [ %dst, %entry ], [ %dst_inner, %inner_exit ]
+  br label %inner
+
+inner:
+  %src_inner = phi ptr addrspace(1) [ %src_outer, %outer ], [ %src_next, %inner_body ]
+  %dst_inner = phi ptr addrspace(1) [ %dst_outer, %outer ], [ %dst_next, %inner_body ]
+  br i1 %inner_again, label %inner_body, label %inner_exit
+
+inner_body:
+  %src_next = getelementptr inbounds i16, ptr addrspace(1) %src_inner, i64 1
+  %dst_next = getelementptr inbounds i16, ptr addrspace(1) %dst_inner, i64 1
+  br label %inner
+
+inner_exit:
+  %value = load i16, ptr addrspace(1) %src_inner, align 2
+  store i16 %value, ptr addrspace(1) %dst_inner, align 2
+  br i1 %outer_again, label %outer, label %exit
+
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 2, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"ushort", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 2, !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"ushort", !"air.arg_name", !"dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_bda_direct_pointer_phi_network_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load translated module");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(
+        asm.contains("Binding 640"),
+        "direct-buffer addresses were pruned:\n{asm}"
+    );
+    let i16_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypeInt
+                && matches!(
+                    instruction.operands.first(),
+                    Some(Operand::LiteralBit32(16))
+                ))
+            .then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    let loaded_i16 = module
+        .all_inst_iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::Load
+                && instruction
+                    .result_type
+                    .is_some_and(|ty| i16_types.contains(&ty)))
+            .then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert!(
+        !loaded_i16.is_empty(),
+        "direct source load was replaced with zero:\n{asm}"
+    );
+    assert!(
+        module.all_inst_iter().any(|instruction| {
+            instruction.class.opcode == Op::Store
+                && matches!(instruction.operands.get(1), Some(Operand::IdRef(value)) if loaded_i16.contains(value))
+        }),
+        "direct destination store was discarded:\n{asm}"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_device_buffer_array_lowers_null_logical_pointer_aggregate_fields() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%ArrayRef = type { ptr, i64 }
+%State = type { %ArrayRef, %ArrayRef }
+
+define void @k(ptr %buffers) {
+entry:
+  %state = alloca %State, align 8
+  %field = getelementptr inbounds %State, ptr %state, i64 0, i32 0, i32 0
+  store ptr %buffers, ptr %field, align 8
+  %secondary = insertvalue %State poison, ptr null, 1, 0
+  call void @write(ptr %state)
+  ret void
+}
+
+define internal void @write(ptr %state) {
+entry:
+  %opaque = bitcast ptr %state to ptr
+  %table = load ptr, ptr %opaque, align 8
+  %buffer = load ptr addrspace(1), ptr %table, align 8
+  store i32 7, ptr addrspace(1) %buffer, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_device_buffer_array_null_aggregate_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let module = load_bytes(&spv).expect("load translated module");
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| (inst.class.opcode == Op::TypePointer).then_some(inst.result_id?))
+        .collect::<HashSet<_>>();
+    assert!(
+        !module.types_global_values.iter().any(|inst| {
+            inst.class.opcode == Op::ConstantNull
+                && inst
+                    .result_type
+                    .is_some_and(|ty| pointer_types.contains(&ty))
+        }),
+        "{}",
+        disassemble(&spv).unwrap()
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_device_buffer_array_reinterprets_aggregate_prefix() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%ArrayRef = type { ptr, i64 }
+%Texture = type { ptr addrspace(1) }
+%InOut = type { %ArrayRef, %ArrayRef, %ArrayRef, %Texture }
+%State = type { %InOut, i32 }
+@next_buffer = internal addrspace(2) global i32 1
+
+define void @k(ptr %buffers) {
+entry:
+  %aggregate = insertvalue %InOut poison, ptr %buffers, 0, 0
+  %table = extractvalue %InOut %aggregate, 0, 0
+  %slot = getelementptr inbounds i64, ptr %table, i64 1
+  %buffer = load ptr addrspace(1), ptr %slot, align 8
+  %element = getelementptr inbounds i32, ptr addrspace(1) %buffer, i64 0
+  store i32 7, ptr addrspace(1) %element, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_device_buffer_array_nested_callback_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let module = load_bytes(&spv).expect("load translated module");
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer).then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert!(module.types_global_values.iter().all(|instruction| {
+        instruction.class.opcode != Op::TypePointer
+            || !matches!(
+                instruction.operands.as_slice(),
+                [
+                    Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
+                    Operand::IdRef(pointee)
+                ] if pointer_types.contains(pointee)
+            )
+    }), "device pointer-table slots must be addressed as 64-bit payloads, not as physical pointers to logical pointers:\n{}", disassemble(&spv).unwrap());
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_device_address_model_follows_generic_callback_table_cursor() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+@next_buffer = internal addrspace(2) global i32 1
+
+define void @k(ptr %buffers) {
+entry:
+  call void @callback(ptr %buffers)
+  ret void
+}
+
+define internal void @callback(ptr %state) {
+entry:
+  %alias = bitcast ptr %state to ptr
+  %table = load ptr, ptr %alias, align 8
+  %slot = getelementptr inbounds ptr addrspace(1), ptr %table, i64 1
+  %slot_alias = bitcast ptr %slot to ptr
+  %buffer = load ptr addrspace(1), ptr %slot_alias, align 8
+  store i32 7, ptr addrspace(1) %buffer, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+"#;
+    let parsed = crate::native::ir::LlModule::parse(ll).expect("parse callback table cursor");
+    assert!(
+        crate::native::emit_tiers::requires_device_address_model(&parsed),
+        "a generic callback cursor over device-pointer elements requires physical addresses"
+    );
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_generic_callback_table_cursor_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_device_pointer_round_trips_through_direct_pointer_alloca() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+@next_buffer = internal addrspace(2) global i32 1
+
+define void @k(ptr %buffers) {
+entry:
+  %table = load ptr, ptr %buffers, align 8
+  %slot = getelementptr inbounds ptr addrspace(1), ptr %table, i64 0
+  %slot_alias = bitcast ptr %slot to ptr
+  %buffer = load ptr addrspace(1), ptr %slot_alias, align 8
+  %cursor = alloca ptr addrspace(1), align 8
+  store ptr addrspace(1) %buffer, ptr %cursor, align 8
+  %current = load ptr addrspace(1), ptr %cursor, align 8
+  %next = getelementptr inbounds i32, ptr addrspace(1) %current, i64 1
+  store ptr addrspace(1) %next, ptr %cursor, align 8
+  %destination = load ptr addrspace(1), ptr %cursor, align 8
+  store i32 7, ptr addrspace(1) %destination, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_direct_pointer_alloca_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_device_address_model_follows_argument_buffer_pointer_into_helper() {
+    let ll = r#"
+%Args = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args) {
+entry:
+  %field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0
+  %buffer = load ptr addrspace(1), ptr addrspace(2) %field, align 8
+  call void @atomic_helper(ptr addrspace(1) %buffer)
+  ret void
+}
+
+define internal void @atomic_helper(ptr addrspace(1) %buffer) {
+entry:
+  %element = getelementptr inbounds i32, ptr addrspace(1) %buffer, i64 1
+  %old = call i32 @air.atomic.global.min.s.i32(ptr addrspace(1) %element, i32 7, i32 0, i32 2, i1 true)
+  ret void
+}
+
+declare i32 @air.atomic.global.min.s.i32(ptr addrspace(1), i32, i32, i32, i1)
+"#;
+    let parsed = crate::native::ir::LlModule::parse(ll).expect("parse argument-buffer pointer");
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &parsed
+    ));
+}
+
+#[test]
+fn native_device_address_model_follows_direct_argument_buffer_pointer_dereference() {
+    let ll = r#"
+%Args = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args, i64 %index) {
+entry:
+  %field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0
+  %buffer = load ptr addrspace(1), ptr addrspace(2) %field, align 8
+  %element = getelementptr inbounds [4 x i8], ptr addrspace(1) %buffer, i64 %index, i64 3
+  %value = load i8, ptr addrspace(1) %element, align 1
+  ret void
+}
+"#;
+    let parsed = crate::native::ir::LlModule::parse(ll).expect("parse argument-buffer pointer");
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &parsed
+    ));
+}
+
+#[test]
+fn native_device_address_model_keeps_mixed_argument_buffer_handles_opaque() {
+    let ll = r#"
+%Args = type { ptr addrspace(1), ptr addrspace(1) }
+
+define void @k(ptr addrspace(2) %args, <2 x i32> %coord) {
+entry:
+  %texture_field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 0
+  %texture = load ptr addrspace(1), ptr addrspace(2) %texture_field, align 8
+  call void @write(ptr addrspace(1) %texture, <2 x i32> %coord)
+  %buffer_field = getelementptr inbounds %Args, ptr addrspace(2) %args, i64 0, i32 1
+  %buffer = load ptr addrspace(1), ptr addrspace(2) %buffer_field, align 8
+  %element = getelementptr inbounds i32, ptr addrspace(1) %buffer, i64 1
+  store i32 7, ptr addrspace(1) %element, align 4
+  ret void
+}
+
+define internal void @write(ptr addrspace(1) %texture, <2 x i32> %coord) {
+entry:
+  call void @air.gather_depth_probe(ptr addrspace(1) %texture)
+  ret void
+}
+
+declare void @air.gather_depth_probe(ptr addrspace(1))
+"#;
+    let parsed = crate::native::ir::LlModule::parse(ll).expect("parse mixed argument buffer");
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &parsed
+    ));
+
+    let opaque =
+        crate::native::emitter::functions::opaque_resource_pointer_values_by_function(&parsed);
+    let kernel = opaque.get("k").expect("kernel pointer classification");
+    assert!(kernel.contains("%texture"), "{opaque:?}");
+    assert!(!kernel.contains("%buffer"));
+    assert!(!kernel.contains("%element"));
+}
+
+#[test]
+fn native_device_address_model_constructs_dynamic_raw_helper_cursor_physically() {
+    let ll = r#"
+%Container = type { i32 }
+
+define void @k(ptr addrspace(1) %buffer, i64 %index) {
+entry:
+  %element = getelementptr inbounds %Container, ptr addrspace(1) %buffer, i64 %index, i32 0
+  call void @atomic_helper(ptr addrspace(1) %element)
+  ret void
+}
+
+define internal void @atomic_helper(ptr addrspace(1) %element) {
+entry:
+  %old = call i32 @air.atomic.global.min.s.i32(ptr addrspace(1) %element, i32 7, i32 0, i32 2, i1 true)
+  ret void
+}
+
+declare i32 @air.atomic.global.min.s.i32(ptr addrspace(1), i32, i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar"}
+!4 = !{i32 1, !"air.thread_position_in_grid"}
+"#;
+    let metadata = crate::meta::parse_air_kernel_meta(ll).expect("parse metadata");
+    let mut parsed =
+        crate::native::ir::LlModule::parse_with_stage_meta(ll, Some(&metadata), Some("k"))
+            .expect("parse dynamic raw helper cursor");
+    parsed
+        .raw_buffer_params
+        .insert(("k".to_string(), "%buffer".to_string()));
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &parsed
+    ));
+}
+
+#[test]
+fn native_device_address_model_constructs_integer_atomic_float_view_physically() {
+    let ll = r#"
+define void @k(ptr addrspace(1) %buffer, i64 %index) {
+entry:
+  %element = getelementptr inbounds <3 x float>, ptr addrspace(1) %buffer, i64 %index, i64 1
+  %integer_view = bitcast ptr addrspace(1) %element to ptr addrspace(1)
+  %old = call i32 @air.atomic.global.min.s.i32(ptr addrspace(1) %integer_view, i32 7, i32 0, i32 2, i1 true)
+  ret void
+}
+
+declare i32 @air.atomic.global.min.s.i32(ptr addrspace(1), i32, i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float3"}
+!4 = !{i32 1, !"air.thread_position_in_grid"}
+"#;
+    let metadata = crate::meta::parse_air_kernel_meta(ll).expect("parse metadata");
+    let parsed = crate::native::ir::LlModule::parse_with_stage_meta(ll, Some(&metadata), Some("k"))
+        .expect("parse integer atomic float view");
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &parsed
+    ));
+}
+
+#[test]
+fn native_device_address_model_follows_float_atomic_view_into_helper() {
+    let ll = r#"
+define internal void @atomic_bits(ptr addrspace(1) %slot) {
+entry:
+  %integer_view = bitcast ptr addrspace(1) %slot to ptr addrspace(1)
+  %old = call i32 @air.atomic.global.load.i32(ptr addrspace(1) %integer_view, i32 0, i32 2, i1 true)
+  ret void
+}
+
+define void @k(ptr addrspace(1) %floats) {
+entry:
+  call void @atomic_bits(ptr addrspace(1) %floats)
+  ret void
+}
+
+declare i32 @air.atomic.global.load.i32(ptr addrspace(1), i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"floats"}
+"#;
+    let metadata = crate::meta::parse_air_kernel_meta(ll).expect("parse metadata");
+    let parsed = crate::native::ir::LlModule::parse_with_stage_meta(ll, Some(&metadata), Some("k"))
+        .expect("parse helper integer atomic float view");
+    assert!(crate::native::emit_tiers::requires_device_address_model(
+        &parsed
+    ));
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_helper_atomic_float_address_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpAtomicLoad"), "{asm}");
+    assert!(!asm.contains("OpBitcast %_ptr_StorageBuffer"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_bda_helper_constructs_function_constant_buffer_address_from_table() {
+    let ll = r#"
+@enabled = internal unnamed_addr addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
+
+define void @k(ptr addrspace(1) %optional, ptr addrspace(1) %floats) {
+entry:
+  call void @load_byte(ptr addrspace(1) %optional, ptr addrspace(1) %floats, i1 true)
+  %float_slot = getelementptr inbounds float, ptr addrspace(1) %floats, i64 0
+  %integer_view = bitcast ptr addrspace(1) %float_slot to ptr addrspace(1)
+  %old = call i32 @air.atomic.global.min.s.i32(ptr addrspace(1) %integer_view, i32 7, i32 0, i32 2, i1 true)
+  ret void
+}
+
+define internal void @load_byte(ptr addrspace(1) %buffer, ptr addrspace(1) %output, i1 %read) {
+entry:
+  br i1 %read, label %load, label %done
+load:
+  %field = getelementptr inbounds i8, ptr addrspace(1) %buffer, i64 1
+  %value = load i8, ptr addrspace(1) %field, align 1
+  store i8 %value, ptr addrspace(1) %output, align 1
+  br label %done
+done:
+  ret void
+}
+
+declare i32 @air.atomic.global.min.s.i32(ptr addrspace(1), i32, i32, i32, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.function_constant", !5, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"float"}
+!5 = !{ptr addrspace(2) @enabled, !"bool", !"enabled"}
+"#;
+    let spv =
+        crate::translate_native_no_retry(ll, Stage::Kernel).expect("construct primary BDA module");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("Binding 640"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_bda_fc_buffer_address_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        tools::spirv_val_bytes(&spv, &tmp).expect("primary spirv-val");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
 }
 
 #[test]
@@ -167,6 +982,283 @@ entry:
         !asm.contains("OpConstantNull %_ptr_UniformConstant_uchar"),
         "a provably-null opaque aggregate field must use integer zero in BDA mode:\n{asm}"
     );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_bda_pointer_phi_materializes_cross_root_select_address() {
+    let ll = r#"
+define internal float @read_selected(ptr addrspace(1) %left, ptr addrspace(1) %right, ptr addrspace(1) %table, i1 %choose_left, i1 %direct) {
+entry:
+  br i1 %direct, label %selected_block, label %loaded_block
+
+selected_block:
+  %selected = select i1 %choose_left, ptr addrspace(1) %left, ptr addrspace(1) %right
+  br label %merge
+
+loaded_block:
+  %address = load i64, ptr addrspace(1) %table, align 8
+  %loaded = inttoptr i64 %address to ptr addrspace(1)
+  br label %merge
+
+merge:
+  %pointer = phi ptr addrspace(1) [ %selected, %selected_block ], [ %loaded, %loaded_block ]
+  %value = load float, ptr addrspace(1) %pointer, align 4
+  ret float %value
+}
+
+define void @k(ptr addrspace(1) %left, ptr addrspace(1) %right, ptr addrspace(1) %table, ptr addrspace(1) %out, ptr addrspace(1) %choose_left_input, ptr addrspace(1) %direct_input) {
+entry:
+  %choose_left_word = load i32, ptr addrspace(1) %choose_left_input, align 4
+  %choose_left = icmp ne i32 %choose_left_word, 0
+  %direct_word = load i32, ptr addrspace(1) %direct_input, align 4
+  %direct = icmp ne i32 %direct_word, 0
+  %value = call float @read_selected(ptr addrspace(1) %left, ptr addrspace(1) %right, ptr addrspace(1) %table, i1 %choose_left, i1 %direct)
+  store float %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7, !8}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"left"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"right"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"table"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"choose_left_input"}
+!8 = !{i32 5, !"air.buffer", !"air.location_index", i32 5, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"direct_input"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_cross_root_select_phi_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(asm.contains("OpPhi"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_bda_pointer_phi_materializes_forward_gep_addresses_on_edges() {
+    let ll = r#"
+define float @k(ptr addrspace(1) %root) {
+entry:
+  %loaded_pointer = load ptr addrspace(1), ptr addrspace(1) %root, align 8
+  %cond = icmp eq ptr addrspace(1) %loaded_pointer, null
+  br i1 %cond, label %left, label %right
+
+left:
+  %left_alias = bitcast ptr addrspace(1) %loaded_pointer to ptr addrspace(1)
+  %left_pointer = getelementptr inbounds float, ptr addrspace(1) %left_alias, i64 1
+  br label %merge
+
+right:
+  %right_alias = bitcast ptr addrspace(1) %loaded_pointer to ptr addrspace(1)
+  %right_pointer = getelementptr inbounds float, ptr addrspace(1) %right_alias, i64 2
+  br label %merge
+
+merge:
+  %pointer = phi ptr addrspace(1) [ %left_pointer, %left ], [ %right_pointer, %right ]
+  %value = load float, ptr addrspace(1) %pointer, align 4
+  ret float %value
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"root"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_forward_gep_address_phi_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpIAdd"), "{asm}");
+    assert!(asm.contains("OpPhi"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_bda_physical_and_direct_pointer_select_replays_loaded_values() {
+    let ll = r#"
+define internal <4 x float> @read_selected(ptr addrspace(1) %table, ptr addrspace(1) %zero, i1 %take_source) {
+entry:
+  %address = load i64, ptr addrspace(1) %table, align 8
+  %physical = inttoptr i64 %address to ptr addrspace(1)
+  %selected = select i1 %take_source, ptr addrspace(1) %physical, ptr addrspace(1) %zero
+  %value = load <4 x float>, ptr addrspace(1) %selected, align 16
+  ret <4 x float> %value
+}
+
+define void @k(ptr addrspace(1) %table, ptr addrspace(1) %zero, ptr addrspace(1) %out, <3 x i32> %gid) {
+entry:
+  %x = extractelement <3 x i32> %gid, i64 0
+  %take_source = icmp eq i32 %x, 0
+  %value = call <4 x float> @read_selected(ptr addrspace(1) %table, ptr addrspace(1) %zero, i1 %take_source)
+  store <4 x float> %value, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"table"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"zero"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_physical_direct_select_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(
+        !asm.lines()
+            .any(|line| line.contains("OpSelect") && line.contains("_ptr_")),
+        "mixed-storage selection must be replayed in the value domain:\n{asm}"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_loop_pointer_select_replays_loaded_values() {
+    let ll = r#"
+@optional_raw = internal addrspace(2) global i8 0, align 1
+
+define internal <4 x i16> @read_selected(ptr addrspace(1) %source, ptr addrspace(1) %raw, i1 %choose, i1 %again) {
+entry:
+  %raw_byte = load i8, ptr addrspace(1) %raw, align 1
+  br label %loop
+
+loop:
+  %typed_pointer = phi ptr addrspace(1) [ %source, %entry ], [ %next, %body ]
+  %opaque_alias = bitcast ptr addrspace(1) %typed_pointer to ptr addrspace(1)
+  %selected = select i1 %choose, ptr addrspace(1) %opaque_alias, ptr addrspace(1) %raw
+  %value = load <4 x i16>, ptr addrspace(1) %selected, align 8
+  br i1 %again, label %body, label %exit
+
+body:
+  %next = getelementptr inbounds i16, ptr addrspace(1) %typed_pointer, i64 4
+  br label %loop
+
+exit:
+  ret <4 x i16> %value
+}
+
+define void @k(ptr addrspace(1) %source, ptr addrspace(1) %raw, ptr addrspace(1) %out, i1 %choose, i1 %again) {
+entry:
+  %value = call <4 x i16> @read_selected(ptr addrspace(1) %source, ptr addrspace(1) %raw, i1 %choose, i1 %again)
+  store <4 x i16> %value, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ushort4", !"air.arg_name", !"source"}
+!4 = !{i32 1, !"air.function_constant", !8, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"raw"}
+!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ushort4", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.function_constant", !"air.arg_type_name", !"bool", !"air.arg_name", !"choose"}
+!7 = !{i32 4, !"air.function_constant", !"air.arg_type_name", !"bool", !"air.arg_name", !"again"}
+!8 = !{ptr addrspace(2) @optional_raw, !"bool", !"has_raw"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_incompatible_opaque_select_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp).expect("BDA translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(
+        !asm.lines()
+            .any(|line| line.contains("OpSelect") && line.contains("_ptr_")),
+        "incompatible opaque-pointer selection must be replayed in the value domain:\n{asm}"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_construct_tree_preserves_struct_members_in_bda_pointer_state() {
+    let ll = r#"
+%Pair = type { float, float }
+
+define void @k(ptr addrspace(1) %root, ptr addrspace(1) %out, i1 %direct, i1 %again) {
+entry:
+  %local = alloca %Pair, align 4
+  %field = getelementptr inbounds %Pair, ptr %local, i64 0, i32 1
+  br i1 %direct, label %sibling, label %walk
+
+walk:
+  %cursor = phi ptr addrspace(1) [ %root, %entry ], [ %child, %body ]
+  br label %body
+
+body:
+  %child_addr = load i64, ptr addrspace(1) %cursor, align 8
+  %child = inttoptr i64 %child_addr to ptr addrspace(1)
+  br i1 %again, label %walk, label %sibling
+
+sibling:
+  store float 2.0, ptr %field, align 4
+  store i32 1, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"root"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_bda_construct_tree_struct_member_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_bda_probe(ll, Stage::Kernel, &tmp)
+        .expect("construct-tree BDA translation");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    // The constructed cursor is carried as an integer address rather than a logical-pointer phi.
+    // Both copies of the local member access must retain member index 1, while the device cursor is
+    // reconstructed in the physical address domain.
+    assert!(asm.matches("OpInBoundsAccessChain").count() >= 2, "{asm}");
+    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+    let module = load_bytes(&spv).expect("load constructed BDA module");
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| {
+            (inst.class.opcode == Op::TypePointer)
+                .then_some(inst.result_id)
+                .flatten()
+        })
+        .collect::<HashSet<_>>();
+    assert!(module.all_inst_iter().all(|inst| {
+        inst.class.opcode != Op::Phi
+            || !inst
+                .result_type
+                .is_some_and(|ty| pointer_types.contains(&ty))
+    }));
     tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     let _ = std::fs::remove_dir_all(tmp);
 }
@@ -263,7 +1355,7 @@ declare extern_weak i64 @mtl.force_not_checked.load.i64.p1(ptr addrspace(1)) sec
 #[test]
 fn native_direct_buffer_pointer_store_loads_runtime_address_sidecar() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out, ptr addrspace(1) %source) {
 entry:
@@ -285,6 +1377,8 @@ entry:
         kern.as_ref(),
         entry_name.as_deref(),
         kern.as_ref().map(|meta| &meta.buffer_layouts),
+        &HashSet::new(),
+        &HashSet::new(),
     )
     .expect("emit raw-buffer tier with typed sidecar");
     let mut address_words = emitted
@@ -362,9 +1456,53 @@ declare ptr addrspace(1) @air.get_data_pointer_instance_acceleration_structure(p
 }
 
 #[test]
+fn native_bda_loads_device_address_from_local_aggregate() {
+    let ll = r#"
+%AddressBox = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(1) %out, ptr addrspace(1) %source) {
+entry:
+  %incoming = load ptr addrspace(1), ptr addrspace(1) %source, align 8
+  %local = alloca %AddressBox, align 8
+  %field = getelementptr inbounds %AddressBox, ptr %local, i32 0, i32 0
+  store ptr addrspace(1) %incoming, ptr %field, align 8
+  %address = load ptr addrspace(1), ptr %field, align 8
+  %value_ptr = getelementptr inbounds i32, ptr addrspace(1) %address, i64 0
+  %value = load i32, ptr addrspace(1) %value_ptr, align 4
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 8, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"source"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_bda_local_aggregate_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_acceleration_structure_shadow_lowers_count_child_and_payload_store() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %as, ptr addrspace(1) %out, i32 %idx) {
 entry:
@@ -414,7 +1552,7 @@ declare ptr addrspace(1) @air.get_primitive_acceleration_structure_instance_acce
 #[test]
 fn native_unused_primitive_acceleration_structure_needs_no_vulkan_binding() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %as, ptr addrspace(1) %out) {
 entry:
@@ -577,7 +1715,7 @@ declare { i32, float, i32, i32, ptr addrspace(1), i32, i32, <3 x float>, <3 x fl
 #[test]
 fn native_ignores_llvm_metadata_root_globals() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @llvm.used = appending global [1 x ptr] [ptr @helper], section "llvm.metadata"
 @llvm.compiler.used = appending global [1 x ptr] [ptr @helper], section "llvm.metadata"
 
@@ -629,7 +1767,7 @@ entry:
 #[test]
 fn native_memcpy_to_typed_alloca_first_field_uses_copy_memory() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Light = type { <4 x float>, <4 x float>, <3 x float> }
 %struct.Params = type { %struct.Light, i32 }
 
@@ -673,7 +1811,7 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 #[test]
 fn native_memcpy_between_named_prefix_wrappers_lowers_both_directions() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Frame = type { %union.FrameUnion }
 %union.FrameUnion = type { %struct.FrameInner }
 %struct.FrameInner = type { <3 x float>, <3 x float>, <3 x float> }
@@ -720,7 +1858,7 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 #[test]
 fn native_memcpy_from_named_wrapper_to_bare_array_lowers_by_elements() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Matrix = type { [3 x <3 x float>] }
 
 define void @main() {
@@ -762,9 +1900,58 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 }
 
 #[test]
+fn native_memcpy_source_first_field_targets_destination_array_first_element() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%struct.Matrix = type { [4 x <4 x float>] }
+%struct.Input = type { %struct.Matrix, %struct.Matrix }
+
+@source = internal addrspace(2) constant %struct.Input zeroinitializer, align 16
+@element_source = internal addrspace(2) constant %struct.Matrix zeroinitializer, align 16
+
+define void @main() {
+entry:
+  %matrices = alloca [2 x %struct.Matrix], align 16
+  %dst = bitcast ptr %matrices to ptr
+  call void @llvm.memcpy.p0.p2.i64(ptr align 16 dereferenceable(64) %dst, ptr addrspace(2) align 16 dereferenceable(64) @source, i64 64, i1 false)
+  %direct_matrices = alloca [2 x %struct.Matrix], align 16
+  %direct_dst = bitcast ptr %direct_matrices to ptr
+  call void @llvm.memcpy.p0.p2.i64(ptr align 16 dereferenceable(64) %direct_dst, ptr addrspace(2) align 16 dereferenceable(64) @element_source, i64 64, i1 false)
+  ret void
+}
+
+declare void @llvm.memcpy.p0.p2.i64(ptr, ptr addrspace(2), i64, i1)
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_array_element_memcpy_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect("interface transform")
+        .assemble()
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("OpCopyMemory"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    assert!(!asm.contains("llvm.memcpy"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_memcpy_from_opaque_byval_array_preserves_explicit_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Wrapper = type { [3 x i64] }
 
 define void @main(ptr readonly byval([3 x i64]) %src) {
@@ -806,7 +1993,7 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 #[test]
 fn native_memcpy_struct_prefix_skips_trailing_padding_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Aggregate = type { <4 x float>, i32, float, [4 x i8] }
 
 define void @main() {
@@ -849,7 +2036,7 @@ declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)
 #[test]
 fn native_raw_buffer_memcpy_preserves_byte_offsets() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @main(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
 entry:
@@ -892,7 +2079,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 #[test]
 fn native_raw_buffer_zero_memset_clears_entire_byte_range() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Counter = type { i32, [12 x i8] }
 
@@ -936,7 +2123,7 @@ declare void @llvm.memset.p1.i64(ptr addrspace(1), i8, i64, i1)
 #[test]
 fn native_raw_buffer_memcpy_preserves_partial_byte_range() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Particle = type { [3 x float], half, half, [3 x float], half, i16, float, half, half }
 
@@ -1001,7 +2188,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 #[test]
 fn native_typed_constant_memcpy_to_dynamic_raw_buffer_preserves_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %struct.Params = type { [4 x float] }
 
@@ -1065,7 +2252,7 @@ declare void @llvm.memcpy.p1.p2.i64(ptr addrspace(1), ptr addrspace(2), i64, i1)
 #[test]
 fn native_metadata_struct_memcpy_to_private_alloca_uses_copy_memory() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Eyes = type { [4 x <2 x float>], [4 x <2 x float>], i32 }
 
@@ -1109,7 +2296,7 @@ declare void @llvm.memcpy.p0.p2.i64(ptr, ptr addrspace(2), i64, i1)
 #[test]
 fn native_metadata_struct_memcpy_with_trailing_padding_copies_fields() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Matrix = type { [4 x <4 x float>] }
 %Agg = type <{ %Matrix, <4 x float>, i32, float, float, [4 x i8] }>
@@ -1161,7 +2348,7 @@ declare void @llvm.memcpy.p0.p2.i64(ptr, ptr addrspace(2), i64, i1)
 #[test]
 fn native_raw_metadata_memcpy_through_private_vector_struct_preserves_padding() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Corner = type { <2 x float>, float }
 
@@ -1230,7 +2417,7 @@ declare void @llvm.memcpy.p1.p0.i64(ptr addrspace(1), ptr, i64, i1)
 #[test]
 fn native_record_array_metadata_gep_remaps_padding_fields() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Constants = type <{ i32, i32, [8 x i8], <2 x i32>, i8, [3 x i8], i32 }>
 
@@ -1260,6 +2447,13 @@ entry:
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
+    let kern = meta::parse_air_kernel_meta(ll);
+    let ir = super::super::ir::LlModule::parse_with_stage_meta(ll, kern.as_ref(), Some("main"))
+        .expect("parse typed IR");
+    assert!(
+        !ir.entry_param_requires_raw_layout(Some("main"), 0),
+        "equal-extent source structs must retain ordinal remapping"
+    );
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     let uint_ty = uint32_type_id(&asm);
@@ -1277,7 +2471,7 @@ entry:
 #[test]
 fn native_padded_struct_memcpy_destination_becomes_raw() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %BBox = type { <3 x float>, <3 x float> }
 
 define void @copy(i32 %tid, ptr addrspace(2) %index, ptr addrspace(1) %dst, ptr addrspace(1) %src) {
@@ -1335,7 +2529,7 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 #[test]
 fn native_raw_buffer_vector_i32_store_splits_to_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %buf) {
 entry:
@@ -1383,7 +2577,7 @@ entry:
 #[test]
 fn native_direct_wide_vector_buffer_store_uses_aggregate_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -1466,7 +2660,7 @@ entry:
 #[test]
 fn native_workgroup_global_array_scalar_store_uses_first_element() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @counts = internal unnamed_addr addrspace(3) global [33 x i16] undef, align 2
 
@@ -1572,7 +2766,7 @@ entry:
 #[test]
 fn native_workgroup_global_array_vector_store_uses_first_element() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 @faces = internal unnamed_addr addrspace(3) global [8 x <4 x float>] undef, align 16
 
@@ -1678,7 +2872,7 @@ entry:
 #[test]
 fn native_memcpy_from_void_buffer_to_typed_struct_copies_raw_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Draw = type { i32, i32, i32, i32, i32 }
 
 define void @main(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
@@ -1733,9 +2927,131 @@ declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)
 }
 
 #[test]
+fn native_raw_memcpy_copies_one_element_prefix_of_typed_array() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Matrix = type { [4 x <4 x float>] }
+
+define void @main(ptr addrspace(1) %src, ptr addrspace(1) %out) {
+entry:
+  %dst = alloca [2 x %Matrix], align 16
+  %src_head = load i32, ptr addrspace(1) %src, align 4
+  %dst_raw = bitcast ptr %dst to ptr
+  %src_raw = bitcast ptr addrspace(1) %src to ptr addrspace(1)
+  call void @llvm.memcpy.p0.p1.i64(ptr align 16 %dst_raw, ptr addrspace(1) align 16 %src_raw, i64 64, i1 false)
+  %first = getelementptr inbounds [2 x %Matrix], ptr %dst, i64 0, i64 0, i32 0, i64 0
+  %value = load <4 x float>, ptr %first, align 16
+  store <4 x float> %value, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+declare void @llvm.memcpy.p0.p1.i64(ptr, ptr addrspace(1), i64, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"void"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float4"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_raw_to_typed_array_prefix_memcpy_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module =
+        load_bytes(super::super::emit_vulkan_spirv_all_buffers_raw(ll).expect("native raw emit"))
+            .expect("load native spv");
+    let spv = passes::transform(
+        module,
+        Stage::Kernel,
+        None,
+        None,
+        meta::parse_air_kernel_meta(ll).as_ref(),
+        meta::entry_name(ll, "kernel").as_deref(),
+    )
+    .expect("interface transform")
+    .assemble()
+    .iter()
+    .flat_map(|word| word.to_le_bytes())
+    .collect::<Vec<_>>();
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("OpCopyMemory"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_raw_to_typed_memcpy_constructs_subword_struct_fields() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Payload = type { float, float, i8, float, i32 }
+
+define void @main(ptr addrspace(1) %src, ptr addrspace(1) %out) {
+entry:
+  %tmp = alloca %Payload, align 4
+  %tmp_bytes = bitcast ptr %tmp to ptr
+  %src_bytes = bitcast ptr addrspace(1) %src to ptr addrspace(1)
+  call void @llvm.memcpy.p0.p1.i64(ptr %tmp_bytes, ptr addrspace(1) %src_bytes, i64 20, i1 false)
+  %byte_ptr = getelementptr inbounds %Payload, ptr %tmp, i64 0, i32 2
+  %byte = load i8, ptr %byte_ptr, align 1
+  store i8 %byte, ptr addrspace(1) %out, align 1
+  ret void
+}
+
+declare void @llvm.memcpy.p0.p1.i64(ptr, ptr addrspace(1), i64, i1)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"void"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_raw_to_typed_subword_memcpy_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module =
+        load_bytes(super::super::emit_vulkan_spirv_all_buffers_raw(ll).expect("native raw emit"))
+            .expect("load native spv");
+    let out = passes::transform(
+        module,
+        Stage::Kernel,
+        None,
+        None,
+        meta::parse_air_kernel_meta(ll).as_ref(),
+        meta::entry_name(ll, "kernel").as_deref(),
+    )
+    .expect("interface transform")
+    .assemble()
+    .iter()
+    .flat_map(|word| word.to_le_bytes())
+    .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(!asm.contains("OpCopyMemory"), "{asm}");
+    assert!(!asm.contains("llvm.memcpy"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_char_buffer_struct_array_stores_lower_as_raw_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Src = type { i32, i32 }
 %Dst = type { i32, i32, i32, i32 }
 
@@ -1815,7 +3131,7 @@ entry:
 #[test]
 fn native_raw_i64_copy_uses_access_alignment_for_dynamic_byte_base() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @main(i32 %tid, ptr addrspace(1) %src, ptr addrspace(1) %dst) {
 entry:
@@ -1849,7 +3165,7 @@ entry:
 #[test]
 fn native_raw_unaligned_i32_store_splits_to_byte_atomics() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @StorePacked(i32 %idx, ptr addrspace(1) %bytes) {
 entry:
@@ -1889,7 +3205,7 @@ entry:
 #[test]
 fn native_raw_unaligned_float_load_reassembles_bytes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @LoadPacked(i32 %idx, ptr addrspace(1) %bytes, ptr addrspace(1) %out) {
 entry:
@@ -1930,9 +3246,9 @@ entry:
 }
 
 #[test]
-fn native_indirect_buffer_pointer_fields_use_raw_placeholder_pointers() {
+fn native_indirect_buffer_pointer_fields_use_device_addresses() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Params = type { i16, ptr addrspace(1), i32 }
 
 define void @main(i32 %tid, ptr addrspace(2) %params) {
@@ -1990,7 +3306,9 @@ declare void @llvm.memcpy.p1.p2.i64(ptr addrspace(1), ptr addrspace(2), i64, i1)
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     assert!(!asm.contains("llvm.memcpy"), "{asm}");
-    assert!(!asm.contains("OpStore"), "{asm}");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    assert!(asm.contains("OpConvertUToPtr"), "{asm}");
+    assert!(asm.contains("OpStore"), "{asm}");
     assert!(!asm.contains("RuntimeArray %_ptr"), "{asm}");
     assert!(!asm.contains("OpPtrAccessChain"), "{asm}");
     if std::process::Command::new("spirv-val")
@@ -2005,7 +3323,7 @@ declare void @llvm.memcpy.p1.p2.i64(ptr addrspace(1), ptr addrspace(2), i64, i1)
 #[test]
 fn native_kernel_direct_vector_store_infers_storage_buffer_element() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out) {
 entry:
   store <4 x i32> <i32 40, i32 80, i32 120, i32 255>, ptr addrspace(1) %out, align 16
@@ -2055,7 +3373,7 @@ entry:
 #[test]
 fn native_vector_stride_from_scalar_lane_scales_and_splits_store() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %src, ptr addrspace(1) %dst) {
 entry:
   %srcp = getelementptr inbounds <4 x i16>, ptr addrspace(1) %src, i64 3
@@ -2106,7 +3424,7 @@ entry:
 #[test]
 fn native_kernel_raw_uint_struct_metadata_reconstructs_typed_layout() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::matrix" = type { [3 x <3 x float>] }
 %struct.Params = type { <3 x float>, %"struct.metal::matrix" }
 
@@ -2149,13 +3467,25 @@ entry:
     .flat_map(|w| w.to_le_bytes())
     .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
+    let transformed = load_bytes(&out).expect("load transformed SPIR-V");
+    let uint32 = transformed
+        .types_global_values
+        .iter()
+        .filter(|instruction| {
+            instruction.class.opcode == Op::TypeInt
+                && instruction.operands.as_slice()
+                    == [Operand::LiteralBit32(32), Operand::LiteralBit32(0)]
+        })
+        .filter_map(|instruction| instruction.result_id)
+        .collect::<HashSet<_>>();
+    assert!(!transformed.types_global_values.iter().any(|instruction| {
+        instruction.class.opcode == Op::TypeRuntimeArray
+            && matches!(instruction.operands.first(), Some(Operand::IdRef(id)) if uint32.contains(id))
+    }), "{asm}");
     assert!(
-        !asm.lines()
-            .any(|line| line.contains("OpTypeRuntimeArray %10")),
-        "{asm}"
-    );
-    assert!(
-        asm.lines().any(|line| line.contains("OpTypeStruct %6 %8")),
+        transformed.types_global_values.iter().any(|instruction| {
+            instruction.class.opcode == Op::TypeStruct && instruction.operands.len() == 6
+        }),
         "{asm}"
     );
     if std::process::Command::new("spirv-val")
@@ -2170,7 +3500,7 @@ entry:
 #[test]
 fn native_kernel_void_tail_call_propagates_array_buffer_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @sum_sh(ptr addrspace(1) %out, ptr addrspace(1) %input) {
 entry:
@@ -2281,7 +3611,7 @@ entry:
 #[test]
 fn native_indirect_helper_gep_drops_signed_zero_record_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Params = type <{ ptr addrspace(2), i32, i32, i32, [4 x i8], ptr addrspace(2), [20 x i8] }>
 
 define void @main(i32 %tid, ptr addrspace(1) %params) {
@@ -2355,7 +3685,7 @@ entry:
 #[test]
 fn native_kernel_thread_position_uint3_binds_full_global_invocation_id() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(<3 x i32> %tid) {
 entry:
   %ok = icmp uge <3 x i32> %tid, zeroinitializer
@@ -2406,7 +3736,7 @@ declare i1 @air.all.v3i1(<3 x i1>)
 #[test]
 fn native_air_quad_shuffle_float_lowers_to_quad_local_subgroup_shuffle() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(float %x, i16 %lane, ptr addrspace(1) %out) {
 entry:
   %sx = tail call float @air.quad_shuffle.f32(float %x, i16 %lane)
@@ -2451,7 +3781,7 @@ declare float @air.quad_shuffle.f32(float, i16)
 #[test]
 fn native_selected_buffer_pointer_gep_preserves_typed_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %gid, ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out) {
 entry:
   %idx = zext i32 %gid to i64
@@ -2498,7 +3828,7 @@ fn native_selected_buffer_pointer_gep_store_replays_values_per_arm() {
     // their pointee types agree. The store must stay in the value domain: load both values, select
     // the selected/new value per arm, then store through each original arm.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %gid, ptr addrspace(1) %a, ptr addrspace(1) %b) {
 entry:
   %idx = zext i32 %gid to i64
@@ -2523,7 +3853,7 @@ entry:
     ));
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
-    let module = load_bytes(&spv).expect("load native spv");
+    let mut module = load_bytes(&spv).expect("load native spv");
     let asm = disassemble(&spv).expect("disassemble");
     let pointer_selects = module
         .functions
@@ -2546,6 +3876,10 @@ entry:
         .count();
     assert_eq!(pointer_selects, 0, "{asm}");
     assert!(value_selects >= 2, "{asm}");
+    assert!(
+        !crate::native::construct_interface_cross_binding_pointer_values_module(&mut module),
+        "interface/finalization ownership must leave no value-replayable pointer closure"
+    );
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -2556,9 +3890,135 @@ entry:
 }
 
 #[test]
+fn native_multiblock_helper_pointer_select_consumer_is_planned_before_emission() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define internal i32 @consume(ptr addrspace(1) %pointer, i1 %choose) {
+entry:
+  br i1 %choose, label %load, label %zero
+load:
+  %value = load i32, ptr addrspace(1) %pointer, align 4
+  ret i32 %value
+zero:
+  ret i32 0
+}
+
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out, i32 %gid) {
+entry:
+  %choose = icmp eq i32 %gid, 0
+  %selected = select i1 %choose, ptr addrspace(1) %a, ptr addrspace(1) %b
+  %value = call i32 @consume(ptr addrspace(1) %selected, i1 %choose)
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+"#;
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary construction");
+    let module = load_bytes(&spv).expect("load primary SPIR-V");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        !module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| instruction.class.opcode == Op::FunctionCall),
+        "{asm}"
+    );
+    assert!(
+        !module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| {
+                instruction.class.opcode == Op::Select
+                    && instruction
+                        .result_type
+                        .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
+            }),
+        "{asm}"
+    );
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_multiblock_selected_consumer_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_dynamic_local_buffer_table_vector_load_is_primary_valid() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(i32 %gid, ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, ptr addrspace(1) %out) {
+entry:
+  %table = alloca [3 x ptr addrspace(1)], align 8
+  %slot0 = getelementptr inbounds [3 x ptr addrspace(1)], ptr %table, i32 0, i32 0
+  %slot1 = getelementptr inbounds [3 x ptr addrspace(1)], ptr %table, i32 0, i32 1
+  %slot2 = getelementptr inbounds [3 x ptr addrspace(1)], ptr %table, i32 0, i32 2
+  store ptr addrspace(1) %a, ptr %slot0, align 8
+  store ptr addrspace(1) %b, ptr %slot1, align 8
+  store ptr addrspace(1) %c, ptr %slot2, align 8
+  %selected.slot = getelementptr inbounds [3 x ptr addrspace(1)], ptr %table, i32 0, i32 %gid
+  %selected = load ptr addrspace(1), ptr %selected.slot, align 8
+  %offset = zext i32 %gid to i64
+  %source = getelementptr inbounds <4 x float>, ptr addrspace(1) %selected, i64 %offset
+  %value = load <4 x float>, ptr addrspace(1) %source, align 16
+  %destination = getelementptr inbounds <4 x float>, ptr addrspace(1) %out, i64 %offset
+  store <4 x float> %value, ptr addrspace(1) %destination, align 16
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"a"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"b"}
+!6 = !{i32 3, !"air.buffer", !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"c"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+"#;
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
+    let module = load_bytes(&spv).expect("load native spv");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        !module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .any(|inst| {
+                inst.class.opcode == Op::Select
+                    && inst
+                        .result_type
+                        .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
+            }),
+        "{asm}"
+    );
+}
+
+#[test]
 fn native_selected_i8_buffer_bitcast_vector_load_uses_raw_arms() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out, i32 %gid) {
 entry:
   %cond = icmp eq i32 %gid, 0
@@ -2651,7 +4111,7 @@ entry:
 #[test]
 fn native_selected_i8_buffer_bitcast_vector_store_uses_selected_raw_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, i32 %gid) {
 entry:
   %cond = icmp eq i32 %gid, 0
@@ -2713,7 +4173,7 @@ entry:
 #[test]
 fn native_existing_struct_buffer_uses_air_member_offsets() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %struct.Params = type { <3 x float>, <2 x float>, [8 x i8] }
 
@@ -2772,7 +4232,6 @@ entry:
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpMemberDecorate"), "{asm}");
     assert!(asm.contains("Offset 16"), "{asm}");
-    assert!(!asm.contains("Offset 12"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -2785,7 +4244,7 @@ entry:
 #[test]
 fn native_record_array_buffer_clones_block_element_struct() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %struct.Params = type { i32 }
 
@@ -2859,7 +4318,7 @@ entry:
 #[test]
 fn native_existing_struct_offsets_skip_backend_padding_arrays() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %struct.Params = type <{ i32, [4 x i8], <2 x i32>, float, float }>
 
@@ -2927,7 +4386,7 @@ entry:
 #[test]
 fn native_existing_struct_offsets_place_unaligned_padding_at_byte_cursor() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %struct.Params = type <{ i32, i8, [3 x i8], <2 x i32>, float }>
 
@@ -2992,7 +4451,7 @@ entry:
 #[test]
 fn native_kernel_local_size_option_updates_execution_and_builtin() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(<2 x i32> %threads) {
 entry:
   %sx = extractelement <2 x i32> %threads, i64 0
@@ -3025,18 +4484,18 @@ entry:
     )
     .expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("LocalSize 256 2 1"), "{asm}");
+    assert!(asm.contains("BuiltIn WorkgroupSize"), "{asm}");
     assert!(
         asm.lines()
-            .any(|line| line.contains("OpConstant") && line.contains("256")),
+            .any(|line| line.contains("OpSpecConstant") && line.contains("256")),
         "{asm}"
     );
     assert!(
         asm.lines()
-            .any(|line| line.contains("OpConstant") && line.contains("2")),
+            .any(|line| line.contains("OpSpecConstant") && line.contains("2")),
         "{asm}"
     );
-    assert!(asm.contains("OpConstantComposite"), "{asm}");
+    assert!(asm.contains("OpSpecConstantComposite"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -3049,7 +4508,7 @@ entry:
 #[test]
 fn native_raw_stores_check_wide_byte_offset_before_u32_narrowing() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %offsets, ptr addrspace(1) %dst) {
 entry:
@@ -3072,10 +4531,14 @@ entry:
     ));
     let _ = std::fs::create_dir_all(&tmp);
     let unchecked = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary emit");
-    let unchecked_module = load_bytes(&unchecked).expect("primary module loads");
+    let unchecked_asm = disassemble(&unchecked).expect("disassemble primary store");
     assert!(
-        crate::native::module_has_wide_raw_store_guard(&unchecked_module),
-        "wide raw store must retain its structural robust-store guard"
+        unchecked_asm.contains("OpULessThanEqual"),
+        "{unchecked_asm}"
+    );
+    assert!(
+        unchecked_asm.contains("OpSelectionMerge"),
+        "{unchecked_asm}"
     );
     let subword_ll = ll.replacen("store i32 7,", "store i16 7,", 1);
     let subword_unchecked =
@@ -3083,11 +4546,6 @@ entry:
     let subword_asm = disassemble(&subword_unchecked).expect("disassemble subword store");
     assert!(subword_asm.contains("OpAtomicAnd"), "{subword_asm}");
     assert!(subword_asm.contains("OpAtomicOr"), "{subword_asm}");
-    let subword_module = load_bytes(&subword_unchecked).expect("subword primary module loads");
-    assert!(
-        crate::native::module_has_wide_raw_store_guard(&subword_module),
-        "wide raw subword store must retain its structural robust-store guard"
-    );
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpULessThanEqual"), "{asm}");
@@ -3102,9 +4560,146 @@ entry:
 }
 
 #[test]
+fn native_wide_raw_store_control_flow_keeps_loop_on_source_header() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %offsets, ptr addrspace(1) %dst) {
+entry:
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %next, %latch ]
+  %offset = load i64, ptr addrspace(1) %offsets, align 8
+  %target = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %offset
+  store i32 %i, ptr addrspace(1) %target, align 4
+  %more = icmp ult i32 %i, 1
+  br i1 %more, label %latch, label %exit
+
+latch:
+  %next = add i32 %i, 1
+  br label %loop
+
+exit:
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"offsets"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_wide_raw_store_loop_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpLoopMerge"), "{asm}");
+    assert!(asm.contains("OpULessThanEqual"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_wide_raw_store_uses_its_emitted_exit_as_phi_predecessor() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %offsets, ptr addrspace(1) %dst) {
+entry:
+  %offset = load i64, ptr addrspace(1) %offsets, align 8
+  %left = icmp eq i64 %offset, 0
+  br i1 %left, label %store, label %skip
+
+store:
+  %target = getelementptr inbounds i8, ptr addrspace(1) %dst, i64 %offset
+  store i32 7, ptr addrspace(1) %target, align 4
+  br label %merge
+
+skip:
+  br label %merge
+
+merge:
+  %value = phi i32 [ 1, %store ], [ 2, %skip ]
+  store i32 %value, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"offsets"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"dst"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_wide_raw_store_phi_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary emit");
+    let module = load_bytes(&spv).expect("primary module loads");
+    let function = module.functions.first().expect("entry function");
+    let phi = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| instruction.class.opcode == Op::Phi)
+        .expect("merge phi");
+    let predecessor = match phi.operands.get(1) {
+        Some(Operand::IdRef(predecessor)) => *predecessor,
+        other => panic!("missing first phi predecessor: {other:?}"),
+    };
+    let predecessor_block = function
+        .blocks
+        .iter()
+        .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(predecessor))
+        .expect("phi predecessor block");
+    let guard_label = function
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .instructions
+                .iter()
+                .any(|instruction| instruction.class.opcode == Op::ULessThanEqual)
+        })
+        .and_then(|block| block.label.as_ref())
+        .and_then(|label| label.result_id)
+        .expect("wide-store guard header");
+    assert_ne!(
+        predecessor, guard_label,
+        "the source entry label does not own the emitted outgoing edge"
+    );
+    assert!(
+        predecessor_block
+            .instructions
+            .last()
+            .is_some_and(|instruction| instruction.class.opcode == Op::Branch),
+        "phi must name the robust-store guard's emitted exit block"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_kernel_threadgroup_struct_record_memcpy_scalarizes_to_leaf_indices() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Tile = type { i32, i32, i32, i32 }
 
 define void @k(ptr addrspace(3) %scratch, i32 %i) {
@@ -3233,7 +4828,7 @@ declare void @llvm.memcpy.p3.p3.i64(ptr addrspace(3), ptr addrspace(3), i64, i1)
 #[test]
 fn native_kernel_threadgroup_struct_member_store_splits_flattened_record_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Tile = type { i32, i32, i32, i32 }
 
 define void @k(ptr addrspace(3) %scratch, i32 %i) {
@@ -3320,7 +4915,7 @@ entry:
 #[test]
 fn native_kernel_threadgroup_param_uses_pointer_addrspace_without_metadata_address_space() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(3) %temp, i32 %i) {
 entry:
@@ -3363,9 +4958,9 @@ entry:
 }
 
 #[test]
-fn native_raw_pointer_load_eq_null_uses_payload_nullness() {
+fn native_device_address_load_eq_null_compares_the_address() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Params = type { ptr addrspace(1), i32 }
 
 define void @main(ptr addrspace(2) %params) {
@@ -3413,7 +5008,7 @@ done:
     .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
     assert!(asm.contains("OpIEqual"), "{asm}");
-    assert!(asm.contains("OpLogicalAnd"), "{asm}");
+    assert!(asm.contains("OpTypeInt 64 0"), "{asm}");
     assert!(!asm.contains("OpPtrEqual"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -3425,9 +5020,9 @@ done:
 }
 
 #[test]
-fn native_raw_pointer_loads_compare_serialized_payloads() {
+fn native_device_address_loads_compare_materialized_addresses() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Params = type { ptr addrspace(1), ptr addrspace(1) }
 
 define void @main(ptr addrspace(2) %params) {
@@ -3480,8 +5075,7 @@ done:
     .flat_map(|w| w.to_le_bytes())
     .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
-    assert!(asm.matches("OpIEqual").count() >= 6, "{asm}");
-    assert!(asm.matches("OpLogicalAnd").count() >= 3, "{asm}");
+    assert!(asm.matches("OpIEqual").count() >= 4, "{asm}");
     assert!(asm.contains("OpLogicalNot"), "{asm}");
     assert!(!asm.contains("OpPtrEqual"), "{asm}");
     if std::process::Command::new("spirv-val")
@@ -3496,7 +5090,7 @@ done:
 #[test]
 fn native_direct_pointer_param_icmp_folds_identity() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @same(ptr addrspace(1) %a) {
 entry:
   %c = icmp eq ptr addrspace(1) %a, %a
@@ -3525,7 +5119,7 @@ entry:
 #[test]
 fn native_pointer_icmp_compares_flattened_gep_provenance_indices() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @rot = internal addrspace(2) constant [2 x [4 x i32]] [[4 x i32] [i32 13, i32 15, i32 26, i32 6], [4 x i32] [i32 17, i32 29, i32 16, i32 24]], align 4
 
 define i32 @walk(i32 %row) {
@@ -3561,7 +5155,7 @@ exit:
 #[test]
 fn native_pointer_icmp_reserves_forward_gep_phi_root_provenance() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @rot = internal addrspace(2) constant [2 x [4 x i32]] [[4 x i32] [i32 13, i32 15, i32 26, i32 6], [4 x i32] [i32 17, i32 29, i32 16, i32 24]], align 4
 
 define i32 @walk(i64 %row) {
@@ -3603,7 +5197,7 @@ exit:
 #[test]
 fn native_function_pointer_icmp_compares_loop_cursor_to_end_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Box = type { [3 x float], [3 x float], float }
 
 define void @k() {
@@ -3646,7 +5240,7 @@ exit:
 #[test]
 fn native_entry_pointer_param_eq_null_uses_bound_resource_nullness() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @k(ptr addrspace(2) %maybe) {
 entry:
   %isnull = icmp eq ptr addrspace(2) %maybe, null
@@ -3667,7 +5261,7 @@ entry:
 #[test]
 fn native_alloca_eq_null_uses_intrinsic_nonnullness() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @k() {
 entry:
   %slot = alloca i32, align 4
@@ -3683,7 +5277,7 @@ entry:
 #[test]
 fn native_literal_null_eq_null_folds_true() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @k() {
 entry:
   %isnull = icmp eq ptr null, null
@@ -3698,7 +5292,7 @@ entry:
 #[test]
 fn typed_inline_keeps_helper_parameter_semantics_until_emission_finishes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i1 @k() {
 entry:
   %slot = alloca i32, align 4
@@ -3743,7 +5337,7 @@ entry:
 #[test]
 fn typed_inline_materializes_pointer_field_gep_for_helper_parameter_store() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Wrap = type { ptr addrspace(1), i64 }
 
 define void @k(ptr addrspace(1) %src) {
@@ -3789,7 +5383,7 @@ entry:
 #[test]
 fn typed_inline_records_storage_for_extracted_pointer_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Ext = type { ptr addrspace(2), ptr addrspace(2), ptr addrspace(2) }
 %Entity = type { float, i32 }
 
@@ -3823,13 +5417,14 @@ entry:
         "the helper body is typed-inlined before emission"
     );
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+    assert!(!asm.contains("OpCompositeExtract"), "{asm}");
+    assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
 }
 
 #[test]
 fn native_by_value_buffer_member_keeps_llvm_leading_zero_during_flattening() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %View = type { [944 x i8], i32 }
 %Wrapper = type { ptr addrspace(2) }
 
@@ -3882,7 +5477,7 @@ entry:
 #[test]
 fn typed_inline_retains_pruned_helper_type_capability() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k() {
 entry:
   %slot = alloca i32, align 4
@@ -3920,7 +5515,7 @@ entry:
 #[test]
 fn native_internal_pointer_param_eq_null_uses_callsite_nonnullness() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -3959,7 +5554,7 @@ entry:
 #[test]
 fn native_multiblock_helper_carries_nullable_pointer_shadow() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %out, i1 %choose) {
 entry:
@@ -3995,7 +5590,7 @@ other:
 #[test]
 fn native_internal_pointer_param_from_entry_gep_is_nonnull() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Params = type { [4 x i32], [4 x i32] }
 
 define void @k(ptr addrspace(2) %params) {
@@ -4032,7 +5627,7 @@ entry:
 #[test]
 fn native_internal_pointer_param_from_nonzero_inbounds_loaded_gep_is_nonnull() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Params = type { [4 x i32], [4 x i32] }
 %Args = type { ptr addrspace(2) }
 
@@ -4062,7 +5657,7 @@ entry:
 #[test]
 fn native_inttoptr_lowers_to_unmodeled_pointer_value() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @carry_int_pointer(i1 %cond, i64 %addr, ptr addrspace(2) %fallback) {
 entry:
   br i1 %cond, label %from_int, label %from_param
@@ -4089,7 +5684,7 @@ merge:
 #[test]
 fn native_unmodeled_gep_to_pointer_field_uses_byte_placeholder() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Header = type { i64, ptr addrspace(2) }
 define void @pointer_field(i64 %addr) {
 entry:
@@ -4109,7 +5704,7 @@ entry:
 #[test]
 fn native_unmodeled_pointer_placeholder_uses_storage_only_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Inner = type { ptr addrspace(2), i64 }
 %Outer = type { %Inner, i32 }
 define void @main() {
@@ -4146,7 +5741,7 @@ entry:
 #[test]
 fn native_gep_preserves_device_addrspace_for_loads() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.S = type { i32 }
 define i32 @load_device(ptr addrspace(1) %p) {
 entry:
@@ -4167,7 +5762,7 @@ fn native_threadgroup_atomic_param_struct_gep_keeps_backing_array_index() {
     // index into the backing array + member index), else the atomic pointer stops at the wrapper
     // struct and OpAtomicStore/Load reject the non-scalar pointee (mergeLines_parallel a8dfbc01).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 
 define void @k(ptr addrspace(3) noundef align 4 captures(none) dereferenceable(4) "air-buffer-no-alias" %0, <2 x i16> noundef %1) local_unnamed_addr {
@@ -4231,7 +5826,7 @@ declare i32 @air.atomic.local.load.i32(ptr addrspace(3) captures(none), i32, i32
 #[test]
 fn native_threadgroup_atomic_global_struct_pointer_peels_i32_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 @counter = internal addrspace(3) global %"struct.metal::_atomic" zeroinitializer, align 4
 
@@ -4282,7 +5877,7 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 #[test]
 fn native_threadgroup_atomic_multifield_global_peels_first_atomic_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 %struct.Counters = type { %"struct.metal::_atomic", %"struct.metal::_atomic", %"struct.metal::_atomic" }
 @counters = internal addrspace(3) global %struct.Counters zeroinitializer, align 4
@@ -4322,7 +5917,7 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 #[test]
 fn native_threadgroup_atomic_union_singleton_array_peels_first_scalar_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 %union.atomicUint = type { [1 x %"struct.metal::_atomic"] }
 @counter = internal addrspace(3) global %union.atomicUint undef, align 4
@@ -4360,7 +5955,7 @@ declare i32 @air.atomic.local.max.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 #[test]
 fn native_raw_atomic_array_load_uses_storage_buffer_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %"struct.metal::_atomic" = type { i32 }
 %struct.Counters = type <{ [16 x %"struct.metal::_atomic"] }>
@@ -4414,14 +6009,13 @@ declare i32 @air.atomic.global.load.i32(ptr addrspace(1), i32, i32, i1)
 /// The atomic-float-min/max idiom (MPS BVH bounding boxes): a device `<3 x float>*` buffer whose
 /// float lanes are updated with signed-integer atomics on the reinterpreted bits
 /// (`air.atomic.global.{min,max}.s.i32`). `atomic_i32_pointer_id` cannot form an `i32*` from a
-/// `<3 x float>` pointee under Logical addressing, so the failure-triggered raw retry marks the buffer
-/// raw and lowers the atomics as uint-word `OpAtomicSMin`/`OpAtomicSMax` on the `RuntimeArray<uint>`
-/// backing. Without the retry trigger covering this error, translate fails ("atomic i32 pointer
-/// targets Vector(Float, 3)").
+/// `<3 x float>` pointee under Logical addressing, so typed AIR analysis marks the function's device
+/// buffers raw before emission and lowers the atomics as uint-word `OpAtomicSMin`/`OpAtomicSMax` on
+/// the `RuntimeArray<uint>` backing.
 #[test]
 fn native_device_atomic_int_on_float3_buffer_lowers_via_raw_word() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %bbox) {
 entry:
@@ -4464,7 +6058,7 @@ declare i32 @air.atomic.global.max.s.i32(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn native_device_atomic_i32_lowers_to_device_scope_spirv() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %count) {
 entry:
@@ -4506,7 +6100,7 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn native_device_atomic_store_i32_lowers_to_device_scope_spirv() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %count) {
 entry:
@@ -4548,7 +6142,7 @@ declare void @air.atomic.global.store.i32(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn native_device_atomic_cmpxchg_weak_i32_updates_compare_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define i32 @atomic_cmpxchg(ptr addrspace(1) %slot, i32 %expected, i32 %desired) {
 entry:
@@ -4591,7 +6185,7 @@ declare i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1), ptr, i32, i32,
 #[test]
 fn native_device_atomic_f32_add_lowers_to_ext_atomic_float() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %"struct.metal::_atomic" = type { float }
 
@@ -4638,7 +6232,7 @@ declare float @air.atomic.global.add.f32(ptr addrspace(1), float, i32, i32, i1)
 #[test]
 fn native_device_atomic_f32_sub_lowers_to_negated_ext_atomic_float_add() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %"struct.metal::_atomic" = type { float }
 
@@ -4687,7 +6281,7 @@ declare float @air.atomic.global.sub.f32(ptr addrspace(1), float, i32, i32, i1)
 #[test]
 fn native_unmodeled_device_atomic_cmpxchg_uses_workgroup_scratch() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define i32 @atomic_cmpxchg_unmodeled(i32 %expected, i32 %desired) {
 entry:
@@ -4726,7 +6320,7 @@ declare i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1), ptr, i32, i32,
 #[test]
 fn native_device_atomic_umax_i32_lowers_through_kernel_transform() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Counter = type { i32 }
 
 define void @k(ptr addrspace(1) %max_value) {
@@ -4823,7 +6417,7 @@ fn native_device_atomic_i32_variants_lower_through_kernel_transform() {
     for (callee, opcode, opname) in cases {
         let ll = format!(
             r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Counter = type {{ i32 }}
 
 define void @k(ptr addrspace(1) %value) {{
@@ -4883,7 +6477,7 @@ declare i32 @{callee}(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn native_threadgroup_global_array_opaque_gep_uses_access_chain() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @shared = internal addrspace(3) global [400 x float] undef, align 4
 @nested = internal addrspace(3) global [4 x [324 x float]] undef, align 4
 
@@ -4924,7 +6518,7 @@ entry:
 #[test]
 fn native_threadgroup_scalar_array_struct_view_folds_field_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.half6 = type { half, half, half, half, half, half }
 @randomCoords = internal unnamed_addr addrspace(3) global [1024 x half] undef, align 8
 
@@ -5021,7 +6615,7 @@ entry:
 #[test]
 fn native_threadgroup_union_global_raw_array_gep_indexes_first_scalar_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 %union.histogram_t = type { [64 x %"struct.metal::_atomic"] }
 @wholeFaceHistogram = internal addrspace(3) global %union.histogram_t undef, align 4
@@ -5065,7 +6659,7 @@ declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
 #[test]
 fn native_threadgroup_load_accepts_constant_gep_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @tg_values = internal unnamed_addr addrspace(3) global [128 x i32] undef, align 4
 
 define void @k(ptr addrspace(1) %out) {
@@ -5105,7 +6699,7 @@ entry:
 #[test]
 fn native_threadgroup_vector_global_i32_gep_reinterprets_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @shared = internal addrspace(3) global [64 x <4 x i16>] undef, align 8
 
 define void @k(i32 %i, ptr addrspace(1) %out) {
@@ -5148,7 +6742,7 @@ entry:
 #[test]
 fn native_threadgroup_vector_bitcast_i64_store_reinterprets_whole_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @shared = internal addrspace(3) global [64 x <4 x i16>] undef, align 8
 
 define void @main() {
@@ -5206,7 +6800,7 @@ entry:
 #[test]
 fn native_threadgroup_vector_bitcast_wide_store_splits_to_vector_slots() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @shared = internal addrspace(3) global [64 x <4 x half>] undef, align 8
 
 define void @main() {
@@ -5263,7 +6857,7 @@ entry:
 #[test]
 fn native_threadgroup_vector_param_gep_then_raw_i32_reinterprets_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @shared = internal addrspace(3) global [64 x <4 x i16>] undef, align 8
 
 define void @k(i32 %i, ptr addrspace(1) %out) {
@@ -5336,7 +6930,7 @@ entry:
 #[test]
 fn native_threadgroup_i32_param_gep_uses_callsite_vector_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @shared = internal addrspace(3) global [64 x <4 x i16>] undef, align 8
 
 define void @k(i32 %i, ptr addrspace(1) %out) {
@@ -5387,7 +6981,7 @@ entry:
 #[test]
 fn native_kernel_threadgroup_mixed_half_uint_scratch_uses_raw_word_array() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out, i32 %i) {
 entry:
   %idx = zext i32 %i to i64
@@ -5470,9 +7064,61 @@ entry:
 }
 
 #[test]
+fn native_raw_threadgroup_helper_call_uses_identity_bitcast_root() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out) {
+entry:
+  %alias = bitcast ptr addrspace(3) %scratch to ptr addrspace(3)
+  call void @helper(ptr addrspace(3) %alias, ptr addrspace(1) %out)
+  ret void
+}
+
+define internal void @helper(ptr addrspace(3) %scratch, ptr addrspace(1) %out) {
+entry:
+  br label %body
+
+body:
+  %scalar = getelementptr inbounds float, ptr addrspace(3) %scratch, i64 0
+  store float 1.0, ptr addrspace(3) %scalar, align 4
+  %vectors = bitcast ptr addrspace(3) %scratch to ptr addrspace(3)
+  %vector = getelementptr inbounds <4 x float>, ptr addrspace(3) %vectors, i64 0
+  %loaded = load <4 x float>, ptr addrspace(3) %vector, align 16
+  %first = extractelement <4 x float> %loaded, i64 0
+  store float %first, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 3, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"scratch"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_raw_threadgroup_helper_alias_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains(" Workgroup"), "{asm}");
+    assert!(!asm.contains(" Private"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn native_threadgroup_dynamic_gep_allows_negative_constant_rebase() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(3) %scratch, ptr addrspace(1) %out, i32 %i) {
 entry:
   %ok = icmp uge i32 %i, 128
@@ -5532,7 +7178,7 @@ exit:
 #[test]
 fn native_pointer_bitcast_load_reinterprets_loaded_bits() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.S = type { float }
 define i32 @load_bits(ptr addrspace(1) %p) {
 entry:
@@ -5550,7 +7196,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_load_reads_first_aggregate_word() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.TextureBufferClearParams = type { i32, %union.anon }
 %union.anon = type { [4 x float] }
 define void @k(ptr addrspace(1) %dst, ptr addrspace(2) %clear, i32 %tid) {
@@ -5602,7 +7248,7 @@ declare void @air.write_texture_buffer_1d.u.v4i32(ptr addrspace(1), i32, <4 x i3
 #[test]
 fn native_leading_vector_aggregate_load_bitcasts_to_int_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <3 x i32> @load_leading_vec() {
 entry:
   %buf = alloca [4 x <3 x float>], align 16
@@ -5619,7 +7265,7 @@ entry:
 #[test]
 fn native_scalar_array_load_rebuilds_same_shape_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define <3 x float> @load_array_as_vector() {
 entry:
   %buf = alloca [3 x float], align 16
@@ -5634,9 +7280,27 @@ entry:
 }
 
 #[test]
+fn native_scalar_array_load_bitcasts_each_same_width_vector_lane() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define <3 x i32> @load_array_as_reinterpreted_vector() {
+entry:
+  %buf = alloca [3 x float], align 16
+  %value = load <3 x i32>, ptr %buf, align 16
+  ret <3 x i32> %value
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(asm.contains("OpLoad"), "{asm}");
+    assert_eq!(asm.matches("OpBitcast").count(), 3, "{asm}");
+    assert!(asm.contains("OpCompositeConstruct"), "{asm}");
+    assert!(!asm.contains("OpBitcast %_ptr_"), "{asm}");
+}
+
+#[test]
 fn native_vector_store_rebuilds_same_shape_scalar_array() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @store_vector_as_array(<3 x float> %value) {
 entry:
   %buf = alloca [3 x float], align 16
@@ -5652,7 +7316,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_load_packs_leading_float_fields_as_i64() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Keypoint = type { float, float, i32 }
 define i64 @load_prefix_bits(ptr %p) {
 entry:
@@ -5667,12 +7331,38 @@ entry:
     assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
     assert!(asm.contains("OpBitwiseOr"), "{asm}");
     assert!(!asm.contains("non-bitcastable"), "{asm}");
+    assert!(
+        !asm.lines().any(|line| line.contains("OpCopyObject %_ptr_")),
+        "{asm}"
+    );
+}
+
+#[test]
+fn native_pointer_alias_load_packs_wide_byte_vector_as_i64() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define i64 @load_vector_bits(ptr %p, i64 %index) {
+entry:
+  %element = getelementptr inbounds [8 x <8 x i8>], ptr %p, i64 0, i64 %index
+  %alias = bitcast ptr %element to ptr
+  %bits = load i64, ptr %alias, align 8
+  ret i64 %bits
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(asm.contains("OpShiftLeftLogical"), "{asm}");
+    assert!(asm.contains("OpBitwiseOr"), "{asm}");
+    assert!(!asm.contains("OpBitcast %ulong"), "{asm}");
+    assert!(
+        !asm.lines().any(|line| line.contains("OpCopyObject %_ptr_")),
+        "{asm}"
+    );
 }
 
 #[test]
 fn native_pointer_bitcast_store_splits_i64_into_leading_float_fields() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Keypoint = type { float, float, i32 }
 define void @store_prefix_bits(ptr %p, i64 %bits) {
 entry:
@@ -5692,7 +7382,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_load_reads_first_pointer_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Cache = type { ptr addrspace(1), float }
 define i32 @load_first_pointer_field(ptr addrspace(1) %buf) {
 entry:
@@ -5714,7 +7404,7 @@ entry:
 #[test]
 fn native_local_aggregate_byte_view_uses_array_storage_for_dynamic_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.ETCBlock = type { %struct.Bits }
 %struct.Bits = type { i64 }
 define void @k(ptr addrspace(1) %out, i32 %idx) {
@@ -5761,7 +7451,7 @@ fn native_local_aggregate_multi_view_remodels_to_byte_array() {
     // the universal receiver: the remodel must pick it so every typed view lowers through the
     // byte-reinterpret GEP + byte-assembled load path instead of emitting an over-indexed chain.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.ETCBlock = type { %struct.anon.9 }
 %struct.anon.9 = type { i64 }
 %struct.anon = type { %union.anon, %union.anon }
@@ -5804,7 +7494,7 @@ entry:
 #[test]
 fn native_local_scalar_byte_view_packs_half_lanes_in_byte_storage() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %out) {
 entry:
   %slot = alloca float, align 4
@@ -5852,7 +7542,7 @@ fn native_global_byte_table_reinterpret_view_remodels_to_byte_array() {
     // declared as its flat byte array with the initializer byte image so the byte-array raw paths
     // lower every view.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @tbl = internal unnamed_addr addrspace(2) constant <{ [4 x i8], <{ i8, i8, [2 x i8] }> }> <{ [4 x i8] c"", <{ i8, i8, [2 x i8] }> <{ i8 5, i8 6, [2 x i8] zeroinitializer }> }>, align 1
 define void @k(ptr addrspace(1) %out, i32 %r, i32 %c) {
 entry:
@@ -5883,12 +7573,11 @@ entry:
 #[test]
 fn native_local_aggregate_callee_view_valid_after_inline_sroa() {
     // The DecodeETC2 shape: the caller byte-fills a union alloca, and the CONFLICTING struct view
-    // lives in an internal callee, so the default per-function emission produces a structurally
-    // typed chain against the caller's byte-array storage. The text inliner collapses the views
-    // into one function where the multi-view byte-array remodel handles them; the retry tier in
-    // `translate_sanitized_native` adopts this emission when it validates.
+    // lives in an internal callee. The structural pointer-consumer analysis inlines the helper
+    // before emission, collapsing the views into one function where the multi-view byte-array
+    // remodel handles them without a failed primary module or retry.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.ETCBlock = type { %struct.anon.9 }
 %struct.anon.9 = type { i64 }
 %struct.anon = type { %union.anon, %union.anon }
@@ -5929,7 +7618,7 @@ define internal fastcc i32 @helper(ptr noundef %0) {
 #[test]
 fn native_function_aggregate_pointer_field_store_load_replays_pointer_value() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Cache = type { ptr addrspace(1), ptr addrspace(1), float }
 define void @store_load_pointer_field(ptr addrspace(1) %buf) {
 entry:
@@ -5946,9 +7635,54 @@ entry:
 }
 
 #[test]
+fn native_by_value_aggregate_carries_pointer_outside_serialized_struct() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%struct.Pair = type { ptr addrspace(1), i64 }
+define void @carry_pointer(ptr addrspace(1) %buf, ptr addrspace(1) %out) {
+entry:
+  %with.ptr = insertvalue %struct.Pair poison, ptr addrspace(1) %buf, 0
+  %pair = insertvalue %struct.Pair %with.ptr, i64 7, 1
+  %replayed = extractvalue %struct.Pair %pair, 0
+  store i32 9, ptr addrspace(1) %replayed, align 4
+  %payload = extractvalue %struct.Pair %pair, 1
+  store i64 %payload, ptr addrspace(1) %out, align 8
+  ret void
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load spv");
+    let type_defs = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<std::collections::HashMap<_, _>>();
+    let pointer_types = type_defs
+        .iter()
+        .filter_map(|(id, instruction)| {
+            (instruction.class.opcode == Op::TypePointer).then_some(*id)
+        })
+        .collect::<std::collections::HashSet<_>>();
+
+    assert!(module.types_global_values.iter().all(|instruction| {
+        instruction.class.opcode != Op::TypeStruct
+            || instruction
+                .operands
+                .iter()
+                .all(|operand| !matches!(operand, Operand::IdRef(id) if pointer_types.contains(id)))
+    }));
+    assert!(module
+        .functions
+        .iter()
+        .flat_map(|function| function.all_inst_iter())
+        .any(|instruction| instruction.class.opcode == Op::Store
+            && matches!(instruction.operands.get(1), Some(Operand::IdRef(_)))));
+}
+
+#[test]
 fn native_local_pointer_field_load_preserves_stored_pointer_storage() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Cache = type { ptr }
 define i8 @load_local_pointer_field() {
 entry:
@@ -5982,9 +7716,48 @@ entry:
 }
 
 #[test]
+fn native_null_local_pointer_field_uses_integer_payload() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%struct.Cache = type { ptr, i64 }
+define i1 @null_local_pointer_field() {
+entry:
+  %cache = alloca %struct.Cache, align 8
+  %field = getelementptr inbounds %struct.Cache, ptr %cache, i64 0, i32 0
+  store ptr null, ptr %field, align 8
+  %loaded = load ptr, ptr %field, align 8
+  %is_null = icmp eq ptr %loaded, null
+  ret i1 %is_null
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let module = load_bytes(&spv).expect("load spv");
+    let invalid_pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| {
+            (inst.class.opcode == Op::TypePointer
+                && matches!(
+                    inst.operands.first(),
+                    Some(Operand::StorageClass(
+                        StorageClass::Private | StorageClass::Function
+                    ))
+                ))
+            .then_some(inst.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert!(!module.types_global_values.iter().any(|inst| {
+        inst.class.opcode == Op::ConstantNull
+            && inst
+                .result_type
+                .is_some_and(|ty| invalid_pointer_types.contains(&ty))
+    }));
+}
+
+#[test]
 fn native_concrete_pointer_round_trips_through_opaque_by_value_wrapper() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Wrapper = type { ptr, i64 }
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -6025,7 +7798,7 @@ entry:
 #[test]
 fn native_inlined_byte_struct_view_extracts_from_same_size_scalar_alloca() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Flags = type { i8, i8, i8, i8, i8, i8, i8, i8 }
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -6078,7 +7851,7 @@ absent:
 #[test]
 fn native_function_pointer_array_dynamic_load_selects_stored_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @store_via_pointer_table(ptr addrspace(1) %a, ptr addrspace(1) %b, i32 %idx) {
 entry:
   %table = alloca [2 x ptr addrspace(1)], align 8
@@ -6104,7 +7877,7 @@ entry:
 #[test]
 fn native_function_pointer_matrix_dynamic_load_selects_stored_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @store_via_pointer_matrix(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, ptr addrspace(1) %d, i32 %row, i32 %column) {
 entry:
   %table = alloca [2 x [2 x ptr addrspace(1)]], align 8
@@ -6134,7 +7907,7 @@ entry:
 #[test]
 fn native_bound_buffer_pointer_array_preserves_dynamic_table_sources() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @load_via_pointer_table(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out, i32 %idx) {
 entry:
   %table = alloca [2 x ptr addrspace(1)], align 8
@@ -6180,7 +7953,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_widening_vector_load_pads_extra_lane() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @load_wide_row() {
 entry:
   %matrix = alloca [1 x <3 x float>], align 16
@@ -6200,7 +7973,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_vector_load_store_uses_scalar_lanes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @half4_alias() {
 entry:
   %buf = alloca [16 x half], align 16
@@ -6268,10 +8041,9 @@ attributes #0 = { nounwind }
 !2 = !{!3}
 !3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 0, !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"buf"}
 "#;
-    // Scalarize whole-vs-part deterministically (bypass the env flag), then emit through the PRIMARY,
-    // NO-RETRY translate path (`translate_native_no_retry` — buffer-metadata modeling + the shared
-    // passes tail, but NO spirv-val gate and NO retry cascade). Asserting spirv-val here proves the
-    // primary emit is valid on its own, so the eventual default flip does not lean on retry-rescue.
+    // Scalarize whole-vs-part deterministically (bypass the env flag), then emit through the primary
+    // construction path (`translate_native_no_retry` — buffer-metadata modeling + the shared passes
+    // tail, but no external spirv-val gate). Asserting spirv-val here proves the primary emit itself.
     let widened = super::super::vec_scalar_merge::lower_with_widen_for_test(ll);
     assert!(
         !widened.contains("load <4 x float>"),
@@ -6307,7 +8079,7 @@ fn native_same_width_vector_reinterpret_store_bitcasts_object() {
     // A <2 x float> (8 bytes) stored through a <4 x half> (8 bytes) pointer is a byte-identical
     // reinterpret: the emitter OpBitcasts the object to the pointee vector before the store.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @v2f_into_v4h(<2 x float> %v) {
 entry:
@@ -6324,7 +8096,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_i32_word_load_constructs_i16_vector() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %union.Everything = type { <4 x i32> }
 
 define <4 x i16> @load_half_words() {
@@ -6352,7 +8124,7 @@ entry:
 #[test]
 fn native_pointer_bitcast_narrowing_vector_store_drops_extra_lane() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::matrix" = type { [3 x <3 x float>] }
 define void @main() {
 entry:
@@ -6398,7 +8170,7 @@ entry:
 #[test]
 fn native_i64_load_store_reinterprets_i32_pair_struct() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Pair = type { i32, i32 }
 define void @copy_pair(ptr addrspace(1) %dst, ptr addrspace(1) %src, i64 %idx) {
 entry:
@@ -6422,7 +8194,7 @@ entry:
 #[test]
 fn native_loaded_pointer_can_feed_gep() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.S = type { ptr addrspace(1) }
 define i32 @load_loaded_pointer(ptr addrspace(2) %p, i64 %idx) {
 entry:
@@ -6441,7 +8213,7 @@ entry:
 #[test]
 fn native_i8_pointer_can_load_wider_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @load_from_byte_pointer(ptr addrspace(2) %p, i64 %idx) {
 entry:
   %word = shl i64 %idx, 2
@@ -6525,7 +8297,7 @@ declare { <4 x i32>, i8 } @air.read_texture_2d.u.v4i32(ptr addrspace(1), <2 x i3
 #[test]
 fn native_i8_buffer_bitcast_float_load_uses_raw_offset() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @ByteFloatLoad(ptr addrspace(1) %bytes, ptr addrspace(1) %out, i32 %tid) {
 entry:
   %byte32 = shl i32 %tid, 2
@@ -6580,7 +8352,7 @@ entry:
 #[test]
 fn native_raw_struct_array_dynamic_member_index_preserves_offset() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 %Counters = type <{ i32, [16 x i32] }>
 
@@ -6628,7 +8400,7 @@ entry:
 #[test]
 fn native_raw_i8_load_uses_dynamic_byte_lane() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @ByteLane(i32 %tid, ptr addrspace(1) %bytes, ptr addrspace(1) %out) {
 entry:
   %wide_i32 = shl i32 %tid, 2
@@ -6677,7 +8449,7 @@ entry:
 #[test]
 fn native_raw_i8_vector_source_gep_load_uses_scalar_byte_loads() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @ByteVectorGep(i32 %tid, ptr addrspace(1) %bytes, ptr addrspace(1) %out) {
 entry:
   %lane = zext i32 %tid to i64
@@ -6726,7 +8498,7 @@ entry:
 #[test]
 fn native_raw_pointer_load_from_dynamic_byte_offset_uses_placeholder() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @PointerLoad(i32 %idx, ptr addrspace(1) %bytes, ptr addrspace(1) %out) {
 entry:
   %idx64 = zext i32 %idx to i64
@@ -6767,7 +8539,7 @@ entry:
 #[test]
 fn native_raw_scalar_array_reinterpret_gep_composes_byte_offsets() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @DecodePackedRGB8(i32 %x, ptr addrspace(1) %src, ptr addrspace(2) %stride, ptr addrspace(1) %out) {
 entry:
   %row_stride = load i32, ptr addrspace(2) %stride, align 4
@@ -6827,7 +8599,7 @@ entry:
 #[test]
 fn native_local_pointer_table_gep_infers_buffer_param_pointees() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, i32 %which, i64 %offset, float %v) {
 entry:
   %table = alloca [2 x ptr addrspace(1)], align 8
@@ -6857,7 +8629,7 @@ entry:
 #[test]
 fn native_local_pointer_table_dynamic_gep_selects_per_arm_access_chains() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, i32 %which, i64 %offset, float %v) {
 entry:
   %table = alloca [2 x ptr addrspace(1)], align 8
@@ -6882,9 +8654,57 @@ entry:
 }
 
 #[test]
+fn native_local_pointer_table_vector_gep_keeps_vector_stride() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out, i32 %which) {
+entry:
+  %table = alloca [2 x ptr addrspace(1)], align 8
+  %a0 = getelementptr inbounds <4 x float>, ptr addrspace(1) %a, i64 0
+  %slot0 = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 0
+  store ptr addrspace(1) %a0, ptr %slot0, align 8
+  %b0 = getelementptr inbounds <4 x float>, ptr addrspace(1) %b, i64 0
+  %slot1 = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 1
+  store ptr addrspace(1) %b0, ptr %slot1, align 8
+  %idx = zext i32 %which to i64
+  %slot = getelementptr inbounds [2 x ptr addrspace(1)], ptr %table, i64 0, i64 %idx
+  %base = load ptr addrspace(1), ptr %slot, align 8
+  %ptr = getelementptr inbounds <4 x float>, ptr addrspace(1) %base, i64 %idx
+  %value = load <4 x float>, ptr addrspace(1) %ptr, align 16
+  %lane = extractelement <4 x float> %value, i32 0
+  store float %lane, ptr addrspace(1) %out, align 4
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"which"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_local_pointer_table_vector_gep_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpCompositeExtract"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_vector_store_reinterprets_same_width_scalar_lanes() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @store_half2_lanes(ptr addrspace(3) %scratch, i32 %idx, <4 x float> %packed) {
 entry:
   %wide = zext i32 %idx to i64
@@ -6904,7 +8724,7 @@ entry:
 #[test]
 fn native_scalar_store_reinterprets_same_width_pointee() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %buf, i16 %tid) {
 entry:
@@ -6935,7 +8755,7 @@ entry:
 #[test]
 fn native_selected_raw_byte_pointer_half_store_keeps_raw_offset() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %a, i32 %i) {
 entry:
@@ -6980,7 +8800,7 @@ entry:
 #[test]
 fn native_raw_load_accepts_mul_by_aligned_select_byte_step() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i32 @load_raw_step(ptr addrspace(2) %p, i1 %wide, i32 %idx) {
 entry:
   %tag = load i32, ptr addrspace(2) %p
@@ -7001,7 +8821,7 @@ entry:
 #[test]
 fn native_raw_half_load_uses_dynamic_lane_for_half_stride() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @load_raw_half(ptr addrspace(1) %p, i32 %idx) {
 entry:
   %tag = load i32, ptr addrspace(1) %p
@@ -7019,7 +8839,7 @@ entry:
 #[test]
 fn native_raw_subword_stores_use_dynamic_lane_read_modify_write() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @store_raw_subwords(ptr addrspace(1) %p, i32 %idx, half %h, i16 %s, i8 %b) {
 entry:
   %tag = load i32, ptr addrspace(1) %p
@@ -7046,7 +8866,7 @@ entry:
 #[test]
 fn native_raw_i16_load_assembles_unaligned_byte_offset() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i16 @load_unaligned_u16(ptr addrspace(1) %p, i32 %idx) {
 entry:
   %idx64 = zext i32 %idx to i64
@@ -7067,7 +8887,7 @@ entry:
 #[test]
 fn native_raw_i64_load_combines_two_words() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define i64 @load_raw_i64(ptr addrspace(2) %p, i64 %idx) {
 entry:
   %tag = load i32, ptr addrspace(2) %p
@@ -7087,7 +8907,7 @@ entry:
 #[test]
 fn native_direct_load_infers_pointer_pointee_type() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @load_scalar(ptr addrspace(2) %p) {
 entry:
   %v = load float, ptr addrspace(2) %p
@@ -7118,7 +8938,7 @@ entry:
 #[test]
 fn native_gep_keeps_dynamic_first_index_for_element_buffers() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @load_indexed(ptr addrspace(1) %p, i64 %idx) {
 entry:
   %g = getelementptr inbounds float, ptr addrspace(1) %p, i64 %idx
@@ -7134,7 +8954,7 @@ entry:
 #[test]
 fn native_identity_bitcast_param_gep_uses_access_chain() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @load_indexed_alias(ptr addrspace(1) %p, i64 %idx) {
 entry:
   %alias = bitcast ptr addrspace(1) %p to ptr addrspace(1)
@@ -7204,7 +9024,7 @@ entry:
 #[test]
 fn native_integer_alloca_retyped_by_half_array_gep_view() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @local_half_array_view(i64 %idx, half %value) {
 entry:
   %slot = alloca i64, align 8
@@ -7225,7 +9045,7 @@ entry:
 #[test]
 fn native_collapses_redundant_wrapper_gep_on_derived_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %air.arrblk.0 = type { [0 x float] }
 define float @wrapped(ptr addrspace(1) %b, i64 %idx) {
 entry:
@@ -7244,7 +9064,7 @@ entry:
 #[test]
 fn native_composes_zero_wrapper_gep_offsets_from_derived_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %air.arrblk.0 = type { [0 x <4 x float>] }
 define <4 x float> @wrapped_offset(ptr addrspace(2) %b) {
 entry:
@@ -7265,9 +9085,32 @@ entry:
 }
 
 #[test]
+fn native_zero_offset_gep_emits_no_operandless_access_chain() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @indexless_gep(ptr addrspace(3) %shared) {
+entry:
+  %same = getelementptr i32, ptr addrspace(3) %shared, i64 0
+  store i32 7, ptr addrspace(3) %same, align 4
+  ret void
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    assert!(
+        !asm.lines().any(|line| {
+            line.contains("OpAccessChain")
+                || line.contains("OpInBoundsAccessChain")
+                || line.contains("OpPtrAccessChain")
+                || line.contains("OpInBoundsPtrAccessChain")
+        }),
+        "{asm}"
+    );
+}
+
+#[test]
 fn native_composes_dynamic_zero_wrapper_gep_offsets() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %air.arrblk.0 = type { [0 x <4 x float>] }
 define <4 x float> @wrapped_offset(ptr addrspace(2) %b, i64 %idx) {
 entry:
@@ -7285,7 +9128,7 @@ entry:
 #[test]
 fn native_composes_linear_scalar_gep_offsets() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @scalar_offset(ptr addrspace(2) %b, i64 %idx) {
 entry:
   %base = getelementptr inbounds float, ptr addrspace(2) %b, i64 %idx
@@ -7316,7 +9159,7 @@ fn native_whole_buffer_param_select_loads_values_before_selecting() {
     // metadata-declared data buffer arm is safe to load-and-select
     // (CC_CopyVirtualPixelStatsToReadbackTexture 0f853fb0).
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 
 define void @k(ptr addrspace(1) %0, ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %1, ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %2, <2 x i16> noundef %3) local_unnamed_addr {
   %5 = extractelement <2 x i16> %3, i64 0
@@ -7365,9 +9208,9 @@ declare <4 x float> @air.convert.f.v4f32.f.v4f16(<4 x half>)
 }
 
 #[test]
-fn native_storage_buffer_pointer_select_loads_values_before_selecting() {
+fn native_storage_buffer_pointer_select_replays_two_typed_leaf_loads() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Buffer = type { [4 x half], [4 x half] }
 define half @main(ptr addrspace(1) %buf, i1 %cond, i32 %idx) {
 entry:
@@ -7403,7 +9246,7 @@ entry:
 #[test]
 fn native_mixed_private_uniform_pointer_select_replays_loaded_values() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Config = type { i32, i32 }
 @default_config = internal addrspace(2) global %Config zeroinitializer, align 4
 
@@ -7518,9 +9361,185 @@ entry:
 }
 
 #[test]
+fn native_nested_pointer_select_load_replays_every_level_at_the_load_type() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define float @nested(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, i1 %ab, i1 %abc) {
+entry:
+  %a_seed = load float, ptr addrspace(1) %a, align 4
+  %b_seed = load float, ptr addrspace(1) %b, align 4
+  %first = select i1 %ab, ptr addrspace(1) %a, ptr addrspace(1) %b
+  %second = select i1 %abc, ptr addrspace(1) %c, ptr addrspace(1) %first
+  %value = load float, ptr addrspace(1) %second, align 4
+  ret float %value
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load native spv");
+    let float_type = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::TypeFloat)
+        .and_then(|instruction| instruction.result_id)
+        .expect("float type");
+    let select_types = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == Op::Select)
+        .map(|instruction| instruction.result_type)
+        .collect::<Vec<_>>();
+    assert_eq!(select_types, vec![Some(float_type); 2], "{asm}");
+}
+
+#[test]
+fn native_nested_pointer_select_gep_store_replays_typed_leaf_accesses() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @nested(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c) {
+entry:
+  %first = select i1 true, ptr addrspace(1) %a, ptr addrspace(1) %b
+  %second = select i1 false, ptr addrspace(1) %c, ptr addrspace(1) %first
+  %dst = getelementptr inbounds float, ptr addrspace(1) %second, i64 0
+  store float 1.000000e+00, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @nested, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"c"}
+"#;
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load native spv");
+    let float_type = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::TypeFloat)
+        .and_then(|instruction| instruction.result_id)
+        .expect("float type");
+    let pointer_selects = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            instruction.class.opcode == Op::Select
+                && instruction
+                    .result_type
+                    .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
+        })
+        .count();
+    let value_select_types = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == Op::Select)
+        .map(|instruction| instruction.result_type)
+        .collect::<Vec<_>>();
+    assert_eq!(pointer_selects, 0, "{asm}");
+    assert_eq!(value_select_types, vec![Some(float_type); 3], "{asm}");
+    assert_eq!(asm.matches("OpStore").count(), 3, "{asm}");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_selected_store_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_pointer_phi_merges_selected_access_trees_leafwise() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @nested_phi(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %c, i1 %choose, i1 %advance) {
+entry:
+  %first = select i1 %choose, ptr addrspace(1) %a, ptr addrspace(1) %b
+  %second = select i1 %choose, ptr addrspace(1) %c, ptr addrspace(1) %first
+  br i1 %advance, label %offset, label %direct
+
+offset:
+  %advanced = getelementptr inbounds float, ptr addrspace(1) %second, i64 1
+  br label %merge
+
+direct:
+  br label %merge
+
+merge:
+  %joined = phi ptr addrspace(1) [ %advanced, %offset ], [ %second, %direct ]
+  %dst = getelementptr inbounds float, ptr addrspace(1) %joined, i64 0
+  store float 1.000000e+00, ptr addrspace(1) %dst, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @nested_phi, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"a"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"b"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"c"}
+"#;
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let mut module = load_bytes(&spv).expect("load native spv");
+    let pointer_phis = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| {
+            instruction.class.opcode == Op::Phi
+                && instruction
+                    .result_type
+                    .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
+        })
+        .count();
+    assert_eq!(pointer_phis, 3, "{asm}");
+    assert_eq!(
+        crate::native::construct_interface_cross_binding_pointer_merges_module(
+            &mut module,
+            crate::reflect::DescriptorLayout::default(),
+        ),
+        None,
+        "final resource construction must leave no address-domain closure"
+    );
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_selected_phi_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
 fn native_scalar_store_to_private_aggregate_root_targets_first_field() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Config = type { i8, i32 }
 @config = internal addrspace(2) global %Config zeroinitializer, align 4
 
@@ -7540,9 +9559,9 @@ entry:
 }
 
 #[test]
-fn native_selected_storage_buffer_gep_chain_loads_values_before_selecting() {
+fn native_selected_storage_buffer_gep_chain_replays_two_typed_leaf_loads() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %Buffer = type { [8 x float], [8 x float] }
 define float @main(ptr addrspace(1) %buf, i1 %cond, i32 %base, i32 %idx) {
 entry:
@@ -7579,7 +9598,7 @@ entry:
 #[test]
 fn native_pointer_select_null_arm_load_selects_values() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @main(ptr addrspace(2) %buf, i1 %cond, i64 %idx) {
 entry:
   %p = getelementptr inbounds float, ptr addrspace(2) %buf, i64 %idx
@@ -7620,9 +9639,102 @@ entry:
 }
 
 #[test]
+fn native_pointer_select_null_rooted_gep_arm_materializes_undefined_value() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%Buffer = type { [16 x float] }
+define float @main(ptr addrspace(2) %buf, i1 %cond, i64 %idx) {
+entry:
+  %present = getelementptr inbounds %Buffer, ptr addrspace(2) %buf, i64 0, i32 0, i64 %idx
+  %missing = getelementptr inbounds %Buffer, ptr addrspace(2) null, i64 0, i32 0, i64 %idx
+  %sel = select i1 %cond, ptr addrspace(2) %missing, ptr addrspace(2) %present
+  %v = load float, ptr addrspace(2) %sel, align 4
+  ret float %v
+}
+"#;
+    let spv = emit_vulkan_spirv(ll).expect("native emit");
+    let asm = disassemble(&spv).expect("disassemble");
+    let pointer_types = asm
+        .lines()
+        .filter(|line| line.contains("OpTypePointer"))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect::<HashSet<_>>();
+    let undefined_pointers = asm
+        .lines()
+        .filter(|line| line.contains("OpUndef"))
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let result = words.next()?;
+            let _equals = words.next()?;
+            let _opcode = words.next()?;
+            let ty = words.next()?;
+            pointer_types.contains(ty).then_some(result)
+        })
+        .collect::<HashSet<_>>();
+    assert!(
+        asm.lines()
+            .filter(|line| line.contains("OpLoad"))
+            .all(|line| line
+                .split_whitespace()
+                .last()
+                .is_none_or(|pointer| !undefined_pointers.contains(pointer))),
+        "{asm}"
+    );
+}
+
+#[test]
+fn native_load_through_undefined_pointer_constructs_undefined_value() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define float @main(i1 %done) {
+entry:
+  br label %loop
+loop:
+  %missing = phi ptr addrspace(2) [ null, %entry ], [ %next, %loop ]
+  %v = load float, ptr addrspace(2) %missing, align 4
+  %next = getelementptr inbounds float, ptr addrspace(2) %missing, i64 1
+  br i1 %done, label %exit, label %loop
+exit:
+  ret float %v
+}
+"#;
+    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
+    let pointer_types = asm
+        .lines()
+        .filter(|line| line.contains("OpTypePointer"))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect::<HashSet<_>>();
+    let undefined_pointers = asm
+        .lines()
+        .filter(|line| line.contains("OpUndef"))
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let result = words.next()?;
+            let _equals = words.next()?;
+            let _opcode = words.next()?;
+            let ty = words.next()?;
+            pointer_types.contains(ty).then_some(result)
+        })
+        .collect::<HashSet<_>>();
+    assert!(
+        asm.lines()
+            .filter(|line| line.contains("OpLoad"))
+            .all(|line| line
+                .split_whitespace()
+                .last()
+                .is_none_or(|pointer| !undefined_pointers.contains(pointer))),
+        "{asm}"
+    );
+    assert!(
+        asm.lines().any(|line| line.contains("OpCopyObject")),
+        "{asm}"
+    );
+}
+
+#[test]
 fn native_pointer_select_null_arm_gep_uses_concrete_arm() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define float @main(ptr addrspace(1) %buf, i1 %cond, i64 %base, i64 %idx) {
 entry:
   %p = getelementptr inbounds float, ptr addrspace(1) %buf, i64 %base
@@ -7711,7 +9823,7 @@ entry:
 #[test]
 fn native_buffer_pointer_select_null_arm_rewrites_to_value_select() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %buf, ptr addrspace(2) %flag) {
 entry:
   %flag_value = load i32, ptr addrspace(2) %flag, align 4
@@ -7783,7 +9895,7 @@ entry:
 #[test]
 fn native_workgroup_global_does_not_reuse_block_decorated_buffer_struct() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_atomic" = type { i32 }
 
 @tg = internal addrspace(3) global %"struct.metal::_atomic" zeroinitializer, align 4
@@ -7858,7 +9970,7 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
 #[test]
 fn native_bool_vector_index_lowers_to_integer_dynamic_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define half @pick(<2 x half> %v, half %x, i1 %idx) {
 entry:
   %old = extractelement <2 x half> %v, i1 %idx
@@ -7877,7 +9989,7 @@ entry:
 #[test]
 fn native_fast_sincos_writes_cosine_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %slot = alloca float
@@ -7918,7 +10030,7 @@ declare float @air.fast_sincos.f32(float, ptr)
 #[test]
 fn native_sincos_f16_writes_cosine_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
 entry:
   %slot = alloca half
@@ -7963,7 +10075,7 @@ fn native_half_buffer_loads_as_float_vector() {
     // MPS half-buffer reinterpret. The emitter has no logical pointer bitcast, so it must read the 8
     // contiguous halfs and little-endian–pack them into a v4uint, then bitcast to v4float.
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 define void @main(ptr addrspace(1) %in, ptr addrspace(1) %out) {
 entry:
   %p = getelementptr inbounds half, ptr addrspace(1) %in, i64 4
@@ -8003,7 +10115,7 @@ entry:
 #[test]
 fn native_promoted_lut_global_can_be_loaded() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @.air.lut.0 = private unnamed_addr addrspace(2) constant [1 x float] [float 1.000000e+00]
 define float @lut() {
 entry:
@@ -8022,7 +10134,7 @@ entry:
 #[test]
 fn native_promoted_lut_global_preserves_array_initializer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @.air.lut.0 = private unnamed_addr addrspace(2) constant [2 x float] [float 1.000000e+00, float 2.000000e+00]
 define float @lut(i64 %idx) {
 entry:
@@ -8040,7 +10152,7 @@ entry:
 #[test]
 fn native_promoted_struct_global_preserves_zero_member_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @.air.lut.0 = private unnamed_addr addrspace(2) constant <{ [20 x [3 x [2 x i16]]], [12 x [3 x [2 x i16]]] }> <{ [20 x [3 x [2 x i16]]] zeroinitializer, [12 x [3 x [2 x i16]]] zeroinitializer }>
 define i16 @lut() {
 entry:
@@ -8058,7 +10170,7 @@ entry:
 #[test]
 fn native_inline_struct_global_gep_preserves_zero_member_index() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @.air.lut.0 = private unnamed_addr addrspace(2) constant <{ [20 x [3 x [2 x i16]]], [12 x [3 x [2 x i16]]] }> <{ [20 x [3 x [2 x i16]]] zeroinitializer, [12 x [3 x [2 x i16]]] zeroinitializer }>
 define i16 @read(ptr addrspace(2) %p) {
 entry:
@@ -8078,7 +10190,7 @@ entry:
 !2 = !{!3}
 !3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 2, !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"ushort", !"air.arg_name", !"out"}
 "#;
-    let spv = crate::native::emit_vulkan_spirv_inline_sroa(ll).expect("native emit");
+    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary construction");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
@@ -8087,7 +10199,7 @@ entry:
 #[test]
 fn native_member0_array_element_gep_from_flat_scalar_global_uses_view_indices() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @.air.lut.0 = private unnamed_addr addrspace(2) constant <{ [20 x [3 x [2 x i16]]], [12 x [3 x [2 x i16]]] }> <{ [20 x [3 x [2 x i16]]] zeroinitializer, [12 x [3 x [2 x i16]]] zeroinitializer }>
 define i16 @lut() {
 entry:
@@ -8113,7 +10225,7 @@ entry:
 #[test]
 fn native_gep_through_vector_yields_lane_pointer() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.uniform" = type { [2 x <4 x float>] }
 define float @lane(ptr addrspace(2) %u) {
 entry:
@@ -8130,7 +10242,7 @@ entry:
 #[test]
 fn native_gep_strips_nuw_nusw_flags() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::matrix.21" = type { [1 x <4 x float>] }
 define <4 x float> @matrix(ptr addrspace(2) %m) {
 entry:
@@ -8153,7 +10265,7 @@ fn native_parser_accepts_typed_null_pointer_literal() {
 #[test]
 fn native_global_byte_string_semicolon_is_not_comment() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 @bytes = internal unnamed_addr addrspace(2) constant [4 x i8] c"A;B\00", align 1
 
 define void @keep() {
@@ -8169,7 +10281,7 @@ entry:
 #[test]
 fn native_global_array_of_struct_constants_lowers() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Point = type { <2 x float>, <2 x float> }
 @points = private unnamed_addr addrspace(2) constant [2 x %struct.Point] [%struct.Point { <2 x float> <float 1.0, float 2.0>, <2 x float> <float 3.0, float 4.0> }, %struct.Point { <2 x float> <float 5.0, float 6.0>, <2 x float> <float 7.0, float 8.0> }], align 16
 
@@ -8184,7 +10296,7 @@ entry:
 }
 
 #[test]
-fn native_constant_selected_private_table_retypes_access_chain_after_folding() {
+fn native_constant_selected_private_table_preserves_access_chain_storage() {
     let ll = r#"
 target triple = "air64-apple-macosx14.0.0"
 @first = internal unnamed_addr addrspace(2) constant [2 x <2 x i8>] [<2 x i8> zeroinitializer, <2 x i8> <i8 1, i8 2>], align 2
@@ -8590,6 +10702,66 @@ entry:
 }
 
 #[test]
+fn native_wrapped_raw_buffer_vector_load_keeps_descriptor_provenance() {
+    let ll = r#"
+%S = type { [200 x i32], <3 x float> }
+%W = type { ptr addrspace(1) }
+
+define void @k(ptr addrspace(1) %src, ptr addrspace(1) %out) {
+entry:
+  %wrapped = insertvalue %W poison, ptr addrspace(1) %src, 0
+  %root = extractvalue %W %wrapped, 0
+  %ptr = getelementptr inbounds %S, ptr addrspace(1) %root, i64 0, i32 1
+  %value = load <3 x float>, ptr addrspace(1) %ptr, align 16
+  %lane = extractelement <3 x float> %value, i32 0
+  %byte_ptr = getelementptr inbounds i8, ptr addrspace(1) %root, i64 3
+  %byte = load i8, ptr addrspace(1) %byte_ptr, align 1
+  %wide = zext i8 %byte to i32
+  %as_float = uitofp i32 %wide to float
+  %sum = fadd float %lane, %as_float
+  store float %sum, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 1024, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_wrapped_raw_vector_provenance_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("OpCompositeConstruct"), "{asm}");
+    assert_eq!(
+        asm.lines()
+            .filter(|line| line.contains("Binding 0"))
+            .count(),
+        2,
+        "{asm}"
+    );
+    assert!(asm.contains("ArrayStride 16"), "{asm}");
+    assert!(asm.contains("ArrayStride 1"), "{asm}");
+    assert_eq!(
+        asm.lines().filter(|line| line.contains("OpLoad")).count(),
+        2,
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_raw_induction_phi_stays_raw_under_network_seed() {
     // A fully-RAW single-root pointer INDUCTION: a loop-carried phi whose arms are the raw buffer
     // root (via identity bitcast) and a forward GEP off the phi itself, dereferenced uniformly at
@@ -8665,7 +10837,155 @@ define void @raw_ptr_induction(ptr addrspace(1) noundef readonly captures(none) 
 }
 
 #[test]
-fn native_dead_null_storage_buffer_pointer_phi_prunes_before_final_normalization() {
+fn native_same_buffer_pointer_phi_is_constructed_as_an_index_phi() {
+    let ll = r#"
+define void @same_buffer_phi(ptr addrspace(1) noundef writeonly "air-buffer-no-alias" %out, ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, <3 x i32> %gid) local_unnamed_addr #0 {
+entry:
+  %x = extractelement <3 x i32> %gid, i64 0
+  %cond = icmp eq i32 %x, 0
+  br i1 %cond, label %left, label %right
+
+left:
+  %p0 = getelementptr inbounds float, ptr addrspace(1) %src, i64 1
+  br label %merge
+
+right:
+  %p1 = getelementptr inbounds float, ptr addrspace(1) %src, i64 2
+  br label %merge
+
+merge:
+  %p = phi ptr addrspace(1) [ %p0, %left ], [ %p1, %right ]
+  %v = load float, ptr addrspace(1) %p, align 4
+  store float %v, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @same_buffer_phi, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+"#;
+    let out = crate::translate_native_no_retry(ll, Stage::Kernel).expect("no-retry translate");
+    let asm = disassemble(&out).expect("disassemble");
+    assert!(
+        !asm.lines().any(|line| line.contains("OpPhi %_ptr_")),
+        "same-root pointer phi must be represented by its varying index:\n{asm}"
+    );
+    assert!(!asm.contains("VariablePointersStorageBuffer"), "{asm}");
+    let module = load_bytes(&out).expect("load emitted module");
+    let integer_types = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::TypeInt)
+        .filter_map(|instruction| instruction.result_id)
+        .collect::<HashSet<_>>();
+    assert!(
+        module.functions.iter().any(|function| function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| instruction.class.opcode == Op::Phi
+                && instruction
+                    .result_type
+                    .is_some_and(|ty| integer_types.contains(&ty)))),
+        "expected an integer index phi:\n{asm}"
+    );
+}
+
+#[test]
+fn native_select_fed_pointer_induction_is_constructed_in_the_index_domain() {
+    let ll = r#"
+define void @select_fed_pointer_induction(ptr addrspace(1) noundef writeonly "air-buffer-no-alias" %out, ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, <3 x i32> %gid) local_unnamed_addr #0 {
+entry:
+  %x = extractelement <3 x i32> %gid, i64 0
+  %count = and i32 %x, 7
+  %initial = zext i32 %count to i64
+  br label %loop
+
+loop:
+  %cursor = phi ptr addrspace(1) [ %next, %loop ], [ %src, %entry ]
+  %remaining = phi i64 [ %decremented, %loop ], [ %initial, %entry ]
+  %half = lshr i64 %remaining, 1
+  %middle = getelementptr inbounds i64, ptr addrspace(1) %cursor, i64 %half
+  %candidate = getelementptr inbounds i64, ptr addrspace(1) %middle, i64 1
+  %take = icmp ne i64 %half, 0
+  %next = select i1 %take, ptr addrspace(1) %candidate, ptr addrspace(1) %cursor
+  %decremented = add i64 %remaining, -1
+  %again = icmp sgt i64 %decremented, 0
+  br i1 %again, label %loop, label %exit
+
+exit:
+  %value = load i64, ptr addrspace(1) %next, align 8
+  store i64 %value, ptr addrspace(1) %out, align 8
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @select_fed_pointer_induction, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"ulong", !"air.arg_name", !"src"}
+!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
+"#;
+    let out = crate::translate_native_no_retry(ll, Stage::Kernel).expect("no-retry translate");
+    let asm = disassemble(&out).expect("disassemble");
+    let module = load_bytes(&out).expect("load emitted module");
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|instruction| {
+            (instruction.class.opcode == Op::TypePointer).then_some(instruction.result_id?)
+        })
+        .collect::<HashSet<_>>();
+    assert!(!module.all_inst_iter().any(|instruction| {
+        instruction.class.opcode == Op::Phi
+            && instruction
+                .result_type
+                .is_some_and(|ty| pointer_types.contains(&ty))
+    }));
+    assert!(!module.all_inst_iter().any(|instruction| {
+        instruction.class.opcode == Op::Select
+            && instruction
+                .result_type
+                .is_some_and(|ty| pointer_types.contains(&ty))
+    }));
+    assert!(!asm.contains("VariablePointersStorageBuffer"), "{asm}");
+    let integer_types = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::TypeInt)
+        .filter_map(|instruction| instruction.result_id)
+        .collect::<HashSet<_>>();
+    assert!(module.functions.iter().any(|function| function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .any(|instruction| instruction.class.opcode == Op::Phi
+            && instruction
+                .result_type
+                .is_some_and(|ty| integer_types.contains(&ty)))));
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_select_fed_pointer_induction_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create validation scratch");
+        let validation = tools::spirv_val_bytes(&out, &tmp);
+        std::fs::remove_dir_all(&tmp).expect("remove validation scratch");
+        validation.expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_dead_null_storage_buffer_pointer_phi_is_pruned_before_emission() {
     let ll = r#"
 define void @dead_null_phi(ptr addrspace(1) noundef writeonly "air-buffer-no-alias" %out, ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, <3 x i32> %gid) local_unnamed_addr #0 {
 entry:
@@ -8693,12 +11013,7 @@ merge:
 !4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"src"}
 !5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint3", !"air.arg_name", !"gid"}
 "#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_dead_null_phi_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let out = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let out = crate::translate_native_no_retry(ll, Stage::Kernel).expect("no-retry translate");
     let asm = disassemble(&out).expect("disassemble");
     assert!(!asm.contains("VariablePointersStorageBuffer"), "{asm}");
     assert!(
@@ -8711,14 +11026,20 @@ merge:
         .output()
         .is_ok()
     {
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_native_dead_null_phi_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create validation scratch");
         tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+        std::fs::remove_dir_all(&tmp).expect("remove validation scratch");
     }
 }
 
 #[test]
-fn native_forward_unmodeled_device_gep_phi_uses_placeholder_not_pointer_phi() {
+fn native_forward_unmodeled_device_gep_phi_uses_typed_zero_not_pointer_phi() {
     let ll = r#"
-target triple = "spirv-unknown-vulkan1.3"
+target triple = "spirv-unknown-vulkan1.2"
 %struct.Box = type { [3 x float], [3 x float] }
 %struct.Table = type { ptr addrspace(1), ptr addrspace(1) }
 
@@ -8761,8 +11082,10 @@ rhs:
         "unmodeled forward-GEP arms must not emit a pointer select:\n{asm}"
     );
     assert!(
-        asm.contains("OpTypePointer Private"),
-        "expected private placeholder backing for the unmodeled pointer:\n{asm}"
+        !asm.contains("OpTypePointer Private")
+            && asm.contains("OpConstantNull")
+            && asm.contains("OpCopyObject"),
+        "expected typed zero values without private pointer backing:\n{asm}"
     );
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -8977,6 +11300,51 @@ fn native_struct_layout_shape_mismatch_is_typed_sidecar_evidence() {
 }
 
 #[test]
+fn native_raw_metadata_mismatch_constructs_block_member_access() {
+    let ll = r#"
+target triple = "air64-apple-macosx14.0.0"
+
+define void @k(ptr addrspace(1) %out, ptr addrspace(2) %words) {
+entry:
+  %slot = getelementptr inbounds i32, ptr addrspace(2) %words, i64 236
+  %value = load i32, ptr addrspace(2) %slot, align 4
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 1024, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 1024, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"WordBlock", !"air.arg_name", !"words"}
+!5 = !{i32 0, i32 4, i32 256, !"uint", !"data"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_raw_metadata_block_access_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        asm.lines().any(|line| {
+            (line.contains("OpAccessChain") || line.contains("OpInBoundsAccessChain"))
+                && line.split_whitespace().count() == 7
+        }),
+        "{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn file_translation_threads_source_datalayout_into_emitted_offsets() {
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_source_datalayout_layout_{}",
@@ -9003,33 +11371,39 @@ fn file_translation_threads_source_datalayout_into_emitted_offsets() {
 }
 
 #[test]
-fn construct_tree_retry_three_lane_vector_member_advances_by_its_allocation_size() {
-    // The layout contract belongs to every candidate the retry cascade can adopt, not only the
-    // primary emit. `construct_tree` is the validation-gated tier the reproducing compositor
-    // fragment shader actually lands on.
+fn default_ownership_candidate_three_lane_vector_member_advances_by_allocation_size() {
+    // The layout contract belongs to every construction representation, not only the ordinary-plan
+    // subset. Construct-tree ownership is now selected per function by the primary
+    // emitter, so the primary candidate exercises the same layout seam without an identical re-emit.
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_vector_allocation_stride_retry_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
     let kern = meta::parse_air_kernel_meta(VECTOR_ALLOCATION_STRIDE_LL);
-    let retry = crate::retry::RetryCtx::new(
+    let construction = crate::construction::ConstructionCtx::new(
         VECTOR_ALLOCATION_STRIDE_LL,
         Stage::Kernel,
         None,
         None,
         kern.as_ref(),
-        None,
         Some("k"),
         &tmp,
         passes::TransformOptions::default(),
-        true,
         crate::layout::AirDataLayout::from_ir(VECTOR_ALLOCATION_STRIDE_LL)
             .expect("parse datalayout"),
     );
-    let spv = retry
-        .construct_tree_retry()
-        .expect("construct_tree candidate");
+    let emitted = crate::tools::emit_vulkan_spirv_with_sidecar(
+        VECTOR_ALLOCATION_STRIDE_LL,
+        &tmp,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("primary emission");
+    let spv = construction
+        .finish(emitted)
+        .expect("finished ownership candidate");
     let asm = disassemble(&spv).expect("disassemble");
     assert_eq!(
         three_lane_byte_vector_struct_offsets(&asm),

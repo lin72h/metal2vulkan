@@ -6,7 +6,7 @@
 //! same inventory, so a newly harvested `air.*` family cannot disappear behind an unrelated clean
 //! authored-resource audit.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
 /// Where the product intentionally handles an AIR intrinsic family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +35,52 @@ pub(crate) struct Matrix16Intrinsic {
     pub lhs: Matrix16Element,
     pub rhs: Matrix16Element,
     pub integer: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Matrix8Intrinsic {
+    pub result: Matrix16Element,
+    pub lhs: Matrix16Element,
+    pub rhs: Matrix16Element,
+    pub accumulator: Matrix16Element,
+}
+
+/// Parse the complete stable 8x8 matrix multiply-accumulate ABI grammar.
+pub(crate) fn matrix8_intrinsic(name: &str) -> Option<Matrix8Intrinsic> {
+    let fields: Vec<_> = name.split('.').collect();
+    if fields.len() != 6
+        || fields[0] != "air"
+        || fields[1] != "simdgroup_matrix_8x8_multiply_accumulate"
+    {
+        return None;
+    }
+    let result = matrix8_result_element(fields[2])?;
+    Some(Matrix8Intrinsic {
+        result,
+        lhs: matrix8_float_element(fields[3])?,
+        rhs: matrix8_float_element(fields[4])?,
+        accumulator: matrix8_float_element(fields[5])?,
+    })
+}
+
+fn matrix8_result_element(token: &str) -> Option<Matrix16Element> {
+    Some(match token {
+        "v64f32" => Matrix16Element::F32,
+        "v64f16" => Matrix16Element::F16,
+        _ => return None,
+    })
+}
+
+fn matrix8_float_element(token: &str) -> Option<Matrix16Element> {
+    Some(match token {
+        "v64f32" => Matrix16Element::F32,
+        "v64f16" => Matrix16Element::F16,
+        "v64bf16" => Matrix16Element::Bf16,
+        "v64f8e4m3" => Matrix16Element::F8E4M3,
+        "v64f8e4m3fn" => Matrix16Element::F8E4M3Fn,
+        "v64f8e5m2" => Matrix16Element::F8E5M2,
+        _ => return None,
+    })
 }
 
 /// Parse the complete stable 16x16x16 matrix ABI grammar shared by inventory and lowering.
@@ -105,129 +151,6 @@ pub fn air_call_counts(ll: &str) -> BTreeMap<String, usize> {
         }
     }
     calls
-}
-
-/// Whether the selected entry's direct source call graph reaches one of the exact AIR ABI symbols.
-///
-/// This intentionally parses only definition boundaries and direct callee symbols. It is the
-/// bounded pre-emission dual of the typed emitter graph: ordinary dead helpers are excluded, while
-/// module static initializers are roots because the emitter injects them into the entry. Indirect
-/// calls remain unsupported elsewhere and cannot silently prove a barrier-free graph here.
-pub(crate) fn entry_reaches_air_call(ll: &str, entry_name: Option<&str>, targets: &[&str]) -> bool {
-    // Most kernels have no barrier symbol at all. Keep their preflight allocation-free: besides
-    // avoiding needless work, this matters to the worker's peak-RSS contract for very large IR.
-    // A textual hit is only a reason to build the exact graph below, never evidence by itself.
-    if !targets
-        .iter()
-        .any(|target| llvm_global_symbol_spelling_may_occur(ll, target))
-    {
-        return false;
-    }
-
-    #[derive(Default)]
-    struct FunctionCalls {
-        callees: Vec<String>,
-        reaches_target_directly: bool,
-    }
-
-    let mut functions = HashMap::<String, FunctionCalls>::new();
-    let mut current = None::<(String, FunctionCalls)>;
-    let mut first_function = None;
-    for line in ll.lines() {
-        let trimmed = strip_llvm_comment(line).trim();
-        if current.is_none() && trimmed.starts_with("define ") {
-            let Some(name) = global_symbol_after_at(trimmed) else {
-                continue;
-            };
-            first_function.get_or_insert_with(|| name.clone());
-            current = Some((name, FunctionCalls::default()));
-            continue;
-        }
-        let Some((_, calls)) = current.as_mut() else {
-            continue;
-        };
-        if trimmed == "}" {
-            let (name, calls) = current.take().expect("current function");
-            functions.insert(name, calls);
-            continue;
-        }
-        for callee in direct_callees(trimmed) {
-            if targets.contains(&callee.as_str()) {
-                calls.reaches_target_directly = true;
-            }
-            calls.callees.push(callee);
-        }
-    }
-
-    let Some(entry_name) = entry_name.map(str::to_string).or(first_function) else {
-        return false;
-    };
-    let mut pending = vec![entry_name.clone()];
-    let mut reachable = HashSet::from([entry_name]);
-    for name in functions.keys() {
-        if name.starts_with("_GLOBAL__sub_I") && reachable.insert(name.clone()) {
-            pending.push(name.clone());
-        }
-    }
-    while let Some(name) = pending.pop() {
-        let Some(calls) = functions.get(&name) else {
-            continue;
-        };
-        if calls.reaches_target_directly {
-            return true;
-        }
-        for callee in &calls.callees {
-            if functions.contains_key(callee) && reachable.insert(callee.clone()) {
-                pending.push(callee.clone());
-            }
-        }
-    }
-    false
-}
-
-/// Allocation-free prefilter for an LLVM global symbol in plain or quoted/hex-escaped spelling.
-/// False positives are harmless because the exact function graph remains authoritative; false
-/// negatives would skip that graph and are therefore forbidden.
-fn llvm_global_symbol_spelling_may_occur(ll: &str, target: &str) -> bool {
-    if ll.contains(target) {
-        return true;
-    }
-    ll.match_indices("@\"")
-        .any(|(offset, _)| quoted_symbol_matches(&ll[offset + 2..], target.as_bytes()))
-}
-
-fn quoted_symbol_matches(mut quoted: &str, target: &[u8]) -> bool {
-    for expected in target {
-        let bytes = quoted.as_bytes();
-        let Some(&first) = bytes.first() else {
-            return false;
-        };
-        let (actual, consumed) = if first == b'\\' {
-            let (Some(&hi), Some(&lo)) = (bytes.get(1), bytes.get(2)) else {
-                return false;
-            };
-            let (Some(hi), Some(lo)) = (hex_nibble(hi), hex_nibble(lo)) else {
-                return false;
-            };
-            ((hi << 4) | lo, 3)
-        } else {
-            (first, 1)
-        };
-        if actual != *expected {
-            return false;
-        }
-        quoted = &quoted[consumed..];
-    }
-    quoted.starts_with('"')
-}
-
-const fn hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn direct_callees(line: &str) -> Vec<String> {
@@ -409,6 +332,43 @@ fn any_prefix(name: &str, prefixes: &[&str]) -> bool {
     prefixes.iter().any(|prefix| name.starts_with(prefix))
 }
 
+/// Stable AIR ABI families whose operands or results are opaque Metal image handles. These values
+/// cannot be represented as generic LLVM pointer state without losing the image descriptor identity
+/// required by SPIR-V image operations.
+pub(crate) fn air_image_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "air.calculate_unclamped_lod_texture_2d" | "air.calculate_clamped_lod_texture_2d"
+    ) || any_prefix(
+        name,
+        &[
+            "air.fence_texture",
+            "air.sample_texture",
+            "air.sample_depth",
+            "air.sample_compare_depth",
+            "air.gather_texture",
+            "air.gather_depth",
+            "air.read_texture",
+            "air.read_depth",
+            "air.write_texture",
+            "air.atomic_fetch_max_explicit_texture_",
+            "air.write_imageblock_slice_to_texture",
+            "air.get_width_texture",
+            "air.get_height_texture",
+            "air.get_depth_texture",
+            "air.get_array_size_texture",
+            "air.get_width_depth",
+            "air.get_height_depth",
+            "air.get_depth_depth",
+            "air.get_num_mip_levels_texture",
+            "air.get_num_mip_levels_depth",
+            "air.get_num_samples_texture",
+            "air.is_null_texture",
+            "air.get_null_texture",
+        ],
+    )
+}
+
 pub(crate) fn is_command_encoder_helper(name: &str) -> bool {
     matches!(
         name,
@@ -445,6 +405,10 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
         return Some(LoweredOrStaticLinkage);
     }
 
+    if name == "air.get_descriptor_size_tensor" {
+        return Some(Lowered);
+    }
+
     if any_prefix(
         name,
         &[
@@ -458,9 +422,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
             | "air.get_function_pointer_visible_function_table"
             | "air.is_null_visible_function_table"
             // Inline tensor descriptors are opaque Apple ABI objects consumed by externally-defined
-            // tensor-ops helpers. They must be supplied in the same exact authored linkage unit;
-            // lowering only these calls would invent a layout the linked consumer does not share.
-            | "air.get_descriptor_size_tensor"
+            // tensor-ops helpers. They must be supplied in the same exact authored linkage unit.
             | "air.get_extent_private_tensor.i32"
             | "air.init_strided_private_tensor.i32.global"
             | "air.init_strided_private_tensor.i32.local"
@@ -522,61 +484,41 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
             | "air.get_instance_count_instance_acceleration_structure"
             | "air.get_primitive_acceleration_structure_instance_acceleration_structure"
             | "air.get_data_pointer_instance_acceleration_structure"
-            | "air.calculate_unclamped_lod_texture_2d"
-            | "air.calculate_clamped_lod_texture_2d"
             | "air.imageblock_data"
             | "air.rhadd.u.i16"
     ) {
         return Some(Lowered);
     }
 
-    if any_prefix(
-        name,
-        &[
-            "air.load.device_coherent.",
-            "air.load.system_coherent.",
-            "air.store.device_coherent.",
-            "air.store.system_coherent.",
-            "air.fence_texture",
-            "air.sample_texture",
-            "air.sample_depth",
-            "air.sample_compare_depth",
-            "air.gather_texture",
-            "air.gather_depth",
-            "air.read_texture",
-            "air.read_depth",
-            "air.write_texture",
-            "air.atomic_fetch_max_explicit_texture_",
-            "air.write_imageblock_slice_to_texture",
-            "air.load.implicit_imageblock.",
-            "air.store.implicit_imageblock.",
-            "air.discard_fragment",
-            "air.get_width_texture",
-            "air.get_height_texture",
-            "air.get_depth_texture",
-            "air.get_array_size_texture",
-            "air.get_width_depth",
-            "air.get_height_depth",
-            "air.get_depth_depth",
-            "air.get_num_mip_levels_texture",
-            "air.get_num_mip_levels_depth",
-            "air.get_num_samples_texture",
-            "air.is_null_texture",
-            "air.get_null_texture",
-            "air.map_screen_to_physical_coordinates.",
-            "air.map_physical_to_screen_coordinates.",
-            "air.simdgroup_matrix_8x8_load.",
-            "air.simdgroup_matrix_8x8_store.",
-            "air.simdgroup_matrix_8x8_init_diag.",
-            "air.simdgroup_matrix_8x8_multiply_accumulate.",
-            "air.simdgroup_async_copy_2d.",
-            "air.get_null_simdgroup_event",
-            "air.is_null_simdgroup_event",
-            "air.wait_simdgroup_events",
-            "air.function_constant_predicate",
-            "air.normalize_function_constant_predicate.",
-        ],
-    ) {
+    if air_image_intrinsic(name)
+        || any_prefix(
+            name,
+            &[
+                "air.load.device_coherent.",
+                "air.load.system_coherent.",
+                "air.store.device_coherent.",
+                "air.store.system_coherent.",
+                "air.load.implicit_imageblock.",
+                "air.store.implicit_imageblock.",
+                "air.discard_fragment",
+                "air.map_screen_to_physical_coordinates.",
+                "air.map_physical_to_screen_coordinates.",
+                "air.simdgroup_matrix_8x8_load.",
+                "air.simdgroup_matrix_8x8_store.",
+                "air.simdgroup_matrix_8x8_init_diag.",
+                "air.simdgroup_async_copy_2d.",
+                "air.get_null_simdgroup_event",
+                "air.is_null_simdgroup_event",
+                "air.wait_simdgroup_events",
+                "air.function_constant_predicate",
+                "air.normalize_function_constant_predicate.",
+            ],
+        )
+    {
+        return Some(Lowered);
+    }
+
+    if matrix8_intrinsic(name).is_some() {
         return Some(Lowered);
     }
 
@@ -741,6 +683,10 @@ mod tests {
         assert_eq!(air_intrinsic_disposition("air.anything.v4i1"), None);
         assert_eq!(air_intrinsic_disposition("air.tensor_future.i32"), None);
         assert_eq!(
+            air_intrinsic_disposition("air.get_descriptor_size_tensor"),
+            Some(AirIntrinsicDisposition::Lowered)
+        );
+        assert_eq!(
             air_intrinsic_disposition("air.init_strided_private_tensor.i32.local"),
             Some(AirIntrinsicDisposition::StaticLinkage)
         );
@@ -749,6 +695,17 @@ mod tests {
             air_intrinsic_disposition("air.set_kernel_buffer_compute_command.p1i8"),
             Some(AirIntrinsicDisposition::Lowered)
         );
+    }
+
+    #[test]
+    fn image_handle_families_are_classified_by_the_shared_abi_predicate() {
+        assert!(air_image_intrinsic("air.write_texture_2d.i16.v4f32"));
+        assert!(air_image_intrinsic("air.sample_compare_depth_2d.f32"));
+        assert!(air_image_intrinsic(
+            "air.calculate_unclamped_lod_texture_2d"
+        ));
+        assert!(!air_image_intrinsic("air.texture_future"));
+        assert!(!air_image_intrinsic("air.atomic.global.add.u.i32"));
     }
 
     #[test]
@@ -796,6 +753,39 @@ mod tests {
     }
 
     #[test]
+    fn matrix8_recognition_requires_the_complete_known_abi_shape() {
+        let bfloat = "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64bf16.v64bf16.v64f32";
+        assert_eq!(
+            matrix8_intrinsic(bfloat),
+            Some(Matrix8Intrinsic {
+                result: Matrix16Element::F32,
+                lhs: Matrix16Element::Bf16,
+                rhs: Matrix16Element::Bf16,
+                accumulator: Matrix16Element::F32,
+            })
+        );
+        let float8 =
+            "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64f8e5m2.v64f8e5m2.v64f32";
+        assert_eq!(
+            matrix8_intrinsic(float8),
+            Some(Matrix8Intrinsic {
+                result: Matrix16Element::F32,
+                lhs: Matrix16Element::F8E5M2,
+                rhs: Matrix16Element::F8E5M2,
+                accumulator: Matrix16Element::F32,
+            })
+        );
+        assert!(matrix8_intrinsic(
+            "air.simdgroup_matrix_8x8_multiply_accumulate.v64f32.v64future.v64f16.v64f32"
+        )
+        .is_none());
+        assert!(matrix8_intrinsic(
+            "air.simdgroup_matrix_8x8_multiply_accumulate.v64future.v64f16.v64f16.v64f32"
+        )
+        .is_none());
+    }
+
+    #[test]
     fn call_inventory_ignores_non_callees_and_counts_all_call_forms() {
         let ll = "define void @main() {\nentry:\n %a = call i32 @air.abs.s.i32(i32 -1)\n %b = tail call i32 @air.future_tensor.i32(i32 1)\n %c = musttail\tcall i32 @air.future_tensor.i32(i32 2)\n %d = invoke i32 @\"air.quoted_future.i32\"(i32 3) to label %ok unwind label %err\n callbr void @air.branch_future() to label %ok [label %err]\n call void @ordinary(ptr @air.declaration_only.i32) ; @air.comment_only\n ret void\n}\ndefine void @compact() { %x = call i32 @air.compact_future(i32 0) ret void }\ndeclare i32 @air.declaration_only.i32(i32)";
         assert_eq!(
@@ -817,55 +807,5 @@ mod tests {
                 ("air.quoted_future.i32".into(), 1),
             ])
         );
-    }
-
-    #[test]
-    fn entry_call_graph_excludes_dead_helpers_and_includes_static_initializers() {
-        let ll = r#"
-define void @entry() {
-  call void @live_helper()
-  ret void
-}
-define internal void @live_helper() {
-  ret void
-}
-define internal void @dead_helper() {
-  call void @air.wg.barrier(i32 0, i32 1)
-  ret void
-}
-define internal void @"_GLOBAL__sub_I.quoted"() {
-  call void @"air.simdgroup.barrier"(i32 0, i32 1)
-  ret void
-}
-"#;
-        assert!(!entry_reaches_air_call(
-            ll,
-            Some("entry"),
-            &["air.wg.barrier"]
-        ));
-        assert!(entry_reaches_air_call(
-            ll,
-            Some("entry"),
-            &["air.simdgroup.barrier"]
-        ));
-    }
-
-    #[test]
-    fn entry_call_graph_follows_reachable_quoted_helpers() {
-        let ll = r#"
-define void @entry() {
-  call void @"helper\2Ebarrier"()
-  ret void
-}
-define internal void @"helper.barrier"() {
-  call void @"air\2Ewg\2Ebarrier"(i32 0, i32 1)
-  ret void
-}
-"#;
-        assert!(entry_reaches_air_call(
-            ll,
-            Some("entry"),
-            &["air.wg.barrier"]
-        ));
     }
 }

@@ -636,6 +636,224 @@ pub(in crate::passes) fn retype_demoted_copymemory_placeholder(ctx: &mut Ctx, en
     }
 }
 
+/// Give a null-initialized module-scope Private placeholder the single object type established by
+/// all of its direct loads and stores. Opaque LLVM pointers can leave such a variable declared as
+/// `uchar` even though the complete retained use graph consistently accesses (for example) a
+/// vector. Private storage cannot express byte pointer arithmetic, so the object declaration,
+/// pointer type, and initializer must be constructed as that value type together.
+///
+/// Any address-taking use, qualified memory operation, conflicting value type, or non-null
+/// initializer leaves the variable untouched. The decision is module-wide because a retained helper
+/// can own the only load while the entry owns the variable indirectly.
+pub(in crate::passes) fn retype_private_direct_memory_placeholders(ctx: &mut Ctx) {
+    let definitions = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+        .filter_map(|instruction| {
+            instruction
+                .result_id
+                .map(|result| (result, instruction.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let value_types = ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+        .chain(ctx.module.functions.iter().flat_map(|function| {
+            function
+                .parameters
+                .iter()
+                .chain(function.blocks.iter().flat_map(|block| &block.instructions))
+        }))
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+        .collect::<HashMap<_, _>>();
+    let variables = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter(|instruction| {
+            instruction.class.opcode == Op::Variable
+                && instruction.operands.first()
+                    == Some(&Operand::StorageClass(StorageClass::Private))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let variable_ids = variables
+        .iter()
+        .filter_map(|variable| variable.result_id)
+        .collect::<HashSet<_>>();
+    let mut uses = HashMap::<Word, Vec<(Instruction, usize)>>::new();
+    for instruction in ctx
+        .module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+    {
+        let mut references = HashMap::<Word, usize>::new();
+        for id in instruction
+            .operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) if variable_ids.contains(id) => Some(*id),
+                _ => None,
+            })
+        {
+            *references.entry(id).or_default() += 1;
+        }
+        for (variable, count) in references {
+            uses.entry(variable)
+                .or_default()
+                .push((instruction.clone(), count));
+        }
+    }
+    let mut plans = Vec::new();
+    for variable in &variables {
+        let (Some(variable_id), Some(pointer_ty), Some(Operand::IdRef(initializer))) = (
+            variable.result_id,
+            variable.result_type,
+            variable.operands.get(1),
+        ) else {
+            continue;
+        };
+        let Some(old_pointee) = ptr_pointee(&definitions, pointer_ty) else {
+            continue;
+        };
+        if !definitions.get(initializer).is_some_and(|instruction| {
+            instruction.class.opcode == Op::ConstantNull
+                && instruction.result_type == Some(old_pointee)
+        }) {
+            continue;
+        }
+
+        let mut object_ty = None;
+        let mut saw_use = false;
+        let mut compatible = true;
+        for (instruction, references) in uses.get(&variable_id).into_iter().flatten() {
+            saw_use = true;
+            let inferred = match instruction.class.opcode {
+                Op::Load
+                    if *references == 1
+                        && instruction.operands.len() == 1
+                        && instruction.operands.first() == Some(&Operand::IdRef(variable_id)) =>
+                {
+                    instruction.result_type
+                }
+                Op::Store
+                    if *references == 1
+                        && instruction.operands.len() == 2
+                        && instruction.operands.first() == Some(&Operand::IdRef(variable_id)) =>
+                {
+                    instruction
+                        .operands
+                        .get(1)
+                        .and_then(|operand| match operand {
+                            Operand::IdRef(object) => value_types.get(object).copied(),
+                            _ => None,
+                        })
+                }
+                _ => None,
+            };
+            let Some(inferred) = inferred else {
+                compatible = false;
+                break;
+            };
+            if object_ty.is_some_and(|known| known != inferred) {
+                compatible = false;
+                break;
+            }
+            object_ty = Some(inferred);
+        }
+        if compatible && saw_use {
+            if let Some(object_ty) = object_ty.filter(|object_ty| *object_ty != old_pointee) {
+                plans.push((variable_id, object_ty));
+            }
+        }
+    }
+
+    for (variable_id, object_ty) in plans {
+        let Some(mut variable_pos) = ctx
+            .module
+            .types_global_values
+            .iter()
+            .position(|instruction| instruction.result_id == Some(variable_id))
+        else {
+            continue;
+        };
+        let pointer_ty = ctx
+            .module
+            .types_global_values
+            .iter()
+            .take(variable_pos)
+            .find(|instruction| {
+                instruction.class.opcode == Op::TypePointer
+                    && instruction.operands
+                        == [
+                            Operand::StorageClass(StorageClass::Private),
+                            Operand::IdRef(object_ty),
+                        ]
+            })
+            .and_then(|instruction| instruction.result_id)
+            .unwrap_or_else(|| {
+                let pointer_ty = ctx.module.fresh_id();
+                ctx.module.types_global_values.insert(
+                    variable_pos,
+                    type_inst(
+                        Op::TypePointer,
+                        pointer_ty,
+                        vec![
+                            Operand::StorageClass(StorageClass::Private),
+                            Operand::IdRef(object_ty),
+                        ],
+                    ),
+                );
+                variable_pos += 1;
+                ctx.struct_cache.insert(
+                    (
+                        Op::TypePointer,
+                        None,
+                        vec![
+                            Operand::StorageClass(StorageClass::Private),
+                            Operand::IdRef(object_ty),
+                        ],
+                    ),
+                    pointer_ty,
+                );
+                pointer_ty
+            });
+        let initializer = ctx
+            .module
+            .types_global_values
+            .iter()
+            .take(variable_pos)
+            .find(|instruction| {
+                instruction.class.opcode == Op::ConstantNull
+                    && instruction.result_type == Some(object_ty)
+            })
+            .and_then(|instruction| instruction.result_id)
+            .unwrap_or_else(|| {
+                let initializer = ctx.module.fresh_id();
+                ctx.module.types_global_values.insert(
+                    variable_pos,
+                    Instruction::new(Op::ConstantNull, Some(object_ty), Some(initializer), vec![]),
+                );
+                variable_pos += 1;
+                ctx.struct_cache
+                    .insert((Op::ConstantNull, Some(object_ty), vec![]), initializer);
+                initializer
+            });
+        let variable = &mut ctx.module.types_global_values[variable_pos];
+        variable.result_type = Some(pointer_ty);
+        variable.operands = vec![
+            Operand::StorageClass(StorageClass::Private),
+            Operand::IdRef(initializer),
+        ];
+    }
+}
+
 /// Rewrite an INVALID `OpInBoundsAccessChain`/`OpAccessChain` `base [stride, descent…]` whose FIRST
 /// index is an LLVM-GEP pointer STRIDE over the base pointee (`getelementptr T, ptr %p, i64 N, …` — N
 /// strides whole `T`s) into an `OpPtrAccessChain`, for StorageBuffer/Workgroup/PSB bases where that op
@@ -979,4 +1197,158 @@ pub(in crate::passes) fn direct_scalar_width(ctx: &Ctx, ty: Word) -> Option<u32>
         },
         _ => None,
     })
+}
+
+/// Lower a scalar store through a thread-local aggregate pointer to the aggregate's first scalar
+/// leaf. LLVM opaque-pointer bitcasts preserve the address while changing only the dereference type;
+/// after interface/private-placeholder reconstruction the SPIR-V value can still carry the original
+/// aggregate pointer type. The zero-index descent names that same prefix address, and an equal-width
+/// scalar bitcast preserves the stored bits exactly.
+pub(in crate::passes) fn rewrite_thread_local_aggregate_prefix_stores(
+    ctx: &mut Ctx,
+    function_idx: usize,
+) {
+    let value_types = function_value_types(ctx, function_idx);
+    let mut pointer_types = HashMap::new();
+    for instruction in ctx
+        .new_globals
+        .iter()
+        .chain(ctx.module.types_global_values.iter())
+    {
+        if instruction.class.opcode != Op::TypePointer {
+            continue;
+        }
+        if let (
+            Some(pointer_ty),
+            Some(Operand::StorageClass(storage)),
+            Some(Operand::IdRef(pointee)),
+        ) = (
+            instruction.result_id,
+            instruction.operands.first(),
+            instruction.operands.get(1),
+        ) {
+            pointer_types.insert(pointer_ty, (*storage, *pointee));
+        }
+    }
+
+    #[derive(Clone)]
+    struct Plan {
+        pointer: Word,
+        object: Word,
+        object_ty: Word,
+        leaf_ty: Word,
+        storage: StorageClass,
+        depth: usize,
+        trailing_operands: Vec<Operand>,
+    }
+
+    let first_scalar = |mut ty: Word| {
+        for depth in 0..=8 {
+            if direct_scalar_width(ctx, ty).is_some() {
+                return Some((ty, depth));
+            }
+            let definition = type_def_of(ctx, ty)?;
+            if !matches!(
+                definition.class.opcode,
+                Op::TypeStruct
+                    | Op::TypeArray
+                    | Op::TypeRuntimeArray
+                    | Op::TypeVector
+                    | Op::TypeMatrix
+            ) {
+                return None;
+            }
+            let Operand::IdRef(first) = definition.operands.first()? else {
+                return None;
+            };
+            ty = *first;
+        }
+        None
+    };
+
+    let mut plans = HashMap::new();
+    for (block_idx, block) in ctx.module.functions[function_idx].blocks.iter().enumerate() {
+        for (instruction_idx, instruction) in block.instructions.iter().enumerate() {
+            if instruction.class.opcode != Op::Store || instruction.operands.len() < 2 {
+                continue;
+            }
+            let (Operand::IdRef(pointer), Operand::IdRef(object)) =
+                (&instruction.operands[0], &instruction.operands[1])
+            else {
+                continue;
+            };
+            let Some(pointer_ty) = value_types.get(pointer).copied() else {
+                continue;
+            };
+            let Some(&(storage, pointee)) = pointer_types.get(&pointer_ty) else {
+                continue;
+            };
+            if !matches!(storage, StorageClass::Private | StorageClass::Function) {
+                continue;
+            }
+            let Some(object_ty) = value_types.get(object).copied() else {
+                continue;
+            };
+            let Some((leaf_ty, depth)) = first_scalar(pointee) else {
+                continue;
+            };
+            if depth == 0
+                || direct_scalar_width(ctx, object_ty) != direct_scalar_width(ctx, leaf_ty)
+            {
+                continue;
+            }
+            plans.insert(
+                (block_idx, instruction_idx),
+                Plan {
+                    pointer: *pointer,
+                    object: *object,
+                    object_ty,
+                    leaf_ty,
+                    storage,
+                    depth,
+                    trailing_operands: instruction.operands[2..].to_vec(),
+                },
+            );
+        }
+    }
+
+    let zero = ctx.const_uint(0);
+    for block_idx in 0..ctx.module.functions[function_idx].blocks.len() {
+        let old = ctx.module.functions[function_idx].blocks[block_idx]
+            .instructions
+            .clone();
+        let mut rewritten = Vec::with_capacity(old.len());
+        for (instruction_idx, instruction) in old.into_iter().enumerate() {
+            let Some(plan) = plans.get(&(block_idx, instruction_idx)) else {
+                rewritten.push(instruction);
+                continue;
+            };
+            let pointer_ty = ctx.ty_ptr(plan.storage, plan.leaf_ty);
+            let leaf_pointer = ctx.module.fresh_id();
+            let mut operands = vec![Operand::IdRef(plan.pointer)];
+            operands.extend((0..plan.depth).map(|_| Operand::IdRef(zero)));
+            rewritten.push(Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(pointer_ty),
+                Some(leaf_pointer),
+                operands,
+            ));
+            let value = if plan.object_ty == plan.leaf_ty {
+                plan.object
+            } else {
+                let value = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::Bitcast,
+                    Some(plan.leaf_ty),
+                    Some(value),
+                    vec![Operand::IdRef(plan.object)],
+                ));
+                value
+            };
+            let mut operands = vec![Operand::IdRef(leaf_pointer), Operand::IdRef(value)];
+            operands.extend(plan.trailing_operands.iter().cloned());
+            rewritten.push(Instruction::new(Op::Store, None, None, operands));
+        }
+        ctx.module.functions[function_idx].blocks[block_idx].instructions = rewritten;
+    }
 }

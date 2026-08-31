@@ -47,17 +47,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 # public Rustdoc, including feature-gated APIs (CI denies warnings)
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
 
-# unit + integration tests (serial)
-cargo test -p metal2vulkan -- --test-threads=1
+# unit + integration tests (Cargo defaults to the available logical CPU count)
+cargo test -p metal2vulkan
 
 # optional validation package
-cargo test -p metal2vulkan-validation -- --test-threads=1
+cargo test -p metal2vulkan-validation
 ```
 
 External tools used by some paths: `llvm-dis`, `spirv-val` (and friends). On macOS with Homebrew:
 
 ```sh
-PATH=/opt/homebrew/opt/llvm/bin:$PATH cargo test -p metal2vulkan -- --test-threads=1
+PATH=/opt/homebrew/opt/llvm/bin:$PATH cargo test -p metal2vulkan
 ```
 
 GPU-free byte A/B is provided by `corpus-ab` in the validation crate.
@@ -93,7 +93,7 @@ Quick anchors:
 
 ```sh
 # always
-cargo test -p metal2vulkan -- --test-threads=1
+cargo test -p metal2vulkan
 
 # before/after a byte-stable refactor
 cp target/release/metal2vulkan ./m2v-old

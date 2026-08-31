@@ -154,6 +154,7 @@ pub fn unsupported_reflection_requirements(
                         | ReflectedTextureFormat::R16f
                         | ReflectedTextureFormat::R16ui
                         | ReflectedTextureFormat::Rg16f
+                        | ReflectedTextureFormat::Rg32f
                         | ReflectedTextureFormat::R32i
                         | ReflectedTextureFormat::R32f
                         | ReflectedTextureFormat::R32ui
@@ -468,6 +469,7 @@ pub fn require_case(case: &AuthoredCase, executor: &str) -> Result<(), String> {
         Stage::Fragment | Stage::Vertex => {
             if case.render_targets.is_empty()
                 && case.depth_stencil.is_none()
+                && !(case.stage == Stage::Fragment && matches!(case.output, OutputSelection::None))
                 && !case.is_rasterization_disabled_vertex()
             {
                 return Err(format!(
@@ -552,6 +554,7 @@ mod tests {
                 initial_bytes_b64: Some("q6urqw==".into()),
             }],
             argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
             threadgroup_memory: vec![],
             imageblock: None,
             fragment_imageblock: None,
@@ -711,6 +714,19 @@ mod tests {
             dimensions: [2, 2],
         };
         assert!(require_case(&case, "test executor").is_ok());
+
+        let mut attachmentless = case.clone();
+        attachmentless.render_targets.clear();
+        attachmentless.output = OutputSelection::None;
+        assert!(require_case(&attachmentless, "test executor").is_ok());
+        attachmentless.output = OutputSelection::Buffer {
+            binding: 0,
+            offset: 0,
+            length: 4,
+        };
+        assert!(require_case(&attachmentless, "test executor")
+            .unwrap_err()
+            .contains("at least one attachment"));
 
         case.render_targets.push(RenderTargetResource {
             index: 1,

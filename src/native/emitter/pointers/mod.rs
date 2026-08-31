@@ -63,12 +63,37 @@ fn pointer_arithmetic_access_chain_op_for_storage(
     if scalar_pointee
         && ptr_access_chain_allowed_storage(storage)
         && !base_is_indexed_container
+        && !indices.is_empty()
         && indices.first().and_then(|idx| const_index(Some(idx))) != Some(0)
     {
         Op::PtrAccessChain
     } else {
         Op::InBoundsAccessChain
     }
+}
+
+fn structural_pointer_index(
+    position: usize,
+    selected_ty: &mut LlType,
+    index: &TypedValue,
+    first_index_is_pointer_arithmetic: bool,
+) -> Option<bool> {
+    if position == 0 && first_index_is_pointer_arithmetic {
+        return Some(false);
+    }
+    if position == 0 && const_index(Some(index)) == Some(0) {
+        return Some(true);
+    }
+    if let LlType::Struct(fields) = selected_ty {
+        let member = const_index(Some(index))? as usize;
+        *selected_ty = fields.get(member)?.clone();
+        return Some(true);
+    }
+    *selected_ty = match selected_ty.clone() {
+        LlType::Array(element, _) | LlType::Vector(element, _) => *element,
+        other => other,
+    };
+    Some(false)
 }
 
 #[cfg(test)]
@@ -78,14 +103,67 @@ mod pointee_upgrade_tests {
     //! default-off byte→real / whole-vs-part / reinterpret flags upgrade a pointer's pointee; getting
     //! the shape test wrong would silently mis-upgrade (or fail to upgrade) at the `pointer_pointee_for_value`
     //! seam. Pure functions on already-resolved `LlType`s, so no emitter state is needed.
-    use super::{is_scalar_pointee, reinterp_compatible, scalar_bit_width, whole_part_widens};
-    use crate::native::ir::LlType;
+    use super::{
+        is_scalar_pointee, reinterp_compatible, scalar_bit_width, structural_pointer_index,
+        whole_part_widens,
+    };
+    use crate::native::ir::{LlType, LlValue, TypedValue};
 
     fn vec(elem: LlType, n: u32) -> LlType {
         LlType::Vector(Box::new(elem), n)
     }
     fn arr(elem: LlType, n: u32) -> LlType {
         LlType::Array(Box::new(elem), n)
+    }
+
+    #[test]
+    fn struct_pointer_indices_remain_literals() {
+        let mut selected = LlType::Struct(vec![arr(LlType::Float, 4)]);
+        let zero = TypedValue {
+            ty: LlType::Int(32),
+            value: LlValue::Int(0),
+        };
+        assert_eq!(
+            structural_pointer_index(0, &mut selected, &zero, false),
+            Some(true)
+        );
+        assert_eq!(
+            structural_pointer_index(1, &mut selected, &zero, false),
+            Some(true)
+        );
+        assert_eq!(selected, arr(LlType::Float, 4));
+
+        let dynamic = TypedValue {
+            ty: LlType::Int(64),
+            value: LlValue::Local("%index".into()),
+        };
+        assert_eq!(
+            structural_pointer_index(2, &mut selected, &dynamic, false),
+            Some(false)
+        );
+        assert_eq!(selected, LlType::Float);
+
+        let mut structure = LlType::Struct(vec![LlType::Float]);
+        assert_eq!(
+            structural_pointer_index(1, &mut structure, &dynamic, false),
+            None
+        );
+
+        let member_one = TypedValue {
+            ty: LlType::Int(32),
+            value: LlValue::Int(1),
+        };
+        let mut normalized_structure = LlType::Struct(vec![LlType::Int(32), LlType::Float]);
+        assert_eq!(
+            structural_pointer_index(0, &mut normalized_structure, &member_one, false),
+            Some(true)
+        );
+        assert_eq!(normalized_structure, LlType::Float);
+        let mut normalized_structure = LlType::Struct(vec![LlType::Float]);
+        assert_eq!(
+            structural_pointer_index(0, &mut normalized_structure, &dynamic, false),
+            None
+        );
     }
 
     #[test]

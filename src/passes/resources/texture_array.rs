@@ -236,7 +236,8 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
                 ctx.register_runtime_storage_image_value(handle, metal_index, Some(state));
             }
         }
-        // The original load's pointer operand becomes dead; record its id for the sweep.
+        // The original load's pointer operand becomes dead; record its id as part of this binding
+        // transaction's replaced representation.
         if let Some(load) = defs.get(&handle) {
             if let Some(Operand::IdRef(old_ptr)) = load.operands.first() {
                 if *old_ptr != arrayvar {
@@ -245,6 +246,11 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
             }
         }
     }
+    // Binding an AIR texture-array handle replaces the pointer-shaped view of that exact resource
+    // root. Include the bound descriptor variable itself so the transaction also reaches parallel
+    // stale projections which no longer feed the rewritten handle load. Newly constructed descriptor
+    // accesses share the root but remain live through their image loads and are therefore retained.
+    dead_roots.extend(handles.values().map(|(arrayvar, _)| *arrayvar));
 
     // Opaque pointer loads that the generic emitter cannot type are represented by a Private
     // placeholder variable. Such an id has no function instruction to retype, so materialize the
@@ -310,7 +316,7 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
     for (block_idx, blk) in func.blocks.iter_mut().enumerate() {
         let mut rebuilt: Vec<Instruction> =
             Vec::with_capacity(blk.instructions.len() + handles.len());
-        for (inst_idx, inst) in blk.instructions.drain(..).enumerate() {
+        for (inst_idx, inst) in blk.instructions.clone().into_iter().enumerate() {
             if let Some((chain, load, image)) = placeholder_uses.remove(&(block_idx, inst_idx)) {
                 rebuilt.push(chain);
                 rebuilt.push(load);
@@ -346,10 +352,10 @@ pub(crate) fn materialize_texture_array_loads(ctx: &mut Ctx, entry_idx: usize) {
         .local_pointer_dynamic_field_loads
         .retain(|fact| !handles.contains_key(&fact.id));
 
-    // 4. Sweep the now-dead pointer derivations (the old access chains + any bitcast/copyobject alias
-    //    of the array pointer). A pure pointer-derivation with no remaining use is safe to delete; run
-    //    to a fixpoint so freeing one frees its sources.
-    sweep_dead_pointer_derivations(ctx, entry_idx, &dead_roots);
+    // 4. Retire the now-dead pointer derivations (the old access chains + any bitcast/copyobject alias
+    //    of the array pointer) as part of the same binding transaction. A pure pointer derivation with
+    //    no remaining use is safe to omit; close the exact replacement graph to a fixpoint.
+    retire_dead_pointer_projections(ctx, entry_idx, dead_roots.iter().copied());
 }
 
 /// Sink a descriptor-array element pointer and its image load from a loop header to their sole use.
@@ -449,7 +455,7 @@ pub(crate) fn sink_loop_header_texture_array_loads(ctx: &mut Ctx, entry_idx: usi
     }
     let function = &mut ctx.module.functions[entry_idx];
     for (block_idx, block) in function.blocks.iter_mut().enumerate() {
-        let old = std::mem::take(&mut block.instructions);
+        let old = block.instructions.clone();
         let mut rebuilt = Vec::with_capacity(old.len());
         for (inst_idx, inst) in old.into_iter().enumerate() {
             if let Some(prefix) = insertions.remove(&(block_idx, inst_idx)) {
@@ -730,10 +736,47 @@ fn literal_index_path(operands: &[Operand]) -> Option<Vec<u32>> {
 }
 
 /// Delete dead pure pointer-derivations (AccessChain/PtrAccessChain/Bitcast/CopyObject) reachable from
-/// `roots`, iterating to a fixpoint. An instruction is removed only when no surviving instruction (nor
-/// a global/decoration/name) references its result — so this can only drop provably-dead code.
-fn sweep_dead_pointer_derivations(ctx: &mut Ctx, entry_idx: usize, roots: &[Word]) {
-    let mut candidates: Vec<Word> = roots.to_vec();
+/// `roots`, iterating to a fixpoint. An instruction is removed only when no surviving executable or
+/// global instruction references its result. Debug names and annotations for an omitted derivation
+/// are removed in the same transaction; they describe the old pointer representation and do not make
+/// an otherwise-dead address computation live.
+pub(in crate::passes) fn retire_dead_pointer_projections(
+    ctx: &mut Ctx,
+    entry_idx: usize,
+    roots: impl IntoIterator<Item = Word>,
+) {
+    let is_pointer_derivation = |instruction: &Instruction| {
+        matches!(
+            instruction.class.opcode,
+            Op::AccessChain
+                | Op::InBoundsAccessChain
+                | Op::PtrAccessChain
+                | Op::Bitcast
+                | Op::CopyObject
+        )
+    };
+    let mut candidates = roots.into_iter().collect::<HashSet<_>>();
+    let mut removed = HashSet::new();
+    loop {
+        let additions = ctx.module.functions[entry_idx]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| is_pointer_derivation(instruction))
+            .filter(|instruction| {
+                instruction
+                    .operands
+                    .iter()
+                    .any(|operand| matches!(operand, Operand::IdRef(id) if candidates.contains(id)))
+            })
+            .filter_map(|instruction| instruction.result_id)
+            .filter(|result| !candidates.contains(result))
+            .collect::<Vec<_>>();
+        if additions.is_empty() {
+            break;
+        }
+        candidates.extend(additions);
+    }
     loop {
         // Compute the set of ids currently referenced anywhere.
         let mut used: std::collections::HashSet<Word> = std::collections::HashSet::new();
@@ -753,8 +796,6 @@ fn sweep_dead_pointer_derivations(ctx: &mut Ctx, entry_idx: usize, roots: &[Word
             .types_global_values
             .iter()
             .chain(ctx.new_globals.iter())
-            .chain(ctx.module.debug_names.iter())
-            .chain(ctx.module.annotations.iter())
             .chain(ctx.module.entry_points.iter())
         {
             for op in &inst.operands {
@@ -772,20 +813,14 @@ fn sweep_dead_pointer_derivations(ctx: &mut Ctx, entry_idx: usize, roots: &[Word
                 let Some(rid) = inst.result_id else {
                     return true;
                 };
-                let is_pointer_deriv = matches!(
-                    inst.class.opcode,
-                    Op::AccessChain
-                        | Op::InBoundsAccessChain
-                        | Op::PtrAccessChain
-                        | Op::Bitcast
-                        | Op::CopyObject
-                );
-                if is_pointer_deriv && candidates.contains(&rid) && !used.contains(&rid) {
+                if is_pointer_derivation(inst) && candidates.contains(&rid) && !used.contains(&rid)
+                {
                     for op in &inst.operands {
                         if let Operand::IdRef(id) = op {
                             freed_sources.push(*id);
                         }
                     }
+                    removed.insert(rid);
                     removed_any = true;
                     return false;
                 }
@@ -797,6 +832,20 @@ fn sweep_dead_pointer_derivations(ctx: &mut Ctx, entry_idx: usize, roots: &[Word
         }
         candidates.extend(freed_sources);
     }
+    if !removed.is_empty() {
+        let references_removed = |instruction: &Instruction| {
+            instruction
+                .operands
+                .iter()
+                .any(|operand| matches!(operand, Operand::IdRef(id) if removed.contains(id)))
+        };
+        ctx.module
+            .debug_names
+            .retain(|instruction| !references_removed(instruction));
+        ctx.module
+            .annotations
+            .retain(|instruction| !references_removed(instruction));
+    }
 }
 
 #[cfg(test)]
@@ -805,6 +854,65 @@ mod tests {
     use crate::passes::ImageComp;
     use crate::spirv_module::{Block, Function, Module};
     use spirv::Dim;
+
+    #[test]
+    fn descriptor_materialization_drops_the_dead_derived_pointer_closure() {
+        let descriptor_root = 1;
+        let stale_projection = 10;
+        let alias = 11;
+        let unrelated = 12;
+        let mut module = Module::new();
+        module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(stale_projection),
+                Operand::LiteralString("old.texture.pointer".into()),
+            ],
+        ));
+        module.functions.push(Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: None,
+                instructions: vec![
+                    Instruction::new(
+                        Op::InBoundsAccessChain,
+                        None,
+                        Some(stale_projection),
+                        vec![Operand::IdRef(descriptor_root), Operand::IdRef(2)],
+                    ),
+                    Instruction::new(
+                        Op::CopyObject,
+                        None,
+                        Some(alias),
+                        vec![Operand::IdRef(stale_projection)],
+                    ),
+                    Instruction::new(
+                        Op::AccessChain,
+                        None,
+                        Some(unrelated),
+                        vec![Operand::IdRef(3), Operand::IdRef(2)],
+                    ),
+                ],
+            }],
+        });
+        let mut ctx = Ctx::new(module);
+
+        retire_dead_pointer_projections(&mut ctx, 0, [descriptor_root]);
+
+        let results = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .filter_map(|instruction| instruction.result_id)
+            .collect::<HashSet<_>>();
+        assert!(!results.contains(&stale_projection));
+        assert!(!results.contains(&alias));
+        assert!(results.contains(&unrelated));
+        assert!(ctx.module.debug_names.is_empty());
+    }
 
     #[test]
     fn descriptor_array_root_survives_insert_extract_wrapper() {

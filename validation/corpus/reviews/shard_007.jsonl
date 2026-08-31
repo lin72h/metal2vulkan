@@ -1,0 +1,1 @@
+{"air_sha256":"1ce6ec8047318551df13a751e346a552f6df8c944116f2cbeadd4a3901aa4238","reason":"AIR entry \"quad_display_texture2D\" contains one or more CFG cycles detected from LLVM branch edges; the checker rejects cyclic GPU work because a host timeout cannot safely cancel committed execution.","reviewed_by":"codex:gpt-5.6-sol"}

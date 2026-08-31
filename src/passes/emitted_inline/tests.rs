@@ -90,6 +90,43 @@ fn inlines_single_block_helper_and_drops_it() {
 }
 
 #[test]
+fn inliner_selects_the_body_when_a_linked_declaration_precedes_it() {
+    let helper = mkfunc(
+        20,
+        2,
+        21,
+        vec![Instruction::new(
+            Op::ReturnValue,
+            None,
+            None,
+            vec![Operand::IdRef(5)],
+        )],
+    );
+    let mut declaration = helper.clone();
+    declaration.blocks.clear();
+    let entry = mkfunc(
+        10,
+        2,
+        11,
+        vec![
+            Instruction::new(
+                Op::FunctionCall,
+                Some(2),
+                Some(12),
+                vec![Operand::IdRef(20)],
+            ),
+            Instruction::new(Op::ReturnValue, None, None, vec![Operand::IdRef(12)]),
+        ],
+    );
+    let mut ctx = Ctx::new(module_with(vec![entry, declaration, helper]));
+
+    let stats = inline_helpers(&mut ctx, 0).expect("inline bodied linked definition");
+
+    assert_eq!(stats.splices, 1);
+    assert_eq!(call_count(&ctx.module, 0), 0);
+}
+
+#[test]
 fn inliner_stats_count_unique_helpers_separately_from_splices() {
     let helper = mkfunc(
         20,
@@ -230,6 +267,9 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
     let ptr_function_struct = 106;
     let ptr_private_struct = 107;
     let ptr_private_v4float = 108;
+    let wrapper_array = 109;
+    let ptr_function_wrapper = 110;
+    let uint_1 = 111;
     let helper_param = 25;
     let local_struct = 30;
     let access_result = 31;
@@ -241,7 +281,7 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
         vec![
             Instruction::new(
                 Op::Variable,
-                Some(ptr_function_struct),
+                Some(ptr_function_wrapper),
                 Some(local_struct),
                 vec![Operand::StorageClass(StorageClass::Function)],
             ),
@@ -286,7 +326,11 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
             v4float,
             vec![Operand::IdRef(float), Operand::LiteralBit32(4)],
         ),
-        type_inst(Op::TypeStruct, vertex_struct, vec![Operand::IdRef(v4float)]),
+        type_inst(
+            Op::TypeArray,
+            vertex_struct,
+            vec![Operand::IdRef(v4float), Operand::IdRef(uint_1)],
+        ),
         type_inst(
             Op::TypeInt,
             uint,
@@ -297,6 +341,17 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
             Some(uint),
             Some(uint_0),
             vec![Operand::LiteralBit32(0)],
+        ),
+        Instruction::new(
+            Op::Constant,
+            Some(uint),
+            Some(uint_1),
+            vec![Operand::LiteralBit32(1)],
+        ),
+        type_inst(
+            Op::TypeArray,
+            wrapper_array,
+            vec![Operand::IdRef(vertex_struct), Operand::IdRef(uint_1)],
         ),
         type_inst(
             Op::TypePointer,
@@ -322,6 +377,14 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
                 Operand::IdRef(v4float),
             ],
         ),
+        type_inst(
+            Op::TypePointer,
+            ptr_function_wrapper,
+            vec![
+                Operand::StorageClass(StorageClass::Function),
+                Operand::IdRef(wrapper_array),
+            ],
+        ),
     ];
 
     let mut ctx = Ctx::new(module);
@@ -344,12 +407,563 @@ fn inlined_helper_retargets_pointer_results_to_call_argument_storage() {
         Some(&Operand::IdRef(local_struct)),
         "helper param should be remapped to the caller's Function alloca"
     );
+    assert_eq!(
+        access.operands,
+        vec![
+            Operand::IdRef(local_struct),
+            Operand::IdRef(uint_0),
+            Operand::IdRef(uint_0),
+        ],
+        "the inline splice must complete zero-offset wrapper descent while constructing the chain"
+    );
     let defs = type_defs_with_new_globals(&ctx);
     let result_type = access.result_type.expect("access result type");
     assert_eq!(
         ptr_storage(&defs, result_type),
         Some(StorageClass::Function),
         "access-chain result storage must follow the remapped base pointer"
+    );
+}
+
+#[test]
+fn inlined_helper_extracts_inserted_pointer_from_aggregate_carrier() {
+    let void = 100;
+    let uint = 101;
+    let ptr_buffer_uint = 102;
+    let inner = 103;
+    let outer = 104;
+    let buffer = 12;
+    let undef = 30;
+    let aggregate = 31;
+    let helper_param = 25;
+    let extracted = 26;
+
+    let mut entry = mkfunc(
+        10,
+        void,
+        11,
+        vec![
+            Instruction::new(Op::Undef, Some(outer), Some(undef), vec![]),
+            Instruction::new(
+                Op::CompositeInsert,
+                Some(outer),
+                Some(aggregate),
+                vec![
+                    Operand::IdRef(buffer),
+                    Operand::IdRef(undef),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::FunctionCall,
+                None,
+                None,
+                vec![Operand::IdRef(20), Operand::IdRef(aggregate)],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    entry.parameters.push(Instruction::new(
+        Op::FunctionParameter,
+        Some(ptr_buffer_uint),
+        Some(buffer),
+        vec![],
+    ));
+    let mut helper = mkfunc(
+        20,
+        void,
+        21,
+        vec![
+            Instruction::new(
+                Op::CompositeExtract,
+                Some(ptr_buffer_uint),
+                Some(extracted),
+                vec![
+                    Operand::IdRef(helper_param),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::Load,
+                Some(uint),
+                Some(27),
+                vec![Operand::IdRef(extracted)],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    helper.parameters.push(Instruction::new(
+        Op::FunctionParameter,
+        Some(outer),
+        Some(helper_param),
+        vec![],
+    ));
+    let mut module = module_with(vec![entry, helper]);
+    module.types_global_values = vec![
+        type_inst(Op::TypeVoid, void, vec![]),
+        type_inst(
+            Op::TypeInt,
+            uint,
+            vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+        ),
+        type_inst(
+            Op::TypePointer,
+            ptr_buffer_uint,
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(uint),
+            ],
+        ),
+        type_inst(Op::TypeStruct, inner, vec![Operand::IdRef(ptr_buffer_uint)]),
+        type_inst(
+            Op::TypeStruct,
+            outer,
+            vec![Operand::IdRef(uint), Operand::IdRef(inner)],
+        ),
+    ];
+
+    let mut ctx = Ctx::new(module);
+    inline_helpers(&mut ctx, 0).expect("inline aggregate pointer carrier");
+
+    let instructions = ctx.module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(
+        instructions
+            .iter()
+            .all(|instruction| instruction.class.opcode != Op::CompositeExtract),
+        "the helper extract is replaced by the inserted pointer identity"
+    );
+    let load = instructions
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::Load)
+        .expect("inlined load");
+    assert_eq!(load.operands.first(), Some(&Operand::IdRef(buffer)));
+}
+
+#[test]
+fn inlined_helper_extracts_inserted_device_address_payload_from_aggregate_carrier() {
+    let void = 100;
+    let ulong = 101;
+    let ptr_function_ulong = 102;
+    let inner = 103;
+    let outer = 104;
+    let address = 12;
+    let output = 13;
+    let undef = 30;
+    let aggregate = 31;
+    let helper_param = 25;
+    let helper_output = 26;
+    let extracted = 27;
+
+    let mut entry = mkfunc(
+        10,
+        void,
+        11,
+        vec![
+            Instruction::new(Op::Undef, Some(outer), Some(undef), vec![]),
+            Instruction::new(
+                Op::CompositeInsert,
+                Some(outer),
+                Some(aggregate),
+                vec![
+                    Operand::IdRef(address),
+                    Operand::IdRef(undef),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::FunctionCall,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(20),
+                    Operand::IdRef(aggregate),
+                    Operand::IdRef(output),
+                ],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    entry.parameters.extend([
+        Instruction::new(Op::FunctionParameter, Some(ulong), Some(address), vec![]),
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_function_ulong),
+            Some(output),
+            vec![],
+        ),
+    ]);
+    let mut helper = mkfunc(
+        20,
+        void,
+        21,
+        vec![
+            Instruction::new(
+                Op::CompositeExtract,
+                Some(ulong),
+                Some(extracted),
+                vec![
+                    Operand::IdRef(helper_param),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(helper_output), Operand::IdRef(extracted)],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    helper.parameters.extend([
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(outer),
+            Some(helper_param),
+            vec![],
+        ),
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_function_ulong),
+            Some(helper_output),
+            vec![],
+        ),
+    ]);
+    let mut module = module_with(vec![entry, helper]);
+    module.types_global_values = vec![
+        type_inst(Op::TypeVoid, void, vec![]),
+        type_inst(
+            Op::TypeInt,
+            ulong,
+            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+        ),
+        type_inst(
+            Op::TypePointer,
+            ptr_function_ulong,
+            vec![
+                Operand::StorageClass(StorageClass::Function),
+                Operand::IdRef(ulong),
+            ],
+        ),
+        type_inst(Op::TypeStruct, inner, vec![Operand::IdRef(ulong)]),
+        type_inst(
+            Op::TypeStruct,
+            outer,
+            vec![Operand::IdRef(ulong), Operand::IdRef(inner)],
+        ),
+    ];
+
+    let mut ctx = Ctx::new(module);
+    inline_helpers(&mut ctx, 0).expect("inline aggregate device-address carrier");
+
+    let instructions = ctx.module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(
+        instructions
+            .iter()
+            .all(|instruction| instruction.class.opcode != Op::CompositeExtract),
+        "the helper extract is replaced by the exact inserted payload"
+    );
+    let store = instructions
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::Store)
+        .expect("inlined store");
+    assert_eq!(
+        store.operands,
+        vec![Operand::IdRef(output), Operand::IdRef(address)]
+    );
+}
+
+#[test]
+fn inlined_helper_elides_type_mismatched_pointer_extract_by_exact_identity() {
+    let void = 100;
+    let ulong = 101;
+    let ptr_buffer_ulong = 102;
+    let inner = 103;
+    let outer = 104;
+    let pointer = 12;
+    let output = 13;
+    let undef = 30;
+    let aggregate = 31;
+    let helper_param = 25;
+    let helper_output = 26;
+    let extracted = 27;
+
+    let mut entry = mkfunc(
+        10,
+        void,
+        11,
+        vec![
+            Instruction::new(Op::Undef, Some(outer), Some(undef), vec![]),
+            Instruction::new(
+                Op::CompositeInsert,
+                Some(outer),
+                Some(aggregate),
+                vec![
+                    Operand::IdRef(pointer),
+                    Operand::IdRef(undef),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::FunctionCall,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(20),
+                    Operand::IdRef(aggregate),
+                    Operand::IdRef(output),
+                ],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    entry.parameters.extend([
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_buffer_ulong),
+            Some(pointer),
+            vec![],
+        ),
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_buffer_ulong),
+            Some(output),
+            vec![],
+        ),
+    ]);
+    let mut helper = mkfunc(
+        20,
+        void,
+        21,
+        vec![
+            Instruction::new(
+                Op::CompositeExtract,
+                Some(ptr_buffer_ulong),
+                Some(extracted),
+                vec![
+                    Operand::IdRef(helper_param),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(helper_output), Operand::IdRef(extracted)],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    helper.parameters.extend([
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(outer),
+            Some(helper_param),
+            vec![],
+        ),
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_buffer_ulong),
+            Some(helper_output),
+            vec![],
+        ),
+    ]);
+    let mut module = module_with(vec![entry, helper]);
+    module.types_global_values = vec![
+        type_inst(Op::TypeVoid, void, vec![]),
+        type_inst(
+            Op::TypeInt,
+            ulong,
+            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+        ),
+        type_inst(
+            Op::TypePointer,
+            ptr_buffer_ulong,
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(ulong),
+            ],
+        ),
+        type_inst(Op::TypeStruct, inner, vec![Operand::IdRef(ulong)]),
+        type_inst(
+            Op::TypeStruct,
+            outer,
+            vec![Operand::IdRef(ulong), Operand::IdRef(inner)],
+        ),
+    ];
+
+    let mut ctx = Ctx::new(module);
+    inline_helpers(&mut ctx, 0).expect("inline exact pointer aggregate carrier");
+
+    let instructions = ctx.module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(
+        instructions
+            .iter()
+            .all(|instruction| instruction.class.opcode != Op::CompositeExtract),
+        "the exact pointer identity does not depend on the aggregate's temporary payload type"
+    );
+}
+
+#[test]
+fn inlined_helper_preserves_type_mismatched_pointer_payload_identity() {
+    let void = 100;
+    let ulong = 101;
+    let ptr_buffer_ulong = 102;
+    let inner = 103;
+    let outer = 104;
+    let pointer = 12;
+    let output = 13;
+    let undef = 30;
+    let aggregate = 31;
+    let helper_param = 25;
+    let helper_output = 26;
+    let extracted = 27;
+
+    let mut entry = mkfunc(
+        10,
+        void,
+        11,
+        vec![
+            Instruction::new(Op::Undef, Some(outer), Some(undef), vec![]),
+            Instruction::new(
+                Op::CompositeInsert,
+                Some(outer),
+                Some(aggregate),
+                vec![
+                    Operand::IdRef(pointer),
+                    Operand::IdRef(undef),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::FunctionCall,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(20),
+                    Operand::IdRef(aggregate),
+                    Operand::IdRef(output),
+                ],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    entry.parameters.extend([
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_buffer_ulong),
+            Some(pointer),
+            vec![],
+        ),
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_buffer_ulong),
+            Some(output),
+            vec![],
+        ),
+    ]);
+    let mut helper = mkfunc(
+        20,
+        void,
+        21,
+        vec![
+            Instruction::new(
+                Op::CompositeExtract,
+                Some(ptr_buffer_ulong),
+                Some(extracted),
+                vec![
+                    Operand::IdRef(helper_param),
+                    Operand::LiteralBit32(1),
+                    Operand::LiteralBit32(0),
+                ],
+            ),
+            Instruction::new(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(helper_output), Operand::IdRef(extracted)],
+            ),
+            Instruction::new(Op::Return, None, None, vec![]),
+        ],
+    );
+    helper.parameters.extend([
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(outer),
+            Some(helper_param),
+            vec![],
+        ),
+        Instruction::new(
+            Op::FunctionParameter,
+            Some(ptr_buffer_ulong),
+            Some(helper_output),
+            vec![],
+        ),
+    ]);
+    let mut module = module_with(vec![entry, helper]);
+    module.types_global_values = vec![
+        type_inst(Op::TypeVoid, void, vec![]),
+        type_inst(
+            Op::TypeInt,
+            ulong,
+            vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
+        ),
+        type_inst(
+            Op::TypePointer,
+            ptr_buffer_ulong,
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(ulong),
+            ],
+        ),
+        type_inst(Op::TypeStruct, inner, vec![Operand::IdRef(ulong)]),
+        type_inst(
+            Op::TypeStruct,
+            outer,
+            vec![Operand::IdRef(ulong), Operand::IdRef(inner)],
+        ),
+    ];
+
+    let mut ctx = Ctx::new(module);
+    inline_helpers(&mut ctx, 0).expect("inline type-mismatched pointer aggregate carrier");
+
+    let instructions = ctx.module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert!(
+        instructions
+            .iter()
+            .all(|instruction| instruction.class.opcode != Op::CompositeExtract),
+        "the exact pointer extract is replaced by the inserted pointer identity"
+    );
+    let store = instructions
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::Store)
+        .expect("inlined store");
+    assert_eq!(
+        store.operands,
+        vec![Operand::IdRef(output), Operand::IdRef(pointer)]
     );
 }
 
@@ -601,6 +1215,60 @@ fn multiblock_inline_keeps_loop_merge_on_split_header() {
 }
 
 #[test]
+fn lifted_loop_privatizes_existing_selection_at_continue_boundary() {
+    let loop_merge_label = 30;
+    let loop_continue_label = 31;
+    let true_label = 32;
+    let cond = 40;
+    let mut post = vec![
+        Instruction::new(
+            Op::LoopMerge,
+            None,
+            None,
+            vec![
+                Operand::IdRef(loop_merge_label),
+                Operand::IdRef(loop_continue_label),
+                Operand::LoopControl(LoopControl::NONE),
+            ],
+        ),
+        Instruction::new(
+            Op::SelectionMerge,
+            None,
+            None,
+            vec![
+                Operand::IdRef(loop_continue_label),
+                Operand::SelectionControl(spirv::SelectionControl::NONE),
+            ],
+        ),
+        Instruction::new(
+            Op::BranchConditional,
+            None,
+            None,
+            vec![
+                Operand::IdRef(cond),
+                Operand::IdRef(true_label),
+                Operand::IdRef(loop_continue_label),
+            ],
+        ),
+    ];
+
+    let (lifted, split) = lift_loop_merge_from_split_tail(&mut post);
+
+    assert_eq!(
+        lifted.and_then(|inst| inst.operands.get(1).cloned()),
+        Some(Operand::IdRef(loop_continue_label))
+    );
+    assert_eq!(split, Some(loop_continue_label));
+    assert_eq!(
+        post.iter()
+            .filter(|inst| inst.class.opcode == Op::SelectionMerge)
+            .count(),
+        1,
+        "the existing selection marker is retained for the phi-aware split"
+    );
+}
+
+#[test]
 fn split_inlined_selection_merge_with_backward_merge_inserts_after_construct() {
     let void = 100;
     let function_id = 10;
@@ -699,8 +1367,8 @@ fn split_inlined_selection_merge_with_backward_merge_inserts_after_construct() {
         .expect("loop merge");
     assert_eq!(
         loop_merge.operands.get(1),
-        Some(&Operand::IdRef(synthetic_label)),
-        "split continue target should become the synthetic pass-through"
+        Some(&Operand::IdRef(merge_label)),
+        "the enclosing loop retains its continue while the nested selection gets a private merge"
     );
 
     let header = blocks

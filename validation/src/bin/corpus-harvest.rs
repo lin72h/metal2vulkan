@@ -11,7 +11,7 @@ use metal2vulkan_validation::hash::sha256_bytes;
 use metal2vulkan_validation::library_module::{self, LibraryModuleRow};
 use metal2vulkan_validation::source::{self, SourceRow};
 use metal2vulkan_validation::ScratchDir;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -305,8 +305,8 @@ fn run(opts: Options) -> i32 {
     let mut by_hash = HashMap::new();
     let mut library_modules = HashMap::new();
     let mut indexed_entry_duplicates = 0usize;
-    let indexed_source_hashes = match source::indexed_source_hashes(&opts.out) {
-        Ok(hashes) => hashes,
+    let indexed_source_memberships = match source::indexed_source_memberships(&opts.out) {
+        Ok(memberships) => memberships,
         Err(error) => {
             eprintln!("{PROGRAM}: load source index: {error}");
             return 1;
@@ -321,11 +321,14 @@ fn run(opts: Options) -> i32 {
             &mut library_modules,
             &mut stats,
         );
-        // Dependency modules are deliberately retained independently. Only stage-entry rows can
-        // be discarded here, after each metallib, before a broad reharvest accumulates gigabytes
-        // of entries that SQLite already indexes.
+        // Dependency modules are deliberately retained independently. A stage-entry row can be
+        // discarded only when SQLite already knows every parent-library membership observed in
+        // this batch. Apply that filter after each library so a broad reharvest cannot accumulate
+        // gigabytes of already-complete entries.
         let before_filter = by_hash.len();
-        by_hash.retain(|hash, _| !indexed_source_hashes.contains(hash));
+        by_hash.retain(|hash, row| {
+            !source_memberships_already_indexed(&indexed_source_memberships, hash, row)
+        });
         indexed_entry_duplicates += before_filter - by_hash.len();
     }
 
@@ -337,16 +340,6 @@ fn run(opts: Options) -> i32 {
         return if stats.libs_failed == 0 { 0 } else { 1 };
     }
 
-    let missing_source_hashes =
-        match source::unindexed_source_hashes(&opts.out, by_hash.keys().cloned()) {
-            Ok(hashes) => hashes,
-            Err(error) => {
-                eprintln!("{PROGRAM}: query source index: {error}");
-                return 1;
-            }
-        };
-    let indexed_duplicates = by_hash.len() - missing_source_hashes.len();
-    by_hash.retain(|hash, _| missing_source_hashes.contains(hash));
     let mut merge = match source::merge_source_shards(&opts.out, by_hash.into_values()) {
         Ok(merge) => merge,
         Err(error) => {
@@ -354,7 +347,6 @@ fn run(opts: Options) -> i32 {
             return 1;
         }
     };
-    merge.duplicates += indexed_duplicates;
     merge.duplicates += indexed_entry_duplicates;
     let library_merge =
         match library_module::merge_library_module_shards(&opts.out, library_modules.into_values())
@@ -367,12 +359,13 @@ fn run(opts: Options) -> i32 {
         };
 
     eprintln!(
-        "# RESULT: libs_ok={} libs_failed={} carved={} entry_batch_unique={} entry_inserted={} entry_replaced={} entry_dup={} entry_shards={} library_module_batch_unique={} library_module_inserted={} library_memberships_added={} library_module_dup={} library_module_shards={} large={} dropped_nonfunctions={} llvm_failed={} ({:.1}s)",
+        "# RESULT: libs_ok={} libs_failed={} carved={} entry_batch_unique={} entry_inserted={} entry_memberships_added={} entry_replaced={} entry_dup={} entry_shards={} library_module_batch_unique={} library_module_inserted={} library_memberships_added={} library_module_dup={} library_module_shards={} large={} dropped_nonfunctions={} llvm_failed={} ({:.1}s)",
         stats.libs_ok,
         stats.libs_failed,
         stats.blobs_carved,
         stats.rows_kept,
         merge.inserted,
+        merge.merged_memberships,
         merge.replaced,
         stats.duplicates + merge.duplicates,
         merge.affected_shards,
@@ -391,6 +384,18 @@ fn run(opts: Options) -> i32 {
     } else {
         0
     }
+}
+
+fn source_memberships_already_indexed(
+    indexed: &HashMap<String, HashSet<String>>,
+    hash: &str,
+    row: &SourceRow,
+) -> bool {
+    indexed.get(hash).is_some_and(|memberships| {
+        row.lib_sha256s
+            .iter()
+            .all(|library| memberships.contains(library))
+    })
 }
 
 fn select_metallibs(opts: &Options) -> Result<(Vec<PathBuf>, usize), String> {
@@ -657,7 +662,7 @@ fn harvest_one(
             entry,
             air_ll: ll_text,
             blob_b64: Some(blob_b64),
-            lib_sha256: lib_sha.clone(),
+            lib_sha256s: vec![lib_sha.clone()],
             label,
         };
         if merge_source_row(by_hash, row, stats) {
@@ -702,18 +707,22 @@ fn merge_source_row(
     stats: &mut HarvestStats,
 ) -> bool {
     let hash = row.air_sha256.clone();
-    match by_hash.get(&hash) {
+    match by_hash.get_mut(&hash) {
         None => {
             by_hash.insert(hash, row);
             stats.rows_kept += 1;
             true
         }
-        Some(previous) if row.lib_sha256 < previous.lib_sha256 => {
-            by_hash.insert(hash, row);
-            stats.duplicates += 1;
-            false
-        }
-        Some(_) => {
+        Some(previous) => {
+            previous.lib_sha256s.extend(row.lib_sha256s);
+            previous.lib_sha256s.sort();
+            previous.lib_sha256s.dedup();
+            if source::source_blob_is_preferred(
+                previous.blob_b64.as_deref(),
+                row.blob_b64.as_deref(),
+            ) {
+                previous.blob_b64 = row.blob_b64;
+            }
             stats.duplicates += 1;
             false
         }
@@ -909,7 +918,7 @@ mod tests {
                 entry: "k".into(),
                 air_ll: "ll".into(),
                 blob_b64: Some("YmxvYg==".into()),
-                lib_sha256: library.into(),
+                lib_sha256s: vec![library.into()],
                 label: "local/test.ll".into(),
             }
         }
@@ -922,10 +931,37 @@ mod tests {
         let mut reverse_stats = HarvestStats::default();
         merge_source_row(&mut reverse, row("aa"), &mut reverse_stats);
         merge_source_row(&mut reverse, row("bb"), &mut reverse_stats);
-        assert_eq!(forward[&"11".repeat(32)].lib_sha256, "aa");
-        assert_eq!(reverse[&"11".repeat(32)].lib_sha256, "aa");
+        assert_eq!(
+            forward[&"11".repeat(32)].lib_sha256s,
+            ["aa".to_string(), "bb".to_string()]
+        );
+        assert_eq!(
+            reverse[&"11".repeat(32)].lib_sha256s,
+            ["aa".to_string(), "bb".to_string()]
+        );
         assert_eq!(forward_stats.duplicates, 1);
         assert_eq!(reverse_stats.duplicates, 1);
+    }
+
+    #[test]
+    fn indexed_entry_is_reopened_only_for_a_new_parent_library() {
+        let hash = "11".repeat(32);
+        let mut row = SourceRow {
+            air_sha256: hash.clone(),
+            stage: "Kernel".into(),
+            entry: "k".into(),
+            air_ll: "ll".into(),
+            blob_b64: Some("YmxvYg==".into()),
+            lib_sha256s: vec!["aa".into()],
+            label: "local/test.ll".into(),
+        };
+        let mut indexed = HashMap::new();
+        assert!(!source_memberships_already_indexed(&indexed, &hash, &row));
+
+        indexed.insert(hash.clone(), HashSet::from(["aa".to_string()]));
+        assert!(source_memberships_already_indexed(&indexed, &hash, &row));
+        row.lib_sha256s.push("bb".into());
+        assert!(!source_memberships_already_indexed(&indexed, &hash, &row));
     }
 
     #[cfg(unix)]

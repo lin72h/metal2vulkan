@@ -297,7 +297,7 @@ fn materialize_zero_fc_initializers(module: &mut crate::spirv_module::Module) ->
         .collect();
     let mut rebuilt = Vec::with_capacity(module.types_global_values.len() + new_consts.len());
     let mut emitted = std::collections::HashSet::new();
-    for mut inst in module.types_global_values.drain(..) {
+    for mut inst in module.types_global_values.clone() {
         if inst.class.opcode == Op::Variable {
             if let Some((consts, initializer)) =
                 inst.result_id.as_ref().and_then(|id| var_to_consts.get(id))
@@ -385,9 +385,9 @@ pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String>
     let materialized = materialize_zero_fc_initializers(&mut module);
     let definedness = specialize_fc_definedness(&mut module, &defined_indices);
     if !materialized && !definedness {
-        if prune_static_fc_branches_and_drop_interface(&mut module) {
-            crate::passes::repair_specialized_workgroup_ptr_access_chains(&mut module);
-            return Ok(module
+        let (specialized, pruned) = prune_static_fc_branches_and_rebuild_interface(module);
+        if pruned {
+            return Ok(specialized
                 .assemble()
                 .iter()
                 .flat_map(|w| w.to_le_bytes())
@@ -395,8 +395,7 @@ pub fn specialize_function_constants_zero(spv: &[u8]) -> Result<Vec<u8>, String>
         }
         return Ok(spv.to_vec());
     }
-    prune_static_fc_branches_and_drop_interface(&mut module);
-    crate::passes::repair_specialized_workgroup_ptr_access_chains(&mut module);
+    (module, _) = prune_static_fc_branches_and_rebuild_interface(module);
     Ok(module
         .assemble()
         .iter()
@@ -642,7 +641,7 @@ fn specialize_function_constant_bytes_impl(
     // variable's initializer to the constant as we go.
     let mut rebuilt: Vec<Instruction> = Vec::with_capacity(module.types_global_values.len() + 1);
     let mut emitted: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for mut inst in module.types_global_values.drain(..) {
+    for mut inst in module.types_global_values.clone() {
         if inst.class.opcode == Op::Variable {
             if let Some((consts, initializer)) =
                 inst.result_id.as_ref().and_then(|v| var_to_consts.get(v))
@@ -676,11 +675,10 @@ fn specialize_function_constant_bytes_impl(
     // mutually-exclusive FC-gated resources honest: a Metal function may present a texture2d and a
     // texture2d_array at the same `[[texture(N)]]` slot under different FC predicates, but Vulkan
     // cannot bind two image view types to one descriptor in one specialized module. The pruning pass
-    // is structural and already used by native retry tiers; this helper is opt-in because it only runs
-    // for explicit harness/user-provided FC values.
-    prune_static_fc_branches_and_drop_interface(&mut module);
+    // is structural; this helper is opt-in because it only runs for explicit harness/user-provided
+    // FC values.
+    (module, _) = prune_static_fc_branches_and_rebuild_interface(module);
     rewrite_thread_local_scalar_byte_subslot_stores(&mut module);
-    crate::passes::repair_specialized_workgroup_ptr_access_chains(&mut module);
 
     Ok(module
         .assemble()
@@ -689,17 +687,20 @@ fn specialize_function_constant_bytes_impl(
         .collect())
 }
 
-fn prune_static_fc_branches_and_drop_interface(module: &mut crate::spirv_module::Module) -> bool {
+fn prune_static_fc_branches_and_rebuild_interface(
+    mut module: crate::spirv_module::Module,
+) -> (crate::spirv_module::Module, bool) {
     if module.entry_points.is_empty() {
-        return false;
+        return (module, false);
     }
     let before_prune = module.clone();
-    if crate::native::prune_constant_branches_module(module).is_err() {
-        return false;
+    if crate::native::prune_constant_branches_module(&mut module).is_err() {
+        return (module, false);
     }
-    restore_loop_merges_removed_by_fc_prune(&before_prune, module);
-    drop_unreferenced_entry_interface_globals(module);
-    true
+    restore_loop_merges_removed_by_fc_prune(&before_prune, &mut module);
+    drop_unreferenced_entry_interface_globals(&mut module);
+    module = crate::passes::lower_specialized_workgroup_ptr_access_chains(module);
+    (module, true)
 }
 
 fn rewrite_thread_local_scalar_byte_subslot_stores(
@@ -968,7 +969,7 @@ fn rewrite_thread_local_scalar_byte_subslot_stores(
     let mut changed = false;
     for (fi, function) in module.functions.iter_mut().enumerate() {
         for (bi, block) in function.blocks.iter_mut().enumerate() {
-            let old = std::mem::take(&mut block.instructions);
+            let old = block.instructions.clone();
             let mut out = Vec::with_capacity(old.len() + 16);
             for (ii, inst) in old.into_iter().enumerate() {
                 if chain_sites.contains(&(fi, bi, ii)) {

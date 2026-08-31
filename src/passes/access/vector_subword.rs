@@ -2,69 +2,6 @@
 
 use super::*;
 
-/// Retype a plain element load whose pointer carrier is an array by explicitly selecting element
-/// zero. LLVM opaque pointers permit loading `T` from the address of `[N x T]`; Logical SPIR-V
-/// requires the otherwise address-identical zero descent to produce `T*` first.
-pub(in crate::passes) fn repair_load_through_array_pointer(ctx: &mut Ctx, entry_idx: usize) {
-    let mut plans = HashMap::<(usize, usize), (Word, Word, StorageClass)>::new();
-    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
-        for (ii, load) in block.instructions.iter().enumerate() {
-            if load.class.opcode != Op::Load || load.operands.len() != 1 {
-                continue;
-            }
-            let (Some(result_ty), Some(Operand::IdRef(pointer))) =
-                (load.result_type, load.operands.first())
-            else {
-                continue;
-            };
-            let Some(pointer_ty) = value_result_type(ctx, *pointer) else {
-                continue;
-            };
-            let Some(pointer_def) = type_def_of(ctx, pointer_ty) else {
-                continue;
-            };
-            let (Some(Operand::StorageClass(storage)), Some(Operand::IdRef(array_ty))) =
-                (pointer_def.operands.first(), pointer_def.operands.get(1))
-            else {
-                continue;
-            };
-            let Some(array_def) = type_def_of(ctx, *array_ty) else {
-                continue;
-            };
-            if !matches!(array_def.class.opcode, Op::TypeArray | Op::TypeRuntimeArray)
-                || array_def.operands.first() != Some(&Operand::IdRef(result_ty))
-            {
-                continue;
-            }
-            plans.insert((bi, ii), (*pointer, result_ty, *storage));
-        }
-    }
-    if plans.is_empty() {
-        return;
-    }
-    let zero = ctx.const_uint(0);
-    for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
-        let mut rewritten = Vec::with_capacity(old.len());
-        for (ii, mut instruction) in old.into_iter().enumerate() {
-            let Some(&(pointer, result_ty, storage)) = plans.get(&(bi, ii)) else {
-                rewritten.push(instruction);
-                continue;
-            };
-            let element_pointer = ctx.module.fresh_id();
-            rewritten.push(Instruction::new(
-                Op::InBoundsAccessChain,
-                Some(ctx.ty_ptr(storage, result_ty)),
-                Some(element_pointer),
-                vec![Operand::IdRef(pointer), Operand::IdRef(zero)],
-            ));
-            instruction.operands[0] = Operand::IdRef(element_pointer);
-            rewritten.push(instruction);
-        }
-        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
-    }
-}
-
 /// Lower a flat scalar offset through `{ RuntimeArray<Vector<T, N>> }` into its exact typed path.
 /// Opaque LLVM pointers allow `T*` arithmetic from the wrapper's address; Logical SPIR-V instead
 /// needs member zero, vector index `flat / N`, and lane `flat % N` spelled out explicitly.
@@ -182,7 +119,9 @@ pub(in crate::passes) fn rewrite_flat_scalar_ptr_access_through_vector_array(
         .collect::<HashMap<_, _>>();
     let member_zero = ctx.const_uint(0);
     for bi in 0..ctx.module.functions[entry_idx].blocks.len() {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
+        let old = ctx.module.functions[entry_idx].blocks[bi]
+            .instructions
+            .clone();
         let mut rewritten = Vec::with_capacity(old.len());
         for (ii, instruction) in old.into_iter().enumerate() {
             let Some(plan) = by_site.get(&(bi, ii)).copied() else {
@@ -228,649 +167,6 @@ pub(in crate::passes) fn rewrite_flat_scalar_ptr_access_through_vector_array(
     }
 }
 
-/// Repair a `OpLoad %vecN <p>` whose pointer `<p>` is a SCALAR-pointee access chain that the emitter
-/// produced by accumulating a chain of element-strided geps (`gep <N x scalar>, ptr, idx`) into a single
-/// index off a VECTOR-pointer base, but emitted with the wrong opcode/type: it used
-/// `OpInBoundsAccessChain %_ptr_SC_scalar %base %idx` (which indexes a COMPONENT of the vector and yields
-/// a scalar pointer) where the AIR meant `OpPtrAccessChain %_ptr_SC_vecN %base %idx` (which STRIDES by the
-/// whole vector). The result is a self-inconsistent module: `<p>` is typed `scalar*` yet the load reads a
-/// `vecN` ("OpLoad Result Type vecN does not match Pointer's type"). When `<p> = (InBounds)AccessChain
-/// %_ptr_SC_scalar %base %idx` with EXACTLY ONE index, `%base` is `_ptr_SC_vecN` (same storage class,
-/// pointee = the loaded vector), `scalar` is that vector's component type, and EVERY use of `<p>` is a
-/// load of that same `vecN`, the chain is rewritten to `OpPtrAccessChain %_ptr_SC_vecN %base %idx` — the
-/// vector stride the gep chain encodes.
-///
-/// Byte-EXACT by construction: the AIR strides by `<N x scalar>` (the gep element type), so `%idx` is a
-/// vector-stride count and the byte address is `%idx * sizeof(vecN)` from `%base` — exactly what
-/// `OpPtrAccessChain` over `vecN*` computes; the prior component-index typing was the bug (a scalar pick
-/// can never satisfy a `vecN` load). Floor-SAFE by construction: fires ONLY on the currently-INVALID
-/// shape (a `vecN` load through a scalar-pointee chain whose base is a `vecN*`), which a valid/banked
-/// module never contains; the all-uses-are-`vecN`-loads gate makes the retype of `<p>` safe. Decides
-/// purely from IR structure (pointer/vector type defs), never a shader name. `OpPtrAccessChain` off a
-/// select/phi pointer is legal here under `VariablePointersStorageBuffer` (the same capability the
-/// sibling `OpPtrAccessChain` arms in these MPS kernels already rely on).
-pub(in crate::passes) fn repair_vector_load_through_scalar_stride(ctx: &mut Ctx, entry_idx: usize) {
-    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
-    for inst in ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-    {
-        if inst.class.opcode == Op::TypePointer {
-            if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
-                (inst.result_id, inst.operands.first(), inst.operands.get(1))
-            {
-                ptr_info.insert(id, (*s, *p));
-            }
-        }
-    }
-    // component type of a vector type id, if it is one.
-    let vec_component = |ctx: &Ctx, ty: Word| -> Option<Word> {
-        let def = type_def_of(ctx, ty)?;
-        if def.class.opcode != Op::TypeVector {
-            return None;
-        }
-        match def.operands.first() {
-            Some(Operand::IdRef(c)) => Some(*c),
-            _ => None,
-        }
-    };
-
-    // value-id -> (block, inst) index for the entry function body, plus all use sites of a value.
-    let mut def_at: HashMap<Word, (usize, usize)> = HashMap::new();
-    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Some(id) = inst.result_id {
-                def_at.insert(id, (bi, ii));
-            }
-        }
-    }
-    // For a candidate pointer `<p>`, every use must be `OpLoad <vecN> <p>` for the same vecN.
-    let all_uses_are_vec_load = |ctx: &Ctx, p: Word, vec_ty: Word| -> bool {
-        let mut count = 0usize;
-        for block in &ctx.module.functions[entry_idx].blocks {
-            for inst in &block.instructions {
-                let references_p = inst
-                    .operands
-                    .iter()
-                    .any(|o| matches!(o, Operand::IdRef(r) if *r == p));
-                if !references_p {
-                    continue;
-                }
-                if inst.class.opcode != Op::Load || inst.result_type != Some(vec_ty) {
-                    return false;
-                }
-                // The pointer must be the load's pointer operand (first operand), not some other slot.
-                if inst.operands.first() != Some(&Operand::IdRef(p)) {
-                    return false;
-                }
-                count += 1;
-            }
-        }
-        count > 0
-    };
-
-    // (block, inst of the access chain, new pointer-type id = base's pointer type)
-    let mut edits: Vec<(usize, usize, Word)> = Vec::new();
-    for block in &ctx.module.functions[entry_idx].blocks {
-        for inst in &block.instructions {
-            if inst.class.opcode != Op::Load {
-                continue;
-            }
-            let Some(vec_ty) = inst.result_type else {
-                continue;
-            };
-            let Some(component) = vec_component(ctx, vec_ty) else {
-                continue;
-            };
-            let Some(Operand::IdRef(p)) = inst.operands.first() else {
-                continue;
-            };
-            let Some(&(pbi, pii)) = def_at.get(p) else {
-                continue;
-            };
-            let pdef = &ctx.module.functions[entry_idx].blocks[pbi].instructions[pii];
-            if !matches!(pdef.class.opcode, Op::InBoundsAccessChain | Op::AccessChain) {
-                continue;
-            }
-            // exactly one index (base + 1 index).
-            if pdef.operands.len() != 2 {
-                continue;
-            }
-            let Some(p_ty) = pdef.result_type else {
-                continue;
-            };
-            let Some(&(p_sc, p_pointee)) = ptr_info.get(&p_ty) else {
-                continue;
-            };
-            if p_pointee != component {
-                continue;
-            }
-            let Some(Operand::IdRef(base)) = pdef.operands.first() else {
-                continue;
-            };
-            let Some(base_ty) = value_result_type(ctx, *base) else {
-                continue;
-            };
-            let Some(&(base_sc, base_pointee)) = ptr_info.get(&base_ty) else {
-                continue;
-            };
-            if base_sc != p_sc || base_pointee != vec_ty {
-                continue;
-            }
-            if !all_uses_are_vec_load(ctx, *p, vec_ty) {
-                continue;
-            }
-            edits.push((pbi, pii, base_ty));
-        }
-    }
-    for (bi, ii, new_ty) in edits {
-        let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
-        let result_id = inst.result_id;
-        let operands = inst.operands.clone();
-        *inst = Instruction::new(Op::PtrAccessChain, Some(new_ty), result_id, operands);
-    }
-}
-
-/// Expand an invalid vector load through one word of a raw `{ RuntimeArray<uint> }` buffer into
-/// consecutive scalar-word loads. The chain's final index names the first word; lane `n` reads
-/// `index + n`, bitcasts that word to the declared 32-bit component, and reconstructs the vector.
-pub(in crate::passes) fn repair_vector_load_through_raw_word_pointer(
-    ctx: &mut Ctx,
-    entry_idx: usize,
-) {
-    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
-    for inst in ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-    {
-        if inst.class.opcode == Op::TypePointer {
-            if let (Some(id), Some(Operand::StorageClass(storage)), Some(Operand::IdRef(pointee))) =
-                (inst.result_id, inst.operands.first(), inst.operands.get(1))
-            {
-                ptr_info.insert(id, (*storage, *pointee));
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct Plan {
-        chain_block: usize,
-        chain_inst: usize,
-        chain_id: Word,
-        chain: Instruction,
-        vector_ty: Word,
-        component_ty: Word,
-        lanes: u32,
-        strided_tail: bool,
-        last_index: Word,
-        index_ty: Word,
-        word_offset: u32,
-    }
-
-    let mut definitions = HashMap::new();
-    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Some(id) = inst.result_id {
-                definitions.insert(id, (bi, ii));
-            }
-        }
-    }
-    let uint = ctx.ty_uint();
-    let mut plans = HashMap::new();
-    for block in &ctx.module.functions[entry_idx].blocks {
-        for load in &block.instructions {
-            if load.class.opcode != Op::Load || load.operands.len() != 1 {
-                continue;
-            }
-            let Some(vector_ty) = load.result_type else {
-                continue;
-            };
-            let Some(vector_def) = type_def_of(ctx, vector_ty) else {
-                continue;
-            };
-            let (Some(Operand::IdRef(component_ty)), Some(Operand::LiteralBit32(lanes))) =
-                (vector_def.operands.first(), vector_def.operands.get(1))
-            else {
-                continue;
-            };
-            if vector_def.class.opcode != Op::TypeVector
-                || *lanes < 2
-                || direct_scalar_width(ctx, *component_ty) != Some(32)
-            {
-                continue;
-            }
-            let Some(Operand::IdRef(chain_id)) = load.operands.first() else {
-                continue;
-            };
-            let Some(&(chain_block, chain_inst)) = definitions.get(chain_id) else {
-                continue;
-            };
-            let chain =
-                &ctx.module.functions[entry_idx].blocks[chain_block].instructions[chain_inst];
-            if !matches!(
-                chain.class.opcode,
-                Op::AccessChain | Op::InBoundsAccessChain
-            ) || chain.operands.len() < 3
-            {
-                continue;
-            }
-            let Some(result_ptr_ty) = chain.result_type else {
-                continue;
-            };
-            let Some((StorageClass::StorageBuffer, result_pointee)) =
-                ptr_info.get(&result_ptr_ty).copied()
-            else {
-                continue;
-            };
-            let Some(Operand::IdRef(base)) = chain.operands.first() else {
-                continue;
-            };
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
-                continue;
-            };
-            let Some((StorageClass::StorageBuffer, base_pointee)) =
-                ptr_info.get(&base_ptr_ty).copied()
-            else {
-                continue;
-            };
-            if single_member_array_scalar_elem(ctx, base_pointee) != Some(uint) {
-                continue;
-            }
-            // Composed opaque-pointer GEPs can leave one or more zero-stride scalar tails after the
-            // meaningful vector stride (`..., vector_index, 0, 0`). Once the type walk has reached a
-            // scalar, each such trailing zero is an address-neutral `gep T, ptr, 0`; retain no more
-            // than the canonical `[base, member, word, vector_stride]` form before recognizing it.
-            // This normalization is local to the already-invalid vector-load shape, so it cannot
-            // alter a valid aggregate descent.
-            let mut effective_chain = chain.clone();
-            let mut word_offset = 0;
-            // A composed `gep vecN, ptr, trailing_vector` can follow the dynamic vector stride as
-            // `..., vector_index, 0, trailing_vector`. Once the raw interface has erased the vector
-            // type, recover that constant vector offset in raw words and canonicalize the chain.
-            if effective_chain.operands.len() == 6
-                && walk_into_type(ctx, base_pointee, &effective_chain.operands[1..3]) == Some(uint)
-                && effective_chain
-                    .operands
-                    .get(4)
-                    .and_then(|operand| match operand {
-                        Operand::IdRef(id) => const_u32(ctx, *id),
-                        _ => None,
-                    })
-                    == Some(0)
-            {
-                let trailing_vector =
-                    effective_chain
-                        .operands
-                        .get(5)
-                        .and_then(|operand| match operand {
-                            Operand::IdRef(id) => const_u32(ctx, *id),
-                            _ => None,
-                        });
-                if let Some(trailing_vector) = trailing_vector {
-                    word_offset = trailing_vector.saturating_mul(*lanes);
-                    effective_chain.operands.truncate(4);
-                }
-            }
-            while effective_chain.operands.len() > 4
-                && effective_chain
-                    .operands
-                    .last()
-                    .and_then(|operand| match operand {
-                        Operand::IdRef(id) => const_u32(ctx, *id),
-                        _ => None,
-                    })
-                    == Some(0)
-            {
-                effective_chain.operands.pop();
-            }
-            let strided_tail = if walk_into_type(ctx, base_pointee, &effective_chain.operands[1..])
-                == Some(uint)
-                && result_pointee == uint
-            {
-                false
-            } else if effective_chain.operands.len() == 4
-                && walk_into_type(ctx, base_pointee, &effective_chain.operands[1..3]) == Some(uint)
-                && result_pointee == vector_ty
-            {
-                true
-            } else {
-                continue;
-            };
-            let Some(Operand::IdRef(last_index)) = effective_chain.operands.last() else {
-                continue;
-            };
-            let last_index = *last_index;
-            let Some(index_ty) = value_result_type(ctx, last_index) else {
-                continue;
-            };
-            plans.entry(*chain_id).or_insert_with(|| Plan {
-                chain_block,
-                chain_inst,
-                chain_id: *chain_id,
-                chain: effective_chain,
-                vector_ty,
-                component_ty: *component_ty,
-                lanes: *lanes,
-                strided_tail,
-                last_index,
-                index_ty,
-                word_offset,
-            });
-        }
-    }
-    if plans.is_empty() {
-        return;
-    }
-
-    // Every use of the scalar pointer must be the same exact plain vector load.
-    plans.retain(|chain_id, plan| {
-        let mut uses = 0;
-        for inst in ctx.module.functions[entry_idx]
-            .blocks
-            .iter()
-            .flat_map(|block| block.instructions.iter())
-        {
-            if inst.result_id == Some(*chain_id) {
-                continue;
-            }
-            if !inst
-                .operands
-                .iter()
-                .any(|operand| operand == &Operand::IdRef(*chain_id))
-            {
-                continue;
-            }
-            if inst.class.opcode != Op::Load
-                || inst.operands.as_slice() != [Operand::IdRef(*chain_id)]
-                || inst.result_type != Some(plan.vector_ty)
-            {
-                return false;
-            }
-            uses += 1;
-        }
-        uses > 0
-    });
-    if plans.is_empty() {
-        return;
-    }
-
-    let chain_sites = plans
-        .values()
-        .map(|plan| ((plan.chain_block, plan.chain_inst), plan.chain_id))
-        .collect::<HashMap<_, _>>();
-    let n_blocks = ctx.module.functions[entry_idx].blocks.len();
-    for bi in 0..n_blocks {
-        let old = std::mem::take(&mut ctx.module.functions[entry_idx].blocks[bi].instructions);
-        let mut rewritten = Vec::with_capacity(old.len() + 16);
-        for (ii, inst) in old.into_iter().enumerate() {
-            if chain_sites.contains_key(&(bi, ii)) {
-                continue;
-            }
-            let Some(chain_id) = inst.operands.first().and_then(|operand| match operand {
-                Operand::IdRef(id) if plans.contains_key(id) => Some(*id),
-                _ => None,
-            }) else {
-                rewritten.push(inst);
-                continue;
-            };
-            let plan = &plans[&chain_id];
-            let Some(result) = inst.result_id else {
-                rewritten.push(inst);
-                continue;
-            };
-            let original_last_index = plan.last_index;
-            let index_ty = plan.index_ty;
-            let first_word = if plan.strided_tail {
-                let scaled = ctx.module.fresh_id();
-                let lanes = ctx.const_int_of(index_ty, i64::from(plan.lanes));
-                rewritten.push(Instruction::new(
-                    Op::IMul,
-                    Some(index_ty),
-                    Some(scaled),
-                    vec![Operand::IdRef(original_last_index), Operand::IdRef(lanes)],
-                ));
-                let Some(Operand::IdRef(base_word)) = plan
-                    .chain
-                    .operands
-                    .get(plan.chain.operands.len().saturating_sub(2))
-                else {
-                    rewritten.push(inst);
-                    continue;
-                };
-                let base_word = if value_result_type(ctx, *base_word) == Some(index_ty) {
-                    *base_word
-                } else if let Some(value) = const_u32(ctx, *base_word) {
-                    ctx.const_int_of(index_ty, i64::from(value))
-                } else {
-                    let converted = ctx.module.fresh_id();
-                    rewritten.push(Instruction::new(
-                        Op::UConvert,
-                        Some(index_ty),
-                        Some(converted),
-                        vec![Operand::IdRef(*base_word)],
-                    ));
-                    converted
-                };
-                let first = ctx.module.fresh_id();
-                rewritten.push(Instruction::new(
-                    Op::IAdd,
-                    Some(index_ty),
-                    Some(first),
-                    vec![Operand::IdRef(base_word), Operand::IdRef(scaled)],
-                ));
-                if plan.word_offset == 0 {
-                    first
-                } else {
-                    let offset_first = ctx.module.fresh_id();
-                    let offset = ctx.const_int_of(index_ty, i64::from(plan.word_offset));
-                    rewritten.push(Instruction::new(
-                        Op::IAdd,
-                        Some(index_ty),
-                        Some(offset_first),
-                        vec![Operand::IdRef(first), Operand::IdRef(offset)],
-                    ));
-                    offset_first
-                }
-            } else {
-                original_last_index
-            };
-            let mut components = Vec::with_capacity(plan.lanes as usize);
-            for lane in 0..plan.lanes {
-                let lane_index = if lane == 0 {
-                    first_word
-                } else {
-                    let index = ctx.module.fresh_id();
-                    let offset = ctx.const_int_of(index_ty, i64::from(lane));
-                    rewritten.push(Instruction::new(
-                        Op::IAdd,
-                        Some(index_ty),
-                        Some(index),
-                        vec![Operand::IdRef(first_word), Operand::IdRef(offset)],
-                    ));
-                    index
-                };
-                let pointer = ctx.module.fresh_id();
-                let mut operands = plan.chain.operands.clone();
-                if plan.strided_tail {
-                    operands.pop();
-                }
-                *operands.last_mut().expect("raw word chain has an index") =
-                    Operand::IdRef(lane_index);
-                rewritten.push(Instruction::new(
-                    plan.chain.class.opcode,
-                    Some(ctx.ty_ptr(StorageClass::StorageBuffer, uint)),
-                    Some(pointer),
-                    operands,
-                ));
-                let word = ctx.module.fresh_id();
-                rewritten.push(Instruction::new(
-                    Op::Load,
-                    Some(uint),
-                    Some(word),
-                    vec![Operand::IdRef(pointer)],
-                ));
-                let component = if plan.component_ty == uint {
-                    word
-                } else {
-                    let component = ctx.module.fresh_id();
-                    rewritten.push(Instruction::new(
-                        Op::Bitcast,
-                        Some(plan.component_ty),
-                        Some(component),
-                        vec![Operand::IdRef(word)],
-                    ));
-                    component
-                };
-                components.push(Operand::IdRef(component));
-            }
-            rewritten.push(Instruction::new(
-                Op::CompositeConstruct,
-                Some(plan.vector_ty),
-                Some(result),
-                components,
-            ));
-        }
-        ctx.module.functions[entry_idx].blocks[bi].instructions = rewritten;
-    }
-}
-
-/// Repair a `OpLoad %scalar <p>` whose pointer `<p> = OpPtrAccessChain %_ptr_SC_vecN %base %idx…` is a
-/// VECTOR pointer landed at a vector boundary, where the AIR meant to read the vector's component 0 at
-/// that stride (`OpLoad %float (PtrAccessChain <4 x float>*, idx)` — the matrix-column gather emits
-/// element 0 as a valid `load vecN`+`OpCompositeExtract 0` but elements 1..N-1 as this strided
-/// scalar load). `<p>` is typed `vecN*` yet the load reads a `scalar` ("OpLoad Result Type scalar does not
-/// match Pointer's type"). When `<p> = OpPtrAccessChain %_ptr_SC_vecN %base [indices]`, the load result is
-/// the vector's COMPONENT scalar, and EVERY use of `<p>` is a load of that scalar, a trailing component-0
-/// index is appended (`… %uint_0`) and `<p>` is retyped to `_ptr_SC_scalar` — the byte address is
-/// unchanged (a `PtrAccessChain` over `vecN*` lands at `idx * sizeof(vecN)`, exactly a vector boundary, so
-/// component 0 is byte offset 0), now well-typed for the scalar load.
-///
-/// Byte-EXACT by construction (component 0 of a vector at a vector boundary is the same 4 bytes the
-/// invalid scalar load already addressed). Floor-SAFE by construction: fires ONLY on the currently-INVALID
-/// shape (a scalar load through a `PtrAccessChain` whose result is a `vecN*`), which a valid/banked module
-/// never contains; the all-uses-are-scalar-loads gate makes the retype safe. Decides purely from IR
-/// structure, never a shader name.
-pub(in crate::passes) fn repair_scalar_load_through_vector_ptr(ctx: &mut Ctx, entry_idx: usize) {
-    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
-    for inst in ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-    {
-        if inst.class.opcode == Op::TypePointer {
-            if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
-                (inst.result_id, inst.operands.first(), inst.operands.get(1))
-            {
-                ptr_info.insert(id, (*s, *p));
-            }
-        }
-    }
-    let vec_component = |ctx: &Ctx, ty: Word| -> Option<Word> {
-        let def = type_def_of(ctx, ty)?;
-        if def.class.opcode != Op::TypeVector {
-            return None;
-        }
-        match def.operands.first() {
-            Some(Operand::IdRef(c)) => Some(*c),
-            _ => None,
-        }
-    };
-    // Find (or note absence of) the `_ptr_SC_scalar` pointer type already present in the module.
-    let find_scalar_ptr = |sc: StorageClass, scalar: Word| -> Option<Word> {
-        ptr_info
-            .iter()
-            .find(|(_, (s, p))| *s == sc && *p == scalar)
-            .map(|(id, _)| *id)
-    };
-
-    let mut def_at: HashMap<Word, (usize, usize)> = HashMap::new();
-    for (bi, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
-        for (ii, inst) in block.instructions.iter().enumerate() {
-            if let Some(id) = inst.result_id {
-                def_at.insert(id, (bi, ii));
-            }
-        }
-    }
-    let all_uses_are_scalar_load = |ctx: &Ctx, p: Word, scalar_ty: Word| -> bool {
-        let mut count = 0usize;
-        for block in &ctx.module.functions[entry_idx].blocks {
-            for inst in &block.instructions {
-                let refs = inst
-                    .operands
-                    .iter()
-                    .any(|o| matches!(o, Operand::IdRef(r) if *r == p));
-                if !refs {
-                    continue;
-                }
-                if inst.class.opcode != Op::Load
-                    || inst.result_type != Some(scalar_ty)
-                    || inst.operands.first() != Some(&Operand::IdRef(p))
-                {
-                    return false;
-                }
-                count += 1;
-            }
-        }
-        count > 0
-    };
-
-    // (block, inst of the PtrAccessChain, new result-pointer-type = scalar*)
-    let mut edits: Vec<(usize, usize, Word)> = Vec::new();
-    for block in &ctx.module.functions[entry_idx].blocks {
-        for inst in &block.instructions {
-            if inst.class.opcode != Op::Load {
-                continue;
-            }
-            let Some(scalar_ty) = inst.result_type else {
-                continue;
-            };
-            // result must be a scalar (not a vector/aggregate).
-            if !matches!(
-                type_def_of(ctx, scalar_ty).map(|d| d.class.opcode),
-                Some(Op::TypeInt) | Some(Op::TypeFloat)
-            ) {
-                continue;
-            }
-            let Some(Operand::IdRef(p)) = inst.operands.first() else {
-                continue;
-            };
-            let Some(&(pbi, pii)) = def_at.get(p) else {
-                continue;
-            };
-            let pdef = &ctx.module.functions[entry_idx].blocks[pbi].instructions[pii];
-            if pdef.class.opcode != Op::PtrAccessChain {
-                continue;
-            }
-            let Some(p_ty) = pdef.result_type else {
-                continue;
-            };
-            let Some(&(p_sc, p_pointee)) = ptr_info.get(&p_ty) else {
-                continue;
-            };
-            // The chain points at a vector whose component is the loaded scalar.
-            if vec_component(ctx, p_pointee) != Some(scalar_ty) {
-                continue;
-            }
-            let Some(scalar_ptr_ty) = find_scalar_ptr(p_sc, scalar_ty) else {
-                continue;
-            };
-            if !all_uses_are_scalar_load(ctx, *p, scalar_ty) {
-                continue;
-            }
-            edits.push((pbi, pii, scalar_ptr_ty));
-        }
-    }
-
-    let zero = ctx.const_uint(0);
-    for (bi, ii, new_ty) in edits {
-        let inst = &mut ctx.module.functions[entry_idx].blocks[bi].instructions[ii];
-        inst.result_type = Some(new_ty);
-        inst.operands.push(Operand::IdRef(zero));
-    }
-}
-
 /// Drop the stores into a WRITE-ONLY-DEAD `Function`-storage variable when at least one of those stores
 /// is type-INVALID. The native emitter materializes a thread-local pointer ARRAY (`[N x ulong]`) for an
 /// AIR `[N x ptr]` alloca, fills it with the kernel's buffer pointers, then — when it lowers the dynamic
@@ -889,6 +185,7 @@ pub(in crate::passes) fn repair_scalar_load_through_vector_ptr(ctx: &mut Ctx, en
 /// write-only scratch array with well-typed stores is left untouched. Decides purely from IR structure
 /// (storage class + use census + a store-type compare), never a shader name.
 pub(in crate::passes) fn drop_writeonly_dead_local_array_stores(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -918,284 +215,148 @@ pub(in crate::passes) fn drop_writeonly_dead_local_array_stores(ctx: &mut Ctx, e
         }
     }
 
-    for var in candidates {
-        // Transitive closure of access chains rooted at `var` (S = {var} ∪ chains based in S).
-        let mut set: std::collections::HashSet<Word> = std::collections::HashSet::new();
-        set.insert(var);
-        loop {
-            let mut grew = false;
-            for block in &ctx.module.functions[entry_idx].blocks {
-                for inst in &block.instructions {
-                    if !matches!(
-                        inst.class.opcode,
-                        Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-                    ) {
-                        continue;
-                    }
-                    let Some(id) = inst.result_id else { continue };
-                    if set.contains(&id) {
-                        continue;
-                    }
-                    if matches!(inst.operands.first(), Some(Operand::IdRef(b)) if set.contains(b)) {
-                        set.insert(id);
-                        grew = true;
-                    }
-                }
-            }
-            if !grew {
-                break;
-            }
-        }
-
-        // Census: every reference to an id in `set` must be either a chain in `set` using it as base,
-        // or the POINTER operand of an OpStore. Otherwise the variable escapes / is read — bail.
-        let mut write_only = true;
-        let mut has_invalid_store = false;
-        'census: for block in &ctx.module.functions[entry_idx].blocks {
-            for inst in &block.instructions {
-                match inst.class.opcode {
-                    Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
-                        // A chain in `set` is fine (its base ∈ set). A chain NOT in set must not
-                        // reference any set id (it would be reading through it).
-                        let in_set = inst.result_id.map(|r| set.contains(&r)).unwrap_or(false);
-                        if in_set {
-                            continue;
-                        }
-                        if inst
-                            .operands
-                            .iter()
-                            .any(|o| matches!(o, Operand::IdRef(r) if set.contains(r)))
-                        {
-                            write_only = false;
-                            break 'census;
-                        }
-                    }
-                    Op::Store => {
-                        let ptr_op = inst.operands.first();
-                        let obj_op = inst.operands.get(1);
-                        let ptr_in = matches!(ptr_op, Some(Operand::IdRef(r)) if set.contains(r));
-                        let obj_in = matches!(obj_op, Some(Operand::IdRef(r)) if set.contains(r));
-                        if obj_in {
-                            // The variable's value is being stored elsewhere — it escapes.
-                            write_only = false;
-                            break 'census;
-                        }
-                        if ptr_in {
-                            // Type check: object's result type vs slot pointee.
-                            if let (Some(Operand::IdRef(slot)), Some(Operand::IdRef(obj))) =
-                                (ptr_op, obj_op)
-                            {
-                                let slot_pointee = value_result_type(ctx, *slot)
-                                    .and_then(|t| ptr_info.get(&t).map(|(_, p)| *p));
-                                let obj_ty = value_result_type(ctx, *obj);
-                                if let (Some(sp), Some(ot)) = (slot_pointee, obj_ty) {
-                                    if sp != ot {
-                                        has_invalid_store = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {
-                        if inst
-                            .operands
-                            .iter()
-                            .any(|o| matches!(o, Operand::IdRef(r) if set.contains(r)))
-                        {
-                            write_only = false;
-                            break 'census;
-                        }
-                    }
-                }
-            }
-        }
-
-        if !write_only || !has_invalid_store {
-            continue;
-        }
-
-        // Remove the stores whose pointer ∈ set, and the access chains in `set` (now dead).
-        for block in &mut ctx.module.functions[entry_idx].blocks {
-            block.instructions.retain(|inst| match inst.class.opcode {
-                Op::Store => {
-                    !matches!(inst.operands.first(), Some(Operand::IdRef(r)) if set.contains(r))
-                }
-                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
-                    !inst.result_id.map(|r| set.contains(&r)).unwrap_or(false)
-                }
-                _ => true,
-            });
-        }
-    }
-}
-
-/// Drop access chains in the entry function whose result is UNUSED and whose chain is currently
-/// INVALID (it over-indexes a non-composite or lands on a different pointee than declared). The
-/// emitter sometimes leaves a dead address computation behind a value that a later prune/structurize
-/// pass removed — e.g. a `device uchar*` element pointer re-indexed to `_ptr…_ushort` (a byte-pointer
-/// reinterpret) whose load was pruned. An access chain has no side effects, so removing an unused one
-/// is byte-NEUTRAL; gating on "currently invalid" keeps a valid/banked module provably untouched (its
-/// every chain either is used or validates, so nothing matches). Runs to a fixpoint because dropping
-/// one dead chain can orphan another it fed.
-pub(in crate::passes) fn drop_dead_invalid_access_chains(ctx: &mut Ctx, entry_idx: usize) {
-    let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
-    let mut value_types = HashMap::new();
-    for inst in ctx
-        .new_globals
-        .iter()
-        .chain(ctx.module.types_global_values.iter())
-    {
-        if let (Some(id), Some(ty)) = (inst.result_id, inst.result_type) {
-            value_types.insert(id, ty);
-        }
-        if inst.class.opcode == Op::TypePointer {
-            if let (Some(id), Some(Operand::StorageClass(s)), Some(Operand::IdRef(p))) =
-                (inst.result_id, inst.operands.first(), inst.operands.get(1))
-            {
-                ptr_info.insert(id, (*s, *p));
-            }
-        }
-    }
-    for parameter in &ctx.module.functions[entry_idx].parameters {
-        if let (Some(id), Some(ty)) = (parameter.result_id, parameter.result_type) {
-            value_types.insert(id, ty);
-        }
-    }
-    for block in &ctx.module.functions[entry_idx].blocks {
-        for instruction in &block.instructions {
-            if let (Some(id), Some(ty)) = (instruction.result_id, instruction.result_type) {
-                value_types.insert(id, ty);
-            }
-        }
-    }
-    let chain_definitions = ctx.module.functions[entry_idx]
+    let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
+    let chain_parents = ctx.module.functions[entry_idx]
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
-        .filter_map(|inst| {
+        .filter(|instruction| {
             matches!(
-                inst.class.opcode,
+                instruction.class.opcode,
                 Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
             )
-            .then_some((inst.result_id?, inst.clone()))
+        })
+        .filter_map(|instruction| {
+            let result = instruction.result_id?;
+            let Operand::IdRef(base) = instruction.operands.first()? else {
+                return None;
+            };
+            Some((result, *base))
         })
         .collect::<HashMap<_, _>>();
-    // Build operand reference counts once, then peel newly dead parent chains with a worklist.
-    // The former fixpoint rescanned the complete function after every ancestry layer, which became
-    // quadratic when raw-byte replay expanded a large shader by tens of thousands of instructions.
-    let mut references: HashMap<Word, usize> = HashMap::new();
-    for block in &ctx.module.functions[entry_idx].blocks {
-        for instruction in &block.instructions {
-            for operand in &instruction.operands {
-                if let Operand::IdRef(id) = operand {
-                    *references.entry(*id).or_default() += 1;
+    let mut pointer_roots = candidates
+        .iter()
+        .copied()
+        .map(|candidate| (candidate, candidate))
+        .collect::<HashMap<_, _>>();
+    for result in chain_parents.keys().copied() {
+        let mut current = result;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            let Some(parent) = chain_parents.get(&current).copied() else {
+                break;
+            };
+            if candidate_set.contains(&parent) {
+                pointer_roots.insert(result, parent);
+                break;
+            }
+            current = parent;
+        }
+    }
+
+    // Census all candidates together. Each pointer projection has one candidate root, so a single
+    // instruction walk is equivalent to the former candidate-by-candidate transitive scans.
+    let mut states = candidates
+        .iter()
+        .copied()
+        .map(|candidate| (candidate, (true, false)))
+        .collect::<HashMap<_, _>>();
+    for instruction in ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+    {
+        match instruction.class.opcode {
+            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => {
+                if instruction
+                    .result_id
+                    .is_some_and(|result| pointer_roots.contains_key(&result))
+                {
+                    continue;
+                }
+                for root in instruction
+                    .operands
+                    .iter()
+                    .filter_map(|operand| match operand {
+                        Operand::IdRef(id) => pointer_roots.get(id).copied(),
+                        _ => None,
+                    })
+                {
+                    states.entry(root).and_modify(|state| state.0 = false);
+                }
+            }
+            Op::Store => {
+                let pointer = instruction
+                    .operands
+                    .first()
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(id) => Some(*id),
+                        _ => None,
+                    });
+                let object = instruction
+                    .operands
+                    .get(1)
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(id) => Some(*id),
+                        _ => None,
+                    });
+                if let Some(root) = object.and_then(|id| pointer_roots.get(&id)).copied() {
+                    states.entry(root).and_modify(|state| state.0 = false);
+                }
+                if let (Some(slot), Some(object)) = (pointer, object) {
+                    if let Some(root) = pointer_roots.get(&slot).copied() {
+                        let slot_pointee = value_types
+                            .get(&slot)
+                            .copied()
+                            .and_then(|ty| ptr_info.get(&ty).map(|(_, pointee)| *pointee));
+                        let object_type = value_types.get(&object).copied();
+                        if matches!((slot_pointee, object_type), (Some(slot), Some(object)) if slot != object)
+                        {
+                            states.entry(root).and_modify(|state| state.1 = true);
+                        }
+                    }
+                }
+            }
+            _ => {
+                for root in instruction
+                    .operands
+                    .iter()
+                    .filter_map(|operand| match operand {
+                        Operand::IdRef(id) => pointer_roots.get(id).copied(),
+                        _ => None,
+                    })
+                {
+                    states.entry(root).and_modify(|state| state.0 = false);
                 }
             }
         }
     }
-    for instruction in &ctx.module.annotations {
-        for operand in &instruction.operands {
-            if let Operand::IdRef(id) = operand {
-                *references.entry(*id).or_default() += 1;
-            }
-        }
-    }
-    let mut pending = chain_definitions
-        .keys()
-        .copied()
-        .filter(|id| references.get(id).copied().unwrap_or(0) == 0)
-        .collect::<Vec<_>>();
-    let mut victims = HashSet::new();
-    while let Some(result) = pending.pop() {
-        if victims.contains(&result) || references.get(&result).copied().unwrap_or(0) != 0 {
-            continue;
-        }
-        let Some(instruction) = chain_definitions.get(&result) else {
-            continue;
-        };
-        // A dead, otherwise-valid PtrAccessChain may be the only remaining use of an invalid parent
-        // after its load/store was rewritten. Remove that suffix too, but only when its ancestry
-        // proves the invalidity; an unrelated valid dead chain is deliberately left byte-identical.
-        if !invalid_access_chain_or_ancestor(
-            ctx,
-            &ptr_info,
-            &value_types,
-            &chain_definitions,
-            instruction,
-            &mut HashSet::new(),
-        ) {
-            continue;
-        }
-        victims.insert(result);
-        for operand in &instruction.operands {
-            let Operand::IdRef(id) = operand else {
-                continue;
-            };
-            let Some(count) = references.get_mut(id) else {
-                continue;
-            };
-            *count = count.saturating_sub(1);
-            if *count == 0 && chain_definitions.contains_key(id) {
-                pending.push(*id);
-            }
-        }
-    }
-    if victims.is_empty() {
+    let dead_roots = states
+        .into_iter()
+        .filter_map(|(root, (write_only, invalid))| (write_only && invalid).then_some(root))
+        .collect::<HashSet<_>>();
+    if dead_roots.is_empty() {
         return;
     }
     for block in &mut ctx.module.functions[entry_idx].blocks {
-        block.instructions.retain(|instruction| {
-            !instruction
-                .result_id
-                .is_some_and(|result| victims.contains(&result))
-        });
+        block
+            .instructions
+            .retain(|instruction| match instruction.class.opcode {
+                Op::Store => !instruction
+                    .operands
+                    .first()
+                    .and_then(|operand| match operand {
+                        Operand::IdRef(id) => pointer_roots.get(id),
+                        _ => None,
+                    })
+                    .is_some_and(|root| dead_roots.contains(root)),
+                Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain => !instruction
+                    .result_id
+                    .and_then(|result| pointer_roots.get(&result))
+                    .is_some_and(|root| dead_roots.contains(root)),
+                _ => true,
+            });
     }
-}
-
-fn invalid_access_chain_or_ancestor(
-    ctx: &Ctx,
-    ptr_info: &HashMap<Word, (StorageClass, Word)>,
-    value_types: &HashMap<Word, Word>,
-    definitions: &HashMap<Word, Instruction>,
-    inst: &Instruction,
-    seen: &mut HashSet<Word>,
-) -> bool {
-    let Some(result) = inst.result_id else {
-        return false;
-    };
-    if !seen.insert(result) {
-        return false;
-    }
-    let Some(result_type) = inst.result_type else {
-        return false;
-    };
-    let Some(&(result_storage, result_pointee)) = ptr_info.get(&result_type) else {
-        return false;
-    };
-    let Some(Operand::IdRef(base)) = inst.operands.first() else {
-        return false;
-    };
-    let Some(base_ptr_ty) = value_types.get(base).copied() else {
-        return false;
-    };
-    let Some(&(base_storage, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
-        return false;
-    };
-    let index_start = if inst.class.opcode == Op::PtrAccessChain {
-        // Operand 1 is the pointer-arithmetic element; it preserves the base pointee. Only later
-        // operands descend through composites.
-        2
-    } else {
-        1
-    };
-    let indices = inst.operands.get(index_start..).unwrap_or_default();
-    let (reached, consumed) = walk_into_type_partial(ctx, base_pointee, indices);
-    if result_storage != base_storage || consumed != indices.len() || reached != result_pointee {
-        return true;
-    }
-    definitions.get(base).is_some_and(|parent| {
-        invalid_access_chain_or_ancestor(ctx, ptr_info, value_types, definitions, parent, seen)
-    })
 }
 
 /// Store-side analogue of [`lower_cross_member_subword_load`]: lower an `OpStore` of a wider scalar
@@ -1210,6 +371,7 @@ fn invalid_access_chain_or_ancestor(
 /// the object EXACTLY tiles a run of FULL direct-scalar members from the addressed member (no partial
 /// member — that would clobber bytes outside the write), so a banked module is never touched.
 pub(in crate::passes) fn lower_cross_member_subword_store(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -1284,7 +446,7 @@ pub(in crate::passes) fn lower_cross_member_subword_store(ctx: &mut Ctx, entry_i
             let Some(&(storage, pointee)) = ptr_info.get(&ptr_ty) else {
                 continue;
             };
-            let Some(obj_ty) = value_result_type(ctx, *obj) else {
+            let Some(obj_ty) = value_types.get(obj).copied() else {
                 continue;
             };
             if obj_ty == pointee {
@@ -1303,7 +465,7 @@ pub(in crate::passes) fn lower_cross_member_subword_store(ctx: &mut Ctx, entry_i
             if indices.len() < 2 {
                 continue;
             }
-            let Some(base_ptr_ty) = value_result_type(ctx, *base) else {
+            let Some(base_ptr_ty) = value_types.get(base).copied() else {
                 continue;
             };
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
@@ -1501,6 +663,13 @@ pub(in crate::passes) fn lower_cross_member_subword_store(ctx: &mut Ctx, entry_i
 /// final index enters an array/runtime-array element; bare pointer parameters and struct-member scalars
 /// stay untouched.
 pub(in crate::passes) fn lower_subword_scalar_store(ctx: &mut Ctx, entry_idx: usize) {
+    let value_types = function_value_types(ctx, entry_idx);
+    let value_defs = ctx.module.functions[entry_idx]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.clone())))
+        .collect::<HashMap<_, _>>();
     let mut ptr_info: HashMap<Word, (StorageClass, Word)> = HashMap::new();
     for inst in ctx
         .new_globals
@@ -1539,7 +708,7 @@ pub(in crate::passes) fn lower_subword_scalar_store(ctx: &mut Ctx, entry_idx: us
             else {
                 continue;
             };
-            let Some(ptr_ty) = value_result_type(ctx, *ptr) else {
+            let Some(ptr_ty) = value_types.get(ptr).copied() else {
                 continue;
             };
             let Some(&(storage, pointee_ty)) = ptr_info.get(&ptr_ty) else {
@@ -1548,13 +717,14 @@ pub(in crate::passes) fn lower_subword_scalar_store(ctx: &mut Ctx, entry_idx: us
             if !ptr_access_chain_allowed_storage(storage) {
                 continue;
             }
-            let ptr_is_element = find_def_in_func(&ctx.module.functions[entry_idx], *ptr)
-                .map(|d| store_split_pointer_is_element(ctx, &d, pointee_ty))
+            let ptr_is_element = value_defs
+                .get(ptr)
+                .map(|definition| store_split_pointer_is_element(ctx, definition, pointee_ty))
                 .unwrap_or(false);
             if !ptr_is_element {
                 continue;
             }
-            let Some(obj_ty) = value_result_type(ctx, *obj) else {
+            let Some(obj_ty) = value_types.get(obj).copied() else {
                 continue;
             };
             if obj_ty == pointee_ty {
@@ -1832,6 +1002,7 @@ pub(in crate::passes) struct SubwordPlan {
     pub(in crate::passes) parts: Vec<SubwordPart>,
     pub(in crate::passes) exact_buffer_offset: Option<(Word, u64)>,
     pub(in crate::passes) addressed_member_offset: u32,
+    pub(in crate::passes) source_pointer: Word,
 }
 
 /// Lower a width-mismatched `OpLoad` of a wider scalar through a struct-MEMBER pointer into a
@@ -2055,6 +1226,7 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
                     &mut HashSet::new(),
                 ),
                 addressed_member_offset: read_lo,
+                source_pointer: *ptr,
             });
         }
     }
@@ -2064,6 +1236,10 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
     }
 
     // Apply: rebuild each affected block, splicing the assembly in place of the planned load.
+    let retired_source_pointers = plans
+        .iter()
+        .map(|plan| plan.source_pointer)
+        .collect::<Vec<_>>();
     let mut by_block: HashMap<usize, Vec<SubwordPlan>> = HashMap::new();
     for plan in plans {
         by_block.entry(plan.bi).or_default().push(plan);
@@ -2086,6 +1262,11 @@ pub(in crate::passes) fn lower_cross_member_subword_load(
         }
         ctx.module.functions[entry_idx].blocks[bi].instructions = out;
     }
+    crate::passes::resources::retire_dead_pointer_projections(
+        ctx,
+        entry_idx,
+        retired_source_pointers,
+    );
     Ok(())
 }
 

@@ -13,7 +13,7 @@ use super::*;
 /// private, `M`-dominated merge (inserted afterward by [`unique_selection_merges`]) while outer edges
 /// keep flowing through the untouched original exit. A non-cloneable region (multiple reconvergence
 /// boundaries, an in-region back-edge, or oversize) leaves the graph unchanged — the plan then honestly
-/// rejects and falls to repair, so this is floor-safe.
+/// rejects and falls to the relooper retry, so this is floor-safe.
 pub(in crate::native) fn privatize_dispatch_shared_exits(
     blocks: &mut Vec<BodyBlock>,
     dispatch: &str,
@@ -86,7 +86,7 @@ pub(in crate::native) fn split_phi_overlap(
     let mut exit_rewrites: Vec<(String, TypedIncomings)> = Vec::new();
     if let Some(t) = &blocks[exit_idx].typed {
         for inst in &t.insts {
-            let (Some(dst), Some((ty, inc))) = (inst.result.clone(), inst.phi_incoming.clone())
+            let (Some(dst), Some((ty, inc))) = (inst.result.clone(), inst.phi_incoming().clone())
             else {
                 continue;
             };

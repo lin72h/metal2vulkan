@@ -19,9 +19,9 @@ impl LlModule {
             while changed {
                 changed = false;
                 for inst in f.carrier_insts() {
-                    if let Some((res, base)) = &inst.identity_ptr_bitcast {
+                    if let Some((res, base)) = inst.identity_ptr_bitcast() {
                         if let Some(root) = roots.get(base).cloned() {
-                            if roots.insert(res.clone(), root).is_none() {
+                            if roots.insert(res.to_string(), root).is_none() {
                                 changed = true;
                             }
                         }
@@ -31,7 +31,7 @@ impl LlModule {
                     let Some(res) = &inst.result else {
                         continue;
                     };
-                    if let Some(gep) = &inst.gep {
+                    if let Some(gep) = &inst.gep() {
                         let LlValue::Local(base) = &gep.base.value else {
                             continue;
                         };
@@ -48,7 +48,7 @@ impl LlModule {
                         continue;
                     }
 
-                    if let Some(incoming) = &inst.phi_incoming_values {
+                    if let Some(incoming) = inst.phi_values() {
                         let mut root: Option<String> = None;
                         for value in incoming {
                             let LlValue::Local(name) = value else {
@@ -138,7 +138,7 @@ impl LlModule {
             // `alloca_ty` is `resolve_alloca_ty` — the exact `parse_type(parts[0])` on the post-`alloca`
             // comma-split the reader ran, computed only for `opcode == "alloca"`, so a `Some` here is
             // precisely the reader's parsed alloca type. The result name is the reader's LHS.
-            let (Some(name), Some(ty)) = (&inst.result, &inst.alloca_ty) else {
+            let (Some(name), Some(ty)) = (&inst.result, &inst.alloca_ty()) else {
                 continue;
             };
             allocas.insert(name.clone(), ty.clone());

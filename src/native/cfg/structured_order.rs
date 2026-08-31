@@ -2,7 +2,7 @@
 //!
 //! Primary CFG emission is structured by construction. Block ordering, single-predecessor cleanup,
 //! and merge placement are coupled, so the planner produces a complete plan rather than incrementally
-//! bypassing individual retained-module repairs. This begins with emitting blocks in a structured
+//! avoiding retained-module control-flow rewrites. This begins with emitting blocks in a structured
 //! order.
 //!
 //! This module is that ordering. SPIR-V's structured CFG requires every block to appear after its

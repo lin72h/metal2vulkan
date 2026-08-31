@@ -2,9 +2,8 @@
 
 use super::*;
 use module_cleanup::{
-    add_needed_capabilities, drop_dangling_debug, drop_dead_unreferenced_variables,
-    drop_unused_int64_capability, drop_unused_variable_pointer_capabilities,
-    function_referenced_ids, gc_dead_globals,
+    add_needed_capabilities, drop_dead_unreferenced_variables, drop_unused_int64_capability,
+    drop_unused_variable_pointer_capabilities, function_referenced_ids, gc_dead_globals,
 };
 
 pub(in crate::passes) fn finalize(
@@ -18,6 +17,14 @@ pub(in crate::passes) fn finalize(
     // void types BEFORE we drain new_globals into the module.
     let void = ctx.ty_void();
     let fn_void = ctx.ty_fn_void(void);
+    if matches!(stage, Stage::Kernel)
+        && !matches!(
+            ctx.kernel_dispatch,
+            crate::reflect::KernelDispatch::Workgroups
+        )
+    {
+        ctx.kernel_workgroup_size_id();
+    }
     {
         let def = ctx.module.functions[entry_idx]
             .def
@@ -34,11 +41,32 @@ pub(in crate::passes) fn finalize(
     }
 
     // Append synthesized globals. Every builder emits its dependencies before its users.
-    let globals = std::mem::take(&mut ctx.new_globals);
-    ctx.module.types_global_values.extend(globals);
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
     rewrite_resource_query_selects(ctx)?;
-    let globals = std::mem::take(&mut ctx.new_globals);
-    ctx.module.types_global_values.extend(globals);
+    ctx.module.types_global_values.append(&mut ctx.new_globals);
+    // The two producer streams are now one owned graph. Recompute the allocator floor before the
+    // native closure constructors append pointer/image types so none can reuse an id that was
+    // reserved while still staged in `new_globals`.
+    ctx.module.sync_id_bound_from_instructions();
+    // Resource-query construction is the last producer of descriptor-backed pointer-select
+    // closures. Close them in the Logical value domain, construct any remaining address-domain
+    // closure, then construct opaque image selections that value replay exposes. This is the final
+    // resource-value production boundary: later work computes liveness and layout but cannot create
+    // another descriptor-backed pointer or image selection.
+    let _ = crate::native::construct_interface_cross_binding_pointer_values_module(&mut ctx.module);
+    if !ctx.emit_sidecar.all_device_buffers_raw
+        || ctx.emit_sidecar.construct_cross_binding_addresses
+    {
+        if let Some(address_table) =
+            crate::native::construct_interface_cross_binding_pointer_merges_module(
+                &mut ctx.module,
+                ctx.descriptor_layout,
+            )
+        {
+            ctx.interface_buffer_var(address_table);
+        }
+    }
+    crate::native::construct_opaque_image_selects_module(&mut ctx.module);
 
     let entry_id = ctx.module.functions[entry_idx]
         .def
@@ -172,7 +200,12 @@ pub(in crate::passes) fn finalize(
             ));
         }
     }
-    if matches!(stage, Stage::Kernel) {
+    if matches!(stage, Stage::Kernel)
+        && matches!(
+            ctx.kernel_dispatch,
+            crate::reflect::KernelDispatch::Workgroups
+        )
+    {
         let [x, y, z] = ctx.kernel_local_size;
         ctx.module.execution_modes.push(Instruction::new(
             Op::ExecutionMode,
@@ -220,11 +253,173 @@ pub(in crate::passes) fn finalize(
     });
 
     drop_dead_unreferenced_variables(ctx, &referenced_from_functions, &interface_ids);
-    drop_dangling_debug(ctx);
     gc_dead_globals(ctx);
     drop_unused_int64_capability(ctx);
-    drop_unused_variable_pointer_capabilities(ctx);
-    add_needed_capabilities(ctx);
+    let variable_pointer_requirements = drop_unused_variable_pointer_capabilities(ctx);
+    add_needed_capabilities(ctx, variable_pointer_requirements);
+    order_module_scope_dependencies(&mut ctx.module)?;
 
     Ok(())
+}
+
+/// Put every module-scope definition before its users while preserving source order wherever no
+/// dependency requires movement. Rewrites may point an existing aggregate or variable at a type
+/// synthesized later in `new_globals`; finalization owns merging those two construction streams.
+fn order_module_scope_dependencies(module: &mut Module) -> Result<(), String> {
+    let definitions = module
+        .types_global_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| instruction.result_id.map(|id| (id, index)))
+        .collect::<HashMap<_, _>>();
+    let forward_pointers = module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::TypeForwardPointer)
+        .filter_map(|instruction| match instruction.operands.first() {
+            Some(Operand::IdRef(id)) => Some(*id),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut dependencies = vec![Vec::new(); module.types_global_values.len()];
+    for (index, instruction) in module.types_global_values.iter().enumerate() {
+        let ids =
+            instruction
+                .result_type
+                .into_iter()
+                .chain(
+                    instruction
+                        .operands
+                        .iter()
+                        .filter_map(|operand| match operand {
+                            Operand::IdRef(id)
+                            | Operand::IdMemorySemantics(id)
+                            | Operand::IdScope(id) => Some(*id),
+                            _ => None,
+                        }),
+                );
+        for id in ids {
+            if forward_pointers.contains(&id) {
+                continue;
+            }
+            if let Some(&dependency) = definitions.get(&id) {
+                if dependency != index {
+                    dependencies[index].push(dependency);
+                }
+            }
+        }
+        dependencies[index].sort_unstable();
+        dependencies[index].dedup();
+    }
+
+    fn visit(
+        index: usize,
+        dependencies: &[Vec<usize>],
+        state: &mut [u8],
+        order: &mut Vec<usize>,
+    ) -> Result<(), String> {
+        match state[index] {
+            2 => return Ok(()),
+            1 => {
+                return Err(format!(
+                    "module-scope definitions contain a dependency cycle at instruction {index}"
+                ));
+            }
+            _ => {}
+        }
+        state[index] = 1;
+        for &dependency in &dependencies[index] {
+            visit(dependency, dependencies, state, order)?;
+        }
+        state[index] = 2;
+        order.push(index);
+        Ok(())
+    }
+
+    let mut state = vec![0u8; dependencies.len()];
+    let mut order = Vec::with_capacity(dependencies.len());
+    for index in 0..dependencies.len() {
+        visit(index, &dependencies, &mut state, &mut order)?;
+    }
+    let mut ranks = vec![0usize; order.len()];
+    for (rank, index) in order.into_iter().enumerate() {
+        ranks[index] = rank;
+    }
+    let original_indices = module
+        .types_global_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| instruction.result_id.map(|id| (id, index)))
+        .collect::<HashMap<_, _>>();
+    let forward_ranks = module
+        .types_global_values
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instruction)| {
+            (instruction.class.opcode == Op::TypeForwardPointer)
+                .then(|| match instruction.operands.first() {
+                    Some(Operand::IdRef(id)) => Some((*id, ranks[index])),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect::<HashMap<_, _>>();
+    module.types_global_values.sort_by_key(|instruction| {
+        instruction
+            .result_id
+            .and_then(|id| original_indices.get(&id).copied())
+            .map(|index| ranks[index])
+            .or_else(|| {
+                (instruction.class.opcode == Op::TypeForwardPointer)
+                    .then(|| match instruction.operands.first() {
+                        Some(Operand::IdRef(id)) => forward_ranks.get(id).copied(),
+                        _ => None,
+                    })
+                    .flatten()
+            })
+            .unwrap_or(usize::MAX)
+    });
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finalization_orders_late_aggregate_type_dependencies_before_existing_users() {
+        let mut module = Module::new();
+        module.types_global_values = vec![
+            Instruction::new(Op::TypeStruct, None, Some(1), vec![Operand::IdRef(4)]),
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(2),
+                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
+            ),
+            Instruction::new(
+                Op::Constant,
+                Some(2),
+                Some(3),
+                vec![Operand::LiteralBit32(11)],
+            ),
+            Instruction::new(
+                Op::TypeArray,
+                None,
+                Some(4),
+                vec![Operand::IdRef(2), Operand::IdRef(3)],
+            ),
+        ];
+
+        order_module_scope_dependencies(&mut module).unwrap();
+
+        assert_eq!(
+            module
+                .types_global_values
+                .iter()
+                .filter_map(|instruction| instruction.result_id)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 1]
+        );
+    }
 }

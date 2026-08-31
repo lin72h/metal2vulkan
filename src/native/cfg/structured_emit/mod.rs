@@ -23,13 +23,13 @@
 //! structured: a header whose sole latch is its unconditional direct self branch is split into
 //! header/body/continue blocks and given an unreachable merge.
 //!
-//! The planner is wired into the default structured-emission path. A former failure-triggered retry
-//! (re-emitting with forest merges only when the heuristic path failed) was empirically disproven to
-//! move the CFG frontier: its reachable triggers either could not be fixed by that partial consumer or
-//! never fired, because spirv-val's back-edge notion is not pure dominance. Remaining classes still
-//! need their own complete restructuring before they can replace the fallback path.
+//! The planner is wired into the primary structured-emission path. Its complete structural
+//! alternatives are attempted before the owned pipeline selects the raw-CFG representation;
+//! validator output does not participate in that choice.
 
-use super::blocks::{block_successors, conditional_branch_targets, synthetic_block};
+use super::blocks::{
+    block_successors, conditional_branch_targets, index_branch_merges_by_header, synthetic_block,
+};
 use super::loopforest::{
     analyze, analyze_reusing_natural_loops, break_aware_selection_merges, selection_merges,
     LoopForest, Restructure,
@@ -57,10 +57,13 @@ mod multi_exit;
 pub(in crate::native) use multi_exit::*;
 mod phi_util;
 pub(in crate::native) use phi_util::*;
-// The own-arm retry consumes the construct-tree planner core. The generic R1 route/re-nest
-// materializers remain fixture-only until a later class needs the full regional dispatcher.
+// The own-arm and loop-exit-sibling paths consume the construct-tree planner core. The bounded
+// dispatcher materializers are also the typed source-level fallback for modest rejected CFGs.
 #[allow(dead_code)]
 mod construct_tree;
+pub(in crate::native) use construct_tree::{
+    renest_whole_cfg_dispatch, requires_loop_exit_sibling_dispatch,
+};
 mod own_arm;
 pub(in crate::native) use own_arm::*;
 mod straddle_region;
@@ -120,7 +123,7 @@ mod tests {
             .insts
             .iter()
             .find(|i| i.is_phi() && i.result.as_deref() == Some(dst))
-            .and_then(|i| i.phi_incoming.as_ref())
+            .and_then(|i| i.phi_incoming().as_ref())
             .map(|(_, inc)| inc.as_slice())
             .unwrap_or_else(|| panic!("phi {dst} not found in {}", block.name))
     }
@@ -136,7 +139,7 @@ mod tests {
             .filter_map(|i| {
                 Some((
                     i.result.clone()?,
-                    i.phi_incoming.as_ref().map(|(_, inc)| inc.clone())?,
+                    i.phi_incoming().as_ref().map(|(_, inc)| inc.clone())?,
                 ))
             })
             .collect()
@@ -728,6 +731,41 @@ mod tests {
         assert_eq!(selections.get("%selection"), Some(&"%join".to_string()));
     }
 
+    /// A loop-free guard and a later loop cannot both own their shared return directly. The generic
+    /// convergence refinement must leave this case to the terminal planner, which splits the loop
+    /// exit and gives the guard a private merge before the loop entry.
+    #[test]
+    fn loop_free_guard_defers_shared_loop_return_to_terminal_ownership() {
+        let blocks = vec![
+            bb("%entry", &["br label %guard"]),
+            bb("%guard", &["br i1 %early, label %ret, label %preheader"]),
+            bb("%preheader", &["br label %loop"]),
+            bb("%loop", &["br label %latch"]),
+            bb("%latch", &["br i1 %again, label %loop, label %ret"]),
+            bb("%ret", &["ret void"]),
+        ];
+        let forest = analyze(&blocks);
+        let mut selections = HashMap::new();
+        refine_nested_terminal_selection_merges(
+            &blocks,
+            &forest,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut selections,
+        );
+        assert!(!selections.contains_key("%guard"));
+
+        let terminal = prepare_terminal_exit_selection(&blocks)
+            .expect("shared loop return has explicit terminal ownership");
+        let guard_merge = terminal.merges.get("%guard").expect("guard merge");
+        assert_ne!(guard_merge, "%preheader");
+        assert_ne!(guard_merge, "%ret");
+        assert!(terminal
+            .blocks
+            .iter()
+            .any(|block| { block.name == *guard_merge && block.role == BlockRole::LMerge }));
+    }
+
     /// A shared continuation with an outside predecessor is not header-dominated, but it remains the
     /// selection merge when every arm reaches it. The convergence proof must not require a terminal arm.
     #[test]
@@ -1130,6 +1168,22 @@ mod tests {
         assert!(structured_plan(&blocks).is_none());
     }
 
+    #[test]
+    fn dense_cfg_declines_repeated_local_planning() {
+        let mut blocks = Vec::new();
+        for index in 0..100 {
+            let left = format!("%b{}", (index + 1).min(100));
+            let right = format!("%b{}", (index + 2).min(100));
+            blocks.push(bb(
+                &format!("%b{index}"),
+                &[&format!("br i1 %condition, label {left}, label {right}")],
+            ));
+        }
+        blocks.push(bb("%b100", &["ret void"]));
+
+        assert!(exceeds_local_structured_plan_budget(&blocks));
+    }
+
     /// `synth_multi_latch_continue` funnels a loop's two back-edges through one synthesized latch `L`:
     /// `%l1`/`%l2` (which both branch to header `%h`) are redirected to `L`, `L` branches back to `%h`,
     /// the header's per-latch phi incomings are merged into a value phi in `L`, and the header phi keeps
@@ -1180,6 +1234,71 @@ mod tests {
         assert_eq!(lphi.len(), 2);
         assert!(lphi.iter().any(|(_, p)| p == "%l1"));
         assert!(lphi.iter().any(|(_, p)| p == "%l2"));
+    }
+
+    /// The reusable two-target dispatch owns the complete SSA edge contract independently of loop
+    /// discovery: predecessor edges converge at one selector block, and destination phis retain
+    /// unrelated incoming values while replacing routed predecessors with that block.
+    #[test]
+    fn two_target_dispatch_funnels_typed_destination_phis() {
+        let mut blocks = vec![
+            bb("%entry", &["br i1 %c, label %p0, label %p1"]),
+            bb("%p0", &["br label %x"]),
+            bb("%p1", &["br label %y"]),
+            bb("%outside.x", &["br label %x"]),
+            bb("%outside.y", &["br label %y"]),
+            bb(
+                "%x",
+                &["%vx = phi i32 [ 1, %p0 ], [ 2, %outside.x ]", "ret void"],
+            ),
+            bb(
+                "%y",
+                &["%vy = phi i32 [ 3, %p1 ], [ 4, %outside.y ]", "ret void"],
+            ),
+        ];
+        let exits = vec!["%x".to_string(), "%y".to_string()];
+        let predecessors = vec![("%p0".to_string(), 0), ("%p1".to_string(), 1)];
+        let mut counter = 0;
+
+        let dispatch = synth_two_target_dispatch(&mut blocks, &exits, &predecessors, &mut counter)
+            .expect("typed dispatch");
+
+        for predecessor in ["%p0", "%p1"] {
+            assert_eq!(
+                block_successors(
+                    blocks
+                        .iter()
+                        .find(|block| block.name == predecessor)
+                        .unwrap()
+                ),
+                std::slice::from_ref(&dispatch)
+            );
+        }
+        assert_eq!(
+            block_successors(blocks.iter().find(|block| block.name == dispatch).unwrap()),
+            exits
+        );
+        let dispatch_phis =
+            carrier_phis(blocks.iter().find(|block| block.name == dispatch).unwrap());
+        assert_eq!(dispatch_phis.len(), 3);
+        for (_, incoming) in dispatch_phis {
+            assert_eq!(incoming.len(), 2);
+            assert!(incoming.iter().any(|(_, predecessor)| predecessor == "%p0"));
+            assert!(incoming.iter().any(|(_, predecessor)| predecessor == "%p1"));
+        }
+        for (target, phi, outside) in [("%x", "%vx", "%outside.x"), ("%y", "%vy", "%outside.y")] {
+            let incoming = phi_incomings(
+                blocks.iter().find(|block| block.name == target).unwrap(),
+                phi,
+            );
+            assert_eq!(incoming.len(), 2);
+            assert!(incoming
+                .iter()
+                .any(|(_, predecessor)| *predecessor == dispatch));
+            assert!(incoming
+                .iter()
+                .any(|(_, predecessor)| predecessor == outside));
+        }
     }
 
     /// A pure self-latching infinite loop has no source exit and uses its header as the back-edge.
@@ -1309,7 +1428,7 @@ mod tests {
     /// pass-through (`br label %merge`, no phi/def), the S15 pre-pass clones it: `%h1`'s entry gets a
     /// private copy so `%h1` dominates its arm, `%entry`'s edge keeps the original `%shared`, and the
     /// residual `merge-not-dominated` is synthesized. `structured_plan` now ADMITS instead of falling
-    /// back to the repair path — and the reject diagnostic agrees (mirror consistency).
+    /// back to the relooper retry — and the reject diagnostic agrees (mirror consistency).
     #[test]
     fn cross_arm_shared_convergence_is_structured_by_trivial_privatization() {
         let blocks = vec![
@@ -1361,7 +1480,7 @@ mod tests {
     /// A nested switch whose arms reconverge at a block that an ENCLOSING selection also branches to as
     /// one of its arms: the switch's NATURAL merge is then not dominated by the switch header (an outer
     /// edge reaches it directly). Rather than reject as `selection:merge-not-dominated` (the old
-    /// behavior — this shape, banked `e848bc87`/`72cbab44`, was punted to the repair path), the
+    /// behavior — this shape, banked `e848bc87`/`72cbab44`, was punted to the relooper retry), the
     /// non-dominated natural merge is now treated as a collision and `unique_selection_merges` inserts a
     /// header-dominated pass-through merge: the switch's own reconvergence is redirected to a fresh block
     /// whose predecessors are all switch-dominated, and that fresh block flows on to the shared block. So
@@ -1425,12 +1544,11 @@ mod tests {
         );
     }
 
-    /// A loop header ending in a `switch` whose targets include the loop's merge (a `while`-style switch
-    /// exit test) is NOT splittable — `split_loop_header_switch` requires every target be a genuine
-    /// in-loop block — and would need both OpLoopMerge and OpSelectionMerge on one block. `structured_plan`
-    /// must still reject this residue so it falls back to the repair path (banked `423ff479`).
+    /// A loop-header switch with an exit arm is lowered to a comparison ladder before admission. The
+    /// header owns the loop merge and first conditional; later comparisons are ordinary selection
+    /// blocks, so no block needs both `OpLoopMerge` and `OpSelectionMerge`.
     #[test]
-    fn loop_header_switch_is_rejected() {
+    fn loop_header_exit_switch_is_lowered_and_admitted() {
         let blocks = vec![
             bb("%entry", &["br label %h"]),
             bb(
@@ -1440,9 +1558,67 @@ mod tests {
             bb("%body", &["br label %h"]),
             bb("%merge", &["ret void"]),
         ];
+        let plan = structured_plan(&blocks).expect("loop-header exit switch must structure");
+        assert!(plan.blocks.iter().all(|block| {
+            !block.typed.as_ref().is_some_and(|typed| {
+                matches!(
+                    typed.terminator,
+                    crate::native::tir::TirTerminator::Switch { .. }
+                )
+            })
+        }));
+    }
+
+    #[test]
+    fn multi_exit_loop_header_switch_is_lowered_before_planning() {
+        let blocks = vec![
+            bb("%entry", &["br label %h"]),
+            bb(
+                "%h",
+                &["switch i32 %sel, label %left [ i32 0, label %body i32 1, label %right ]"],
+            ),
+            bb("%body", &["br label %h"]),
+            bb("%left", &["ret void"]),
+            bb("%right", &["ret void"]),
+        ];
+        let lowered = super::blocks::lower_loop_exit_switches(&blocks);
+        assert!(lowered.iter().all(|block| {
+            !block.typed.as_ref().is_some_and(|typed| {
+                matches!(
+                    typed.terminator,
+                    crate::native::tir::TirTerminator::Switch { .. }
+                )
+            })
+        }));
+    }
+
+    /// A non-header switch inside a loop may target both the loop latch and merge. Those targets are
+    /// enclosing loop roles, not case constructs owned by the switch, even when source dominance
+    /// makes the raw CFG appear admissible. Planning must select the branch-ladder form first.
+    #[test]
+    fn loop_role_switch_targets_are_lowered_before_plan_admission() {
+        let blocks = vec![
+            bb("%entry", &["br label %head"]),
+            bb("%head", &["br label %switch"]),
+            bb(
+                "%switch",
+                &["switch i32 %tag, label %exit [ i32 0, label %latch i32 1, label %latch ]"],
+            ),
+            bb("%latch", &["br label %head"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let plan =
+            structured_plan(&blocks).expect("loop-exiting switch must structure as a ladder");
         assert!(
-            structured_plan(&blocks).is_none(),
-            "a loop header that is also a switch must not be admitted"
+            plan.blocks.iter().all(|block| {
+                !block.typed.as_ref().is_some_and(|typed| {
+                    matches!(
+                        typed.terminator,
+                        crate::native::tir::TirTerminator::Switch { .. }
+                    )
+                })
+            }),
+            "the raw switch must not survive admission"
         );
     }
 
@@ -1693,6 +1869,686 @@ mod tests {
             );
             assert!(out.iter().any(|b| &b.name == sel_merge));
         }
+    }
+
+    #[test]
+    fn finalized_emission_plan_keeps_external_entry_out_of_loop_continue() {
+        let mut blocks = vec![
+            bb("%entry", &["br label %preheader"]),
+            bb("%preheader", &["br label %continue"]),
+            bb(
+                "%continue",
+                &[
+                    "%next = phi i32 [ 0, %preheader ], [ 1, %body ]",
+                    "br label %header",
+                ],
+            ),
+            bb(
+                "%header",
+                &[
+                    "%value = phi i32 [ %next, %continue ]",
+                    "br i1 %condition, label %body, label %exit",
+                ],
+            ),
+            bb("%body", &["br label %continue"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let loop_merges = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%continue".to_string(),
+            },
+        )]);
+
+        assert!(normalize_loop_continue_external_predecessors(
+            &mut blocks,
+            &loop_merges,
+        ));
+        assert!(
+            blocks
+                .iter()
+                .position(|block| block.name == "%header")
+                .expect("header position")
+                < blocks
+                    .iter()
+                    .position(|block| block.name == "%continue")
+                    .expect("continue position"),
+            "new dominance must be reflected in serialization",
+        );
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%preheader")
+                    .expect("preheader"),
+            ),
+            ["%header"],
+        );
+        assert_eq!(
+            phi_incomings(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%continue")
+                    .expect("continue"),
+                "%next",
+            )
+            .iter()
+            .map(|(value, predecessor)| (val_str(value), predecessor.as_str()))
+            .collect::<Vec<_>>(),
+            [("1".to_string(), "%body")],
+        );
+        assert_eq!(
+            phi_incomings(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%header")
+                    .expect("header"),
+                "%value",
+            )
+            .iter()
+            .map(|(value, predecessor)| (val_str(value), predecessor.as_str()))
+            .collect::<Vec<_>>(),
+            [
+                ("%next".to_string(), "%continue"),
+                ("0".to_string(), "%preheader"),
+            ],
+        );
+    }
+
+    #[test]
+    fn finalized_emission_plan_moves_enclosing_selection_off_loop_continue() {
+        let mut blocks = vec![
+            bb("%entry", &["br i1 %outer, label %header, label %done"]),
+            bb("%header", &["br i1 %loop, label %body, label %loop_exit"]),
+            bb("%body", &["br label %continue"]),
+            bb("%continue", &["br label %header"]),
+            bb("%loop_exit", &["br label %done"]),
+            bb("%done", &["ret void"]),
+        ];
+        let loops = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%loop_exit".to_string(),
+                continue_target: "%continue".to_string(),
+            },
+        )]);
+        let mut merges = HashMap::from([("%entry".to_string(), "%continue".to_string())]);
+
+        assert!(normalize_continue_selection_merge_targets(
+            &mut blocks,
+            &loops,
+            &mut merges,
+        ));
+        assert_eq!(merges["%entry"], "%done");
+    }
+
+    #[test]
+    fn finalized_emission_plan_declines_identical_loop_boundaries_without_spinning() {
+        let mut blocks = vec![
+            bb("%entry", &["br i1 %outer, label %header, label %done"]),
+            bb("%header", &["br label %boundary"]),
+            bb("%boundary", &["br label %header"]),
+            bb("%done", &["ret void"]),
+        ];
+        let loops = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%boundary".to_string(),
+                continue_target: "%boundary".to_string(),
+            },
+        )]);
+        let mut merges = HashMap::from([("%entry".to_string(), "%boundary".to_string())]);
+
+        assert!(!normalize_continue_selection_merge_targets(
+            &mut blocks,
+            &loops,
+            &mut merges,
+        ));
+        assert_eq!(merges["%entry"], "%boundary");
+    }
+
+    #[test]
+    fn finalized_emission_plan_splits_direct_break_from_loop_continue_merge() {
+        let mut blocks = vec![
+            bb("%header", &["br label %selection"]),
+            bb(
+                "%selection",
+                &["br i1 %condition, label %continue, label %exit"],
+            ),
+            bb("%continue", &["br label %header"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let loops = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%continue".to_string(),
+            },
+        )]);
+        let mut merges = HashMap::from([("%selection".to_string(), "%continue".to_string())]);
+
+        assert!(normalize_continue_selection_merge_targets(
+            &mut blocks,
+            &loops,
+            &mut merges,
+        ));
+        let private = &merges["%selection"];
+        assert_ne!(private, "%continue");
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%selection")
+                    .expect("selection"),
+            ),
+            ["%continue", private.as_str()],
+        );
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == *private)
+                    .expect("private merge"),
+            ),
+            ["%exit"],
+        );
+    }
+
+    #[test]
+    fn structured_plan_owns_continue_selection_boundary_before_emission() {
+        let blocks = vec![
+            bb("%header", &["br label %selection"]),
+            bb(
+                "%selection",
+                &["br i1 %condition, label %continue, label %exit"],
+            ),
+            bb("%continue", &["br label %header"]),
+            bb("%exit", &["ret void"]),
+        ];
+
+        let plan = structured_plan(&blocks).expect("structured plan");
+        let private = plan
+            .branch_merges_by_header
+            .get("%selection")
+            .expect("selection ownership");
+        assert_ne!(private, "%continue");
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == "%selection")
+                    .expect("selection"),
+            ),
+            ["%continue", private.as_str()],
+        );
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == *private)
+                    .expect("private merge"),
+            ),
+            ["%exit"],
+        );
+    }
+
+    #[test]
+    fn finalized_emission_plan_splits_phi_continue_reconvergence() {
+        let mut blocks = vec![
+            bb("%header", &["br i1 %loop, label %selection, label %exit"]),
+            bb(
+                "%selection",
+                &["br i1 %condition, label %left, label %right"],
+            ),
+            bb("%left", &["br label %right"]),
+            bb("%right", &["br label %continue"]),
+            bb(
+                "%continue",
+                &["%value = phi i32 [ 7, %right ]", "br label %header"],
+            ),
+            bb("%exit", &["ret void"]),
+        ];
+        let loops = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%continue".to_string(),
+            },
+        )]);
+        let mut merges = HashMap::from([("%selection".to_string(), "%continue".to_string())]);
+
+        assert!(normalize_continue_selection_merge_targets(
+            &mut blocks,
+            &loops,
+            &mut merges,
+        ));
+        let private = &merges["%selection"];
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%right")
+                    .expect("right arm"),
+            ),
+            [private.as_str()],
+        );
+        let continue_incoming = phi_incomings(
+            blocks
+                .iter()
+                .find(|block| block.name == "%continue")
+                .expect("continue"),
+            "%value",
+        );
+        assert_eq!(continue_incoming.len(), 1);
+        assert_eq!(continue_incoming[0].1, *private);
+    }
+
+    #[test]
+    fn finalized_emission_plan_privatizes_reused_phi_merge_targets() {
+        let mut blocks = vec![
+            bb("%outer", &["br i1 %c0, label %inner, label %outer_arm"]),
+            bb("%inner", &["br i1 %c1, label %inner_t, label %inner_f"]),
+            bb("%inner_t", &["br label %join"]),
+            bb("%inner_f", &["br label %join"]),
+            bb("%outer_arm", &["br label %join"]),
+            bb(
+                "%join",
+                &[
+                    "%value = phi i32 [ 1, %inner_t ], [ 2, %inner_f ], [ 3, %outer_arm ]",
+                    "ret void",
+                ],
+            ),
+        ];
+        let mut loop_merges = HashMap::new();
+        let branch_merges = HashMap::new();
+        let mut branch_merges_by_header = HashMap::from([
+            ("%outer".to_string(), "%join".to_string()),
+            ("%inner".to_string(), "%join".to_string()),
+        ]);
+        let mut switch_merges = HashMap::new();
+
+        assert!(privatize_reused_emitted_merge_targets(
+            &mut blocks,
+            &mut loop_merges,
+            &branch_merges,
+            &mut branch_merges_by_header,
+            true,
+            &mut switch_merges,
+        ));
+
+        let outer_merge = &branch_merges_by_header["%outer"];
+        let inner_merge = &branch_merges_by_header["%inner"];
+        assert_ne!(outer_merge, inner_merge);
+        assert_ne!(outer_merge, "%join");
+        assert_ne!(inner_merge, "%join");
+        let inner_block = blocks
+            .iter()
+            .find(|block| block.name == *inner_merge)
+            .expect("inner private merge");
+        assert_eq!(block_successors(inner_block), [outer_merge.as_str()]);
+        let outer_block = blocks
+            .iter()
+            .find(|block| block.name == *outer_merge)
+            .expect("outer private merge");
+        assert_eq!(block_successors(outer_block), ["%join"]);
+        assert_eq!(
+            phi_incomings(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%join")
+                    .expect("join block"),
+                "%value",
+            )
+            .iter()
+            .map(|(_, predecessor)| predecessor.as_str())
+            .collect::<Vec<_>>(),
+            [outer_merge.as_str()],
+        );
+    }
+
+    #[test]
+    fn finalized_emission_plan_does_not_redirect_loop_header_backedges() {
+        let mut blocks = vec![
+            bb("%outer", &["br i1 %c0, label %inner, label %outer_arm"]),
+            bb("%inner", &["br i1 %c1, label %inner_t, label %inner_f"]),
+            bb("%inner_t", &["br label %loop"]),
+            bb("%inner_f", &["br label %loop"]),
+            bb("%outer_arm", &["br label %loop"]),
+            bb("%loop", &["br i1 %c2, label %body, label %exit"]),
+            bb("%body", &["br label %loop"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let mut loop_merges = HashMap::from([(
+            "%loop".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%body".to_string(),
+            },
+        )]);
+        let mut branch_merges_by_header = HashMap::from([
+            ("%outer".to_string(), "%loop".to_string()),
+            ("%inner".to_string(), "%loop".to_string()),
+        ]);
+
+        assert!(privatize_reused_emitted_merge_targets(
+            &mut blocks,
+            &mut loop_merges,
+            &HashMap::new(),
+            &mut branch_merges_by_header,
+            true,
+            &mut HashMap::new(),
+        ));
+
+        assert_ne!(branch_merges_by_header["%outer"], "%loop");
+        assert_ne!(branch_merges_by_header["%inner"], "%loop");
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%body")
+                    .expect("loop body"),
+            ),
+            ["%loop"],
+            "the loop-header backedge must not enter an ordinary private merge",
+        );
+    }
+
+    #[test]
+    fn finalized_emission_plan_privatizes_merge_from_enclosing_continue() {
+        let mut blocks = vec![
+            bb("%outer", &["br label %inner"]),
+            bb(
+                "%inner",
+                &["br i1 %inner_loop, label %outer_continue, label %inner"],
+            ),
+            bb(
+                "%outer_continue",
+                &["br i1 %outer_loop, label %outer, label %exit"],
+            ),
+            bb("%exit", &["ret void"]),
+        ];
+        let mut loops = HashMap::from([
+            (
+                "%outer".to_string(),
+                LoopMergeInfo {
+                    merge: "%exit".to_string(),
+                    continue_target: "%outer_continue".to_string(),
+                },
+            ),
+            (
+                "%inner".to_string(),
+                LoopMergeInfo {
+                    merge: "%outer_continue".to_string(),
+                    continue_target: "%inner".to_string(),
+                },
+            ),
+        ]);
+
+        assert!(privatize_reused_emitted_merge_targets(
+            &mut blocks,
+            &mut loops,
+            &HashMap::new(),
+            &mut HashMap::new(),
+            true,
+            &mut HashMap::new(),
+        ));
+        let private = &loops["%inner"].merge;
+        assert_ne!(private, "%outer_continue");
+        assert_eq!(loops["%outer"].continue_target, "%outer_continue");
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == *private)
+                    .expect("private inner merge"),
+            ),
+            ["%outer_continue"],
+        );
+    }
+
+    #[test]
+    fn finalized_emission_plan_drops_stale_unconditional_loop_claim() {
+        let blocks = vec![
+            bb("%entry", &["br label %header"]),
+            bb("%header", &["br label %exit"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let mut loops = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%header".to_string(),
+            },
+        )]);
+
+        assert!(normalize_stale_emitted_loop_claims(
+            &blocks,
+            &mut loops,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        ));
+        assert!(loops.is_empty());
+    }
+
+    #[test]
+    fn finalized_emission_plan_reclassifies_stale_conditional_loop_as_selection() {
+        let blocks = vec![
+            bb("%entry", &["br label %header"]),
+            bb("%header", &["br i1 %choose, label %body, label %exit"]),
+            bb("%body", &["br label %exit"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let mut loops = HashMap::from([(
+            "%header".to_string(),
+            LoopMergeInfo {
+                merge: "%exit".to_string(),
+                continue_target: "%header".to_string(),
+            },
+        )]);
+        let mut branch_merges = HashMap::new();
+
+        assert!(normalize_stale_emitted_loop_claims(
+            &blocks,
+            &mut loops,
+            &mut branch_merges,
+            &mut HashMap::new(),
+        ));
+        assert!(loops.is_empty());
+        assert_eq!(branch_merges["%header"], "%exit");
+    }
+
+    #[test]
+    fn finalized_emission_plan_privatizes_nondominated_selection_merge() {
+        let mut blocks = vec![
+            bb(
+                "%entry",
+                &["br i1 %outside, label %header, label %external"],
+            ),
+            bb("%header", &["br i1 %choose, label %body, label %exit"]),
+            bb("%body", &["br label %exit"]),
+            bb("%external", &["br label %exit"]),
+            bb("%exit", &["ret void"]),
+        ];
+        let mut branch_merges_by_header =
+            HashMap::from([("%header".to_string(), "%exit".to_string())]);
+
+        assert!(privatize_reused_emitted_merge_targets(
+            &mut blocks,
+            &mut HashMap::new(),
+            &HashMap::new(),
+            &mut branch_merges_by_header,
+            true,
+            &mut HashMap::new(),
+        ));
+        let private = &branch_merges_by_header["%header"];
+        assert_ne!(private, "%exit");
+        let forest = analyze(&blocks);
+        assert!(forest.dominates("%header", private));
+        assert_eq!(
+            block_successors(blocks.iter().find(|block| block.name == "%body").unwrap()).as_slice(),
+            std::slice::from_ref(private)
+        );
+        assert_eq!(
+            block_successors(
+                blocks
+                    .iter()
+                    .find(|block| block.name == "%external")
+                    .unwrap(),
+            ),
+            ["%exit"]
+        );
+    }
+
+    #[test]
+    fn finalized_emission_plan_funnels_phi_bypass_through_declared_merge() {
+        let mut blocks = vec![
+            bb(
+                "%entry",
+                &["br i1 %outside, label %header, label %external"],
+            ),
+            bb("%header", &["br i1 %c, label %merge, label %body"]),
+            bb(
+                "%merge",
+                &["%merged = phi i32 [ 1, %header ]", "br label %join"],
+            ),
+            bb("%body", &["br label %join"]),
+            bb("%external", &["br label %join"]),
+            bb(
+                "%join",
+                &[
+                    "%value = phi i32 [ %merged, %merge ], [ 2, %body ], [ 3, %external ]",
+                    "ret void",
+                ],
+            ),
+        ];
+        let branch_merges_by_header =
+            HashMap::from([("%header".to_string(), "%merge".to_string())]);
+
+        assert!(funnel_emitted_selection_merge_bypasses(
+            &mut blocks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &branch_merges_by_header,
+            true,
+            &HashMap::new(),
+        ));
+
+        assert_eq!(
+            block_successors(blocks.iter().find(|block| block.name == "%body").unwrap(),),
+            ["%merge"],
+        );
+        assert_eq!(
+            phi_incomings(
+                blocks.iter().find(|block| block.name == "%merge").unwrap(),
+                "%merged",
+            )
+            .iter()
+            .map(|(_, predecessor)| predecessor.as_str())
+            .collect::<Vec<_>>(),
+            ["%header", "%body"],
+        );
+        assert_eq!(
+            phi_incomings(
+                blocks.iter().find(|block| block.name == "%join").unwrap(),
+                "%value",
+            )
+            .iter()
+            .map(|(_, predecessor)| predecessor.as_str())
+            .collect::<Vec<_>>(),
+            ["%merge", "%external"],
+        );
+        assert!(!funnel_emitted_selection_merge_bypasses(
+            &mut blocks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &branch_merges_by_header,
+            true,
+            &HashMap::new(),
+        ));
+    }
+
+    #[test]
+    fn phi_bypass_value_equality_preserves_nan_payload_bits() {
+        use crate::native::ir::LlValue;
+
+        let payload = LlValue::Float(f64::from_bits(0x7ff8_0000_0000_0042));
+        let same_payload = LlValue::Float(f64::from_bits(0x7ff8_0000_0000_0042));
+        let other_payload = LlValue::Float(f64::from_bits(0x7ff8_0000_0000_0043));
+        assert!(phi_value_exact_eq(&payload, &same_payload));
+        assert!(!phi_value_exact_eq(&payload, &other_payload));
+    }
+
+    #[test]
+    fn finalized_emission_plan_privatizes_shared_direct_arm_through_merge() {
+        let mut blocks = vec![
+            bb("%entry", &["br i1 %outer, label %shared, label %inner"]),
+            bb("%inner", &["br i1 %nested, label %shared, label %local"]),
+            bb("%shared", &["%defined = add i32 %x, 1", "br label %target"]),
+            bb("%local", &["br label %merge"]),
+            bb("%merge", &["br label %target"]),
+            bb(
+                "%target",
+                &[
+                    "%value = phi i32 [ %defined, %shared ], [ 9, %merge ]",
+                    "ret void",
+                ],
+            ),
+        ];
+        let mut branch_merges_by_header =
+            HashMap::from([("%inner".to_string(), "%merge".to_string())]);
+
+        assert!(privatize_emitted_shared_direct_selection_arms(
+            &mut blocks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut branch_merges_by_header,
+            true,
+            &HashMap::new(),
+        ));
+        let clone = blocks
+            .iter()
+            .find(|block| block.name.starts_with("%xa"))
+            .expect("private shared-arm clone")
+            .name
+            .clone();
+        assert!(
+            block_successors(blocks.iter().find(|block| block.name == "%inner").unwrap())
+                .contains(&clone)
+        );
+
+        assert!(!funnel_emitted_selection_merge_bypasses(
+            &mut blocks,
+            &HashMap::new(),
+            &HashMap::new(),
+            &branch_merges_by_header,
+            true,
+            &HashMap::new(),
+        ));
+        assert_eq!(
+            block_successors(blocks.iter().find(|block| block.name == clone).unwrap()),
+            ["%merge"],
+        );
+        let merge_phis = carrier_phis(blocks.iter().find(|block| block.name == "%merge").unwrap());
+        assert_eq!(merge_phis.len(), 1);
+        assert!(merge_phis[0]
+            .1
+            .iter()
+            .any(|(_, predecessor)| predecessor == "%local"));
+        assert!(merge_phis[0]
+            .1
+            .iter()
+            .any(|(_, predecessor)| predecessor == &clone));
+        assert_eq!(
+            phi_incomings(
+                blocks.iter().find(|block| block.name == "%target").unwrap(),
+                "%value",
+            )
+            .iter()
+            .map(|(_, predecessor)| predecessor.as_str())
+            .collect::<Vec<_>>(),
+            ["%shared", "%merge"],
+        );
     }
 
     /// Simple single loop: header branches into body/exit, latch branches back. Directly
@@ -1965,9 +2821,8 @@ mod tests {
     }
 
     /// A single-exit loop with a mid-body conditional break: `body` branches to the loop merge
-    /// (break) or the continue block. The break conditional is NOT a selection needing a post-dom
-    /// merge — its OpSelectionMerge is the continue block — so `structured_plan` must fully admit the
-    /// function (loop directly structurable + break recognized), recording the break in branch_merges.
+    /// (break) or the continue block. Planning gives the conditional a private selection boundary
+    /// which then exits to the loop merge, keeping the selection inside the loop construct.
     #[test]
     fn mid_body_break_is_recognized_not_a_selection() {
         let blocks = vec![
@@ -1988,12 +2843,28 @@ mod tests {
         let info = plan.loop_merges.get("%head").expect("loop merge");
         assert_eq!(info.merge, "%merge");
         assert_eq!(info.continue_target, "%cont");
-        // The body break (arms = loop merge + continue) is recorded with the continue as its merge,
-        // NOT synthesized as a fresh selection merge or rejected as cond-phi-shared.
+        let private = plan
+            .branch_merges_by_header
+            .get("%body")
+            .expect("private body selection merge");
+        assert_ne!(private, "%cont");
         assert_eq!(
-            plan.branch_merges
-                .get(&("%merge".to_string(), "%cont".to_string())),
-            Some(&"%cont".to_string())
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == "%body")
+                    .expect("body"),
+            ),
+            [private.as_str(), "%cont"],
+        );
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == *private)
+                    .expect("private merge"),
+            ),
+            ["%merge"],
         );
     }
 
@@ -2081,13 +2952,11 @@ mod tests {
         );
     }
 
-    /// Residual merge-inloop / M2 shape: do-while with a mid-body guarded break that claims the loop
-    /// merge. Converge gives the loop a distinct merge + rotates the latch to `{merge, continue}`;
-    /// without structural-exit protection the subsequent selection synth would redirect the latch's
-    /// break arm through a pass-through and reject `branch-no-merge`. With the latch pre-registered
-    /// and protected, the plan admits (and the latch keeps its `{merge, continue}` arms).
+    /// Residual merge-inloop / M2 shape: do-while with a mid-body guarded break that initially claims
+    /// the loop continue. Planning must finalize that collision into a private selection merge which
+    /// then exits to the loop merge; no post-admission emitter rewrite may own this relationship.
     #[test]
-    fn do_while_latch_survives_selection_merge_synth_claiming_loop_merge() {
+    fn do_while_latch_finalizes_private_selection_boundary() {
         // entry -> h -> S; S -> body / m (guarded break); body -> latch; latch -> h / m (do-while).
         let blocks = vec![
             bb("%entry", &["br label %h"]),
@@ -2109,28 +2978,30 @@ mod tests {
             "continue: {}",
             info.continue_target
         );
-        // The rotated latch (or original if not rotated) keeps a branch_merges entry keyed by its
-        // CURRENT arms — never orphaned as (selN, cont).
-        let latch = plan
+        let (latch, continue_arm, private) = plan
             .blocks
             .iter()
-            .find(|b| {
-                conditional_branch_targets(b).is_some_and(|(t, f)| {
-                    let arms = [t.as_str(), f.as_str()];
-                    arms.contains(&info.merge.as_str())
-                        && arms.contains(&info.continue_target.as_str())
-                })
+            .find_map(|block| {
+                let (true_target, false_target) = conditional_branch_targets(block)?;
+                if true_target == info.continue_target {
+                    Some((block, true_target, false_target))
+                } else if false_target == info.continue_target {
+                    Some((block, false_target, true_target))
+                } else {
+                    None
+                }
             })
-            .expect("a break/continue latch with arms {{merge, continue}} must remain");
-        let (t, f) = conditional_branch_targets(latch).unwrap();
-        assert!(
-            plan.branch_merges.contains_key(&(t.clone(), f.clone()))
-                || plan.branch_merges.contains_key(&(f.clone(), t.clone())),
-            "latch {} arms ({},{}) must be in branch_merges: {:?}",
-            latch.name,
-            t,
-            f,
-            plan.branch_merges.keys().collect::<Vec<_>>()
+            .expect("continue selection");
+        assert_eq!(continue_arm, info.continue_target);
+        assert_eq!(plan.branch_merges_by_header[&latch.name], private);
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == private)
+                    .expect("private selection merge"),
+            ),
+            [info.merge.as_str()],
         );
     }
 
@@ -2199,6 +3070,53 @@ mod tests {
             "%merge",
             "%continue"
         ));
+    }
+
+    /// An exit-only arm dominated by a loop header belongs to the SPIR-V loop construct even though
+    /// it is not part of the natural-loop SCC. It may not bypass the loop merge by jumping directly
+    /// to an enclosing selection merge shared with an outside arm.
+    #[test]
+    fn dominance_owned_loop_arm_cannot_exit_to_outer_selection_merge() {
+        let blocks = vec![
+            bb("%entry", &["br label %outer"]),
+            bb(
+                "%outer",
+                &["br i1 %choose, label %preheader, label %outside"],
+            ),
+            bb("%preheader", &["br label %head"]),
+            bb(
+                "%head",
+                &[
+                    "%i = phi i32 [ 0, %preheader ], [ %n, %latch ]",
+                    "br label %body",
+                ],
+            ),
+            bb("%body", &["br i1 %escape, label %exit_only, label %latch"]),
+            bb("%latch", &["%n = add i32 %i, 1", "br label %head"]),
+            bb("%exit_only", &["br label %outer_merge"]),
+            bb("%loop_merge", &["br label %outer_merge"]),
+            bb("%outside", &["br label %outer_merge"]),
+            bb("%outer_merge", &["ret void"]),
+        ];
+        let loop_merges = HashMap::from([(
+            "%head".to_string(),
+            LoopMergeInfo {
+                merge: "%loop_merge".to_string(),
+                continue_target: "%latch".to_string(),
+            },
+        )]);
+        let forest = analyze(&blocks);
+        let natural_loop = forest
+            .loops
+            .iter()
+            .find(|natural_loop| natural_loop.header == "%head")
+            .expect("natural loop");
+        assert!(!natural_loop.body.iter().any(|node| node == "%exit_only"));
+        assert!(forest.dominates("%head", "%exit_only"));
+        assert_eq!(
+            dominance_loop_exit_escape_reason(&blocks, &loop_merges),
+            Some("loop-exit:dominance-owned-bypass")
+        );
     }
 
     /// A loop header that carries a genuine in-loop conditional is split into an `lhsel` carrier so
@@ -2511,14 +3429,115 @@ mod tests {
             .typed
             .as_ref()
             .and_then(|typed| typed.insts.first())
-            .and_then(|instruction| instruction.phi_incoming.as_ref())
+            .and_then(|instruction| instruction.phi_incoming().as_ref())
             .expect("continuation phi retained");
         assert_eq!(incoming.1[0].1, plan.merges["%inner"]);
     }
 
     #[test]
-    fn construct_tree_drops_pure_enclosing_selection_route_marker() {
+    fn construct_tree_direct_terminal_owner_accepts_a_proved_linear_tail() {
         let blocks = vec![
+            bb(
+                "%entry",
+                &["br i1 %outside_path, label %header, label %outside"],
+            ),
+            bb("%header", &["br i1 %guard, label %live, label %exit"]),
+            bb("%live", &["br i1 %work, label %left, label %right"]),
+            bb("%left", &["ret void"]),
+            bb("%right", &["ret void"]),
+            bb("%exit", &["br label %exit_tail"]),
+            bb("%exit_tail", &["br label %shared_return"]),
+            bb("%outside", &["br label %shared_return"]),
+            bb("%shared_return", &["ret void"]),
+        ];
+
+        let already_owned = HashMap::from([("%entry".to_string(), "%outside".to_string())]);
+        let plan = direct_terminal_exit_selection_merges(&blocks, &already_owned)
+            .expect("the proved linear terminal tail is owned before selection construction");
+        let merge = plan.merges.get("%header").expect("header owns a merge");
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == *merge)
+                    .expect("private merge materialized")
+            ),
+            vec!["%live".to_string()]
+        );
+        let exit_tail = plan
+            .blocks
+            .iter()
+            .find(|block| block.name == "%exit_tail")
+            .expect("terminal predecessor retained");
+        let exit_tail_successors = block_successors(exit_tail);
+        let [private_return] = exit_tail_successors.as_slice() else {
+            panic!("terminal predecessor must have one successor");
+        };
+        assert!(plan.blocks.iter().any(|block| {
+            block.name == *private_return && block.role == BlockRole::TerminalExitReturn
+        }));
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == "%outside")
+                    .unwrap()
+            ),
+            vec!["%shared_return".to_string()]
+        );
+    }
+
+    #[test]
+    fn construct_tree_direct_terminal_owner_preserves_work_in_return_blocks() {
+        let blocks = vec![
+            bb("%header", &["br i1 %guard, label %live, label %exit"]),
+            bb("%live", &["br i1 %work, label %left, label %right"]),
+            bb("%left", &["ret void"]),
+            bb("%right", &["ret void"]),
+            bb("%exit", &["%value = add i32 1, 2", "ret void"]),
+        ];
+
+        assert!(direct_terminal_exit_selection_merges(&blocks, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn construct_tree_generic_repairs_preserve_direct_terminal_guard_ownership() {
+        let mut blocks = vec![
+            bb("%header", &["br i1 %condition, label %return, label %live"]),
+            bb_role("%return", BlockRole::TerminalExitReturn, &["ret void"]),
+            bb("%live", &["br i1 %work, label %left, label %right"]),
+            bb("%left", &["br label %join"]),
+            bb("%right", &["br label %join"]),
+            bb_role("%local", BlockRole::LMerge, &["br label %join"]),
+            bb("%join", &["ret void"]),
+        ];
+        let mut merges = HashMap::from([("%header".to_string(), "%local".to_string())]);
+        let mut counter = 0usize;
+
+        repair_construct_tree_nondominated_selection_merges(
+            &mut blocks,
+            &HashMap::new(),
+            &mut merges,
+            &mut counter,
+        );
+        repair_construct_tree_passthrough_selection_merges(&blocks, &HashMap::new(), &mut merges);
+        assert!(!repair_construct_tree_bypassed_passthrough_merges(
+            &mut blocks,
+            &mut merges,
+            &mut counter,
+        ));
+
+        assert_eq!(merges.get("%header").map(String::as_str), Some("%local"));
+        assert_eq!(counter, 0);
+        assert_eq!(
+            block_successors(blocks.iter().find(|block| block.name == "%left").unwrap()),
+            vec!["%join".to_string()]
+        );
+    }
+
+    #[test]
+    fn construct_tree_materializes_pure_enclosing_selection_route() {
+        let mut blocks = vec![
             bb("%outer", &["br i1 %a, label %route, label %sibling"]),
             bb("%route", &["br i1 %b, label %shared, label %private"]),
             bb_role(
@@ -2534,18 +3553,87 @@ mod tests {
             ("%outer".to_string(), "%outer_merge".to_string()),
             ("%route".to_string(), "%private".to_string()),
         ]);
+        let mut counter = 0;
+        let indexed = pure_enclosing_selection_owners(&blocks, &analyze(&blocks), &merges);
 
-        assert!(drop_pure_enclosing_selection_routes(&blocks, &mut merges));
-        assert!(!merges.contains_key("%route"));
+        assert!(materialize_pure_enclosing_selection_routes_for_owner(
+            &mut blocks,
+            &HashMap::new(),
+            &mut merges,
+            &indexed,
+            "%outer",
+            &mut counter,
+        ));
+        let route_merge = merges
+            .get("%route")
+            .expect("conditional ownership is preserved");
+        assert!(route_merge.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()));
         assert_eq!(
             merges.get("%outer").map(String::as_str),
             Some("%outer_merge")
         );
+        let route = blocks
+            .iter()
+            .find(|block| block.name == "%route")
+            .expect("route header retained");
+        assert!(!block_successors(route).contains(&"%shared".to_string()));
         let private = blocks
             .iter()
             .find(|block| block.name == "%private")
             .expect("phi pass-through retained");
-        assert_eq!(block_successors(private), vec!["%outer_merge".to_string()]);
+        assert_eq!(block_successors(private), vec![route_merge.clone()]);
+        let merge_block = blocks
+            .iter()
+            .find(|block| block.name == *route_merge)
+            .expect("private selection merge materialized");
+        assert_eq!(
+            block_successors(merge_block),
+            vec!["%outer_merge".to_string()]
+        );
+    }
+
+    #[test]
+    fn construct_tree_region_clone_carries_nested_selection_ownership() {
+        let mut blocks = vec![
+            bb("%outer", &["br i1 %a, label %route, label %sibling"]),
+            bb("%route", &["br i1 %b, label %shared, label %private"]),
+            bb_role("%private", BlockRole::LMerge, &["br label %outer_merge"]),
+            bb("%sibling", &["br label %shared"]),
+            bb("%shared", &["br label %nested"]),
+            bb("%nested", &["br i1 %c, label %left, label %right"]),
+            bb("%left", &["br label %nested_merge"]),
+            bb("%right", &["br label %nested_merge"]),
+            bb("%nested_merge", &["br label %outer_merge"]),
+            bb("%outer_merge", &["ret void"]),
+        ];
+        let mut merges = HashMap::from([
+            ("%outer".to_string(), "%outer_merge".to_string()),
+            ("%route".to_string(), "%private".to_string()),
+            ("%nested".to_string(), "%nested_merge".to_string()),
+        ]);
+        let mut counter = 0;
+        let indexed = pure_enclosing_selection_owners(&blocks, &analyze(&blocks), &merges);
+
+        assert!(materialize_pure_enclosing_selection_routes_for_owner(
+            &mut blocks,
+            &HashMap::new(),
+            &mut merges,
+            &indexed,
+            "%outer",
+            &mut counter,
+        ));
+
+        let (cloned_header, cloned_merge) = merges
+            .iter()
+            .find(|(header, _)| header.ends_with("_nested"))
+            .expect("cloned nested header carries an assignment");
+        assert!(cloned_merge.ends_with("_nested_merge"));
+        assert!(blocks.iter().any(|block| block.name == *cloned_header));
+        assert!(blocks.iter().any(|block| block.name == *cloned_merge));
+        assert_eq!(
+            merges.get("%nested").map(String::as_str),
+            Some("%nested_merge")
+        );
     }
 
     #[test]
@@ -2604,7 +3692,7 @@ mod tests {
             .find(|block| block.name == "%exit")
             .and_then(|block| block.typed.as_ref())
             .and_then(|typed| typed.insts.first())
-            .and_then(|instruction| instruction.phi_incoming.as_ref())
+            .and_then(|instruction| instruction.phi_incoming().as_ref())
             .expect("exit phi retained");
         assert!(exit_phi
             .1
@@ -2617,8 +3705,8 @@ mod tests {
     }
 
     #[test]
-    fn construct_tree_completes_residual_fully_terminal_selection() {
-        let mut blocks = vec![
+    fn construct_tree_assigns_fully_terminal_merges_with_the_other_headers() {
+        let blocks = vec![
             bb("%header", &["br i1 %c, label %left, label %right"]),
             bb("%left", &["br i1 %a, label %left_ret, label %left_tail"]),
             bb("%left_tail", &["br label %left_ret"]),
@@ -2627,42 +3715,28 @@ mod tests {
             bb("%right_tail", &["br label %right_ret"]),
             bb("%right_ret", &["ret void"]),
         ];
-        let mut merges = HashMap::new();
-        let mut counter = 0usize;
+        let (planned, _, header_merges, _) = unique_selection_merges_with_construct_tree_ownership(
+            &blocks,
+            &HashMap::new(),
+            false,
+            false,
+            &HashMap::new(),
+        );
 
-        assert!(complete_terminal_construct_tree_merges(
-            &mut blocks,
-            &HashMap::new(),
-            &HashMap::new(),
-            &mut merges,
-            &mut counter,
-        ));
-        let merge = merges
-            .get("%header")
-            .expect("fully terminal owner receives a merge");
-        let merge_block = blocks
-            .iter()
-            .find(|block| block.name == *merge)
-            .expect("unreachable merge materialized");
-        assert!(is_bare_unreachable(merge_block));
-        assert!(block_successors(merge_block).is_empty());
-        for nested in ["%left", "%right"] {
-            let nested_merge = merges
-                .get(nested)
-                .unwrap_or_else(|| panic!("{nested} receives its required terminal merge"));
-            assert!(blocks
-                .iter()
-                .find(|block| block.name == *nested_merge)
-                .is_some_and(is_bare_unreachable));
+        for header in ["%header", "%left", "%right"] {
+            assert!(
+                header_merges.contains_key(header),
+                "{header} was assigned during header construction"
+            );
         }
-        let before = merge.clone();
-        assert!(!repair_enclosing_selection_region_escapes(
-            &mut blocks,
-            &HashMap::new(),
-            &mut merges,
-            &mut counter,
-        ));
-        assert_eq!(merges.get("%header"), Some(&before));
+        let terminal_merge = &header_merges["%header"];
+        assert!(
+            planned
+                .iter()
+                .find(|block| block.name == *terminal_merge)
+                .is_some_and(is_bare_unreachable),
+            "%header -> {terminal_merge}"
+        );
     }
 
     #[test]
@@ -2689,23 +3763,40 @@ mod tests {
             bb("%continuation", &["br label %return"]),
             bb("%return", &["ret void"]),
         ];
-        let mut merges = HashMap::from([("%guard".to_string(), "%private_merge".to_string())]);
-
-        assert!(complete_construct_tree_terminal_convergences(
+        let (planned, _, merges, _) = unique_selection_merges_with_construct_tree_ownership(
             &blocks,
             &HashMap::new(),
+            false,
+            false,
             &HashMap::new(),
-            &HashMap::new(),
-            &mut merges,
-        ));
-        assert_eq!(
-            merges.get("%header").map(String::as_str),
-            Some("%continuation")
         );
+        let outer_merge = merges
+            .get("%header")
+            .expect("outer terminal continuation is owned during construction");
+        assert!(outer_merge.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()));
         assert_eq!(
-            merges.get("%guard").map(String::as_str),
-            Some("%private_merge")
+            block_successors(
+                planned
+                    .iter()
+                    .find(|block| block.name == *outer_merge)
+                    .expect("outer merge is materialized")
+            ),
+            vec!["%continuation".to_string()]
         );
+        let guard_merge = merges
+            .get("%guard")
+            .expect("nested terminal continuation is owned during construction");
+        assert!(guard_merge.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()));
+        assert_eq!(
+            block_successors(
+                planned
+                    .iter()
+                    .find(|block| block.name == *guard_merge)
+                    .expect("nested merge is materialized")
+            ),
+            vec![outer_merge.clone()]
+        );
+        assert!(planned.iter().any(|block| block.name == "%continuation"));
     }
 
     #[test]
@@ -2747,9 +3838,10 @@ mod tests {
             &mut merges,
         ));
         assert_eq!(merges.get("%header").map(String::as_str), Some("%merge"));
-        assert!(privatize_direct_arm_terminal_returns(
+        assert!(privatize_direct_arm_terminal_return(
             &mut blocks,
-            &merges,
+            "%header",
+            &merges["%header"],
             &mut counter,
         ));
 
@@ -2825,53 +3917,11 @@ mod tests {
                 .find(|block| block.name == target)
                 .and_then(|block| block.typed.as_ref())
                 .and_then(|typed| typed.insts.first())
-                .and_then(|instruction| instruction.phi_incoming.as_ref())
+                .and_then(|instruction| instruction.phi_incoming().as_ref())
                 .expect("target phi retained");
             assert_eq!(incoming.1.len(), 1);
             assert_eq!(incoming.1[0].1, merge);
         }
-    }
-
-    #[test]
-    fn terminal_selection_live_arm_gets_private_enclosing_merge() {
-        let mut blocks = vec![
-            bb(
-                "%outer",
-                &["br i1 %outer_cond, label %nested, label %outer_merge"],
-            ),
-            bb(
-                "%nested",
-                &["br i1 %inner_cond, label %terminal, label %work"],
-            ),
-            bb_role("%terminal", BlockRole::TerminalExitReturn, &["ret void"]),
-            bb("%work", &["br label %outer_merge"]),
-            bb("%outer_merge", &["ret void"]),
-        ];
-        let mut merges = HashMap::from([
-            ("%outer".to_string(), "%outer_merge".to_string()),
-            ("%nested".to_string(), "%terminal".to_string()),
-        ]);
-        let mut counter = 0usize;
-
-        assert!(repair_terminal_selection_live_escapes(
-            &mut blocks,
-            &HashMap::new(),
-            &mut merges,
-            &mut counter,
-        ));
-        let private = merges
-            .get("%nested")
-            .expect("nested live arm receives a private merge");
-        assert_ne!(private, "%terminal");
-        assert_ne!(private, "%outer_merge");
-        assert_eq!(
-            block_successors(blocks.iter().find(|block| block.name == "%work").unwrap()),
-            vec![private.clone()]
-        );
-        assert_eq!(
-            block_successors(blocks.iter().find(|block| block.name == *private).unwrap()),
-            vec!["%outer_merge".to_string()]
-        );
     }
 
     #[test]
@@ -3026,7 +4076,7 @@ mod tests {
 
     #[test]
     fn construct_tree_privatizes_shared_return_below_direct_arm_merge() {
-        let mut blocks = vec![
+        let blocks = vec![
             bb(
                 "%entry",
                 &["br i1 %outside, label %header, label %external"],
@@ -3045,14 +4095,15 @@ mod tests {
             bb("%external", &["br label %shared_return"]),
             bb("%shared_return", &["ret void"]),
         ];
-        let merges = HashMap::from([("%header".to_string(), "%merge".to_string())]);
-        let mut counter = 0usize;
-
-        assert!(privatize_direct_arm_terminal_returns(
-            &mut blocks,
-            &merges,
-            &mut counter,
-        ));
+        let forced = HashMap::from([("%header".to_string(), "%merge".to_string())]);
+        let (blocks, _, merges, _) = unique_selection_merges_with_construct_tree_ownership(
+            &blocks,
+            &HashMap::new(),
+            false,
+            false,
+            &forced,
+        );
+        assert_eq!(merges.get("%header").map(String::as_str), Some("%merge"));
         let work_target =
             block_successors(blocks.iter().find(|block| block.name == "%work").unwrap());
         assert_eq!(work_target.len(), 2);
@@ -3134,7 +4185,7 @@ mod tests {
             .find(|block| block.name == "%join")
             .and_then(|block| block.typed.as_ref())
             .and_then(|typed| typed.insts.first())
-            .and_then(|instruction| instruction.phi_incoming.as_ref())
+            .and_then(|instruction| instruction.phi_incoming().as_ref())
             .expect("join phi retained");
         assert!(join_phi
             .1
@@ -3257,7 +4308,7 @@ mod tests {
             .find(|block| block.name == private)
             .and_then(|block| block.typed.as_ref())
             .and_then(|typed| typed.insts.first())
-            .and_then(|instruction| instruction.phi_incoming.as_ref())
+            .and_then(|instruction| instruction.phi_incoming().as_ref())
             .expect("private merge carries the routed values");
         assert_eq!(
             private_phi
@@ -3272,7 +4323,7 @@ mod tests {
             .find(|block| block.name == "%join")
             .and_then(|block| block.typed.as_ref())
             .and_then(|typed| typed.insts.first())
-            .and_then(|instruction| instruction.phi_incoming.as_ref())
+            .and_then(|instruction| instruction.phi_incoming().as_ref())
             .expect("join phi retained");
         assert_eq!(
             join_phi
@@ -3320,18 +4371,6 @@ mod tests {
             let block = out.iter().find(|block| block.name == pred).unwrap();
             assert_eq!(block_successors(block), vec![private.clone()]);
         }
-        let tail = branch_by_header
-            .get("%entry")
-            .cloned()
-            .unwrap_or_else(|| "%old".to_string());
-        if tail != "%old" {
-            let entry = out.iter().find(|block| block.name == "%entry").unwrap();
-            let (entry_true, entry_false) =
-                conditional_branch_targets(entry).expect("entry remains conditional");
-            assert!(entry_true == tail || entry_false == tail);
-            let tail_block = out.iter().find(|block| block.name == tail).unwrap();
-            assert_eq!(block_successors(tail_block), vec!["%h".to_string()]);
-        }
         let mut cursor = private.clone();
         let mut seen = HashSet::new();
         while cursor != "%old" {
@@ -3349,132 +4388,6 @@ mod tests {
                 panic!("merge {cursor} must have one successor");
             };
             cursor = next.clone();
-        }
-    }
-
-    #[test]
-    fn final_completeness_refunnels_missing_child_at_parent_merge() {
-        let mut blocks = vec![
-            bb("%entry", &["br i1 %outside, label %left, label %inner"]),
-            bb("%left", &["br label %join"]),
-            bb("%inner", &["br i1 %c, label %via, label %direct"]),
-            bb("%via", &["br label %join"]),
-            bb("%direct", &["br label %join"]),
-            bb(
-                "%join",
-                &[
-                    "%value = phi i32 [ 1, %left ], [ 2, %via ], [ 3, %direct ]",
-                    "ret void",
-                ],
-            ),
-        ];
-        let mut header_merges = HashMap::from([("%entry".to_string(), "%join".to_string())]);
-        let mut counter = 0;
-
-        assert!(complete_construct_tree_missing_selection_merges(
-            &mut blocks,
-            &HashMap::new(),
-            &mut header_merges,
-            &mut counter,
-        ));
-
-        let private = header_merges
-            .get("%inner")
-            .expect("missing child receives a private merge");
-        assert!(private.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()));
-        for predecessor in ["%via", "%direct"] {
-            let block = blocks
-                .iter()
-                .find(|block| block.name == predecessor)
-                .unwrap();
-            assert_eq!(block_successors(block), vec![private.clone()]);
-        }
-        let private_block = blocks.iter().find(|block| &block.name == private).unwrap();
-        assert_eq!(block_successors(private_block), vec!["%join".to_string()]);
-        let join_phi = phi_incomings(
-            blocks.iter().find(|block| block.name == "%join").unwrap(),
-            "%value",
-        );
-        assert_eq!(
-            join_phi
-                .iter()
-                .map(|(_, predecessor)| predecessor.as_str())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["%left", private.as_str()])
-        );
-    }
-
-    #[test]
-    fn final_completeness_privatizes_a_shared_direct_arm_before_refunneling() {
-        let mut blocks = vec![
-            bb("%entry", &["br i1 %outside, label %sibling, label %inner"]),
-            bb("%sibling", &["br label %shared"]),
-            bb("%inner", &["br i1 %c, label %shared, label %direct"]),
-            bb(
-                "%shared",
-                &[
-                    "%shared_value = phi i32 [ 1, %sibling ], [ 2, %inner ]",
-                    "br label %join",
-                ],
-            ),
-            bb("%direct", &["br label %join"]),
-            bb(
-                "%join",
-                &[
-                    "%value = phi i32 [ %shared_value, %shared ], [ 3, %direct ]",
-                    "ret void",
-                ],
-            ),
-        ];
-        let mut header_merges = HashMap::from([("%entry".to_string(), "%join".to_string())]);
-        let mut counter = 0;
-
-        assert!(complete_construct_tree_missing_selection_merges(
-            &mut blocks,
-            &HashMap::new(),
-            &mut header_merges,
-            &mut counter,
-        ));
-
-        let inner = blocks.iter().find(|block| block.name == "%inner").unwrap();
-        let (true_arm, false_arm) = conditional_branch_targets(inner).unwrap();
-        let shared_clone = [true_arm, false_arm]
-            .into_iter()
-            .find(|arm| arm != "%direct")
-            .expect("shared arm remains present");
-        assert_ne!(shared_clone, "%shared");
-        assert_eq!(
-            phi_incomings(
-                blocks.iter().find(|block| block.name == "%shared").unwrap(),
-                "%shared_value",
-            )
-            .iter()
-            .map(|(_, predecessor)| predecessor.as_str())
-            .collect::<HashSet<_>>(),
-            HashSet::from(["%sibling"])
-        );
-        let clone_phi = carrier_phis(
-            blocks
-                .iter()
-                .find(|block| block.name == shared_clone)
-                .unwrap(),
-        );
-        assert_eq!(clone_phi.len(), 1);
-        assert_eq!(
-            clone_phi[0]
-                .1
-                .iter()
-                .map(|(_, predecessor)| predecessor.as_str())
-                .collect::<HashSet<_>>(),
-            HashSet::from(["%inner"])
-        );
-        let private = header_merges.get("%inner").unwrap();
-        for predecessor in [shared_clone.as_str(), "%direct"] {
-            let block = blocks
-                .iter()
-                .find(|block| block.name == predecessor)
-                .unwrap();
-            assert_eq!(block_successors(block), vec![private.clone()]);
         }
     }
 
@@ -3502,10 +4415,6 @@ mod tests {
             .expect("inner block retained");
         let (t, f) = conditional_branch_targets(inner).expect("inner conditional");
         assert_eq!(t.as_str(), "%work");
-        assert!(
-            f == "%sibling" || f.ends_with("_sibling"),
-            "sibling arm should be the original or a private clone, got {f}"
-        );
         let private = plan
             .branch_merges_by_header
             .get("%inner")
@@ -3513,6 +4422,16 @@ mod tests {
         assert!(
             private.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()),
             "private merge should be a selection split, got {private}"
+        );
+        assert_eq!(f, *private);
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == *private)
+                    .expect("private merge retained")
+            ),
+            vec!["%sibling".to_string()]
         );
         assert_eq!(
             plan.branch_merges.get(&(t, f)),
@@ -3552,7 +4471,7 @@ mod tests {
             .find(|block| block.name == "%inner")
             .expect("inner block retained");
         let (t, f) = conditional_branch_targets(inner).expect("inner conditional");
-        assert_eq!((t.as_str(), f.as_str()), ("%exit", "%work"));
+        assert_eq!(f.as_str(), "%work");
         let private = plan
             .branch_merges_by_header
             .get("%inner")
@@ -3560,6 +4479,16 @@ mod tests {
         assert!(
             private.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()),
             "private merge should be a selection split, got {private}"
+        );
+        assert_eq!(t, *private);
+        assert_eq!(
+            block_successors(
+                plan.blocks
+                    .iter()
+                    .find(|block| block.name == *private)
+                    .expect("private merge retained")
+            ),
+            vec!["%exit".to_string()]
         );
         assert_eq!(
             plan.branch_merges.get(&(t, f)),
@@ -3569,6 +4498,89 @@ mod tests {
         assert!(
             plan.branch_merges_by_header.contains_key("%outer"),
             "enclosing selection still owns the region"
+        );
+    }
+
+    #[test]
+    fn ordinary_planner_constructs_deep_enclosing_selection_boundary_once() {
+        let blocks = vec![
+            bb("%entry", &["br label %outer"]),
+            bb("%outer", &["br i1 %a, label %sibling, label %gate"]),
+            bb("%gate", &["br i1 %b, label %sibling, label %inner"]),
+            bb("%inner", &["br i1 %c, label %exit, label %work"]),
+            bb("%work", &["br label %inner_tail"]),
+            bb("%inner_tail", &["br label %outer_merge"]),
+            bb("%exit", &["br label %join"]),
+            bb("%sibling", &["br label %join"]),
+            bb("%join", &["br label %outer_merge"]),
+            bb("%outer_merge", &["ret void"]),
+        ];
+
+        let (out, branch, by_header, _) =
+            unique_selection_merges_with_loop_exit(&blocks, &HashMap::new(), false, false);
+        let private = by_header
+            .get("%inner")
+            .expect("deep enclosing-region exit receives its boundary during construction");
+        assert!(private.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()));
+        let inner = out.iter().find(|block| block.name == "%inner").unwrap();
+        let arms = conditional_branch_targets(inner).expect("inner remains conditional");
+        assert_eq!(branch.get(&arms), Some(private));
+        assert_eq!(
+            block_successors(out.iter().find(|block| block.name == "%exit").unwrap()),
+            vec![private.clone()]
+        );
+        let private_successors =
+            block_successors(out.iter().find(|block| block.name == *private).unwrap());
+        let [enclosing_boundary] = private_successors.as_slice() else {
+            panic!("private boundary must have one enclosing successor");
+        };
+        assert!(enclosing_boundary.starts_with(format!("{SPLIT_PREFIX}{SEL_TOKEN}").as_str()));
+        assert_ne!(enclosing_boundary, private);
+    }
+
+    #[test]
+    fn ordinary_enclosing_boundary_declines_multiple_distinct_escapes() {
+        let blocks = vec![
+            bb("%outer", &["br i1 %a, label %sibling, label %inner"]),
+            bb("%inner", &["br i1 %b, label %left, label %right"]),
+            bb("%left", &["br label %left_join"]),
+            bb("%right", &["br label %right_join"]),
+            bb(
+                "%sibling",
+                &["br i1 %c, label %left_join, label %right_join"],
+            ),
+            bb("%left_join", &["br label %outer_merge"]),
+            bb("%right_join", &["br label %outer_merge"]),
+            bb("%outer_merge", &["ret void"]),
+        ];
+        let forest = analyze(&blocks);
+        let source_merges = HashMap::from([
+            ("%outer".to_string(), "%outer_merge".to_string()),
+            ("%inner".to_string(), "%outer_merge".to_string()),
+            ("%sibling".to_string(), "%outer_merge".to_string()),
+        ]);
+
+        assert!(enclosing_selection_region_exit_target(
+            &blocks,
+            &forest,
+            &HashMap::new(),
+            &source_merges,
+            "%inner",
+            "%left",
+            "%right",
+            Some("%outer_merge"),
+        )
+        .is_some());
+        assert_eq!(
+            ordinary_selection_enclosing_boundary_target(
+                &blocks,
+                &forest,
+                &HashMap::new(),
+                &source_merges,
+                "%inner",
+                "%outer_merge",
+            ),
+            None,
         );
     }
 
@@ -3904,6 +4916,59 @@ mod tests {
         );
     }
 
+    /// A value defined only on one loop-exit path no longer dominates its original target after the
+    /// two exits are funnelled through a common dispatch. The constructor must carry that live-in in
+    /// the dispatch itself and retarget the ordinary consumer, rather than relying on a later SSA
+    /// repair or whole-function relooper.
+    #[test]
+    fn multiple_exits_carry_path_local_values_through_dispatch() {
+        let blocks = vec![
+            bb("%entry", &["br label %head"]),
+            bb("%head", &["br i1 %c0, label %body, label %exitA"]),
+            bb(
+                "%body",
+                &[
+                    "%path = sext i32 %index to i64",
+                    "br i1 %c1, label %exitB, label %latch",
+                ],
+            ),
+            bb("%latch", &["br label %head"]),
+            bb("%exitA", &["ret void"]),
+            bb(
+                "%exitB",
+                &[
+                    "%address = getelementptr i32, ptr %base, i64 %path",
+                    "ret void",
+                ],
+            ),
+        ];
+
+        let (out, merges) = forest_loop_merges(&blocks, false, false);
+        let dispatch = out
+            .iter()
+            .find(|block| block.name == merges["%head"].merge)
+            .expect("dispatch merge");
+        let live_phi = carrier_phis(dispatch)
+            .into_iter()
+            .find(|(result, incoming)| {
+                result.starts_with("%metal2vulkan.exitlive.")
+                    && incoming.iter().any(|(value, predecessor)| {
+                        val_str(value) == "%path" && predecessor == "%body"
+                    })
+            })
+            .expect("path-local value phi");
+        assert!(live_phi
+            .1
+            .iter()
+            .any(|(value, predecessor)| val_str(value) == "undef" && predecessor == "%head"));
+
+        let exit = out.iter().find(|block| block.name == "%exitB").unwrap();
+        let mut uses = Vec::new();
+        exit.typed.as_ref().unwrap().insts[0].visit_uses(|name| uses.push(name.to_string()));
+        assert!(uses.contains(&live_phi.0.to_string()));
+        assert!(!uses.contains(&"%path".to_string()));
+    }
+
     /// Bare trap arms terminate inside the loop construct; they are not live continuation targets
     /// and therefore must not turn a one-merge loop into an artificial multi-exit loop.
     #[test]
@@ -3999,6 +5064,56 @@ mod tests {
         assert!(
             pb.iter().any(|(_, p)| *p == m.name) && !pb.iter().any(|(_, p)| p == "%body"),
             "exitB phi rebuilt via the merge: {pb:?}"
+        );
+    }
+
+    /// An inner multi-exit loop can synthesize a dispatch edge that is itself an exit of its
+    /// enclosing loop. Loop planning must recompute the outer body after materializing the inner
+    /// dispatch, so that new edge is routed through the outer merge rather than bypassing it.
+    #[test]
+    fn nested_multi_exit_dispatch_is_owned_by_recomputed_outer_loop() {
+        let blocks = vec![
+            bb("%entry", &["br label %outer"]),
+            bb(
+                "%outer",
+                &["br i1 %enter, label %outer.latch, label %inner"],
+            ),
+            bb(
+                "%inner",
+                &["br i1 %leave.inner, label %exit.a, label %inner.body"],
+            ),
+            bb(
+                "%inner.body",
+                &["br i1 %finish.inner, label %outer.latch, label %inner"],
+            ),
+            bb(
+                "%outer.latch",
+                &["br i1 %leave.outer, label %exit.b, label %outer"],
+            ),
+            bb("%exit.a", &["ret void"]),
+            bb("%exit.b", &["ret void"]),
+        ];
+
+        let (planned, merges) = forest_loop_merges(&blocks, false, false);
+        let inner = merges.get("%inner").expect("inner loop");
+        let outer = merges.get("%outer").expect("outer loop");
+        let inner_dispatch = planned
+            .iter()
+            .find(|block| block.name == inner.merge)
+            .expect("inner dispatch");
+        let outer_dispatch = planned
+            .iter()
+            .find(|block| block.name == outer.merge)
+            .expect("outer dispatch");
+
+        let inner_targets = block_successors(inner_dispatch);
+        assert!(inner_targets.contains(&outer.merge));
+        assert!(inner_targets.contains(&"%outer.latch".to_string()));
+        assert!(!inner_targets.contains(&"%exit.a".to_string()));
+        let outer_targets = block_successors(outer_dispatch);
+        assert_eq!(
+            outer_targets.into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["%exit.a".to_string(), "%exit.b".to_string()])
         );
     }
 
@@ -4105,7 +5220,7 @@ mod tests {
             .insts
             .iter()
             .find(|i| i.is_phi())
-            .and_then(|i| i.phi_incoming.as_ref())
+            .and_then(|i| i.phi_incoming().as_ref())
             .expect("merged phi in pass-through");
         assert!(
             merged_phi.1.iter().any(|(_, p)| p == "%inner"),
@@ -4126,7 +5241,7 @@ mod tests {
             .insts
             .iter()
             .find(|i| i.is_phi())
-            .and_then(|i| i.phi_incoming.as_ref())
+            .and_then(|i| i.phi_incoming().as_ref())
             .unwrap();
         assert!(
             latch_phi.1.iter().any(|(_, p)| *p == pt.name),
