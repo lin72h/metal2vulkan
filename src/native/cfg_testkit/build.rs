@@ -206,6 +206,15 @@ impl CfgBuilder {
         self.binary_into(Op::IAdd, self.uint, result, a, b);
     }
 
+    pub(in crate::native) fn bitwise_xor(&mut self, a: Word, b: Word) -> Word {
+        self.binary(Op::BitwiseXor, self.uint, a, b)
+    }
+
+    /// `OpBitwiseXor` defining a previously [reserved](Self::reserve_value) id.
+    pub(in crate::native) fn bitwise_xor_into(&mut self, result: Word, a: Word, b: Word) {
+        self.binary_into(Op::BitwiseXor, self.uint, result, a, b);
+    }
+
     pub(in crate::native) fn bitwise_and(&mut self, a: Word, b: Word) -> Word {
         self.binary(Op::BitwiseAnd, self.uint, a, b)
     }

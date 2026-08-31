@@ -23,6 +23,7 @@
 
 use super::build::CfgBuilder;
 use crate::spirv_module::Module;
+use spirv::Word;
 
 /// Upper bound on the accumulator, and so on every generated loop's trip count.
 const ACCUMULATOR_BOUND: u32 = 4096;
@@ -285,6 +286,17 @@ impl Shape {
         self.terminators.len()
     }
 
+    /// How many edges arrive at a block from one written after it — the edges [`author`] puts the
+    /// value swap on, and so a direct measure of how much of the phi-demotion hazard this shape
+    /// actually contains.
+    pub(in crate::native) fn swapping_edges(&self) -> usize {
+        predecessors(&self.terminators)
+            .iter()
+            .enumerate()
+            .map(|(block, sources)| sources.iter().filter(|source| **source > block).count())
+            .sum()
+    }
+
     /// How many blocks end in a branch with more than one target — a rough measure of how much
     /// branching the shape has for a structurizer to get wrong.
     pub(in crate::native) fn branching(&self) -> usize {
@@ -342,52 +354,102 @@ fn grow(seed: u64, depth: u32, crossings: u32) -> Shape {
 
 /// Author `shape` as a `uint (uint)` SPIR-V function.
 ///
-/// Every block adds a positive, block-specific amount to the accumulator threaded through the
-/// function; joins merge it with `OpPhi`; the exit returns it. The single argument seeds it, so
-/// different arguments take different paths through the same graph.
+/// Three values are live across the whole function and `OpPhi`-merged at every join:
+///
+/// - `accumulator` — every block adds a positive, block-specific amount to it. It drives every
+///   branch condition, so control flow depends on data, and being monotonic is what makes every
+///   generated loop terminate.
+/// - `mixed` and `carried` — two more values that no condition reads, **swapped with each other on
+///   every back edge**. A pair of phis at one block whose incoming values are each other is the
+///   classic hazard for demoting phis to memory: the simultaneous assignment becomes two
+///   sequential stores, and in the obvious order the first clobbers what the second was to read.
+///   The swap is placed only on back edges so it cannot affect termination.
+///
+/// The returned value combines all three asymmetrically, so exchanging any two of them, or picking
+/// a phi's incoming value from the wrong predecessor, changes the answer.
 pub(in crate::native) fn author(shape: &Shape) -> Module {
     let mut builder = CfgBuilder::new(1);
     let name = |block: usize| format!("b{block}");
 
     let predecessors = predecessors(&shape.terminators);
-    // The accumulator each block leaves with. A loop header's `OpPhi` names the value its latch
-    // leaves with, and the latch is authored after the header, so these ids are reserved up front
-    // and defined as each block is authored.
-    let leaving = (0..shape.terminators.len())
+    // Ids for the three values each block leaves with. A loop header's `OpPhi` names what its latch
+    // leaves with and the latch is authored after the header, so they are reserved up front.
+    let blocks = shape.terminators.len();
+    let accumulator = (0..blocks)
         .map(|_| builder.reserve_value())
         .collect::<Vec<_>>();
+    let mixed = (0..blocks)
+        .map(|_| builder.reserve_value())
+        .collect::<Vec<_>>();
+    let carried = (0..blocks)
+        .map(|_| builder.reserve_value())
+        .collect::<Vec<_>>();
+
     for (block, term) in shape.terminators.iter().enumerate() {
         builder.block(&name(block));
-        let entering = if block == 0 {
+        let (accumulator_in, mixed_in, carried_in) = if block == 0 {
             assert!(
                 predecessors[0].is_empty(),
-                "the entry block has predecessors, so its accumulator would ignore them"
+                "the entry block has predecessors, so its values would ignore them"
             );
-            builder.parameter(0)
+            let seed = builder.parameter(0);
+            let five = builder.constant(5);
+            let nine = builder.constant(9);
+            let seeded_mix = builder.bitwise_xor(seed, five);
+            let seeded_carry = builder.add(seed, nine);
+            (seed, seeded_mix, seeded_carry)
         } else {
-            let incoming = predecessors[block]
-                .iter()
-                .map(|predecessor| (leaving[*predecessor], name(*predecessor)))
-                .collect::<Vec<_>>();
+            let sources = &predecessors[block];
             assert!(
-                !incoming.is_empty(),
+                !sources.is_empty(),
                 "block {block} is unreachable, so the shape is not connected"
             );
-            if incoming.len() == 1 {
-                incoming[0].0
-            } else {
-                let incoming = incoming
+            // A predecessor written after this block reaches it by a back edge, and that is the
+            // edge the swap rides on.
+            let swaps = |predecessor: &usize| *predecessor > block;
+            let names = sources.iter().map(|p| name(*p)).collect::<Vec<_>>();
+            let pick = |values: &[Word], swapped: &[Word]| {
+                sources
                     .iter()
-                    .map(|(value, predecessor)| (*value, predecessor.as_str()))
-                    .collect::<Vec<_>>();
-                builder.phi(&incoming)
-            }
+                    .enumerate()
+                    .map(|(index, predecessor)| {
+                        let value = if swaps(predecessor) {
+                            swapped[*predecessor]
+                        } else {
+                            values[*predecessor]
+                        };
+                        (value, names[index].as_str())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let straight = sources
+                .iter()
+                .enumerate()
+                .map(|(index, predecessor)| (accumulator[*predecessor], names[index].as_str()))
+                .collect::<Vec<_>>();
+            let crossed_mix = pick(&mixed, &carried);
+            let crossed_carry = pick(&carried, &mixed);
+            let one_of = |builder: &mut CfgBuilder, incoming: &[(Word, &str)]| {
+                if incoming.len() == 1 {
+                    incoming[0].0
+                } else {
+                    builder.phi(incoming)
+                }
+            };
+            (
+                one_of(&mut builder, &straight),
+                one_of(&mut builder, &crossed_mix),
+                one_of(&mut builder, &crossed_carry),
+            )
         };
+
         // A positive, block-specific step: monotonic, so every loop terminates, and distinct, so a
         // path taken in the wrong order shows up in the result.
         let step = builder.constant(block as u32 + 1);
-        let value = leaving[block];
-        builder.add_into(value, entering, step);
+        let value = accumulator[block];
+        builder.add_into(value, accumulator_in, step);
+        builder.bitwise_xor_into(mixed[block], mixed_in, value);
+        builder.add_into(carried[block], carried_in, value);
 
         match term {
             Term::Branch(target) => builder.branch(&name(*target)),
@@ -424,7 +486,12 @@ pub(in crate::native) fn author(shape: &Shape) -> Module {
                     .collect::<Vec<_>>();
                 builder.switch(selector, &name(*default), &cases);
             }
-            Term::Return => builder.return_value(value),
+            Term::Return => {
+                // Asymmetric in all three, so exchanging any two changes it.
+                let summed = builder.add(value, mixed[block]);
+                let result = builder.bitwise_xor(summed, carried[block]);
+                builder.return_value(result);
+            }
         }
     }
     builder.finish()

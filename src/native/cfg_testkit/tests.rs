@@ -301,3 +301,76 @@ fn irreducible_shapes_are_declined_by_the_nesting_structurizer() {
         "only {declined}/{total} shapes with interior cross edges reach the state machine"
     );
 }
+
+/// Two phis at a loop header that read each other: `x = phi(x0, y)` and `y = phi(y0, x)`. Both
+/// incoming values are the header's own results, so the pair swaps every iteration. Demoting them
+/// to memory turns a simultaneous assignment into two sequential stores, and doing that in the
+/// obvious order writes the new x before y has read the old one.
+#[test]
+fn a_pair_of_loop_phis_that_swap_still_swaps() {
+    let mut builder = CfgBuilder::new(1);
+    let (one, two, three, bound) = (
+        builder.constant(1),
+        builder.constant(2),
+        builder.constant(3),
+        builder.constant(64),
+    );
+
+    let x_next = builder.reserve_value();
+    let y_next = builder.reserve_value();
+    let i_next = builder.reserve_value();
+
+    builder.block("entry");
+    let seed = builder.parameter(0);
+    let x0 = builder.add(seed, one);
+    let y0 = builder.add(seed, two);
+    builder.branch("header");
+
+    builder.block("header");
+    // The swap: x takes what y had, y takes what x had.
+    let x = builder.phi(&[(x0, "entry"), (y_next, "latch")]);
+    let y = builder.phi(&[(y0, "entry"), (x_next, "latch")]);
+    let i = builder.phi(&[(seed, "entry"), (i_next, "latch")]);
+    let below = builder.less_than(i, bound);
+    builder.branch_conditional(below, "latch", "exit");
+
+    builder.block("latch");
+    // Only x advances, so x and y are distinguishable after any number of swaps.
+    builder.add_into(x_next, x, three);
+    builder.add_into(y_next, y, three);
+    builder.add_into(i_next, i, one);
+    builder.branch("header");
+
+    builder.block("exit");
+    let mixed = builder.bitwise_and(x, one);
+    let combined = builder.add(y, mixed);
+    builder.return_value(combined);
+
+    assert_construction_preserves_semantics(builder.finish(), ARGUMENTS);
+}
+
+/// The generated family only exercises the phi-demotion hazard if its shapes actually have back
+/// edges for [`shapes::author`] to hang the value swap on. If this drops, the sweeps above have
+/// quietly become straight-line value flow.
+#[test]
+fn generated_shapes_carry_the_phi_swap_on_real_back_edges() {
+    let mut swapping = 0;
+    let mut shapes_with_a_swap = 0;
+    let mut total = 0;
+    for (seeds, depth, crossings) in [(0..64u64, 4u32, 0u32), (0..48, 5, 3)] {
+        for seed in seeds {
+            total += 1;
+            let edges = shapes::irreducible_shape(seed, depth, crossings).swapping_edges();
+            swapping += edges;
+            if edges > 0 {
+                shapes_with_a_swap += 1;
+            }
+        }
+    }
+    // Measured at 105/112 shapes carrying 262 swapping edges when this was written.
+    assert!(
+        shapes_with_a_swap * 2 >= total && swapping >= total,
+        "only {shapes_with_a_swap}/{total} generated shapes have a back edge ({swapping} edges \
+         in total); the swap the author hangs on them is not being exercised"
+    );
+}
