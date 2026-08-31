@@ -384,29 +384,7 @@ impl OwnedCfg {
             );
         }
 
-        let mut definition_sites = HashMap::new();
-        for (block_index, block) in function.blocks.iter().enumerate() {
-            for (instruction_index, instruction) in block.instructions.iter().enumerate() {
-                let Some(id) = instruction.result_id else {
-                    continue;
-                };
-                if definition_sites
-                    .insert(
-                        id,
-                        DefinitionSite {
-                            block: block_index,
-                            instruction: instruction_index,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(
-                        "native emitter: owned function defines a result id more than once"
-                            .to_string(),
-                    );
-                }
-            }
-        }
+        let definition_sites = definition_sites(function)?;
         let mut entry_value_seen = false;
         for (block_index, block) in function.blocks.iter().enumerate() {
             let mut non_phi_seen = false;
@@ -1024,6 +1002,62 @@ fn switch_info(operands: &[Operand], labels: &HashMap<Word, usize>) -> Result<Sw
         .map(|pair| operand_label(pair.get(1), labels))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(SwitchInfo { default, targets })
+}
+
+/// Where every result id of `function` is written, as a block/instruction position.
+fn definition_sites(function: &Function) -> Result<HashMap<Word, DefinitionSite>, String> {
+    let mut sites = HashMap::new();
+    for (block, instructions) in function.blocks.iter().enumerate() {
+        for (instruction, definition) in instructions.instructions.iter().enumerate() {
+            let Some(id) = definition.result_id else {
+                continue;
+            };
+            if sites
+                .insert(id, DefinitionSite { block, instruction })
+                .is_some()
+            {
+                return Err(
+                    "native emitter: owned function defines a result id more than once".to_string(),
+                );
+            }
+        }
+    }
+    Ok(sites)
+}
+
+/// Report the first way `function` breaks the owned contract that binds values to control flow:
+/// a use its definition does not dominate, or an `OpPhi` whose incoming pairs do not match the
+/// block's predecessors and result type.
+///
+/// This is the part of the module contract a control-flow rewrite is answerable for, so a pass
+/// that reshapes blocks can check its own output before adopting it rather than assume the reshape
+/// preserved dominance. `value_types` maps result ids to their result types; ids missing from it
+/// are not type-checked.
+pub(super) fn owned_function_value_flow_error(
+    function: &Function,
+    value_types: &HashMap<Word, Word>,
+) -> Option<String> {
+    let cfg = match OwnedCfg::new(function) {
+        Ok(cfg) => cfg,
+        Err(error) => return Some(error),
+    };
+    let sites = match definition_sites(function) {
+        Ok(sites) => sites,
+        Err(error) => return Some(error),
+    };
+    for (block, instructions) in function.blocks.iter().enumerate() {
+        for (index, instruction) in instructions.instructions.iter().enumerate() {
+            let result = if instruction.class.opcode == Op::Phi {
+                cfg.check_phi(block, instruction, value_types, &sites)
+            } else {
+                cfg.check_ordinary_uses(block, index, instruction, &sites)
+            };
+            if let Err(error) = result {
+                return Some(error);
+            }
+        }
+    }
+    None
 }
 
 fn build_predecessors(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {

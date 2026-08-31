@@ -11,12 +11,19 @@
 //!
 //! Reducible control flow does not need that. This module derives the relooper shape tree (see
 //! [`shape`]) and emits it as genuinely nested SPIR-V loop and selection constructs. Nesting
-//! preserves the original CFG's paths, and therefore its dominance, so ordinary SSA values are
-//! emitted untouched; only `OpPhi` — whose meaning is its predecessor list, which is exactly what
-//! nesting rewrites — is demoted.
+//! keeps the original CFG's paths, so ordinary SSA values are emitted untouched; only `OpPhi` —
+//! whose meaning is its predecessor list, which is exactly what nesting rewrites — is demoted.
 //!
-//! It is a strict addition, not a replacement. Irreducible graphs, and any shape the emitter cannot
-//! express, are declined with an `Err` and stay on the state-machine constructor.
+//! Keeping paths is not the same as keeping dominance. An edge that has to leave more than one
+//! construct is staged through a merge dispatch, and its destination is then reached from that
+//! merge rather than from the block that left, so a definition inside the construct can stop
+//! dominating a use beyond it. The state machine repaired that incidentally, by demoting every
+//! crossing value. This pass does not, so [`structure_selected_functions`] checks the function it
+//! emitted against the module's value-flow contract and discards it when the check fails.
+//!
+//! It is a strict addition, not a replacement. Irreducible graphs, any shape the emitter cannot
+//! express, and any nesting that does not survive that check stay on the state-machine
+//! constructor.
 
 mod emit;
 mod shape;
@@ -25,7 +32,7 @@ use super::relooper::{block_label, decode_term, Term, TypeCtx};
 use crate::spirv_module::{Function, Module};
 use shape::Graph;
 use spirv::Word;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Restructure every selected function whose control flow this module can nest. Returns the result
 /// ids it rewrote, so the caller can leave the rest to the state-machine constructor.
@@ -38,6 +45,13 @@ pub(crate) fn structure_selected_functions(
         .as_ref()
         .map(|header| header.bound)
         .unwrap_or(1);
+    // Verifying the emitted nesting needs the result type of every value it can name. Snapshot the
+    // module's before its functions are borrowed mutably; result ids are unique module-wide, so the
+    // ids each emitted function adds can simply be folded into the same map.
+    let mut value_types = module
+        .all_inst_iter()
+        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
+        .collect::<HashMap<_, _>>();
     let mut tc = TypeCtx::new(module, &mut next_id);
     let mut structured = HashSet::new();
     for function in &mut module.functions {
@@ -50,16 +64,40 @@ pub(crate) fn structure_selected_functions(
         let before = function.blocks.len();
         match structure_function(function, &mut tc) {
             Ok(blocks) => {
+                let candidate = std::mem::replace(&mut function.blocks, blocks);
+                value_types.extend(function.blocks.iter().flat_map(|block| {
+                    block.instructions.iter().filter_map(|instruction| {
+                        Some((instruction.result_id?, instruction.result_type?))
+                    })
+                }));
                 // The same structural checks the caller uses to select construction in the first
                 // place. A nesting that leaves an unowned selection header or back edge has not
                 // structured the function, so it is discarded rather than shipped.
-                let candidate = std::mem::replace(&mut function.blocks, blocks);
-                if super::rewrites::blocks_have_unowned_selection_header(&function.blocks)
-                    || super::rewrites::function_has_unowned_backedge(function)
-                {
+                //
+                // Value flow is checked for the same reason. Keeping ordinary values in registers
+                // is only sound where the nesting really did preserve the paths that made their
+                // definitions dominate their uses, and that does not always hold: an edge staged
+                // through a construct's merge dispatch reaches its destination from that merge
+                // rather than from the block it left. The state machine this pass replaces repaired
+                // such a function incidentally, by demoting every crossing value; nesting keeps
+                // them, so it has to prove the definitions still reach.
+                let broken =
+                    super::rewrites::blocks_have_unowned_selection_header(&function.blocks)
+                        .then(|| "nesting left an unowned construct".to_string())
+                        .or_else(|| {
+                            super::rewrites::function_has_unowned_backedge(function)
+                                .then(|| "nesting left an unowned back edge".to_string())
+                        })
+                        .or_else(|| {
+                            super::owned_cfg::owned_function_value_flow_error(
+                                function,
+                                &value_types,
+                            )
+                        });
+                if let Some(reason) = broken {
                     function.blocks = candidate;
                     if crate::env_vars::reloop_why() {
-                        eprintln!("NEST-DECLINE blocks={before} nesting left an unowned construct");
+                        eprintln!("NEST-DECLINE blocks={before} {reason}");
                     }
                 } else {
                     structured.insert(id);
@@ -373,6 +411,48 @@ mod tests {
         let variables = asm.matches("OpVariable").count();
         assert_eq!(variables, 1, "{asm}");
         assert!(asm.contains("OpIAdd"), "{asm}");
+    }
+
+    /// A value defined in one arm of a selection and used after the merge. The state-machine
+    /// constructor repairs this by demoting every crossing value; the nesting keeps values in
+    /// registers, so it cannot, and must decline rather than ship a use its definition never
+    /// reaches. Earlier stages hand construction such functions, so this is a real input, not a
+    /// hypothetical malformed one.
+    const USE_WITHOUT_DOMINATING_DEFINITION: &str = r#"
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+       %void = OpTypeVoid
+       %uint = OpTypeInt 32 0
+       %bool = OpTypeBool
+     %uint_0 = OpConstant %uint 0
+     %uint_1 = OpConstant %uint 1
+    %fnvoid = OpTypeFunction %void
+       %main = OpFunction %void None %fnvoid
+      %entry = OpLabel
+       %cond = OpIEqual %bool %uint_0 %uint_1
+               OpBranchConditional %cond %arm %other
+        %arm = OpLabel
+      %value = OpIAdd %uint %uint_0 %uint_1
+               OpBranch %join
+      %other = OpLabel
+               OpBranch %join
+       %join = OpLabel
+       %used = OpIAdd %uint %value %uint_1
+               OpReturn
+               OpFunctionEnd
+"#;
+
+    #[test]
+    fn nesting_declines_a_use_its_definition_does_not_dominate() {
+        let Some(spv) = assemble(USE_WITHOUT_DOMINATING_DEFINITION) else {
+            return;
+        };
+        assert!(
+            nested_bytes(&spv).is_none(),
+            "a function whose value flow the nesting cannot honour must stay on the state machine"
+        );
     }
 
     /// `while (c) { if (d) { p(); if (e) break; } q(); }` — the break leaves a selection AND the

@@ -2,9 +2,12 @@
 //!
 //! Walks the [`Shape`](super::shape::Shape) tree and writes the nested loop and selection
 //! constructs it describes. The point of the nesting is what it does NOT do: it keeps every value
-//! in SSA, because the shape tree preserves the original CFG's paths and therefore its dominance.
-//! Only `OpPhi` results are register-demoted, because a phi's predecessor identity is exactly what
-//! nesting rewrites.
+//! in SSA, because the shape tree preserves the original CFG's paths. Only `OpPhi` results are
+//! register-demoted, because a phi's predecessor identity is exactly what nesting rewrites.
+//!
+//! Preserved paths do not guarantee preserved dominance — a staged edge (below) reaches its
+//! destination from a merge dispatch rather than from the block it left. The caller checks the
+//! emitted function's value flow and discards a nesting that broke it; see [`super`].
 //!
 //! # Leaving more than one construct
 //!
