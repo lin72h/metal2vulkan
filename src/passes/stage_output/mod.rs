@@ -22,6 +22,11 @@ fn fragment_output_is_stencil(frag: Option<&FragMeta>, member_idx: usize) -> boo
         .unwrap_or(false)
 }
 
+fn fragment_output_is_sample_mask(frag: Option<&FragMeta>, member_idx: usize) -> bool {
+    frag.map(|meta| meta.is_sample_mask_member(member_idx as u32))
+        .unwrap_or(false)
+}
+
 fn fragment_output_type(
     ctx: &mut Ctx,
     frag: Option<&FragMeta>,
@@ -424,9 +429,12 @@ pub(in crate::passes) fn rewrite_return(
             src_ty: Word,
             dst_ty: Word,
         },
-        ClipDistanceExtract {
+        /// A scalar value stored into element 0 of an array-typed builtin. Both `ClipDistance`
+        /// and `SampleMask` are arrays in SPIR-V while Metal returns one scalar. `member` is the
+        /// return-struct member to take it from, or `None` when the scalar IS the return value.
+        ArrayBuiltinSlot {
             var: Word,
-            member: u32,
+            member: Option<u32>,
             src_ty: Word,
             elem_ty: Word,
         },
@@ -474,22 +482,33 @@ pub(in crate::passes) fn rewrite_return(
                     ));
                     (var, ext, src_ty, dst_ty)
                 }
-                OutputWrite::ClipDistanceExtract {
+                OutputWrite::ArrayBuiltinSlot {
                     var,
                     member,
                     src_ty,
                     elem_ty,
                 } => {
-                    if composite_member_is_statically_undef(ctx, retval, member) {
-                        return stores;
-                    }
-                    let ext = ctx.module.fresh_id();
-                    stores.push(Instruction::new(
-                        Op::CompositeExtract,
-                        Some(src_ty),
-                        Some(ext),
-                        vec![Operand::IdRef(retval), Operand::LiteralBit32(member)],
-                    ));
+                    let ext = match member {
+                        Some(member) => {
+                            if composite_member_is_statically_undef(ctx, retval, member) {
+                                return stores;
+                            }
+                            let ext = ctx.module.fresh_id();
+                            stores.push(Instruction::new(
+                                Op::CompositeExtract,
+                                Some(src_ty),
+                                Some(ext),
+                                vec![Operand::IdRef(retval), Operand::LiteralBit32(member)],
+                            ));
+                            ext
+                        }
+                        None => {
+                            if value_is_statically_undef(ctx, retval) {
+                                return stores;
+                            }
+                            retval
+                        }
+                    };
                     let zero = ctx.const_uint(0);
                     let ptr_ty = ctx.ty_ptr(StorageClass::Output, elem_ty);
                     let ptr = ctx.module.fresh_id();
@@ -705,16 +724,24 @@ pub(in crate::passes) fn rewrite_return(
                             Location(u32),
                             Depth,
                             Stencil,
+                            SampleMask,
                         }
                         let kind = if fragment_output_is_depth(frag, mi) {
                             Some(OutKind::Depth)
                         } else if fragment_output_is_stencil(frag, mi) {
                             Some(OutKind::Stencil)
+                        } else if fragment_output_is_sample_mask(frag, mi) {
+                            Some(OutKind::SampleMask)
                         } else {
                             fragment_output_location(frag, mi).map(OutKind::Location)
                         };
                         let Some(kind) = kind else { continue };
-                        let output_ty = fragment_output_type(ctx, frag, mi, *mty, defs);
+                        let uint_ty = ctx.ty_uint();
+                        let output_ty = match kind {
+                            // `SampleMask` is `uint[1]` in SPIR-V; Metal returns the scalar mask.
+                            OutKind::SampleMask => ctx.ty_array(uint_ty, 1),
+                            _ => fragment_output_type(ctx, frag, mi, *mty, defs),
+                        };
                         let var = make_output_var(ctx, output_ty);
                         match kind {
                             OutKind::Location(location) => {
@@ -727,13 +754,24 @@ pub(in crate::passes) fn rewrite_return(
                             OutKind::Stencil => {
                                 decorate_builtin(&mut ctx.module, var, BuiltIn::FragStencilRefEXT)
                             }
+                            OutKind::SampleMask => {
+                                decorate_builtin(&mut ctx.module, var, BuiltIn::SampleMask)
+                            }
                         }
                         ctx.interface.push(var);
-                        outputs.push(OutputWrite::Extract {
-                            var,
-                            member: mi as u32,
-                            src_ty: *mty,
-                            dst_ty: output_ty,
+                        outputs.push(match kind {
+                            OutKind::SampleMask => OutputWrite::ArrayBuiltinSlot {
+                                var,
+                                member: Some(mi as u32),
+                                src_ty: *mty,
+                                elem_ty: uint_ty,
+                            },
+                            _ => OutputWrite::Extract {
+                                var,
+                                member: mi as u32,
+                                src_ty: *mty,
+                                dst_ty: output_ty,
+                            },
                         });
                     }
                 } else {
@@ -756,6 +794,18 @@ pub(in crate::passes) fn rewrite_return(
                             var,
                             src_ty: ret_ty,
                             dst_ty: ret_ty,
+                        });
+                    } else if fragment_output_is_sample_mask(frag, 0) {
+                        let uint_ty = ctx.ty_uint();
+                        let mask_ty = ctx.ty_array(uint_ty, 1);
+                        let var = make_output_var(ctx, mask_ty);
+                        decorate_builtin(&mut ctx.module, var, BuiltIn::SampleMask);
+                        ctx.interface.push(var);
+                        outputs.push(OutputWrite::ArrayBuiltinSlot {
+                            var,
+                            member: None,
+                            src_ty: ret_ty,
+                            elem_ty: uint_ty,
                         });
                     } else if let Some(location) = fragment_output_location(frag, 0) {
                         let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs);
@@ -838,9 +888,9 @@ pub(in crate::passes) fn rewrite_return(
                         ctx.interface.push(var);
                         match clip_distance_ty {
                             Some(ClipDistanceOutputType::Scalar { elem_ty, .. }) => {
-                                outputs.push(OutputWrite::ClipDistanceExtract {
+                                outputs.push(OutputWrite::ArrayBuiltinSlot {
                                     var,
-                                    member: mi as u32,
+                                    member: Some(mi as u32),
                                     src_ty: *mty,
                                     elem_ty,
                                 });

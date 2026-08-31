@@ -379,6 +379,48 @@ fn fragment_depth_output_is_not_a_render_target() {
     assert!(!m.is_depth_member(1));
 }
 
+/// Every non-color fragment output role is read by the same walk, so none can be the one nobody
+/// copied it for — which is how `air.sample_mask` came to be dropped.
+#[test]
+fn each_non_color_fragment_output_role_is_recognised() {
+    let with = |node: &str| {
+        let ll = FRAG_LL.replace(r#"!17 = !{!"air.render_target", i32 0, i32 0}"#, node);
+        parse_air_fragment_meta(&ll).unwrap()
+    };
+
+    let depth = with(r#"!17 = !{!"air.depth", !"air.arg_type_name", !"float"}"#);
+    assert!(depth.is_depth_member(0));
+    assert!(!depth.is_stencil_member(0) && !depth.is_sample_mask_member(0));
+
+    let stencil = with(r#"!17 = !{!"air.stencil", !"air.arg_type_name", !"uint"}"#);
+    assert!(stencil.is_stencil_member(0));
+    assert!(!stencil.is_depth_member(0) && !stencil.is_sample_mask_member(0));
+
+    let mask = with(r#"!17 = !{!"air.sample_mask", !"air.arg_type_name", !"uint"}"#);
+    assert!(mask.is_sample_mask_member(0));
+    assert!(!mask.is_depth_member(0) && !mask.is_stencil_member(0));
+    assert_eq!(
+        mask.n_render_targets, 0,
+        "a coverage mask is not a color attachment"
+    );
+    assert!(mask.render_target_members.is_empty());
+}
+
+/// A function-constant-gated output is off by default, and that gate is checked for every role.
+#[test]
+fn a_disabled_sample_mask_output_is_not_reported() {
+    let ll = FRAG_LL.replace(
+        r#"!17 = !{!"air.render_target", i32 0, i32 0}"#,
+        r#"!17 = !{!"air.function_constant", !99, !"air.sample_mask", !"air.arg_type_name", !"uint"}
+!99 = !{ptr addrspace(2) @off.MTL_FC_INIT_0_b, !"bool", !"off", i32 0, i1 false}"#,
+    );
+    let m = parse_air_fragment_meta(&ll).unwrap();
+    assert!(
+        !m.is_sample_mask_member(0),
+        "an off-by-default mask must not claim the builtin"
+    );
+}
+
 const VERT_LL: &str = r#"
 !air.vertex = !{!15}
 !15 = !{ptr @V, !16, !19}

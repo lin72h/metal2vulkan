@@ -169,6 +169,12 @@ pub struct FragMeta {
     pub depth_qualifier: Option<DepthQualifier>,
     /// Return-struct member indices tagged as `air.stencil` (`[[stencil]]`).
     pub stencil_members: Vec<u32>,
+    /// Return-struct member indices tagged as `air.sample_mask` (`[[sample_mask]]`).
+    ///
+    /// The value is a coverage mask: a sample whose bit the shader clears is not written, which is
+    /// how alpha-to-coverage and custom MSAA resolves are expressed. Vulkan spells it as the
+    /// `SampleMask` builtin, an array of `uint` rather than the scalar Metal returns.
+    pub sample_mask_members: Vec<u32>,
     /// Custom per-pixel fragment imageblock master plus the input/output projections that expose
     /// subsets of its fields. `None` when the fragment carries no `air.imageblock_master` contract.
     pub fragment_imageblock: Option<FragmentImageblock>,
@@ -298,6 +304,9 @@ impl FragMeta {
     }
     pub fn is_stencil_member(&self, member_idx: u32) -> bool {
         self.stencil_members.contains(&member_idx)
+    }
+    pub fn is_sample_mask_member(&self, member_idx: u32) -> bool {
+        self.sample_mask_members.contains(&member_idx)
     }
 }
 
@@ -1638,22 +1647,27 @@ fn parse_air_fragment_meta_with_nodes(
                 .collect()
         })
         .unwrap_or_default();
-    let depth_members: Vec<u32> = nodes
-        .get(&out_ref)
-        .map(|c| {
-            refs_in(c)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    let node = nodes.get(&r)?;
-                    let roles = role_strings(node);
-                    let is_depth = primary_role(&roles) == Some("depth");
-                    (is_depth && metadata_enabled_by_default(node, nodes, &static_int_globals))
+    // Which return members carry a given non-color output role. One reader for every such role, so
+    // adding one is a call rather than another copy of this walk — `air.sample_mask` was dropped
+    // for as long as it was the role nobody had copied the walk for.
+    let output_members_with_role = |role: &str| -> Vec<u32> {
+        nodes
+            .get(&out_ref)
+            .map(|c| {
+                refs_in(c)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, r)| {
+                        let node = nodes.get(&r)?;
+                        (primary_role(&role_strings(node)) == Some(role)
+                            && metadata_enabled_by_default(node, nodes, &static_int_globals))
                         .then_some(i as u32)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let depth_members = output_members_with_role("depth");
     let depth_qualifier = nodes.get(&out_ref).and_then(|c| {
         refs_in(c).into_iter().find_map(|r| {
             let node = nodes.get(&r)?;
@@ -1668,22 +1682,8 @@ fn parse_air_fragment_meta_with_nodes(
                 })
         })
     });
-    let stencil_members: Vec<u32> = nodes
-        .get(&out_ref)
-        .map(|c| {
-            refs_in(c)
-                .into_iter()
-                .enumerate()
-                .filter_map(|(i, r)| {
-                    let node = nodes.get(&r)?;
-                    let roles = role_strings(node);
-                    let is_stencil = primary_role(&roles) == Some("stencil");
-                    (is_stencil && metadata_enabled_by_default(node, nodes, &static_int_globals))
-                        .then_some(i as u32)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let stencil_members = output_members_with_role("stencil");
+    let sample_mask_members = output_members_with_role("sample_mask");
     let render_target_indices: Vec<u32> = render_target_members
         .iter()
         .map(|(_, location)| *location)
@@ -1850,6 +1850,7 @@ fn parse_air_fragment_meta_with_nodes(
         depth_members,
         depth_qualifier,
         stencil_members,
+        sample_mask_members,
         fragment_imageblock,
         render_target_indices,
         buffer_layouts,
