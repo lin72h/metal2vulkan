@@ -95,6 +95,11 @@ pub(super) struct Emitter<'a, 'b> {
     tc: &'a mut TypeCtx<'b>,
     blocks: HashMap<Word, Block>,
     terms: HashMap<Word, Term>,
+    /// The original function's block labels, in the order it declared them. `blocks` is keyed by
+    /// label, so anything that walks it has to take its order from here: minting a variable or a
+    /// pointer type in hash-map order would make the same input translate to different bytes on
+    /// every run.
+    block_order: Vec<Word>,
     /// Original block -> the phi results it must load on entry, as (result, variable, type).
     phi_loads: HashMap<Word, Vec<(Word, Word, Word)>>,
     /// Every demoted phi slot, as (block, result, variable), for the promotion pass.
@@ -140,6 +145,7 @@ pub(super) fn structure_function(
     let mut emitter = Emitter {
         tc,
         blocks: HashMap::new(),
+        block_order: Vec::new(),
         terms: HashMap::new(),
         phi_loads: HashMap::new(),
         phi_slots: Vec::new(),
@@ -209,6 +215,7 @@ impl Emitter<'_, '_> {
                 .and_then(decode_term)
                 .ok_or_else(|| "unhandled terminator".to_string())?;
             self.terms.insert(label, term);
+            self.block_order.push(label);
             let mut block = block.clone();
             // OpVariable is only legal in a function's first block, and nesting can put any block
             // inside a loop. Hoist the declarations into the prologue this emitter always writes.
@@ -590,7 +597,7 @@ impl Emitter<'_, '_> {
     /// loads. The nesting rewrites which block physically branches into a merge, so a phi's
     /// predecessor list is the one thing it cannot carry through unchanged.
     fn demote_phis(&mut self, graph: &Graph) -> Result<(), String> {
-        let labels = self.blocks.keys().copied().collect::<Vec<_>>();
+        let labels = self.block_order.clone();
         for label in labels {
             let phis = self
                 .blocks

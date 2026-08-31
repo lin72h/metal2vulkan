@@ -100,10 +100,16 @@ pub(in crate::passes) fn lower_buffer_address_facts(
     ctx.interface_buffer_var(table);
 
     let zero = ctx.const_uint(0);
-    let location_constants = locations
+    // `ctx.const_uint` mints a new constant the first time it sees a value, so the order these are
+    // requested in is the order they are declared in the emitted module. Taking that order from a
+    // hash set would make the same input translate to different bytes on every run.
+    let mut distinct_locations = locations
         .values()
         .map(|(location, _)| *location)
-        .collect::<HashSet<_>>()
+        .collect::<Vec<_>>();
+    distinct_locations.sort_unstable();
+    distinct_locations.dedup();
+    let location_constants = distinct_locations
         .into_iter()
         .map(|location| (location, ctx.const_uint(location)))
         .collect::<HashMap<_, _>>();

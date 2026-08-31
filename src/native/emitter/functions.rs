@@ -1803,10 +1803,11 @@ impl Emitter {
             }
             let mut instructions = Vec::new();
             if self.bda_device_pointers && block_idx == 0 {
-                let direct_buffers = self
+                let mut direct_buffers = self
                     .raw_offsets
                     .iter()
                     .filter_map(|(name, raw)| {
+                        let &param_index = self.direct_param_indices.get(name)?;
                         (raw.root == *name
                             && raw.const_off == 0
                             && raw.dyn_terms.is_empty()
@@ -1814,12 +1815,18 @@ impl Emitter {
                                 || self
                                     .ir
                                     .metadata_fc_buffer_locations
-                                    .contains_key(&(f.name.clone(), name.clone())))
-                            && self.direct_param_indices.contains_key(name))
-                        .then_some(name.clone())
+                                    .contains_key(&(f.name.clone(), name.clone()))))
+                        .then(|| (param_index, name.clone()))
                     })
                     .collect::<Vec<_>>();
-                for name in direct_buffers {
+                // `raw_offsets` is a hash map, and this loop decides the order the entry prologue
+                // materializes buffer addresses in -- which fixes their positions in the emitted
+                // module and, downstream, which address-table slot each position reads. Taking that
+                // order from the map makes the whole translation differ from run to run for the
+                // same input. Order by the entry parameter ordinal instead: it is stable, and it is
+                // the order a reader expects the prologue to be in.
+                direct_buffers.sort_unstable();
+                for (_, name) in direct_buffers {
                     let (low, high) =
                         self.emit_direct_buffer_address_payload(&name, &mut instructions)?;
                     let address =
