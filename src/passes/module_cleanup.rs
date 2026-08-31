@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// Declare `ext` unless the module already does.
+///
+/// Every capability that is not core Vulkan needs its extension named alongside it, and each of
+/// them wants the same idempotent push — one place to get it right rather than one copy per
+/// extension.
+fn require_extension(ctx: &mut Ctx, ext: &str) {
+    let have = ctx
+        .module
+        .extensions
+        .iter()
+        .any(|e| matches!(e.operands.first(), Some(Operand::LiteralString(s)) if s == ext));
+    if !have {
+        ctx.module.extensions.push(Instruction::new(
+            Op::Extension,
+            None,
+            None,
+            vec![Operand::LiteralString(ext.into())],
+        ));
+    }
+}
+
 fn needed_variable_pointer_capabilities(ctx: &Ctx) -> (bool, bool) {
     crate::spirv_variable_ptr::variable_pointer_requirement(&ctx.module)
 }
@@ -401,6 +422,20 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     if has_sample_id || has_sample_interpolation {
         want.push(Capability::SampleRateShading);
     }
+    // `BaryCoordKHR` / `BaryCoordNoPerspKHR` are `[[barycentric_coord]]`; both come from the
+    // fragment-barycentric extension rather than core Vulkan.
+    let has_barycentric = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && matches!(
+                instruction.operands.get(2),
+                Some(&Operand::BuiltIn(BuiltIn::BaryCoordKHR))
+                    | Some(&Operand::BuiltIn(BuiltIn::BaryCoordNoPerspKHR))
+            )
+    });
+    if has_barycentric {
+        want.push(Capability::FragmentBarycentricKHR);
+    }
     let has_stencil_export = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
@@ -638,51 +673,19 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     // DemoteToHelperInvocation needs its SPIR-V extension declared (core only from SPIR-V 1.6).
     if want.contains(&Capability::DemoteToHelperInvocation) {
         let ext = "SPV_EXT_demote_to_helper_invocation";
-        let have = ctx
-            .module
-            .extensions
-            .iter()
-            .any(|e| matches!(e.operands.first(), Some(Operand::LiteralString(s)) if s == ext));
-        if !have {
-            ctx.module.extensions.push(Instruction::new(
-                Op::Extension,
-                None,
-                None,
-                vec![Operand::LiteralString(ext.into())],
-            ));
-        }
+        require_extension(ctx, ext);
     }
     if want.contains(&Capability::AtomicFloat32AddEXT) {
         let ext = "SPV_EXT_shader_atomic_float_add";
-        let have = ctx
-            .module
-            .extensions
-            .iter()
-            .any(|e| matches!(e.operands.first(), Some(Operand::LiteralString(s)) if s == ext));
-        if !have {
-            ctx.module.extensions.push(Instruction::new(
-                Op::Extension,
-                None,
-                None,
-                vec![Operand::LiteralString(ext.into())],
-            ));
-        }
+        require_extension(ctx, ext);
+    }
+    if want.contains(&Capability::FragmentBarycentricKHR) {
+        let ext = "SPV_KHR_fragment_shader_barycentric";
+        require_extension(ctx, ext);
     }
     if want.contains(&Capability::StencilExportEXT) {
         let ext = "SPV_EXT_shader_stencil_export";
-        let have = ctx
-            .module
-            .extensions
-            .iter()
-            .any(|e| matches!(e.operands.first(), Some(Operand::LiteralString(s)) if s == ext));
-        if !have {
-            ctx.module.extensions.push(Instruction::new(
-                Op::Extension,
-                None,
-                None,
-                vec![Operand::LiteralString(ext.into())],
-            ));
-        }
+        require_extension(ctx, ext);
     }
 }
 

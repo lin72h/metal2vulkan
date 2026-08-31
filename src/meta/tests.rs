@@ -87,6 +87,50 @@ fn every_interpolation_marker_is_decoded_or_deliberately_ignored() {
     assert_eq!(with(""), VaryingInterpolation::default());
 }
 
+/// A barycentric argument carries its own perspective axis, and only the perspective axis.
+#[test]
+fn a_barycentric_argument_keeps_its_perspective_axis() {
+    let with = |markers: &str| {
+        let ll = FRAG_LL.replace(
+            r#"!20 = !{i32 1, !"air.fragment_input", !"generated","#,
+            &format!(r#"!20 = !{{i32 1, !"air.barycentric_coord", {markers}"#),
+        );
+        let m = parse_air_fragment_meta(&ll).unwrap();
+        m.role_of(1).expect("decoded role").clone()
+    };
+    assert_eq!(
+        with(r#"!"air.center", !"air.perspective","#),
+        FragRole::BarycentricCoord {
+            no_perspective: false
+        }
+    );
+    assert_eq!(
+        with(r#"!"air.center", !"air.no_perspective","#),
+        FragRole::BarycentricCoord {
+            no_perspective: true
+        }
+    );
+    assert_eq!(
+        with(r#"!"air.centroid", !"air.perspective","#),
+        FragRole::BarycentricCoord {
+            no_perspective: false
+        },
+        "SPIR-V has no centroid barycentric builtin, so the sampling axis is deliberately ignored"
+    );
+}
+
+/// An off-by-default barycentric argument is absent, and must not make the module require the
+/// fragment-barycentric extension for a value nothing reads.
+#[test]
+fn a_disabled_barycentric_argument_declares_no_builtin() {
+    let ll = FRAG_LL.replace(
+        r#"!20 = !{i32 1, !"air.fragment_input", !"generated","#,
+        r#"!20 = !{i32 1, !"air.function_constant", !98, !"air.barycentric_coord", !"air.center", !"air.perspective","#,
+    ) + "\n!98 = !{ptr addrspace(2) @off.MTL_FC_INIT_0_b, !\"bool\", !\"off\", i32 0, i1 false}\n";
+    let m = parse_air_fragment_meta(&ll).unwrap();
+    assert_eq!(m.role_of(1), Some(&FragRole::Other));
+}
+
 /// `air.sample` means per-sample interpolation on a varying and sample-read access on a texture.
 /// The decode must not read one argument's markers as another's.
 #[test]

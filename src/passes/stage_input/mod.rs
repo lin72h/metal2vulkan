@@ -327,6 +327,8 @@ pub(super) fn build_stage_input(
     let mut primitive_id_var: Option<Word> = None;
     let mut sample_id_var: Option<Word> = None;
     let mut layer_var: Option<Word> = None;
+    let mut bary_coord_var: Option<Word> = None;
+    let mut bary_coord_no_persp_var: Option<Word> = None;
     let mut tess_coord_var: Option<Word> = None;
     let mut local_invocation_index_var: Option<Word> = None;
     let mut num_workgroups_var: Option<Word> = None;
@@ -363,6 +365,7 @@ pub(super) fn build_stage_input(
                 Some(FragRole::Position) => s == "position",
                 Some(FragRole::PointCoord) => s == "point_coord",
                 Some(FragRole::FrontFacing) => s == "front_facing",
+                Some(FragRole::BarycentricCoord { .. }) => s == "barycentric_coord",
                 Some(FragRole::PrimitiveId) => s == "primitive_id",
                 Some(FragRole::SampleId) => s == "sample_id",
                 Some(FragRole::ViewportArrayIndex) => s == "viewport_array_index",
@@ -1685,6 +1688,54 @@ pub(super) fn build_stage_input(
                 let z = ctx.const_zero(*pty, &defs);
                 bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
             }
+        } else if role_is("barycentric_coord") {
+            // `[[barycentric_coord]]` is the primitive's barycentric weights at this fragment.
+            // Vulkan spells the perspective and screen-space forms as two builtins, so the AIR
+            // marker picks which one; both need the fragment-barycentric extension, which
+            // `module_cleanup` requests from the decoration.
+            let v3 = ctx.ty_vecf(3);
+            if *pty != v3 {
+                return Err(format!(
+                    "[[barycentric_coord]] parameter {idx} is not a float3; \
+                     BaryCoord is a 3-component float builtin"
+                ));
+            }
+            let no_perspective = matches!(
+                frag.and_then(|meta| meta.role_of(idx)),
+                Some(FragRole::BarycentricCoord {
+                    no_perspective: true
+                })
+            );
+            let slot = if no_perspective {
+                &mut bary_coord_no_persp_var
+            } else {
+                &mut bary_coord_var
+            };
+            let var = if let Some(existing) = *slot {
+                existing
+            } else {
+                let pptr = ctx.ty_ptr(StorageClass::Input, v3);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_builtin(
+                    &mut ctx.module,
+                    var,
+                    if no_perspective {
+                        BuiltIn::BaryCoordNoPerspKHR
+                    } else {
+                        BuiltIn::BaryCoordKHR
+                    },
+                );
+                ctx.interface.push(var);
+                *slot = Some(var);
+                var
+            };
+            bindings.push((*pid, ParamBinding::LoadVar { var, ty: v3 }));
         } else if role_is("front_facing") {
             let bool_ty = ctx.ty_bool();
             if *pty == bool_ty {

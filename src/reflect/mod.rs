@@ -2476,6 +2476,7 @@ impl ShaderReflection {
                 FragRole::Position
                 | FragRole::PointCoord
                 | FragRole::FrontFacing
+                | FragRole::BarycentricCoord { .. }
                 | FragRole::PrimitiveId
                 | FragRole::SampleId
                 | FragRole::ViewportArrayIndex

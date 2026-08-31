@@ -41,6 +41,12 @@ pub enum FragRole {
     PointCoord,
     /// `[[front_facing]]` -> Input BuiltIn FrontFacing.
     FrontFacing,
+    /// `[[barycentric_coord]]` -> Input BuiltIn `BaryCoordKHR` / `BaryCoordNoPerspKHR` (float3).
+    ///
+    /// AIR states the perspective axis on the same node, exactly as it does for a varying, and
+    /// SPIR-V spells the two as different builtins rather than as a decoration — so the flag has to
+    /// travel with the role.
+    BarycentricCoord { no_perspective: bool },
     /// `[[primitive_id]]` -> Input BuiltIn PrimitiveId (32-bit uint).
     PrimitiveId,
     /// `[[sample_id]]` -> Input BuiltIn SampleId (32-bit uint).
@@ -1673,6 +1679,7 @@ pub(crate) fn parse_air_fragment_meta_with_entry(ll: &str) -> (Option<FragMeta>,
 /// emission. `render_target` appears here because an `air.render_target` in the *input* list is
 /// framebuffer fetch (`[[color(n)]]`), not an output.
 pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
+    "barycentric_coord",
     "buffer",
     "fragment_input",
     "front_facing",
@@ -1910,6 +1917,16 @@ fn parse_air_fragment_meta_with_nodes(
             "position" => FragRole::Position,
             "point_coord" => FragRole::PointCoord,
             "front_facing" => FragRole::FrontFacing,
+            // A function-constant-gated barycentric argument that is off by default is absent, and
+            // materializing its builtin anyway would make the module require the
+            // fragment-barycentric extension for a value nothing reads.
+            "barycentric_coord"
+                if metadata_enabled_by_default(node, nodes, &static_int_globals) =>
+            {
+                FragRole::BarycentricCoord {
+                    no_perspective: VaryingInterpolation::from_role_strings(&strs).no_perspective,
+                }
+            }
             "primitive_id" => FragRole::PrimitiveId,
             "sample_id" => FragRole::SampleId,
             "viewport_array_index" => FragRole::ViewportArrayIndex,
