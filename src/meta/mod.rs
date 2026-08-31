@@ -565,8 +565,14 @@ pub enum KernRole {
     /// A Metal intersection-function table. Like visible tables, this is a link-time authored
     /// resource rather than a Vulkan descriptor.
     IntersectionFunctionTable(u32),
-    /// `[[threads_per_threadgroup]]` (`uint` or `uint3`) -> the execution local size.
-    /// Scalar params receive `64`; vector params receive `(64, 1, 1)` for the current harness.
+    /// `[[threads_per_threadgroup]]` or `[[dispatch_threads_per_threadgroup]]` (`uint` or `uint3`)
+    /// -> the execution local size. Scalar params receive `64`; vector params receive `(64, 1, 1)`
+    /// for the current harness.
+    ///
+    /// Metal distinguishes the two only under `dispatchThreads:`, where a final partial threadgroup
+    /// reports a smaller `threads_per_threadgroup` than the size the dispatch asked for. Vulkan has
+    /// no partial workgroups — `vkCmdDispatch` issues whole ones — so both AIR roles denote the same
+    /// value here, and the declared local size is that value.
     ThreadsPerThreadgroup,
     /// `[[thread_position_in_threadgroup]]` (`uint` or `uint3`) -> LocalInvocationId.
     /// Scalar params receive component .x; vector params receive the full v3uint.
@@ -875,7 +881,9 @@ fn parse_air_kernel_meta_with_nodes(
                 KernRole::Other
             }
             "sampler" => KernRole::Sampler(resource_location(node, idx)),
-            "threads_per_threadgroup" => KernRole::ThreadsPerThreadgroup,
+            "threads_per_threadgroup" | "dispatch_threads_per_threadgroup" => {
+                KernRole::ThreadsPerThreadgroup
+            }
             "thread_position_in_threadgroup" => KernRole::ThreadPositionInThreadgroup,
             "threadgroups_per_grid" => KernRole::ThreadgroupsPerGrid,
             "threads_per_grid" => KernRole::ThreadsPerGrid,
@@ -1720,6 +1728,7 @@ pub const VERTEX_INPUT_ROLES: &[&str] = &[
 /// The kernel entry-parameter roles the emitter models. See [`FRAGMENT_INPUT_ROLES`].
 pub const KERNEL_INPUT_ROLES: &[&str] = &[
     "buffer",
+    "dispatch_threads_per_threadgroup",
     "imageblock",
     "indirect_buffer",
     "instance_acceleration_structure",

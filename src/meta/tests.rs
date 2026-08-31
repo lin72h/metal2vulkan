@@ -207,6 +207,46 @@ entry:
     assert_eq!(m.role_of(0), Some(&FragRole::Texture(4)));
 }
 
+/// Both Metal spellings of the threadgroup size denote the same value in Vulkan.
+///
+/// They differ only under `dispatchThreads:`, where a final partial threadgroup reports a smaller
+/// `threads_per_threadgroup` than the dispatch asked for. `vkCmdDispatch` issues whole workgroups
+/// only, so there is nothing for the two to disagree about — and a parameter that read a zero
+/// instead of the size divided by it in every shader that used it.
+#[test]
+fn both_threadgroup_size_roles_are_the_execution_local_size() {
+    let ll = |role: &str| {
+        format!(
+            r#"
+define void @K(i32 %size) {{
+  ret void
+}}
+
+!air.kernel = !{{!0}}
+!0 = !{{ptr @K, !1, !2}}
+!1 = !{{}}
+!2 = !{{!3}}
+!3 = !{{i32 0, !"air.{role}", !"air.arg_type_name", !"uint", !"air.arg_name", !"size"}}
+"#
+        )
+    };
+    for role in [
+        "threads_per_threadgroup",
+        "dispatch_threads_per_threadgroup",
+    ] {
+        let meta = parse_air_kernel_meta(&ll(role)).expect("kernel metadata");
+        assert_eq!(
+            meta.role_of(0),
+            Some(&KernRole::ThreadsPerThreadgroup),
+            "`air.{role}` is the execution local size"
+        );
+        assert!(
+            meta.unmodelled_input_params.is_empty(),
+            "`air.{role}` has a lowering, so it must not be reported as unmodelled"
+        );
+    }
+}
+
 #[test]
 fn kernel_function_constant_texture_with_valid_location_is_bound_when_disabled_by_default() {
     let ll = r#"
