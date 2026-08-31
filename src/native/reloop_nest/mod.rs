@@ -405,11 +405,13 @@ mod tests {
             return;
         };
         let nested = nested_bytes(&spv).expect("nested");
+        assert!(validates(&nested));
         let asm = disassemble(&nested);
-        // Exactly one variable: the demoted induction phi. The comparison, the add and the
-        // condition stay in SSA, which is the whole point of nesting over a dispatch.
+        // No variable at all. The comparison, the add and the condition never left SSA, and the
+        // induction phi went back to one on the synthesized loop header, where its two edges meet.
         let variables = asm.matches("OpVariable").count();
-        assert_eq!(variables, 1, "{asm}");
+        assert_eq!(variables, 0, "{asm}");
+        assert!(asm.contains("OpPhi"), "{asm}");
         assert!(asm.contains("OpIAdd"), "{asm}");
     }
 

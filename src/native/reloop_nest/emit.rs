@@ -1158,6 +1158,33 @@ impl Emitter<'_, '_> {
     ///
     /// The check is on the emitted blocks, so it needs no model of how they were produced: an edge
     /// that got a helper block of its own is as good a phi predecessor as the original block.
+    /// Walk up from `block` through single-predecessor blocks that do not write `var`, and return
+    /// the first block whose entry value can differ: the join where the slot's edges meet. Every
+    /// block stepped over is dominated by the one before it, so a phi written at the result is
+    /// still in scope everywhere the load was.
+    fn join_of(
+        &self,
+        block: Word,
+        var: Word,
+        predecessors: &HashMap<Word, Vec<Word>>,
+        index: &HashMap<Word, usize>,
+    ) -> Word {
+        let mut join = block;
+        while let Some([only]) = predecessors.get(&join).map(Vec::as_slice) {
+            let writes_slot = index.get(only).is_some_and(|position| {
+                self.out[*position].instructions.iter().any(|instruction| {
+                    instruction.class.opcode == Op::Store
+                        && instruction.operands.first() == Some(&Operand::IdRef(var))
+                })
+            });
+            if writes_slot {
+                break;
+            }
+            join = *only;
+        }
+        join
+    }
+
     fn promote_phi_slots(&mut self) {
         let mut predecessors: HashMap<Word, Vec<Word>> = HashMap::new();
         for block in &self.out {
@@ -1193,7 +1220,15 @@ impl Emitter<'_, '_> {
 
         let slots = std::mem::take(&mut self.phi_slots);
         let mut promoted = HashSet::new();
-        for (block, result, var) in slots {
+        for (loaded_in, result, var) in slots {
+            // The phi belongs where the slot's incoming edges actually converge, and the load is
+            // not always there. Nesting routinely puts the load one unconditional hop below the
+            // join: a loop's original header becomes the body of a synthesized header, and it is
+            // the synthesized header that owns the back edge and therefore the meeting of the two
+            // values. Walking up through single-predecessor blocks that do not write the slot
+            // reaches that join without changing the value on entry, and every block walked
+            // through dominates the load's block, so its uses stay in range.
+            let block = self.join_of(loaded_in, var, &predecessors, &index);
             let Some(incoming) = predecessors.get(&block) else {
                 continue;
             };
@@ -1265,7 +1300,7 @@ impl Emitter<'_, '_> {
             if !usable {
                 continue;
             }
-            let Some(&position) = index.get(&block) else {
+            let (Some(&join), Some(&position)) = (index.get(&block), index.get(&loaded_in)) else {
                 continue;
             };
             let Some(load) = self.out[position]
@@ -1279,7 +1314,7 @@ impl Emitter<'_, '_> {
             };
             let ty = self.out[position].instructions[load].result_type;
             self.out[position].instructions.remove(load);
-            self.out[position]
+            self.out[join]
                 .instructions
                 .insert(0, Instruction::new(Op::Phi, ty, Some(result), operands));
             for carrier in carriers {
