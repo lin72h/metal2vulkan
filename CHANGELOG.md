@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A texture AIR declares write-capable binds as a storage image even when the shader body only
+  queries its size. The binding class came from what the body did, and a size query counted as a
+  sampled-image use, so such a texture bound in the sampled-texture band while reflection reported
+  it in the storage-texture band -- a consumer wrote its descriptor where the shader does not read
+  it. Only sampling decides the class now; every other AIR texture operation has a form for either.
 - Scratch files under a caller-supplied `tmp` are named per process and per call, so two callers
   sharing one directory no longer overwrite and delete each other's input to `spirv-val` or
   `llvm-dis`. The shared name surfaced as a validation failure in a module that was fine.

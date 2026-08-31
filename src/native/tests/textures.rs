@@ -207,6 +207,65 @@ fn runtime_storage_image_atomic_requires_scalar_format_and_host_support() {
 }
 
 #[test]
+fn native_write_declared_texture_binds_as_storage_even_if_the_body_only_queries_it() {
+    // AIR declares `dst` write-capable, so a consumer allocates it a storage-image descriptor at
+    // `STORAGE_TEXTURE_BINDING_BASE + n` -- reflection says so, from the type name. The binding
+    // class the emitter chose came instead from what the BODY does, and a size query used to count
+    // as a sampled-image use, so this shader bound `dst` at `TEXTURE_BINDING_BASE + n`: the
+    // consumer wrote its descriptor where the shader does not read it.
+    //
+    // Only sampling can decide this. A size query has an opcode for each binding class, so it
+    // decides nothing.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %dst, ptr addrspace(1) %out) {
+entry:
+  %w = call i32 @air.get_width_texture_2d(ptr addrspace(1) %dst, i32 0)
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dst"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_write_declared_query_only_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let (spv, reflection) = crate::translate_sanitized_native_reflected(
+        ll,
+        Stage::Kernel,
+        &tmp,
+        passes::TransformOptions::default(),
+    )
+    .expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(
+        asm.contains("2D 0 0 0 2"),
+        "a write-declared texture binds as a storage image:\n{asm}"
+    );
+    let reflected = reflection
+        .binding_at(crate::reflect::ResourceKind::StorageImage, 0)
+        .and_then(|resource| resource.descriptor)
+        .expect("reflection reports it as a storage image");
+    assert_eq!(
+        reflected.binding,
+        crate::reflect::STORAGE_TEXTURE_BINDING_BASE
+    );
+    assert!(
+        asm.contains(&format!("Binding {}", reflected.binding)),
+        "the module has to decorate the binding reflection reports:\n{asm}"
+    );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn native_buffer_texture_size_query_uses_query_size_without_lod() {
     // SPIR-V allows `OpImageQuerySizeLod` only on a 1D/2D/3D/Cube image with `MS` 0 and a `Sampled`
     // operand that is not 2, so a `Dim Buffer` image must use the LOD-less `OpImageQuerySize`.
@@ -4220,7 +4279,9 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
+    // The subject is that the query resolves to the wrapped texture at all. AIR declares `dst`
+    // write-capable, so it binds as a storage image and the query takes the LOD-less form.
+    assert!(asm.contains("OpImageQuerySize "), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")

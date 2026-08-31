@@ -626,13 +626,34 @@ fn write_texture_operands(
     out
 }
 
-/// Metadata-declared storage textures used by direct texel reads, with any parameter also consumed
-/// by a sampled-image operation or query removed. This distinguishes `read_texture` (legal as
-/// `OpImageRead`) from the other calls that make `texture_dims` require a Sampled=1 binding.
-pub(in crate::passes) fn storage_texel_read_operands(ctx: &Ctx, entry_idx: usize) -> HashSet<Word> {
+/// Textures this module cannot bind as a storage image, because something samples through them.
+///
+/// `OpSampledImage` requires an image whose `Sampled` operand is 1. Everything else AIR does to a
+/// texture has a form for either binding: `read_texture` is `OpImageRead` on a storage image and
+/// `OpImageFetch` on a sampled one, size and sample-count queries have an opcode each (see
+/// `image_size_query_op`), `get_num_mip_levels` folds to one level on a storage image, and
+/// `is_null_texture` folds to a constant.
+///
+/// So a query does not decide the binding class, and this is the only rule that does. It used to
+/// take two: `texture_dims` collects every use including queries but skips the read and query uses
+/// of a texture the body WRITES, and `storage_texel_read_operands` restored the ones a texel read
+/// had otherwise disqualified. A texture that AIR declares write-capable but the body never writes
+/// fell through both -- a `texture2d<float, write>` that is only size-queried bound as a sampled
+/// image at `TEXTURE_BINDING_BASE + n` while reflection reported a storage image at
+/// `STORAGE_TEXTURE_BINDING_BASE + n`, so the consumer wrote its descriptor where the shader does
+/// not read it.
+///
+/// `air.gather_*` is not here, which preserves what this classification has always done. A gathered
+/// AND written texture would need one descriptor to be both `Sampled` 1 and `Sampled` 2 -- the
+/// read-write-with-format case `write_texture_dims` documents as out of scope -- so putting it here
+/// converts those shaders into a write-lowering failure instead of resolving anything. Whether a
+/// gathered storage image reaches a correct lowering is unaudited.
+pub(in crate::passes) fn sampled_binding_required_operands(
+    ctx: &Ctx,
+    entry_idx: usize,
+) -> HashSet<Word> {
     let names = air_names(&ctx.module);
-    let mut reads = HashSet::new();
-    let mut sampled_or_queried = HashSet::new();
+    let mut required = HashSet::new();
     for instruction in ctx.module.functions[entry_idx]
         .blocks
         .iter()
@@ -649,20 +670,11 @@ pub(in crate::passes) fn storage_texel_read_operands(ctx: &Ctx, entry_idx: usize
         let Some(Operand::IdRef(texture)) = instruction.operands.get(1) else {
             continue;
         };
-        if name.starts_with("air.read_texture") || name.starts_with("air.read_depth") {
-            reads.insert(*texture);
-        } else if name.starts_with("air.sample_texture")
-            || name.starts_with("air.sample_depth")
-            || name.starts_with("air.is_null_texture")
-            || is_size_query(name)
-            || name.starts_with("air.get_num_mip_levels_")
-            || name.starts_with("air.get_num_samples_texture")
-        {
-            sampled_or_queried.insert(*texture);
+        if name.starts_with("air.sample_texture") || name.starts_with("air.sample_depth") {
+            required.insert(*texture);
         }
     }
-    reads.retain(|texture| !sampled_or_queried.contains(texture));
-    reads
+    required
 }
 
 fn is_size_query(name: &str) -> bool {

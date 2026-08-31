@@ -308,10 +308,10 @@ pub(super) fn build_stage_input(
             wtex_candidates.entry(pid).or_insert(shape);
         }
     }
-    let storage_texel_reads = storage_texel_read_operands(ctx, entry_idx);
+    let sampled_required = sampled_binding_required_operands(ctx, entry_idx);
     let wtex_dims: HashMap<Word, (Dim, bool, ImageFormat, ImageComp)> = wtex_candidates
         .into_iter()
-        .filter(|(pid, _)| !tex_dims.contains_key(pid) || storage_texel_reads.contains(pid))
+        .filter(|(pid, _)| !sampled_required.contains(pid))
         .collect();
 
     // Plan a binding for each parameter, allocating descriptor bindings and locations in role order.
