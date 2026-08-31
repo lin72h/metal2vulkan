@@ -2151,6 +2151,24 @@ fn unique_selection_merges_with_loop_exit_and_forced_inner(
     // re-analyze the 1k+ block regional graph after every merge split; it derives dominance from the
     // immutable source forest and carries synthesized predecessor origins through `ct_owned_preds`
     // instead.
+    //
+    // `cur_forest` is MAINTAINED, not re-derived. Only the two pass-through splits below record what
+    // they added (`Dominators::record_pass_through`); the other nine mutations in this loop record
+    // nothing, and not all of them preserve the relation. Over a 2880-source corpus, 17 sources end
+    // up with `cur_forest` disagreeing with a fresh `analyze(&out)` about some pair of blocks that
+    // both already existed -- in both directions -- and the first divergence was attributed each
+    // time to `synth_unique_selection_merge_phi_explicit` or to
+    // `finish_construct_tree_selection_owner`. So this is not "the current graph's forest", and a
+    // dominance query added here is not necessarily answered about the graph the loop is holding.
+    //
+    // Left as measured rather than repaired, because the repair is not affordable and buys nothing
+    // observable: re-deriving at the top of every iteration produced byte-identical SPIR-V for all
+    // 2880 sources and doubled the slowest one (2.96s -> 6.12s, against a 20-second ceiling). The
+    // residual risk is real though -- a query whose answer depends on one of those stale pairs would
+    // be a wrong ownership decision, and nothing here would catch it. Neither the generated
+    // selection-chain kernel of `bounded_work.rs` nor a generated irreducible nest reaches the
+    // state, so there is no fixture to guard it with yet; the divergence needs a construct-tree
+    // exit gateway.
     let mut cur_forest = analyze(&out);
     #[derive(Clone, Debug)]
     struct CtOwnedPred {
