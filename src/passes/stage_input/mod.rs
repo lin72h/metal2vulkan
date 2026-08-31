@@ -1165,15 +1165,17 @@ pub(super) fn build_stage_input(
                     vec![Operand::StorageClass(StorageClass::Input)],
                 ));
                 decorate_location(&mut ctx.module, var, loc);
-                // Fragment inputs are Flat either because Vulkan forbids interpolation for their
-                // scalar type (integer / 64-bit float; VUID-StandaloneSpirv-Flat-04744) or because
-                // AIR explicitly marked the varying `air.flat`.
-                let air_flat_varying = matches!(stage, Stage::Fragment)
-                    && frag.is_some_and(|m| m.varying_is_flat(loc));
-                if matches!(stage, Stage::Fragment)
-                    && (air_flat_varying || fragment_input_needs_flat(&defs, *pty))
-                {
-                    decorate_flat(&mut ctx.module, var);
+                // A fragment input carries the interpolation attribute AIR declared for it, or
+                // `Flat` when Vulkan forbids interpolating its scalar type at all (integer /
+                // 64-bit float; VUID-StandaloneSpirv-Flat-04744).
+                if matches!(stage, Stage::Fragment) {
+                    decorate_interpolation(
+                        &mut ctx.module,
+                        var,
+                        frag.map(|m| m.varying_interpolation(loc))
+                            .unwrap_or_default(),
+                        fragment_input_needs_flat(&defs, *pty),
+                    );
                 }
                 ctx.interface.push(var);
                 if interface_ty == *pty {

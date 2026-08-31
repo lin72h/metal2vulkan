@@ -392,7 +392,13 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
             && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::SampleId))
     });
-    if has_sample_id {
+    // `Sample` on an Input variable is per-sample interpolation (Metal `[[sample_perspective]]`),
+    // which requests sample-rate shading just as reading `SampleId` does.
+    let has_sample_interpolation = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::Sample))
+    });
+    if has_sample_id || has_sample_interpolation {
         want.push(Capability::SampleRateShading);
     }
     let has_stencil_export = ctx.module.annotations.iter().any(|instruction| {

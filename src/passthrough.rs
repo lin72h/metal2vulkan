@@ -648,7 +648,13 @@ declare float @air.fast_rsqrt.f32(float)
         let mut frag = meta::FragMeta::default();
         frag.roles.push((1, meta::FragRole::Varying(0)));
         frag.varying_types.insert(0, "float4".to_string());
-        frag.flat_varyings.insert(0);
+        frag.varying_interpolation.insert(
+            0,
+            crate::meta::VaryingInterpolation {
+                flat: true,
+                ..Default::default()
+            },
+        );
 
         let asm = passthrough_vertex_spvasm(&frag, false).unwrap();
         assert!(asm.contains("OpDecorate %vout0 Flat"), "{asm}");

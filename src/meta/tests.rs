@@ -33,6 +33,82 @@ fn fragment_roles() {
     assert!(!m.varying_is_flat(0));
 }
 
+/// Every AIR interpolation marker is decoded into [`VaryingInterpolation`] or listed here as
+/// deliberately ignored.
+///
+/// `air.no_perspective` and `air.centroid` were silently dropped for as long as this decode read
+/// only `air.flat`: a `[[center_no_perspective]]` varying translated to a perspective-correct one,
+/// valid SPIR-V that renders differently. The inventory below is the ABI's whole interpolation
+/// vocabulary, so a marker added to AIR later shows up as a case this test does not name rather
+/// than as another silent default.
+#[test]
+fn every_interpolation_marker_is_decoded_or_deliberately_ignored() {
+    let with = |markers: &str| {
+        let ll = FRAG_LL.replace(
+            r#"!"air.fragment_input", !"generated","#,
+            &format!(r#"!"air.fragment_input", !"generated", {markers}"#),
+        );
+        parse_air_fragment_meta(&ll)
+            .unwrap()
+            .varying_interpolation(0)
+    };
+
+    // Decoded: the perspective axis.
+    assert_eq!(
+        with(r#"!"air.center", !"air.perspective","#),
+        VaryingInterpolation::default(),
+        "AIR's defaults are Vulkan's defaults and decode to no decoration"
+    );
+    assert!(with(r#"!"air.center", !"air.no_perspective","#).no_perspective);
+    assert!(!with(r#"!"air.center", !"air.perspective","#).no_perspective);
+
+    // Decoded: the sampling axis.
+    assert_eq!(
+        with(r#"!"air.center", !"air.perspective","#).sampling,
+        VaryingSampling::Center
+    );
+    assert_eq!(
+        with(r#"!"air.centroid", !"air.perspective","#).sampling,
+        VaryingSampling::Centroid
+    );
+    assert_eq!(
+        with(r#"!"air.sample", !"air.no_perspective","#).sampling,
+        VaryingSampling::Sample
+    );
+
+    // Decoded: `air.flat`, which AIR states instead of the pair above.
+    assert!(with(r#"!"air.flat","#).flat);
+    assert!(!with(r#"!"air.center", !"air.perspective","#).flat);
+
+    // Deliberately ignored: every other marker AIR states on the same node. `FRAG_LL` already
+    // carries `air.fragment_input`, `air.arg_type_name` and `air.arg_name` on this argument, so a
+    // node with no interpolation markers at all still decoding to the default is what pins that
+    // none of them is mistaken for one.
+    assert_eq!(with(""), VaryingInterpolation::default());
+}
+
+/// `air.sample` means per-sample interpolation on a varying and sample-read access on a texture.
+/// The decode must not read one argument's markers as another's.
+#[test]
+fn the_sample_marker_is_read_per_argument_not_per_module() {
+    let ll = FRAG_LL
+        .replace(
+            r#"!"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"texture2d<float, sample>""#,
+            r#"!"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>""#,
+        )
+        .replace(
+            r#"!"air.fragment_input", !"generated","#,
+            r#"!"air.fragment_input", !"generated", !"air.center", !"air.perspective","#,
+        );
+    let m = parse_air_fragment_meta(&ll).unwrap();
+    assert_eq!(m.role_of(2), Some(&FragRole::Texture(0)));
+    assert_eq!(
+        m.varying_interpolation(0).sampling,
+        VaryingSampling::Center,
+        "the texture argument's `air.sample` access qualifier is not the varying's sampling rate"
+    );
+}
+
 #[test]
 fn fragment_flat_varying_metadata() {
     let ll = FRAG_LL.replace(

@@ -2,7 +2,7 @@
 //! each entry-function parameter to the role that the interface pass uses to synthesize Vulkan
 //! bindings, stage inputs, and stage outputs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 mod embedded;
 mod function_constants;
@@ -79,6 +79,61 @@ pub enum BufferAccess {
     ReadWrite,
 }
 
+/// Where inside a pixel AIR asked a `fragment_input` varying to be sampled.
+///
+/// Metal spells this as the first half of an interpolation attribute — `[[center_perspective]]`,
+/// `[[centroid_no_perspective]]`, `[[sample_perspective]]` — and AIR emits it as its own marker
+/// alongside the perspective marker. `air.center` is the default and needs no SPIR-V decoration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VaryingSampling {
+    /// `air.center` — sampled at the pixel center. Vulkan's default; no decoration.
+    #[default]
+    Center,
+    /// `air.centroid` — sampled inside the covered area of the primitive (`Centroid`).
+    Centroid,
+    /// `air.sample` — sampled per covered sample, which forces per-sample shading (`Sample`,
+    /// capability `SampleRateShading`).
+    Sample,
+}
+
+/// How AIR asked a `fragment_input` varying to be interpolated.
+///
+/// One record per varying rather than one set per qualifier: AIR states the whole interpolation
+/// attribute on the argument node, and reading only the part the emitter happened to support is
+/// how `air.no_perspective` and `air.centroid` were silently dropped for as long as only
+/// `air.flat` was decoded. `interpolation_markers_are_decoded_or_deliberately_ignored` in
+/// `src/meta/tests.rs` pins the full marker inventory against this record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VaryingInterpolation {
+    /// `air.flat` — not interpolated at all. AIR states this instead of, not alongside, the
+    /// perspective/sampling pair, so it takes precedence over both fields below.
+    pub flat: bool,
+    /// `air.no_perspective` — interpolated linearly in screen space rather than
+    /// perspective-correct (`NoPerspective`). Its complement `air.perspective` is Vulkan's
+    /// default and needs no decoration.
+    pub no_perspective: bool,
+    /// Where in the pixel the interpolated value is taken from.
+    pub sampling: VaryingSampling,
+}
+
+impl VaryingInterpolation {
+    /// Decode the interpolation attribute from an argument node's `air.*` marker list.
+    fn from_role_strings(strs: &[String]) -> Self {
+        let has = |marker: &str| strs.iter().any(|s| s == marker);
+        Self {
+            flat: has("flat"),
+            no_perspective: has("no_perspective"),
+            sampling: if has("centroid") {
+                VaryingSampling::Centroid
+            } else if has("sample") {
+                VaryingSampling::Sample
+            } else {
+                VaryingSampling::Center
+            },
+        }
+    }
+}
+
 /// A fragment shader's decoded parameter roles + render-target count/indices.
 #[derive(Clone, Debug, Default)]
 pub struct FragMeta {
@@ -98,8 +153,9 @@ pub struct FragMeta {
     /// `fragment_input` Location -> Metal user semantic, such as `user(texturecoord)`, when AIR
     /// metadata carries one.
     pub varying_user_semantics: HashMap<u32, String>,
-    /// `fragment_input` locations carrying AIR `air.flat` interpolation.
-    pub flat_varyings: HashSet<u32>,
+    /// `fragment_input` Location -> the interpolation attribute AIR declared for it. Absent means
+    /// AIR said nothing, which is Vulkan's default (perspective-correct, pixel center).
+    pub varying_interpolation: HashMap<u32, VaryingInterpolation>,
     /// number of `air.render_target` outputs (MRT count; 1 for the common single-output case).
     pub n_render_targets: u32,
     /// Return-struct member index -> color attachment Location for actual `air.render_target`
@@ -216,8 +272,16 @@ impl FragMeta {
     pub fn varying_user_semantic(&self, loc: u32) -> Option<&str> {
         self.varying_user_semantics.get(&loc).map(String::as_str)
     }
+    /// The interpolation attribute AIR declared for the varying at `loc`, defaulting to Vulkan's
+    /// own default when AIR declared none.
+    pub fn varying_interpolation(&self, loc: u32) -> VaryingInterpolation {
+        self.varying_interpolation
+            .get(&loc)
+            .copied()
+            .unwrap_or_default()
+    }
     pub fn varying_is_flat(&self, loc: u32) -> bool {
-        self.flat_varyings.contains(&loc)
+        self.varying_interpolation(loc).flat
     }
     pub fn render_target_location_for_member(&self, member_idx: u32) -> Option<u32> {
         self.render_target_members
@@ -1640,7 +1704,7 @@ fn parse_air_fragment_meta_with_nodes(
     let mut varying_types = HashMap::new();
     let mut varying_names = HashMap::new();
     let mut varying_user_semantics = HashMap::new();
-    let mut flat_varyings = HashSet::new();
+    let mut varying_interpolation = HashMap::new();
     let mut texture_type_names = HashMap::new();
     let mut color_input_type_names = HashMap::new();
     let mut varying_loc = 0u32;
@@ -1688,9 +1752,7 @@ fn parse_air_fragment_meta_with_nodes(
                 if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
                     varying_user_semantics.insert(l, semantic);
                 }
-                if strs.iter().any(|s| s == "flat") {
-                    flat_varyings.insert(l);
-                }
+                varying_interpolation.insert(l, VaryingInterpolation::from_role_strings(&strs));
                 FragRole::Varying(l)
             }
             "texture" if location_index_with_static(node, idx, &static_int_globals) != u32::MAX => {
@@ -1769,7 +1831,7 @@ fn parse_air_fragment_meta_with_nodes(
         varying_types,
         varying_names,
         varying_user_semantics,
-        flat_varyings,
+        varying_interpolation,
         n_render_targets,
         render_target_members,
         render_target_type_names,
