@@ -68,7 +68,10 @@ mod footprint;
 /// dispatch is now an explicit caller assertion.
 /// v30 replaces surplus-invocation culling with exact boundary-region decomposition. Exact-thread
 /// kernels expose three local-size specialization constants and a complete logical-grid payload.
-pub const REFLECTION_VERSION: u32 = 30;
+/// v31 reports implicit imageblock render-target planes at every stage whose module carries the
+/// `air.load/store.implicit_imageblock.*` intrinsics, not only in kernels. The interface pass
+/// materializes the plane from the call, which is a property of the body rather than of the stage.
+pub const REFLECTION_VERSION: u32 = 31;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -1463,6 +1466,35 @@ fn tessellation_system_attribute(
     })
 }
 
+/// Describe the implicit imageblock render-target planes the interface pass materializes for a
+/// module's `air.load/store.implicit_imageblock.*` calls.
+///
+/// Those calls are detected from the module body, not from the stage, and the interface pass
+/// materializes a descriptor wherever it lowers one. Every stage therefore reports them the same
+/// way: a stage that reported nothing here would leave a consumer building a descriptor-set layout
+/// that does not cover a binding the module it was handed declares.
+fn implicit_imageblock_planes(
+    attachments: &[crate::meta::ImplicitImageblockAttachment],
+) -> Vec<ImplicitImageblockAttachment> {
+    attachments
+        .iter()
+        .map(|attachment| ImplicitImageblockAttachment {
+            attachment: attachment.attachment,
+            data_rate: attachment.data_rate,
+            max_index: attachment.max_index,
+            binding: imageblock_resource_binding(attachment.attachment, attachment.data_rate)
+                .unwrap_or(IMAGEBLOCK_BINDING_RANGE.end),
+            format: attachment.format,
+            access: match (attachment.reads, attachment.writes) {
+                (true, true) => ResourceAccess::ReadWrite,
+                (true, false) => ResourceAccess::ReadOnly,
+                (false, true) => ResourceAccess::WriteOnly,
+                (false, false) => ResourceAccess::Unused,
+            },
+        })
+        .collect()
+}
+
 /// Consumer-shaped reflection of one translated shader.
 ///
 /// Interface declarations are built from parser-shaped AIR metadata and the translator's shared
@@ -2054,7 +2086,9 @@ impl ShaderReflection {
             vertex_builtins: None,
             tessellation: None,
             imageblock_layouts: Vec::new(),
-            implicit_imageblock_attachments: Vec::new(),
+            implicit_imageblock_attachments: implicit_imageblock_planes(
+                &meta.implicit_imageblock_attachments,
+            ),
             fragment_imageblock: meta.fragment_imageblock.as_ref().map(|imageblock| {
                 FragmentImageblock {
                     sample_size: imageblock.sample_size,
@@ -2261,7 +2295,9 @@ impl ShaderReflection {
                 }
             }),
             imageblock_layouts: Vec::new(),
-            implicit_imageblock_attachments: Vec::new(),
+            implicit_imageblock_attachments: implicit_imageblock_planes(
+                &meta.implicit_imageblock_attachments,
+            ),
             fragment_imageblock: None,
             datalayout: None,
             runtime_sampler_specializations: Vec::new(),
@@ -2436,27 +2472,9 @@ impl ShaderReflection {
                 ibs.sort_by_key(|ib| ib.param_index);
                 ibs
             },
-            implicit_imageblock_attachments: meta
-                .implicit_imageblock_attachments
-                .iter()
-                .map(|attachment| ImplicitImageblockAttachment {
-                    attachment: attachment.attachment,
-                    data_rate: attachment.data_rate,
-                    max_index: attachment.max_index,
-                    binding: imageblock_resource_binding(
-                        attachment.attachment,
-                        attachment.data_rate,
-                    )
-                    .unwrap_or(IMAGEBLOCK_BINDING_RANGE.end),
-                    format: attachment.format,
-                    access: match (attachment.reads, attachment.writes) {
-                        (true, true) => ResourceAccess::ReadWrite,
-                        (true, false) => ResourceAccess::ReadOnly,
-                        (false, true) => ResourceAccess::WriteOnly,
-                        (false, false) => ResourceAccess::Unused,
-                    },
-                })
-                .collect(),
+            implicit_imageblock_attachments: implicit_imageblock_planes(
+                &meta.implicit_imageblock_attachments,
+            ),
             fragment_imageblock: None,
             datalayout: None,
             runtime_sampler_specializations: Vec::new(),

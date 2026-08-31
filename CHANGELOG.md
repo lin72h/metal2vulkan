@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reflection schema v31: implicit imageblock render-target planes are reported at every stage whose
+  module calls the `air.load/store.implicit_imageblock.*` intrinsics, not only in compute. The
+  interface pass materializes the descriptor from the call, so a fragment entry that reads its
+  render target back through the imageblock now reflects the binding it declares.
 - Bounded translation censuses now consume exact authored visible-function-table populations inside
   the isolated worker, using hash-local case lookup and the same checked linkage mapping as Vulkan
   candidate execution; only rows with no authored population remain linkage-required.

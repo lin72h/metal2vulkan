@@ -84,6 +84,11 @@ pub enum BufferAccess {
 pub struct FragMeta {
     /// `(param_idx, role)` — one per fragment input, in declaration order.
     pub roles: Vec<(u32, FragRole)>,
+    /// Descriptor-backed render-target planes used by implicit imageblock load/store intrinsics.
+    /// Detected from the module's intrinsic calls, which is a property of the body rather than of
+    /// the stage — the interface pass materializes the plane wherever it lowers one of those calls,
+    /// so every stage that can carry them has to be able to report them.
+    pub implicit_imageblock_attachments: Vec<ImplicitImageblockAttachment>,
     /// `fragment_input` Location -> AIR type name (`float2`, `float4`, ...). Used by passthrough
     /// vertex synthesis when the pipeline binds a built-in vertex slot.
     pub varying_types: HashMap<u32, String>,
@@ -314,6 +319,11 @@ pub enum VertOutRole {
 #[derive(Clone, Debug, Default)]
 pub struct VertMeta {
     pub roles: Vec<(u32, VertRole)>,
+    /// Descriptor-backed render-target planes used by implicit imageblock load/store intrinsics.
+    /// Detected from the module's intrinsic calls, which is a property of the body rather than of
+    /// the stage — the interface pass materializes the plane wherever it lowers one of those calls,
+    /// so every stage that can carry them has to be able to report them.
+    pub implicit_imageblock_attachments: Vec<ImplicitImageblockAttachment>,
     /// Entry parameter index -> AIR type name. Tessellation system values use this to expose the
     /// exact cross-stage scalar type instead of forcing executors to infer it from a location.
     pub parameter_type_names: HashMap<u32, String>,
@@ -1755,6 +1765,7 @@ fn parse_air_fragment_meta_with_nodes(
         .collect::<Vec<_>>();
     Some(FragMeta {
         roles,
+        implicit_imageblock_attachments: detect_implicit_imageblock_attachments(ll)?,
         varying_types,
         varying_names,
         varying_user_semantics,
@@ -2016,6 +2027,7 @@ fn parse_air_vertex_meta_with_nodes(
         .collect::<Vec<_>>();
     Some(VertMeta {
         roles,
+        implicit_imageblock_attachments: detect_implicit_imageblock_attachments(ll)?,
         parameter_type_names,
         output_roles,
         output_varying_types,

@@ -170,13 +170,62 @@ fn a_sampler_less_texture_read_needs_no_sampler_descriptor() {
     assert_eq!(declared.len(), 2, "one sampled and one write texture");
 }
 
+/// A fragment shader that reads its render target back through the implicit imageblock.
+///
+/// `air.load.implicit_imageblock.*` is detected from the module body, not from the stage, and the
+/// interface pass materializes a descriptor-backed plane wherever it lowers one. Reflection has to
+/// describe that plane whichever stage declared the entry.
+const FRAGMENT_IMPLICIT_IMAGEBLOCK: &str = r#"define <2 x half> @read_back_render_target(<4 x float> %position) {
+entry:
+  %value = call <2 x half> @air.load.implicit_imageblock.v2f16(i32 0, <2 x i16> zeroinitializer, i32 0, i16 0)
+  ret <2 x half> %value
+}
+
+declare <2 x half> @air.load.implicit_imageblock.v2f16(i32, <2 x i16>, i32, i16)
+
+!air.fragment = !{!0}
+!0 = !{ptr @read_back_render_target, !1, !2}
+!1 = !{!3}
+!2 = !{!4}
+!3 = !{i32 0, !"air.render_target", !"air.location_index", i32 0, i32 0, !"air.arg_type_name", !"half2"}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
+"#;
+
+#[test]
+fn a_fragment_shader_reflects_the_imageblock_plane_it_declares() {
+    let (spirv, reflection) = translate_sanitized_native_reflected(
+        FRAGMENT_IMPLICIT_IMAGEBLOCK,
+        Stage::Fragment,
+        &scratch("fragment_implicit_imageblock"),
+        TransformOptions::default(),
+    )
+    .expect("the render-target read-back translates");
+
+    let declared = assert_reflection_covers_declarations(
+        "the render-target read-back fragment",
+        &spirv,
+        &reflection,
+    );
+    assert_eq!(
+        reflection.implicit_imageblock_attachments.len(),
+        1,
+        "the shader loads one implicit imageblock plane"
+    );
+    assert!(
+        declared.contains(&(
+            reflection.descriptor_layout.set,
+            reflection.implicit_imageblock_attachments[0].binding
+        )),
+        "the reported plane is the binding the module decorates; module declares {declared:?}"
+    );
+}
+
 /// The same contract over every committed fixture, at the stage its AIR declares.
 ///
-/// The stage is deliberately not varied here, unlike the sweeps in `deterministic_output.rs`.
-/// Reflection's stage-specific sections describe the stage the AIR declares — a kernel's tile
-/// imageblock planes are reported by `from_kernel` and by nothing else — so asking what a compute
-/// module reflects when it is translated as a vertex shader asks about a pairing Metal cannot
-/// produce. (That pairing does expose a real reporting gap; it is not this file's subject.)
+/// The stage is not varied here, unlike the sweeps in `deterministic_output.rs`. Reflection is
+/// parsed from the stage metadata the AIR carries, so asking what a module reflects at a stage it
+/// does not declare asks about a description that has no source — the parse returns nothing and the
+/// reflection is a stub, whatever the module happens to contain.
 #[test]
 fn every_public_fixture_reflects_every_descriptor_it_declares() {
     let mut declared = 0;
