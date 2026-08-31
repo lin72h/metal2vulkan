@@ -3921,6 +3921,145 @@ declare i32 @air.get_num_samples_texture_2d(ptr addrspace(1))
 }
 
 #[test]
+fn native_kernel_multisample_array_sample_count_query_uses_image_query_samples() {
+    // A multisample *array* texture is still a 2D multisampled image, so its sample count is still
+    // a property of the bound image. Covering only `texture2d_ms` would leave the array member of
+    // the same family free to regress back to a literal.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
+entry:
+  %n = tail call i32 @air.get_num_samples_texture_2d_ms_array(ptr addrspace(1) %tex)
+  store i32 %n, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.get_num_samples_texture_2d_ms_array(ptr addrspace(1))
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_ms_array<float, read>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_ms_array_sample_count_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageQuerySamples"), "{asm}");
+    assert!(asm.contains("OpCapability ImageQuery"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+/// Regression: `bugs/compute-multisample-query-reports-one`.
+///
+/// The guest-visible loss was never the query instruction on its own — it was that the sample count
+/// is what bounds the per-sample loop. Substituting the literal 1 made a four-sample kernel visit
+/// only sample zero and leave samples one through three at their sentinel values, and the module
+/// still passed `spirv-val`, because a constant loop bound is perfectly valid SPIR-V.
+///
+/// So pin the data flow, not just the opcode: the queried sample count has to be what the loop
+/// compares against. A regression that reintroduced the constant would keep `OpImageQuerySamples`
+/// live in a dead corner of the module and still collapse the loop.
+#[test]
+fn native_kernel_multisample_sample_count_query_bounds_the_per_sample_loop() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
+entry:
+  %n = tail call i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1) %tex)
+  br label %loop
+
+loop:
+  %s = phi i32 [ 0, %entry ], [ %s.next, %body ]
+  %acc = phi i32 [ 0, %entry ], [ %acc.next, %body ]
+  %more = icmp slt i32 %s, %n
+  br i1 %more, label %body, label %done
+
+body:
+  %acc.next = add i32 %acc, %s
+  %s.next = add i32 %s, 1
+  br label %loop
+
+done:
+  store i32 %acc, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1))
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_ms<float, read>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_ms_sample_loop_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageQuerySamples"), "{asm}");
+
+    // The query's result id, and every id derived from it by a pure move/convert. The bound may be
+    // bitcast or copied on its way to the comparison; what must not happen is a constant taking its
+    // place.
+    let mut derived = Vec::new();
+    for line in asm.lines() {
+        let Some((result, rhs)) = line.split_once(" = ") else {
+            continue;
+        };
+        let result = result.trim();
+        if rhs.contains("OpImageQuerySamples") {
+            derived.push(result.to_string());
+            continue;
+        }
+        let forwards = ["OpCopyObject", "OpBitcast", "OpUConvert", "OpSConvert"]
+            .iter()
+            .any(|op| rhs.starts_with(op));
+        if forwards && derived.iter().any(|id| rhs.contains(id.as_str())) {
+            derived.push(result.to_string());
+        }
+    }
+    assert!(!derived.is_empty(), "no OpImageQuerySamples result: {asm}");
+
+    let bounds_the_loop = asm.lines().any(|line| {
+        ["OpSLessThan", "OpULessThan", "OpINotEqual", "OpIEqual"]
+            .iter()
+            .any(|op| line.contains(op))
+            && derived.iter().any(|id| line.contains(id.as_str()))
+    });
+    assert!(
+        bounds_the_loop,
+        "the queried sample count must bound the per-sample loop; a constant bound here is the \
+         defect that made a four-sample kernel visit only sample zero: {asm}"
+    );
+    assert!(asm.contains("OpLoopMerge"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_kernel_helper_wrapped_texture_query_resolves_loaded_image() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

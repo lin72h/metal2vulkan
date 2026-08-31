@@ -1946,4 +1946,271 @@ mod tests {
             .expect("unowned backedge construction");
         assert_ne!(module.functions[0].blocks.len(), 4);
     }
+
+    /// Build a reducible-but-unstructured function: one loop whose body is a chain of `diamonds`
+    /// conditional diamonds, none of them carrying a declared merge. Selection picks it up through
+    /// the unowned selection headers and the unowned back-edge.
+    fn loop_of_unstructured_diamonds(diamonds: u32) -> Module {
+        let (void, uint, bool_ty, fn_ty) = (1, 2, 3, 4);
+        let (uint_0, uint_1, uint_64) = (5, 6, 7);
+        let (entry, header, latch, exit) = (100, 101, 102, 103);
+        let (i, cmp, next) = (300, 301, 302);
+        let body = |k: u32| 1000 + k * 10;
+        let then = |k: u32| 1001 + k * 10;
+        let join = |k: u32| 1002 + k * 10;
+        let cond = |k: u32| 5000 + k * 10;
+        let bumped = |k: u32| 5001 + k * 10;
+        let merged = |k: u32| 5002 + k * 10;
+
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(20000));
+        set_logical_memory_model(&mut module);
+        module.types_global_values = vec![
+            inst(Op::TypeVoid, None, Some(void), vec![]),
+            inst(
+                Op::TypeInt,
+                None,
+                Some(uint),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            inst(Op::TypeBool, None, Some(bool_ty), vec![]),
+            inst(
+                Op::TypeFunction,
+                None,
+                Some(fn_ty),
+                vec![Operand::IdRef(void)],
+            ),
+            inst(
+                Op::Constant,
+                Some(uint),
+                Some(uint_0),
+                vec![Operand::LiteralBit32(0)],
+            ),
+            inst(
+                Op::Constant,
+                Some(uint),
+                Some(uint_1),
+                vec![Operand::LiteralBit32(1)],
+            ),
+            inst(
+                Op::Constant,
+                Some(uint),
+                Some(uint_64),
+                vec![Operand::LiteralBit32(64)],
+            ),
+        ];
+
+        let mut function = Function::new();
+        function.def = Some(inst(
+            Op::Function,
+            Some(void),
+            Some(20),
+            vec![
+                Operand::FunctionControl(spirv::FunctionControl::NONE),
+                Operand::IdRef(fn_ty),
+            ],
+        ));
+        function.blocks.push(Block {
+            label: Some(inst(Op::Label, None, Some(entry), vec![])),
+            instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(header)])],
+        });
+        // The loop header carries no OpLoopMerge, so the back-edge from the latch is unowned.
+        function.blocks.push(Block {
+            label: Some(inst(Op::Label, None, Some(header), vec![])),
+            instructions: vec![
+                inst(
+                    Op::Phi,
+                    Some(uint),
+                    Some(i),
+                    vec![
+                        Operand::IdRef(uint_0),
+                        Operand::IdRef(entry),
+                        Operand::IdRef(next),
+                        Operand::IdRef(latch),
+                    ],
+                ),
+                inst(
+                    Op::ULessThan,
+                    Some(bool_ty),
+                    Some(cmp),
+                    vec![Operand::IdRef(i), Operand::IdRef(uint_64)],
+                ),
+                inst(
+                    Op::BranchConditional,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(cmp),
+                        Operand::IdRef(body(0)),
+                        Operand::IdRef(exit),
+                    ],
+                ),
+            ],
+        });
+        for k in 0..diamonds {
+            let after = if k + 1 == diamonds {
+                latch
+            } else {
+                body(k + 1)
+            };
+            // No OpSelectionMerge: this is the unowned selection header that selects construction.
+            function.blocks.push(Block {
+                label: Some(inst(Op::Label, None, Some(body(k)), vec![])),
+                instructions: vec![
+                    inst(
+                        Op::IEqual,
+                        Some(bool_ty),
+                        Some(cond(k)),
+                        vec![Operand::IdRef(i), Operand::IdRef(uint_1)],
+                    ),
+                    inst(
+                        Op::BranchConditional,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(cond(k)),
+                            Operand::IdRef(then(k)),
+                            Operand::IdRef(join(k)),
+                        ],
+                    ),
+                ],
+            });
+            function.blocks.push(Block {
+                label: Some(inst(Op::Label, None, Some(then(k)), vec![])),
+                instructions: vec![
+                    inst(
+                        Op::IAdd,
+                        Some(uint),
+                        Some(bumped(k)),
+                        vec![Operand::IdRef(i), Operand::IdRef(uint_1)],
+                    ),
+                    inst(Op::Branch, None, None, vec![Operand::IdRef(join(k))]),
+                ],
+            });
+            function.blocks.push(Block {
+                label: Some(inst(Op::Label, None, Some(join(k)), vec![])),
+                instructions: vec![
+                    inst(
+                        Op::Phi,
+                        Some(uint),
+                        Some(merged(k)),
+                        vec![
+                            Operand::IdRef(bumped(k)),
+                            Operand::IdRef(then(k)),
+                            Operand::IdRef(i),
+                            Operand::IdRef(body(k)),
+                        ],
+                    ),
+                    inst(Op::Branch, None, None, vec![Operand::IdRef(after)]),
+                ],
+            });
+        }
+        function.blocks.push(Block {
+            label: Some(inst(Op::Label, None, Some(latch), vec![])),
+            instructions: vec![
+                inst(
+                    Op::IAdd,
+                    Some(uint),
+                    Some(next),
+                    vec![Operand::IdRef(i), Operand::IdRef(uint_1)],
+                ),
+                inst(Op::Branch, None, None, vec![Operand::IdRef(header)]),
+            ],
+        });
+        function.blocks.push(Block {
+            label: Some(inst(Op::Label, None, Some(exit), vec![])),
+            instructions: vec![inst(Op::Return, None, None, vec![])],
+        });
+        module.functions.push(function);
+        module
+    }
+
+    /// The emitted control-flow shape of a function, as the driver's shader compiler sees it.
+    fn emitted_shape(function: &Function) -> (usize, usize, usize, usize) {
+        let body = || function.blocks.iter().flat_map(|block| &block.instructions);
+        let blocks = function.blocks.len();
+        let loop_merges = body()
+            .filter(|instruction| instruction.class.opcode == Op::LoopMerge)
+            .count();
+        // An OpSwitch is `selector, default, (literal, label)...`.
+        let switch_cases = body()
+            .filter(|instruction| instruction.class.opcode == Op::Switch)
+            .map(|instruction| instruction.operands.len().saturating_sub(2) / 2)
+            .sum();
+        let function_variables = body()
+            .filter(|instruction| {
+                instruction.class.opcode == Op::Variable
+                    && matches!(
+                        instruction.operands.first(),
+                        Some(Operand::StorageClass(StorageClass::Function))
+                    )
+            })
+            .count();
+        (blocks, loop_merges, switch_cases, function_variables)
+    }
+
+    /// Regression: `bugs/fragment-code-size-explosion`.
+    ///
+    /// A fragment module reached a host GPU driver as one `OpFunction` in state-machine form —
+    /// 2296 blocks, 2286 of them sibling `OpSwitch` cases inside a single loop, zero `OpPhi`, and
+    /// 3516 function-scope variables because sibling cases cannot dominate each other. The driver's
+    /// shader compiler promotes each of those back to SSA inside one loop spanning the whole
+    /// program, the interference graph goes near-complete, and `vkCreateGraphicsPipelines` never
+    /// returns — taking the VM process with it.
+    ///
+    /// The module was valid SPIR-V and translated in about two seconds, so neither `spirv-val` nor
+    /// a time budget catches this. The only thing that does is the emitted shape, which is what
+    /// this pins: reducible control flow must arrive nested, with real loop constructs, dispatch
+    /// over a small minority of blocks, and no variable-per-crossing-value demotion.
+    #[test]
+    fn reducible_control_flow_is_not_constructed_as_a_whole_function_dispatch() {
+        const DIAMONDS: u32 = 16;
+        let mut module = loop_of_unstructured_diamonds(DIAMONDS);
+        let before = module.functions[0].blocks.len();
+        construct_cfg_functions_module(&mut module, &HashSet::new()).expect("construction");
+
+        let (blocks, loop_merges, switch_cases, function_variables) =
+            emitted_shape(&module.functions[0]);
+        assert!(
+            loop_merges >= 1,
+            "the loop must survive as a real loop construct, not as a dispatch over its body; \
+             got {loop_merges} OpLoopMerge across {blocks} blocks"
+        );
+        assert!(
+            switch_cases * 2 < blocks,
+            "dispatch must cover a minority of blocks; {switch_cases} switch cases over {blocks} \
+             blocks is the whole-function state machine that hangs the driver"
+        );
+        // Flattening demotes every value that crosses a block boundary. This function has one
+        // crossing value per diamond plus the loop's own induction values, and nesting keeps them
+        // in registers.
+        assert!(
+            function_variables < DIAMONDS as usize,
+            "nesting must keep crossing values in registers; {function_variables} function-scope \
+             variables for {DIAMONDS} diamonds is the register-demotion the driver chokes on"
+        );
+        assert!(
+            before > 0 && blocks > 0,
+            "the function must still have a body"
+        );
+    }
+
+    /// The same shape contract, held as the function grows. Flattening is what makes the driver's
+    /// cost superlinear, so the guard has to hold at a size where that would actually bite.
+    #[test]
+    fn a_larger_reducible_function_still_nests_instead_of_flattening() {
+        let mut module = loop_of_unstructured_diamonds(64);
+        construct_cfg_functions_module(&mut module, &HashSet::new()).expect("construction");
+        let (blocks, loop_merges, switch_cases, function_variables) =
+            emitted_shape(&module.functions[0]);
+        assert!(loop_merges >= 1, "{blocks} blocks, no loop construct");
+        assert!(
+            switch_cases * 2 < blocks,
+            "{switch_cases} switch cases over {blocks} blocks is a dispatch state machine"
+        );
+        assert!(
+            function_variables < 64,
+            "{function_variables} function-scope variables is register demotion at scale"
+        );
+    }
 }
