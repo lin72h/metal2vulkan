@@ -101,6 +101,9 @@ pub(crate) fn structure_selected_functions(
                         eprintln!("NEST-DECLINE blocks={before} {reason}");
                     }
                 } else {
+                    if crate::env_vars::reloop_why() {
+                        eprintln!("NEST-ADOPT blocks={before} after={}", function.blocks.len());
+                    }
                     structured.insert(id);
                 }
             }
