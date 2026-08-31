@@ -5159,8 +5159,17 @@ pub(crate) fn owned_module_failure(
         }
     }
     for instruction in module.all_inst_iter() {
-        if referenced_ids(instruction).any(|id| id == 0 || !definitions.contains_key(&id)) {
-            return invalid("native emitter: owned module references an undefined id".to_string());
+        if let Some(id) =
+            referenced_ids(instruction).find(|id| *id == 0 || !definitions.contains_key(id))
+        {
+            return invalid(format!(
+                "native emitter: owned {:?}{} references undefined id %{id}",
+                instruction.class.opcode,
+                instruction
+                    .result_id
+                    .map(|result| format!(" %{result}"))
+                    .unwrap_or_default()
+            ));
         }
         if instruction.result_type.is_some_and(|result_type| {
             !definitions
@@ -10202,7 +10211,7 @@ mod tests {
         duplicate.functions[0].blocks[0].instructions[0] = copy(22, 99);
         assert_eq!(
             owned_module_cfg_error(&duplicate).as_deref(),
-            Some("native emitter: owned module references an undefined id")
+            Some("native emitter: owned CopyObject %22 references undefined id %99")
         );
     }
 

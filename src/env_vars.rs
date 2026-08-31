@@ -63,6 +63,12 @@ pub const REGISTRY: &[EnvVar] = &[
         effect: "trace raw-byte GEP indexing",
     },
     EnvVar {
+        name: "METAL2VULKAN_PASS_CONTRACT",
+        default: "off",
+        effect: "after every lowering phase, report whether the module satisfies the owned \
+                 construction contract, so the phase that first breaks it names itself",
+    },
+    EnvVar {
         name: "METAL2VULKAN_RETRY_DEBUG",
         default: "off",
         effect: "trace each retry tier's emit/validate to stderr",
@@ -235,6 +241,15 @@ pub fn tool_path_override(cmd: &str) -> Option<OsString> {
 
 pub fn dbg_rawbyte() -> bool {
     present("METAL2VULKAN_DBG_RAWBYTE")
+}
+/// Whether to check the owned construction contract after every lowering phase.
+///
+/// A contract violation is reported by the emitter as a property of the FINISHED module, which says
+/// nothing about which of the ~40 phases introduced it. Bisecting that by hand costs an afternoon
+/// per bug. With this on, each phase prints its own verdict, and the phase whose verdict first turns
+/// bad -- and stays bad -- is the one to read.
+pub fn pass_contract() -> bool {
+    present("METAL2VULKAN_PASS_CONTRACT")
 }
 pub fn retry_debug() -> bool {
     present("METAL2VULKAN_RETRY_DEBUG")

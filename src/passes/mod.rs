@@ -2163,6 +2163,132 @@ pub(crate) fn validate_descriptor_bindings(
     resources::validate_descriptor_binding_classes(module, layout)
 }
 
+#[cfg(test)]
+mod phase_contract_tests {
+    use super::*;
+    use crate::spirv_module::ModuleHeader;
+
+    /// A module whose only pointer type is still staged in `new_globals`.
+    ///
+    /// Every phase between the interface pass and the splice looks like this, so if the verdict were
+    /// taken from `ctx.module` alone it would read "references undefined id" for all of them and the
+    /// trace would say nothing about where a real violation started.
+    fn ctx_with_staged_pointer_type() -> Ctx {
+        let mut module = Module::new();
+        // `ModuleHeader::new` defaults to the grammar's 1.6; the owned contract is written against
+        // the Vulkan 1.2 target environment, which caps SPIR-V at 1.5.
+        let mut header = ModuleHeader::new(10);
+        header.set_version(1, 5);
+        module.header = Some(header);
+        // `Linkage` rather than an entry point: the owned contract accepts either, and this fixture
+        // exists to exercise the staged-globals merge, not to be a runnable shader.
+        module.capabilities = [spirv::Capability::Shader, spirv::Capability::Linkage]
+            .map(|capability| {
+                Instruction::new(
+                    Op::Capability,
+                    None,
+                    None,
+                    vec![Operand::Capability(capability)],
+                )
+            })
+            .to_vec();
+        module.memory_model = Some(Instruction::new(
+            Op::MemoryModel,
+            None,
+            None,
+            vec![
+                Operand::AddressingModel(spirv::AddressingModel::Logical),
+                Operand::MemoryModel(spirv::MemoryModel::GLSL450),
+            ],
+        ));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeInt,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
+            ),
+            // Uses %2, which only exists in `new_globals` below.
+            Instruction::new(
+                Op::Variable,
+                Some(2),
+                Some(3),
+                vec![Operand::StorageClass(StorageClass::Private)],
+            ),
+        ];
+        let mut ctx = Ctx::new(module);
+        ctx.new_globals.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(2),
+            vec![
+                Operand::StorageClass(StorageClass::Private),
+                Operand::IdRef(1),
+            ],
+        ));
+        ctx
+    }
+
+    #[test]
+    fn a_staged_global_counts_as_declared() {
+        assert_eq!(
+            phase_contract_verdict(&ctx_with_staged_pointer_type()),
+            None
+        );
+    }
+
+    /// The same context with the staging buffer emptied: now %2 really is undefined, and the verdict
+    /// must both fire and name the id, which is the whole reason the trace is worth reading.
+    #[test]
+    fn a_genuinely_missing_global_is_reported_by_id() {
+        let mut ctx = ctx_with_staged_pointer_type();
+        ctx.new_globals.clear();
+        let verdict = phase_contract_verdict(&ctx).expect("the module references an undefined id");
+        assert!(
+            verdict.contains("references undefined id %2"),
+            "verdict must name the missing id, got: {verdict}"
+        );
+    }
+}
+
+/// The owned-construction verdict for the module a phase just produced, or `None` when it holds.
+///
+/// Phases stage new type/constant declarations in `new_globals` and only splice them into the module
+/// at the end. Checking the module alone would therefore report an undefined id for every phase in
+/// between, which drowns out the verdict this exists to show. Merging the staged globals in
+/// reproduces the module the pipeline is actually building.
+fn phase_contract_verdict(ctx: &Ctx) -> Option<String> {
+    let mut module = ctx.module.clone();
+    module
+        .types_global_values
+        .extend(ctx.new_globals.iter().cloned());
+    let (kind, error) = match crate::native::owned_module_failure(&module)? {
+        crate::native::OwnedModuleFailure::Invalid(error) => ("invalid", error),
+        crate::native::OwnedModuleFailure::TypeConstruction(error) => ("type-construction", error),
+        crate::native::OwnedModuleFailure::CfgConstruction(error) => ("cfg-construction", error),
+        crate::native::OwnedModuleFailure::RawBufferConstruction(error) => {
+            ("raw-buffer-construction", error)
+        }
+    };
+    Some(format!("{kind}: {error}"))
+}
+
+/// Print whether the in-flight module satisfies the owned construction contract, tagged with the
+/// phase that just finished.
+///
+/// This is a debugging aid, not a gate. A module part-way through lowering is *allowed* to violate
+/// the contract -- several phases exist precisely to repair what an earlier one left behind -- so a
+/// single bad verdict means nothing on its own. What the trace gives you is the shape of the run:
+/// the phase where a violation first appears and is never repaired is the one that introduced it,
+/// and the message is the one the finished module would have failed with. Without it, a contract
+/// failure reported at the end says nothing about which phase produced it.
+fn report_phase_contract(ctx: &Ctx, phase: &str) {
+    match phase_contract_verdict(ctx) {
+        None => eprintln!("[pass-contract] {phase}: ok"),
+        Some(verdict) => eprintln!("[pass-contract] {phase}: {verdict}"),
+    }
+}
+
 pub(crate) fn transform_with_options_and_sidecar(
     module: Module,
     emit_sidecar: crate::emit_sidecar::EmitSidecar,
@@ -2184,14 +2310,23 @@ pub(crate) fn transform_with_options_and_sidecar(
     }
     let mut ctx = Ctx::with_options_and_sidecar(module, emit_sidecar, stage, options);
     let retry_debug = crate::env_vars::retry_debug();
-    let debug_phase = |phase: &str| {
-        if retry_debug {
-            eprintln!("[retry-debug] passes: {phase}");
-        }
-    };
+    let pass_contract = crate::env_vars::pass_contract();
+    // A macro rather than a closure so it can read `ctx.module` at the point it is written: a closure
+    // capturing `&ctx` would hold a borrow across the whole pipeline, which is exactly where the
+    // phases need `&mut ctx`.
+    macro_rules! debug_phase {
+        ($phase:expr) => {
+            if retry_debug {
+                eprintln!("[retry-debug] passes: {}", $phase);
+            }
+            if pass_contract {
+                report_phase_contract(&ctx, $phase);
+            }
+        };
+    }
     let mut entry_idx = find_entry_index(&ctx.module, entry_name)
         .ok_or_else(|| "no entry function with a body found".to_string())?;
-    debug_phase("cleanup start");
+    debug_phase!("cleanup start");
     // Producer-side closure already made the entry self-contained. Preserve the former residual
     // inliner's two post-splice cleanup operations at this phase.
     compose_chained_access_chains(&mut ctx, entry_idx);
@@ -2203,7 +2338,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     agx_cluster::lower_agx2_cluster_numbers(&mut ctx, entry_idx, &stage)?;
     neutralize_null_access_chains(&mut ctx, entry_idx);
 
-    debug_phase("interface start");
+    debug_phase!("interface start");
     // 1a) decoded params -> stage-input/resource vars and entry-body replacements. Preserve the
     //     original type snapshot for the immediately-following return rewrite.
     let input_defs = build_stage_input(&mut ctx, entry_idx, &stage, frag, vert, kern)?;
@@ -2231,7 +2366,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     neutralize_private_placeholder_access_chains(&mut ctx, entry_idx)?;
     propagate_sampler_state_aliases(&mut ctx, entry_idx);
 
-    debug_phase("air lowering start");
+    debug_phase!("air lowering start");
     // 2) lower residual air.* calls inside the entry function.
     ctx.phase_value_types = Some(function_value_types(&ctx, entry_idx));
     let air_lowering = lower_air_calls(&mut ctx, entry_idx);
@@ -2249,7 +2384,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     //     divergent values from guarded select expressions.
     guard_integer_division_by_zero(&mut ctx, entry_idx);
 
-    debug_phase("memory lowering start");
+    debug_phase!("memory lowering start");
     ctx.phase_type_positions = Some(
         ctx.new_globals
             .iter()
@@ -2414,13 +2549,13 @@ pub(crate) fn transform_with_options_and_sidecar(
     // invariant to the newly constructed address-domain graph before finalization.
     decorate_ptr_access_chain_base_strides(&mut ctx);
 
-    debug_phase("integer lowering start");
+    debug_phase!("integer lowering start");
     // 2i) Some conformant Vulkan devices expose `shaderInt64` but execute scalar 64-bit arithmetic
     //     via a fragile native path. Rebuild add/sub/mul from 32-bit/16-bit pieces; this is the same
     //     modular result as the original `ulong` arithmetic and is structural over integer width.
     lower_scalar_i64_arithmetic_to_u32_halves(&mut ctx);
 
-    debug_phase("workgroup/finalize start");
+    debug_phase!("workgroup/finalize start");
     // 2g) deterministic threadgroup memory: zero-fill every Workgroup variable at kernel entry
     //     (stores of OpConstantNull + one control barrier), the candidate half of the harness's
     //     defined refinement of Metal's undefined threadgroup contents. Kernel-only: Workgroup
@@ -2467,7 +2602,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
     module_cleanup::gc_dead_globals(&mut ctx);
-    debug_phase("complete");
+    debug_phase!("complete");
 
     Ok((ctx.module, ctx.emit_sidecar))
 }
