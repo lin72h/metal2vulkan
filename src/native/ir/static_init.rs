@@ -176,9 +176,7 @@ impl LlModule {
         let mut reachable = self
             .functions
             .iter()
-            .filter(|function| {
-                function.name == entry || function.name.starts_with("_GLOBAL__sub_I")
-            })
+            .filter(|function| function.name == entry || function.is_static_initializer)
             .map(|function| function.name.clone())
             .collect::<HashSet<_>>();
         let mut pending = reachable.iter().cloned().collect::<Vec<_>>();
@@ -368,9 +366,7 @@ impl LlModule {
             .functions
             .iter()
             .enumerate()
-            .filter(|(_, function)| {
-                function.name != entry_name && function.name.starts_with("_GLOBAL__sub_I")
-            })
+            .filter(|(_, function)| function.name != entry_name && function.is_static_initializer)
             .map(|(ordinal, function)| {
                 (
                     ordinal,
@@ -483,7 +479,7 @@ mod tests {
 @has_buffer = internal addrspace(2) global i8 undef
 @fallback = internal addrspace(2) constant [1 x float] zeroinitializer
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
   %value = load i8, ptr addrspace(2) @fc.MTL_FC_INIT_23_b
   store i8 %value, ptr addrspace(2) @has_buffer
   ret void
@@ -530,7 +526,7 @@ define void @main(ptr addrspace(1) %buffer) {
 @fc.MTL_FC_INIT_7_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
 @enabled = internal addrspace(2) global i8 undef
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
   %value = load i8, ptr addrspace(2) @fc.MTL_FC_INIT_7_b
   %defined = call i1 @air.is_function_constant_defined(ptr addrspace(2) @fc.MTL_FC_INIT_7_b)
   %selected = select i1 %defined, i8 %value, i8 0
@@ -589,7 +585,7 @@ declare i1 @air.is_function_constant_defined(ptr addrspace(2))
 @fc.MTL_FC_INIT_1_Dv2_t = internal addrspace(2) externally_initialized constant <2 x i16> undef, section "air.fc_initializer", align 4
 @shape = internal addrspace(2) global <2 x i16> undef, align 4
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
   %value = load <2 x i16>, ptr addrspace(2) @fc.MTL_FC_INIT_1_Dv2_t
   store <2 x i16> %value, ptr addrspace(2) @shape
   ret void
@@ -637,7 +633,7 @@ exit:
 @fc.MTL_FC_INIT_2_t = internal addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
 @rounded = internal addrspace(2) global i16 undef, align 2
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
   %value = load i16, ptr addrspace(2) @fc.MTL_FC_INIT_2_t
   %biased = add i16 %value, 15
   %masked = and i16 %biased, -16
@@ -691,12 +687,12 @@ exit:
         let ll = r#"
 @a = internal addrspace(2) global i8 0
 
-define internal void @_GLOBAL__sub_I_leaf() {
+define internal void @_GLOBAL__sub_I_leaf() section "air.static_init" {
   store i8 1, ptr addrspace(2) @a
   ret void
 }
 
-define internal void @_GLOBAL__sub_I_callful() {
+define internal void @_GLOBAL__sub_I_callful() section "air.static_init" {
   call void @air.test()
   ret void
 }
@@ -732,12 +728,12 @@ declare void @air.test()
         let ll = r#"
 @a = internal addrspace(2) global i8 0
 
-define internal void @_GLOBAL__sub_I_before() {
+define internal void @_GLOBAL__sub_I_before() section "air.static_init" {
   store i8 1, ptr addrspace(2) @a
   ret void
 }
 
-define internal void @_GLOBAL__sub_I_cfg() {
+define internal void @_GLOBAL__sub_I_cfg() section "air.static_init" {
 entry:
   %c = icmp eq i8 0, 0
   br i1 %c, label %then, label %merge
@@ -750,7 +746,7 @@ merge:
   ret void
 }
 
-define internal void @_GLOBAL__sub_I_after() {
+define internal void @_GLOBAL__sub_I_after() section "air.static_init" {
   store i8 5, ptr addrspace(2) @a
   ret void
 }
@@ -788,7 +784,7 @@ define void @main() {
         let ll = r#"
 @a = internal addrspace(2) global i8 0
 
-define internal void @_GLOBAL__sub_I_cfg() {
+define internal void @_GLOBAL__sub_I_cfg() section "air.static_init" {
 entry:
   br label %exit
 exit:
@@ -816,7 +812,7 @@ define void @main() {
     #[test]
     fn static_initializer_chained_cfgs_remain_independent_until_emitted_closure() {
         let ll = r#"
-define internal void @_GLOBAL__sub_I_first() {
+define internal void @_GLOBAL__sub_I_first() section "air.static_init" {
 entry:
   %c = icmp eq i8 0, 0
   br i1 %c, label %then, label %merge
@@ -826,7 +822,7 @@ merge:
   ret void
 }
 
-define internal void @_GLOBAL__sub_I_second() {
+define internal void @_GLOBAL__sub_I_second() section "air.static_init" {
 entry:
   %c = icmp eq i8 0, 0
   br i1 %c, label %then, label %merge
@@ -860,7 +856,7 @@ define void @main() {
         let ll = r#"
 @a = internal addrspace(2) global i8 0
 
-define internal void @_GLOBAL__sub_I_indirect() {
+define internal void @_GLOBAL__sub_I_indirect() section "air.static_init" {
   %fn = inttoptr i64 0 to ptr
   call void %fn()
   ret void

@@ -71,7 +71,7 @@ fn static_init_global_values(ll: &str) -> HashMap<String, StaticValue> {
     for raw in ll.lines() {
         let line = raw.split(';').next().unwrap_or(raw).trim();
         if line.starts_with("define ") {
-            in_static_init = line.contains("@_GLOBAL__sub_I");
+            in_static_init = crate::air_static_init::define_line_declares_static_initializer(line);
             env.clear();
             continue;
         }
@@ -145,7 +145,7 @@ pub(crate) fn static_init_foldable_global_values(ll: &str) -> HashMap<String, St
     for raw in ll.lines() {
         let line = raw.split(';').next().unwrap_or(raw).trim();
         if line.starts_with("define ") {
-            in_constructor = line.contains("@_GLOBAL__sub_I");
+            in_constructor = crate::air_static_init::define_line_declares_static_initializer(line);
             derived_locals.clear();
             continue;
         }
@@ -189,7 +189,7 @@ pub(crate) fn static_init_foldable_global_values(ll: &str) -> HashMap<String, St
         let line = raw.split(';').next().unwrap_or(raw).trim();
         if line.starts_with("define ") {
             in_function = true;
-            in_static_init = line.contains("@_GLOBAL__sub_I");
+            in_static_init = crate::air_static_init::define_line_declares_static_initializer(line);
             continue;
         }
         if line == "}" {
@@ -504,7 +504,7 @@ mod tests {
 @fc.MTL_FC_INIT_3_Dv4_j = internal addrspace(2) externally_initialized constant <4 x i32> <i32 1, i32 2, i32 3, i32 4>, section "air.fc_initializer", align 16
 @mirror = internal addrspace(2) global i32 undef, align 4
 
-define internal void @_GLOBAL__sub_I_vector_fc() {
+define internal void @_GLOBAL__sub_I_vector_fc() section "air.static_init" {
 entry:
   %value = load <4 x i32>, ptr addrspace(2) @fc.MTL_FC_INIT_3_Dv4_j
   %lane = extractelement <4 x i32> %value, i64 2
@@ -537,7 +537,7 @@ entry:
 @rounded = internal addrspace(2) global i16 undef, align 2
 @negative = internal addrspace(2) global i16 -1, align 2
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
 entry:
   %value = load i16, ptr addrspace(2) @fc.MTL_FC_INIT_2_t
   %biased = add i16 %value, 15
@@ -570,7 +570,7 @@ entry:
 @fc.MTL_FC_INIT_2_t = internal addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
 @shifted = internal addrspace(2) global i16 undef, align 2
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
 entry:
   %value = load i16, ptr addrspace(2) @fc.MTL_FC_INIT_2_t
   %value.shifted = shl i16 %value, 16
@@ -594,7 +594,7 @@ entry:
 @fc.MTL_FC_INIT_1_b = internal addrspace(2) externally_initialized constant i8 1, section "air.fc_initializer", align 1
 @predicate = internal addrspace(2) global i8 0, align 1
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
 entry:
   %value = load i8, ptr addrspace(2) @fc.MTL_FC_INIT_1_b
   %normalized = tail call i8 @air.normalize_function_constant_predicate.i8(i8 %value)

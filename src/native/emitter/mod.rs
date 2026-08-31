@@ -2722,7 +2722,7 @@ impl Emitter {
             .iter()
             .filter(|function| {
                 Some(function.name.as_str()) != entry_name.as_deref()
-                    && function.name.starts_with("_GLOBAL__sub_I")
+                    && function.is_static_initializer
                     && !self
                         .ir
                         .preinlined_static_initializers

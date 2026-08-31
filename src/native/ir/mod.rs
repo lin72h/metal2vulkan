@@ -119,6 +119,11 @@ pub(super) struct LlFunction {
     /// pointer syntax otherwise erases `T`, and a parameter used only as a memcpy source has no
     /// dereference from which the ordinary body-use inference could recover it.
     pub(super) byval_param_pointees: Vec<Option<LlType>>,
+    /// Whether the `define` carried `section "air.static_init"` — the AIR ABI's marker for the
+    /// function that runs a translation unit's namespace-scope initialization, most importantly the
+    /// `[[function_constant]]` default-state stores. See `crate::air_static_init` for why this is
+    /// read from the section and not from the function's Itanium `_GLOBAL__sub_I` name.
+    pub(super) is_static_initializer: bool,
     /// The function's basic blocks lowered to typed carriers — the parse-once typed IR and the SOLE
     /// body substrate. `parse_function` lexes the body lines transiently and hands them to
     /// `parse_inner`, which lowers them once (via `split_body_blocks`, where the module type table is

@@ -604,7 +604,7 @@ target triple = "spirv-unknown-vulkan1.2"
 @enabled.MTL_FC_INIT_0_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
 @enabled_copy = internal addrspace(2) global i8 undef, align 1
 
-define internal void @_GLOBAL__sub_I_fc() {
+define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
 entry:
   %value = load i8, ptr addrspace(2) @enabled.MTL_FC_INIT_0_b
   %defined = call i1 @air.is_function_constant_defined(ptr addrspace(2) @enabled.MTL_FC_INIT_0_b)

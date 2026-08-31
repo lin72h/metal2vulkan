@@ -476,7 +476,7 @@ define internal void @leaf(ptr %pointer) {
   ret void
 }
 
-define internal void @_GLOBAL__sub_I_residual() {
+define internal void @_GLOBAL__sub_I_residual() section "air.static_init" {
   %slot = alloca i32
   call void @leaf(ptr %slot)
   ret void

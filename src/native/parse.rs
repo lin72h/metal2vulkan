@@ -60,11 +60,14 @@ pub(super) fn parse_function_header(head: &str) -> Result<LlFunction, String> {
         .ok_or_else(|| format!("native emitter: unmatched params in define: {head}"))?;
     let ret = parse_return_type(&head["define".len()..at])?;
     let (params, byval_param_pointees) = parse_params(&head[open + 1..close])?;
+    let is_static_initializer =
+        crate::air_static_init::tail_declares_static_init_section(&head[close + 1..]);
     Ok(LlFunction {
         name,
         ret,
         params,
         byval_param_pointees,
+        is_static_initializer,
         blocks: Vec::new(),
     })
 }

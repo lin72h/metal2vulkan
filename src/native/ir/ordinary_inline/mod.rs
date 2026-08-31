@@ -116,7 +116,7 @@ fn reachable_functions(
     let mut pending = vec![entry_name.to_string()];
     for function in &module.functions {
         if function.name != entry_name
-            && function.name.starts_with("_GLOBAL__sub_I")
+            && function.is_static_initializer
             && !module
                 .preinlined_static_initializers
                 .contains(&function.name)
@@ -374,7 +374,7 @@ impl LlModule {
                 reachable.contains(&function.name)
                     && function.blocks.len() == 1
                     && function.name != entry_name
-                    && !function.name.starts_with("_GLOBAL__sub_I")
+                    && !function.is_static_initializer
                     && !is_residual_intrinsic(&function.name)
             })
             .filter_map(|(ordinal, function)| {

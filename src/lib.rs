@@ -17,6 +17,7 @@
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub mod air_intrinsics;
+pub(crate) mod air_static_init;
 pub mod as_shadow;
 mod construction;
 mod emission_order;

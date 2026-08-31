@@ -191,12 +191,14 @@ enum Item {
 }
 
 /// A parsed `define` header: the callee name (`@foo`), whether it is `internal`, its return type,
-/// and its parameter value tokens (the `%name`s in the signature, in order).
+/// its parameter value tokens (the `%name`s in the signature, in order), and whether AIR marked it
+/// as this translation unit's static initializer.
 struct DefSig {
     name: String,
     internal: bool,
     ret_ty: String,
     params: Vec<String>,
+    static_initializer: bool,
 }
 
 /// Split the module into ordered items. Fails (returns None) only if a `define` opens without a
@@ -271,11 +273,14 @@ fn parse_def_header(header: &str) -> Option<DefSig> {
     let close = matching_paren(rest, paren)?;
     let params_str = &rest[paren + 1..close];
     let params = parse_param_names(params_str);
+    let static_initializer =
+        crate::air_static_init::tail_declares_static_init_section(&rest[close + 1..]);
     Some(DefSig {
         name,
         internal,
         ret_ty,
         params,
+        static_initializer,
     })
 }
 
@@ -917,7 +922,7 @@ fn drop_dead_internal_functions(items: Vec<Item>) -> Vec<Item> {
                     // after function emission and therefore do not appear in the textual IR. Keep
                     // them live during this source-level helper sweep so targeted inlining cannot
                     // silently discard function-constant/default-state initialization.
-                    let implicit_constructor_root = sig.name.starts_with("@_GLOBAL__sub_I");
+                    let implicit_constructor_root = sig.static_initializer;
                     if sig.internal && !implicit_constructor_root && !live.contains(&sig.name) {
                         continue; // a not-yet-live internal fn does not propagate references
                     }
@@ -942,9 +947,7 @@ fn drop_dead_internal_functions(items: Vec<Item>) -> Vec<Item> {
         .into_iter()
         .filter(|it| match it {
             Item::Func(f) => match parse_def_header(&f.header) {
-                Some(sig) if sig.internal => {
-                    sig.name.starts_with("@_GLOBAL__sub_I") || live.contains(&sig.name)
-                }
+                Some(sig) if sig.internal => sig.static_initializer || live.contains(&sig.name),
                 _ => true,
             },
             _ => true,

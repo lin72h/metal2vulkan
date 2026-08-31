@@ -233,6 +233,34 @@ fn function_constant_gated_visible_function_table_call_is_folded_away() {
     );
 }
 
+/// The initializer is recognised by its `air.static_init` section, not by its Itanium name.
+///
+/// `_GLOBAL__sub_I…` is how clang mangles a translation-unit initializer; `section
+/// "air.static_init"` is how AIR declares what the function *is*. Over the corpus the two always
+/// travel together, so only an authored pair can tell which one the readers act on — and the answer
+/// decides real translations, since the fold above is what makes the gated call disappear. Renaming
+/// the function must change nothing; removing the section must stop the fold, leaving the same
+/// module with the same dead-side branch to reject on the call it can no longer prune.
+#[test]
+fn a_static_initializer_is_recognised_by_its_air_section_not_its_name() {
+    let dead_side = fc_gated_vft("label %done, label %use");
+
+    let renamed = dead_side.replace("_GLOBAL__sub_I_fc", "air_static_ctor");
+    assert_ne!(
+        renamed, dead_side,
+        "the initializer name must be substituted"
+    );
+    translate_sanitized_native(&renamed, Stage::Kernel, &tmp())
+        .expect("an initializer keeps its meaning when only its name changes");
+
+    let unsectioned = dead_side.replace(" section \"air.static_init\"", "");
+    assert_ne!(unsectioned, dead_side, "the section must be removed");
+    assert_fallback(
+        &unsectioned,
+        "unsupported indirect call through function pointer %fp",
+    );
+}
+
 #[test]
 fn live_visible_function_table_call_still_fallbacks_under_a_function_constant() {
     let ll = fc_gated_vft("label %use, label %done");

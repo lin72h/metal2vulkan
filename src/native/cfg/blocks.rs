@@ -2339,6 +2339,7 @@ mod tests {
                 ("%6".to_string(), LlType::Int(32)),
             ],
             byval_param_pointees: vec![None; 3],
+            is_static_initializer: false,
             blocks: Vec::new(),
         };
 
@@ -2349,6 +2350,7 @@ mod tests {
             ret: LlType::Void,
             params: vec![("%named".to_string(), LlType::Int(32))],
             byval_param_pointees: vec![None],
+            is_static_initializer: false,
             blocks: Vec::new(),
         };
 
