@@ -371,6 +371,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A buffer parameter whose body reads several distinct types through a one-index access chain is no
+  longer wrapped as a flat `{ RuntimeArray<T> }` of whichever type happened to be seen first. A
+  genuine `device T*` array has exactly one element view; several views mean the index selects
+  members of a record, so the buffer's AIR struct layout is reconstructed instead. Wrapping such a
+  buffer flatly kept the first view's stride and left every other access loading the wrong type.
 - `air.get_num_samples_texture*` now lowers from the image type instead of an unconditional literal
   `1`: a multisampled 2D image queries `OpImageQuerySamples`, a single-sample image keeps the exact
   constant, and a multisampled non-2D dimensionality is refused. `ImageQuery` capability inference

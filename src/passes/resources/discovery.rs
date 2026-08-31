@@ -426,8 +426,14 @@ pub(in crate::passes) fn body_buf_elem_types(ctx: &Ctx, func: &Function, pid: Wo
     elements
 }
 
+/// The body's one unambiguous flat element view of a buffer param, or `None` when it has more than
+/// one. A genuine `device T*` array has exactly one element type. Several distinct views through
+/// the same pointer mean the single index navigates an aggregate instead — reading them as array
+/// elements would keep the first view's stride and mistype every access that used another one.
 pub(in crate::passes) fn body_buf_elem_type(ctx: &Ctx, func: &Function, pid: Word) -> Option<Word> {
-    body_buf_elem_types(ctx, func, pid).into_iter().next()
+    let mut elements = body_buf_elem_types(ctx, func, pid).into_iter();
+    let element = elements.next()?;
+    elements.next().is_none().then_some(element)
 }
 
 /// Detect the canonical flat-word view emitted for a homogeneous aggregate buffer. Every rooted
@@ -985,6 +991,90 @@ mod tests {
         assert_eq!(
             body_buf_elem_types(&ctx, &ctx.module.functions[0], 10),
             vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn buffer_flat_element_view_is_none_when_the_body_reads_several_types() {
+        let mut module = Module::new();
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(1),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(2),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(4)],
+            ),
+            Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(3),
+                vec![Operand::IdRef(1), Operand::LiteralBit32(2)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(4),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(2),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(5),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(3),
+                ],
+            ),
+        ];
+        // `buf %uint_0` reads a float4 and `buf %uint_1` reads a float2: the index selects members
+        // of a `{ float4, float2 }` record, so there is no single flat element type to wrap.
+        let member_chains = vec![
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(4),
+                Some(11),
+                vec![Operand::IdRef(10), Operand::IdRef(30)],
+            ),
+            Instruction::new(
+                Op::InBoundsAccessChain,
+                Some(5),
+                Some(12),
+                vec![Operand::IdRef(10), Operand::IdRef(31)],
+            ),
+        ];
+        module.functions.push(Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(20), vec![])),
+                instructions: member_chains.clone(),
+            }],
+        });
+        module.functions.push(Function {
+            def: None,
+            end: None,
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(21), vec![])),
+                instructions: member_chains[..1].to_vec(),
+            }],
+        });
+        let ctx = Ctx::new(module);
+
+        assert_eq!(body_buf_elem_type(&ctx, &ctx.module.functions[0], 10), None);
+        assert_eq!(
+            body_buf_elem_type(&ctx, &ctx.module.functions[1], 10),
+            Some(2)
         );
     }
 
