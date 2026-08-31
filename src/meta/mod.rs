@@ -139,6 +139,15 @@ impl VaryingInterpolation {
 pub struct FragMeta {
     /// `(param_idx, role)` — one per fragment input, in declaration order.
     pub roles: Vec<(u32, FragRole)>,
+    /// `(parameter index, AIR role)` for every enabled entry parameter whose role has no
+    /// lowering.
+    ///
+    /// An unrecognised parameter is bound to a zero value so the body stays well formed. That is
+    /// right for a function-constant-disabled resource, which Metal itself defines as absent, and
+    /// wrong for anything else: a `[[barycentric_coord]]` the emitter does not model becomes a
+    /// silent zero, and everything computed from it is wrong in a module that validates. Emission
+    /// rejects on a non-empty list instead.
+    pub unmodelled_input_params: Vec<(u32, String)>,
     /// Descriptor-backed render-target planes used by implicit imageblock load/store intrinsics.
     /// Detected from the module's intrinsic calls, which is a property of the body rather than of
     /// the stage — the interface pass materializes the plane wherever it lowers one of those calls,
@@ -395,6 +404,15 @@ pub enum VertOutRole {
 #[derive(Clone, Debug, Default)]
 pub struct VertMeta {
     pub roles: Vec<(u32, VertRole)>,
+    /// `(parameter index, AIR role)` for every enabled entry parameter whose role has no
+    /// lowering.
+    ///
+    /// An unrecognised parameter is bound to a zero value so the body stays well formed. That is
+    /// right for a function-constant-disabled resource, which Metal itself defines as absent, and
+    /// wrong for anything else: a `[[barycentric_coord]]` the emitter does not model becomes a
+    /// silent zero, and everything computed from it is wrong in a module that validates. Emission
+    /// rejects on a non-empty list instead.
+    pub unmodelled_input_params: Vec<(u32, String)>,
     /// Descriptor-backed render-target planes used by implicit imageblock load/store intrinsics.
     /// Detected from the module's intrinsic calls, which is a property of the body rather than of
     /// the stage — the interface pass materializes the plane wherever it lowers one of those calls,
@@ -586,6 +604,9 @@ pub enum KernRole {
 #[derive(Clone, Debug, Default)]
 pub struct KernMeta {
     pub roles: Vec<(u32, KernRole)>,
+    /// `(parameter index, AIR role)` for every enabled entry parameter whose role has no
+    /// lowering. See [`FragMeta::unmodelled_input_params`].
+    pub unmodelled_input_params: Vec<(u32, String)>,
     /// Function-constant-wrapped buffer parameter index -> Metal buffer location. Multiple mutually
     /// exclusive typed alternatives may intentionally share one location.
     pub function_constant_buffer_locations: HashMap<u32, u32>,
@@ -741,6 +762,7 @@ fn parse_air_kernel_meta_with_nodes(
     let in_ref = *refs.get(1)?;
 
     let mut roles = vec![];
+    let mut unmodelled_input_params: Vec<(u32, String)> = vec![];
     let mut function_constant_buffer_locations = HashMap::new();
     let mut buffer_layouts = HashMap::new();
     let mut imageblock_layouts = HashMap::new();
@@ -772,6 +794,13 @@ fn parse_air_kernel_meta_with_nodes(
         };
         if primary_role(&strs) == Some("texture") && resource_location(node, idx) == u32::MAX {
             first = "function_constant";
+        }
+        if let Some(declared) = declared_role(&strs) {
+            if !KERNEL_INPUT_ROLES.contains(&declared)
+                && metadata_enabled_by_default(node, nodes, &static_int_globals)
+            {
+                unmodelled_input_params.push((idx, declared.to_string()));
+            }
         }
         let role = match first {
             "buffer" | "indirect_buffer" => {
@@ -880,6 +909,7 @@ fn parse_air_kernel_meta_with_nodes(
     let implicit_imageblock_attachments = detect_implicit_imageblock_attachments(ll)?;
     Some(KernMeta {
         roles,
+        unmodelled_input_params,
         function_constant_buffer_locations,
         buffer_layouts,
         imageblock_layouts,
@@ -1321,6 +1351,20 @@ fn primary_role(strs: &[String]) -> Option<&str> {
         .find(|s| *s != "function_constant")
 }
 
+/// The role marker an argument node declares, or `None` when it declares none.
+///
+/// A bare `!"air.function_constant"` parameter *is* the function constant: there is no role marker
+/// behind the wrapper, so reading past it lands on the node's own type/name qualifiers and reports
+/// `arg_type_name` as though it were a role. [`fc_promoted_role`] already models this — it collapses
+/// a gated argument to the wrapper unless the role is one the emitter binds anyway — so the two
+/// stay consistent by sharing it.
+fn declared_role(strs: &[String]) -> Option<&str> {
+    match fc_promoted_role(strs, true)? {
+        "function_constant" | "function_constant_disabled" => None,
+        role => Some(role),
+    }
+}
+
 fn function_constant_gate_global(body: &str, nodes: &HashMap<u32, String>) -> Option<String> {
     if role_strings(body).first().map(String::as_str) != Some("function_constant") {
         return None;
@@ -1623,6 +1667,76 @@ pub(crate) fn parse_air_fragment_meta_with_entry(ll: &str) -> (Option<FragMeta>,
     (meta, entry)
 }
 
+/// The fragment entry-parameter roles the emitter models.
+///
+/// Any other enabled role lands in [`FragMeta::unmodelled_input_params`] and is rejected at
+/// emission. `render_target` appears here because an `air.render_target` in the *input* list is
+/// framebuffer fetch (`[[color(n)]]`), not an output.
+pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
+    "buffer",
+    "fragment_input",
+    "front_facing",
+    "imageblock_data",
+    "indirect_buffer",
+    "intersection_function_table",
+    "point_coord",
+    "position",
+    "primitive_id",
+    "render_target",
+    "render_target_array_index",
+    "sample_id",
+    "sampler",
+    "texture",
+    "viewport_array_index",
+    "visible_function_table",
+];
+
+/// The vertex entry-parameter roles the emitter models. See [`FRAGMENT_INPUT_ROLES`].
+pub const VERTEX_INPUT_ROLES: &[&str] = &[
+    "amplification_count",
+    "amplification_id",
+    "buffer",
+    "indirect_buffer",
+    "instance_id",
+    "intersection_function_table",
+    "patch_control_point_input",
+    "patch_id",
+    "patch_input",
+    "position_in_patch",
+    "sampler",
+    "texture",
+    "vertex_id",
+    "vertex_input",
+    "visible_function_table",
+];
+
+/// The kernel entry-parameter roles the emitter models. See [`FRAGMENT_INPUT_ROLES`].
+pub const KERNEL_INPUT_ROLES: &[&str] = &[
+    "buffer",
+    "imageblock",
+    "indirect_buffer",
+    "instance_acceleration_structure",
+    "intersection_function_table",
+    "primitive_acceleration_structure",
+    "quadgroup_index_in_threadgroup",
+    "sampler",
+    "simdgroup_index_in_threadgroup",
+    "simdgroups_per_threadgroup",
+    "stage_in",
+    "texture",
+    "thread_index_in_quadgroup",
+    "thread_index_in_simdgroup",
+    "thread_index_in_threadgroup",
+    "thread_position_in_grid",
+    "thread_position_in_threadgroup",
+    "threadgroup_position_in_grid",
+    "threadgroups_per_grid",
+    "threads_per_grid",
+    "threads_per_simdgroup",
+    "threads_per_threadgroup",
+    "visible_function_table",
+];
+
 /// The fragment return-member roles the emitter lowers.
 ///
 /// A member carrying any other role is reported through `FragMeta::unmodelled_output_members` and
@@ -1716,7 +1830,7 @@ fn parse_air_fragment_meta_with_nodes(
                 .filter_map(|(i, r)| {
                     let node = nodes.get(&r)?;
                     let roles = role_strings(node);
-                    let role = primary_role(&roles)?;
+                    let role = declared_role(&roles)?;
                     (!FRAGMENT_OUTPUT_ROLES.contains(&role)
                         && metadata_enabled_by_default(node, nodes, &static_int_globals))
                     .then(|| (i as u32, role.to_string()))
@@ -1752,6 +1866,7 @@ fn parse_air_fragment_meta_with_nodes(
         .unwrap_or_default();
 
     let mut roles = vec![];
+    let mut unmodelled_input_params: Vec<(u32, String)> = vec![];
     let mut buffer_layouts = HashMap::new();
     let mut varying_types = HashMap::new();
     let mut varying_names = HashMap::new();
@@ -1784,6 +1899,13 @@ fn parse_air_fragment_meta_with_nodes(
         let Some(role_str) = primary_role(&strs) else {
             continue;
         };
+        if let Some(declared) = declared_role(&strs) {
+            if !FRAGMENT_INPUT_ROLES.contains(&declared)
+                && metadata_enabled_by_default(node, nodes, &static_int_globals)
+            {
+                unmodelled_input_params.push((idx, declared.to_string()));
+            }
+        }
         let role = match role_str {
             "position" => FragRole::Position,
             "point_coord" => FragRole::PointCoord,
@@ -1879,6 +2001,7 @@ fn parse_air_fragment_meta_with_nodes(
         .collect::<Vec<_>>();
     Some(FragMeta {
         roles,
+        unmodelled_input_params,
         implicit_imageblock_attachments: detect_implicit_imageblock_attachments(ll)?,
         varying_types,
         varying_names,
@@ -2002,6 +2125,7 @@ fn parse_air_vertex_meta_with_nodes(
     }
 
     let mut roles = vec![];
+    let mut unmodelled_input_params: Vec<(u32, String)> = vec![];
     let mut parameter_type_names = HashMap::new();
     let mut vertex_input_types = HashMap::new();
     let mut vertex_input_names = HashMap::new();
@@ -2042,6 +2166,13 @@ fn parse_air_vertex_meta_with_nodes(
         }
         if primary_role(&strs) == Some("patch_input") {
             first = "patch_input";
+        }
+        if let Some(declared) = declared_role(&strs) {
+            if !VERTEX_INPUT_ROLES.contains(&declared)
+                && metadata_enabled_by_default(node, nodes, &static_int_globals)
+            {
+                unmodelled_input_params.push((idx, declared.to_string()));
+            }
         }
         let role =
             match first {
@@ -2151,6 +2282,7 @@ fn parse_air_vertex_meta_with_nodes(
         .collect::<Vec<_>>();
     Some(VertMeta {
         roles,
+        unmodelled_input_params,
         implicit_imageblock_attachments: detect_implicit_imageblock_attachments(ll)?,
         parameter_type_names,
         output_roles,

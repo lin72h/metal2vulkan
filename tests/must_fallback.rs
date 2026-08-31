@@ -406,6 +406,71 @@ entry:
     );
 }
 
+/// An entry parameter whose AIR role has no lowering.
+///
+/// The input side of the same hole. An unrecognised parameter is bound to a zero value so the body
+/// stays well formed, which is right for a function-constant-disabled resource — Metal defines that
+/// one as absent — and wrong for a system value nothing models: the shader reads zero where the
+/// hardware would have supplied a value, in a module that validates, binds and reflects exactly as
+/// if nothing were missing.
+///
+/// The three cases below are the boundary. An unmodelled role rejects; a modelled one translates;
+/// and a bare `air.function_constant` parameter — which has no role marker behind the wrapper at
+/// all, so reading past it lands on the node's own `air.arg_type_name` — must not be mistaken for a
+/// role and rejected.
+#[test]
+fn an_entry_parameter_with_no_lowering_fallbacks() {
+    const KERNEL: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+define void @k(ptr addrspace(1) %out, i32 %sys) {
+entry:
+  %p = getelementptr i32, ptr addrspace(1) %out, i64 0
+  store i32 %sys, ptr addrspace(1) %p
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.ROLE", !"air.arg_type_name", !"uint", !"air.arg_name", !"sys"}
+"#;
+
+    let unknown = KERNEL.replace("air.ROLE", "air.system_value_that_does_not_exist");
+    match translate_sanitized_native(&unknown, Stage::Kernel, &tmp()) {
+        Ok(spv) => panic!(
+            "expected a clean FALLBACK but translate succeeded ({} bytes); a system value read \
+             as zero is a silently wrong module",
+            spv.len()
+        ),
+        Err(e) => {
+            assert!(
+                e.contains("air.system_value_that_does_not_exist"),
+                "the diagnostic should name the role; got: {e}"
+            );
+            assert!(
+                e.contains("entry parameter 1"),
+                "and the parameter it sits on; got: {e}"
+            );
+        }
+    }
+
+    let known = KERNEL.replace(r#"!"air.ROLE""#, r#"!"air.thread_index_in_threadgroup""#);
+    assert!(
+        translate_sanitized_native(&known, Stage::Kernel, &tmp()).is_ok(),
+        "the same module with a modelled role must translate"
+    );
+
+    // A parameter that IS a function constant carries the wrapper and nothing else. Metal supplies
+    // no value here, so binding it to its default is the defined behaviour, not a missing lowering.
+    let constant = KERNEL.replace(r#"!"air.ROLE""#, r#"!"air.function_constant""#);
+    assert!(
+        translate_sanitized_native(&constant, Stage::Kernel, &tmp()).is_ok(),
+        "a bare function-constant parameter has no role to reject"
+    );
+}
+
 #[test]
 fn no_function_definitions_fallbacks() {
     assert_fallback(

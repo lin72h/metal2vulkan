@@ -337,6 +337,25 @@ pub(super) fn build_stage_input(
     }
     let stage_input_bindings = kern.map(KernMeta::stage_input_bindings).unwrap_or_default();
 
+    // A parameter no role recognises is bound to a zero value further down so the body stays well
+    // formed. That is correct for a function-constant-disabled resource — Metal defines it as
+    // absent — and wrong for a system value the emitter simply does not model: the shader reads a
+    // zero where the hardware would have given it a barycentric coordinate or a sample mask, and
+    // the module validates, binds and reflects exactly as if nothing were missing. Reject those
+    // instead, naming the role.
+    let unmodelled = match stage {
+        Stage::Fragment => frag.map(|meta| meta.unmodelled_input_params.as_slice()),
+        Stage::Vertex => vert.map(|meta| meta.unmodelled_input_params.as_slice()),
+        Stage::Kernel => kern.map(|meta| meta.unmodelled_input_params.as_slice()),
+    }
+    .unwrap_or_default();
+    if let Some((param, role)) = unmodelled.first() {
+        return Err(format!(
+            "entry parameter {param} declares AIR role `air.{role}`, which has no lowering; \
+             emitting the module would silently read a zero in its place"
+        ));
+    }
+
     for (i, (pid, pty)) in params.iter().enumerate() {
         let idx = i as u32;
         let role_is = |s: &str| match stage {
