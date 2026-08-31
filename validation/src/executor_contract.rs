@@ -127,6 +127,14 @@ pub fn unsupported_reflection_requirements(
             | ResourceKind::EmbeddedArgBufferTexture
             | ResourceKind::EmbeddedArgBufferBuffer
             | ResourceKind::BufferAddressTable => {}
+            // A descriptor the translator invented to type an AIR value has no Metal argument
+            // behind it, so there is no authored resource for the Vulkan executor to write there
+            // and nothing for the Metal oracle to encode. The module still reads through it, so
+            // leaving the binding out of the layout is not an option either -- the row is honestly
+            // not executable until the harness can supply a deterministic placeholder resource.
+            ResourceKind::SynthesizedNullTexture | ResourceKind::SynthesizedReadSampler => {
+                requirements.insert(ToolingRequirement::SynthesizedPlaceholderDescriptor);
+            }
         }
         if binding.kind == ResourceKind::KernelStageInput
             && binding
@@ -804,6 +812,61 @@ mod tests {
         }
         let reflection = ShaderReflection::from_kernel(&meta, Some("k"), [1, 1, 1]);
         assert!(unsupported_reflection_requirements(&reflection).is_empty());
+    }
+
+    #[test]
+    fn a_synthesized_placeholder_descriptor_is_an_unsupported_requirement() {
+        // `air.get_null_texture_2d()` whose handle is read: the translator binds a real image at a
+        // binding no Metal argument produces, so the Vulkan executor has nothing authored to write
+        // there and the Metal oracle has nothing to encode. Both sides must say so.
+        let ll = r#"
+define void @k(ptr addrspace(1) %out) {
+entry:
+  %tex = call ptr addrspace(1) @air.get_null_texture_2d()
+  %width = call i32 @air.get_width_texture_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %width, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare ptr addrspace(1) @air.get_null_texture_2d()
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+        let tmp = std::env::temp_dir().join(format!(
+            "m2v_validation_placeholder_requirement_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).expect("scratch directory");
+        let (_spirv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
+            ll,
+            metal2vulkan::passes::Stage::Kernel,
+            &tmp,
+            metal2vulkan::passes::TransformOptions::default(),
+        )
+        .expect("the placeholder-reading kernel translates");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(reflection
+            .bindings
+            .iter()
+            .any(|binding| binding.kind == ResourceKind::SynthesizedNullTexture));
+        assert!(unsupported_reflection_requirements(&reflection)
+            .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
+
+        // Reflection built without a module never sees the placeholder, so this requirement is a
+        // property of reflected translation and must not appear from metadata alone.
+        let metadata_only = metal2vulkan::reflect_sanitized(
+            ll,
+            metal2vulkan::passes::Stage::Kernel,
+            metal2vulkan::passes::TransformOptions::default(),
+        )
+        .expect("metadata-only reflection");
+        assert!(!unsupported_reflection_requirements(&metadata_only)
+            .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
     }
 
     #[test]

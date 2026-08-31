@@ -29,10 +29,11 @@ pub enum ToolingRequirement {
     FragmentVaryingObservationType,
     FragmentVaryingLinkage,
     FragmentOutputObservationType,
+    SynthesizedPlaceholderDescriptor,
 }
 
 impl ToolingRequirement {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::FunctionConstantLiteral,
         Self::VertexAttributeLiteral,
         Self::TessellationAttributeLiteral,
@@ -53,6 +54,7 @@ impl ToolingRequirement {
         Self::FragmentVaryingObservationType,
         Self::FragmentVaryingLinkage,
         Self::FragmentOutputObservationType,
+        Self::SynthesizedPlaceholderDescriptor,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -77,6 +79,7 @@ impl ToolingRequirement {
             Self::FragmentVaryingObservationType => "fragment_varying_observation_type",
             Self::FragmentVaryingLinkage => "fragment_varying_linkage",
             Self::FragmentOutputObservationType => "fragment_output_observation_type",
+            Self::SynthesizedPlaceholderDescriptor => "synthesized_placeholder_descriptor",
         }
     }
 }

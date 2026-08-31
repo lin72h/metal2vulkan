@@ -73,7 +73,7 @@ mod footprint;
 /// materializes the plane from the call, which is a property of the body rather than of the stage.
 /// Reflected translation also reports the buffer-address table the finished module declares instead
 /// of the one an AIR text scan predicted.
-pub const REFLECTION_VERSION: u32 = 32;
+pub const REFLECTION_VERSION: u32 = 33;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -663,6 +663,22 @@ pub enum ResourceKind {
     /// Synthesized table of Vulkan buffer device addresses indexed by Metal buffer location. Used
     /// by the BDA retry tier for direct device-buffer parameters.
     BufferAddressTable,
+    /// A placeholder sampled image the translator binds for `air.get_null_texture_*()`, at the first
+    /// binding in the sampled-texture band no Metal texture claims.
+    ///
+    /// No Metal argument corresponds to it. It exists because a function-constant-gated optional
+    /// attachment still has to yield a texture handle, and it is reported only when the shader
+    /// actually reads through that handle -- an unread one is retracted during translation. A
+    /// consumer must bind an image of [`ResourceBinding::texture_shape`] here; what it contains is
+    /// not observed, since Metal's null texture reads as zero.
+    SynthesizedNullTexture,
+    /// A placeholder sampler the translator binds for `air.get_read_sampler()`, at the first binding
+    /// in the sampler band no Metal sampler claims.
+    ///
+    /// No Metal argument corresponds to it. It exists because AIR threads a sampler pointer into
+    /// the sampler-less `texture.read(coord)`, and it is reported only when something consumes that
+    /// value -- otherwise it is retracted during translation. A consumer must bind a sampler here.
+    SynthesizedReadSampler,
 }
 
 /// The descriptor location the interface pass decorates a resource with. Absent for resources that
@@ -1498,6 +1514,32 @@ fn implicit_imageblock_planes(
 }
 
 /// The `Binding` decoration on `variable`, if the module gives it one.
+/// The shape a consumer needs to bind an image at a synthesized placeholder's descriptor, read off
+/// the `OpTypeImage` the module declares rather than off any AIR type name -- there is no Metal
+/// argument to name one.
+fn placeholder_texture_shape(image: &crate::spirv_module::Instruction) -> TextureShape {
+    let literal = |index: usize| match image.operands.get(index) {
+        Some(crate::spirv_module::Operand::LiteralBit32(value)) => *value,
+        _ => 0,
+    };
+    let dimension = match image.operands.get(1) {
+        Some(crate::spirv_module::Operand::Dim(dim)) => TextureDimension::from_spirv_dim(*dim),
+        _ => TextureDimension::D2,
+    };
+    TextureShape {
+        dimension,
+        arrayed: literal(3) != 0,
+        multisampled: literal(4) != 0,
+        // `default_null_image_of` always builds a float sampled image; the module carries that in
+        // its sampled-type operand, which is the float scalar this branch would have to contradict.
+        component: TextureComponent::Float,
+        writable: false,
+        array_ref: false,
+        array_length: None,
+        storage_format: None,
+    }
+}
+
 fn descriptor_binding_of(module: &Module, variable: spirv::Word) -> Option<u32> {
     module.annotations.iter().find_map(|annotation| {
         match (
@@ -1622,7 +1664,10 @@ impl ShaderReflection {
                 }
                 ResourceKind::Sampler => layout.sampler_binding(resource.metal_index),
                 ResourceKind::ColorInput => layout.color_input_binding(resource.metal_index),
-                ResourceKind::StaticSampler | ResourceKind::BufferAddressTable => {
+                ResourceKind::StaticSampler
+                | ResourceKind::BufferAddressTable
+                | ResourceKind::SynthesizedNullTexture
+                | ResourceKind::SynthesizedReadSampler => {
                     return Err(format!(
                         "cannot reconfigure reflection after synthesized {:?} resources were added",
                         resource.kind
@@ -1778,7 +1823,10 @@ impl ShaderReflection {
                         DescriptorClass::SampledImage
                     }
                 }
-                ResourceKind::Sampler | ResourceKind::StaticSampler => DescriptorClass::Sampler,
+                ResourceKind::Sampler
+                | ResourceKind::StaticSampler
+                | ResourceKind::SynthesizedReadSampler => DescriptorClass::Sampler,
+                ResourceKind::SynthesizedNullTexture => DescriptorClass::SampledImage,
                 ResourceKind::ColorInput => DescriptorClass::InputAttachment,
                 ResourceKind::ThreadgroupBuffer
                 | ResourceKind::VisibleFunctionTable
@@ -1816,7 +1864,12 @@ impl ShaderReflection {
                     self.descriptor_layout
                         .color_input_binding(resource.metal_index),
                 ),
-                ResourceKind::BufferAddressTable => None,
+                // The two synthesized placeholders take the first binding in their band that no
+                // Metal argument claims, so there is no index to recompute the expectation from.
+                // The band check below is what constrains them.
+                ResourceKind::BufferAddressTable
+                | ResourceKind::SynthesizedNullTexture
+                | ResourceKind::SynthesizedReadSampler => None,
                 ResourceKind::ThreadgroupBuffer
                 | ResourceKind::PrimitiveAccelerationStructure
                 | ResourceKind::VisibleFunctionTable
@@ -1832,6 +1885,25 @@ impl ShaderReflection {
                 }
             };
             let owner = format!("{:?}({})", resource.kind, resource.metal_index);
+            if let Some(band) = match resource.kind {
+                ResourceKind::SynthesizedNullTexture => {
+                    Some(self.descriptor_layout.sampled_textures)
+                }
+                ResourceKind::SynthesizedReadSampler => Some(self.descriptor_layout.samplers),
+                _ => None,
+            } {
+                let location = resource
+                    .descriptor
+                    .ok_or_else(|| format!("{owner} is missing its descriptor"))?;
+                if !band.contains(location.binding) {
+                    return Err(format!(
+                        "{owner} uses binding {}, outside its descriptor band [{},{})",
+                        location.binding, band.start, band.end
+                    ));
+                }
+                record(location, owner, class)?;
+                continue;
+            }
             if resource.kind == ResourceKind::BufferAddressTable {
                 let location = resource
                     .descriptor
@@ -1963,6 +2035,90 @@ impl ShaderReflection {
     ///
     /// The module is the fact. Callers that have one observe it here; `reflect_sanitized`, which
     /// never builds a module, keeps the prediction and is documented as an approximation.
+    /// Report the descriptors the passes synthesized with no Metal argument behind them.
+    ///
+    /// `air.get_read_sampler()` and `air.get_null_texture_*()` each make the interface pass bind a
+    /// real resource so an AIR value has a legal SPIR-V type. Nothing in the AIR metadata describes
+    /// those bindings, so reflection built from metadata alone reports a descriptor-set layout that
+    /// does not cover the module -- the same shape of gap `reconcile_buffer_address_table` closes
+    /// for the address table. `bindings` is what translation kept after retracting every
+    /// placeholder nothing consumed, filtered to what the finished module still declares; the
+    /// module supplies the resource class, so nothing here is inferred from binding numbers.
+    pub(crate) fn report_synthesized_placeholders(&mut self, module: &Module, bindings: &[u32]) {
+        self.bindings.retain(|resource| {
+            !matches!(
+                resource.kind,
+                ResourceKind::SynthesizedNullTexture | ResourceKind::SynthesizedReadSampler
+            )
+        });
+        let types = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| Some((instruction.result_id?, instruction)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut null_textures = 0;
+        let mut read_samplers = 0;
+        for &binding in bindings {
+            let Some(pointee) = module
+                .types_global_values
+                .iter()
+                .filter(|instruction| instruction.class.opcode == spirv::Op::Variable)
+                .filter(|instruction| {
+                    instruction
+                        .result_id
+                        .map(|variable| descriptor_binding_of(module, variable) == Some(binding))
+                        == Some(true)
+                })
+                .find_map(|instruction| types.get(&instruction.result_type?))
+                .and_then(|pointer| match pointer.operands.get(1) {
+                    Some(crate::spirv_module::Operand::IdRef(pointee)) => types.get(pointee),
+                    _ => None,
+                })
+            else {
+                continue;
+            };
+            let (kind, metal_index, texture_shape, access) = match pointee.class.opcode {
+                spirv::Op::TypeImage => {
+                    let index = null_textures;
+                    null_textures += 1;
+                    (
+                        ResourceKind::SynthesizedNullTexture,
+                        index,
+                        Some(placeholder_texture_shape(pointee)),
+                        Some(ResourceAccess::Sampled),
+                    )
+                }
+                spirv::Op::TypeSampler => {
+                    let index = read_samplers;
+                    read_samplers += 1;
+                    (ResourceKind::SynthesizedReadSampler, index, None, None)
+                }
+                _ => continue,
+            };
+            self.bindings.push(ResourceBinding {
+                kind,
+                metal_index,
+                descriptor: Some(DescriptorLocation {
+                    set: self.descriptor_layout.set,
+                    binding,
+                    count: 1,
+                }),
+                param_index: None,
+                stage_input_location: None,
+                address_space: None,
+                declared_size: None,
+                extent: None,
+                footprint: None,
+                type_layout: None,
+                type_name: None,
+                texture_shape,
+                embedded_source: None,
+                access,
+                static_sampler: None,
+            });
+        }
+    }
+
     pub(crate) fn reconcile_buffer_address_table(&mut self, module: &Module) {
         let mut declared = module
             .types_global_values

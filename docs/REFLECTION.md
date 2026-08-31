@@ -72,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `32`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `33`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -104,6 +104,8 @@ By default, every descriptor-backed Metal-facing resource uses **descriptor set 
 | Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | selected sampled- or storage-texture range at `synthetic_index` |
 | Device buffer embedded in argument buffer | `EmbeddedArgBufferBuffer` | **no descriptor**; owner field contains its Vulkan device address |
 | Synthesized direct-buffer address table | `BufferAddressTable` | first free binding in the selected synthetic range (default starts at `640`); one `u64` address per Metal buffer slot |
+| Placeholder image for `air.get_null_texture_*()` | `SynthesizedNullTexture` | first binding in the sampled-texture band no Metal texture claims; reported only when the shader reads through the handle |
+| Placeholder sampler for `air.get_read_sampler()` | `SynthesizedReadSampler` | first binding in the sampler band no Metal sampler claims; reported only when something consumes the value |
 
 Constants live in `metal2vulkan::reflect`:
 
@@ -144,7 +146,8 @@ Descriptor types for `bindings`:
 | `EmbeddedArgBufferTexture` | Sampled image or storage image according to `access`; a reflected `Buffer` dimension uses the corresponding texel-buffer type |
 | `TextureArray` | Sampled-image or storage-image array according to `access`; a reflected `Buffer` dimension uses the corresponding texel-buffer type |
 | `StorageImage` | Storage image, or storage texel buffer when `texture_shape.dimension` is `Buffer` |
-| `Sampler`, `StaticSampler` | Sampler |
+| `SynthesizedNullTexture` | Sampled image of `texture_shape`; contents are never observed |
+| `Sampler`, `StaticSampler`, `SynthesizedReadSampler` | Sampler |
 | `ColorInput` | Input attachment |
 
 `implicit_imageblock_attachments` and projected `fragment_imageblock.members` are additional

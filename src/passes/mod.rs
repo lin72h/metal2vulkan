@@ -370,9 +370,10 @@ struct Ctx {
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
     /// Descriptor variables the translator invented to give an AIR value a legal SPIR-V type, with
-    /// no Metal argument behind them. Retracted when unconsumed; see
-    /// [`stage_input::drop_unconsumed_placeholder_descriptor_loads`].
-    placeholder_descriptor_vars: HashSet<Word>,
+    /// no Metal argument behind them, mapped to the binding each was decorated with. Retracted when
+    /// unconsumed (see [`stage_input::drop_unconsumed_placeholder_descriptor_loads`]); the ones that
+    /// survive are reported to reflection, since no Metal argument would otherwise describe them.
+    placeholder_descriptor_vars: HashMap<Word, u32>,
     /// Loaded sampler value ids with an exact static or pipeline-provided state.
     sampler_states: HashMap<Word, StaticSamplerState>,
     /// Direct loads of runtime sampler bindings that were given pipeline state.
@@ -463,7 +464,7 @@ impl Ctx {
             specialized_runtime_sampler_values: HashSet::new(),
             ambiguous_sampler_states: HashSet::new(),
             default_null_image_vars: HashMap::new(),
-            placeholder_descriptor_vars: HashSet::new(),
+            placeholder_descriptor_vars: HashMap::new(),
             implicit_imageblock_vars: HashMap::new(),
             fragment_imageblock_vars: HashMap::new(),
             uses_fragment_imageblock: false,
@@ -2151,15 +2152,20 @@ pub(crate) fn transform_with_options(
         entry_name,
         options,
     )
-    .map(|(module, mut sidecar)| {
-        // This test-only byte boundary intentionally discards the sidecar. Drop its source-layout
-        // oracle roots too so direct transform tests observe the same serialized type cleanup as a
-        // completed product translation after main-pipeline exact-access replay.
-        sidecar.buffer_root_source_types.clear();
-        let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, stage, options);
-        module_cleanup::gc_dead_globals(&mut ctx);
-        ctx.module
-    })
+    .map(
+        |Transformed {
+             module, sidecar, ..
+         }| {
+            let mut sidecar = sidecar;
+            // This test-only byte boundary intentionally discards the sidecar. Drop its source-layout
+            // oracle roots too so direct transform tests observe the same serialized type cleanup as a
+            // completed product translation after main-pipeline exact-access replay.
+            sidecar.buffer_root_source_types.clear();
+            let mut ctx = Ctx::with_options_and_sidecar(module, sidecar, stage, options);
+            module_cleanup::gc_dead_globals(&mut ctx);
+            ctx.module
+        },
+    )
 }
 
 pub(crate) fn validate_descriptor_bindings(
@@ -2355,6 +2361,16 @@ fn report_phase_contract(ctx: &Ctx, phase: &str) {
     }
 }
 
+/// What `transform_with_options_and_sidecar` produced: the finished module, the emit-seam sidecar
+/// it consumed, and the descriptor facts that only the passes are in a position to know.
+pub(crate) struct Transformed {
+    pub(crate) module: Module,
+    pub(crate) sidecar: crate::emit_sidecar::EmitSidecar,
+    /// Bindings of descriptors the passes synthesized with no Metal argument behind them, still
+    /// present at this boundary. Reflection reports these; nothing else describes them.
+    pub(crate) placeholder_descriptor_bindings: Vec<u32>,
+}
+
 pub(crate) fn transform_with_options_and_sidecar(
     module: Module,
     emit_sidecar: crate::emit_sidecar::EmitSidecar,
@@ -2364,7 +2380,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     kern: Option<&KernMeta>,
     entry_name: Option<&str>,
     options: TransformOptions,
-) -> Result<(Module, crate::emit_sidecar::EmitSidecar), String> {
+) -> Result<Transformed, String> {
     if matches!(stage, Stage::Kernel) && options.kernel_local_size.contains(&0) {
         return Err("kernel LocalSize dimensions must be non-zero".to_string());
     }
@@ -2678,5 +2694,29 @@ pub(crate) fn transform_with_options_and_sidecar(
     module_cleanup::gc_dead_globals(&mut ctx);
     debug_phase!("complete");
 
-    Ok((ctx.module, ctx.emit_sidecar))
+    let placeholder_descriptor_bindings = surviving_placeholder_bindings(&ctx);
+    Ok(Transformed {
+        module: ctx.module,
+        sidecar: ctx.emit_sidecar,
+        placeholder_descriptor_bindings,
+    })
+}
+
+/// The bindings of the synthesized placeholder descriptors that still exist in the finished module.
+///
+/// A placeholder whose loads were retracted has already lost its variable to
+/// `drop_unreferenced_global_variables`; asking the module which ones remain is what keeps this
+/// list from claiming a descriptor that is no longer there.
+fn surviving_placeholder_bindings(ctx: &Ctx) -> Vec<u32> {
+    let mut bindings = ctx
+        .module
+        .types_global_values
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::Variable)
+        .filter_map(|instruction| instruction.result_id)
+        .filter_map(|variable| ctx.placeholder_descriptor_vars.get(&variable).copied())
+        .collect::<Vec<_>>();
+    bindings.sort_unstable();
+    bindings.dedup();
+    bindings
 }

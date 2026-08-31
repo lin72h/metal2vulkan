@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Reflection schema v33: reflected translation reports the descriptors the passes synthesize with no
+  Metal argument behind them -- `SynthesizedNullTexture` for a read `air.get_null_texture_*()`
+  placeholder and `SynthesizedReadSampler` for a consumed `air.get_read_sampler()` one. Nothing in
+  the AIR metadata describes those bindings, so a descriptor-set layout built from reflection alone
+  did not cover the module. The list comes from the passes and is filtered to what the finished
+  module still declares; the module supplies each resource's class.
 - Reflection schema v32: `ShaderReflection::bindings` reports each resource exactly once. A fragment
   entry with an `air.indirect_buffer` argument previously listed every argument-buffer resident
   twice, so a consumer sizing its work from that list allocated and wrote each of those descriptors

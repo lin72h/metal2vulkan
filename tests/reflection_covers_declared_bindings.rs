@@ -18,8 +18,11 @@
 //! that value then turned out to be nothing at all. No Metal argument corresponds to either, so
 //! reflection had nothing to report — while the module demanded the binding anyway.
 
+use metal2vulkan::meta::TextureDimension;
 use metal2vulkan::passes::{Stage, TransformOptions};
-use metal2vulkan::reflect::{ShaderReflection, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE};
+use metal2vulkan::reflect::{
+    ResourceKind, ShaderReflection, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE,
+};
 use metal2vulkan::translate_sanitized_native_reflected;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -228,6 +231,69 @@ fn a_placeholder_texture_nothing_reads_needs_no_texture_descriptor() {
         "no image is bound, so no image type should survive:\n{text}"
     );
     assert_eq!(declared.len(), 1, "the one output buffer");
+}
+
+/// A kernel that queries the size of the placeholder texture, so something does read through it.
+///
+/// This is the other half of `UNCONSUMED_NULL_TEXTURE`: the value has a consumer, so the descriptor
+/// is not retracted and the consumer of the shader has to bind an image at it. No Metal argument
+/// corresponds to that binding, so nothing in the AIR metadata could describe it -- reflection
+/// reports it from the finished module instead.
+const CONSUMED_NULL_TEXTURE: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+define void @measure_optional_attachment(ptr addrspace(1) %out) {
+entry:
+  %tex = call ptr addrspace(1) @air.get_null_texture_2d()
+  %width = call i32 @air.get_width_texture_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %width, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare ptr addrspace(1) @air.get_null_texture_2d()
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @measure_optional_attachment, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+
+#[test]
+fn a_placeholder_texture_the_shader_reads_is_reported_as_a_descriptor() {
+    let (spirv, reflection) = translate_sanitized_native_reflected(
+        CONSUMED_NULL_TEXTURE,
+        Stage::Kernel,
+        &scratch("consumed_null_texture"),
+        TransformOptions::default(),
+    )
+    .expect("the optional-attachment measurement translates");
+
+    let declared = assert_reflection_covers_declarations(
+        "the optional-attachment measurement",
+        &spirv,
+        &reflection,
+    );
+    let placeholder = reflection
+        .bindings
+        .iter()
+        .find(|resource| resource.kind == ResourceKind::SynthesizedNullTexture)
+        .expect("the placeholder the module reads through is reported");
+    let location = placeholder.descriptor.expect("it consumes a descriptor");
+    assert!(
+        TEXTURE_BINDING_RANGE.contains(location.binding),
+        "a placeholder image belongs in the sampled-texture band, not at {}",
+        location.binding
+    );
+    assert!(
+        declared.contains(&(location.set, location.binding)),
+        "the reported binding is one the module decorates; module declares {declared:?}"
+    );
+    let shape = placeholder
+        .texture_shape
+        .expect("a consumer needs the shape of the image it has to bind");
+    assert_eq!(shape.dimension, TextureDimension::D2);
+    assert!(!shape.arrayed && !shape.writable);
 }
 
 /// A fragment shader that reads its render target back through the implicit imageblock.

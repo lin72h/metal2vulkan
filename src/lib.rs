@@ -569,14 +569,18 @@ pub fn translate_reflected_with_options(
 ///
 /// Authored dependency validation uses this for link-time resources such as function tables: their
 /// stage interface is fully described by AIR metadata even before indirect calls have been resolved
-/// to linked function definitions. The returned shape is identical to the reflection attached to a
-/// successful translated module.
+/// to linked function definitions.
 ///
-/// One field is a prediction rather than an observation. Whether the emitter needs a buffer-address
-/// table is decided by the constructed pointer graph, and this path builds no module, so it is
-/// approximated from an AIR text scan (`has_device_address_pointer_load`). Measured over 2880
-/// corpus sources, that scan disagrees with what the emitter actually emits on 39 of them.
-/// `translate_sanitized_native_reflected` has a module and reads it instead.
+/// The returned shape is identical only in its fields, not in what fills them: two descriptor
+/// classes are decided by the constructed module, and this path builds none.
+///
+/// Whether the emitter needs a buffer-address table is decided by the constructed pointer graph, so
+/// here it is approximated from an AIR text scan (`has_device_address_pointer_load`). Measured over
+/// 2880 corpus sources, that scan disagrees with what the emitter actually emits on 39 of them.
+/// The descriptors the passes synthesize to type an AIR value -- `SynthesizedNullTexture` and
+/// `SynthesizedReadSampler` -- are absent entirely, because whether one survives depends on whether
+/// anything in the finished module consumed its value. `translate_sanitized_native_reflected` has a
+/// module and reads both off it instead.
 pub fn reflect_sanitized(
     san_ll: &str,
     stage: passes::Stage,
@@ -673,6 +677,12 @@ fn translate_sanitized_native_reflected_with_layout(
     // The emitter decides whether the constructed pointer graph needs an address table; reflection
     // no longer predicts that from the AIR text when a module is in hand to be read.
     reflection.reconcile_buffer_address_table(&finished.module);
+    // Nothing in the AIR metadata describes a descriptor the passes invented to type an AIR value,
+    // so only the module and the pass that made it can say a consumer has to bind one.
+    reflection.report_synthesized_placeholders(
+        &finished.module,
+        &finished.placeholder_descriptor_bindings,
+    );
     reflection.add_buffer_footprints(&finished.module)?;
     reflection.validate_descriptor_abi()?;
     Ok((finished.bytes, reflection))
@@ -801,13 +811,21 @@ struct FinishedModule {
     /// The same module represented by `bytes`, retained for owned construction consumers.
     module: Module,
     bytes: Vec<u8>,
+    /// Bindings of descriptors the passes synthesized with no Metal argument behind them, filtered
+    /// to those this module still declares. Only the passes know these exist; reflection reports
+    /// them from here so a consumer's descriptor-set layout covers them.
+    placeholder_descriptor_bindings: Vec<u32>,
 }
 
 impl FinishedModule {
     /// Seal one finished owned module and its only serialized representation together.
-    fn new(module: Module) -> Self {
+    fn new(module: Module, placeholder_descriptor_bindings: Vec<u32>) -> Self {
         let bytes = assemble_finished_module(&module);
-        Self { module, bytes }
+        Self {
+            module,
+            bytes,
+            placeholder_descriptor_bindings,
+        }
     }
 }
 
@@ -912,7 +930,11 @@ fn finish_module(
         }
         eprintln!("[retry-debug] finish: passes start");
     }
-    let (mut out, mut sidecar) = passes::transform_with_options_and_sidecar(
+    let passes::Transformed {
+        module: mut out,
+        mut sidecar,
+        placeholder_descriptor_bindings,
+    } = passes::transform_with_options_and_sidecar(
         emitted.module,
         emitted.sidecar,
         stage,
@@ -992,7 +1014,15 @@ fn finish_module(
         return Err(failure.into());
     }
     passes::validate_descriptor_bindings(&out, options.descriptor_layout)?;
-    let finished = FinishedModule::new(out);
+    // Steps after `transform` delete instructions and can strand a placeholder's last use, and the
+    // liveness pass above then takes its variable. Keep only the ones this finished module still
+    // declares, so the list reflection reads never names a descriptor that is no longer there.
+    let declared = spirv_module::descriptor_bindings_in_set(&out, options.descriptor_layout.set);
+    let placeholder_descriptor_bindings = placeholder_descriptor_bindings
+        .into_iter()
+        .filter(|binding| declared.contains(binding))
+        .collect::<Vec<_>>();
+    let finished = FinishedModule::new(out, placeholder_descriptor_bindings);
     if retry_debug {
         eprintln!("[retry-debug] finish: assembly complete");
     }

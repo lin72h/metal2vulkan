@@ -60,7 +60,7 @@ impl Ctx {
     /// with no Metal argument behind it. See [`drop_unconsumed_placeholder_descriptor_loads`].
     fn placeholder_descriptor(&mut self, pointee_ty: Word, binding: u32) -> Word {
         let var = self.descriptor_variable(pointee_ty, binding);
-        self.placeholder_descriptor_vars.insert(var);
+        self.placeholder_descriptor_vars.insert(var, binding);
         var
     }
 
@@ -396,7 +396,7 @@ pub(in crate::passes) fn drop_unconsumed_placeholder_descriptor_loads(ctx: &mut 
         instruction.class.opcode == Op::Load
             && matches!(
                 instruction.operands.first(),
-                Some(Operand::IdRef(variable)) if placeholders.contains(variable)
+                Some(Operand::IdRef(variable)) if placeholders.contains_key(variable)
             )
             && instruction
                 .result_id
