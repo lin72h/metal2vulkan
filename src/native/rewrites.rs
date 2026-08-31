@@ -988,8 +988,8 @@ pub(crate) fn construct_cfg_functions_module(
     let nested = crate::native::reloop_nest::structure_selected_functions(module, &selected);
     let mut remaining = selected.clone();
     remaining.retain(|id| !nested.contains(id));
-    let relooped = if remaining.is_empty() {
-        false
+    let (relooped, declines) = if remaining.is_empty() {
+        (false, Vec::new())
     } else if named.len() == construction_names.len() || !nested.is_empty() {
         relooper::rewrite_selected_to_relooper(
             module,
@@ -997,15 +997,71 @@ pub(crate) fn construct_cfg_functions_module(
             &remaining,
         )
     } else {
-        relooper::rewrite_to_relooper(module, relooper::default_max_relooper_blocks())
+        (
+            relooper::rewrite_to_relooper(module, relooper::default_max_relooper_blocks()),
+            Vec::new(),
+        )
     };
     let changed = relooped || !nested.is_empty();
     if !changed {
-        return Err("native emitter: selected CFG function cannot be constructed".to_string());
+        return Err(format!(
+            "native emitter: selected CFG function cannot be constructed{}",
+            construction_decline_detail(&declines)
+        ));
     }
     finish_id_deleting_rewrite(module, defined_before, changed);
     add_native_module_capabilities(module);
     Ok(())
+}
+
+/// Why no construction was available, appended to the emitter's error.
+///
+/// Neither construction is an admission gate the caller can inspect: the nesting structurizer takes
+/// the functions it can nest and the state-machine construction takes the rest, and when both leave
+/// a function alone the caller only knows that it has none. The state-machine construction does know
+/// -- it names a residual CFG limit at every `bail` -- and one of those limits, `too-many-blocks`, is
+/// a fixed product ceiling that a reader would otherwise have to bisect a shader to discover. So say
+/// it. Silence about a size limit reads like a bug in the shader.
+///
+/// Nothing is claimed about the nesting structurizer here: it declined too, and it does not report a
+/// reason. `MAX_RELOOPER_GROUPS` nested dispatch groups is the ceiling and it is deliberate, so this
+/// is a description of the boundary, not a defect report.
+fn construction_decline_detail(declines: &[relooper::ReloopDecline]) -> String {
+    if declines.is_empty() {
+        return String::new();
+    }
+    // Bounded like every other diagnostic here: a module with hundreds of declining functions would
+    // otherwise put hundreds of them in one error string, and the first few are the ones a reader
+    // acts on. The count is still reported, so nothing is hidden.
+    const SHOWN: usize = 4;
+    let ceiling = relooper::relooper_block_ceiling(relooper::default_max_relooper_blocks());
+    let reasons = declines
+        .iter()
+        .take(SHOWN)
+        .map(|decline| {
+            let name = decline
+                .function
+                .map(|id| format!("%{id}"))
+                .unwrap_or_else(|| "an unnamed function".to_string());
+            let limit = if decline.reason == relooper::TOO_MANY_BLOCKS {
+                format!(" (the state-machine ceiling is {ceiling} blocks)")
+            } else {
+                String::new()
+            };
+            format!(
+                "{name} with {} blocks: {}{limit}",
+                decline.blocks, decline.reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let rest = declines.len().saturating_sub(SHOWN);
+    let more = if rest > 0 {
+        format!(" (and {rest} more)")
+    } else {
+        String::new()
+    };
+    format!("; the state-machine construction declined {reasons}{more}")
 }
 
 /// Shader control flow requires an `OpSelectionMerge` before every switch and before a

@@ -51,19 +51,47 @@ use crate::spirv_module::{Block, Function, Instruction};
 use spirv::{Op, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
+/// Why the state-machine construction left one function alone.
+///
+/// Every decline names itself. The reason strings were already written at each `bail` site as
+/// documentation of the residual CFG limits, but they only ever reached a `METAL2VULKAN_RELOOP_WHY`
+/// trace, so a caller that ran out of constructions could say no more than "cannot be constructed".
+/// A shader author reading that has nothing to act on -- and one of these reasons, `too-many-blocks`,
+/// is a fixed product ceiling they would otherwise have to bisect for.
+pub(super) struct ReloopDecline {
+    /// The function's result id, when it has one.
+    pub(super) function: Option<Word>,
+    /// Blocks it had when the construction looked at it.
+    pub(super) blocks: usize,
+    /// The `bail` reason token.
+    pub(super) reason: &'static str,
+}
+
+/// The `bail` reason a function larger than the state-machine ceiling declines with.
+pub(super) const TOO_MANY_BLOCKS: &str = "too-many-blocks";
+
+/// The largest function the state-machine construction will take: [`MAX_RELOOPER_GROUPS`] nested
+/// dispatch groups of at most `max_blocks` cases each.
+pub(super) fn relooper_block_ceiling(max_blocks: usize) -> usize {
+    effective_relooper_block_cap(max_blocks).saturating_mul(MAX_RELOOPER_GROUPS)
+}
+
 /// Rewrite every eligible multi-block function of `module` into relooper form. Returns true if any
 /// function was rewritten.
 pub(super) fn rewrite_to_relooper(module: &mut Module, max_blocks: usize) -> bool {
-    rewrite_to_relooper_if(module, max_blocks, |_| true)
+    rewrite_to_relooper_if(module, max_blocks, |_| true).0
 }
 
 /// Rewrite only functions whose result id is selected by the caller. Selection is derived from the
 /// source ownership planner before this module is serialized; it is not a validator diagnosis.
+///
+/// Returns whether anything was rewritten, and why each selected function that was not rewritten
+/// declined.
 pub(super) fn rewrite_selected_to_relooper(
     module: &mut Module,
     max_blocks: usize,
     selected: &HashSet<Word>,
-) -> bool {
+) -> (bool, Vec<ReloopDecline>) {
     rewrite_to_relooper_if(module, max_blocks, |function| {
         function
             .def
@@ -77,28 +105,39 @@ fn rewrite_to_relooper_if(
     module: &mut Module,
     max_blocks: usize,
     mut selected: impl FnMut(&Function) -> bool,
-) -> bool {
+) -> (bool, Vec<ReloopDecline>) {
     let max_blocks = effective_relooper_block_cap(max_blocks);
     // Snapshot the global type/const tables we read while choosing/creating types and constants.
     let mut next_id = module.header.as_ref().map(|h| h.bound).unwrap_or(1);
     let mut tc = TypeCtx::new(module, &mut next_id);
 
     let mut changed = false;
+    let mut declines = Vec::new();
     // TypeCtx snapshots the global definitions it needs, so function rewrites can borrow their own
     // module field directly while newly synthesized globals remain buffered in `pending`.
     if crate::env_vars::reloop_why() {
         eprintln!("RELOOP-ENTER functions={}", module.functions.len());
     }
     for function in &mut module.functions {
-        if selected(function) && rewrite_function(function, &mut tc, max_blocks) {
-            changed = true;
+        if !selected(function) {
+            continue;
+        }
+        let id = function.def.as_ref().and_then(|def| def.result_id);
+        let blocks = function.blocks.len();
+        match rewrite_function(function, &mut tc, max_blocks) {
+            Ok(()) => changed = true,
+            Err(reason) => declines.push(ReloopDecline {
+                function: id,
+                blocks,
+                reason,
+            }),
         }
     }
     tc.flush(module);
     if let Some(h) = module.header.as_mut() {
         h.bound = next_id;
     }
-    changed
+    (changed, declines)
 }
 
 /// Find-or-create cache for the integer / bool / pointer types and the integer constants the relooper
@@ -600,13 +639,24 @@ pub(super) fn default_max_relooper_blocks() -> usize {
     effective_relooper_block_cap(crate::env_vars::relooper_max_blocks(MAX_RELOOPER_BLOCKS))
 }
 
-fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize) -> bool {
+/// Rewrite one function, or name the residual CFG limit that stopped it.
+///
+/// The reason strings are the documentation of those limits, and they are what a caller reports when
+/// no construction was available for a function -- see [`ReloopDecline`]. `Result` rather than
+/// `bool` on purpose: a decline that does not name itself becomes a FALLBACK the reader cannot act
+/// on, and three of the declines here used to be a bare `return false` for exactly that reason.
+/// With this signature there is no way to write one.
+fn rewrite_function(
+    function: &mut Function,
+    tc: &mut TypeCtx,
+    max_blocks: usize,
+) -> Result<(), &'static str> {
     // Bail with a reason string kept at each call site as documentation of the residual cfg limits.
-    let bail = |_r: &str| -> bool {
+    let bail = |reason: &'static str| -> Result<(), &'static str> {
         if crate::env_vars::reloop_why() {
-            eprintln!("RELOOP-BAIL {_r} (blocks={})", function.blocks.len());
+            eprintln!("RELOOP-BAIL {reason} (blocks={})", function.blocks.len());
         }
-        false
+        Err(reason)
     };
 
     if crate::env_vars::reloop_why() {
@@ -620,7 +670,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
         return bail("too-few-blocks");
     }
     if function.blocks.len() > max_blocks.saturating_mul(MAX_RELOOPER_GROUPS) {
-        return bail("too-many-blocks");
+        return bail(TOO_MANY_BLOCKS);
     }
 
     // Decode every block's terminator; bail if any is unhandled.
@@ -650,7 +700,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
         .collect::<Option<_>>()
     {
         Some(v) => v,
-        None => return false,
+        None => return bail("block-without-label"),
     };
     let label_index: HashMap<Word, usize> =
         labels.iter().enumerate().map(|(i, l)| (*l, i)).collect();
@@ -751,7 +801,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                     let rid = inst.result_id.unwrap();
                     let rty = match inst.result_type {
                         Some(t) => t,
-                        None => return false,
+                        None => return bail("phi-without-result-type"),
                     };
                     let mut incoming = Vec::new();
                     let mut k = 0;
@@ -759,7 +809,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
                         let (Operand::IdRef(v), Operand::IdRef(p)) =
                             (&inst.operands[k], &inst.operands[k + 1])
                         else {
-                            return false;
+                            return bail("malformed-phi-operands");
                         };
                         incoming.push((*v, *p));
                         k += 2;
@@ -1695,7 +1745,7 @@ fn rewrite_function(function: &mut Function, tc: &mut TypeCtx, max_blocks: usize
     new_blocks.push(continue_block);
     new_blocks.push(merge_block);
     function.blocks = new_blocks;
-    true
+    Ok(())
 }
 
 /// Read-only demotion context threaded into the terminator-lowering helpers.
@@ -2028,6 +2078,58 @@ mod tests {
             .collect()
     }
 
+    /// A function of `blocks` labelled blocks, selected by result id `1`.
+    ///
+    /// Deliberately not assembled: the size check runs before any terminator is decoded, so this
+    /// needs no valid SPIR-V and no `spirv-as` on the machine running the test.
+    fn module_with_block_count(blocks: usize) -> Module {
+        let mut function = Function::new();
+        function.def = Some(Instruction::new(Op::Function, Some(2), Some(1), vec![]));
+        function.blocks = (0..blocks)
+            .map(|index| Block {
+                label: Some(Instruction::new(
+                    Op::Label,
+                    None,
+                    Some(index as Word + 16),
+                    vec![],
+                )),
+                instructions: Vec::new(),
+            })
+            .collect();
+        let mut module = Module::new();
+        module.functions.push(function);
+        module
+    }
+
+    /// The size boundary is exact, and a function that crosses it says so.
+    ///
+    /// `MAX_RELOOPER_GROUPS` nested dispatch groups of `MAX_RELOOPER_BLOCKS` cases is a deliberate
+    /// product ceiling, and a shader that exceeds it gets an honest FALLBACK. What it must not get is
+    /// a FALLBACK with no reason: the number is not derivable from anything the author can see, so
+    /// finding it means bisecting a shader. The decline carries it out to the emitter's error.
+    #[test]
+    fn a_function_over_the_state_machine_ceiling_declines_by_name() {
+        let ceiling = relooper_block_ceiling(MAX_RELOOPER_BLOCKS);
+        assert_eq!(ceiling, MAX_RELOOPER_BLOCKS * MAX_RELOOPER_GROUPS);
+
+        let mut module = module_with_block_count(ceiling + 1);
+        let (rewrote, declines) =
+            rewrite_selected_to_relooper(&mut module, MAX_RELOOPER_BLOCKS, &HashSet::from([1]));
+        assert!(!rewrote);
+        assert_eq!(declines.len(), 1);
+        assert_eq!(declines[0].reason, TOO_MANY_BLOCKS);
+        assert_eq!(declines[0].blocks, ceiling + 1);
+        assert_eq!(declines[0].function, Some(1));
+
+        // Exactly at the ceiling the size is not what stops it. (These blocks have no terminators,
+        // so it still declines -- for a different, equally named reason.)
+        let mut module = module_with_block_count(ceiling);
+        let (_, declines) =
+            rewrite_selected_to_relooper(&mut module, MAX_RELOOPER_BLOCKS, &HashSet::from([1]));
+        assert_eq!(declines.len(), 1);
+        assert_ne!(declines[0].reason, TOO_MANY_BLOCKS);
+    }
+
     #[test]
     fn whole_function_relooper_clamps_requested_cap_to_driver_safe_limit() {
         assert_eq!(
@@ -2071,11 +2173,13 @@ OpFunctionEnd
             .as_ref()
             .and_then(|def| def.result_id)
             .expect("helper id");
-        assert!(rewrite_selected_to_relooper(
+        let (rewrote, declines) = rewrite_selected_to_relooper(
             &mut module,
             MAX_RELOOPER_BLOCKS,
             &HashSet::from([helper_id]),
-        ));
+        );
+        assert!(rewrote);
+        assert!(declines.is_empty());
         assert_ne!(module.functions[0].blocks.len(), 2);
         assert_eq!(module.functions[1].blocks.len(), 2);
     }
