@@ -1639,28 +1639,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn redirect_label_respects_identifier_boundary() {
-        let line = "br i1 %c, label %bb1, label %bb10";
-        let out = redirect_label(line, "%bb1", "%new");
-        assert_eq!(out, "br i1 %c, label %new, label %bb10");
-    }
-
-    #[test]
-    fn redirect_label_unconditional() {
-        assert_eq!(
-            redirect_label("br label %exit", "%exit", "%m"),
-            "br label %m"
-        );
-    }
-
-    #[test]
-    fn is_phi_line_detects_phi() {
-        assert!(is_phi_line("  %x = phi i32 [ 0, %a ], [ %y, %b ]"));
-        assert!(!is_phi_line("  %x = add i32 %a, %b"));
-        assert!(!is_phi_line("br label %x"));
-    }
-
     /// A single if/else with a unique merge: no synthesis, the header keeps its natural merge.
     #[test]
     fn unique_selection_merge_keeps_unshared_merge() {

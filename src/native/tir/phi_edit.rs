@@ -240,40 +240,6 @@ impl TirBlock {
             recompute_phi_uses(inst);
         }
     }
-
-    /// Replace this block's phi named by `phi_line`'s result with one re-derived from `phi_line` — the
-    /// typed dual of a synthesis site that rebuilds a phi's incoming list (drop redirected + append a
-    /// `[merged, M]` funnel incoming, mirror a cloned predecessor, or extend a boundary phi) and writes
-    /// the new line. Recomputes the canonical incoming field with the same `phi_incoming_parse` parser a
-    /// re-lower runs (retaining unresolved operands only when that canonical parse fails), so the
-    /// carrier's phi is byte-identical to re-lowering the rewritten line — the phi TYPE (hence
-    /// `result_ty`, `opcode`, and every non-incoming field) is unchanged by an incoming edit. A no-op if
-    /// the block has no phi with that result (the caller's line did not name one of this block's phis).
-    #[cfg(test)]
-    pub(in crate::native) fn relower_phi(&mut self, phi_line: &str) {
-        let Some(result) = result_name(phi_line) else {
-            return;
-        };
-        for inst in &mut self.insts {
-            if inst.opcode == "phi" && inst.result.as_deref() == Some(result.as_str()) {
-                let incoming = phi_incoming_parse(phi_line).0;
-                let fallback = incoming
-                    .is_none()
-                    .then(|| resolve_phi_incoming_values(phi_line, "phi"))
-                    .flatten();
-                let parsed = incoming.is_some();
-                *inst.phi_incoming_mut() = incoming;
-                *inst.phi_incoming_values_mut() = fallback;
-                inst.operands = if parsed {
-                    Vec::new()
-                } else {
-                    resolve_operands(phi_line)
-                };
-                inst.uses = (!parsed).then(|| instruction_uses(phi_line, Some(result.as_str())));
-                return;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -338,51 +304,6 @@ mod tests {
                 format!("{carrier:?}"),
                 format!("{expected:?}"),
                 "typed rebuild_phi_incomings diverged from re-lower for {lines:?} keep {keep:?}"
-            );
-        }
-    }
-
-    /// The typed `relower_phi` must equal re-lowering the block with the rewritten phi line, for the
-    /// synthesis-site edit shapes: drop-and-append a funnel incoming, mirror a cloned predecessor, and
-    /// extend a boundary phi with new incomings — including aggregate/constant/`undef` incoming values.
-    #[test]
-    fn relower_phi_matches_relowered_lines() {
-        // (original block lines, index of the phi line, its rewritten replacement).
-        let cases: &[(&[&str], usize, &str)] = &[
-            // Drop `%p2`, append a merged funnel incoming `[ %m, %M ]` (multi_exit / phi_util shape).
-            (
-                &["%r = phi i32 [ %a, %p1 ], [ %b, %p2 ]", "br label %x"],
-                0,
-                "%r = phi i32 [ %a, %p1 ], [ %m, %M ]",
-            ),
-            // Mirror a cloned predecessor: append `[ %a.c, %arm.c ]` (privatize / cross_arm shape).
-            (
-                &["%r = phi i32 [ %a, %arm ], [ %b, %o ]", "ret void"],
-                0,
-                "%r = phi i32 [ %a, %arm ], [ %b, %o ], [ %a.c, %arm.c ]",
-            ),
-            // Extend a boundary phi with an undef funnel incoming, aggregate incoming value present.
-            (
-                &[
-                    "%r = phi <2 x i32> [ <2 x i32> <i32 %a, i32 %b>, %p1 ]",
-                    "br label %x",
-                ],
-                0,
-                "%r = phi <2 x i32> [ <2 x i32> <i32 %a, i32 %b>, %p1 ], [ undef, %M ]",
-            ),
-        ];
-        for (lines, phi_idx, rewritten_phi) in cases {
-            let src: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
-            let mut carrier = lower_block_carrier("%blk", &src, &types()).unwrap();
-            carrier.relower_phi(rewritten_phi);
-
-            let mut rewritten = src.clone();
-            rewritten[*phi_idx] = rewritten_phi.to_string();
-            let expected = lower_block_carrier("%blk", &rewritten, &types()).unwrap();
-            assert_eq!(
-                format!("{carrier:?}"),
-                format!("{expected:?}"),
-                "typed relower_phi diverged from re-lower for {rewritten_phi:?}"
             );
         }
     }
