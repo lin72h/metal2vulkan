@@ -1499,11 +1499,10 @@ pub(in crate::passes) fn lower_one(
     {
         return lower_get_num_mip_levels(ctx, name, res, rty, args);
     }
-    // The current conformance texture contract creates single-sample RGBA8 textures. Until the
-    // harness grows a real multisample image resource, sample-count queries on FC-selected/default
-    // texture paths lower to that canonical count instead of emitting an invalid MS image query.
+    // `air.get_num_samples_texture*` reads the bound image's sample count, so it lowers to
+    // OpImageQuerySamples whenever the operand really is a multisample image.
     if name.starts_with("air.get_num_samples_texture") {
-        return lower_get_num_samples_texture(ctx, name, res, rty);
+        return lower_get_num_samples_texture(ctx, name, res, rty, args);
     }
     if name == "air.get_num_samples.i32" {
         return lower_raster_sample_count(ctx, name, res, rty);

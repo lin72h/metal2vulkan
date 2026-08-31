@@ -895,19 +895,54 @@ pub(in crate::passes) fn lower_get_num_mip_levels(
     ])
 }
 
-/// `air.get_num_samples_texture*`: the conformance texture contract creates single-sample textures,
-/// so this lowers to the canonical count 1 rather than emitting an invalid multisample image query.
+/// `air.get_num_samples_texture*(texture)` is a property of the bound image, not of the pipeline.
+/// SPIR-V spells it `OpImageQuerySamples`, which is only defined for a 2D image whose `MS` operand
+/// is 1. A non-multisampled image has exactly one sample per texel, so the constant 1 is the exact
+/// answer there rather than a stand-in; emitting the query on such an image would be invalid.
 pub(in crate::passes) fn lower_get_num_samples_texture(
     ctx: &mut Ctx,
     name: &str,
     res: Option<Word>,
     rty: Option<Word>,
+    args: &[Word],
 ) -> Result<Vec<Instruction>, String> {
     let res = res.ok_or_else(|| format!("{name} has no result"))?;
     let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
     let uint = ctx.ty_uint();
-    let one = ctx.const_uint(1);
-    Ok(vec![copy_or_bitcast_result(rty, res, uint, one)])
+    let single_sample = |ctx: &mut Ctx| {
+        let one = ctx.const_uint(1);
+        vec![copy_or_bitcast_result(rty, res, uint, one)]
+    };
+    let Some(mut img) = args.first().copied() else {
+        return Err(format!("{name} missing texture"));
+    };
+    img = resolve_image_value(ctx, img);
+    if texture_operand_is_private_pointer(ctx, img) {
+        match single_image_for_private_query(ctx, img) {
+            Some(query_img) => img = query_img,
+            None => return Ok(single_sample(ctx)),
+        }
+    }
+    let mut out = Vec::new();
+    let img = load_image_if_pointer(ctx, img, &mut out);
+    if !image_value_is_multisampled(ctx, img) {
+        return Ok(single_sample(ctx));
+    }
+    let (dim, _, _) = image_shape_or_recorded(ctx, img);
+    if dim != Dim::Dim2D {
+        return Err(format!(
+            "{name} requires a 2D multisample texture; OpImageQuerySamples is undefined for {dim:?}"
+        ));
+    }
+    let samples = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ImageQuerySamples,
+        Some(uint),
+        Some(samples),
+        vec![Operand::IdRef(img)],
+    ));
+    out.push(copy_or_bitcast_result(rty, res, uint, samples));
+    Ok(out)
 }
 
 /// `air.get_num_samples.i32(flags)` returns graphics pipeline state, not a property of an image

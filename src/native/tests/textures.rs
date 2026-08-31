@@ -3839,6 +3839,88 @@ declare void @air.write_texture_2d.i16.v4f16(ptr addrspace(1), <2 x i16>, <4 x h
 }
 
 #[test]
+fn native_kernel_multisample_sample_count_query_uses_image_query_samples() {
+    // `air.get_num_samples_texture_2d_ms` is a property of the bound image, so it must reach the
+    // GPU as OpImageQuerySamples. Substituting a literal silently collapses every per-sample loop
+    // in the guest to a single iteration.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
+entry:
+  %n = tail call i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1) %tex)
+  store i32 %n, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.get_num_samples_texture_2d_ms(ptr addrspace(1))
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_ms<float, read>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_ms_sample_count_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("OpImageQuerySamples"), "{asm}");
+    assert!(asm.contains("OpCapability ImageQuery"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
+fn native_kernel_single_sample_texture_sample_count_query_is_constant_one() {
+    // OpImageQuerySamples is only defined for images whose MS operand is 1. A single-sample image
+    // has exactly one sample per texel, so the constant is the exact answer, not a stand-in.
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out) {
+entry:
+  %n = tail call i32 @air.get_num_samples_texture_2d(ptr addrspace(1) %tex)
+  store i32 %n, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.get_num_samples_texture_2d(ptr addrspace(1))
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_single_sample_count_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    assert!(!asm.contains("OpImageQuerySamples"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+}
+
+#[test]
 fn native_kernel_helper_wrapped_texture_query_resolves_loaded_image() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"

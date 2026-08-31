@@ -352,6 +352,7 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
                     | Op::ImageQuerySizeLod
                     | Op::ImageQueryLod
                     | Op::ImageQueryLevels
+                    | Op::ImageQuerySamples
             )
         });
     if has_query {
