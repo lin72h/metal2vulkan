@@ -107,9 +107,10 @@ pub(in crate::passes) enum ParamBinding {
         param_ty: Word,
         shift: u32,
     },
-    /// A vector builtin Input var (e.g. GlobalInvocationId, a v3uint) whose `comp`-th component feeds
-    /// a scalar param: load the vector then OpCompositeExtract the 32-bit component, converting when the
-    /// AIR param is narrower.
+    /// A composite builtin Input var whose `comp`-th component feeds a scalar param: load the
+    /// composite then OpCompositeExtract the 32-bit component, converting when the AIR param is
+    /// narrower. Vectors (GlobalInvocationId, a v3uint) and arrays (`SampleMask`, a `uint[1]`) both
+    /// take this shape.
     LoadVarComponent {
         var: Word,
         vec_ty: Word,
@@ -327,6 +328,7 @@ pub(super) fn build_stage_input(
     let mut primitive_id_var: Option<Word> = None;
     let mut sample_id_var: Option<Word> = None;
     let mut layer_var: Option<Word> = None;
+    let mut sample_mask_in_var: Option<Word> = None;
     let mut bary_coord_var: Option<Word> = None;
     let mut bary_coord_no_persp_var: Option<Word> = None;
     let mut tess_coord_var: Option<Word> = None;
@@ -368,6 +370,7 @@ pub(super) fn build_stage_input(
                 Some(FragRole::BarycentricCoord { .. }) => s == "barycentric_coord",
                 Some(FragRole::PrimitiveId) => s == "primitive_id",
                 Some(FragRole::SampleId) => s == "sample_id",
+                Some(FragRole::SampleMaskIn) => s == "sample_mask_in",
                 Some(FragRole::ViewportArrayIndex) => s == "viewport_array_index",
                 Some(FragRole::RenderTargetArrayIndex) => s == "render_target_array_index",
                 Some(FragRole::Varying(_)) => s == "varying",
@@ -1692,6 +1695,45 @@ pub(super) fn build_stage_input(
                      float builtin"
                 ));
             }
+        } else if role_is("sample_mask_in") {
+            // The coverage the rasterizer produced for this fragment. SPIR-V's `SampleMask` is an
+            // array of `uint` — element N covering samples 32N..32N+31 — in both storage classes,
+            // so the argument reads element 0 of an Input variable while a `[[sample_mask]]` return
+            // member writes element 0 of an Output one.
+            if type_int_shape(&defs, *pty).is_none() {
+                return Err(format!(
+                    "[[sample_mask]] parameter {idx} is not an integer; SampleMask is a coverage \
+                     bitmask"
+                ));
+            }
+            let uint_ty = ctx.ty_uint();
+            let mask_ty = ctx.ty_array(uint_ty, 1);
+            let var = if let Some(existing) = sample_mask_in_var {
+                existing
+            } else {
+                let pptr = ctx.ty_ptr(StorageClass::Input, mask_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_builtin(&mut ctx.module, var, BuiltIn::SampleMask);
+                ctx.interface.push(var);
+                sample_mask_in_var = Some(var);
+                var
+            };
+            bindings.push((
+                *pid,
+                ParamBinding::LoadVarComponent {
+                    var,
+                    vec_ty: mask_ty,
+                    scalar_ty: uint_ty,
+                    out_ty: *pty,
+                    comp: 0,
+                },
+            ));
         } else if role_is("barycentric_coord") {
             // `[[barycentric_coord]]` is the primitive's barycentric weights at this fragment.
             // Vulkan spells the perspective and screen-space forms as two builtins, so the AIR

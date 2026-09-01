@@ -87,6 +87,51 @@ fn every_interpolation_marker_is_decoded_or_deliberately_ignored() {
     assert_eq!(with(""), VaryingInterpolation::default());
 }
 
+/// The two spellings of `[[sample_mask]]` are different roles: an argument is the coverage coming
+/// in, a return member is the coverage going out. Reading either as the other loses a direction.
+#[test]
+fn the_two_sample_mask_directions_are_distinct_roles() {
+    let ll = FRAG_LL
+        .replace(
+            r#"!20 = !{i32 1, !"air.fragment_input", !"generated","#,
+            r#"!20 = !{i32 1, !"air.sample_mask_in","#,
+        )
+        .replace(
+            r#"!17 = !{!"air.render_target", i32 0, i32 0}"#,
+            r#"!17 = !{!"air.sample_mask", !"air.arg_type_name", !"uint"}"#,
+        );
+    let m = parse_air_fragment_meta(&ll).unwrap();
+    assert_eq!(m.role_of(1), Some(&FragRole::SampleMaskIn));
+    assert!(
+        m.is_sample_mask_member(0),
+        "and the return member is the output"
+    );
+    assert!(
+        m.unmodelled_input_params.is_empty(),
+        "`air.sample_mask_in` has a lowering"
+    );
+}
+
+/// A gated-off argument is absent whichever builtin it names, so neither of the two roles that
+/// declare an Input variable of their own may materialize one for it.
+#[test]
+fn a_disabled_builtin_argument_declares_no_input_variable() {
+    for role in ["sample_mask_in", "barycentric_coord"] {
+        let ll = FRAG_LL.replace(
+            r#"!20 = !{i32 1, !"air.fragment_input", !"generated","#,
+            &format!(
+                r#"!20 = !{{i32 1, !"air.function_constant", !97, !"air.{role}", !"air.center", !"air.perspective","#
+            ),
+        ) + "\n!97 = !{ptr addrspace(2) @off.MTL_FC_INIT_0_b, !\"bool\", !\"off\", i32 0, i1 false}\n";
+        let m = parse_air_fragment_meta(&ll).unwrap();
+        assert_eq!(
+            m.role_of(1),
+            Some(&FragRole::Other),
+            "an off-by-default `air.{role}` argument must not claim its builtin"
+        );
+    }
+}
+
 /// A barycentric argument carries its own perspective axis, and only the perspective axis.
 #[test]
 fn a_barycentric_argument_keeps_its_perspective_axis() {
@@ -117,18 +162,6 @@ fn a_barycentric_argument_keeps_its_perspective_axis() {
         },
         "SPIR-V has no centroid barycentric builtin, so the sampling axis is deliberately ignored"
     );
-}
-
-/// An off-by-default barycentric argument is absent, and must not make the module require the
-/// fragment-barycentric extension for a value nothing reads.
-#[test]
-fn a_disabled_barycentric_argument_declares_no_builtin() {
-    let ll = FRAG_LL.replace(
-        r#"!20 = !{i32 1, !"air.fragment_input", !"generated","#,
-        r#"!20 = !{i32 1, !"air.function_constant", !98, !"air.barycentric_coord", !"air.center", !"air.perspective","#,
-    ) + "\n!98 = !{ptr addrspace(2) @off.MTL_FC_INIT_0_b, !\"bool\", !\"off\", i32 0, i1 false}\n";
-    let m = parse_air_fragment_meta(&ll).unwrap();
-    assert_eq!(m.role_of(1), Some(&FragRole::Other));
 }
 
 /// `air.sample` means per-sample interpolation on a varying and sample-read access on a texture.

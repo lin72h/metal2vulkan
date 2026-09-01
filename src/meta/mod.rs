@@ -51,6 +51,10 @@ pub enum FragRole {
     PrimitiveId,
     /// `[[sample_id]]` -> Input BuiltIn SampleId (32-bit uint).
     SampleId,
+    /// `[[sample_mask]]` on an *argument* -> Input BuiltIn `SampleMask`, the coverage the
+    /// rasterizer produced for this fragment. AIR spells the input form `air.sample_mask_in` to
+    /// distinguish it from the return member; SPIR-V uses one builtin in two storage classes.
+    SampleMaskIn,
     /// `[[viewport_array_index]]` -> Input BuiltIn ViewportIndex (32-bit uint).
     ViewportArrayIndex,
     /// `[[render_target_array_index]]` -> Input BuiltIn Layer (32-bit uint).
@@ -1700,6 +1704,7 @@ pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
     "render_target",
     "render_target_array_index",
     "sample_id",
+    "sample_mask_in",
     "sampler",
     "texture",
     "viewport_array_index",
@@ -1938,6 +1943,12 @@ fn parse_air_fragment_meta_with_nodes(
             }
             "primitive_id" => FragRole::PrimitiveId,
             "sample_id" => FragRole::SampleId,
+            // As with `barycentric_coord` below: a gated-off argument is absent, and declaring
+            // its builtin anyway puts a variable in the entry point interface for a value the
+            // shader cannot read.
+            "sample_mask_in" if metadata_enabled_by_default(node, nodes, &static_int_globals) => {
+                FragRole::SampleMaskIn
+            }
             "viewport_array_index" => FragRole::ViewportArrayIndex,
             "render_target_array_index" => FragRole::RenderTargetArrayIndex,
             "fragment_input" => {

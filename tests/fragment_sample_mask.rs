@@ -1,4 +1,4 @@
-//! A `[[sample_mask]]` return member is written, not dropped.
+//! A `[[sample_mask]]` crosses in both directions.
 //!
 //! Metal's `[[sample_mask]]` output is a coverage mask: each bit the fragment clears removes that
 //! sample from the write. Shaders use it for custom alpha-to-coverage, for order-independent
@@ -16,6 +16,13 @@
 //! Metal returns one scalar, so the write is an access chain into element 0 rather than a store to
 //! the variable — the same shape `ClipDistance` already needed, which is why the two now share one
 //! lowering.
+//!
+//! The same attribute on an *argument* is the coverage the rasterizer produced, which AIR spells
+//! `air.sample_mask_in` and SPIR-V spells with the same builtin in the Input storage class. It had
+//! no lowering either, so a shader that intersected its own mask with the incoming one read zero
+//! coverage and intersected everything away. A shader can declare both, and then one module carries
+//! two variables with the same builtin decoration in different storage classes — legal, and worth
+//! pinning, because collapsing them to one is an easy mistake to make.
 
 use metal2vulkan::passes::Stage;
 use metal2vulkan::{disassemble, translate_sanitized_native};
@@ -46,6 +53,26 @@ entry:
 !4 = !{!5, !6}
 !5 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
 !6 = !{i32 1, !"air.fragment_input", !"generated(m)", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"mask"}
+"#;
+
+/// A fragment that reads the incoming coverage and returns a new one — both directions at once.
+const MASK_IN_AND_OUT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+define <{ <4 x float>, i32 }> @frag(<4 x float> %pos, i32 %covin) {
+entry:
+  %r0 = insertvalue <{ <4 x float>, i32 }> undef, <4 x float> %pos, 0
+  %r1 = insertvalue <{ <4 x float>, i32 }> %r0, i32 %covin, 1
+  ret <{ <4 x float>, i32 }> %r1
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!3 = !{!"air.sample_mask", !"air.arg_type_name", !"uint", !"air.arg_name", !"coverage"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
+!6 = !{i32 1, !"air.sample_mask_in", !"air.arg_type_name", !"uint", !"air.arg_name", !"covin"}
 "#;
 
 /// A depth/coverage-only fragment: the mask IS the return value, so it never passes through a
@@ -155,6 +182,57 @@ fn the_mask_is_stored_through_element_zero_of_the_array() {
                 .map(str::trim)
                 .any(|line| line.starts_with(&format!("OpStore {chain} "))),
             "the mask must be stored through the access chain:\n{asm}"
+        );
+    }
+}
+
+/// The incoming coverage reaches the shader, and does not share a variable with the outgoing one.
+///
+/// One builtin, two storage classes: `OpEntryPoint` must list both variables, the Input one must be
+/// read (not written) and the Output one written (not read).
+#[test]
+fn the_incoming_and_outgoing_masks_are_separate_variables() {
+    let asm = translate_to_asm(MASK_IN_AND_OUT);
+    let defs = definitions(&asm);
+    let masks: Vec<String> = asm
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| {
+            let rest = line.strip_prefix("OpDecorate ")?;
+            let (id, tail) = rest.split_once(' ')?;
+            (tail == "BuiltIn SampleMask").then(|| id.to_string())
+        })
+        .collect();
+    assert_eq!(
+        masks.len(),
+        2,
+        "an incoming and an outgoing mask are two variables:\n{asm}"
+    );
+
+    let storage_class = |id: &String| defs[id].last().cloned().unwrap_or_default();
+    let mut classes: Vec<String> = masks.iter().map(storage_class).collect();
+    classes.sort();
+    assert_eq!(
+        classes,
+        vec!["Input".to_string(), "Output".to_string()],
+        "one of each storage class:\n{asm}"
+    );
+
+    let input = masks
+        .iter()
+        .find(|id| storage_class(id) == "Input")
+        .expect("Input mask");
+    assert!(
+        asm.lines()
+            .map(str::trim)
+            .any(|line| line.contains("OpLoad") && line.ends_with(input.as_str())),
+        "the incoming mask must be loaded:\n{asm}"
+    );
+    for mask in &masks {
+        assert!(
+            asm.lines()
+                .any(|line| line.contains("OpEntryPoint") && line.contains(mask.as_str())),
+            "{mask} must be in the entry point interface:\n{asm}"
         );
     }
 }

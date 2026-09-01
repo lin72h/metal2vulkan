@@ -2479,6 +2479,7 @@ impl ShaderReflection {
                 | FragRole::BarycentricCoord { .. }
                 | FragRole::PrimitiveId
                 | FragRole::SampleId
+                | FragRole::SampleMaskIn
                 | FragRole::ViewportArrayIndex
                 | FragRole::RenderTargetArrayIndex
                 | FragRole::Varying(_)
