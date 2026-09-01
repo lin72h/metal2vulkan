@@ -236,6 +236,12 @@ pub struct FragMeta {
     pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
+    /// `param_idx -> the descriptor count `air.location_index` states, when it states more than one.
+    ///
+    /// A texture or sampler argument above `1` is a handle ARRAY occupying that many descriptors at
+    /// its Metal slot. Absent for the ordinary single-descriptor argument and for a count spelled as
+    /// a function-constant global.
+    pub declared_descriptor_counts: HashMap<u32, u32>,
     /// Framebuffer-fetch color input Location -> AIR render-target type name, e.g. `float4`.
     pub color_input_type_names: HashMap<u32, String>,
     pub embedded_textures: Vec<EmbeddedTexture>,
@@ -297,6 +303,10 @@ impl FragMeta {
     }
     pub fn texture_type_name(&self, idx: u32) -> Option<&str> {
         self.texture_type_names.get(&idx).map(String::as_str)
+    }
+    /// See [`Self::declared_descriptor_counts`].
+    pub fn declared_descriptor_count(&self, idx: u32) -> Option<u32> {
+        self.declared_descriptor_counts.get(&idx).copied()
     }
     pub fn color_input_type_name(&self, location: u32) -> Option<&str> {
         self.color_input_type_names
@@ -486,6 +496,12 @@ pub struct VertMeta {
     pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
+    /// `param_idx -> the descriptor count `air.location_index` states, when it states more than one.
+    ///
+    /// A texture or sampler argument above `1` is a handle ARRAY occupying that many descriptors at
+    /// its Metal slot. Absent for the ordinary single-descriptor argument and for a count spelled as
+    /// a function-constant global.
+    pub declared_descriptor_counts: HashMap<u32, u32>,
     pub embedded_textures: Vec<EmbeddedTexture>,
     pub embedded_arguments: Vec<EmbeddedArgument>,
     pub tessellation: Option<TessellationMeta>,
@@ -541,6 +557,10 @@ impl VertMeta {
     }
     pub fn texture_type_name(&self, idx: u32) -> Option<&str> {
         self.texture_type_names.get(&idx).map(String::as_str)
+    }
+    /// See [`Self::declared_descriptor_counts`].
+    pub fn declared_descriptor_count(&self, idx: u32) -> Option<u32> {
+        self.declared_descriptor_counts.get(&idx).copied()
     }
     pub fn output_role_of(&self, idx: u32) -> Option<&VertOutRole> {
         self.output_roles.get(idx as usize)
@@ -685,6 +705,12 @@ pub struct KernMeta {
     pub buffer_accesses: HashMap<u32, BufferAccess>,
     /// `param_idx -> AIR texture argument type name`, e.g. `texture2d<uint, read>`.
     pub texture_type_names: HashMap<u32, String>,
+    /// `param_idx -> the descriptor count `air.location_index` states, when it states more than one.
+    ///
+    /// A texture or sampler argument above `1` is a handle ARRAY occupying that many descriptors at
+    /// its Metal slot. Absent for the ordinary single-descriptor argument and for a count spelled as
+    /// a function-constant global.
+    pub declared_descriptor_counts: HashMap<u32, u32>,
     /// `param_idx -> AIR kernel stage-input scalar/vector type name`.
     pub stage_input_type_names: HashMap<u32, String>,
     /// Textures EMBEDDED inside an `air.indirect_buffer` argument buffer (via `air.indirect_argument`
@@ -728,6 +754,10 @@ impl KernMeta {
     }
     pub fn texture_type_name(&self, idx: u32) -> Option<&str> {
         self.texture_type_names.get(&idx).map(String::as_str)
+    }
+    /// See [`Self::declared_descriptor_counts`].
+    pub fn declared_descriptor_count(&self, idx: u32) -> Option<u32> {
+        self.declared_descriptor_counts.get(&idx).copied()
     }
 
     /// Synthetic buffer slots used for kernel `[[stage_in]]` attributes.
@@ -837,6 +867,7 @@ fn parse_air_kernel_meta_with_nodes(
     let mut buffer_type_names = HashMap::new();
     let mut buffer_accesses = HashMap::new();
     let mut texture_type_names = HashMap::new();
+    let mut declared_descriptor_counts = HashMap::new();
     let mut stage_input_type_names = HashMap::new();
     // `air.location_index` of every top-level `air.texture` arg — the basis for the synthetic
     // embedded-texture index K (see `embedded_synthetic_texture_index`).
@@ -849,6 +880,9 @@ fn parse_air_kernel_meta_with_nodes(
         let Some(idx) = first_i32(node) else { continue };
         let layout = struct_info_ref(node).and_then(|sref| parse_struct_info(nodes, sref, 0));
         let strs = role_strings(node);
+        if let Some(count) = declared_descriptor_count(node) {
+            declared_descriptor_counts.insert(idx, count);
+        }
         if strs.first().map(String::as_str) == Some("function_constant")
             && primary_role(&strs) == Some("buffer")
         {
@@ -900,7 +934,7 @@ fn parse_air_kernel_meta_with_nodes(
                 if let Some(access) = declared_buffer_access(node) {
                     buffer_accesses.insert(idx, access);
                 }
-                KernRole::Buffer(buffer_location_index(node, idx, &static_int_globals))
+                KernRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
             }
             "texture" => {
                 if let Some(name) = arg_type_name(node) {
@@ -993,6 +1027,7 @@ fn parse_air_kernel_meta_with_nodes(
         buffer_type_names,
         buffer_accesses,
         texture_type_names,
+        declared_descriptor_counts,
         stage_input_type_names,
         embedded_textures,
         embedded_arguments,
@@ -1429,25 +1464,98 @@ fn i32_after_marker(body: &str, marker: &str) -> Option<u32> {
 }
 
 fn location_index(body: &str, fallback: u32) -> u32 {
-    i32_after_marker(body, "air.location_index").unwrap_or(fallback)
+    match location_operands(body).map(|operands| operands.index) {
+        Some(LocationOperand::Literal(index)) => index,
+        _ => fallback,
+    }
 }
 
-fn buffer_location_index(
-    body: &str,
-    fallback: u32,
-    static_int_globals: &HashMap<String, u32>,
-) -> u32 {
-    if arg_type_name(body)
-        .as_deref()
-        .is_some_and(is_device_buffer_array_type_name)
-    {
-        // Metal flattens `array_ref<void>` into consecutive buffer-table arguments beginning at
-        // the literal metadata location. Its static initializer computes the array extent/next
-        // free slot, not a replacement binding for element zero.
-        location_index(body, fallback)
-    } else {
-        location_index_with_static(body, fallback, static_int_globals)
+/// How many descriptors an argument node states it occupies, when AIR states more than one.
+///
+/// `None` for the ordinary single-descriptor argument, and for a count spelled as a
+/// function-constant global -- the consumer picks that length at pipeline creation, so there is no
+/// compile-time array to size.
+fn declared_descriptor_count(body: &str) -> Option<u32> {
+    match location_operands(body)?.count? {
+        LocationOperand::Literal(count) if count > 1 => Some(count),
+        _ => None,
     }
+}
+
+/// One operand of the `air.location_index` pair: either a compile-time value or a pointer to a
+/// function-constant global whose value the consumer chooses at pipeline creation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LocationOperand {
+    Literal(u32),
+    Global(String),
+}
+
+/// The two operands `air.location_index` always carries: the resource's Metal slot, and how many
+/// descriptors the argument occupies at that slot.
+///
+/// `!"air.location_index", i32 4, i32 2` is `[[texture(4)]]` holding two texture handles. The count
+/// is `1` for an ordinary resource; above `1` the argument is a handle ARRAY, and every corpus
+/// declaration above `1` agrees with the `array<..., N>` length in the type name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocationOperands {
+    pub index: LocationOperand,
+    pub count: Option<LocationOperand>,
+}
+
+/// Decode the `air.location_index` operand pair POSITIONALLY.
+///
+/// Either operand may be a literal or a global, and all four combinations occur -- measured over
+/// 14579 corpus sources: 112946 `(i32, i32)`, 3404 `(ptr, i32)`, 1447 `(ptr, ptr)`, 439
+/// `(i32, ptr)`, and no other shape. Scanning forward for "the next `i32`" or "the next `@`"
+/// therefore reads the COUNT whenever the slot is spelled the other way: a texture argument at
+/// `[[texture(1)]]` with a function-constant array count would be bound at the count's value
+/// instead of at 1. 69 corpus texture nodes are that shape.
+pub(crate) fn location_operands(body: &str) -> Option<LocationOperands> {
+    let marker = "!\"air.location_index\"";
+    let position = body.find(marker)?;
+    let mut operands = split_metadata_operands(&body[position + marker.len()..])
+        .into_iter()
+        .map(|operand| {
+            if let Some(literal) = operand.strip_prefix("i32 ") {
+                return literal.trim().parse().ok().map(LocationOperand::Literal);
+            }
+            let at = operand.find('@')?;
+            let name = operand[at..]
+                .chars()
+                .take_while(|character| {
+                    !character.is_whitespace() && !matches!(*character, ',' | ')' | '(' | '[' | ']')
+                })
+                .collect::<String>();
+            (name.len() > 1).then_some(LocationOperand::Global(name))
+        });
+    Some(LocationOperands {
+        index: operands.next().flatten()?,
+        count: operands.next().flatten(),
+    })
+}
+
+/// Split an AIR metadata operand list on the commas that separate operands. A `!"..."` string
+/// operand may itself contain commas (`!"array<texture2d<half, sample>, 2>"`), so a plain
+/// `split(',')` would tear one operand into three and shift every position after it.
+fn split_metadata_operands(tail: &str) -> Vec<String> {
+    let mut operands = vec![];
+    let mut current = String::new();
+    let mut quoted = false;
+    for character in tail.chars() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                current.push(character);
+            }
+            ',' if !quoted => {
+                operands.push(std::mem::take(&mut current).trim().to_string());
+            }
+            _ => current.push(character),
+        }
+    }
+    operands.push(current.trim().to_string());
+    operands.retain(|operand| !operand.is_empty());
+    operands
 }
 
 fn render_target_location(
@@ -2058,6 +2166,7 @@ fn parse_air_fragment_meta_with_nodes(
     let mut varying_user_semantics = HashMap::new();
     let mut varying_interpolation = HashMap::new();
     let mut texture_type_names = HashMap::new();
+    let mut declared_descriptor_counts = HashMap::new();
     let mut color_input_type_names = HashMap::new();
     let mut varying_loc = 0u32;
     let mut buffer_address_spaces = HashMap::new();
@@ -2081,6 +2190,9 @@ fn parse_air_fragment_meta_with_nodes(
             }
         }
         let strs = role_strings(node);
+        if let Some(count) = declared_descriptor_count(node) {
+            declared_descriptor_counts.insert(idx, count);
+        }
         let Some(role_str) = primary_role(&strs) else {
             continue;
         };
@@ -2174,7 +2286,7 @@ fn parse_air_fragment_meta_with_nodes(
                 if let Some(access) = declared_buffer_access(node) {
                     buffer_accesses.insert(idx, access);
                 }
-                FragRole::Buffer(buffer_location_index(node, idx, &static_int_globals))
+                FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
             }
             // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
             "render_target" => {
@@ -2223,6 +2335,7 @@ fn parse_air_fragment_meta_with_nodes(
         buffer_type_names,
         buffer_accesses,
         texture_type_names,
+        declared_descriptor_counts,
         color_input_type_names,
         embedded_textures: if body_uses_texture_intrinsic(ll) {
             detect_embedded_textures(
@@ -2358,6 +2471,7 @@ fn parse_air_vertex_meta_with_nodes(
     let mut buffer_type_names = HashMap::new();
     let mut buffer_accesses = HashMap::new();
     let mut texture_type_names = HashMap::new();
+    let mut declared_descriptor_counts = HashMap::new();
     let mut indirect_buffer_struct_refs = Vec::new();
     let mut patch_control_point = None;
     let param_address_spaces = entry
@@ -2376,6 +2490,9 @@ fn parse_air_vertex_meta_with_nodes(
             }
         }
         let strs = role_strings(node);
+        if let Some(count) = declared_descriptor_count(node) {
+            declared_descriptor_counts.insert(idx, count);
+        }
         let Some(mut first) = fc_promoted_role(&strs, false) else {
             continue;
         };
@@ -2436,7 +2553,7 @@ fn parse_air_vertex_meta_with_nodes(
                     if let Some(access) = declared_buffer_access(node) {
                         buffer_accesses.insert(idx, access);
                     }
-                    VertRole::Buffer(buffer_location_index(node, idx, &static_int_globals))
+                    VertRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
                 }
                 "texture" => {
                     if let Some(name) = arg_type_name(node) {
@@ -2522,6 +2639,7 @@ fn parse_air_vertex_meta_with_nodes(
         buffer_type_names,
         buffer_accesses,
         texture_type_names,
+        declared_descriptor_counts,
         embedded_textures: if body_uses_texture_intrinsic(ll) {
             detect_embedded_textures(
                 nodes,

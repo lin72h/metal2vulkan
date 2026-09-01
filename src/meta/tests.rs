@@ -347,6 +347,13 @@ fn kernel_function_constant_buffer_locations_preserve_shared_bindings() {
     );
 }
 
+/// Metal flattens `array_ref<void>` into consecutive buffer-table arguments beginning at the
+/// literal slot; its global is the array extent, not a replacement binding for element zero.
+///
+/// This used to need a type-name special case in the buffer decode. It does not any more: the slot
+/// is the FIRST `air.location_index` operand whatever the second one is, so the general positional
+/// read gets it right and nothing keys on the spelling `array_ref<void>`. Kept as the case that
+/// motivated the fix.
 #[test]
 fn device_buffer_array_uses_literal_base_instead_of_static_next_location() {
     let ll = r#"
@@ -1332,4 +1339,73 @@ define { { <4 x half>, i16 } } @f({ <4 x half>, i16 } %tile) { ret { { <4 x half
     assert_eq!(imageblock.members[1].raster_order_group, 1);
     assert_eq!(imageblock.inputs[0].members[1].master_member, 1);
     assert_eq!(imageblock.outputs[0].members[0].master_member, 0);
+}
+
+/// `air.location_index` carries a PAIR of operands -- the Metal slot and the descriptor count --
+/// and either may be a literal or a pointer to a function-constant global. All four combinations
+/// occur in the corpus (112946 / 3404 / 1447 / 439 over 14579 sources), so a decode that scans
+/// forward for "the next i32" or "the next @" reads the COUNT whenever the slot is spelled the
+/// other way.
+#[test]
+fn the_location_index_operand_pair_is_read_by_position() {
+    use super::{location_operands, LocationOperand};
+    let global = "@_ZL32__metal_implicit_attr_int_expr_2.150".to_string();
+    for (body, index, count) in [
+        (
+            r#"i32 0, !"air.texture", !"air.location_index", i32 4, i32 2, !"air.sample""#,
+            LocationOperand::Literal(4),
+            Some(LocationOperand::Literal(2)),
+        ),
+        (
+            r#"i32 0, !"air.buffer", !"air.location_index", i32 7, ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_2.150, !"air.read_write""#,
+            LocationOperand::Literal(7),
+            Some(LocationOperand::Global(global.clone())),
+        ),
+        (
+            r#"i32 0, !"air.texture", !"air.location_index", ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_2.150, i32 1, !"air.sample""#,
+            LocationOperand::Global(global.clone()),
+            Some(LocationOperand::Literal(1)),
+        ),
+        (
+            r#"i32 0, !"air.texture", !"air.location_index", ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_2.150, ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_2.150, !"air.write""#,
+            LocationOperand::Global(global.clone()),
+            Some(LocationOperand::Global(global.clone())),
+        ),
+    ] {
+        let decoded = location_operands(body).expect("every shape decodes");
+        assert_eq!(decoded.index, index, "slot operand of `{body}`");
+        assert_eq!(decoded.count, count, "count operand of `{body}`");
+    }
+
+    // A string operand may itself contain commas, so splitting the list on every comma would shift
+    // every position after it.
+    let quoted = r#"i32 0, !"air.texture", !"air.arg_type_name", !"array<texture2d<half, sample>, 2>", !"air.location_index", i32 4, i32 2"#;
+    let decoded = location_operands(quoted).expect("decodes past a comma-bearing string");
+    assert_eq!(decoded.index, LocationOperand::Literal(4));
+    assert_eq!(decoded.count, Some(LocationOperand::Literal(2)));
+}
+
+/// The slot of an argument whose COUNT is a function-constant global is still the literal slot.
+///
+/// `array_ref<void>` is spelled `air.location_index, i32 N, ptr @extent`: a fixed buffer slot with
+/// a runtime array extent. Resolving "the first global after the marker" through the static
+/// initializers answers with the extent, binding the argument at a slot AIR never named. 439 corpus
+/// nodes are that shape, 69 of them textures.
+#[test]
+fn a_function_constant_count_does_not_become_the_location_index() {
+    let ll = FRAG_LL.replace(
+        r#"!"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"texture2d<float, sample>""#,
+        r#"!"air.location_index", i32 0, ptr addrspace(2) @extent.1, !"air.arg_type_name", !"texture2d<float, sample>""#,
+    );
+    let ll = format!(
+        "@extent.1 = internal addrspace(2) global i32 9, align 4\n\
+         define internal void @init() section \"air.static_init\" {{\n\
+         entry:\n  store i32 9, ptr addrspace(2) @extent.1, align 4\n  ret void\n}}\n{ll}"
+    );
+    let meta = parse_air_fragment_meta(&ll).unwrap();
+    assert_eq!(
+        meta.role_of(2),
+        Some(&FragRole::Texture(0)),
+        "the texture binds at the slot AIR states, not at the value of its count global"
+    );
 }

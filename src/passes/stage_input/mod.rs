@@ -235,6 +235,71 @@ pub(in crate::passes) enum ParamBinding {
     ZeroPointer { var: Word },
 }
 
+/// Refuse an argument whose declared descriptor count this translator cannot honour.
+///
+/// The count is the second `air.location_index` operand -- the stable ABI statement of how many
+/// descriptors the argument occupies at its Metal slot. Only a texture handle array has a lowering
+/// (`ParamBinding::ImageArray`), and it sizes itself from the type name, so the two statements of
+/// the length have to agree; the ABI is what makes the name parse checkable at all. Over 14579
+/// corpus sources every declaration above one agrees, and only textures and samplers carry one.
+fn declared_descriptor_counts(
+    stage: Stage,
+    frag: Option<&FragMeta>,
+    vert: Option<&VertMeta>,
+    kern: Option<&KernMeta>,
+) -> Result<(), String> {
+    let counts = match stage {
+        Stage::Fragment => frag.map(|meta| &meta.declared_descriptor_counts),
+        Stage::Vertex => vert.map(|meta| &meta.declared_descriptor_counts),
+        Stage::Kernel => kern.map(|meta| &meta.declared_descriptor_counts),
+    };
+    let Some(counts) = counts else {
+        return Ok(());
+    };
+    let mut declared = counts.iter().collect::<Vec<_>>();
+    declared.sort();
+    for (&idx, &count) in declared {
+        let is_sampler = match stage {
+            Stage::Fragment => matches!(
+                frag.and_then(|m| m.role_of(idx)),
+                Some(FragRole::Sampler(_))
+            ),
+            Stage::Vertex => matches!(
+                vert.and_then(|m| m.role_of(idx)),
+                Some(VertRole::Sampler(_))
+            ),
+            Stage::Kernel => matches!(
+                kern.and_then(|m| m.role_of(idx)),
+                Some(KernRole::Sampler(_))
+            ),
+        };
+        if is_sampler {
+            return Err(format!(
+                "entry parameter {idx} is an array of {count} samplers, which this translator has \
+                 no descriptor-array lowering for; emitting the module would sample with a \
+                 synthesized default sampler instead of the one the shader selected"
+            ));
+        }
+        let texture_type_name = match stage {
+            Stage::Fragment => frag.and_then(|m| m.texture_type_name(idx)),
+            Stage::Vertex => vert.and_then(|m| m.texture_type_name(idx)),
+            Stage::Kernel => kern.and_then(|m| m.texture_type_name(idx)),
+        };
+        let Some(name) = texture_type_name else {
+            // Not a texture, and no other role has a descriptor-array lowering to check against.
+            continue;
+        };
+        if crate::meta::texture_shape_from_name(name).array_length != Some(count) {
+            return Err(format!(
+                "entry parameter {idx} occupies {count} descriptors per `air.location_index`, \
+                 which its type name `{name}` does not state; emitting the module would size the \
+                 descriptor array from a type name the ABI contradicts"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// How a buffer param's body uses are lowered.
 pub(in crate::passes) enum BufWrap {
     /// The AIR pointee is a heterogeneous struct emitted as a struct pointer. The body's
@@ -351,6 +416,14 @@ pub(super) fn build_stage_input(
              emitting the module would silently read a zero in its place"
         ));
     }
+
+    // `air.location_index` states how many descriptors an argument occupies. Above one the argument
+    // is a handle ARRAY, and binding a single descriptor where the shader indexes several is silent:
+    // the module validates, and the consumer's layout has one descriptor at a slot the shader reads
+    // eight of. Textures have an array lowering and are checked against it; a sampler array has no
+    // lowering at all, and today its element loads resolve to nothing, so the sample falls back to a
+    // synthesized default sampler and the shader's chosen sampler state is dropped without trace.
+    declared_descriptor_counts(*stage, frag, vert, kern)?;
 
     // An `air.patch` node the decode could not read is not the same as no patch node at all. The
     // first is a post-tessellation evaluation shader; dropping its shape emits it as an ordinary

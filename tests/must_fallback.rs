@@ -626,3 +626,136 @@ define fastcc void @store_vec(ptr %0) {
 !9 = !{i32 4, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"data"}"#;
     assert_fallback(ll, "no dynamic-struct-index rewrite repaired");
 }
+
+/// A sampler argument AIR states occupies more than one descriptor.
+///
+/// `air.location_index` carries two operands, the Metal slot and the descriptor count, and Metal
+/// spells `array<sampler, 8>` with a count of 8. There is no sampler descriptor-array lowering:
+/// the element loads resolve to nothing, so the sample falls back to the synthesized default
+/// sampler and the state the shader selected is dropped -- in a module that validates, binds and
+/// reflects as though one sampler at that slot were the whole story. Two of 14579 local corpus
+/// sources declare one.
+///
+/// Pinned from both sides over one template, so the boundary is what is fixed: the ordinary
+/// single-sampler spelling of the same kernel must keep translating.
+#[test]
+fn a_sampler_descriptor_array_fallbacks() {
+    const KERNEL: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr addrspace(1) %tex, ptr readonly byval([8 x ptr addrspace(2)]) captures(none) %samps, ptr addrspace(1) %out) {
+entry:
+  %slot = getelementptr inbounds [8 x ptr addrspace(2)], ptr %samps, i32 0, i32 5
+  %s = load ptr addrspace(2), ptr %slot, align 8
+  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %s, <2 x float> zeroinitializer, i1 false, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  store <4 x float> %color, ptr addrspace(1) %out, align 16
+  ret void
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 COUNT, !"air.arg_type_name", !"SAMPLER_TYPE", !"air.arg_name", !"samps"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+"#;
+
+    let array = KERNEL
+        .replace("i32 COUNT", "i32 8")
+        .replace("SAMPLER_TYPE", "array<sampler, 8>");
+    match translate_sanitized_native(&array, Stage::Kernel, &tmp()) {
+        Ok(spv) => panic!(
+            "expected a clean FALLBACK but translate succeeded ({} bytes); a sample through a \
+             default sampler the shader never asked for is a silently wrong module",
+            spv.len()
+        ),
+        Err(e) => {
+            assert!(
+                e.contains("array of 8 samplers"),
+                "the diagnostic should name the declared count; got: {e}"
+            );
+            assert!(
+                e.contains("entry parameter 1"),
+                "and the parameter it sits on; got: {e}"
+            );
+        }
+    }
+
+    let single = KERNEL
+        .replace("i32 COUNT", "i32 1")
+        .replace("SAMPLER_TYPE", "sampler");
+    assert!(
+        translate_sanitized_native(&single, Stage::Kernel, &tmp()).is_ok(),
+        "the same kernel with an ordinary single sampler must translate"
+    );
+}
+
+/// A texture handle array whose two statements of its own length disagree.
+///
+/// AIR states the length twice: as the `air.location_index` count operand and inside the
+/// `array<texture..., N>` type name. The interface pass sizes its `OpTypeArray` from the name and
+/// reflection reports the same number, so a name the ABI contradicts would bind and publish a
+/// descriptor array of the wrong size. Over 14579 local corpus sources all 76 declarations agree,
+/// which is exactly what makes the ABI usable as a check on the name parse: it costs nothing today
+/// and fails the moment the parse drifts.
+#[test]
+fn a_texture_array_whose_declared_length_contradicts_its_type_name_fallbacks() {
+    const KERNEL: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+define void @k(ptr readonly captures(none) %imgs, ptr addrspace(1) %out) {
+entry:
+  %slot = getelementptr inbounds ptr addrspace(1), ptr %imgs, i32 3
+  %tex = load ptr addrspace(1), ptr %slot, align 8
+  %w = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 COUNT, !"air.sample", !"air.arg_type_name", !"TEXTURE_TYPE", !"air.arg_name", !"imgs"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+    let fixed = |count: &str, name: &str| {
+        KERNEL
+            .replace("i32 COUNT", count)
+            .replace("TEXTURE_TYPE", name)
+    };
+
+    for (count, name, why) in [
+        (
+            "i32 3",
+            "array<texture2d<float, sample>, 4>",
+            "a length the ABI contradicts",
+        ),
+        (
+            "i32 4",
+            "texture2d<float, sample>",
+            "a count on a name that is not an array at all",
+        ),
+    ] {
+        match translate_sanitized_native(&fixed(count, name), Stage::Kernel, &tmp()) {
+            Ok(spv) => panic!(
+                "expected a clean FALLBACK for {why} but translate succeeded ({} bytes)",
+                spv.len()
+            ),
+            Err(e) => assert!(
+                e.contains("descriptors per `air.location_index`"),
+                "the diagnostic should name the ABI count for {why}; got: {e}"
+            ),
+        }
+    }
+
+    assert!(
+        translate_sanitized_native(
+            &fixed("i32 4", "array<texture2d<float, sample>, 4>"),
+            Stage::Kernel,
+            &tmp()
+        )
+        .is_ok(),
+        "the same kernel whose two statements of the length agree must translate"
+    );
+}

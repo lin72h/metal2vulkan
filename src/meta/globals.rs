@@ -1,25 +1,23 @@
-use super::location_index;
+use super::location_operands;
 use std::collections::{HashMap, HashSet};
 
+/// The Metal slot an argument node declares, resolving a function-constant slot through the
+/// module's static initializers.
+///
+/// The slot is the FIRST operand of the `air.location_index` pair; `fallback` (the parameter
+/// ordinal) stands in when it is a function-constant global this module does not initialize.
 pub(super) fn location_index_with_static(
     body: &str,
     fallback: u32,
     static_int_globals: &HashMap<String, u32>,
 ) -> u32 {
-    location_index_global(body)
-        .and_then(|global| static_int_globals.get(&global).copied())
-        .unwrap_or_else(|| location_index(body, fallback))
-}
-
-fn location_index_global(body: &str) -> Option<String> {
-    global_after_marker(body, "air.location_index")
-}
-
-fn global_after_marker(body: &str, marker: &str) -> Option<String> {
-    let marker = format!("!\"{marker}\"");
-    let pos = body.find(&marker)?;
-    let after = &body[pos + marker.len()..];
-    parse_global_name(after)
+    match location_operands(body).map(|operands| operands.index) {
+        Some(super::LocationOperand::Literal(index)) => index,
+        Some(super::LocationOperand::Global(global)) => {
+            static_int_globals.get(&global).copied().unwrap_or(fallback)
+        }
+        None => fallback,
+    }
 }
 
 fn parse_global_name(s: &str) -> Option<String> {

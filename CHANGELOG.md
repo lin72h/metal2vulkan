@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A sampler argument AIR states is an ARRAY is refused instead of sampled through a default sampler
+  nothing asked for. `air.location_index` carries two operands -- the Metal slot and the descriptor
+  count -- and Metal spells `array<sampler, 8>` with a count of 8. Nothing read the count, so the
+  argument bound as a single sampler; the element loads then resolved to nothing and the sample fell
+  back to the synthesized read sampler, dropping the state the shader selected in a module that
+  validates, binds and reflects as though one sampler at that slot were the whole story. Two of
+  14579 local corpus sources declare one. There is no sampler descriptor-array lowering, so the
+  honest answer is a `FALLBACK` naming the parameter and the count.
+
+  The same count now checks the texture-array length the type name states. AIR states that length
+  twice and all 76 corpus declarations agree, which is what makes the ABI usable as a standing check
+  on the name parse: a `array<texture..., N>` whose two statements disagree, or a count above one on
+  a name that is not an array at all, is refused rather than sized from the name alone.
+
+- The `air.location_index` operand pair is decoded by POSITION rather than by scanning forward for
+  the next operand of a given kind. Either operand may be a literal or a pointer to a
+  function-constant global, and all four combinations occur (112946 / 3404 / 1447 / 439 over 14579
+  local corpus sources). The slot decode looked for the first global after the marker, which is the
+  COUNT whenever the slot is a literal -- so an argument at `[[texture(1)]]` with a
+  function-constant array extent could bind at the extent's value instead of at 1. 439 corpus nodes
+  are that shape, 69 of them textures; the buffer half was already dodged by a type-name special
+  case for `array_ref<void>`, which the positional read makes unnecessary and which is now gone.
+  Latent today -- no corpus module resolves the count global -- and no longer reachable.
+
 - A fixed texture-handle array binds and reflects at the length AIR declares, not at the
   descriptor-ABI ceiling. `array<texture2d<half, sample>, 32>` states its length twice -- in the type
   name and as the second `air.location_index` operand -- and the decoded `TextureShape` already
