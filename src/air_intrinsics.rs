@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-/// Where the product intentionally handles an AIR intrinsic family.
+/// How the product treats an AIR intrinsic family it recognises.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AirIntrinsicDisposition {
     /// The native emitter or retained-SPIR-V passes lower this family directly.
@@ -17,6 +17,11 @@ pub enum AirIntrinsicDisposition {
     StaticLinkage,
     /// Some exact ABI shapes lower directly while callback-bearing shapes require static linkage.
     LoweredOrStaticLinkage,
+    /// A family this translator recognises and Vulkan has no equivalent for. Translation refuses.
+    ///
+    /// Distinct from `None`, which is a family nothing has modelled yet: the refusal here is the
+    /// modelled answer, and it names the family rather than reporting it as unrecognised.
+    NoVulkanEquivalent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -369,7 +374,14 @@ pub(crate) fn air_image_intrinsic(name: &str) -> bool {
     )
 }
 
-pub(crate) fn is_command_encoder_helper(name: &str) -> bool {
+/// The AIR families that encode into a Metal indirect command buffer.
+///
+/// Each writes a command into an ICB the shader received as an argument. Vulkan has no equivalent:
+/// its device-generated-command extensions describe a different, driver-defined layout that no
+/// sequence of SPIR-V instructions can produce from these operands. This is the single definition
+/// of that boundary -- translation refuses on it, and validation reports the tooling requirement
+/// from it.
+pub fn is_command_encoder_helper(name: &str) -> bool {
     matches!(
         name,
         "air.concurrent_dispatch_threadgroups_compute_command"
@@ -395,7 +407,9 @@ pub(crate) fn is_command_encoder_helper(name: &str) -> bool {
 /// prefix corresponds to a concrete dispatch arm, so a new sibling family remains visible until
 /// its implementation and this contract are added together.
 pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> {
-    use AirIntrinsicDisposition::{Lowered, LoweredOrStaticLinkage, StaticLinkage};
+    use AirIntrinsicDisposition::{
+        Lowered, LoweredOrStaticLinkage, NoVulkanEquivalent, StaticLinkage,
+    };
 
     if !name.starts_with("air.") {
         return None;
@@ -526,12 +540,11 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
         return Some(Lowered);
     }
 
-    // Command helpers are an intentional observed-output contract: translation consumes these exact
-    // stable ABI families while the validation executor reports the indirect-command-buffer tooling
-    // requirement separately. Do not admit the broad `_command` suffix: a new sibling must remain
-    // visible until both this contract and the lowering intentionally support it.
+    // Indirect-command-buffer encoding. Recognised, and refused: see
+    // [`is_command_encoder_helper`]. Do not admit the broad `_command` suffix -- a new sibling must
+    // remain visible until this contract and its handling are decided together.
     if is_command_encoder_helper(name) {
-        return Some(Lowered);
+        return Some(NoVulkanEquivalent);
     }
 
     if any_typed(
@@ -693,7 +706,7 @@ mod tests {
         assert_eq!(air_intrinsic_disposition("air.future_command"), None);
         assert_eq!(
             air_intrinsic_disposition("air.set_kernel_buffer_compute_command.p1i8"),
-            Some(AirIntrinsicDisposition::Lowered)
+            Some(AirIntrinsicDisposition::NoVulkanEquivalent)
         );
     }
 

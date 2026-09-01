@@ -1357,9 +1357,20 @@ pub(in crate::passes) fn lower_one(
     args: &[Word],
     v4: Word,
 ) -> Result<Vec<Instruction>, String> {
-    if name.starts_with("air.") && crate::air_intrinsics::air_intrinsic_disposition(name).is_none()
-    {
-        return Err(format!("unrecognized AIR intrinsic family: {name}"));
+    if name.starts_with("air.") {
+        match crate::air_intrinsics::air_intrinsic_disposition(name) {
+            None => return Err(format!("unrecognized AIR intrinsic family: {name}")),
+            // Recognised, and there is nothing to emit for it. Dropping the call would leave a
+            // module that validates, binds and reflects as though the shader had asked for
+            // nothing -- for an indirect-command-buffer encoder, that is the whole shader.
+            Some(crate::air_intrinsics::AirIntrinsicDisposition::NoVulkanEquivalent) => {
+                return Err(format!(
+                    "AIR family {name} has no Vulkan equivalent; emitting the module would \
+                     silently drop what the call does"
+                ))
+            }
+            Some(_) => {}
+        }
     }
     // texture sampling: air.sample_texture_<dim>.<ret>. Result is a {vecN, i8} struct in AIR; the
     // body then CompositeExtract member 0. We make our sample produce the same struct so the extract
@@ -1428,19 +1439,6 @@ pub(in crate::passes) fn lower_one(
             None,
             vec![],
         )]);
-    }
-    if crate::air_intrinsics::is_command_encoder_helper(name) {
-        if let Some(rty) = rty {
-            if !is_void_type(ctx, rty) {
-                return Err(format!(
-                    "command helper {name} unexpectedly returns a value"
-                ));
-            }
-        }
-        // These AIR helpers mutate Metal command encoders/indirect command buffers. The current
-        // conformance compute runner observes buffer bytes only, so preserve translation validity
-        // without claiming command-buffer side-effect emulation.
-        return Ok(vec![]);
     }
     if name.starts_with("air.fence_texture") {
         return lower_fence_texture(ctx, name, res, rty, args);

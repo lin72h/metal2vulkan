@@ -1905,7 +1905,7 @@ declare void @air.set_buffer_intersection_function_table.p1i8(ptr addrspace(1), 
     #[test]
     fn tooling_requirements_are_independent_not_precedence_ordered() {
         let mut row = source(
-            "define void @main() { ret void }\n!0 = !{i32 0, !\"air.imageblock\"}\n!1 = !{i32 1, !\"air.indirect_command_buffer\"}\n!2 = !{i32 2, !\"air.texture\", !\"air.arg_type_name\", !\"array_ref<texture2d<float, sample>>\"}",
+            "define void @main() { ret void }\n!0 = !{i32 0, !\"air.imageblock\"}\n!1 = !{i32 1, !\"air.command_buffer\", !\"air.location_index\", i32 0}\n!2 = !{i32 2, !\"air.texture\", !\"air.arg_type_name\", !\"array_ref<texture2d<float, sample>>\"}",
         );
         row.stage = "Fragment".into();
         let result = classify(&row);

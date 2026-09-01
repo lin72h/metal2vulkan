@@ -21,7 +21,16 @@ pub fn unsupported_air_requirements(source_ll: &str) -> BTreeSet<ToolingRequirem
     {
         requirements.insert(ToolingRequirement::ImplicitImageblockLiteral);
     }
-    if source_ll.contains("!\"air.indirect_command_buffer\"") {
+    // Ask the product what an indirect-command-buffer encoder looks like rather than restating it.
+    // This used to key on `!"air.indirect_command_buffer"`, a metadata string no AIR module the
+    // harvest has ever produced carries -- so the requirement was never reported for any real
+    // encoder. What they do carry is a call into one of the encoder families and an
+    // `air.command_buffer` argument-buffer member.
+    if air_call_counts(source_ll)
+        .keys()
+        .any(|name| metal2vulkan::air_intrinsics::is_command_encoder_helper(name))
+        || source_ll.contains("!\"air.command_buffer\"")
+    {
         requirements.insert(ToolingRequirement::IndirectCommandBuffer);
     }
     requirements
@@ -641,7 +650,11 @@ mod tests {
                 ToolingRequirement::ImplicitImageblockLiteral,
             ),
             (
-                "!0 = !{i32 0, !\"air.indirect_command_buffer\"}",
+                "call void @air.set_kernel_buffer_compute_command.p1i8()",
+                ToolingRequirement::IndirectCommandBuffer,
+            ),
+            (
+                "!0 = !{i32 0, !\"air.command_buffer\", !\"air.location_index\", i32 0}",
                 ToolingRequirement::IndirectCommandBuffer,
             ),
         ] {

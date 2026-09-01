@@ -19,12 +19,6 @@ pub(in crate::passes) fn is_half_scalar_or_vector(ctx: &Ctx, ty: Word) -> bool {
     is_half_scalar(ctx, ty) || is_half_vector(ctx, ty)
 }
 
-pub(in crate::passes) fn is_void_type(ctx: &Ctx, ty: Word) -> bool {
-    type_def_of(ctx, ty)
-        .map(|def| def.class.opcode == Op::TypeVoid)
-        .unwrap_or(false)
-}
-
 pub(in crate::passes) fn is_bool_type(ctx: &Ctx, ty: Word) -> bool {
     type_def_of(ctx, ty)
         .map(|def| def.class.opcode == Op::TypeBool)

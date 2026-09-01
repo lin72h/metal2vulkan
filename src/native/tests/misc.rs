@@ -892,8 +892,16 @@ declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)
     }
 }
 
+/// A shader that encodes into an indirect command buffer must not translate to one that does not.
+///
+/// These helpers were lowered to nothing, on the reasoning that the conformance runner reads only
+/// buffer bytes. What came out was a module that validates, binds and reflects exactly like the
+/// original while performing none of the encoding the shader exists to do -- for a kernel whose
+/// whole body is `set_pipeline_state` / `set_kernel_buffer` / `draw_primitives`, that is the whole
+/// shader. Vulkan has no equivalent to encode into, so the honest answer is a refusal that names
+/// the family.
 #[test]
-fn native_void_command_helpers_lower_to_noops() {
+fn native_command_encoder_helpers_are_refused_rather_than_dropped() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 define void @main() {
@@ -906,29 +914,38 @@ entry:
 declare void @air.set_object_buffer_render_command.p1i8(ptr addrspace(1), i32, ptr addrspace(1), i32)
 declare void @air.draw_primitives_render_command(ptr addrspace(1), i32, i32, i32, i32, i32, i32)
 "#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_command_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
     let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
-    let out = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
-        .expect("interface transform")
-        .assemble()
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect::<Vec<_>>();
-    let asm = disassemble(&out).expect("disassemble transformed");
-    assert!(!asm.contains("OpFunctionCall"), "{asm}");
-    assert!(!asm.contains("set_object_buffer_render_command"), "{asm}");
-    assert!(!asm.contains("draw_primitives_render_command"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    let error = passes::transform(module, Stage::Kernel, None, None, None, Some("main"))
+        .expect_err("an indirect-command-buffer encoder has no Vulkan lowering");
+    assert!(
+        error.contains("air.set_object_buffer_render_command")
+            || error.contains("air.draw_primitives_render_command"),
+        "the refusal must name the family it could not lower: {error}"
+    );
+    assert!(
+        error.contains("no Vulkan equivalent"),
+        "the refusal must say the family is recognised, not unknown: {error}"
+    );
+}
+
+/// The refusal is not the generic unknown-symbol path: the family is modelled, and says so.
+#[test]
+fn a_command_encoder_family_is_recognised_rather_than_unknown() {
+    use crate::air_intrinsics::{air_intrinsic_disposition, AirIntrinsicDisposition};
+    for name in [
+        "air.set_object_buffer_render_command.p1i8",
+        "air.draw_primitives_render_command",
+        "air.set_kernel_buffer_compute_command.p2i8",
+        "air.set_threadgroup_memory_length_compute_command",
+    ] {
+        assert_eq!(
+            air_intrinsic_disposition(name),
+            Some(AirIntrinsicDisposition::NoVulkanEquivalent),
+            "{name}"
+        );
     }
+    // A sibling nobody has decided about stays unrecognised, so it cannot arrive silently.
+    assert_eq!(air_intrinsic_disposition("air.future_command"), None);
 }
 
 #[test]

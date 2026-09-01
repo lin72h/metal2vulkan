@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A shader that encodes into an indirect command buffer is refused instead of translated into one
+  that does not. The `air.*_command` encoder families -- `set_pipeline_state_compute_command`,
+  `set_kernel_buffer_compute_command`, `draw_primitives_render_command` and their siblings -- were
+  lowered to nothing, on the reasoning that the conformance runner observes buffer bytes only. What
+  that produced was a module that validates, binds and reflects exactly like the original while
+  performing none of the encoding, which for a kernel whose body is entirely ICB encoding is the
+  whole shader. Vulkan's device-generated-command extensions describe a different, driver-defined
+  layout that no sequence of SPIR-V instructions can produce from these operands, so the honest
+  answer is a `FALLBACK` naming the family. Twelve of 14579 local corpus sources reach it (two of
+  the 2880-source A/B sample), all of which previously reported success.
+
+  `AirIntrinsicDisposition::NoVulkanEquivalent` now distinguishes a family the translator has
+  modelled and refuses from one nothing has modelled yet, so the refusal names the family rather
+  than reporting it as unrecognised. Validation's `IndirectCommandBuffer` tooling requirement is
+  derived from the same `is_command_encoder_helper` definition: it previously keyed on
+  `!"air.indirect_command_buffer"`, a metadata string no harvested AIR module carries, so it never
+  fired for a real encoder. It now fires on an encoder call or an `air.command_buffer` argument.
+
 - One encoder produces every `half` constant the translator mints. The native emitter and the
   passes layer each carried their own `f32` -> binary16 conversion, and they disagreed: the passes
   copy rounded half-away-from-zero rather than to even, and combined the rounded significand into

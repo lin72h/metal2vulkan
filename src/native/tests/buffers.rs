@@ -3266,11 +3266,9 @@ entry:
   %arg = getelementptr inbounds i8, ptr addrspace(1) %base, i64 4
   store i32 %tid, ptr addrspace(1) %arg, align 4
   tail call void @llvm.memcpy.p1.p2.i64(ptr addrspace(1) %arg, ptr addrspace(2) %params, i64 4, i1 false)
-  tail call void @air.set_object_buffer_render_command.p1i8(ptr addrspace(1) null, i32 %tid, ptr addrspace(1) %arg, i32 2)
   ret void
 }
 
-declare void @air.set_object_buffer_render_command.p1i8(ptr addrspace(1), i32, ptr addrspace(1), i32)
 declare void @llvm.memcpy.p1.p2.i64(ptr addrspace(1), ptr addrspace(2), i64, i1)
 
 !air.kernel = !{!0}
