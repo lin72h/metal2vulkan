@@ -11280,8 +11280,12 @@ fn native_uchar3_struct_preserves_authoritative_air_offsets() {
     );
 }
 
+/// Calling the four-byte `uchar3` member a `float3` widens it to sixteen bytes, so it now runs over
+/// the two members declared after it. Overlapping members are exactly what forces the buffer to a
+/// raw word view, and a raw buffer has no members for the declared offsets to land on -- so the
+/// evidence this leaves is that no comparison was possible, not that one was made and failed.
 #[test]
-fn native_struct_layout_shape_mismatch_is_typed_sidecar_evidence() {
+fn native_struct_layout_overlap_leaves_typed_sidecar_evidence() {
     let ll = vector_allocation_stride_with_metadata().replace("!\"uchar3\"", "!\"float3\"");
     let kern = meta::parse_air_kernel_meta(&ll);
     let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
@@ -11294,7 +11298,7 @@ fn native_struct_layout_shape_mismatch_is_typed_sidecar_evidence() {
 
     assert_eq!(
         emitted.sidecar.air_struct_layout_mappings[0].status,
-        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
+        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedIsUntypedBuffer
     );
     assert!(emitted.sidecar.air_struct_offsets.is_empty());
 }
@@ -11503,11 +11507,13 @@ fn native_opaque_struct_member_keeps_the_declared_offsets() {
 #[test]
 fn native_opaque_struct_member_of_the_wrong_size_is_still_a_mismatch() {
     // Size is the only claim an unmodelled member makes, so it is the only claim that can fail --
-    // but it must be able to fail. A member declared twelve bytes does not describe the eight-byte
-    // member the emitter produced, and accepting it would shift every following offset.
+    // but it must be able to fail. A member declared four bytes does not describe the eight-byte
+    // member the emitter produced, and accepting it would shift every following offset. Four rather
+    // than twelve keeps the declared members from overlapping, so the buffer keeps its struct type
+    // and the disagreement is reported as one.
     let ll = OPAQUE_STRUCT_MEMBER_LL.replace(
         "i32 4, i32 8, i32 0, !\"Inner\"",
-        "i32 4, i32 12, i32 0, !\"Inner\"",
+        "i32 4, i32 4, i32 0, !\"Inner\"",
     );
     let kern = meta::parse_air_kernel_meta(&ll);
     let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
@@ -11523,4 +11529,75 @@ fn native_opaque_struct_member_of_the_wrong_size_is_still_a_mismatch() {
         crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
     );
     assert!(emitted.sidecar.air_struct_offsets.is_empty());
+}
+
+/// A buffer whose accesses are byte-addressed is emitted as its raw contents -- a pointer straight
+/// to a word, or the block a storage buffer requires wrapping a runtime array of one. The Metal
+/// struct AIR describes has no members to line up against that, which is a different fact from two
+/// structural descriptions disagreeing, and the two ask for different work.
+const BYTE_ADDRESSED_BUFFER_LL: &str = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-n8:16:32"
+target triple = "air64-apple-macosx10.15.0"
+
+define void @k(ptr addrspace(2) noalias readonly %cfg, ptr addrspace(1) %out, i32 %tid) {
+entry:
+  %off = zext i32 %tid to i64
+  %p = getelementptr inbounds i8, ptr addrspace(2) %cfg, i64 %off
+  %v = load i32, ptr addrspace(2) %p, align 4
+  store i32 %v, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !6}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Cfg", !"air.arg_name", !"cfg"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"a", i32 4, i32 4, i32 0, !"float", !"b", i32 8, i32 4, i32 0, !"uint", !"c"}
+!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+
+#[test]
+fn native_byte_addressed_buffer_is_untyped_rather_than_mismatched() {
+    let kern = meta::parse_air_kernel_meta(BYTE_ADDRESSED_BUFFER_LL);
+    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
+        BYTE_ADDRESSED_BUFFER_LL,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("emit byte-addressed buffer");
+
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings[0].status,
+        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedIsUntypedBuffer,
+        "a raw buffer has no members to carry the declared offsets, which is not a disagreement"
+    );
+    assert!(emitted.sidecar.air_struct_offsets.is_empty());
+}
+
+#[test]
+fn native_typed_buffer_with_wrong_member_shapes_stays_a_mismatch() {
+    // A buffer that keeps its struct type: there are members to compare, and AIR calls the middle
+    // one a `uint` where the emitter produced a struct. Nothing overlaps, so the buffer is not
+    // pushed to a raw view, and the disagreement stays visible as one -- which is the residue worth
+    // looking at, and what the untyped status above must not swallow.
+    let ll = OPAQUE_STRUCT_MEMBER_LL.replace(
+        "i32 4, i32 8, i32 0, !\"Inner\"",
+        "i32 4, i32 4, i32 0, !\"uint\"",
+    );
+    let kern = meta::parse_air_kernel_meta(&ll);
+    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
+        &ll,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("emit mismatched AIR layout");
+
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings[0].status,
+        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
+    );
 }

@@ -89,6 +89,14 @@ pub(crate) enum AirStructLayoutMappingStatus {
     ParameterMissing,
     ParameterIsNotPointer,
     MetadataIsNotStruct,
+    /// The emitted parameter carries no members for the declared offsets to land on: once the
+    /// storage-buffer block is stripped, the type the shader indexes is a scalar or a vector. That
+    /// is the raw byte/word view a buffer takes when its accesses are byte-addressed, and it is not
+    /// a disagreement with the metadata -- there is nothing to disagree with. Keeping it apart from
+    /// [`AirStructLayoutMappingStatus::EmittedShapeMismatch`] matters because the two ask for
+    /// different work: over 2880 corpus sources 1681 of 1805 unmapped parameters are this, and the
+    /// 124 that remain are the ones where two structural descriptions actually differ.
+    EmittedIsUntypedBuffer,
     EmittedShapeMismatch,
     NonIncreasingOffsets,
 }

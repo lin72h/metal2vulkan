@@ -69,13 +69,18 @@ impl Emitter {
                     });
                 continue;
             };
-            let status = remember_existing_air_struct_offsets(
+            let mut status = remember_existing_air_struct_offsets(
                 &mut self.emit_sidecar.air_struct_offsets,
                 &defs,
                 struct_ty,
                 layout,
                 air_data_layout,
             );
+            if status == AirStructLayoutMappingStatus::EmittedShapeMismatch
+                && !emitted_carries_members(&defs, struct_ty)
+            {
+                status = AirStructLayoutMappingStatus::EmittedIsUntypedBuffer;
+            }
             self.emit_sidecar
                 .air_struct_layout_mappings
                 .push(AirStructLayoutMapping {
@@ -102,6 +107,42 @@ impl Emitter {
                     }),
             );
     }
+}
+
+/// Whether a buffer parameter's emitted pointee has any members for AIR's declared offsets to land
+/// on, once Vulkan's packaging is stripped off.
+///
+/// A buffer whose accesses are byte-addressed is emitted as its raw contents: a pointer straight to
+/// a scalar, or the block a storage buffer requires -- a one-member struct -- wrapping a runtime
+/// array of one. `air.struct_type_info` still describes the Metal struct, so the comparison finds
+/// nothing to match, but nothing matching is not the same as two descriptions disagreeing. Over
+/// 2880 corpus sources 1730 of the 1805 unmapped parameters are this, and reporting them as shape
+/// mismatches buried the 75 where the shapes really do differ.
+fn emitted_carries_members(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
+    let mut current = ty;
+    // The SPIR-V type graph is acyclic, but the bound keeps a malformed input from spinning.
+    for _ in 0..8 {
+        let Some(def) = defs.get(&current) else {
+            return false;
+        };
+        match def.class.opcode {
+            Op::TypeStruct if def.operands.len() != 1 => return true,
+            Op::TypeStruct => match def.operands.first() {
+                Some(Operand::IdRef(member_ty)) => current = *member_ty,
+                _ => return true,
+            },
+            Op::TypeRuntimeArray => match def.operands.first() {
+                Some(Operand::IdRef(elem)) => current = *elem,
+                _ => return false,
+            },
+            Op::TypeArray => match array_type(defs, current) {
+                Some((elem, _len)) => current = elem,
+                None => return false,
+            },
+            _ => return false,
+        }
+    }
+    false
 }
 
 fn pointer_pointee(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<Word> {

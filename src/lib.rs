@@ -931,6 +931,12 @@ fn finish_module(
                     "[retry-debug] AIR struct layout param={} type={:?}: exact metadata differs from natural layout; using exact offsets",
                     mapping.param_index, mapping.struct_ty
                 ),
+                // Not a disagreement: a byte-addressed buffer is emitted as its raw contents, so
+                // there are no members for the declared offsets to land on in the first place.
+                emit_sidecar::AirStructLayoutMappingStatus::EmittedIsUntypedBuffer => eprintln!(
+                    "[retry-debug] AIR struct layout param={} type={:?}: emitted as an untyped buffer; declared offsets do not apply",
+                    mapping.param_index, mapping.struct_ty
+                ),
                 status => eprintln!(
                     "[retry-debug] AIR struct layout param={} type={:?}: unmapped ({status:?}); using datalayout-derived natural layout",
                     mapping.param_index, mapping.struct_ty

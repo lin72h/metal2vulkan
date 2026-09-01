@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An entry buffer whose declared AIR layout could not be attached to the emitted parameter now says
+  which of the two things happened. A byte-addressed buffer is emitted as its raw contents -- a
+  pointer to a word, or the block a storage buffer requires wrapping a runtime array of one -- and
+  has no members for the declared offsets to land on, which is not the same as two structural
+  descriptions disagreeing. Both reported `EmittedShapeMismatch`; over 2880 corpus sources 1733 of
+  the 1805 unmapped parameters are the former, and reporting them as mismatches buried the 72 where
+  the shapes really do differ.
 - A buffer member `air.struct_type_info` names without describing -- a user struct or class
   mentioned by name only -- decodes as `AirType::Opaque { size }` at the byte size the member tuple
   declares, instead of as a 32-bit `Float`. The float leaf named a type AIR never stated and sized
