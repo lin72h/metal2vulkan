@@ -69,14 +69,18 @@ fn bindings_the_module_declares(spirv: &[u8]) -> BTreeSet<(u32, u32)> {
 
 /// Every `(set, binding)` reflection reports, from all three places it carries one: ordinary
 /// resources, implicit imageblock attachment planes, and custom fragment imageblock members.
+///
+/// A descriptor array occupies ONE binding holding `count` descriptors, not `count` consecutive
+/// bindings -- `DescriptorLocation` maps to a single `VkDescriptorSetLayoutBinding`. Expanding the
+/// count into a binding range would let one array silently vouch for every binding above it: a
+/// runtime handle array at 480 with a count of 128 would "report" the whole storage-texture band,
+/// so a module variable decorated anywhere in it would pass a check reflection never made.
 fn bindings_reflection_reports(reflection: &ShaderReflection) -> BTreeSet<(u32, u32)> {
     let set = reflection.descriptor_layout.set;
     let mut reported = BTreeSet::new();
     for resource in &reflection.bindings {
         if let Some(location) = &resource.descriptor {
-            for index in 0..location.count {
-                reported.insert((location.set, location.binding + index));
-            }
+            reported.insert((location.set, location.binding));
         }
     }
     for attachment in &reflection.implicit_imageblock_attachments {
