@@ -10,6 +10,7 @@ pub(in crate::passes) fn finalize(
     ctx: &mut Ctx,
     entry_idx: usize,
     stage: &Stage,
+    frag: Option<&FragMeta>,
     vert: Option<&VertMeta>,
 ) -> Result<(), String> {
     // The entry must be `void main()` with FunctionControl None. The backend gave it the AIR return
@@ -151,6 +152,21 @@ pub(in crate::passes) fn finalize(
                 Operand::ExecutionMode(spirv::ExecutionMode::OriginUpperLeft),
             ],
         ));
+        // `[[early_fragment_tests]]`. Depth and stencil run before the body, so a fragment the
+        // test rejects performs none of the body's stores. Under Vulkan's default late test the
+        // same shader performs every store and only its color output is thrown away, which is a
+        // different program wherever the fragment writes a buffer, texture or imageblock.
+        if frag.is_some_and(|meta| meta.early_fragment_tests) {
+            ctx.module.execution_modes.push(Instruction::new(
+                Op::ExecutionMode,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(entry_id),
+                    Operand::ExecutionMode(spirv::ExecutionMode::EarlyFragmentTests),
+                ],
+            ));
+        }
         if ctx.writes_frag_depth {
             ctx.module.execution_modes.push(Instruction::new(
                 Op::ExecutionMode,

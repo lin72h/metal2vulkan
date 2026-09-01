@@ -371,6 +371,41 @@ pub(super) fn build_stage_input(
         ));
     }
 
+    // An attribute on the stage root states how the entry runs, not how it is named: early depth
+    // testing, a tessellation domain, a threadgroup ceiling. Whichever stage carries one that this
+    // translator has no model for, emitting the module would answer the attribute with silence --
+    // the module validates, binds and reflects exactly as if AIR had asked for nothing.
+    let unmodelled_attributes = match stage {
+        Stage::Fragment => frag.map(|meta| meta.unmodelled_stage_attributes.as_slice()),
+        Stage::Vertex => vert.map(|meta| meta.unmodelled_stage_attributes.as_slice()),
+        Stage::Kernel => kern.map(|meta| meta.unmodelled_stage_attributes.as_slice()),
+    }
+    .unwrap_or_default();
+    if let Some(attribute) = unmodelled_attributes.first() {
+        return Err(format!(
+            "entry declares stage attribute `{attribute}`, which this translator does not model; \
+             emitting the module would silently drop what it asks of the stage"
+        ));
+    }
+
+    // `[[early_fragment_tests]]` runs the depth and stencil tests before the body, so the body
+    // cannot be the source of a value either test compares -- it does not exist yet. Metal rejects
+    // the pair outright. Emitting both would give a module whose `FragDepth` / `FragStencilRefEXT`
+    // store is inert against the very test it was computed for.
+    if let Some(meta) = frag.filter(|meta| meta.early_fragment_tests) {
+        for (members, role) in [
+            (&meta.depth_members, "air.depth"),
+            (&meta.stencil_members, "air.stencil"),
+        ] {
+            if !members.is_empty() {
+                return Err(format!(
+                    "entry declares `early_fragment_tests` and writes `{role}`; the test runs \
+                     before the value the shader computes for it exists"
+                ));
+            }
+        }
+    }
+
     for (i, (pid, pty)) in params.iter().enumerate() {
         let idx = i as u32;
         let role_is = |s: &str| match stage {

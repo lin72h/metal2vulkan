@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every attribute an AIR stage root carries is read, and one the translator has no model for is
+  refused instead of dropped. All three roots -- `!air.kernel`, `!air.vertex`, `!air.fragment` --
+  state their per-entry attributes as extra operands past `(function, outputs, inputs)`, but not in
+  one form: `air.patch` and `air.max_work_group_size` are references to a keyed node, while
+  `early_fragment_tests` is a bare string on the root itself. Only the vertex decode looked at that
+  tail, and only for `air.patch`, so:
+  - `[[early_fragment_tests]]` reaches SPIR-V as `OpExecutionMode ... EarlyFragmentTests`. It was
+    dropped on 51 of 14579 local corpus sources, which emitted them with Vulkan's default late
+    depth test. Under early tests a fragment the depth test rejects performs none of the body's stores; under
+    late tests the same shader performs every buffer, texture and imageblock write and only its
+    color output is discarded. A fragment that both declares it and writes `air.depth` or
+    `air.stencil` is refused: the test runs before the value it compares exists.
+  - `[[max_total_threads_per_threadgroup(N)]]` (`air.max_work_group_size`, 439 of the same sources)
+    bounds the requested kernel `LocalSize`. A dispatch wider than the ceiling the entry was
+    compiled for is refused rather than emitted as a module that validates and runs a shape the
+    source ruled out.
+
+  A/B over a 2880-source sample: no status changes, and the only SPIR-V byte changes are the ten
+  fragments that declare `early_fragment_tests`, each gaining exactly the one execution mode and
+  still passing `spirv-val`. No source in that sample requests a dispatch past its ceiling.
+
 - `reflect_sanitized` decides whether a kernel needs a buffer-address table with the emitter's own
   device-address predicate rather than a line-prefix scan of the AIR text. The scan disagreed with
   the finished module on 63 of 2880 corpus sources -- 49 by reporting a binding no module declares,

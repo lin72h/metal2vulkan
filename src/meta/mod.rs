@@ -159,6 +159,17 @@ pub struct FragMeta {
     /// silent zero, and everything computed from it is wrong in a module that validates. Emission
     /// rejects on a non-empty list instead.
     pub unmodelled_input_params: Vec<(u32, String)>,
+    /// Every attribute on the `!air.fragment` root this stage has no model for, as it reads in
+    /// AIR. See [`FragMeta::early_fragment_tests`]: the root's attribute tail changes what the
+    /// stage does, so an entry carrying an attribute nothing consumes must be refused rather than
+    /// emitted as if the root had carried nothing.
+    pub unmodelled_stage_attributes: Vec<String>,
+    /// `[[early_fragment_tests]]`: depth and stencil testing happens before the fragment body.
+    ///
+    /// This is not an optimisation hint. A fragment the depth test rejects runs no part of the
+    /// body, so none of its buffer, texture or imageblock stores happen; under the default late
+    /// test the same shader performs every store and only its color output is discarded.
+    pub early_fragment_tests: bool,
     /// Descriptor-backed render-target planes used by implicit imageblock load/store intrinsics.
     /// Detected from the module's intrinsic calls, which is a property of the body rather than of
     /// the stage — the interface pass materializes the plane wherever it lowers one of those calls,
@@ -487,6 +498,9 @@ pub struct VertMeta {
     /// and the module that results is valid, binds, reflects, and draws the wrong geometry. The
     /// stage-input pass refuses on this rather than emitting it.
     pub undecoded_patch_shape: Option<String>,
+    /// Every attribute on the `!air.vertex` root this stage has no model for, as it reads in AIR.
+    /// Mirrors [`FragMeta::unmodelled_stage_attributes`].
+    pub unmodelled_stage_attributes: Vec<String>,
 }
 
 impl VertMeta {
@@ -633,6 +647,13 @@ pub struct KernMeta {
     /// `(parameter index, AIR role)` for every enabled entry parameter whose role has no
     /// lowering. See [`FragMeta::unmodelled_input_params`].
     pub unmodelled_input_params: Vec<(u32, String)>,
+    /// Every attribute on the `!air.kernel` root this stage has no model for, as it reads in AIR.
+    /// Mirrors [`FragMeta::unmodelled_stage_attributes`].
+    pub unmodelled_stage_attributes: Vec<String>,
+    /// `[[max_total_threads_per_threadgroup(N)]]`: the largest threadgroup the entry was compiled
+    /// to run. A dispatch wider than this is outside what the AIR body was built for, so the
+    /// requested `LocalSize` is checked against it rather than emitted unread.
+    pub max_work_group_size: Option<u32>,
     /// Function-constant-wrapped buffer parameter index -> Metal buffer location. Multiple mutually
     /// exclusive typed alternatives may intentionally share one location.
     pub function_constant_buffer_locations: HashMap<u32, u32>,
@@ -786,6 +807,14 @@ fn parse_air_kernel_meta_with_nodes(
     let refs = refs_in(rootc);
     // The argument-info list is the SECOND ref (`!EMPTY` is the first — an empty placeholder node).
     let in_ref = *refs.get(1)?;
+    let mut max_work_group_size = None;
+    let mut unmodelled_stage_attributes = vec![];
+    for attribute in stage_root_attributes(rootc, nodes) {
+        match attribute {
+            StageAttribute::MaxWorkGroupSize(size) => max_work_group_size = Some(size),
+            other => unmodelled_stage_attributes.push(other.describe()),
+        }
+    }
 
     let mut roles = vec![];
     let mut unmodelled_input_params: Vec<(u32, String)> = vec![];
@@ -938,6 +967,8 @@ fn parse_air_kernel_meta_with_nodes(
     Some(KernMeta {
         roles,
         unmodelled_input_params,
+        unmodelled_stage_attributes,
+        max_work_group_size,
         function_constant_buffer_locations,
         buffer_layouts,
         imageblock_layouts,
@@ -1270,6 +1301,84 @@ fn stage_root(ll: &str, stage: &str) -> Option<u32> {
         }
     }
     None
+}
+
+/// One per-entry attribute carried by a stage root node, past its
+/// `(function, outputs, inputs)` operand triple.
+///
+/// All three roots -- `!air.kernel`, `!air.vertex`, `!air.fragment` -- grow their entry
+/// attributes in that same tail, but not in the same form: some are references to a keyed node
+/// (`!{!"air.patch", ...}`), some are bare strings (`!"early_fragment_tests"`). A stage that
+/// scans the tail for only the one attribute it knows cannot tell "no attribute" from "an
+/// attribute I have never seen", so a new one is dropped in silence. Decoding the whole tail in
+/// one place is what makes the difference observable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StageAttribute {
+    /// `!{!"air.patch", !"<domain>", !"air.patch_control_point", i32 N}` on a post-tessellation
+    /// vertex function. Carries the node body; the vertex decode reads the shape out of it.
+    Patch(String),
+    /// `!"early_fragment_tests"` -- `[[early_fragment_tests]]`. Depth and stencil tests run
+    /// before the fragment body, so a fragment the test rejects performs none of the body's
+    /// stores. Vulkan spells it `OpExecutionMode ... EarlyFragmentTests`.
+    EarlyFragmentTests,
+    /// `!{!"air.max_work_group_size", i32 N}` -- `[[max_total_threads_per_threadgroup(N)]]`. The
+    /// largest threadgroup this entry was compiled to run.
+    MaxWorkGroupSize(u32),
+    /// A tail operand this translator has no model for. Carried out so a stage can refuse rather
+    /// than emit a module that silently lacks whatever the attribute asked for.
+    Unrecognized(String),
+}
+
+impl StageAttribute {
+    /// How the attribute reads back in a refusal message.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            StageAttribute::Patch(_) => "air.patch".to_string(),
+            StageAttribute::EarlyFragmentTests => "early_fragment_tests".to_string(),
+            StageAttribute::MaxWorkGroupSize(_) => "air.max_work_group_size".to_string(),
+            StageAttribute::Unrecognized(text) => text.clone(),
+        }
+    }
+}
+
+/// Decode the attribute tail of a stage root node body.
+///
+/// The first three operands are the entry function pointer, its output node and its input node;
+/// every operand after them is an attribute. Recognition is by the attribute's own ABI marker,
+/// never by its position in the tail.
+fn stage_root_attributes(rootc: &str, nodes: &HashMap<u32, String>) -> Vec<StageAttribute> {
+    let operands = split_top_level_commas(rootc);
+    operands
+        .iter()
+        .skip(3)
+        .filter_map(|operand| {
+            let referenced = operand
+                .strip_prefix('!')
+                .and_then(|digits| digits.parse::<u32>().ok())
+                .and_then(|id| nodes.get(&id));
+            Some(match referenced {
+                Some(node) if node.contains("!\"air.patch\"") => {
+                    StageAttribute::Patch(node.clone())
+                }
+                Some(node) if node.contains("!\"air.max_work_group_size\"") => {
+                    match i32_after_marker(node, "air.max_work_group_size") {
+                        Some(size) => StageAttribute::MaxWorkGroupSize(size),
+                        None => StageAttribute::Unrecognized(
+                            "air.max_work_group_size states no thread count".to_string(),
+                        ),
+                    }
+                }
+                // A node with no operands states nothing, so there is nothing here to model and
+                // nothing emission could drop. Refusing it would cost a translation for no safety.
+                Some(node) if node.trim().is_empty() => return None,
+                Some(node) => StageAttribute::Unrecognized(format!("!{{{node}}}")),
+                None if operand == "!\"early_fragment_tests\"" => {
+                    StageAttribute::EarlyFragmentTests
+                }
+                None => StageAttribute::Unrecognized(operand.clone()),
+            })
+        })
+        .collect()
 }
 
 /// The metadata refs (`!N`) appearing in a node body, in order. Skips `ptr @func` operands.
@@ -1815,6 +1924,14 @@ fn parse_air_fragment_meta_with_nodes(
     let rootc = nodes.get(&root)?;
     let refs = refs_in(rootc);
     let (out_ref, in_ref) = (*refs.first()?, *refs.get(1)?);
+    let mut early_fragment_tests = false;
+    let mut unmodelled_stage_attributes = vec![];
+    for attribute in stage_root_attributes(rootc, nodes) {
+        match attribute {
+            StageAttribute::EarlyFragmentTests => early_fragment_tests = true,
+            other => unmodelled_stage_attributes.push(other.describe()),
+        }
+    }
     let fragment_imageblock = parse_fragment_imageblock(nodes, out_ref, in_ref);
     let render_target_members: Vec<(u32, u32)> = nodes
         .get(&out_ref)
@@ -2067,6 +2184,8 @@ fn parse_air_fragment_meta_with_nodes(
         .collect::<Vec<_>>();
     Some(FragMeta {
         roles,
+        unmodelled_stage_attributes,
+        early_fragment_tests,
         unmodelled_input_params,
         implicit_imageblock_attachments: detect_implicit_imageblock_attachments(ll)?,
         varying_types,
@@ -2128,16 +2247,19 @@ fn parse_air_vertex_meta_with_nodes(
     let refs = refs_in(rootc);
     let out_ref = *refs.first()?;
     let in_ref = *refs.get(1)?;
-    // Find the patch node by what it says rather than by where it sits. A post-tessellation vertex
-    // function's root carries it third, but position is not the fact -- `air.patch` is -- and
-    // reading position alone cannot tell a patch node from whatever else a root might grow.
-    let patch_node = refs
-        .iter()
-        .skip(2)
-        .filter_map(|patch_ref| nodes.get(patch_ref))
-        .find(|node| node.contains("!\"air.patch\""));
+    // Read the whole attribute tail, not just the one attribute this stage models. A patch node is
+    // recognised by what it says (`air.patch`) rather than by where it sits, and anything else the
+    // root carries becomes a named refusal instead of silence.
+    let mut patch_node = None;
+    let mut unmodelled_stage_attributes = vec![];
+    for attribute in stage_root_attributes(rootc, nodes) {
+        match attribute {
+            StageAttribute::Patch(node) => patch_node = Some(node),
+            other => unmodelled_stage_attributes.push(other.describe()),
+        }
+    }
     let mut undecoded_patch_shape = None;
-    let patch_shape = patch_node.and_then(|node| {
+    let patch_shape = patch_node.as_deref().and_then(|node| {
         let domain = if node.contains("!\"quad\"") {
             PatchDomain::Quad
         } else if node.contains("!\"triangle\"") {
@@ -2397,6 +2519,7 @@ fn parse_air_vertex_meta_with_nodes(
         },
         embedded_arguments: detect_embedded_arguments(nodes, &indirect_buffer_struct_refs),
         undecoded_patch_shape,
+        unmodelled_stage_attributes,
         tessellation: patch_shape.map(|(domain, control_point_count)| {
             let (control_point_function, control_point_fields) = patch_control_point
                 .map(|(function, fields)| (Some(function), fields))

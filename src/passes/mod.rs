@@ -2385,8 +2385,21 @@ pub(crate) fn transform_with_options_and_sidecar(
     entry_name: Option<&str>,
     options: TransformOptions,
 ) -> Result<Transformed, String> {
-    if matches!(stage, Stage::Kernel) && options.kernel_local_size.contains(&0) {
-        return Err("kernel LocalSize dimensions must be non-zero".to_string());
+    validate_kernel_dispatch_options(stage, options)?;
+    // The entry states the largest threadgroup it was compiled to run. A dispatch wider than that
+    // is outside the body's own contract -- Metal sizes its threadgroup allocations and simdgroup
+    // reasoning against the declared ceiling -- so emitting the requested LocalSize anyway would
+    // produce a module that validates and runs a shape the source ruled out.
+    if let (Stage::Kernel, Some(ceiling)) = (stage, kern.and_then(|meta| meta.max_work_group_size))
+    {
+        let [x, y, z] = options.kernel_local_size;
+        let requested = x.saturating_mul(y).saturating_mul(z);
+        if requested > ceiling {
+            return Err(format!(
+                "kernel LocalSize {x}x{y}x{z} is {requested} threads, past the \
+                 `air.max_work_group_size` ceiling of {ceiling} this entry was compiled for"
+            ));
+        }
     }
     if let Some(dispatch) = options.kernel_dispatch {
         dispatch.validate()?;
@@ -2663,7 +2676,7 @@ pub(crate) fn transform_with_options_and_sidecar(
     ctx.emit_sidecar.aggregate_pointer_values.clear();
     // 3) finalize: append synthesized globals, drop dead air.* decls, add entry point + exec modes,
     //    bump the bound.
-    finalize(&mut ctx, entry_idx, &stage, vert)?;
+    finalize(&mut ctx, entry_idx, &stage, frag, vert)?;
     // Interface finalization can replace an optional scalar parameter with a Private scalar slot
     // while retaining LLVM's zero-only GEP descent. Close those identity chains on the complete
     // interface graph before the owned type check.
