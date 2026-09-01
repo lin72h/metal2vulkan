@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reflected translation no longer asks a consumer to create a `VkSampler` at a binding the module
+  does not declare. `StaticSampler` is a descriptor translation invents -- nothing in Metal's API
+  puts one there, so the only reason a consumer creates it is that this reflection asked. Reflection
+  named one per `!air.sampler_states` entry, which is every constexpr sampler state the source
+  wrote, but a state no sample reads leaves a variable nothing references and the module drops it.
+  112 such bindings in 60 of the 2880-source sample; `StaticSampler` was the last translator-
+  invented kind still reported without the module's agreement, the other three already being
+  reconciled by `reconcile_buffer_address_table` and `report_synthesized_placeholders`. The
+  surviving samplers keep their bindings and their states -- the interface pass allocates before the
+  drop -- and `tests/reflection_covers_declared_bindings.rs` now checks that direction for every
+  invented kind over every public fixture, which is the one
+  `assert_reflection_covers_declarations` does not. `REFLECTION_VERSION` is now 41.
+
 - A color attachment whose Location is a function constant is read from the operand after its
   marker, like every other declared slot. `!"air.render_target", ptr addrspace(2) @loc, i32 0`
   states the Location as a global and the dual-source index after it; when the global was one the

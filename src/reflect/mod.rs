@@ -84,7 +84,10 @@ mod footprint;
 /// descriptor-ABI ceiling, and the module declares the same `OpTypeArray`. Both now derive from
 /// `TextureShape::descriptor_count`. Only a runtime `array_ref`, whose length is not in the type
 /// name, still reports the ceiling.
-pub const REFLECTION_VERSION: u32 = 40;
+/// v41 stops reporting a constexpr sampler the finished module does not bind. A state no sample
+/// reads leaves a variable nothing references, which the module drops; reflection still asked a
+/// consumer to create a `VkSampler` there. 112 such bindings in 60 of the 2880-source sample.
+pub const REFLECTION_VERSION: u32 = 41;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -2279,6 +2282,49 @@ impl ShaderReflection {
             shape.writable = image.writable;
             shape.storage_format = image.storage_format;
         }
+    }
+
+    /// Drop a constexpr sampler the finished module does not bind.
+    ///
+    /// `StaticSampler` is a descriptor the translator invents: nothing in Metal's API declares it,
+    /// so the only reason a consumer creates a `VkSampler` at that binding is that this reflection
+    /// asked for one. `add_static_samplers` names one per entry of the `!air.sampler_states` root,
+    /// which is every constexpr sampler state the source wrote, and the interface pass gives each
+    /// the same binding in the same order -- but a state no sample reads leaves a variable nothing
+    /// references, and the module drops it. Reflection then describes a sampler that is not there.
+    ///
+    /// Measured over the 2880-source sample: 112 such bindings in 60 modules, and `StaticSampler`
+    /// is the ONLY translator-invented kind still reported without the module declaring it --
+    /// `reconcile_buffer_address_table` and `report_synthesized_placeholders` already close the
+    /// same gap for the other three. In all 60 the surviving samplers keep their bindings, so this
+    /// removes ghosts without moving anything: the pass allocates before the drop, so the states
+    /// that remain are still on the bindings that carry them.
+    ///
+    /// `reflect_sanitized` builds no module and keeps the whole prediction, as it does elsewhere.
+    pub(crate) fn retract_unbound_static_samplers(&mut self, module: &Module) {
+        let types = module
+            .types_global_values
+            .iter()
+            .filter_map(|instruction| Some((instruction.result_id?, instruction)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let bound = module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == spirv::Op::Variable)
+            .filter_map(|instruction| {
+                let variable = instruction.result_id?;
+                let pointee = pointee_of(&types, instruction.result_type?)?;
+                (types.get(&pointee)?.class.opcode == spirv::Op::TypeSampler)
+                    .then(|| descriptor_binding_of(module, variable))
+                    .flatten()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        self.bindings.retain(|resource| {
+            resource.kind != ResourceKind::StaticSampler
+                || resource
+                    .descriptor
+                    .is_none_or(|location| bound.contains(&location.binding))
+        });
     }
 
     /// Report the descriptors the passes synthesized with no Metal argument behind them.

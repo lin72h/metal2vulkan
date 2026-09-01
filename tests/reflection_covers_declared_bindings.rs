@@ -626,6 +626,7 @@ fn every_public_fixture_reflects_every_descriptor_it_declares() {
         };
         declared += assert_reflection_covers_declarations(&label, &spirv, &reflection).len();
         assert_counts_cover_declared_arrays(&label, &spirv, &reflection);
+        assert_invented_descriptors_are_declared(&label, &spirv, &reflection);
         checked += 1;
     }
     assert!(
@@ -754,6 +755,7 @@ fn every_public_fixture_reflects_every_descriptor_it_declares_under_a_shifted_la
         );
         let module = assert_reflection_covers_declarations(&label, &spirv, &reflection);
         assert_counts_cover_declared_arrays(&label, &spirv, &reflection);
+        assert_invented_descriptors_are_declared(&label, &spirv, &reflection);
         for (set, binding) in module
             .iter()
             .copied()
@@ -976,5 +978,130 @@ fn each_constexpr_sampler_binding_reports_the_state_its_sample_reads() {
                 reported.get(&binding)
             );
         }
+    }
+}
+
+/// Three constexpr sampler states where only two are ever sampled with.
+///
+/// The interface pass binds one sampler variable per `__air_sampler_state` global and reflection
+/// names one per `!air.sampler_states` entry, in the same order -- but a state no sample reads
+/// leaves a variable nothing references, and the module drops it. Reflection then asks a consumer
+/// for a `VkSampler` at a binding the module never declares. Nothing in Metal's API puts a
+/// descriptor there: the only reason to create one is that this reflection asked.
+const UNREAD_CONSTEXPR_SAMPLER: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+@__air_sampler_state.117 = internal addrspace(2) constant i64 -9188470239253747127, align 8
+@__air_sampler_state.118 = internal addrspace(2) constant i64 -9188470239253755319, align 8
+@__air_sampler_state.119 = internal addrspace(2) constant i64 -9188470239253757806, align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex, ptr addrspace(2) %runtime_sampler) {
+entry:
+  %sample0 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.118, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value0 = extractvalue { <4 x float>, i8 } %sample0, 0
+  %sample1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.119, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value1 = extractvalue { <4 x float>, i8 } %sample1, 0
+  %value = fadd <4 x float> %value0, %value1
+  ret <4 x float> %value
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!8, !9, !10}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!7 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.117}
+!9 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.118}
+!10 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.119}
+"#;
+
+/// Descriptor kinds nothing in Metal's API declares -- the translator invents the binding, so a
+/// consumer creates a descriptor there for no reason other than this reflection asking.
+const TRANSLATOR_INVENTED_KINDS: [ResourceKind; 4] = [
+    ResourceKind::StaticSampler,
+    ResourceKind::BufferAddressTable,
+    ResourceKind::SynthesizedNullTexture,
+    ResourceKind::SynthesizedReadSampler,
+];
+
+/// No invented descriptor may be reported at a binding the module does not declare, and return how
+/// many were checked.
+///
+/// This is the direction `assert_reflection_covers_declarations` does not check. For a resource
+/// Metal declared there is an argument to report it whatever the module did with it; for one the
+/// translator invented there is none, and the module is the only thing that can say a consumer has
+/// to bind it. Over the 2880-source sample `StaticSampler` was the last kind still reported
+/// without that -- 112 bindings in 60 modules.
+fn assert_invented_descriptors_are_declared(
+    label: &str,
+    spirv: &[u8],
+    reflection: &ShaderReflection,
+) -> usize {
+    let declared = bindings_the_module_declares(spirv);
+    let mut checked = 0;
+    for resource in reflection
+        .bindings
+        .iter()
+        .filter(|resource| TRANSLATOR_INVENTED_KINDS.contains(&resource.kind))
+    {
+        let Some(location) = resource.descriptor else {
+            continue;
+        };
+        assert!(
+            declared.contains(&(location.set, location.binding)),
+            "{label} reports {:?} at ({}, {}), which the module declares no variable at, so a \
+             consumer would create a descriptor nothing can read",
+            resource.kind,
+            location.set,
+            location.binding
+        );
+        checked += 1;
+    }
+    checked
+}
+
+#[test]
+fn a_constexpr_sampler_no_sample_reads_is_not_reported() {
+    let (spirv, reflection) = translate_sanitized_native_reflected(
+        UNREAD_CONSTEXPR_SAMPLER,
+        Stage::Fragment,
+        &scratch("unread_constexpr_sampler"),
+        TransformOptions::default(),
+    )
+    .expect("the three-sampler fragment translates");
+
+    assert_reflection_covers_declarations("the unread-sampler fragment", &spirv, &reflection);
+    assert_eq!(
+        assert_invented_descriptors_are_declared(
+            "the unread-sampler fragment",
+            &spirv,
+            &reflection
+        ),
+        2,
+        "the two sampled states are reported and the unread one is not"
+    );
+
+    // The two that survive keep the bindings their samples read, with their own states: retracting
+    // the ghost must not renumber what is left.
+    let reported = reflection
+        .bindings
+        .iter()
+        .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+        .filter_map(|binding| {
+            Some((
+                binding.descriptor?.binding,
+                binding.static_sampler?.raw_words[0],
+            ))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let sampled = sampler_bindings_in_sample_order(&spirv);
+    assert_eq!(sampled.len(), 2, "both samples reach a static sampler");
+    for (binding, expected) in sampled.iter().zip(CONSTEXPR_SAMPLER_WORDS) {
+        assert_eq!(reported.get(binding).copied(), Some(expected));
     }
 }
