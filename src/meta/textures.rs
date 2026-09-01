@@ -1,8 +1,12 @@
 use crate::passes::ImageComp;
 use spirv::{Dim, ImageFormat};
 
-/// Descriptor capacity used for AIR texture-handle arrays. Fixed arrays occupy their prefix;
-/// runtime `array_ref` cases author the logical prefix they may access.
+/// Descriptor capacity for a texture-handle array whose length AIR does not state: a runtime
+/// `array_ref<texture...>`, sized by a function constant rather than by the type name. A consumer
+/// supplies this many valid descriptors, or uses `descriptorBindingPartiallyBound`.
+///
+/// A fixed `array<texture..., N>` states `N` and is bound and reported at `N`; see
+/// [`TextureShape::descriptor_count`], which is the only reader of this constant.
 pub const TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT: u32 = 128;
 
 /// Texture dimensionality decoded from a Metal texture type name, independent of the SPIR-V emit
@@ -191,7 +195,8 @@ pub struct TextureShape {
     pub component: TextureComponent,
     /// The access qualifier declares `write`/`read_write` — a storage image (vs `sample`/`read`).
     pub writable: bool,
-    /// The argument is a runtime-indexed descriptor array of texture handles.
+    /// The argument is a descriptor array of texture handles rather than a single texture — either
+    /// a fixed `array<texture..., N>` (see `array_length`) or a runtime `array_ref<texture...>`.
     pub array_ref: bool,
     /// Fixed texture-handle array length (`array<texture..., N>`), or `None` for a runtime
     /// `array_ref` and for a single texture.
@@ -201,13 +206,30 @@ pub struct TextureShape {
     pub storage_format: Option<TextureFormat>,
 }
 
+impl TextureShape {
+    /// How many descriptors this texture argument occupies: the declared length of a fixed
+    /// `array<texture..., N>`, [`TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT`] for a runtime-length
+    /// `array_ref` (whose length is not in the type name), and `1` for a single texture.
+    ///
+    /// This is the ONLY place the count is decided. The interface pass sizes its `OpTypeArray` from
+    /// it and reflection reports it as `DescriptorLocation::count`, so an emitted module and its
+    /// reflection cannot disagree about how many descriptors a consumer must supply.
+    pub fn descriptor_count(&self) -> u32 {
+        if !self.array_ref {
+            return 1;
+        }
+        self.array_length
+            .unwrap_or(TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT)
+    }
+}
+
 /// Decode a Metal texture argument/type name into its [`TextureShape`]. The dimensionality/arrayed
 /// classification is substring-order-sensitive (`1d_array` before `1d`, `cube_array` before `cube`)
 /// and matches what the interface pass uses to construct the emitted image type, including its
 /// multisample operand.
 pub fn texture_shape_from_name(name: &str) -> TextureShape {
     let (writable, array_ref) = texture_access_from_name(name);
-    let array_length = fixed_texture_array_length(name);
+    let array_length = texture_handle_array(name).flatten();
     let shape_name = if array_ref {
         name.find("texture")
             .or_else(|| name.find("depth"))
@@ -256,17 +278,31 @@ pub fn texture_shape_from_name(name: &str) -> TextureShape {
     }
 }
 
-fn fixed_texture_array_length(name: &str) -> Option<u32> {
+/// Whether a texture type name declares a handle ARRAY rather than a single texture, and — for the
+/// fixed `array<texture..., N>` spelling — the declared length `N`.
+///
+/// One scan answers both questions, so "is this an array" and "how long is it" can never be decided
+/// by two different rules. `Some(None)` is a runtime-length `array_ref<texture...>`, whose length is
+/// not in the type name; `None` is a single texture.
+fn texture_handle_array(name: &str) -> Option<Option<u32>> {
     let compact = name
         .chars()
         .filter(|ch| !ch.is_whitespace())
         .collect::<String>();
+    if compact.starts_with("array_ref<texture") || compact.starts_with("array_ref<depth") {
+        return Some(None);
+    }
     if !compact.starts_with("array<texture") && !compact.starts_with("array<depth") {
         return None;
     }
-    let end = compact.rfind('>')?;
-    let before_end = &compact[..end];
-    before_end.rsplit_once(',')?.1.parse().ok()
+    // `array<texture2d<half, sample>, 32>` — the length is the last comma-separated field before the
+    // outermost `>`. A malformed spelling stays an array of unknown (runtime) length rather than
+    // silently degrading to a single texture.
+    let length = compact
+        .rfind('>')
+        .and_then(|end| compact[..end].rsplit_once(','))
+        .and_then(|(_, tail)| tail.parse().ok());
+    Some(length)
 }
 
 /// The storage-image texel format a write-capable texture lowers to, from its scalar precision. A
@@ -313,14 +349,7 @@ fn texture_component_from_name(name: &str) -> TextureComponent {
 /// `(writable, array_ref)` decoded from the access qualifier — the second template field
 /// (`texture2d<float, write>`) and texture-handle array wrappers.
 fn texture_access_from_name(name: &str) -> (bool, bool) {
-    let compact = name
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect::<String>();
-    let array_ref = compact.contains("array_ref<texture")
-        || compact.contains("array<texture")
-        || compact.contains("array_ref<depth")
-        || compact.contains("array<depth");
+    let array_ref = texture_handle_array(name).is_some();
     let Some((_, rest)) = name.split_once('<') else {
         return (false, array_ref);
     };

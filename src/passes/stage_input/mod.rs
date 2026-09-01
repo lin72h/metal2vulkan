@@ -235,14 +235,6 @@ pub(in crate::passes) enum ParamBinding {
     ZeroPointer { var: Word },
 }
 
-fn texture_type_is_handle_array(name: &str) -> bool {
-    let compact = name
-        .chars()
-        .filter(|ch| !ch.is_ascii_whitespace())
-        .collect::<String>();
-    compact.contains("array_ref<texture") || compact.contains("array<texture")
-}
-
 /// How a buffer param's body uses are lowered.
 pub(in crate::passes) enum BufWrap {
     /// The AIR pointee is a heterogeneous struct emitted as a struct pointer. The body's
@@ -589,7 +581,8 @@ pub(super) fn build_stage_input(
             Stage::Vertex => vert.and_then(|m| m.texture_type_name(idx)),
             Stage::Kernel => kern.and_then(|m| m.texture_type_name(idx)),
         };
-        let is_array_texture = texture_type_name.is_some_and(texture_type_is_handle_array);
+        let texture_handle_shape = texture_type_name.map(crate::meta::texture_shape_from_name);
+        let is_array_texture = texture_handle_shape.is_some_and(|shape| shape.array_ref);
 
         if let (Stage::Kernel, Some(KernRole::StageInput(_))) =
             (stage, kern.and_then(|m| m.role_of(idx)))
@@ -665,15 +658,18 @@ pub(super) fn build_stage_input(
                         None,
                     )
                 };
-            // The array length is a runtime function constant (`nImagesFC`), not a compile-time value,
-            // so over-declare to `air.max_textures` (128). Vulkan lets an argument-buffer texture array
-            // be over-sized; only accessed descriptors need be valid, and spirv-val does not bounds-check
-            // a dynamic `OpAccessChain` index. A fixed `OpTypeArray` avoids the RuntimeDescriptorArray
-            // capability; the index is `air.is_uniform`-marked, so no ShaderNonUniform is needed either.
-            let array_ty = ctx.ty_array(
-                elem_image_ty,
-                crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT,
-            );
+            // A fixed `array<texture..., N>` declares N; a runtime `array_ref` has no compile-time
+            // length (it is a function constant like `nImagesFC`), so it over-declares to
+            // `air.max_textures` (128). Vulkan lets a texture array be over-sized: only accessed
+            // descriptors need be valid, and spirv-val does not bounds-check a dynamic
+            // `OpAccessChain` index. A fixed `OpTypeArray` avoids the RuntimeDescriptorArray
+            // capability; the index is `air.is_uniform`-marked, so no ShaderNonUniform is needed
+            // either. `TextureShape::descriptor_count` is also what reflection reports, so the
+            // module and its `DescriptorLocation::count` cannot disagree.
+            let descriptor_count = texture_handle_shape
+                .map(|shape| shape.descriptor_count())
+                .ok_or("texture handle array has no decoded type name to size it from")?;
+            let array_ty = ctx.ty_array(elem_image_ty, descriptor_count);
             let pptr = ctx.ty_ptr(StorageClass::UniformConstant, array_ty);
             let var = ctx.module.fresh_id();
             ctx.new_globals.push(Instruction::new(

@@ -1150,19 +1150,23 @@ fn texture_access_classification_matches_declared_qualifier() {
             .unwrap_or_else(|| panic!("binding {n}"));
         assert_eq!(b.kind, kind, "kind for texture {n}");
         assert_eq!(b.access, Some(access), "access for texture {n}");
+        let shape = b.texture_shape.expect("texture shape");
         assert_eq!(
-            b.descriptor.expect("texture descriptor").count,
-            if kind == ResourceKind::TextureArray {
-                crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
-            } else {
-                1
-            },
-            "descriptor count for {name}"
-        );
-        assert_eq!(
-            b.texture_shape.and_then(|shape| shape.array_length),
+            shape.array_length,
             (name == "array<texture2d<half, sample>, 32>").then_some(32),
             "fixed array length for {name}"
+        );
+        // A fixed array reports exactly what it declares; only a runtime `array_ref`, whose length
+        // is not in the type name, falls back to the over-declared ceiling.
+        assert_eq!(
+            b.descriptor.expect("texture descriptor").count,
+            match (kind, shape.array_length) {
+                (ResourceKind::TextureArray, Some(length)) => length,
+                (ResourceKind::TextureArray, None) =>
+                    crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT,
+                _ => 1,
+            },
+            "descriptor count for {name}"
         );
     }
 }

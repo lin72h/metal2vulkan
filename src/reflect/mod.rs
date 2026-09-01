@@ -80,7 +80,11 @@ mod footprint;
 /// predicate instead of an AIR text scan. Over 2880 corpus sources the scan disagreed with the
 /// finished module 63 times and the predicate disagrees 8 times; reflected translation, which reads
 /// the table off the module, is unchanged.
-pub const REFLECTION_VERSION: u32 = 39;
+/// v40 reports a fixed `array<texture..., N>` at its declared length `N` rather than at the
+/// descriptor-ABI ceiling, and the module declares the same `OpTypeArray`. Both now derive from
+/// `TextureShape::descriptor_count`. Only a runtime `array_ref`, whose length is not in the type
+/// name, still reports the ceiling.
+pub const REFLECTION_VERSION: u32 = 40;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -3261,9 +3265,10 @@ fn texture_binding(
         texture_resource_binding(n)
     };
     let mut descriptor = ResourceBinding::descriptor_at(descriptor_binding);
-    if kind == ResourceKind::TextureArray {
-        descriptor.as_mut().expect("texture descriptor").count =
-            crate::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT;
+    if let (Some(location), Some(shape)) = (descriptor.as_mut(), texture_shape.as_ref()) {
+        // Same derivation the interface pass sizes its `OpTypeArray` from, so what a consumer
+        // allocates always matches what the module declares.
+        location.count = shape.descriptor_count();
     }
     ResourceBinding {
         kind,

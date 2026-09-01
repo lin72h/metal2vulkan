@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A fixed texture-handle array binds and reflects at the length AIR declares, not at the
+  descriptor-ABI ceiling. `array<texture2d<half, sample>, 32>` states its length twice -- in the type
+  name and as the second `air.location_index` operand -- and the decoded `TextureShape` already
+  carried it, but the interface pass emitted `OpTypeArray` of 128 and reflection reported
+  `count: 128` for every handle array, fixed or runtime. A consumer following the reflection had to
+  supply 128 valid descriptors (or `descriptorBindingPartiallyBound`) for an array of 8, and the
+  same `ResourceBinding` contradicted itself: `texture_shape.array_length` said 8 while
+  `descriptor.count` said 128. Both sides now derive from `TextureShape::descriptor_count`; only a
+  runtime `array_ref`, whose length is a function constant rather than part of the type name, still
+  reports the capacity. 40 of 14579 local corpus sources declare a fixed array (lengths 2, 3, 4, 8,
+  32 and 80); every one of the 76 declarations agrees with the second `air.location_index` operand.
+  `REFLECTION_VERSION` is now 40.
+
+  The same unification fixes a depth-texture array being bound as a single image. The interface
+  pass asked `contains("array<texture")` while the shared type-name decoder asked about
+  `array<depth` too, so `array<depth2d<float, sample>, 2>` was not recognised as a handle array at
+  all: the module declared one `depth2d` where the shader indexes two, while reflection reported a
+  `TextureArray` of 128 at that binding. There is now one predicate -- `TextureShape::array_ref` --
+  and `tests/reflection_covers_declared_bindings.rs` requires the reported `count` to EQUAL the
+  array the module declares rather than merely cover it, which is what makes over-reporting
+  detectable at all.
+
 - `ShaderReflection` reports `max_work_group_size`, the `[[max_total_threads_per_threadgroup(N)]]`
   ceiling translation now enforces. Enforcing a bound a consumer has no way to read leaves it
   guessing at the dispatch shape; reflection reports the ceiling and does not enforce it, because

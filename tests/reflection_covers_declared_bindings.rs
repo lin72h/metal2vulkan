@@ -377,7 +377,7 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
 "#;
 
 #[test]
-fn a_descriptor_array_reports_at_least_as_many_descriptors_as_the_module_declares() {
+fn a_runtime_descriptor_array_reports_the_capacity_the_module_declares() {
     let (spirv, reflection) = translate_sanitized_native_reflected(
         RUNTIME_TEXTURE_ARRAY,
         Stage::Kernel,
@@ -395,8 +395,107 @@ fn a_descriptor_array_reports_at_least_as_many_descriptors_as_the_module_declare
     assert_counts_cover_declared_arrays("the descriptor-array kernel", &spirv, &reflection);
 }
 
-/// Require the largest reported `count` at each binding to reach the largest array the module
-/// declares there, and return how many bindings carried an array.
+/// A FIXED texture-handle array: `array<texture2d<float, sample>, 4>` states its own length, both in
+/// the type name and as the second `air.location_index` operand.
+///
+/// The runtime fixture above cannot catch over-reporting — its declared capacity IS the ceiling — so
+/// this is the case that pins `count` to the declared length rather than to the ceiling. The kernel
+/// indexes element 3 so the array is genuinely indexed past element 0.
+const FIXED_TEXTURE_ARRAY: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+
+define void @k(ptr readonly captures(none) %imgs, ptr addrspace(1) %out) {
+entry:
+  %slot = getelementptr inbounds ptr addrspace(1), ptr %imgs, i32 3
+  %tex = load ptr addrspace(1), ptr %slot, align 8
+  %w = tail call i32 @air.get_width_texture_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 4, !"air.sample", !"air.arg_type_name", !"array<texture2d<float, sample>, 4>", !"air.arg_name", !"imgs"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+
+/// The same fixed array spelled over `depth2d`. Metal spells a depth texture array
+/// `array<depth2d<float, sample>, N>`, which shares nothing lexically with `array<texture` — a
+/// handle-array test that only ever says `texture` cannot tell whether the emitter recognised it.
+const FIXED_DEPTH_TEXTURE_ARRAY: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+%"struct.metal::depth2d" = type { ptr addrspace(1) }
+
+define void @k(ptr readonly captures(none) %imgs, ptr addrspace(1) %out) {
+entry:
+  %slot = getelementptr inbounds ptr addrspace(1), ptr %imgs, i32 2
+  %tex = load ptr addrspace(1), ptr %slot, align 8
+  %w = tail call i32 @air.get_width_depth_2d(ptr addrspace(1) %tex, i32 0)
+  store i32 %w, ptr addrspace(1) %out, align 4
+  ret void
+}
+declare i32 @air.get_width_depth_2d(ptr addrspace(1), i32)
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 3, !"air.sample", !"air.arg_type_name", !"array<depth2d<float, sample>, 3>", !"air.arg_name", !"imgs"}
+!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+
+#[test]
+fn a_fixed_descriptor_array_reports_its_declared_length_not_the_ceiling() {
+    for (label, source, declared_length) in [
+        ("the fixed texture-array kernel", FIXED_TEXTURE_ARRAY, 4),
+        ("the fixed depth-array kernel", FIXED_DEPTH_TEXTURE_ARRAY, 3),
+    ] {
+        let (spirv, reflection) = translate_sanitized_native_reflected(
+            source,
+            Stage::Kernel,
+            &scratch(label),
+            TransformOptions::default(),
+        )
+        .unwrap_or_else(|error| panic!("{label} translates: {error}"));
+
+        assert_reflection_covers_declarations(label, &spirv, &reflection);
+
+        // The module declares the array the AIR declares, not the descriptor-ABI ceiling.
+        let declared = array_lengths_the_module_declares(&spirv);
+        assert!(
+            declared.values().any(|length| *length == declared_length),
+            "{label} should declare an OpTypeArray of {declared_length}; got {declared:?}"
+        );
+
+        // Reflection agrees with the module, binding for binding.
+        assert_eq!(
+            assert_counts_cover_declared_arrays(label, &spirv, &reflection),
+            declared.len(),
+            "{label} left a declared binding uncompared"
+        );
+
+        // And the array binding reports the AIR length rather than the runtime ceiling.
+        let array_counts = reflection
+            .bindings
+            .iter()
+            .filter(|resource| resource.kind == metal2vulkan::reflect::ResourceKind::TextureArray)
+            .filter_map(|resource| resource.descriptor.map(|location| location.count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            array_counts,
+            vec![declared_length],
+            "{label} should report exactly the declared array length"
+        );
+    }
+}
+
+/// Require the largest reported `count` at each binding to EQUAL the largest array the module
+/// declares there, and return how many bindings were compared.
+///
+/// Equality, not coverage: a count above the declared array over-reports how many descriptors a
+/// consumer must supply, and reporting an array's length is the only way a consumer can size the
+/// layout for a fixed `array<texture..., N>` without re-parsing AIR. Both sides derive from
+/// `TextureShape::descriptor_count`, so this is the assertion that keeps them one derivation.
 fn assert_counts_cover_declared_arrays(
     label: &str,
     spirv: &[u8],
@@ -419,11 +518,11 @@ fn assert_counts_cover_declared_arrays(
         let Some(count) = reported.get(binding) else {
             continue;
         };
-        assert!(
-            count >= length,
-            "{label} reports at most {count} descriptor(s) at binding {binding}, but the module \
-             declares an array of {length} there, so a layout built from the reflection is smaller \
-             than the array the shader indexes"
+        assert_eq!(
+            count, length,
+            "{label} reports {count} descriptor(s) at binding {binding} but the module declares an \
+             array of {length} there; a layout built from the reflection is the wrong size for the \
+             array the shader indexes"
         );
         checked += 1;
     }
