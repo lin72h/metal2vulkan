@@ -647,6 +647,15 @@ pub struct KernMeta {
     /// `(parameter index, AIR role)` for every enabled entry parameter whose role has no
     /// lowering. See [`FragMeta::unmodelled_input_params`].
     pub unmodelled_input_params: Vec<(u32, String)>,
+    /// Parameter indices of explicit imageblocks whose AIR node carries
+    /// `air.alias_implicit_imageblock`.
+    ///
+    /// An explicit imageblock is ordinarily tile-local scratch, and the emitter gives it Private
+    /// storage. This marker says the opposite: the storage *is* the implicit imageblock -- the
+    /// render targets the rasterizer already wrote -- so the kernel's first read is of framebuffer
+    /// content, and its writes have to land back there. Private scratch is neither, so the marker
+    /// cannot be dropped.
+    pub aliased_implicit_imageblock_params: Vec<u32>,
     /// Every attribute on the `!air.kernel` root this stage has no model for, as it reads in AIR.
     /// Mirrors [`FragMeta::unmodelled_stage_attributes`].
     pub unmodelled_stage_attributes: Vec<String>,
@@ -818,6 +827,7 @@ fn parse_air_kernel_meta_with_nodes(
 
     let mut roles = vec![];
     let mut unmodelled_input_params: Vec<(u32, String)> = vec![];
+    let mut aliased_implicit_imageblock_params: Vec<u32> = vec![];
     let mut function_constant_buffer_locations = HashMap::new();
     let mut buffer_layouts = HashMap::new();
     let mut imageblock_layouts = HashMap::new();
@@ -921,6 +931,9 @@ fn parse_air_kernel_meta_with_nodes(
                 if let Some(t) = layout {
                     imageblock_layouts.insert(idx, t);
                 }
+                if strs.iter().any(|s| s == "alias_implicit_imageblock") {
+                    aliased_implicit_imageblock_params.push(idx);
+                }
                 KernRole::Other
             }
             "sampler" => KernRole::Sampler(resource_location(node, idx)),
@@ -967,6 +980,7 @@ fn parse_air_kernel_meta_with_nodes(
     Some(KernMeta {
         roles,
         unmodelled_input_params,
+        aliased_implicit_imageblock_params,
         unmodelled_stage_attributes,
         max_work_group_size,
         function_constant_buffer_locations,

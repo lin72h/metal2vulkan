@@ -4528,6 +4528,67 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
     let _ = std::fs::remove_dir_all(tmp);
 }
 
+/// An explicit imageblock is tile-local scratch, undefined on entry, and Private storage is an
+/// honest refinement of that. `air.alias_implicit_imageblock` states the opposite: the storage is
+/// the implicit imageblock -- the render targets the rasterizer already wrote -- so the kernel's
+/// first read is of framebuffer content and its writes have to land back there. Neither is true of
+/// Private scratch.
+///
+/// Nothing else in the module distinguishes the two. The marker sits beside the ordinary
+/// `explicit` qualifier on the same node, the body is the same `air.imageblock_data` pointer, and
+/// the emitted module validates and reports the same descriptors either way -- it just resolves an
+/// uninitialized array. So the pair is checked from both ends: the marker must refuse, and the same
+/// shader without it must still translate.
+#[test]
+fn native_kernel_imageblock_aliased_onto_the_implicit_one_is_refused() {
+    let scratch = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
+
+define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %tid) {
+entry:
+  %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
+  %v = load <4 x half>, ptr addrspace(4) %ptr, align 8
+  store <4 x half> %v, ptr addrspace(1) %dst, align 8
+  ret void
+}
+
+declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !5, !6}
+!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, ALIAS!"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
+!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"half4*", !"air.arg_name", !"dst"}
+!6 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_kernel_imageblock_alias_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+
+    let plain = scratch.replace("ALIAS", "");
+    assert_ne!(plain, scratch, "the template has no ALIAS splice point");
+    crate::translate_sanitized_native(&plain, Stage::Kernel, &tmp)
+        .expect("tile-local scratch still translates");
+
+    let aliased = scratch.replace("ALIAS", "!\"air.alias_implicit_imageblock\", ");
+    let error = crate::translate_sanitized_native(&aliased, Stage::Kernel, &tmp)
+        .expect_err("an imageblock aliased onto the render targets has no Private equivalent");
+    assert!(
+        error.contains("implicit imageblock"),
+        "the refusal must name what the storage aliases: {error}"
+    );
+    assert!(
+        error.contains("parameter 0"),
+        "the refusal must name the parameter carrying the marker: {error}"
+    );
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn native_kernel_imageblock_slice_write_uses_private_scratch_and_storage_image() {
     let ll = r#"

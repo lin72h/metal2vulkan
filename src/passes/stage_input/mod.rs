@@ -388,6 +388,20 @@ pub(super) fn build_stage_input(
         ));
     }
 
+    // An explicit imageblock is tile-local scratch, and the interface gives it Private storage,
+    // undefined on entry. `air.alias_implicit_imageblock` says its storage is the implicit
+    // imageblock instead -- the render targets the rasterizer has already written -- so the
+    // kernel's reads are of framebuffer content and its writes have to reach it. Private scratch
+    // is neither: the module validates and resolves an uninitialized array, and no descriptor even
+    // appears for a consumer to notice was missing.
+    if let Some(param) = kern.and_then(|meta| meta.aliased_implicit_imageblock_params.first()) {
+        return Err(format!(
+            "entry parameter {param} is an imageblock aliased onto the implicit imageblock, \
+             which this translator has no storage for; emitting the module would read tile-local \
+             scratch where the render targets should be"
+        ));
+    }
+
     // `[[early_fragment_tests]]` runs the depth and stencil tests before the body, so the body
     // cannot be the source of a value either test compares -- it does not exist yet. Metal rejects
     // the pair outright. Emitting both would give a module whose `FragDepth` / `FragStencilRefEXT`

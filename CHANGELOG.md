@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A kernel imageblock aliased onto the implicit one is refused instead of given tile-local scratch.
+  An explicit imageblock is ordinarily per-tile scratch, undefined on entry, and the interface gives
+  it a `Private` array -- an honest refinement. `air.alias_implicit_imageblock` on the same node
+  states the opposite: the storage *is* the implicit imageblock, the render targets the rasterizer
+  has already written, so the kernel's first read is of framebuffer content and its writes have to
+  land back there. The marker was unread, so a tile-resolve kernel loaded an uninitialized `Private`
+  array where the rasterized colors should have been, resolved it, and reported success -- with no
+  descriptor for the framebuffer anywhere in the module or its reflection for a consumer to notice
+  was missing. 30 of 14579 local corpus sources carry the marker; 124 non-aliased explicit
+  imageblocks keep the scratch lowering unchanged.
+
 - A shader that encodes into an indirect command buffer is refused instead of translated into one
   that does not. The `air.*_command` encoder families -- `set_pipeline_state_compute_command`,
   `set_kernel_buffer_compute_command`, `draw_primitives_render_command` and their siblings -- were
