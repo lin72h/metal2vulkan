@@ -994,9 +994,15 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), Stri
     let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
 
     for (old_var, _) in samp_globals {
+        // The same emulation rules the caller-supplied path enforces, on the state AIR encoded.
+        // Without this an unreproducible constexpr sampler is lowered anyway, and the module
+        // samples the right texture with the wrong filter, anisotropy or border.
         let sampler_state = static_sampler_words(ctx, old_var)
             .map(StaticSamplerState::from_air_words)
             .transpose()?;
+        if let Some(state) = sampler_state {
+            state.validate_lowering()?;
+        }
         // One sampler resource per static sampler.
         let new_var = ctx.module.fresh_id();
         ctx.new_globals.push(Instruction::new(

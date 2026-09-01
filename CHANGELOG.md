@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `with_runtime_sampler` accepts a pixel-coordinate sampler whose LOD maximum is Metal's default.
+  The emulation fetches level zero, so only a *minimum* above zero can exclude the level it reads --
+  a maximum never can, since validation already requires it to be at least the minimum. Demanding
+  both be zero refused the ordinary case: 531 of the 535 pixel-coordinate static samplers across
+  2880 corpus sources carry a maximum of 65504, the half-precision limit AIR encodes "unclamped" as.
+  The emulation constraints now live on `StaticSamplerState`, the type the lowering consumes, and
+  the AIR constexpr-sampler path applies them too -- it previously applied none, so a static sampler
+  the emulation cannot reproduce was lowered anyway.
 - A vertex function carrying an `air.patch` node the decoder cannot read is refused instead of being
   emitted as an ordinary vertex shader. The node states a post-tessellation evaluation shader's
   domain and control-point count; dropping it dropped the `Quads`/`Triangles`/`Isolines`,

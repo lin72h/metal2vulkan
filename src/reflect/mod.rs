@@ -920,6 +920,9 @@ pub struct RuntimeSamplerState {
 }
 
 impl RuntimeSamplerState {
+    /// Reject pipeline-provided state the sampler lowering cannot reproduce, before translation
+    /// mutates anything. The emulation constraints live on [`StaticSamplerState`] -- the type the
+    /// lowering actually consumes -- so caller-supplied and AIR-encoded state answer to one rule.
     pub(crate) fn validate(self) -> Result<(), String> {
         if self.max_anisotropy == 0 {
             return Err("runtime sampler max_anisotropy must be at least 1".into());
@@ -936,52 +939,7 @@ impl RuntimeSamplerState {
                 self.lod_min_clamp, self.lod_max_clamp
             ));
         }
-        if self.coordinates == SamplerCoordinates::Pixel {
-            if self.min_filter != self.mag_filter {
-                return Err(
-                    "pixel-coordinate runtime samplers with mixed min/mag filters are unsupported because AIR does not expose the pipeline derivative state needed to select the filter"
-                        .into(),
-                );
-            }
-            if self.mip_filter == SamplerMipFilter::Linear {
-                return Err(
-                    "pixel-coordinate runtime samplers with linear mip filtering are unsupported"
-                        .into(),
-                );
-            }
-            if self.max_anisotropy > 1 {
-                return Err(
-                    "pixel-coordinate runtime sampler anisotropy cannot be emulated exactly".into(),
-                );
-            }
-            if self.lod_bias != 0.0 {
-                return Err(
-                    "pixel-coordinate runtime sampler LOD bias cannot be emulated exactly".into(),
-                );
-            }
-            if self.lod_min_clamp != 0.0 || self.lod_max_clamp != 0.0 {
-                return Err("pixel-coordinate runtime sampler LOD clamps must both be zero".into());
-            }
-            if self.reduction != SamplerReduction::WeightedAverage {
-                return Err(
-                    "pixel-coordinate runtime sampler min/max reduction is unsupported".into(),
-                );
-            }
-            if self.border_color != SamplerBorderColor::TransparentBlack
-                && [
-                    self.address_mode_s,
-                    self.address_mode_t,
-                    self.address_mode_r,
-                ]
-                .contains(&SamplerAddressMode::ClampToBorder)
-            {
-                return Err(
-                    "pixel-coordinate runtime samplers support only transparent-black border emulation"
-                        .into(),
-                );
-            }
-        }
-        Ok(())
+        self.lowering_state().validate_lowering()
     }
 
     /// Project pipeline-provided state into the sampler-lowering representation shared by the
@@ -1245,6 +1203,68 @@ impl StaticSamplerState {
             lod_bias: half_to_f32(bias_half),
             raw_words: words,
         })
+    }
+
+    /// Reject state the sampler lowering cannot reproduce exactly.
+    ///
+    /// Vulkan has no unnormalized-coordinate sampler with Metal's semantics, so a
+    /// `coord::pixel` sampler is emulated with shader-side image fetches at level zero. Anything
+    /// the fetch cannot express has to fail the translation rather than be silently dropped: the
+    /// emitted module would sample the right texture with the wrong filter, the wrong anisotropy,
+    /// or the wrong border, and validate either way.
+    ///
+    /// Both sources of sampler state answer to this: pipeline-provided state through
+    /// [`RuntimeSamplerState::validate`], and AIR's constexpr encoding where the static sampler is
+    /// lowered. Two copies of these rules drift, and they had -- the caller's copy refused a LOD
+    /// maximum the AIR path accepted 531 times over the corpus.
+    pub(crate) fn validate_lowering(self) -> Result<(), String> {
+        if self.coordinates != SamplerCoordinates::Pixel {
+            return Ok(());
+        }
+        if self.min_filter != self.mag_filter {
+            return Err(
+                "pixel-coordinate samplers with mixed min/mag filters are unsupported because AIR does not expose the pipeline derivative state needed to select the filter"
+                    .into(),
+            );
+        }
+        if self.mip_filter == SamplerMipFilter::Linear {
+            return Err(
+                "pixel-coordinate samplers with linear mip filtering are unsupported".into(),
+            );
+        }
+        if self.max_anisotropy > 1 {
+            return Err("pixel-coordinate sampler anisotropy cannot be emulated exactly".into());
+        }
+        if self.lod_bias != 0.0 {
+            return Err("pixel-coordinate sampler LOD bias cannot be emulated exactly".into());
+        }
+        // Only the minimum matters. The fetch reads level zero, so a minimum above zero excludes
+        // the level the emulation reads; a maximum cannot, since it is never below the minimum.
+        // Metal's default maximum is the half-precision limit rather than zero -- 531 of the 535
+        // pixel-coordinate static samplers in the corpus carry exactly that -- so demanding zero
+        // rejected the ordinary case.
+        if self.lod_min_clamp != 0.0 {
+            return Err(format!(
+                "pixel-coordinate sampler minimum LOD clamp {} excludes the level zero the emulation reads",
+                self.lod_min_clamp
+            ));
+        }
+        if self.reduction != SamplerReduction::WeightedAverage {
+            return Err("pixel-coordinate sampler min/max reduction is unsupported".into());
+        }
+        if self.border_color != SamplerBorderColor::TransparentBlack
+            && [
+                self.address_mode_s,
+                self.address_mode_t,
+                self.address_mode_r,
+            ]
+            .contains(&SamplerAddressMode::ClampToBorder)
+        {
+            return Err(
+                "pixel-coordinate samplers support only transparent-black border emulation".into(),
+            );
+        }
+        Ok(())
     }
 
     pub(crate) fn uses_pixel_nearest(self) -> bool {

@@ -1616,10 +1616,11 @@ fn runtime_pixel_sampler_rejects_unmodeled_pipeline_state() {
         ),
         (
             crate::reflect::RuntimeSamplerState {
-                lod_max_clamp: 1.0,
+                lod_min_clamp: 1.0,
+                lod_max_clamp: 2.0,
                 ..base
             },
-            "LOD clamps",
+            "minimum LOD clamp",
         ),
         (
             crate::reflect::RuntimeSamplerState {
@@ -1640,6 +1641,56 @@ fn runtime_pixel_sampler_rejects_unmodeled_pipeline_state() {
         .with_runtime_sampler(16, base)
         .expect_err("out-of-range sampler index");
     assert!(error.contains("range 0..16"), "{error}");
+}
+
+/// Metal's default LOD maximum is the half-precision limit, not zero, and the fetch the emulation
+/// performs reads level zero either way -- a maximum that is never below the minimum cannot exclude
+/// it. Refusing this refuses the state 531 of the corpus's 535 pixel-coordinate static samplers
+/// carry, and refuses it only from the caller: the AIR path accepted the identical state.
+#[test]
+fn runtime_pixel_sampler_accepts_the_default_lod_maximum() {
+    let base = runtime_sampler_state(
+        crate::reflect::SamplerCoordinates::Pixel,
+        crate::reflect::SamplerFilter::Nearest,
+        crate::reflect::SamplerAddressMode::ClampToEdge,
+    );
+    for lod_max_clamp in [0.0, 1.0, 65504.0] {
+        passes::TransformOptions::default()
+            .with_runtime_sampler(
+                0,
+                crate::reflect::RuntimeSamplerState {
+                    lod_max_clamp,
+                    ..base
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("a maximum LOD of {lod_max_clamp} cannot exclude level zero: {error}")
+            });
+    }
+}
+
+/// AIR-encoded constexpr sampler state answers to the same rules as caller-supplied state. The
+/// words are a `coord::pixel`, `filter::nearest`, `mip_filter::none` sampler taken verbatim from a
+/// corpus module -- the ordinary shape, carrying Metal's half-precision default LOD maximum.
+#[test]
+fn air_static_pixel_sampler_with_mixed_filters_is_refused() {
+    let state = crate::reflect::StaticSamplerState::from_air_words([34901797601050624, 0])
+        .expect("decode AIR sampler words");
+    assert_eq!(state.coordinates, crate::reflect::SamplerCoordinates::Pixel);
+    let mixed = crate::reflect::StaticSamplerState {
+        mag_filter: crate::reflect::SamplerFilter::Linear,
+        min_filter: crate::reflect::SamplerFilter::Nearest,
+        ..state
+    };
+    let error = mixed
+        .validate_lowering()
+        .expect_err("mixed min/mag filters have no pixel-coordinate lowering");
+    assert!(error.contains("mixed min/mag"), "{error}");
+    // The decoded state itself is reproducible, including its half-precision default LOD maximum.
+    state
+        .validate_lowering()
+        .expect("a corpus-shaped constexpr sampler lowers");
+    assert_eq!(state.lod_max_clamp, 65504.0);
 }
 
 #[test]
