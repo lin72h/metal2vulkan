@@ -498,6 +498,10 @@ pub(in crate::passes) fn build_workgroup_air_type(ctx: &mut Ctx, ty: &AirType) -
             ctx.new_globals.push(type_inst(Op::TypeStruct, st, fields));
             st
         }
+        // Size is the only fact; build the storage shape that occupies it.
+        AirType::Opaque { size } => {
+            build_workgroup_air_type(ctx, &crate::meta::storage_air_type_for_size(*size))
+        }
     }
 }
 

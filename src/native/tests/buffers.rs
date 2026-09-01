@@ -11421,3 +11421,106 @@ fn default_ownership_candidate_three_lane_vector_member_advances_by_allocation_s
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// `air.struct_type_info` names a member's type without describing its interior whenever the member
+/// is a user struct or class. The tuple still carries the member's declared byte size, and that size
+/// is what has to survive: decoding the name as a concrete leaf invents an interior, and the
+/// invented interior then fails to match the member the emitter actually produced.
+const OPAQUE_STRUCT_MEMBER_LL: &str = r#"
+target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-n8:16:32"
+target triple = "air64-apple-macosx10.15.0"
+
+%struct.Inner = type <{ float, float }>
+%struct.Cfg = type <{ i32, %struct.Inner, i32 }>
+
+define void @k(ptr addrspace(2) noalias readonly dereferenceable(16) %cfg, ptr addrspace(1) %out) {
+entry:
+  %p = getelementptr inbounds %struct.Cfg, ptr addrspace(2) %cfg, i64 0, i32 2
+  %v = load i32, ptr addrspace(2) %p, align 4
+  store i32 %v, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Cfg", !"air.arg_name", !"cfg"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+!5 = !{i32 0, i32 4, i32 0, !"uint", !"a", i32 4, i32 8, i32 0, !"Inner", !"b", i32 12, i32 4, i32 0, !"uint", !"c"}
+"#;
+
+#[test]
+fn native_opaque_struct_member_decodes_at_its_declared_size() {
+    let kern = meta::parse_air_kernel_meta(OPAQUE_STRUCT_MEMBER_LL).expect("kernel metadata");
+    assert_eq!(
+        kern.buffer_layouts.get(&0),
+        Some(&meta::AirType::Struct(vec![
+            meta::AirMember {
+                offset: 0,
+                ty: meta::AirType::Scalar(meta::AirScalar::UInt),
+            },
+            meta::AirMember {
+                offset: 4,
+                ty: meta::AirType::Opaque { size: 8 },
+            },
+            meta::AirMember {
+                offset: 12,
+                ty: meta::AirType::Scalar(meta::AirScalar::UInt),
+            },
+        ])),
+        "an unmodelled member name must decode as its declared byte size, not as a float leaf"
+    );
+}
+
+#[test]
+fn native_opaque_struct_member_keeps_the_declared_offsets() {
+    let kern = meta::parse_air_kernel_meta(OPAQUE_STRUCT_MEMBER_LL);
+    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
+        OPAQUE_STRUCT_MEMBER_LL,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("emit with AIR layout sidecar");
+
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings[0].status,
+        crate::emit_sidecar::AirStructLayoutMappingStatus::MappedNatural,
+        "the emitted member occupies exactly the eight declared bytes, so it is the member AIR meant"
+    );
+    assert!(
+        emitted
+            .sidecar
+            .air_struct_offsets
+            .values()
+            .any(|offsets| offsets == &[0, 4, 12]),
+        "{:?}",
+        emitted.sidecar.air_struct_offsets
+    );
+}
+
+#[test]
+fn native_opaque_struct_member_of_the_wrong_size_is_still_a_mismatch() {
+    // Size is the only claim an unmodelled member makes, so it is the only claim that can fail --
+    // but it must be able to fail. A member declared twelve bytes does not describe the eight-byte
+    // member the emitter produced, and accepting it would shift every following offset.
+    let ll = OPAQUE_STRUCT_MEMBER_LL.replace(
+        "i32 4, i32 8, i32 0, !\"Inner\"",
+        "i32 4, i32 12, i32 0, !\"Inner\"",
+    );
+    let kern = meta::parse_air_kernel_meta(&ll);
+    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
+        &ll,
+        kern.as_ref(),
+        Some("k"),
+        kern.as_ref().map(|meta| &meta.buffer_layouts),
+    )
+    .expect("emit mismatched AIR layout");
+
+    assert_eq!(
+        emitted.sidecar.air_struct_layout_mappings[0].status,
+        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
+    );
+    assert!(emitted.sidecar.air_struct_offsets.is_empty());
+}

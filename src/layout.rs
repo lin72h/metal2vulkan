@@ -522,6 +522,37 @@ mod tests {
         assert_eq!(air_metadata_extent(&AirType::Struct(vec![])), Some(0));
     }
 
+    /// `air_metadata_extent` bounds a decoded layout against `air.arg_type_size`, so a member whose
+    /// interior AIR never described has to reach its declared size. Reporting the old float leaf
+    /// understated a 408-byte member by 404 bytes and let a layout that overruns its argument pass.
+    #[test]
+    fn air_metadata_extent_reaches_an_unmodelled_member_declared_size() {
+        use crate::meta::{AirMember, AirScalar};
+
+        let with_opaque_tail = AirType::Struct(vec![
+            AirMember {
+                offset: 0,
+                ty: AirType::Scalar(AirScalar::UInt),
+            },
+            AirMember {
+                offset: 8,
+                ty: AirType::Opaque { size: 408 },
+            },
+        ]);
+        assert_eq!(air_metadata_extent(&with_opaque_tail), Some(416));
+        assert_eq!(
+            air_metadata_size_align(&with_opaque_tail, &|ty| ty.clone(), None),
+            Some((416, 4)),
+        );
+
+        // An array of unmodelled elements strides by the per-element size the member tuple carries.
+        let array_of_opaque = AirType::Array {
+            elem: Box::new(AirType::Opaque { size: 288 }),
+            len: 8,
+        };
+        assert_eq!(air_metadata_extent(&array_of_opaque), Some(2304));
+    }
+
     #[test]
     fn air_datalayout_parses_vector_abi_overrides_and_rejects_partial_bytes() {
         let layout = AirDataLayout::parse("e-p:64:64-v24:64:64-v96:128:128-n8:16:32")

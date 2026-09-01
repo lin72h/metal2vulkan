@@ -24,6 +24,20 @@ pub enum AirType {
     },
     /// Nested struct, members in declaration order with explicit AIR byte offsets.
     Struct(Vec<AirMember>),
+    /// A member AIR named with a type it does not describe the interior of -- a user struct or
+    /// class (`Espresso::padding_params_t`, `VFX_RE_C_LightSpot`) that `air.struct_type_info`
+    /// mentions by name only. The member tuple still carries its declared byte size, and that size
+    /// is the whole of what AIR states, so it is the whole of what this variant claims.
+    ///
+    /// Modelling such a member as a concrete leaf invents an interior: before this variant existed
+    /// the decoder answered `float` for every one of them, which sized a 408-byte member at four
+    /// bytes and made it fail to match the emitted member it describes. Over 2880 corpus sources
+    /// 2357 members across 817 modules are opaque, and the resulting shape mismatch discarded the
+    /// declared offsets for the entire buffer, not just the member that provoked it.
+    ///
+    /// The translator renders the declared bytes as a concrete storage shape wherever it must
+    /// hand a real SPIR-V or LLVM type to the emitter.
+    Opaque { size: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,11 +94,11 @@ pub fn primitive_air_type_from_name(name: &str) -> Option<AirType> {
     None
 }
 
-/// Map a primitive AIR type-name inside `air.struct_type_info`; historical callers default unknown
-/// names to float leaves because metadata occasionally names opaque helper structs without nested
-/// layout. New external users should prefer `primitive_air_type_from_name`.
-fn air_type_from_name(name: &str) -> AirType {
-    primitive_air_type_from_name(name).unwrap_or(AirType::Scalar(AirScalar::Float))
+/// Decode one `air.struct_type_info` member from the two facts the tuple carries: the type name and
+/// the declared byte size. A name with a primitive lowering wins; anything else is
+/// [`AirType::Opaque`] at the declared size, because the size is all AIR said about it.
+fn member_air_type(name: &str, size: u32) -> AirType {
+    primitive_air_type_from_name(name).unwrap_or(AirType::Opaque { size })
 }
 
 fn parse_dims(rest: &str, scalar: AirScalar, packed: bool) -> Option<AirType> {
@@ -198,7 +212,7 @@ pub(super) fn parse_struct_info(
             None if member_holds_resource_handle(nodes, argument_node) => {
                 storage_air_type_for_size(size)
             }
-            None => air_type_from_name(&tyname),
+            None => member_air_type(&tyname, size),
         };
         if array_len > 0 {
             mt = AirType::Array {
@@ -267,7 +281,10 @@ fn nested_offsets_are_strict(ty: &AirType) -> bool {
     }
 }
 
-fn storage_air_type_for_size(size: u32) -> AirType {
+/// Render `size` opaque bytes as a concrete AIR leaf, for the places that must hand a real
+/// SPIR-V/LLVM type to the emitter. Word-sized runs stay words so natural alignment survives; a
+/// size that is not a multiple of four falls to bytes.
+pub(crate) fn storage_air_type_for_size(size: u32) -> AirType {
     match size {
         0 | 4 => AirType::Scalar(AirScalar::UInt),
         1 => AirType::Scalar(AirScalar::UChar),

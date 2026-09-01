@@ -309,6 +309,18 @@ fn air_type_matches_existing(
                 && map_existing_air_struct_offsets(defs, def, members, air_data_layout)
                     .is_some_and(|offsets| offsets.windows(2).all(|window| window[1] > window[0]))
         }
+        // AIR named this member without describing its interior, so size is the only claim there is
+        // to check. Any emitted member occupying exactly the declared bytes is the one AIR meant:
+        // demanding a shape the metadata never stated is what discarded the declared offsets for
+        // the whole buffer.
+        AirType::Opaque { size } => {
+            let (emitted_size, emitted_align) = crate::layout::spirv_size_align(
+                ty,
+                defs,
+                crate::layout::SpirvLayout::natural(air_data_layout),
+            );
+            crate::layout::round_up_u32(emitted_size, emitted_align) == *size
+        }
     }
 }
 

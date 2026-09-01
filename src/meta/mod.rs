@@ -22,6 +22,7 @@ pub use textures::{
     texture_shape_from_name, TextureComponent, TextureDimension, TextureFormat, TextureShape,
     TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT,
 };
+pub(crate) use types::storage_air_type_for_size;
 use types::{parse_struct_info, struct_info_ref, tokenize, Tok};
 pub use types::{primitive_air_type_from_name, AirMember, AirScalar, AirType};
 

@@ -1146,6 +1146,10 @@ impl Ctx {
                 ));
                 st
             }
+            // Size is the only fact; build the storage shape that occupies it.
+            AirType::Opaque { size } => {
+                self.build_air_type(&crate::meta::storage_air_type_for_size(*size))
+            }
         }
     }
 

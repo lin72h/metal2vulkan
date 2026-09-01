@@ -156,6 +156,8 @@ fn extent(ty: &AirType) -> u32 {
             .map(|member| member.offset + extent(&member.ty))
             .max()
             .unwrap_or(0),
+        // A member AIR named without describing reaches exactly the bytes it declared.
+        AirType::Opaque { size } => *size,
     }
 }
 

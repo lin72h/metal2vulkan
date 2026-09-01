@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A buffer member `air.struct_type_info` names without describing -- a user struct or class
+  mentioned by name only -- decodes as `AirType::Opaque { size }` at the byte size the member tuple
+  declares, instead of as a 32-bit `Float`. The float leaf named a type AIR never stated and sized
+  every such member at four bytes: over 2880 corpus sources, 2513 members across 817 modules are
+  opaque, and 2357 of those declare a size other than four. The invented interior also failed to
+  match the member the emitter produced, which discarded the declared offsets for the whole buffer
+  rather than for the one member that provoked it. `REFLECTION_VERSION` is now 37.
 - `validate_descriptor_abi` rejects a reported member layout that reaches past the argument holding
   it. AIR states an argument's size and its member layout as two independent facts and reflection
   reconstructs them independently, so a layout that over-runs means some member's storage was

@@ -73,7 +73,10 @@ mod footprint;
 /// materializes the plane from the call, which is a property of the body rather than of the stage.
 /// Reflected translation also reports the buffer-address table the finished module declares instead
 /// of the one an AIR text scan predicted.
-pub const REFLECTION_VERSION: u32 = 36;
+/// v37 reports a buffer member AIR names without describing as `AirType::Opaque { size }`. Earlier
+/// versions reported every such member as a 32-bit `Float`, which named a type AIR never stated and
+/// understated members of any other size.
+pub const REFLECTION_VERSION: u32 = 37;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).

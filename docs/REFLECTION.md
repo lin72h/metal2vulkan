@@ -72,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `36`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `37`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -219,7 +219,7 @@ binding them as ordinary vertex attributes.
 | `metal_index` | Guest Metal slot `n`, or synthetic index for embedded textures |
 | `descriptor` | `{ set, binding, count }` or `None` if no descriptor (threadgroup / some locals) |
 | `param_index` | SPIR-V `OpFunctionParameter` order, if any |
-| `address_space` / `declared_size` / `type_layout` | Buffer address space, argument/pointee size, and aggregate layout. An argument-buffer member marked `air.indirect_argument` with any role but `air.indirect_constant` is a resource the buffer references, so it is reported at the handle size it occupies rather than as the pointee type AIR names it with (`char` for a `device char *`, `texture2d<...>` for a texture). A layout therefore reaches exactly as far as `declared_size`. |
+| `address_space` / `declared_size` / `type_layout` | Buffer address space, argument/pointee size, and aggregate layout. An argument-buffer member marked `air.indirect_argument` with any role but `air.indirect_constant` is a resource the buffer references, so it is reported at the handle size it occupies rather than as the pointee type AIR names it with (`char` for a `device char *`, `texture2d<...>` for a texture). A member AIR names without describing -- a user struct or class mentioned by name only -- is reported as `Opaque { size }` at its declared byte size, because that size is the whole of what the metadata states. A layout therefore reaches exactly as far as `declared_size`. |
 | `extent` | Buffer reachability: `Object { bytes }`, `Unbounded`, or `Unknown` |
 | `footprint` | Final-module static byte ranges, invocation-strided accesses, and an explicit unbounded-access flag |
 | `type_name` | AIR type string when metadata carried it |

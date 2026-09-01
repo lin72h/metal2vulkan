@@ -838,6 +838,9 @@ pub(crate) fn ll_type_from_air_type(ty: &AirType) -> LlType {
                 .map(|member| ll_type_from_air_type(&member.ty))
                 .collect(),
         ),
+        // No interior to translate: hand back the declared bytes in the storage shape every other
+        // size-only AIR member already uses.
+        AirType::Opaque { size } => ll_type_from_air_type(&meta::storage_air_type_for_size(*size)),
     }
 }
 
