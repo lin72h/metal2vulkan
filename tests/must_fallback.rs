@@ -471,6 +471,76 @@ entry:
     );
 }
 
+/// A builtin entry parameter whose type is not the builtin's type.
+///
+/// The third face of the same hole. `position`, `point_coord` and `front_facing` each declare a
+/// SPIR-V builtin of a fixed shape; a parameter of any other shape used to be bound to a zero, so a
+/// `[[position]]` the emitter could not wire put every fragment at the origin and a
+/// `[[front_facing]]` it could not wire called every triangle back-facing — in a module that
+/// validated and reflected as though the builtin were connected.
+///
+/// Unlike an unmodelled role, this branch is unreachable on real AIR: Metal fixes each attribute's
+/// type, and over 2880 corpus sources no module takes it. So the rejection costs nothing and exists
+/// to keep the silent zero from coming back.
+#[test]
+fn a_builtin_parameter_of_the_wrong_type_fallbacks() {
+    const FRAGMENT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
+
+define <4 x float> @frag(TYPE %sys) {
+entry:
+  %v0 = insertelement <4 x float> undef, float 0.000000e+00, i32 0
+  %v1 = insertelement <4 x float> %v0, float 0.000000e+00, i32 1
+  %v2 = insertelement <4 x float> %v1, float 0.000000e+00, i32 2
+  %v3 = insertelement <4 x float> %v2, float 1.000000e+00, i32 3
+  ret <4 x float> %v3
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4}
+!4 = !{i32 0, !"air.ROLE", !"air.center", !"air.arg_type_name", !"NAME"}
+"#;
+
+    let build = |role: &str, name: &str, ty: &str| {
+        FRAGMENT
+            .replace("air.ROLE", &format!("air.{role}"))
+            .replace("NAME", name)
+            .replace("TYPE", ty)
+    };
+
+    // Each attribute's own type translates.
+    for (role, name, ty) in [
+        ("position", "float4", "<4 x float>"),
+        ("point_coord", "float2", "<2 x float>"),
+        ("front_facing", "bool", "i1"),
+    ] {
+        assert!(
+            translate_sanitized_native(&build(role, name, ty), Stage::Fragment, &tmp()).is_ok(),
+            "[[{role}]] of type {name} must translate"
+        );
+    }
+
+    // Any other type has no wiring, and a zero in its place is a lie about the geometry.
+    for (role, name, ty, needle) in [
+        ("position", "float2", "<2 x float>", "float4"),
+        ("point_coord", "float4", "<4 x float>", "float2"),
+        ("front_facing", "uint", "i32", "bool"),
+    ] {
+        match translate_sanitized_native(&build(role, name, ty), Stage::Fragment, &tmp()) {
+            Ok(spv) => panic!(
+                "expected a FALLBACK for [[{role}]] typed {name}, got {} bytes",
+                spv.len()
+            ),
+            Err(e) => assert!(
+                e.contains(role) && e.contains(needle),
+                "the diagnostic should name the attribute and the type it needs; got: {e}"
+            ),
+        }
+    }
+}
+
 #[test]
 fn no_function_definitions_fallbacks() {
     assert_fallback(

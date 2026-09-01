@@ -749,8 +749,9 @@ source_filename = "synth_multi_return_fragment"
 target datalayout = "e-p:64:64:64"
 target triple = "air64-apple-macosx14.0.0"
 
-define <4 x float> @frag(float %x) local_unnamed_addr #0 {
+define <4 x float> @frag(<4 x float> %pos) local_unnamed_addr #0 {
 entry:
+  %x = extractelement <4 x float> %pos, i32 0
   %cond = fcmp olt float %x, 0.000000e+00
   br i1 %cond, label %early, label %late
 
@@ -772,7 +773,7 @@ attributes #0 = { nounwind }
 !1 = !{!2}
 !2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
 !3 = !{!4}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float"}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_fragment_multi_return_{}",

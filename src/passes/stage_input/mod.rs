@@ -1661,8 +1661,10 @@ pub(super) fn build_stage_input(
                 };
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: v4 }));
             } else {
-                let z = ctx.const_zero(*pty, &defs);
-                bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
+                return Err(format!(
+                    "[[position]] parameter {idx} is not a float4; FragCoord is a 4-component \
+                     float builtin and reading a zero in its place puts the fragment at the origin"
+                ));
             }
         } else if role_is("point_coord") {
             let v2 = ctx.ty_vecf(2);
@@ -1685,8 +1687,10 @@ pub(super) fn build_stage_input(
                 };
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: v2 }));
             } else {
-                let z = ctx.const_zero(*pty, &defs);
-                bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
+                return Err(format!(
+                    "[[point_coord]] parameter {idx} is not a float2; PointCoord is a 2-component \
+                     float builtin"
+                ));
             }
         } else if role_is("barycentric_coord") {
             // `[[barycentric_coord]]` is the primitive's barycentric weights at this fragment.
@@ -1757,8 +1761,10 @@ pub(super) fn build_stage_input(
                 };
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: bool_ty }));
             } else {
-                let z = ctx.const_zero(*pty, &defs);
-                bindings.push((*pid, ParamBinding::ZeroValue { val: z }));
+                return Err(format!(
+                    "[[front_facing]] parameter {idx} is not a bool; FrontFacing is a boolean \
+                     builtin and reading a zero in its place claims every triangle is back-facing"
+                ));
             }
         } else if role_is("primitive_id") {
             let uint_ty = ctx.ty_uint();
