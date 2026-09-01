@@ -26,7 +26,8 @@
 use metal2vulkan::meta::TextureDimension;
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
-    ResourceKind, ShaderReflection, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE,
+    DescriptorBindingRange, DescriptorLayout, ResourceKind, ShaderReflection,
+    DEFAULT_DESCRIPTOR_LAYOUT, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE,
 };
 use metal2vulkan::translate_sanitized_native_reflected;
 use std::collections::BTreeSet;
@@ -529,6 +530,189 @@ fn every_public_fixture_reflects_every_descriptor_it_declares() {
         "only {checked} fixtures declaring {declared} bindings were inspected, so this swept \
          almost nothing"
     );
+}
+
+/// A fragment that samples one texture through two `constexpr sampler`s.
+///
+/// AIR gives a constexpr sampler no argument-table index: it is a module-scope constant, and the
+/// binding it lands on is allocated from the sampler band rather than projected from a Metal index.
+/// That allocation is written twice -- once by the interface pass, once by reflection -- and no
+/// public fixture carries one, so nothing swept the two writers against each other.
+const CONSTEXPR_SAMPLERS: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+@__air_sampler_state.118 = internal addrspace(2) constant i64 -9188470239253755319, align 8
+@__air_sampler_state.119 = internal addrspace(2) constant i64 -9188470239253757806, align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex, ptr addrspace(2) %runtime_sampler) {
+entry:
+  %sample0 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.118, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value0 = extractvalue { <4 x float>, i8 } %sample0, 0
+  %sample1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.119, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value1 = extractvalue { <4 x float>, i8 } %sample1, 0
+  %value = fadd <4 x float> %value0, %value1
+  ret <4 x float> %value
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!9, !8}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!7 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.118}
+!9 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.119}
+"#;
+
+#[test]
+fn constexpr_samplers_are_reported_on_the_bindings_the_module_gives_them() {
+    for (label, layout) in [
+        ("default", DEFAULT_DESCRIPTOR_LAYOUT),
+        ("shifted", shifted_layout()),
+    ] {
+        let options = TransformOptions::default()
+            .with_descriptor_layout(layout)
+            .expect("layout");
+        let (spirv, reflection) = translate_sanitized_native_reflected(
+            CONSTEXPR_SAMPLERS,
+            Stage::Fragment,
+            &scratch(&format!("constexpr_samplers_{label}")),
+            options,
+        )
+        .expect("translate constexpr samplers");
+
+        assert_reflection_covers_declarations(label, &spirv, &reflection);
+        let static_samplers = reflection
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+            .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            static_samplers.len(),
+            2,
+            "{label}: both constexpr samplers must be reported, got {static_samplers:?}"
+        );
+        for binding in static_samplers {
+            assert!(
+                layout.samplers.contains(binding),
+                "{label}: constexpr sampler reported at {binding}, outside the selected sampler \
+                 band [{}, {})",
+                layout.samplers.start,
+                layout.samplers.end
+            );
+        }
+    }
+}
+
+/// The descriptor ABI is written twice: the passes decorate the module from the selected
+/// `DescriptorLayout`, and reflection reports numbers it computes for itself. Every case above runs
+/// at the default layout, where the two agree by construction as much as by correctness -- a band
+/// whose reflection forgot the selected layout and used the default constant would be right at the
+/// default and wrong everywhere else, and nothing here would notice.
+///
+/// So run the same sweep on a layout that shares the default's widths and none of its numbers. The
+/// coverage direction still has to hold, and one more besides: no reported or declared binding may
+/// fall outside the selected bands, or sit on any set but the selected one. A default-layout number
+/// surviving into a shifted translation shows up as a binding in neither.
+#[test]
+fn every_public_fixture_reflects_every_descriptor_it_declares_under_a_shifted_layout() {
+    let layout = shifted_layout();
+    let mut checked = 0;
+    let mut declared = 0;
+    for path in public_fixtures() {
+        let source = std::fs::read_to_string(&path).expect("read fixture");
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(stage) = stage_of(&source) else {
+            continue;
+        };
+        let options = TransformOptions::default()
+            .with_descriptor_layout(layout)
+            .expect("shifted layout");
+        let Ok((spirv, reflection)) = translate_sanitized_native_reflected(
+            &source,
+            stage,
+            &scratch(&format!("shifted_{label}")),
+            options,
+        ) else {
+            continue;
+        };
+        assert_eq!(
+            reflection.descriptor_layout, layout,
+            "{label} reports a layout other than the one it was translated with"
+        );
+        let module = assert_reflection_covers_declarations(&label, &spirv, &reflection);
+        assert_counts_cover_declared_arrays(&label, &spirv, &reflection);
+        for (set, binding) in module
+            .iter()
+            .copied()
+            .chain(bindings_reflection_reports(&reflection))
+        {
+            assert_eq!(
+                set, layout.set,
+                "{label} places binding {binding} on set {set}, not the selected set"
+            );
+            assert!(
+                selected_bands(layout)
+                    .iter()
+                    .any(|band| band.contains(binding)),
+                "{label} uses binding {binding}, which is in no band of the selected layout -- a \
+                 default-layout number that survived the shift"
+            );
+        }
+        declared += module.len();
+        checked += 1;
+    }
+    assert!(
+        checked >= 20 && declared >= 20,
+        "only {checked} fixtures declaring {declared} bindings were inspected, so this swept \
+         almost nothing"
+    );
+}
+
+/// The default layout's band widths at bases the default never uses, on a set it never uses. Widths
+/// are preserved so no fixture can overflow a band that fits it by default, and the offset is larger
+/// than every default band so no shifted band can overlap a default one.
+fn shifted_layout() -> DescriptorLayout {
+    const OFFSET: u32 = 4096;
+    let shift = |range: DescriptorBindingRange| DescriptorBindingRange {
+        start: range.start + OFFSET,
+        end: range.end + OFFSET,
+    };
+    let default = DEFAULT_DESCRIPTOR_LAYOUT;
+    DescriptorLayout {
+        set: default.set + 3,
+        buffers: shift(default.buffers),
+        sampled_textures: shift(default.sampled_textures),
+        samplers: shift(default.samplers),
+        color_inputs: shift(default.color_inputs),
+        imageblocks: shift(default.imageblocks),
+        fragment_imageblocks: shift(default.fragment_imageblocks),
+        storage_textures: shift(default.storage_textures),
+        synthetic: shift(default.synthetic),
+        ..default
+    }
+}
+
+fn selected_bands(layout: DescriptorLayout) -> [DescriptorBindingRange; 8] {
+    [
+        layout.buffers,
+        layout.sampled_textures,
+        layout.samplers,
+        layout.color_inputs,
+        layout.imageblocks,
+        layout.fragment_imageblocks,
+        layout.storage_textures,
+        layout.synthetic,
+    ]
 }
 
 /// The stage the AIR declares. The library's `detect_stage` sanitizes from a file path; these
