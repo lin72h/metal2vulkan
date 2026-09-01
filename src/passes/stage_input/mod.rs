@@ -360,6 +360,17 @@ pub(super) fn build_stage_input(
         ));
     }
 
+    // An `air.patch` node the decode could not read is not the same as no patch node at all. The
+    // first is a post-tessellation evaluation shader; dropping its shape emits it as an ordinary
+    // vertex shader, without the domain, spacing and winding execution modes Vulkan requires of a
+    // tessellation evaluation stage and without the per-patch inputs the pipeline has to wire.
+    if let Some(reason) = vert.and_then(|meta| meta.undecoded_patch_shape.as_deref()) {
+        return Err(format!(
+            "entry declares a tessellation patch this translator cannot read ({reason}); \
+             emitting the module would silently drop the tessellation stage"
+        ));
+    }
+
     for (i, (pid, pty)) in params.iter().enumerate() {
         let idx = i as u32;
         let role_is = |s: &str| match stage {

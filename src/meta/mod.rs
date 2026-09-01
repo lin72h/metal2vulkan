@@ -478,6 +478,15 @@ pub struct VertMeta {
     pub embedded_textures: Vec<EmbeddedTexture>,
     pub embedded_arguments: Vec<EmbeddedArgument>,
     pub tessellation: Option<TessellationMeta>,
+    /// Why an `air.patch` node the function does carry could not be decoded into
+    /// [`VertMeta::tessellation`], if that happened.
+    ///
+    /// The two are not interchangeable with `tessellation: None`. A vertex function with no patch
+    /// node is an ordinary vertex shader; one whose patch node did not decode is a post-tessellation
+    /// evaluation shader whose domain, spacing, winding and per-patch inputs would all go missing,
+    /// and the module that results is valid, binds, reflects, and draws the wrong geometry. The
+    /// stage-input pass refuses on this rather than emitting it.
+    pub undecoded_patch_shape: Option<String>,
 }
 
 impl VertMeta {
@@ -2119,8 +2128,16 @@ fn parse_air_vertex_meta_with_nodes(
     let refs = refs_in(rootc);
     let out_ref = *refs.first()?;
     let in_ref = *refs.get(1)?;
-    let patch_shape = refs.get(2).and_then(|patch_ref| {
-        let node = nodes.get(patch_ref)?;
+    // Find the patch node by what it says rather than by where it sits. A post-tessellation vertex
+    // function's root carries it third, but position is not the fact -- `air.patch` is -- and
+    // reading position alone cannot tell a patch node from whatever else a root might grow.
+    let patch_node = refs
+        .iter()
+        .skip(2)
+        .filter_map(|patch_ref| nodes.get(patch_ref))
+        .find(|node| node.contains("!\"air.patch\""));
+    let mut undecoded_patch_shape = None;
+    let patch_shape = patch_node.and_then(|node| {
         let domain = if node.contains("!\"quad\"") {
             PatchDomain::Quad
         } else if node.contains("!\"triangle\"") {
@@ -2128,10 +2145,20 @@ fn parse_air_vertex_meta_with_nodes(
         } else if node.contains("!\"isoline\"") {
             PatchDomain::Isoline
         } else {
+            // Dropping the shape here would emit an ordinary vertex shader: no domain, no spacing,
+            // no winding, and a per-patch input set the pipeline never wires. Carry the failure out
+            // so the passes can refuse instead.
+            undecoded_patch_shape = Some("air.patch names no tessellation domain".to_string());
             return None;
         };
-        let count = i32_after_marker(node, "air.patch_control_point")?;
-        Some((domain, count))
+        match i32_after_marker(node, "air.patch_control_point") {
+            Some(count) => Some((domain, count)),
+            None => {
+                undecoded_patch_shape =
+                    Some("air.patch states no air.patch_control_point count".to_string());
+                None
+            }
+        }
     });
 
     let mut output_roles = vec![];
@@ -2369,6 +2396,7 @@ fn parse_air_vertex_meta_with_nodes(
             Vec::new()
         },
         embedded_arguments: detect_embedded_arguments(nodes, &indirect_buffer_struct_refs),
+        undecoded_patch_shape,
         tessellation: patch_shape.map(|(domain, control_point_count)| {
             let (control_point_function, control_point_fields) = patch_control_point
                 .map(|(function, fields)| (Some(function), fields))

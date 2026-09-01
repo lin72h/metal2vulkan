@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A vertex function carrying an `air.patch` node the decoder cannot read is refused instead of being
+  emitted as an ordinary vertex shader. The node states a post-tessellation evaluation shader's
+  domain and control-point count; dropping it dropped the `Quads`/`Triangles`/`Isolines`,
+  `SpacingEqual` and `VertexOrderCcw` execution modes Vulkan requires of that stage along with every
+  per-patch input the pipeline wires, and the module that came out validated, bound and reflected
+  while drawing the wrong geometry. The node is also located by the `air.patch` marker it carries
+  rather than by its position in the vertex root.
 - An entry buffer whose declared AIR layout could not be attached to the emitted parameter now says
   which of the two things happened. A byte-addressed buffer is emitted as its raw contents -- a
   pointer to a word, or the block a storage buffer requires wrapping a runtime array of one -- and

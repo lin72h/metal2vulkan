@@ -781,9 +781,9 @@ declare void @postfixPrimary_f.MTL_VISIBLE_FN_REF(ptr addrspace(2)) section "air
     assert!(err.contains("Logical SPIR-V"), "{err}");
 }
 
-#[test]
-fn native_patch_control_point_reference_lowers_to_tessellation_evaluation() {
-    let ll = r#"
+/// A post-tessellation vertex function: `air.patch` states the domain and control-point count, and
+/// `air.patch_control_point_input` names the per-control-point fetch the evaluation stage calls.
+const PATCH_CONTROL_POINT_LL: &str = r#"
 target triple = "spirv-unknown-vulkan1.2"
 define <{ <4 x float> }> @main(ptr %patch, <2 x float> %position_in_patch) {
 entry:
@@ -804,6 +804,10 @@ declare { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32, ptr) section "air.ext
 !7 = !{!"air.patch", !"triangle", !"air.patch_control_point", i32 3}
 !8 = !{i32 1, !"air.position_in_patch", !"air.arg_type_name", !"float2"}
 "#;
+
+#[test]
+fn native_patch_control_point_reference_lowers_to_tessellation_evaluation() {
+    let ll = PATCH_CONTROL_POINT_LL;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_patch_control_point_ref_{}",
         std::process::id()
@@ -818,6 +822,62 @@ declare { <3 x float> } @control.MTL_CONTROL_POINT_FN(i32, ptr) section "air.ext
     );
     assert!(asm.contains("BuiltIn TessCoord"), "{asm}");
     assert!(!asm.contains("MTL_CONTROL_POINT_FN"), "{asm}");
+}
+
+/// The same function with an `air.patch` node naming a domain the translator does not model. Metal
+/// would still run it as a post-tessellation evaluation shader; dropping the shape turns it into an
+/// ordinary vertex shader that validates, binds and reflects while drawing the wrong geometry.
+#[test]
+fn native_unreadable_patch_domain_is_refused_rather_than_dropped() {
+    let ll = PATCH_CONTROL_POINT_LL.replace("!\"triangle\"", "!\"tetrahedron\"");
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_unreadable_patch_domain_{}",
+        std::process::id()
+    ));
+    let err = crate::translate_sanitized_native(&ll, Stage::Vertex, &tmp)
+        .expect_err("a patch domain with no lowering must not become an ordinary vertex shader");
+    assert!(err.contains("tessellation patch"), "{err}");
+    assert!(err.contains("no tessellation domain"), "{err}");
+}
+
+/// An `air.patch` node that states a domain but no control-point count is the same hazard: the
+/// count is what sizes every per-patch input the pipeline wires.
+#[test]
+fn native_patch_without_a_control_point_count_is_refused() {
+    let ll = PATCH_CONTROL_POINT_LL.replace(
+        "!\"air.patch\", !\"triangle\", !\"air.patch_control_point\", i32 3",
+        "!\"air.patch\", !\"triangle\"",
+    );
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_patch_no_control_point_{}",
+        std::process::id()
+    ));
+    let err = crate::translate_sanitized_native(&ll, Stage::Vertex, &tmp).expect_err(
+        "a patch with no control-point count must not become an ordinary vertex shader",
+    );
+    assert!(err.contains("air.patch_control_point"), "{err}");
+}
+
+/// The patch node is found by what it says, not by where it sits. Metal writes it third in the
+/// vertex root today; a root that grows another entry must not turn a tessellation shader into a
+/// plain vertex one, nor read a non-patch node as a patch.
+#[test]
+fn native_patch_node_is_found_by_its_marker_not_its_position() {
+    let ll = PATCH_CONTROL_POINT_LL
+        .replace("!0 = !{ptr @main, !1, !2, !7}", "!0 = !{ptr @main, !1, !2, !9, !7}")
+        .replace(
+            "!8 = !{i32 1, !\"air.position_in_patch\", !\"air.arg_type_name\", !\"float2\"}",
+            "!8 = !{i32 1, !\"air.position_in_patch\", !\"air.arg_type_name\", !\"float2\"}\n!9 = !{}",
+        );
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_patch_marker_position_{}",
+        std::process::id()
+    ));
+    let out = crate::translate_sanitized_native(&ll, Stage::Vertex, &tmp)
+        .expect("the patch node is still found past an unrelated root entry");
+    let asm = disassemble(&out).expect("disassemble tessellation evaluation module");
+    assert!(asm.contains("OpEntryPoint TessellationEvaluation"), "{asm}");
+    assert!(asm.contains("Triangles"), "{asm}");
 }
 
 #[test]
