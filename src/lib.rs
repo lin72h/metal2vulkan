@@ -25,6 +25,7 @@ mod emit_sidecar;
 pub mod env_vars;
 mod fc_air_specialize;
 mod fc_specialize;
+pub(crate) mod float16;
 mod layout;
 pub mod linked_functions;
 pub mod meta;

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- One encoder produces every `half` constant the translator mints. The native emitter and the
+  passes layer each carried their own `f32` -> binary16 conversion, and they disagreed: the passes
+  copy rounded half-away-from-zero rather than to even, and combined the rounded significand into
+  the encoding with `|` instead of `+`, so a value whose rounding carries out of the significand
+  kept the exponent it started with whenever that exponent was odd. `1.999755859375` encoded as
+  `1.0` instead of `2.0`.
+
+  This reached emitted modules through the saturating bounds of `air.convert` from a `half` source
+  to a narrow integer: the `32767.0` bound of a 16-bit signed convert encoded as `16384.0`, and the
+  `8191.0` bound of a 14-bit one as `4096.0`, each halving the range the conversion could produce.
+  A `half` above the halved bound saturated to it instead of to the destination's maximum. Across
+  2880 corpus sources six modules change, each replacing the upper `FClamp` bound of a `half` ->
+  `short` conversion: `OpConstant %half 0x1p+14` becomes `0x1p+15`, against a lower bound of
+  `-0x1p+15` that was already right. (`32767` is not representable as a `half`; `0x1p+15` is the
+  nearest one, which is what a correctly rounded bound means. `0x1p+14` was not near it.)
+
+  The correct encoder now lives in `crate::float16` and is exercised at every rounding boundary in
+  the format: for each pair of adjacent finite halves, the exact midpoint must land on the even one
+  and the two neighbouring `f32` values must land on their own side.
+
 - Every attribute an AIR stage root carries is read, and one the translator has no model for is
   refused instead of dropped. All three roots -- `!air.kernel`, `!air.vertex`, `!air.fragment` --
   state their per-entry attributes as extra operands past `(function, outputs, inputs)`, but not in

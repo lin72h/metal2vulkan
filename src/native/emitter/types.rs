@@ -1,4 +1,5 @@
 use super::*;
+use crate::float16::f32_to_f16_bits;
 
 impl Emitter {
     /// Canonicalize a type to its SPIR-V *storage* form for type-table interning. `BFloat` shares
@@ -1086,45 +1087,6 @@ impl Emitter {
         self.interner.float16_constants.insert(bits, id);
         Ok(id)
     }
-}
-
-fn f32_to_f16_bits(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exponent = ((bits >> 23) & 0xff) as i32;
-    let significand = bits & 0x007f_ffff;
-
-    if exponent == 0xff {
-        if significand == 0 {
-            return sign | 0x7c00;
-        }
-        let payload = (significand >> 13) as u16;
-        return sign | 0x7c00 | payload | u16::from(payload == 0);
-    }
-
-    let half_exponent = exponent - 127 + 15;
-    if half_exponent >= 31 {
-        return sign | 0x7c00;
-    }
-    if half_exponent <= 0 {
-        if half_exponent < -10 {
-            return sign;
-        }
-        let mantissa = significand | 0x0080_0000;
-        let shift = (14 - half_exponent) as u32;
-        return sign | round_shift_right_ties_even(mantissa, shift) as u16;
-    }
-
-    let rounded = round_shift_right_ties_even(significand, 13);
-    let encoded = ((half_exponent as u32) << 10) + rounded;
-    sign | encoded.min(0x7c00) as u16
-}
-
-fn round_shift_right_ties_even(value: u32, shift: u32) -> u32 {
-    let truncated = value >> shift;
-    let remainder = value & ((1 << shift) - 1);
-    let halfway = 1 << (shift - 1);
-    truncated + u32::from(remainder > halfway || (remainder == halfway && truncated & 1 != 0))
 }
 
 #[cfg(test)]

@@ -715,33 +715,6 @@ fn type_inst(op: Op, result: Word, operands: Vec<Operand>) -> Instruction {
     Instruction::new(op, None, Some(result), operands)
 }
 
-/// Convert an f32 to its IEEE-754 binary16 (half) bit pattern. Round-to-nearest-even; handles the
-/// small set of exact values we synthesize (0.0, 1.0) plus general finite values for robustness.
-pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
-    let bits = v.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mant = bits & 0x007f_ffff;
-    if ((bits >> 23) & 0xff) == 0xff {
-        // inf / nan
-        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
-    }
-    if exp >= 0x1f {
-        return sign | 0x7c00; // overflow -> inf
-    }
-    if exp <= 0 {
-        // subnormal / underflow to zero (sufficient for 0.0; our synthesized consts are 0/1).
-        if exp < -10 {
-            return sign;
-        }
-        let mant = (mant | 0x0080_0000) >> (1 - exp);
-        let rounded = (mant + 0x0000_1000) >> 13;
-        return sign | rounded as u16;
-    }
-    let half_mant = (mant + 0x0000_1000) >> 13; // round to nearest even (approx)
-    sign | ((exp as u16) << 10) | half_mant as u16
-}
-
 /// Find the entry function by name (the Vulkan backend does NOT inline helpers, so a module has many
 /// functions with bodies; only one is the AIR stage entry). Falls back to the first bodied function.
 fn find_entry_index(module: &Module, entry_name: Option<&str>) -> Option<usize> {
@@ -1505,7 +1478,7 @@ impl Ctx {
 
     /// Constant `half` of value `v` (0.0/1.0 etc.), encoded as the IEEE-754 binary16 bit pattern.
     fn const_half(&mut self, v: f32) -> Word {
-        let bits = f32_to_f16_bits(v);
+        let bits = crate::float16::f32_to_f16_bits(v);
         let key = SynthCacheKey::ConstHalf { bits };
         if let Some(&id) = self.synth_cache.get(&key) {
             return id;

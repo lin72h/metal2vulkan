@@ -1,11 +1,12 @@
 //! Cross-subsystem regression fixtures for retained lowering passes.
 
+use crate::float16::f32_to_f16_bits;
 use crate::passes::access::*;
 use crate::passes::air_calls::conversions::is_i1_type_token;
 use crate::passes::resources::rewrites::{
     rewrite_private_pointer_atomics, rewrite_private_zero_root_loads,
 };
-use crate::passes::{f32_to_f16_bits, value_result_type};
+use crate::passes::value_result_type;
 use crate::spirv_module::Operand;
 use crate::spirv_module::{Block, Function, Instruction, Module, ModuleHeader};
 use spirv::{Decoration, FunctionControl, Op, StorageClass};
