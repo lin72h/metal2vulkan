@@ -1,4 +1,3 @@
-use super::location_operands;
 use std::collections::{HashMap, HashSet};
 
 /// The Metal slot an argument node declares, resolving a function-constant slot through the
@@ -11,13 +10,7 @@ pub(super) fn location_index_with_static(
     fallback: u32,
     static_int_globals: &HashMap<String, u32>,
 ) -> u32 {
-    match location_operands(body).map(|operands| operands.index) {
-        Some(super::LocationOperand::Literal(index)) => index,
-        Some(super::LocationOperand::Global(global)) => {
-            static_int_globals.get(&global).copied().unwrap_or(fallback)
-        }
-        None => fallback,
-    }
+    super::declared_slot(body, "air.location_index", fallback, static_int_globals)
 }
 
 fn parse_global_name(s: &str) -> Option<String> {

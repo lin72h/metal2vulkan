@@ -1409,3 +1409,50 @@ fn a_function_constant_count_does_not_become_the_location_index() {
         "the texture binds at the slot AIR states, not at the value of its count global"
     );
 }
+
+/// A color attachment whose Location is a function constant is read the same way a resource slot
+/// is: it is the FIRST operand after its marker, and the operands after it describe something else.
+///
+/// `!"air.render_target", ptr addrspace(2) @loc, i32 0` -- the trailing `i32 0` is the dual-source
+/// index, `0` in all 3213 literal-form corpus declarations. A decode that answers with the next
+/// `i32` it can find reports every function-constant render target at Location 0 whatever the
+/// constant says, which for a multi-target shader is every output on one attachment. 103 of the
+/// 3316 corpus `air.render_target` declarations spell the Location as a global.
+#[test]
+fn a_function_constant_render_target_location_is_the_operand_after_its_marker() {
+    const FRAGMENT: &str = r#"
+@_ZL32__metal_implicit_attr_int_expr_0.103 = internal addrspace(2) global i32 0, align 4
+
+define internal void @_GLOBAL__sub_I_targets.metal() section "air.static_init" {
+entry:
+  store i32 SLOT, ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_0.103
+  ret void
+}
+
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4", !"air.arg_name", !"color"}
+!3 = !{!"air.render_target", ptr addrspace(2) @_ZL32__metal_implicit_attr_int_expr_0.103, i32 0, !"air.arg_type_name", !"half4", !"air.arg_name", !"extra"}
+!4 = !{}
+"#;
+
+    let resolved = FRAGMENT.replace("i32 SLOT", "i32 3");
+    let meta = parse_air_fragment_meta(&resolved).unwrap();
+    assert_eq!(
+        meta.render_target_members,
+        vec![(0, 0), (1, 3)],
+        "the second member's Location is what its function constant initializes to, not the \
+         dual-source index sitting after it"
+    );
+
+    // A global this module does not initialize at all is a Location the translator does not know.
+    // The member ordinal stands in -- it is at least unique per member -- and the operands after
+    // the slot still do not. Answering `0` here would put both outputs on attachment 0.
+    let unresolved = resolved.replace(
+        "@_ZL32__metal_implicit_attr_int_expr_0.103, i32 0, !\"air.arg_type_name\", !\"half4\", !\"air.arg_name\", !\"extra\"",
+        "@__air_location_this_module_never_defines, i32 0, !\"air.arg_type_name\", !\"half4\", !\"air.arg_name\", !\"extra\"",
+    );
+    let meta = parse_air_fragment_meta(&unresolved).unwrap();
+    assert_eq!(meta.render_target_members, vec![(0, 0), (1, 1)]);
+}

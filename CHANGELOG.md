@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A color attachment whose Location is a function constant is read from the operand after its
+  marker, like every other declared slot. `!"air.render_target", ptr addrspace(2) @loc, i32 0`
+  states the Location as a global and the dual-source index after it; when the global was one the
+  module does not initialize, the decode fell through to "the next `i32` after the marker" and
+  answered with that index -- `0` in all 3213 literal-form corpus declarations -- so every such
+  output landed on attachment 0 whatever the constant said. 103 of 3316 corpus `air.render_target`
+  declarations spell the Location as a global. The parameter or member ordinal now stands in for an
+  unknown slot, which is at least unique per member.
+
+  `air.location_index` and `air.render_target` are now one decoder, `meta::declared_slot`, and the
+  last scan-forward helper behind them is gone. A/B over the 2880-source sample: no change.
+
 - Constexpr samplers are ordered by one shared, total key, so the state reflection reports at a
   binding is the state the module gave it. Two independent scans put the module's
   `__air_sampler_state` globals in a sequence and pair them off by position: the interface pass,

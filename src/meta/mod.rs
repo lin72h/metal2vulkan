@@ -1504,18 +1504,21 @@ pub(crate) struct LocationOperands {
     pub count: Option<LocationOperand>,
 }
 
-/// Decode the `air.location_index` operand pair POSITIONALLY.
+/// The operands that follow `marker` in an argument node, POSITIONALLY, each decoded as a literal
+/// or as the function-constant global that supplies it at pipeline creation.
 ///
-/// Either operand may be a literal or a global, and all four combinations occur -- measured over
-/// 14579 corpus sources: 112946 `(i32, i32)`, 3404 `(ptr, i32)`, 1447 `(ptr, ptr)`, 439
-/// `(i32, ptr)`, and no other shape. Scanning forward for "the next `i32`" or "the next `@`"
-/// therefore reads the COUNT whenever the slot is spelled the other way: a texture argument at
-/// `[[texture(1)]]` with a function-constant array count would be bound at the count's value
-/// instead of at 1. 69 corpus texture nodes are that shape.
-pub(crate) fn location_operands(body: &str) -> Option<LocationOperands> {
-    let marker = "!\"air.location_index\"";
-    let position = body.find(marker)?;
-    let mut operands = split_metadata_operands(&body[position + marker.len()..])
+/// AIR spells a slot either way, and a decoder that scans forward for "the next `i32`" or "the next
+/// `@`" reads a DIFFERENT operand whenever the one it wants is spelled the other way. Measured over
+/// 14579 corpus sources, `air.location_index`'s pair is 112946 `(i32, i32)`, 3404 `(ptr, i32)`,
+/// 1447 `(ptr, ptr)` and 439 `(i32, ptr)`, and `air.render_target`'s first operand is 3213 `i32`
+/// and 103 `ptr` -- so scanning finds the descriptor COUNT in place of the texture slot, or the
+/// dual-source index in place of the color attachment.
+fn marker_operands(body: &str, marker: &str) -> Vec<Option<LocationOperand>> {
+    let marker = format!("!\"{marker}\"");
+    let Some(position) = body.find(&marker) else {
+        return vec![];
+    };
+    split_metadata_operands(&body[position + marker.len()..])
         .into_iter()
         .map(|operand| {
             if let Some(literal) = operand.strip_prefix("i32 ") {
@@ -1529,11 +1532,39 @@ pub(crate) fn location_operands(body: &str) -> Option<LocationOperands> {
                 })
                 .collect::<String>();
             (name.len() > 1).then_some(LocationOperand::Global(name))
-        });
+        })
+        .collect()
+}
+
+/// Decode the `air.location_index` operand pair.
+pub(crate) fn location_operands(body: &str) -> Option<LocationOperands> {
+    let mut operands = marker_operands(body, "air.location_index").into_iter();
     Some(LocationOperands {
         index: operands.next().flatten()?,
         count: operands.next().flatten(),
     })
+}
+
+/// The Metal slot a node declares under `marker`: `air.location_index` for a bound resource,
+/// `air.render_target` for a color attachment.
+///
+/// Both are the FIRST operand after their marker, and both may name a function-constant global
+/// instead of a literal. `fallback` -- the parameter or member ordinal -- stands in when the global
+/// is one this module does not initialize, because the operands AFTER the slot describe something
+/// else entirely and answering with one of those is answering the wrong question.
+pub(crate) fn declared_slot(
+    body: &str,
+    marker: &str,
+    fallback: u32,
+    static_int_globals: &HashMap<String, u32>,
+) -> u32 {
+    match marker_operands(body, marker).into_iter().next().flatten() {
+        Some(LocationOperand::Literal(slot)) => slot,
+        Some(LocationOperand::Global(global)) => {
+            static_int_globals.get(&global).copied().unwrap_or(fallback)
+        }
+        None => fallback,
+    }
 }
 
 /// Split an AIR metadata operand list on the commas that separate operands. A `!"..."` string
@@ -1565,22 +1596,7 @@ fn render_target_location(
     fallback: u32,
     static_int_globals: &HashMap<String, u32>,
 ) -> u32 {
-    global_after_marker(body, "air.render_target")
-        .and_then(|global| static_int_globals.get(&global).copied())
-        .or_else(|| i32_after_marker(body, "air.render_target"))
-        .unwrap_or(fallback)
-}
-
-fn global_after_marker(body: &str, marker: &str) -> Option<String> {
-    let marker = format!("!\"{marker}\"");
-    let pos = body.find(&marker)?;
-    let after = &body[pos + marker.len()..];
-    let at = after.find('@')?;
-    let name = after[at..]
-        .chars()
-        .take_while(|c| !c.is_whitespace() && !matches!(*c, ',' | ')' | '(' | '[' | ']'))
-        .collect::<String>();
-    (name.len() > 1).then_some(name)
+    declared_slot(body, "air.render_target", fallback, static_int_globals)
 }
 
 fn address_space(body: &str) -> Option<u32> {
