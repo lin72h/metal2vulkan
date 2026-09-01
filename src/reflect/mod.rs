@@ -3213,7 +3213,10 @@ fn parse_static_sampler_constants(ll: &str) -> Result<Vec<[u64; 2]>, String> {
             .ok_or_else(|| format!("AIR sampler-state global {name} has no i64 initializer"))?;
         constants.push((name.to_string(), words));
     }
-    constants.sort_by_key(|(name, _)| static_sampler_name_order(name));
+    // The interface pass sorts the same globals with the same key, from SPIR-V `OpName` rather
+    // than from this root. The key is total, so both sequences agree and the state reported here
+    // belongs to the binding the module gave that global.
+    constants.sort_by_key(|(name, _)| crate::meta::static_sampler_name_order(name));
     Ok(constants.into_iter().map(|(_, words)| words).collect())
 }
 
@@ -3241,14 +3244,6 @@ fn global_name(body: &str) -> Option<&str> {
         })
         .unwrap_or(rest.len());
     Some(&rest[..end])
-}
-
-fn static_sampler_name_order(name: &str) -> u64 {
-    name.trim_start_matches('@')
-        .strip_prefix("__air_sampler_state")
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .and_then(|suffix| suffix.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 fn texture_binding(

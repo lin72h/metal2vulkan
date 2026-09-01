@@ -979,7 +979,7 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), Stri
             if let (Some(Operand::IdRef(id)), Some(Operand::LiteralString(s))) =
                 (inst.operands.first(), inst.operands.get(1))
             {
-                if s.trim_start_matches('@').starts_with("__air_sampler_state") {
+                if crate::meta::is_static_sampler_global(s) {
                     samp_globals.push((*id, s.trim_start_matches('@').to_string()));
                 }
             }
@@ -988,7 +988,10 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), Stri
     if samp_globals.is_empty() {
         return Ok(());
     }
-    samp_globals.sort_by_key(|(_, name)| static_sampler_name_order(name));
+    // Reflection sorts the same globals with the same key, from the `!air.sampler_states` root
+    // rather than from `OpName`. The key is total, so the two sequences agree and the state
+    // reflection reports at a binding is the state this pass gave it.
+    samp_globals.sort_by_key(|(_, name)| crate::meta::static_sampler_name_order(name));
 
     let sty = ctx.ty_sampler();
     let pptr = ctx.ty_ptr(StorageClass::UniformConstant, sty);
@@ -1109,13 +1112,6 @@ pub(in crate::passes) fn handle_static_sampler(ctx: &mut Ctx) -> Result<(), Stri
         debug_assert!(load_ids.next().is_none());
     }
     Ok(())
-}
-
-fn static_sampler_name_order(name: &str) -> u64 {
-    name.strip_prefix("__air_sampler_state")
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .and_then(|suffix| suffix.parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 fn static_sampler_words(ctx: &Ctx, var: Word) -> Option<[u64; 2]> {

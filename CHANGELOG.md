@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Constexpr samplers are ordered by one shared, total key, so the state reflection reports at a
+  binding is the state the module gave it. Two independent scans put the module's
+  `__air_sampler_state` globals in a sequence and pair them off by position: the interface pass,
+  which walks SPIR-V `OpName` and hands each global the next free sampler binding, and reflection,
+  which walks the `!air.sampler_states` root and reports the decoded state at each of those
+  bindings. Both sorted by a key that read the name suffix as a single integer -- which fails on the
+  unsuffixed original and on the doubled form LLVM produces when it re-uniques an already uniqued
+  name (`__air_sampler_state.163.1608`), collapsing both to `0`. A tie leaves the order to the input
+  order, and the two scans have different ones, so every sample got a real sampler with the other
+  one's filter, address modes and compare function, in a module that validates and binds cleanly.
+  14 of the 5499 sampler-state globals across 14579 local corpus sources carry the doubled form and
+  10 modules hold one beside the original. The key now orders by the whole dot-separated suffix with
+  the name last, which cannot tie, and lives in one place
+  (`meta::static_sampler_name_order`) with the prefix test beside it.
+
 - A sampler argument AIR states is an ARRAY is refused instead of sampled through a default sampler
   nothing asked for. `air.location_index` carries two operands -- the Metal slot and the descriptor
   count -- and Metal spells `array<sampler, 8>` with a count of 8. Nothing read the count, so the

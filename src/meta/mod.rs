@@ -8,6 +8,7 @@ mod embedded;
 mod function_constants;
 mod globals;
 mod intersections;
+mod samplers;
 mod textures;
 mod types;
 use embedded::{body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_textures};
@@ -18,6 +19,7 @@ pub(crate) use globals::{static_init_foldable_global_values, StaticIntValue};
 pub use intersections::{
     AirIntersectionFamily, AirIntersectionInstancing, AirIntersectionResultField,
 };
+pub use samplers::{is_static_sampler_global, static_sampler_name_order};
 pub use textures::{
     texture_shape_from_name, TextureComponent, TextureDimension, TextureFormat, TextureShape,
     TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT,

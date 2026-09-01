@@ -843,3 +843,138 @@ fn public_fixtures() -> Vec<PathBuf> {
     paths.sort();
     paths
 }
+
+/// The same two constexpr samplers under names LLVM re-uniqued.
+///
+/// `__air_sampler_state` and `__air_sampler_state.118.9` are what a repeated constexpr sampler
+/// looks like after LLVM appends a discriminator to an already-discriminated name; 14 of the 5499
+/// sampler-state globals across 14579 local corpus sources carry the doubled form, and 10 modules
+/// hold one of them alongside the unsuffixed original. Parsing the suffix as a single integer maps
+/// both to the same sort key, and the two sides that sort these globals -- the interface pass, over
+/// SPIR-V `OpName` order, and reflection, over `!air.sampler_states` root order -- then break the
+/// tie from different input orders. `!air.sampler_states` here lists the two in the reverse of both.
+const RE_UNIQUED_CONSTEXPR_SAMPLERS: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253755319, align 8
+@__air_sampler_state.118.9 = internal addrspace(2) constant i64 -9188470239253757806, align 8
+
+define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex, ptr addrspace(2) %runtime_sampler) {
+entry:
+  %sample0 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value0 = extractvalue { <4 x float>, i8 } %sample0, 0
+  %sample1 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.118.9, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %value1 = extractvalue { <4 x float>, i8 } %sample1, 0
+  %value = fadd <4 x float> %value0, %value1
+  ret <4 x float> %value
+}
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.fragment = !{!0}
+!air.sampler_states = !{!9, !8}
+!0 = !{ptr @frag, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5, !6, !7}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4"}
+!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!7 = !{i32 3, !"air.sampler", !"air.location_index", i32 0, i32 1}
+!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+!9 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.118.9}
+"#;
+
+/// The AIR word each sample in the two constexpr-sampler fixtures selects, in program order.
+const CONSTEXPR_SAMPLER_WORDS: [u64; 2] = [
+    (-9188470239253755319_i64) as u64,
+    (-9188470239253757806_i64) as u64,
+];
+
+/// Which static-sampler binding each `OpSampledImage` in the module samples through, in program
+/// order. The state a sampler carries is only meaningful paired with the sample that reads it.
+fn sampler_bindings_in_sample_order(spirv: &[u8]) -> Vec<u32> {
+    let text = metal2vulkan::disassemble(spirv).expect("disassemble the translated module");
+    let mut bindings = std::collections::HashMap::<String, u32>::new();
+    let mut loaded_from = std::collections::HashMap::<String, String>::new();
+    let mut order = Vec::new();
+    for line in text.lines() {
+        match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+            ["OpDecorate", target, "Binding", value] => {
+                if let Ok(value) = value.parse::<u32>() {
+                    bindings.insert((*target).to_string(), value);
+                }
+            }
+            [result, "=", "OpLoad", _, source] => {
+                loaded_from.insert((*result).to_string(), (*source).to_string());
+            }
+            [_, "=", "OpSampledImage", _, _, sampler] => {
+                let variable = loaded_from.get(*sampler).cloned().unwrap_or_default();
+                if let Some(binding) = bindings.get(&variable) {
+                    order.push(*binding);
+                }
+            }
+            _ => {}
+        }
+    }
+    order
+}
+
+/// Every sample must reach the state the shader wrote next to it.
+///
+/// The bindings alone are not the contract: reflection publishes a decoded `StaticSamplerState` per
+/// binding, and a consumer creates a `VkSampler` from it. If the interface pass and reflection order
+/// the same set of sampler globals differently, both agree on WHICH bindings exist while reflection
+/// describes each one as the other -- so every sample gets a real sampler with the wrong filter,
+/// address mode and compare function, in a module that validates and binds cleanly.
+#[test]
+fn each_constexpr_sampler_binding_reports_the_state_its_sample_reads() {
+    for (label, source) in [
+        ("uniquely suffixed", CONSTEXPR_SAMPLERS),
+        ("re-uniqued", RE_UNIQUED_CONSTEXPR_SAMPLERS),
+    ] {
+        let (spirv, reflection) = translate_sanitized_native_reflected(
+            source,
+            Stage::Fragment,
+            &scratch(&format!(
+                "sampler_state_pairing_{}",
+                label.replace(' ', "_")
+            )),
+            TransformOptions::default(),
+        )
+        .unwrap_or_else(|error| panic!("{label} constexpr samplers translate: {error}"));
+
+        let reported = reflection
+            .bindings
+            .iter()
+            .filter(|binding| binding.kind == ResourceKind::StaticSampler)
+            .filter_map(|binding| {
+                Some((
+                    binding.descriptor?.binding,
+                    binding.static_sampler?.raw_words[0],
+                ))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(reported.len(), 2, "{label}: both samplers reported");
+
+        let sampled = sampler_bindings_in_sample_order(&spirv);
+        assert_eq!(
+            sampled.len(),
+            2,
+            "{label}: both samples must reach a static-sampler binding, got {sampled:?}"
+        );
+        for (position, (binding, expected)) in sampled
+            .iter()
+            .zip(CONSTEXPR_SAMPLER_WORDS)
+            .map(|(binding, word)| (*binding, word))
+            .enumerate()
+        {
+            assert_eq!(
+                reported.get(&binding).copied(),
+                Some(expected),
+                "{label}: sample {position} reads binding {binding}, where AIR put \
+                 {expected:#x}, but reflection describes that binding as \
+                 {:#x?}",
+                reported.get(&binding)
+            );
+        }
+    }
+}
