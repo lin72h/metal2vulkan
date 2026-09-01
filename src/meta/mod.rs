@@ -1690,6 +1690,29 @@ pub(crate) fn parse_air_fragment_meta_with_entry(ll: &str) -> (Option<FragMeta>,
 /// Any other enabled role lands in [`FragMeta::unmodelled_input_params`] and is rejected at
 /// emission. `render_target` appears here because an `air.render_target` in the *input* list is
 /// framebuffer fetch (`[[color(n)]]`), not an output.
+/// The fragment entry-parameter roles that name a SPIR-V builtin rather than a bound resource.
+///
+/// A resource keeps its descriptor whether or not its function constant is on: the pipeline layout
+/// has to match what the application binds either way. A system value does not. When its constant
+/// is off the parameter is absent, and declaring the builtin anyway puts a variable in the entry
+/// point interface — and, for `viewport_array_index` and `render_target_array_index`, a device
+/// capability in the module — for a value the shader cannot read.
+///
+/// The vertex and kernel decodes already drop a gated-off system value, because `fc_promoted_role`
+/// collapses everything but a promoted resource back to the wrapper. The fragment decode reads the
+/// role past the wrapper unconditionally, so this list is how it makes the same distinction.
+pub const FRAGMENT_SYSTEM_VALUE_ROLES: &[&str] = &[
+    "barycentric_coord",
+    "front_facing",
+    "point_coord",
+    "position",
+    "primitive_id",
+    "render_target_array_index",
+    "sample_id",
+    "sample_mask_in",
+    "viewport_array_index",
+];
+
 pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
     "barycentric_coord",
     "buffer",
@@ -1920,6 +1943,14 @@ fn parse_air_fragment_meta_with_nodes(
         let Some(role_str) = primary_role(&strs) else {
             continue;
         };
+        // A gated-off system value is absent; falling through to `Other` binds a zero for it.
+        let role_str = if FRAGMENT_SYSTEM_VALUE_ROLES.contains(&role_str)
+            && !metadata_enabled_by_default(node, nodes, &static_int_globals)
+        {
+            ""
+        } else {
+            role_str
+        };
         if let Some(declared) = declared_role(&strs) {
             if !FRAGMENT_INPUT_ROLES.contains(&declared)
                 && metadata_enabled_by_default(node, nodes, &static_int_globals)
@@ -1931,24 +1962,12 @@ fn parse_air_fragment_meta_with_nodes(
             "position" => FragRole::Position,
             "point_coord" => FragRole::PointCoord,
             "front_facing" => FragRole::FrontFacing,
-            // A function-constant-gated barycentric argument that is off by default is absent, and
-            // materializing its builtin anyway would make the module require the
-            // fragment-barycentric extension for a value nothing reads.
-            "barycentric_coord"
-                if metadata_enabled_by_default(node, nodes, &static_int_globals) =>
-            {
-                FragRole::BarycentricCoord {
-                    no_perspective: VaryingInterpolation::from_role_strings(&strs).no_perspective,
-                }
-            }
+            "barycentric_coord" => FragRole::BarycentricCoord {
+                no_perspective: VaryingInterpolation::from_role_strings(&strs).no_perspective,
+            },
             "primitive_id" => FragRole::PrimitiveId,
             "sample_id" => FragRole::SampleId,
-            // As with `barycentric_coord` below: a gated-off argument is absent, and declaring
-            // its builtin anyway puts a variable in the entry point interface for a value the
-            // shader cannot read.
-            "sample_mask_in" if metadata_enabled_by_default(node, nodes, &static_int_globals) => {
-                FragRole::SampleMaskIn
-            }
+            "sample_mask_in" => FragRole::SampleMaskIn,
             "viewport_array_index" => FragRole::ViewportArrayIndex,
             "render_target_array_index" => FragRole::RenderTargetArrayIndex,
             "fragment_input" => {
