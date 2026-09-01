@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `ShaderReflection` reports `max_work_group_size`, the `[[max_total_threads_per_threadgroup(N)]]`
+  ceiling translation now enforces. Enforcing a bound a consumer has no way to read leaves it
+  guessing at the dispatch shape; reflection reports the ceiling and does not enforce it, because
+  discovering the bound is the reason to ask. `REFLECTION_VERSION` is now 39.
+
 - A kernel imageblock aliased onto the implicit one is refused instead of given tile-local scratch.
   An explicit imageblock is ordinarily per-tile scratch, undefined on entry, and the interface gives
   it a `Private` array -- an honest refinement. `air.alias_implicit_imageblock` on the same node

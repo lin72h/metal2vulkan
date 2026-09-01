@@ -80,7 +80,7 @@ mod footprint;
 /// predicate instead of an AIR text scan. Over 2880 corpus sources the scan disagreed with the
 /// finished module 63 times and the predicate disagrees 8 times; reflected translation, which reads
 /// the table off the module, is unchanged.
-pub const REFLECTION_VERSION: u32 = 38;
+pub const REFLECTION_VERSION: u32 = 39;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -1733,6 +1733,13 @@ pub struct ShaderReflection {
     pub stencil_members: Vec<u32>,
     /// Kernel GLCompute local size (`[x, y, z]`), when the stage is a kernel.
     pub local_size: Option<[u32; 3]>,
+    /// `[[max_total_threads_per_threadgroup(N)]]`, when the kernel declares one.
+    ///
+    /// The largest threadgroup the entry was compiled to run. Translation refuses a
+    /// `TransformOptions::kernel_local_size` whose product exceeds it, so a consumer choosing a
+    /// dispatch shape reads this first: reflection reports the ceiling rather than enforcing it,
+    /// because discovering the bound is the reason to ask.
+    pub max_work_group_size: Option<u32>,
     /// Kernel dispatch/grid ABI, when the stage is a kernel. A push-constant grid must be populated
     /// before each dispatch using the reflected byte range.
     pub kernel_dispatch: Option<KernelDispatch>,
@@ -2560,6 +2567,7 @@ impl ShaderReflection {
             depth_qualifier: meta.depth_qualifier,
             stencil_members: meta.stencil_members.clone(),
             local_size: None,
+            max_work_group_size: None,
             kernel_dispatch: None,
             vertex_builtins: None,
             tessellation: None,
@@ -2724,6 +2732,7 @@ impl ShaderReflection {
             depth_qualifier: None,
             stencil_members: Vec::new(),
             local_size: None,
+            max_work_group_size: None,
             kernel_dispatch: None,
             vertex_builtins: Some(vertex_builtins),
             tessellation: meta.tessellation.as_ref().map(|tessellation| {
@@ -2935,6 +2944,7 @@ impl ShaderReflection {
             depth_qualifier: None,
             stencil_members: Vec::new(),
             local_size: Some(local_size),
+            max_work_group_size: meta.max_work_group_size,
             kernel_dispatch: Some(KernelDispatch::safe_default()),
             vertex_builtins: None,
             tessellation: None,

@@ -25,7 +25,8 @@
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::KernelDispatch;
 use metal2vulkan::{
-    disassemble, translate_sanitized_native, translate_sanitized_native_with_options,
+    disassemble, reflect_sanitized, translate_sanitized_native,
+    translate_sanitized_native_with_options,
 };
 use std::path::PathBuf;
 
@@ -255,6 +256,50 @@ fn a_dispatch_past_the_declared_threadgroup_ceiling_is_refused() {
             "the requested local size must still be emitted:\n{asm}"
         );
     }
+}
+
+/// The ceiling reflection reports is the ceiling translation enforces.
+///
+/// The refusal above is only usable if a consumer can find out what it is before asking. Reflection
+/// reports `air.max_work_group_size` and does not enforce it -- discovering the bound is the reason
+/// to call it -- so the two numbers have to be the same number, and this drives both off one
+/// declaration. A kernel that declares nothing reports nothing and accepts any dispatch.
+#[test]
+fn the_reflected_threadgroup_ceiling_is_the_one_translation_enforces() {
+    let declared = with_attribute(KERNEL, ", !6}\n!6 = !{!\"air.max_work_group_size\", i32 64");
+    let reflection = reflect_sanitized(&declared, Stage::Kernel, TransformOptions::default())
+        .expect("reflection reports the ceiling rather than enforcing it");
+    let ceiling = reflection
+        .max_work_group_size
+        .expect("the kernel declares a ceiling");
+    assert_eq!(ceiling, 64);
+
+    // At the ceiling and past it, driven off the number reflection just reported.
+    let at = [8, ceiling / 8, 1];
+    let past = [8, ceiling / 8, 2];
+    dispatch(
+        KERNEL,
+        ", !6}\n!6 = !{!\"air.max_work_group_size\", i32 64",
+        at,
+    )
+    .expect("a dispatch of exactly the reported ceiling translates");
+    let error = dispatch(
+        KERNEL,
+        ", !6}\n!6 = !{!\"air.max_work_group_size\", i32 64",
+        past,
+    )
+    .expect_err("a dispatch past the reported ceiling is refused");
+    assert!(
+        error.contains(&ceiling.to_string()),
+        "the refusal must cite the ceiling reflection reported: {error}"
+    );
+
+    // No declaration, no ceiling, and nothing to enforce.
+    let plain = with_attribute(KERNEL, "");
+    let plain_reflection = reflect_sanitized(&plain, Stage::Kernel, TransformOptions::default())
+        .expect("a kernel with no ceiling still reflects");
+    assert_eq!(plain_reflection.max_work_group_size, None);
+    dispatch(KERNEL, "", [16, 16, 4]).expect("an undeclared ceiling bounds nothing");
 }
 
 /// The structural half: an attribute no stage models is refused by every stage that can carry one,

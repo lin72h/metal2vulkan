@@ -72,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `38`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `39`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -184,6 +184,7 @@ Top-level fields:
 | `depth_members` / `stencil_members` | Fragment return members tagged depth/stencil |
 | `depth_qualifier` | Fragment depth comparison contract (`Any`, `Less`, or `Greater`) |
 | `local_size` | Nominal Metal kernel local size `[x,y,z]`; exact-thread regions specialize boundary dimensions |
+| `max_work_group_size` | `[[max_total_threads_per_threadgroup(N)]]` when the kernel declares one; translation refuses a `local_size` whose product exceeds it |
 | `kernel_dispatch` | Whole-workgroup launch or the fixed/dynamic exact-thread region-planning contract |
 | `vertex_builtins` | Whether vertex uses `VertexIndex` / `InstanceIndex` / writes `Position` |
 | `tessellation` | Post-tessellation patch domain, control-point count, locations, and synthesized system-value carriers |
