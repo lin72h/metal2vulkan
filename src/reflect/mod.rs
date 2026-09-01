@@ -76,7 +76,11 @@ mod footprint;
 /// v37 reports a buffer member AIR names without describing as `AirType::Opaque { size }`. Earlier
 /// versions reported every such member as a 32-bit `Float`, which named a type AIR never stated and
 /// understated members of any other size.
-pub const REFLECTION_VERSION: u32 = 37;
+/// v38 decides `reflect_sanitized`'s buffer-address table with the emitter's own device-address
+/// predicate instead of an AIR text scan. Over 2880 corpus sources the scan disagreed with the
+/// finished module 63 times and the predicate disagrees 8 times; reflected translation, which reads
+/// the table off the module, is unchanged.
+pub const REFLECTION_VERSION: u32 = 38;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).

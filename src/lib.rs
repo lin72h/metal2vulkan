@@ -576,8 +576,11 @@ pub fn translate_reflected_with_options(
 /// classes are decided by the constructed module, and this path builds none.
 ///
 /// Whether the emitter needs a buffer-address table is decided by the constructed pointer graph, so
-/// here it is approximated from an AIR text scan (`has_device_address_pointer_load`). Measured over
-/// 2880 corpus sources, that scan disagrees with what the emitter actually emits on 39 of them.
+/// this path asks the emitter's own predicate: it parses the source and runs
+/// `requires_device_address_model`, the same question `emit_vulkan_spirv_with_sidecar` asks. That is
+/// still not the finished module -- over 2880 corpus sources it disagrees with what the emitter
+/// emits on 8, four in each direction. The AIR text scan it replaced disagreed on 63, and 13 of
+/// those reported no table for a module that declares one.
 /// The descriptors the passes synthesize to type an AIR value -- `SynthesizedNullTexture` and
 /// `SynthesizedReadSampler` -- are absent entirely, because whether one survives depends on whether
 /// anything in the finished module consumed its value.
@@ -608,7 +611,13 @@ pub fn reflect_sanitized(
     reflection.function_constants = meta::parse_function_constants(san_ll);
     reflection.refine_buffer_access_from_entry(san_ll);
     reflection.add_static_samplers(san_ll)?;
-    if stage == passes::Stage::Kernel && has_device_address_pointer_load(san_ll) {
+    if stage == passes::Stage::Kernel
+        && native::requires_device_address_model_for_source(
+            san_ll,
+            stage_meta.kern.as_ref(),
+            stage_meta.entry_name.as_deref(),
+        )
+    {
         reflection.add_buffer_address_table()?;
     }
     reflection.validate_descriptor_abi()?;
@@ -1264,28 +1273,6 @@ fn translate_sanitized_with_meta_prevalidated_carrier(
     translated
 }
 
-fn has_device_address_pointer_load(san_ll: &str) -> bool {
-    let has_device_buffer_array = meta::parse_air_kernel_meta(san_ll).is_some_and(|metadata| {
-        metadata
-            .buffer_type_names
-            .values()
-            .any(|name| meta::is_device_buffer_array_type_name(name))
-    });
-    san_ll.lines().any(|line| {
-        line.split_once('=').is_some_and(|(_, rhs)| {
-            let rhs = rhs.trim_start();
-            rhs.starts_with("inttoptr ")
-                || (rhs.starts_with("load ptr addrspace(1)")
-                    && rhs.split_once(',').is_some_and(|(_, pointer)| {
-                        let pointer = pointer.trim_start();
-                        pointer.starts_with("ptr addrspace(1) ")
-                            || pointer.starts_with("ptr addrspace(2) ")
-                            || (has_device_buffer_array && pointer.starts_with("ptr "))
-                    }))
-        })
-    })
-}
-
 /// Canonicalize the ids of an emitted SPIR-V byte stream into the deterministic serialized-order form
 /// the shipped pipeline applies in `finish_module`. Exposed for the byte-drift gates
 /// (historical validation tooling byte-baseline-check` / `byte-determinism-check`), which compare native-emit
@@ -1387,26 +1374,12 @@ define void @k(ptr addrspace(2) %args) {
     }
 
     #[test]
-    fn device_address_model_detects_loaded_device_pointers_not_local_pointer_staging() {
-        assert!(has_device_address_pointer_load(
-            "%p = load ptr addrspace(1), ptr addrspace(2) %field"
-        ));
-        assert!(has_device_address_pointer_load(
-            "%p = load ptr addrspace(1), ptr addrspace(1) %field"
-        ));
-        assert!(has_device_address_pointer_load(
-            "%p = inttoptr i64 %address to ptr addrspace(1)"
-        ));
-        assert!(!has_device_address_pointer_load(
-            "%p = load ptr addrspace(1), ptr %local"
-        ));
-        assert!(!has_device_address_pointer_load(
-            "%p = load ptr addrspace(2), ptr addrspace(2) %field"
-        ));
-
+    fn metadata_only_reflection_reports_the_address_table_a_device_pointer_needs() {
         let ll = r#"
 define void @k(ptr addrspace(1) %out, i64 %address) {
   %p = inttoptr i64 %address to ptr addrspace(1)
+  %v = load i32, ptr addrspace(1) %p, align 4
+  store i32 %v, ptr addrspace(1) %out, align 4
   ret void
 }
 !air.kernel = !{!0}
@@ -1430,6 +1403,97 @@ define void @k(ptr addrspace(1) %out, i64 %address) {
         assert_eq!(
             table.descriptor.map(|descriptor| descriptor.binding),
             Some(reflect::SYNTHETIC_BINDING_BASE)
+        );
+
+        // The same `inttoptr` with nothing reading it needs no address model, and the emitter
+        // builds none. A text scan cannot tell the two apart -- it sees the token either way, and
+        // reported a table for 49 corpus modules that declare none.
+        let dead = ll.replace(
+            "  %v = load i32, ptr addrspace(1) %p, align 4\n  store i32 %v, ptr addrspace(1) %out, align 4\n",
+            "",
+        );
+        assert!(!reflect_sanitized(
+            &dead,
+            passes::Stage::Kernel,
+            passes::TransformOptions::default(),
+        )
+        .expect("reflect dead-pointer kernel")
+        .bindings
+        .iter()
+        .any(|binding| binding.kind == reflect::ResourceKind::BufferAddressTable));
+    }
+
+    /// The predicate is the emitter's, so it sees what a text scan cannot. This kernel loads a
+    /// device pointer out of a *struct member* through a GEP -- there is no `inttoptr`, and the
+    /// load's pointer operand is a temporary rather than a literal `ptr addrspace(1)` operand, so
+    /// a line-prefix scan of the AIR reads nothing. The pointer graph says otherwise, and the
+    /// emitted module carries the address model, so reflection has to report the table.
+    #[test]
+    fn metadata_only_reflection_sees_a_device_pointer_a_text_scan_cannot() {
+        let ll = r#"
+%struct.Handles = type { ptr addrspace(1), i32 }
+
+define void @k(ptr addrspace(1) %handles, ptr addrspace(1) %out) {
+entry:
+  %slot = getelementptr inbounds %struct.Handles, ptr addrspace(1) %handles, i64 0, i32 0
+  %device = load ptr addrspace(1), ptr addrspace(1) %slot, align 8
+  %value = load i32, ptr addrspace(1) %device, align 4
+  store i32 %value, ptr addrspace(1) %out, align 4
+  ret void
+}
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"Handles", !"air.arg_name", !"handles"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+"#;
+        let metadata_only = reflect_sanitized(
+            ll,
+            passes::Stage::Kernel,
+            passes::TransformOptions::default(),
+        )
+        .expect("reflect device-address kernel");
+        assert!(
+            metadata_only
+                .bindings
+                .iter()
+                .any(|binding| binding.kind == reflect::ResourceKind::BufferAddressTable),
+            "{:?}",
+            metadata_only
+                .bindings
+                .iter()
+                .map(|binding| binding.kind)
+                .collect::<Vec<_>>()
+        );
+
+        // And it agrees with what translation actually emits, which is the point of asking the
+        // emitter's predicate rather than a second one.
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_metadata_address_table_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let (_, translated) = translate_sanitized_native_reflected(
+            ll,
+            passes::Stage::Kernel,
+            &tmp,
+            passes::TransformOptions::default(),
+        )
+        .expect("translate device-address kernel");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let table_bindings = |reflection: &reflect::ShaderReflection| {
+            reflection
+                .bindings
+                .iter()
+                .filter(|binding| binding.kind == reflect::ResourceKind::BufferAddressTable)
+                .filter_map(|binding| binding.descriptor.map(|descriptor| descriptor.binding))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            table_bindings(&metadata_only),
+            table_bindings(&translated),
+            "metadata-only and reflected translation must agree on the address table"
         );
     }
 

@@ -42,7 +42,7 @@ Other entry points:
 |---|---|
 | `translate_reflected` / `translate_reflected_with_options` | Path to `.air` or `.ll` + stage |
 | `translate_sanitized_native_reflected` | You already have sanitized LLVM IR text and `TransformOptions` |
-| `reflect_sanitized` | You need metadata for link-time tooling even when executable translation is not yet possible; buffer footprints remain absent |
+| `reflect_sanitized` | You need metadata for link-time tooling even when executable translation is not yet possible; buffer footprints remain absent, and the `BufferAddressTable` binding is predicted rather than read off a module (it can be reported for a module that declares none, or missed for one that does) |
 | `reflect_sanitized_specialized` | You need metadata for exact function-constant values that can select resources or outputs; buffer footprints remain absent |
 | `ShaderReflection::from_{fragment,vertex,kernel}` | You already have `meta::{Frag,Vert,Kern}Meta`; IR-derived fields and buffer footprints remain absent |
 
@@ -72,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `37`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `38`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -103,7 +103,7 @@ By default, every descriptor-backed Metal-facing resource uses **descriptor set 
 | Authored visible/intersection function table | `VisibleFunctionTable` / `IntersectionFunctionTable` | **no descriptor** (`descriptor: None`); `metal_index` and `param_index` identify static linkage |
 | Texture embedded in argument buffer | `EmbeddedArgBufferTexture` | selected sampled- or storage-texture range at `synthetic_index` |
 | Device buffer embedded in argument buffer | `EmbeddedArgBufferBuffer` | **no descriptor**; owner field contains its Vulkan device address |
-| Synthesized direct-buffer address table | `BufferAddressTable` | first free binding in the selected synthetic range (default starts at `640`); one `u64` address per Metal buffer slot |
+| Synthesized direct-buffer address table | `BufferAddressTable` | first free binding in the selected synthetic range (default starts at `640`); one `u64` address per Metal buffer slot. Reflected translation reads it off the finished module; `reflect_sanitized` predicts it with the emitter's device-address predicate and can differ in either direction |
 | Placeholder image for `air.get_null_texture_*()` | `SynthesizedNullTexture` | first binding in the sampled-texture band no Metal texture claims; reported only when the shader reads through the handle |
 | Placeholder sampler for `air.get_read_sampler()` | `SynthesizedReadSampler` | first binding in the sampler band no Metal sampler claims; reported only when something consumes the value |
 

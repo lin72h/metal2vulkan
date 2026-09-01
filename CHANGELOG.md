@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `reflect_sanitized` decides whether a kernel needs a buffer-address table with the emitter's own
+  device-address predicate rather than a line-prefix scan of the AIR text. The scan disagreed with
+  the finished module on 63 of 2880 corpus sources -- 49 by reporting a binding no module declares,
+  and 13 by reporting none for a module that does, which leaves a consumer building a descriptor-set
+  layout without a binding the shader reads. Asking the predicate the emitter itself asks leaves 8,
+  four in each direction, and metadata-only reflection remains about three times cheaper than
+  translating. Reflected translation, which reads the table off the module, is unchanged.
+  `REFLECTION_VERSION` is now 38.
 - `with_runtime_sampler` accepts a pixel-coordinate sampler whose LOD maximum is Metal's default.
   The emulation fetches level zero, so only a *minimum* above zero can exclude the level it reads --
   a maximum never can, since validation already requires it to be at least the minimum. Demanding

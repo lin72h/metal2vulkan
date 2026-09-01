@@ -142,3 +142,27 @@ fn require_capability(module: &mut Module, capability: Capability) {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether the emitter will build this module against the physical-storage-buffer address model.
+///
+/// [`emit_tiers::requires_device_address_model`] answers this from the parsed pointer graph and is
+/// what the emitter itself consults. Metadata-only reflection has to answer the same question to
+/// know whether the module will carry a buffer-address table, and it used to answer it from a
+/// line-prefix scan of the AIR text -- a second derivation of one fact, and the worse of the two:
+/// over 2880 corpus sources the scan disagreed with the finished module 63 times, 13 of them by
+/// reporting no table for a module that declares one. Asking the emitter's own predicate leaves 8.
+///
+/// The pre-parse normalizations are the ones [`emit_vulkan_spirv_with_sidecar`] applies before it
+/// parses, so both callers read the same graph. Source that will not parse gets `false`: it will
+/// not translate either, and there is no module for the answer to be right about.
+pub(crate) fn requires_device_address_model_for_source(
+    san_ll: &str,
+    kern: Option<&crate::meta::KernMeta>,
+    entry: Option<&str>,
+) -> bool {
+    let san_ll = async_copy::lower_simdgroup_async_copy(san_ll);
+    let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&san_ll);
+    let san_ll = inline::inline_pointer_select_consumers(&san_ll, entry).source;
+    ir::LlModule::parse_with_stage_meta(&san_ll, kern, entry)
+        .is_ok_and(|parsed| emit_tiers::requires_device_address_model(&parsed))
+}
